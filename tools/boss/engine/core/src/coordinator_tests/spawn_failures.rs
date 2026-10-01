@@ -240,16 +240,15 @@ async fn missing_turn_start_evidence_persists_pane_spawn_failed_status_and_reaso
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
 
-    let fail_message = crate::runner::spawn_confirmation::turn_did_not_start_error(
-        "claude",
-        "exec-silent-turn",
-        std::time::Duration::from_secs(45),
-    )
-    .to_string();
+    let fail_source = crate::runner::spawn_confirmation::SpawnConfirmationError::TurnDidNotStart {
+        driver_name: "claude".to_owned(),
+        run_id: "exec-silent-turn".to_owned(),
+        timeout_secs: 45,
+    };
     let cube = Arc::new(FakeCubeClient::default());
     let runner = Arc::new(FakeExecutionRunner {
         fail: true,
-        fail_message: Some(fail_message.clone()),
+        fail_source: Some(fail_source),
         ..FakeExecutionRunner::default()
     });
     let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
@@ -293,6 +292,67 @@ async fn missing_turn_start_evidence_persists_pane_spawn_failed_status_and_reaso
             .is_some_and(|msg| msg.contains("no driver hook or session event")),
         "pane_spawned event must include the turn-start reason; got {:?}",
         pane_event.error_message,
+    );
+}
+
+/// Coordinator persistence for a spawn that the runner refused because
+/// the composer never became ready: the attention item is still
+/// `pane_spawn_failed`, but the body must not claim the driver started.
+#[tokio::test]
+async fn composer_never_ready_persists_pane_spawn_failed_without_claiming_the_driver_started() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let fail_source = crate::runner::spawn_confirmation::SpawnConfirmationError::ComposerNotReady {
+        driver_name: "claude".to_owned(),
+        run_id: "exec-missing-composer".to_owned(),
+        timeout_secs: 20,
+    };
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        fail: true,
+        fail_source: Some(fail_source),
+        ..FakeExecutionRunner::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+            .with_dispatch_events(recording.clone()),
+    );
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+
+    let attention_items = db.list_attention_items(&execution_id).unwrap();
+    let first = attention_items
+        .first()
+        .expect("composer-not-ready must raise pane_spawn_failed");
+    assert_eq!(first.kind, "pane_spawn_failed");
+    assert!(
+        first.body_markdown.contains("composer never became ready"),
+        "attention body must carry the composer-not-ready reason; got {:?}",
+        first.body_markdown,
+    );
+    assert!(
+        first
+            .body_markdown
+            .contains("spawn confirmation failed and the pane was reaped"),
+        "composer timeout must use the neutral confirmation wording; got {:?}",
+        first.body_markdown,
+    );
+    assert!(
+        !first.body_markdown.contains("the driver started"),
+        "composer timeout must not claim the driver started; got {:?}",
+        first.body_markdown,
+    );
+    assert!(
+        !first.body_markdown.contains("never came up"),
+        "confirmation failure must not claim the pane never came up; got {:?}",
+        first.body_markdown,
     );
 }
 

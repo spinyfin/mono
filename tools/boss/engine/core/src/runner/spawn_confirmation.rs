@@ -27,8 +27,37 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use boss_protocol::PaneMonitorSpec;
+
+/// Typed spawn-confirmation failure so the coordinator can classify the
+/// attention body without matching error-message substrings.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SpawnConfirmationError {
+    #[error(
+        "refusing to complete {driver_name} spawn for {run_id}: driver composer never became ready within {timeout_secs}s \
+         (no pane marker from the driver's monitor spec after prompt delivery); recording a failed spawn"
+    )]
+    ComposerNotReady {
+        driver_name: String,
+        run_id: String,
+        timeout_secs: u64,
+    },
+    #[error(
+        "refusing to complete {driver_name} spawn for {run_id}: no driver hook or session event arrived within \
+         {timeout_secs}s after prompt delivery; recording a failed spawn"
+    )]
+    TurnDidNotStart {
+        driver_name: String,
+        run_id: String,
+        timeout_secs: u64,
+    },
+}
+
+/// Walk an anyhow chain for a [`SpawnConfirmationError`].
+pub(crate) fn spawn_confirmation_error(err: &anyhow::Error) -> Option<&SpawnConfirmationError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SpawnConfirmationError>())
+}
 
 use crate::driver::{AgentDriver, ProgressIngress, ProgressObservationConfig};
 use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -122,19 +151,19 @@ where
 }
 
 pub(crate) fn composer_not_ready_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
-    anyhow!(
-        "refusing to complete {driver_name} spawn for {run_id}: driver composer never became ready within {}s \
-         (no pane marker from the driver's monitor spec after prompt delivery); recording a failed spawn",
-        timeout.as_secs()
-    )
+    anyhow::Error::from(SpawnConfirmationError::ComposerNotReady {
+        driver_name: driver_name.to_owned(),
+        run_id: run_id.to_owned(),
+        timeout_secs: timeout.as_secs(),
+    })
 }
 
 pub(crate) fn turn_did_not_start_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
-    anyhow!(
-        "refusing to complete {driver_name} spawn for {run_id}: no driver hook or session event arrived within \
-         {}s after prompt delivery; recording a failed spawn",
-        timeout.as_secs()
-    )
+    anyhow::Error::from(SpawnConfirmationError::TurnDidNotStart {
+        driver_name: driver_name.to_owned(),
+        run_id: run_id.to_owned(),
+        timeout_secs: timeout.as_secs(),
+    })
 }
 
 /// Run the two spawn-time waits against injected predicates so production
@@ -321,6 +350,10 @@ mod tests {
         assert!(msg.contains("exec-missing-composer"), "{msg}");
         assert!(msg.contains("composer never became ready"), "{msg}");
         assert!(msg.contains("failed spawn"), "{msg}");
+        assert!(matches!(
+            spawn_confirmation_error(&err),
+            Some(SpawnConfirmationError::ComposerNotReady { .. })
+        ));
     }
 
     #[tokio::test]
@@ -356,6 +389,10 @@ mod tests {
         assert!(msg.contains("exec-silent-turn"), "{msg}");
         assert!(msg.contains("no driver hook or session event"), "{msg}");
         assert!(msg.contains("failed spawn"), "{msg}");
+        assert!(matches!(
+            spawn_confirmation_error(&err),
+            Some(SpawnConfirmationError::TurnDidNotStart { .. })
+        ));
     }
 
     #[tokio::test]

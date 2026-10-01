@@ -336,6 +336,12 @@ pub fn remote_worker_log_path(workspace_path: &str) -> String {
     format!("{}/.boss/worker.log", workspace_path.trim_end_matches('/'))
 }
 
+/// Absolute path of the remote worker PID file the wrapper publishes before
+/// the stderr handshake (`<workspace>/.boss/worker.pid`).
+pub fn remote_worker_pid_path(workspace_path: &str) -> String {
+    format!("{}/.boss/worker.pid", workspace_path.trim_end_matches('/'))
+}
+
 // ── LocalHostAdapter ──────────────────────────────────────────────────────────
 
 /// Local-host adapter: delegates workspace lifecycle to `CubeClient`
@@ -1177,7 +1183,7 @@ impl HostAdapter for SshHostAdapter {
         let plan = RemoteSpawnPlan::builder()
             .run_id(run_id.clone())
             .lease_id(lease_id)
-            .workspace_path(workspace)
+            .workspace_path(workspace.clone())
             .maybe_repo_remote_url((!execution.repo_remote_url.is_empty()).then(|| execution.repo_remote_url.clone()))
             .events_socket_path(remote_socket)
             .wrapper_path(remote_wrapper_path())
@@ -1258,6 +1264,7 @@ impl HostAdapter for SshHostAdapter {
         let transport = self.transport.clone();
         let wait_run_id = run_id.clone();
         let reap_run_id = run_id.clone();
+        let reap_workspace = workspace.clone();
         let reap_remote_socket = plan.events_socket_path.clone();
         let reap_engine_socket = engine_socket.clone();
         crate::runner::spawn_confirmation::confirm_turn_start_or_reap(
@@ -1282,6 +1289,7 @@ impl HostAdapter for SshHostAdapter {
                     &transport,
                     &reap_run_id,
                     remote_pid,
+                    &reap_workspace,
                     &reap_remote_socket,
                     &reap_engine_socket,
                 )

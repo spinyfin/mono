@@ -36,7 +36,7 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
-use crate::host_adapter::{WORKER_LOG_TAIL_BYTES, remote_worker_log_path};
+use crate::host_adapter::{WORKER_LOG_TAIL_BYTES, remote_worker_log_path, remote_worker_pid_path};
 use crate::ssh_transport::{SshOutput, SshTransport};
 
 // ── Failure-reason taxonomy (matches the wrapper sentinels) ───────────────────
@@ -422,29 +422,101 @@ pub async fn perform_remote_launch(
 ///
 /// Always cancels the reverse events forward so it does not leak on the
 /// ControlMaster. When the wrapper handshake pid is known, kill that pid;
-/// when it is missing, locate the still-running driver by the `BOSS_RUN_ID`
-/// the wrapper exported so a slow-but-alive worker is not left in a
-/// workspace the coordinator is about to re-lease.
+/// when it is missing, kill the pid the wrapper published at
+/// `<workspace>/.boss/worker.pid` (written before the stderr handshake).
+/// If that file is absent, scan `/proc/*/environ` for `BOSS_RUN_ID` on
+/// Linux remotes. `pkill -f` is not used: the driver argv does not carry
+/// that token.
 pub async fn reap_failed_remote_turn(
     exec: &dyn SshExec,
     run_id: &str,
     remote_pid: Option<i64>,
+    workspace_path: &str,
     events_socket_path: &str,
     engine_events_socket: &str,
 ) {
-    if let Some(pid) = remote_pid {
-        let _ = exec.run(&["kill", &pid.to_string()]).await;
+    let pids = if let Some(pid) = remote_pid {
+        vec![pid]
     } else {
         tracing::warn!(
             run_id,
             host_id = exec.host_id(),
-            "remote turn-start timeout with no handshake pid; locating the driver by BOSS_RUN_ID"
+            workspace_path,
+            "remote turn-start timeout with no handshake pid; looking up the driver via worker.pid"
         );
-        let _ = exec.run(&["pkill", "-f", &format!("BOSS_RUN_ID={run_id}")]).await;
+        resolve_failed_remote_worker_pids(exec, run_id, workspace_path).await
+    };
+    for pid in pids {
+        let _ = exec.run(&["kill", &pid.to_string()]).await;
     }
     let _ = exec
         .cancel_reverse_unix_forward(events_socket_path, engine_events_socket)
         .await;
+}
+
+async fn resolve_failed_remote_worker_pids(exec: &dyn SshExec, run_id: &str, workspace_path: &str) -> Vec<i64> {
+    if let Some(pid) = read_published_worker_pid(exec, workspace_path).await {
+        return vec![pid];
+    }
+    let scanned = scan_remote_pids_by_run_id_environ(exec, run_id).await;
+    if scanned.is_empty() {
+        tracing::warn!(
+            run_id,
+            host_id = exec.host_id(),
+            workspace_path,
+            "remote turn-start timeout: no handshake pid, worker.pid, or BOSS_RUN_ID environ match; \
+             leaving the driver for the reconciler"
+        );
+    }
+    scanned
+}
+
+async fn read_published_worker_pid(exec: &dyn SshExec, workspace_path: &str) -> Option<i64> {
+    let path = remote_worker_pid_path(workspace_path);
+    let out = exec.run(&["cat", "--", &path]).await.ok()?;
+    if !out.success() {
+        return None;
+    }
+    parse_published_worker_pid(&out.stdout)
+}
+
+/// Parse a single pid from the wrapper's `worker.pid` file (or one line of
+/// an environ-scan listing). Rejects 0/1 and any non-integer payload.
+fn parse_published_worker_pid(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let pid: i64 = trimmed.parse().ok()?;
+    (pid > 1).then_some(pid)
+}
+
+/// Linux-only fallback: match processes whose environment contains this
+/// run's `BOSS_RUN_ID`. macOS remotes have no `/proc`, so this returns
+/// empty there and the reconciler owns leftover drivers.
+fn remote_run_id_environ_scan_script(run_id: &str) -> String {
+    let needle = crate::ssh_transport::shell_quote(&format!("BOSS_RUN_ID={run_id}"));
+    format!(
+        r#"if [ -d /proc ]; then
+  for d in /proc/[0-9]*; do
+    [ -r "$d/environ" ] || continue
+    if grep -F -x -z -q -- {needle} "$d/environ" 2>/dev/null; then
+      printf '%s\n' "${{d#/proc/}}"
+    fi
+  done
+fi"#
+    )
+}
+
+async fn scan_remote_pids_by_run_id_environ(exec: &dyn SshExec, run_id: &str) -> Vec<i64> {
+    let script = remote_run_id_environ_scan_script(run_id);
+    let Ok(out) = exec.run_shell(&script).await else {
+        return Vec::new();
+    };
+    if !out.success() {
+        return Vec::new();
+    }
+    out.stdout.lines().filter_map(parse_published_worker_pid).collect()
 }
 
 /// Read a bounded tail of the remote worker log after a liveness probe proves
@@ -763,6 +835,11 @@ mod tests {
         fail_forward: bool,
         liveness: LivenessStub,
         worker_log: WorkerLogStub,
+        /// Contents of `<workspace>/.boss/worker.pid` for pid-less reap.
+        published_worker_pid: Option<i64>,
+        /// Pids a `/proc/*/environ` scan would return when the pid file is
+        /// missing.
+        environ_scan_pids: Vec<i64>,
     }
 
     impl FakeExec {
@@ -776,7 +853,17 @@ mod tests {
                 // exercises the real "alive" branch of the liveness ack.
                 liveness: LivenessStub::Alive,
                 worker_log: WorkerLogStub::Empty,
+                published_worker_pid: None,
+                environ_scan_pids: Vec::new(),
             }
+        }
+        fn with_published_worker_pid(mut self, pid: i64) -> Self {
+            self.published_worker_pid = Some(pid);
+            self
+        }
+        fn with_environ_scan_pids(mut self, pids: Vec<i64>) -> Self {
+            self.environ_scan_pids = pids;
+            self
         }
         fn with_liveness(mut self, liveness: LivenessStub) -> Self {
             self.liveness = liveness;
@@ -807,6 +894,20 @@ mod tests {
                     stdout: String::new(),
                     stderr: self.wrapper_stderr.clone(),
                 })
+            } else if owned.first().map(String::as_str) == Some("cat") {
+                if let Some(pid) = self.published_worker_pid {
+                    Ok(SshOutput {
+                        status: 0,
+                        stdout: format!("{pid}\n"),
+                        stderr: String::new(),
+                    })
+                } else {
+                    Ok(SshOutput {
+                        status: 1,
+                        stdout: String::new(),
+                        stderr: "No such file or directory".to_owned(),
+                    })
+                }
             } else {
                 Ok(SshOutput {
                     status: 0,
@@ -859,6 +960,18 @@ mod tests {
                     }),
                     WorkerLogStub::TransportError => Err(anyhow!("ssh log capture transport failure")),
                 };
+            }
+            if script.contains("/proc/") && script.contains("environ") {
+                let stdout = self
+                    .environ_scan_pids
+                    .iter()
+                    .map(|pid| format!("{pid}\n"))
+                    .collect::<String>();
+                return Ok(SshOutput {
+                    status: 0,
+                    stdout,
+                    stderr: String::new(),
+                });
             }
             Ok(SshOutput {
                 status: 0,
@@ -1191,6 +1304,7 @@ mod tests {
             &exec,
             "run-1",
             Some(4242),
+            "/remote/ws",
             "/tmp/boss-events-run-1.sock",
             "/engine.sock",
         )
@@ -1206,7 +1320,13 @@ mod tests {
             !calls
                 .iter()
                 .any(|call| matches!(call, Call::Run(argv) if argv.first().map(String::as_str) == Some("pkill"))),
-            "pkill is only for a missing handshake pid, got {calls:?}"
+            "pkill must not be used to reap a remote driver, got {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| matches!(call, Call::Run(argv) if argv.first().map(String::as_str) == Some("cat"))),
+            "handshake pid skips the worker.pid lookup, got {calls:?}"
         );
         assert_eq!(
             calls
@@ -1226,23 +1346,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reap_failed_remote_turn_without_pid_locates_the_driver_by_run_id() {
-        let exec = FakeExec::new(0, "");
-        reap_failed_remote_turn(&exec, "run-1", None, "/tmp/boss-events-run-1.sock", "/engine.sock").await;
+    async fn reap_failed_remote_turn_without_pid_kills_the_published_worker_pid() {
+        let exec = FakeExec::new(0, "").with_published_worker_pid(7777);
+        reap_failed_remote_turn(
+            &exec,
+            "run-1",
+            None,
+            "/remote/ws",
+            "/tmp/boss-events-run-1.sock",
+            "/engine.sock",
+        )
+        .await;
         let calls = exec.calls();
         assert!(
             calls.iter().any(|call| matches!(
                 call,
-                Call::Run(argv) if argv == &["pkill".to_owned(), "-f".to_owned(), "BOSS_RUN_ID=run-1".to_owned()]
+                Call::Run(argv) if argv == &["cat".to_owned(), "--".to_owned(), "/remote/ws/.boss/worker.pid".to_owned()]
             )),
-            "missing handshake pid must locate the driver by BOSS_RUN_ID, got {calls:?}"
+            "missing handshake pid must read the wrapper's worker.pid, got {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, Call::Run(argv) if argv == &["kill".to_owned(), "7777".to_owned()])),
+            "published worker.pid must be killed, got {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| matches!(
+                call,
+                Call::Run(argv) if argv.first().map(String::as_str) == Some("pkill")
+                    || argv.iter().any(|arg| arg.contains("/proc/"))
+            )),
+            "worker.pid lookup must not fall through to pkill or /proc, got {calls:?}"
+        );
+        assert!(calls.iter().any(|call| matches!(call, Call::CancelForward { .. })));
+    }
+
+    #[tokio::test]
+    async fn reap_failed_remote_turn_without_pid_falls_back_to_environ_scan() {
+        let exec = FakeExec::new(0, "").with_environ_scan_pids(vec![4242, 4243]);
+        reap_failed_remote_turn(
+            &exec,
+            "run-1",
+            None,
+            "/remote/ws",
+            "/tmp/boss-events-run-1.sock",
+            "/engine.sock",
+        )
+        .await;
+        let calls = exec.calls();
+        assert!(
+            calls.iter().any(|call| matches!(
+                call,
+                Call::Run(argv)
+                    if argv.len() == 1
+                        && argv[0].contains("/proc/")
+                        && argv[0].contains("environ")
+                        && argv[0].contains("BOSS_RUN_ID=run-1")
+            )),
+            "missing worker.pid must scan /proc/*/environ for BOSS_RUN_ID, got {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, Call::Run(argv) if argv == &["kill".to_owned(), "4242".to_owned()])),
+            "environ-scan pid 4242 must be killed, got {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, Call::Run(argv) if argv == &["kill".to_owned(), "4243".to_owned()])),
+            "environ-scan pid 4243 must be killed, got {calls:?}"
         );
         assert!(
             !calls
                 .iter()
-                .any(|call| matches!(call, Call::Run(argv) if argv.first().map(String::as_str) == Some("kill"))),
-            "bare kill is only for a known handshake pid, got {calls:?}"
+                .any(|call| matches!(call, Call::Run(argv) if argv.first().map(String::as_str) == Some("pkill"))),
+            "pkill -f cannot see BOSS_RUN_ID in the driver argv, got {calls:?}"
         );
         assert!(calls.iter().any(|call| matches!(call, Call::CancelForward { .. })));
+    }
+
+    #[tokio::test]
+    async fn reap_failed_remote_turn_without_identity_still_cancels_the_forward() {
+        let exec = FakeExec::new(0, "");
+        reap_failed_remote_turn(
+            &exec,
+            "run-1",
+            None,
+            "/remote/ws",
+            "/tmp/boss-events-run-1.sock",
+            "/engine.sock",
+        )
+        .await;
+        let calls = exec.calls();
+        assert!(
+            !calls.iter().any(|call| matches!(
+                call,
+                Call::Run(argv) if argv.first().map(String::as_str) == Some("kill")
+                    || argv.first().map(String::as_str) == Some("pkill")
+            )),
+            "without a published pid or environ match, do not guess at a process, got {calls:?}"
+        );
+        assert!(calls.iter().any(|call| matches!(call, Call::CancelForward { .. })));
+    }
+
+    #[test]
+    fn parse_published_worker_pid_accepts_a_single_positive_pid() {
+        assert_eq!(parse_published_worker_pid("7777\n"), Some(7777));
+        assert_eq!(parse_published_worker_pid("  12 "), Some(12));
+        assert_eq!(parse_published_worker_pid(""), None);
+        assert_eq!(parse_published_worker_pid("1"), None);
+        assert_eq!(parse_published_worker_pid("not-a-pid"), None);
     }
 }
