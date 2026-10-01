@@ -111,7 +111,9 @@ public struct PaneLayoutModel: Equatable, Sendable {
         } else {
             syncShapes()
             anchorRunId = anchor
-            selectAnchorPage(anchor)
+            // Only growth may follow an off-page anchor; routine snapshots
+            // must preserve the reader's explicit page selection.
+            if !arrivals.isEmpty { selectAnchorPage(anchor) }
             clampSelectedPage()
         }
     }
