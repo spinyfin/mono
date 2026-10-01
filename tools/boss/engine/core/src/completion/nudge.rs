@@ -580,7 +580,12 @@ impl WorkerCompletionHandler {
         // clobber that tag. `NudgeDebounced` is already re-recorded by
         // `nudge_or_park` itself. Only a probe that actually advanced the
         // ladder needs the retention re-record.
-        if hold == NudgeHold::Debounced && Self::nudge_queued_a_probe(&outcome) {
+        // An expired `WorkerWait` hold reaches here by the same route (the
+        // wait lapsed while the worker sat idle, so no further Stop is
+        // coming) and needs the same retention; the retained intent keeps its
+        // `WorkerWait` tag, so a fresh declaration still suppresses it.
+        let retained_hold = matches!(hold, NudgeHold::Debounced | NudgeHold::WorkerWait);
+        if retained_hold && Self::nudge_queued_a_probe(&outcome) {
             self.background_children_tracker.record_intent(
                 execution_id,
                 BackgroundNudgeIntent {
@@ -598,7 +603,7 @@ impl WorkerCompletionHandler {
             // breaker counts it as an unproductive nudge the worker was
             // never actually shown.
             self.probe_queuer.deliver_queued_probes_now(execution_id);
-            if hold == NudgeHold::Debounced {
+            if retained_hold {
                 NUDGE_LADDER_SWEEP_ADVANCED.inc(&self.metrics);
                 tracing::warn!(
                     execution_id,

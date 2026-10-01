@@ -214,6 +214,12 @@ impl WorkerCompletionHandler {
         self
     }
 
+    /// The registry this handler consults at Stop time.
+    #[cfg(test)]
+    pub(crate) fn wait_registry(&self) -> &Arc<crate::wait_registry::WaitRegistry> {
+        &self.wait_registry
+    }
+
     /// Wire an externally-owned [`crate::wait_registry::WaitRegistry`] into
     /// this handler. `app.rs` shares one instance with the SubmitProposal
     /// RPC so a wait granted on the verb is visible at the next Stop.

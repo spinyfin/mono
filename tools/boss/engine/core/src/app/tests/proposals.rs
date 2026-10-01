@@ -1588,6 +1588,74 @@ async fn a_replay_at_the_cap_still_succeeds() {
     assert_eq!(Some(replay.id), first_id);
 }
 
+// ── Worker wait ──────────────────────────────────────────────────────────────
+
+fn wait_payload(reason: &str) -> Value {
+    json!({"duration_secs": 60, "reason": reason})
+}
+
+/// The proposal handler and the completion handler must consult the same
+/// registry: a wait declared over the proposal channel has to be visible to
+/// the Stop-time nudge (which holds on `active`).
+#[tokio::test]
+async fn a_submitted_wait_is_visible_to_the_completion_handlers_registry() {
+    let fx = WorkerFixture::new();
+    submitted(submit(&fx, ProposalKind::Wait, wait_payload("bazel test")).await);
+
+    let handler_registry = fx.server_state.completion_handler.wait_registry();
+    assert!(Arc::ptr_eq(handler_registry, &fx.server_state.wait_registry));
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let active = handler_registry
+        .active(&fx.execution_id, now)
+        .expect("the completion handler must see the declared wait");
+    assert_eq!(active.reason, "bazel test");
+}
+
+/// Replaying an explicit idempotency key returns the recorded row; it must not
+/// renew the wait or charge the per-execution budget again.
+#[tokio::test]
+async fn replaying_a_keyed_wait_neither_renews_nor_recharges() {
+    let fx = WorkerFixture::new();
+    let request =
+        |reason: &str| submit_request_keyed(&fx.execution_id, ProposalKind::Wait, wait_payload(reason), "wait-key");
+    let (_, first_replay) = submitted(call_with_peer(&fx.server_state, Some(fx.peer_pid), request("bazel test")).await);
+    assert!(!first_replay);
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let before = fx.server_state.wait_registry.active(&fx.execution_id, now).unwrap();
+
+    let (_, replayed) = submitted(call_with_peer(&fx.server_state, Some(fx.peer_pid), request("bazel test")).await);
+    assert!(replayed);
+
+    let after = fx.server_state.wait_registry.active(&fx.execution_id, now).unwrap();
+    assert_eq!(after.expires_at_epoch, before.expires_at_epoch);
+    assert_eq!(fx.server_state.wait_registry.total_granted_secs(&fx.execution_id), 60);
+}
+
+/// A refused submit (rate cap) must leave no grant behind.
+#[tokio::test]
+async fn a_rate_limited_wait_is_not_granted() {
+    let fx = WorkerFixture::new();
+    for i in 0..PROPOSAL_CAP_PER_KIND_PER_EXECUTION {
+        submitted(submit(&fx, ProposalKind::Wait, wait_payload(&format!("w{i}"))).await);
+    }
+    let granted = fx.server_state.wait_registry.total_granted_secs(&fx.execution_id);
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let active_before = fx.server_state.wait_registry.active(&fx.execution_id, now).unwrap();
+
+    let error = rejected(submit(&fx, ProposalKind::Wait, wait_payload("one too many")).await);
+    assert_eq!(error.code, ProposalErrorCode::RateLimited);
+
+    assert_eq!(
+        fx.server_state.wait_registry.total_granted_secs(&fx.execution_id),
+        granted
+    );
+    let active_after = fx.server_state.wait_registry.active(&fx.execution_id, now).unwrap();
+    assert_eq!(
+        active_after.reason, active_before.reason,
+        "a refused wait must not replace the active one"
+    );
+}
+
 // ── Listing ──────────────────────────────────────────────────────────────────
 
 /// The read a successor run depends on: proposals from *every* execution of

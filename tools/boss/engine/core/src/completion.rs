@@ -1923,6 +1923,25 @@ pub const MID_TURN_REAP_ATTENTION_KIND: &str = "mid_turn_reap";
 /// implying a provider-side failure that never happened.
 pub const REMOTE_COLLECTION_FAILED_ATTENTION_KIND: &str = "remote_collection_failed";
 
+/// Wait-declaration sentence shared verbatim by the produce-a-PR and
+/// push-to-existing-PR probes. A macro so [`PROBE_NO_PR`] can `concat!` the
+/// same literal instead of repeating it.
+macro_rules! worker_wait_nudge_directive {
+    () => {
+        " If you are legitimately waiting on a \
+long-running job (a background build, test gate, or similar), do not reply in prose — run \
+`$BOSS_BIN propose wait --reason \"<what you are waiting on>\" --duration <bound>` \
+(for example `--duration 30m`; the engine caps a single wait at 2h). Re-running renews \
+the wait. An unexpired wait holds the produce-a-PR nudge ladder; it does not stop other \
+safety checks."
+    };
+}
+
+/// Shared by the produce-a-PR and push-to-existing-PR probes: if the worker
+/// is legitimately waiting on a long-running job it must declare that with
+/// `boss propose wait` rather than answering in prose.
+pub const WORKER_WAIT_NUDGE_DIRECTIVE: &str = worker_wait_nudge_directive!();
+
 /// Probe text dispatched when a worker stops without producing any PR
 /// for its branch. Phrased so a worker that already finished the work
 /// will simply push and open one, but a worker that's blocked has an
@@ -1938,17 +1957,8 @@ pub const REMOTE_COLLECTION_FAILED_ATTENTION_KIND: &str = "remote_collection_fai
 /// the marker const by `probe_texts_name_the_no_op_marker`; the mention here
 /// is inline and backticked, so it can never itself satisfy the own-line
 /// match.
-/// Shared by the produce-a-PR and push-to-existing-PR probes: if the worker
-/// is legitimately waiting on a long-running job it must declare that with
-/// `boss propose wait` rather than answering in prose.
-pub const WORKER_WAIT_NUDGE_DIRECTIVE: &str = " If you are legitimately waiting on a \
-long-running job (a background build, test gate, or similar), do not reply in prose — run \
-`$BOSS_BIN propose wait --reason \"<what you are waiting on>\" --duration <bound>` \
-(for example `--duration 30m`; the engine caps a single wait at 2h). Re-running renews \
-the wait. An unexpired wait holds the produce-a-PR nudge ladder; it does not stop other \
-safety checks.";
-
-pub const PROBE_NO_PR: &str = "You stopped without producing a PR for this work. \
+pub const PROBE_NO_PR: &str = concat!(
+    "You stopped without producing a PR for this work. \
 If the work is complete, open the PR with `cube pr create --branch <bookmark>` (pushes the \
 branch and opens the PR in one step, jj-aware, no GIT_DIR needed). If a PR already exists \
 for this branch, push any new commits with `cube pr update --branch <bookmark>` instead — \
@@ -1956,12 +1966,9 @@ do not open a duplicate. If you're blocked, explain what you need. If instead yo
 verified there is genuinely nothing left to change (`jj diff -r @` is empty because the work \
 is already done), do NOT answer in prose alone — prose is not a signal the engine can act on. \
 End your response with a line containing exactly `NO_CHANGES_NEEDED` and stop; that is the \
-sanctioned way to close this run with no PR. If you are legitimately waiting on a \
-long-running job (a background build, test gate, or similar), do not reply in prose — run \
-`$BOSS_BIN propose wait --reason \"<what you are waiting on>\" --duration <bound>` \
-(for example `--duration 30m`; the engine caps a single wait at 2h). Re-running renews \
-the wait. An unexpired wait holds the produce-a-PR nudge ladder; it does not stop other \
-safety checks.";
+sanctioned way to close this run with no PR.",
+    worker_wait_nudge_directive!()
+);
 
 /// Extract the set of required-check names a `ci_remediations` attempt
 /// was opened to fix, parsed from its `failed_checks` JSON snapshot

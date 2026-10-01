@@ -95,6 +95,38 @@ impl WaitRegistry {
         Self::default()
     }
 
+    /// Read-only pre-check: would [`declare`](Self::declare) accept
+    /// `duration_secs` right now? Charges nothing and changes no state, so a
+    /// caller can validate before persisting its audit row and only commit
+    /// the grant once the row is freshly accepted.
+    pub fn check(&self, execution_id: &str, duration_secs: u64) -> Result<(), WaitDeclareError> {
+        let guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
+        let used = guard.get(execution_id).map(|s| s.total_granted_secs).unwrap_or(0);
+        Self::validate(duration_secs, used)
+    }
+
+    fn validate(duration_secs: u64, used: u64) -> Result<(), WaitDeclareError> {
+        if duration_secs == 0 {
+            return Err(WaitDeclareError::DurationZero);
+        }
+        if duration_secs > WAIT_MAX_DURATION_SECS {
+            return Err(WaitDeclareError::DurationTooLong {
+                requested: duration_secs,
+                max: WAIT_MAX_DURATION_SECS,
+            });
+        }
+        let remaining = WAIT_MAX_TOTAL_SECS_PER_EXECUTION.saturating_sub(used);
+        if duration_secs > remaining {
+            return Err(WaitDeclareError::CapExhausted {
+                requested: duration_secs,
+                remaining,
+                used,
+                cap: WAIT_MAX_TOTAL_SECS_PER_EXECUTION,
+            });
+        }
+        Ok(())
+    }
+
     /// Grant (or renew) a wait on `execution_id`. Charges `duration_secs`
     /// against the per-execution total even when a previous wait has not
     /// yet expired, so renewals cannot stack unbounded time.
@@ -106,27 +138,9 @@ impl WaitRegistry {
         duration_secs: u64,
         now_epoch_secs: i64,
     ) -> Result<WaitRecord, WaitDeclareError> {
-        if duration_secs == 0 {
-            return Err(WaitDeclareError::DurationZero);
-        }
-        if duration_secs > WAIT_MAX_DURATION_SECS {
-            return Err(WaitDeclareError::DurationTooLong {
-                requested: duration_secs,
-                max: WAIT_MAX_DURATION_SECS,
-            });
-        }
-
         let mut guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
         let state = guard.entry(execution_id.to_owned()).or_default();
-        let remaining = WAIT_MAX_TOTAL_SECS_PER_EXECUTION.saturating_sub(state.total_granted_secs);
-        if duration_secs > remaining {
-            return Err(WaitDeclareError::CapExhausted {
-                requested: duration_secs,
-                remaining,
-                used: state.total_granted_secs,
-                cap: WAIT_MAX_TOTAL_SECS_PER_EXECUTION,
-            });
-        }
+        Self::validate(duration_secs, state.total_granted_secs)?;
 
         let expires_at_epoch = now_epoch_secs.saturating_add(duration_secs as i64);
         let record = WaitRecord {
