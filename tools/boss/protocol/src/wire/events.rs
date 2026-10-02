@@ -1120,10 +1120,13 @@ pub enum FrontendEvent {
     /// `boss_engine::build_info::binary_fingerprint`). The macOS app
     /// computes the same hash for its bundled engine file and compares;
     /// a mismatch means the running engine pre-dates the current app
-    /// bundle and should be replaced. `git_sha` and `build_time` are
-    /// included for human-readable logging only; they may be "unknown"
-    /// in dev builds.
+    /// bundle and should be replaced. `version` is the stamped Boss
+    /// version (`1.0.N` on a release tag, `1.0.N-dev-<sha>` otherwise,
+    /// or `"unknown"` if unstamped). `git_sha` and `build_time` are
+    /// included for human-readable logging; they may be "unknown"
+    /// in Cargo (non-Bazel) builds.
     EngineVersionResult {
+        version: String,
         git_sha: String,
         build_time: String,
         binary_fingerprint: String,

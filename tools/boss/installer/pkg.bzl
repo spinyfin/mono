@@ -245,7 +245,7 @@ because of it; see `build_provenance_rs`'s own doc comment below.
 # ── build_provenance_rs ───────────────────────────────────────────────────────
 
 def _build_provenance_rs_impl(ctx):
-    """Emits a Rust source file with the real build sha/dirty/build-time."""
+    """Emits a Rust source file with the real version/sha/dirty/build-time."""
     output = ctx.actions.declare_file(ctx.attr.out)
 
     # ctx.info_file (stable-status.txt) carries the commit-derived facts;
@@ -260,8 +260,16 @@ def _build_provenance_rs_impl(ctx):
     # changes. See that crate's own doc comment for the verified detail,
     # and the `LiveStatusDebugReport.engine_build_sha` doc comment for how
     # this is surfaced to an operator.
+    #
+    # VERSION is STABLE_BOSS_VERSION (`1.0.N` on a release tag, `1.0.N-dev-<sha>`
+    # otherwise). It already changes every commit on a dev build, so stamping
+    # it here does not add cache churn beyond GIT_SHA. Empty / `0.0.0` fall
+    # back to `unknown` — never the Cargo-crate placeholder.
     command = (
         "set -euo pipefail\n" +
+        "VERSION=$(grep '^STABLE_BOSS_VERSION ' " + ctx.info_file.path +
+        " | cut -d' ' -f2 2>/dev/null || true)\n" +
+        "if [ -z \"$VERSION\" ] || [ \"$VERSION\" = \"0.0.0\" ]; then VERSION=unknown; fi\n" +
         "SHA=$(grep '^STABLE_BOSS_GIT_SHA_FULL ' " + ctx.info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$SHA\" ] && SHA=unknown\n" +
@@ -271,10 +279,11 @@ def _build_provenance_rs_impl(ctx):
         "BUILD_TIME=$(grep '^BOSS_BUILD_TIME ' " + ctx.version_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$BUILD_TIME\" ] && BUILD_TIME=unknown\n" +
-        "printf 'pub const GIT_SHA: &str = \"%s\";\\n" +
+        "printf 'pub const VERSION: &str = \"%s\";\\n" +
+        "pub const GIT_SHA: &str = \"%s\";\\n" +
         "pub const GIT_DIRTY: bool = %s;\\n" +
         "pub const BUILD_TIME: &str = \"%s\";\\n' " +
-        "\"$SHA\" \"$DIRTY\" \"$BUILD_TIME\" > " + output.path + "\n"
+        "\"$VERSION\" \"$SHA\" \"$DIRTY\" \"$BUILD_TIME\" > " + output.path + "\n"
     )
 
     ctx.actions.run_shell(
@@ -299,6 +308,7 @@ build_provenance_rs = rule(
 Generates a Rust source file containing the engine's real build provenance.
 
 Emits:
+  pub const VERSION: &str = "<1.0.N or 1.0.N-dev-<sha>, else unknown>";
   pub const GIT_SHA: &str = "<full commit sha>";
   pub const GIT_DIRTY: bool = <true|false>;
   pub const BUILD_TIME: &str = "<ISO-8601 UTC>";

@@ -12,7 +12,7 @@ rust_library(
         exclude = ["src/provenance_default.rs"],
     ),
     compile_data = [
-        # Stamped provenance constants (GIT_SHA, GIT_DIRTY, BUILD_TIME).
+        # Stamped provenance constants (VERSION, GIT_SHA, GIT_DIRTY, BUILD_TIME).
         # Referenced via include!(env!("BOSS_BUILD_PROVENANCE_RS")) in lib.rs.
         "//tools/boss/installer:build_provenance_rs",
     ],

@@ -2788,6 +2788,7 @@ async fn live_status_debug(socket_path: &Option<String>, json: bool) -> Result<(
 
 fn print_live_status_debug_human(report: &LiveStatusDebugReport) {
     println!("live-status pipeline debug");
+    println!("  engine_version:             {}", report.engine_version);
     println!(
         "  engine_build_sha:           {}{}",
         report.engine_build_sha,

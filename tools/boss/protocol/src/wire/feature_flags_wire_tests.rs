@@ -277,6 +277,8 @@ fn get_engine_health_request_round_trips() {
 fn engine_health_result_event_round_trips_healthy() {
     let original = FrontendEvent::EngineHealthResult {
         report: EngineHealthReport {
+            engine_version: "1.0.4-dev-abc123".into(),
+            engine_git_sha: "abc123".into(),
             anthropic_api_key_present: true,
             dispatch_paused: false,
             automation_paused: false,
@@ -313,6 +315,8 @@ fn engine_health_result_event_round_trips_with_issue() {
     };
     let original = FrontendEvent::EngineHealthResult {
         report: EngineHealthReport {
+            engine_version: "1.0.4-dev-abc123".into(),
+            engine_git_sha: "abc123".into(),
             anthropic_api_key_present: false,
             dispatch_paused: false,
             automation_paused: false,

@@ -91,7 +91,7 @@ fi
 #   - boss_short_version_plist: STABLE_BOSS_VERSION / STABLE_BOSS_BASE_VERSION
 #   - boss_pkg_unsigned:        STABLE_BOSS_GIT_SHA (embedded in the .pkg filename)
 #   - build_info_rs:            STABLE_BOSS_BASE_VERSION only
-#   - build_provenance_rs:      STABLE_BOSS_GIT_SHA_FULL / STABLE_BOSS_GIT_DIRTY
+#   - build_provenance_rs:      STABLE_BOSS_VERSION / STABLE_BOSS_GIT_SHA_FULL / STABLE_BOSS_GIT_DIRTY
 #
 # IMPORTANT: do not add a per-build or per-commit value (wall-clock time, full
 # git SHA, dev-suffixed version) to anything build_info_rs reads. That file is
