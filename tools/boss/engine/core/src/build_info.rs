@@ -164,7 +164,7 @@ fn binary_mtime_iso8601() -> Option<String> {
 /// IMPORTANT: callers must ensure this function is invoked at engine
 /// startup (via [`init`]) *before* any chance of the on-disk binary
 /// being replaced by an installer. The macOS app's version-mismatch
-/// restart path (T460) depends on the running engine reporting the
+/// restart path depends on the running engine reporting the
 /// fingerprint of the bytes it was *launched from*, not the bytes
 /// that happen to be on disk at the moment of the first query —
 /// otherwise an in-place app update silently rewrites the very file
