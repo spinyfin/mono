@@ -9,7 +9,9 @@
 //!    is actually up (`PaneMonitorSpec` agent markers).
 //!    For argv delivery this is the analog of "the composer can accept
 //!    input": the CLI has exec'd and rendered its surface, which is what
-//!    proves the sourced script did not die at `execve()`.
+//!    proves the sourced script did not die at `execve()`. A driver hook
+//!    or persisted `transcript_path` is strictly stronger than a scraped
+//!    pane marker, so turn-start evidence also satisfies this wait.
 //! 2. **Turn start** — fresh evidence for the **current** run: a driver
 //!    hook / session event (`LiveWorkerStateRegistry::has_driver_signal_for_run`)
 //!    or a `transcript_path` on the current `work_runs` row
@@ -19,12 +21,43 @@
 //! Either wait timing out fails the spawn immediately with a named error
 //! so the coordinator records `pane_spawn_failed` instead of leaving the
 //! execution `Spawning` for `spawn_ack_sweep`'s later generic reap.
+//! "Composer never became ready" is reported only when neither composer
+//! chrome nor turn-start evidence arrives.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use boss_protocol::PaneMonitorSpec;
+
+/// Typed spawn-confirmation failure so the coordinator can classify the
+/// attention body without matching error-message substrings.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SpawnConfirmationError {
+    #[error(
+        "refusing to complete {driver_name} spawn for {run_id}: driver composer never became ready within {timeout_secs}s \
+         (no pane marker from the driver's monitor spec after prompt delivery); recording a failed spawn"
+    )]
+    ComposerNotReady {
+        driver_name: String,
+        run_id: String,
+        timeout_secs: u64,
+    },
+    #[error(
+        "refusing to complete {driver_name} spawn for {run_id}: no driver hook or session event arrived within \
+         {timeout_secs}s after prompt delivery; recording a failed spawn"
+    )]
+    TurnDidNotStart {
+        driver_name: String,
+        run_id: String,
+        timeout_secs: u64,
+    },
+}
+
+/// Walk an anyhow chain for a [`SpawnConfirmationError`].
+pub(crate) fn spawn_confirmation_error(err: &anyhow::Error) -> Option<&SpawnConfirmationError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SpawnConfirmationError>())
+}
 
 use crate::driver::{AgentDriver, ProgressIngress, ProgressObservationConfig};
 use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -118,31 +151,35 @@ where
 }
 
 pub(crate) fn composer_not_ready_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
-    anyhow!(
-        "refusing to complete {driver_name} spawn for {run_id}: driver composer never became ready within {}s \
-         (no pane marker from the driver's monitor spec after prompt delivery); recording a failed spawn",
-        timeout.as_secs()
-    )
+    anyhow::Error::from(SpawnConfirmationError::ComposerNotReady {
+        driver_name: driver_name.to_owned(),
+        run_id: run_id.to_owned(),
+        timeout_secs: timeout.as_secs(),
+    })
 }
 
 pub(crate) fn turn_did_not_start_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
-    anyhow!(
-        "refusing to complete {driver_name} spawn for {run_id}: no driver hook or session event arrived within \
-         {}s after prompt delivery; recording a failed spawn",
-        timeout.as_secs()
-    )
+    anyhow::Error::from(SpawnConfirmationError::TurnDidNotStart {
+        driver_name: driver_name.to_owned(),
+        run_id: run_id.to_owned(),
+        timeout_secs: timeout.as_secs(),
+    })
 }
 
 /// Run the two spawn-time waits against injected predicates so production
 /// (local pane spawn) and tests share one loop.
+///
+/// Phase 1 treats turn-start evidence as readiness: a driver hook is
+/// stronger proof the CLI exec'd than a scraped pane marker, so a spawn
+/// whose turn has already started is not reaped for missing chrome.
 pub(crate) async fn confirm_spawn_started<Ready, ReadyFut, Started, StartedFut>(
     driver_name: &str,
     run_id: &str,
     composer_timeout: Duration,
     turn_timeout: Duration,
     poll: Duration,
-    composer_ready: Ready,
-    turn_started: Started,
+    mut composer_ready: Ready,
+    mut turn_started: Started,
 ) -> anyhow::Result<()>
 where
     Ready: FnMut() -> ReadyFut,
@@ -150,8 +187,20 @@ where
     Started: FnMut() -> StartedFut,
     StartedFut: std::future::Future<Output = bool>,
 {
-    if !wait_until(composer_timeout, poll, composer_ready).await {
-        return Err(composer_not_ready_error(driver_name, run_id, composer_timeout));
+    let composer_deadline = tokio::time::Instant::now() + composer_timeout;
+    loop {
+        if turn_started().await {
+            return Ok(());
+        }
+        if composer_ready().await {
+            break;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= composer_deadline {
+            return Err(composer_not_ready_error(driver_name, run_id, composer_timeout));
+        }
+        let remaining = composer_deadline.saturating_duration_since(now);
+        tokio::time::sleep(poll.min(remaining)).await;
     }
     if !wait_until(turn_timeout, poll, turn_started).await {
         return Err(turn_did_not_start_error(driver_name, run_id, turn_timeout));
@@ -292,7 +341,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(5),
             || async { false },
-            || async { true },
+            || async { false },
         )
         .await
         .expect_err("must fail the spawn");
@@ -301,6 +350,25 @@ mod tests {
         assert!(msg.contains("exec-missing-composer"), "{msg}");
         assert!(msg.contains("composer never became ready"), "{msg}");
         assert!(msg.contains("failed spawn"), "{msg}");
+        assert!(matches!(
+            spawn_confirmation_error(&err),
+            Some(SpawnConfirmationError::ComposerNotReady { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_spawn_started_succeeds_when_turn_starts_without_composer_chrome() {
+        confirm_spawn_started(
+            "claude",
+            "exec-hook-without-chrome",
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+            || async { false },
+            || async { true },
+        )
+        .await
+        .expect("turn-start evidence must satisfy composer readiness");
     }
 
     #[tokio::test]
@@ -321,6 +389,10 @@ mod tests {
         assert!(msg.contains("exec-silent-turn"), "{msg}");
         assert!(msg.contains("no driver hook or session event"), "{msg}");
         assert!(msg.contains("failed spawn"), "{msg}");
+        assert!(matches!(
+            spawn_confirmation_error(&err),
+            Some(SpawnConfirmationError::TurnDidNotStart { .. })
+        ));
     }
 
     #[tokio::test]

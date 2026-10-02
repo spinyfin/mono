@@ -341,6 +341,10 @@ pub(super) struct FakeExecutionRunner {
     /// Defaults to `"worker prompt failed"` so existing spawn-failure
     /// tests keep their original message.
     pub(super) fail_message: Option<String>,
+    /// Typed spawn-confirmation cause. When set, `run_execution` returns
+    /// this error (so the coordinator can downcast it) instead of a
+    /// string-only `fail_message`.
+    pub(super) fail_source: Option<crate::runner::spawn_confirmation::SpawnConfirmationError>,
     /// When `true`, `run_execution` fails with a `SlotBusy` app
     /// rejection (wrapped the same way `spawn_flow` wraps it) instead
     /// of the generic `fail` error, so tests can exercise the
@@ -386,6 +390,7 @@ impl Default for FakeExecutionRunner {
             calls: Mutex::new(Vec::new()),
             fail: false,
             fail_message: None,
+            fail_source: None,
             slot_busy: false,
             pending: false,
             slot_id: None,
@@ -422,6 +427,9 @@ impl ExecutionRunner for FakeExecutionRunner {
                 occupying_run_id: Some("exec_other_occupant".to_owned()),
             };
             return Err(anyhow::Error::new(root).context("failed to spawn worker pane"));
+        }
+        if let Some(source) = self.fail_source.clone() {
+            return Err(anyhow::Error::from(source));
         }
         if self.fail {
             return Err(anyhow!(

@@ -41,7 +41,8 @@ use crate::runner::{
     compose_worker_spawn, work_item_name, work_item_task_kind,
 };
 use crate::ssh_spawn::{
-    REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, remote_events_socket_path,
+    REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, reap_failed_remote_turn,
+    remote_events_socket_path,
 };
 use crate::ssh_transport::SshTransport;
 use crate::work::{WorkDb, WorkExecution, WorkItem};
@@ -333,6 +334,12 @@ pub const WORKER_LOG_TAIL_BYTES: u64 = 4096;
 /// cites that file so relocating it is a one-line change.
 pub fn remote_worker_log_path(workspace_path: &str) -> String {
     format!("{}/.boss/worker.log", workspace_path.trim_end_matches('/'))
+}
+
+/// Absolute path of the remote worker PID file the wrapper publishes before
+/// the stderr handshake (`<workspace>/.boss/worker.pid`).
+pub fn remote_worker_pid_path(workspace_path: &str) -> String {
+    format!("{}/.boss/worker.pid", workspace_path.trim_end_matches('/'))
 }
 
 // ── LocalHostAdapter ──────────────────────────────────────────────────────────
@@ -1176,7 +1183,7 @@ impl HostAdapter for SshHostAdapter {
         let plan = RemoteSpawnPlan::builder()
             .run_id(run_id.clone())
             .lease_id(lease_id)
-            .workspace_path(workspace)
+            .workspace_path(workspace.clone())
             .maybe_repo_remote_url((!execution.repo_remote_url.is_empty()).then(|| execution.repo_remote_url.clone()))
             .events_socket_path(remote_socket)
             .wrapper_path(remote_wrapper_path())
@@ -1256,6 +1263,10 @@ impl HostAdapter for SshHostAdapter {
         let live_worker_states = self.live_worker_states.clone();
         let transport = self.transport.clone();
         let wait_run_id = run_id.clone();
+        let reap_run_id = run_id.clone();
+        let reap_workspace = workspace.clone();
+        let reap_remote_socket = plan.events_socket_path.clone();
+        let reap_engine_socket = engine_socket.clone();
         crate::runner::spawn_confirmation::confirm_turn_start_or_reap(
             driver.descriptor().name,
             &run_id,
@@ -1274,9 +1285,15 @@ impl HostAdapter for SshHostAdapter {
                 }
             },
             || async {
-                if let Some(pid) = remote_pid {
-                    let _ = transport.run(&["kill", &pid.to_string()]).await;
-                }
+                reap_failed_remote_turn(
+                    &transport,
+                    &reap_run_id,
+                    remote_pid,
+                    &reap_workspace,
+                    &reap_remote_socket,
+                    &reap_engine_socket,
+                )
+                .await;
             },
         )
         .await?;

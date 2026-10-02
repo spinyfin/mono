@@ -3,12 +3,43 @@
 //! module split; see [`super`] for the struct and shared types.
 use super::*;
 
-/// Filed against a run when the worker pane never came up (libghostty IPC
-/// drop, slot busy, prompt composition error). See
-/// [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
+/// Filed against a run when spawn or spawn confirmation failed (libghostty
+/// IPC drop, slot busy, prompt composition error, composer never ready, or
+/// no turn-start evidence). The pane may have come up and then been reaped.
+/// See [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
 /// rule: `ClearedBy::WorkResumed`, since a later run starting for the item
 /// is direct evidence the pane-spawn problem is no longer blocking it.
 pub const PANE_SPAWN_FAILED_ATTENTION_KIND: &str = "pane_spawn_failed";
+
+fn pane_spawn_failed_attention_body(exec_id: &str, workspace_id: &str, err: &anyhow::Error, released: bool) -> String {
+    let release_state = if released {
+        "released back to cube"
+    } else {
+        "still held by the engine (release failed — see the engine log)"
+    };
+    let err_detail = format!("{err:#}");
+    let lead = match crate::runner::spawn_confirmation::spawn_confirmation_error(err) {
+        Some(crate::runner::spawn_confirmation::SpawnConfirmationError::TurnDidNotStart { .. }) => {
+            format!(
+                "Execution `{exec_id}` leased workspace `{workspace_id}` and the driver started, \
+                 but spawn confirmation failed and the pane was reaped."
+            )
+        }
+        Some(crate::runner::spawn_confirmation::SpawnConfirmationError::ComposerNotReady { .. }) => {
+            format!(
+                "Execution `{exec_id}` leased workspace `{workspace_id}`: spawn confirmation failed \
+                 and the pane was reaped."
+            )
+        }
+        None => {
+            format!("Execution `{exec_id}` leased workspace `{workspace_id}` but the worker pane never came up.")
+        }
+    };
+    format!(
+        "{lead}\n\n**Error:** {err_detail}\n\nThe lease was {release_state}. Inspect \
+         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline."
+    )
+}
 
 impl ExecutionCoordinator {
     // `change` is `None` for `pr_review` executions that checked out the PR
@@ -294,9 +325,8 @@ impl ExecutionCoordinator {
                 // Report it, but at WARN, and tag every abort with
                 // `slot_busy` so the two classes stay filterable either way.
                 let slot_busy = slot_busy_occupant(&err).is_some();
-                let abort_message = "spawn aborted: ExecutionRunner::run_execution returned an \
-                                     error before any pane existed; tearing down and releasing \
-                                     the workspace";
+                let abort_message = "spawn aborted: run_execution failed during spawn or spawn \
+                                     confirmation; tearing down and releasing the workspace";
                 if slot_busy {
                     tracing::warn!(
                         execution_id = %execution.id,
@@ -400,19 +430,7 @@ impl ExecutionCoordinator {
                     kind: PANE_SPAWN_FAILED_ATTENTION_KIND.to_owned(),
                     status: None,
                     title: "Worker pane failed to spawn".to_owned(),
-                    body_markdown: format!(
-                        "Execution `{exec_id}` leased workspace `{ws}` but the worker pane never came up.\n\n\
-                         **Error:** {err_detail}\n\n\
-                         The lease was {release_state}. Inspect \
-                         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline.",
-                        exec_id = execution.id,
-                        ws = lease.workspace_id,
-                        release_state = if released {
-                            "released back to cube"
-                        } else {
-                            "still held by the engine (release failed — see the engine log)"
-                        },
-                    ),
+                    body_markdown: pane_spawn_failed_attention_body(&execution.id, &lease.workspace_id, &err, released),
                     resolved_at: None,
                 });
 
@@ -1140,5 +1158,43 @@ impl ExecutionCoordinator {
                 .await;
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pane_spawn_failed_attention_body_tests {
+    use super::pane_spawn_failed_attention_body;
+    use crate::runner::spawn_confirmation::{composer_not_ready_error, turn_did_not_start_error};
+    use std::time::Duration;
+
+    #[test]
+    fn composer_timeout_uses_neutral_wording() {
+        let err = composer_not_ready_error("claude", "exec-1", Duration::from_secs(20));
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true);
+        assert!(
+            body.contains("spawn confirmation failed and the pane was reaped"),
+            "{body}"
+        );
+        assert!(!body.contains("the driver started"), "{body}");
+        assert!(!body.contains("never came up"), "{body}");
+        assert!(body.contains("composer never became ready"), "{body}");
+    }
+
+    #[test]
+    fn turn_start_timeout_says_the_driver_started() {
+        let err = turn_did_not_start_error("claude", "exec-1", Duration::from_secs(45));
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true);
+        assert!(body.contains("the driver started"), "{body}");
+        assert!(body.contains("the pane was reaped"), "{body}");
+        assert!(!body.contains("never came up"), "{body}");
+        assert!(body.contains("no driver hook or session event"), "{body}");
+    }
+
+    #[test]
+    fn other_spawn_failure_says_the_pane_never_came_up() {
+        let err = anyhow::anyhow!("worker prompt failed");
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true);
+        assert!(body.contains("worker pane never came up"), "{body}");
+        assert!(!body.contains("the driver started"), "{body}");
     }
 }
