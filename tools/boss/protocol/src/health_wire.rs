@@ -24,6 +24,23 @@ pub struct EngineHealthReport {
     #[serde(default)]
     #[builder(default)]
     pub engine_git_sha: String,
+    /// Newest published `boss-v` release the app's updater has reported
+    /// to this engine (`1.0.N`), or `None` if nothing has been reported
+    /// since the engine started. The engine never polls for releases
+    /// itself — see [`crate::FrontendRequest::ReportNewestPublishedRelease`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_published_release: Option<String>,
+    /// How `engine_version` compares with `newest_published_release`.
+    /// See [`engine_release_freshness`].
+    #[serde(default)]
+    #[builder(default)]
+    pub engine_release_status: EngineReleaseStatus,
+    /// True when `engine_version` is a `-dev-` build. A dev build is
+    /// still reported as behind when it is; it is just never
+    /// auto-installed over.
+    #[serde(default)]
+    #[builder(default)]
+    pub engine_is_dev_build: bool,
     /// True iff the engine's agent config had an `ANTHROPIC_API_KEY`
     /// at startup. Surfaced as a top-level bit (rather than only via
     /// the `issues` list) so a CLI consumer doing
@@ -69,4 +86,156 @@ pub struct EngineHealthIssue {
     /// Multi-line body with the remediation steps (e.g. which env var
     /// to set and where to restart). The UI wraps and renders verbatim.
     pub body: String,
+}
+
+/// Stable `kind` of the [`EngineHealthIssue`] raised when the running
+/// engine is older than the newest published release.
+pub const ENGINE_BEHIND_PUBLISHED_RELEASE_KIND: &str = "engine_behind_published_release";
+
+/// Running engine vs. newest published `boss-v` release.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineReleaseStatus {
+    /// The engine is at or ahead of the newest published release.
+    Current,
+    /// A newer release is published than the one the engine runs.
+    Behind,
+    /// Cannot tell: the engine is unstamped, or no newest release has
+    /// been reported (or it did not parse).
+    #[default]
+    Unknown,
+}
+
+impl EngineReleaseStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Behind => "behind",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Result of [`engine_release_freshness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineReleaseFreshness {
+    pub status: EngineReleaseStatus,
+    pub is_dev_build: bool,
+}
+
+/// Parse a numeric `MAJOR.MINOR.PATCH` release version. Rejects
+/// anything else, including a `-dev-<sha>` suffix.
+pub fn parse_release_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = raw.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Compare the running engine's stamped version (`1.0.N`,
+/// `1.0.N-dev-<sha>`, or `unknown`) with the newest published release
+/// (`1.0.N`).
+///
+/// A dev build is stamped with the last release tag it descends from,
+/// so it compares by that base: `1.0.5-dev-abc` is behind `1.0.6` and
+/// current against `1.0.5`. The dev flag is reported separately so a
+/// caller can show the gap without ever auto-installing over it.
+pub fn engine_release_freshness(running: &str, newest_published: Option<&str>) -> EngineReleaseFreshness {
+    let is_dev_build = running.contains("-dev-");
+    let base = running.split_once('-').map_or(running, |(base, _)| base);
+    let status = match (
+        parse_release_version(base),
+        newest_published.and_then(parse_release_version),
+    ) {
+        (Some(running), Some(newest)) if running < newest => EngineReleaseStatus::Behind,
+        (Some(_), Some(_)) => EngineReleaseStatus::Current,
+        _ => EngineReleaseStatus::Unknown,
+    };
+    EngineReleaseFreshness { status, is_dev_build }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn freshness(running: &str, newest: Option<&str>) -> (EngineReleaseStatus, bool) {
+        let f = engine_release_freshness(running, newest);
+        (f.status, f.is_dev_build)
+    }
+
+    #[test]
+    fn older_engine_is_behind() {
+        assert_eq!(
+            freshness("1.0.685", Some("1.0.686")),
+            (EngineReleaseStatus::Behind, false)
+        );
+        // Numeric, not lexical: 1.0.99 < 1.0.100.
+        assert_eq!(
+            freshness("1.0.99", Some("1.0.100")),
+            (EngineReleaseStatus::Behind, false)
+        );
+    }
+
+    #[test]
+    fn equal_or_newer_engine_is_current() {
+        assert_eq!(
+            freshness("1.0.686", Some("1.0.686")),
+            (EngineReleaseStatus::Current, false)
+        );
+        assert_eq!(
+            freshness("1.0.687", Some("1.0.686")),
+            (EngineReleaseStatus::Current, false)
+        );
+    }
+
+    #[test]
+    fn dev_build_is_compared_by_base_and_flagged() {
+        // Behind is still reported for a dev build, never hidden.
+        assert_eq!(
+            freshness("1.0.685-dev-abc1234", Some("1.0.686")),
+            (EngineReleaseStatus::Behind, true)
+        );
+        // A dev build past the newest tag is ahead of it.
+        assert_eq!(
+            freshness("1.0.686-dev-abc1234", Some("1.0.686")),
+            (EngineReleaseStatus::Current, true)
+        );
+    }
+
+    #[test]
+    fn unknown_versions_are_unknown_not_current() {
+        assert_eq!(
+            freshness("unknown", Some("1.0.686")),
+            (EngineReleaseStatus::Unknown, false)
+        );
+        assert_eq!(freshness("1.0.686", None), (EngineReleaseStatus::Unknown, false));
+        assert_eq!(
+            freshness("1.0.686", Some("boss-v1.0.686")),
+            (EngineReleaseStatus::Unknown, false)
+        );
+        assert_eq!(freshness("", Some("1.0.686")), (EngineReleaseStatus::Unknown, false));
+    }
+
+    #[test]
+    fn parse_release_version_rejects_non_release_shapes() {
+        assert_eq!(parse_release_version("1.0.686"), Some((1, 0, 686)));
+        assert_eq!(parse_release_version("1.0"), None);
+        assert_eq!(parse_release_version("1.0.686.1"), None);
+        assert_eq!(parse_release_version("1.0.686-dev-abc"), None);
+    }
+
+    #[test]
+    fn health_report_without_release_fields_deserializes_as_unknown() {
+        // An engine that predates these fields must read as "unknown",
+        // never as "current".
+        let report: EngineHealthReport =
+            serde_json::from_str(r#"{"anthropic_api_key_present":true,"issues":[]}"#).unwrap();
+        assert_eq!(report.newest_published_release, None);
+        assert_eq!(report.engine_release_status, EngineReleaseStatus::Unknown);
+        assert!(!report.engine_is_dev_build);
+    }
 }

@@ -380,3 +380,113 @@ async fn get_engine_version_response_matches_swift_app_parser() {
     drop(write_half);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), conn).await;
 }
+
+/// Incident 008: the fix was published but the running engine predated
+/// it for a day. Once the app reports a newer release, the health
+/// report must say so with both versions.
+#[tokio::test]
+async fn engine_health_report_carries_reported_newest_release() {
+    let (state, _dir) = test_server_state();
+    let before = build_engine_health_report(&state);
+    assert_eq!(before.newest_published_release, None);
+    assert_eq!(
+        before.engine_release_status,
+        boss_protocol::EngineReleaseStatus::Unknown
+    );
+
+    *state.newest_published_release.lock().unwrap() = Some("1.0.686".to_owned());
+    let report = build_engine_health_report(&state);
+    assert_eq!(report.newest_published_release.as_deref(), Some("1.0.686"));
+    let expected = boss_protocol::engine_release_freshness(crate::build_info::version(), Some("1.0.686"));
+    assert_eq!(report.engine_release_status, expected.status);
+    assert_eq!(report.engine_is_dev_build, expected.is_dev_build);
+    let has_issue = report
+        .issues
+        .iter()
+        .any(|issue| issue.kind == boss_protocol::ENGINE_BEHIND_PUBLISHED_RELEASE_KIND);
+    assert_eq!(has_issue, expected.status == boss_protocol::EngineReleaseStatus::Behind);
+}
+
+#[test]
+fn behind_issue_names_both_versions() {
+    let freshness = boss_protocol::engine_release_freshness("1.0.685", Some("1.0.686"));
+    let issue = crate::app::handler_helpers::engine_behind_release_issue("1.0.685", Some("1.0.686"), freshness)
+        .expect("behind raises an issue");
+    assert_eq!(issue.kind, boss_protocol::ENGINE_BEHIND_PUBLISHED_RELEASE_KIND);
+    assert_eq!(issue.severity, "warning");
+    assert!(
+        issue.title.contains("1.0.685") && issue.title.contains("1.0.686"),
+        "{}",
+        issue.title
+    );
+    assert!(issue.body.contains("Update & Restart"), "{}", issue.body);
+}
+
+#[test]
+fn behind_issue_is_raised_for_dev_builds_without_offering_auto_install() {
+    let freshness = boss_protocol::engine_release_freshness("1.0.685-dev-abc1234", Some("1.0.686"));
+    let issue =
+        crate::app::handler_helpers::engine_behind_release_issue("1.0.685-dev-abc1234", Some("1.0.686"), freshness)
+            .expect("a dev build that is behind is still reported");
+    assert!(issue.title.contains("1.0.685-dev-abc1234"), "{}", issue.title);
+    assert!(issue.body.contains("never auto-installs"), "{}", issue.body);
+    assert!(!issue.body.contains("Update & Restart"), "{}", issue.body);
+}
+
+#[test]
+fn no_behind_issue_when_current_or_unknown() {
+    for (running, newest) in [
+        ("1.0.686", Some("1.0.686")),
+        ("1.0.687", Some("1.0.686")),
+        ("unknown", Some("1.0.686")),
+        ("1.0.686", None),
+    ] {
+        let freshness = boss_protocol::engine_release_freshness(running, newest);
+        assert!(
+            crate::app::handler_helpers::engine_behind_release_issue(running, newest, freshness).is_none(),
+            "running={running} newest={newest:?}"
+        );
+    }
+}
+
+async fn report_newest_published_release(state: &Arc<ServerState>, version: &str) -> FrontendEvent {
+    let sink = make_session_sink();
+    let ctx = Dispatch::builder()
+        .server_state(state.clone())
+        .work_db(state.work_db.clone())
+        .sink(sink.clone())
+        .session_id("session-test")
+        .request_id("req-1")
+        .recv_instant(std::time::Instant::now())
+        .decode_ms(0.0)
+        .build();
+    crate::app::engine_meta::handle_report_newest_published_release(
+        ctx,
+        FrontendRequest::ReportNewestPublishedRelease {
+            version: version.to_owned(),
+        },
+    )
+    .await;
+    sink.close();
+    let response = sink.next().await.expect("handler must send a response").payload;
+    assert!(sink.next().await.is_none(), "handler must send exactly one response");
+    response
+}
+
+/// The RPC stores the report, rejects junk, and echoes the health
+/// report so the reporter sees the comparison immediately.
+#[tokio::test]
+async fn report_newest_published_release_updates_health_and_rejects_junk() {
+    let (state, _dir) = test_server_state();
+    let response = report_newest_published_release(&state, "boss-v1.0.686").await;
+    assert!(matches!(response, FrontendEvent::WorkError { .. }), "{response:?}");
+    assert_eq!(*state.newest_published_release.lock().unwrap(), None);
+
+    let response = report_newest_published_release(&state, "1.0.686").await;
+    match response {
+        FrontendEvent::EngineHealthResult { report } => {
+            assert_eq!(report.newest_published_release.as_deref(), Some("1.0.686"));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}

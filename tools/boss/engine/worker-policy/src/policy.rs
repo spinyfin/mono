@@ -404,6 +404,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ProbeStatus { .. }
         | FrontendRequest::ReapRun { .. }
         | FrontendRequest::ReleaseReviewTerminal { .. }
+        | FrontendRequest::ReportNewestPublishedRelease { .. }
         | FrontendRequest::EvaluateDispatchAdmission { .. }
         | FrontendRequest::RequestExecution { .. }
         | FrontendRequest::RetirePane { .. }

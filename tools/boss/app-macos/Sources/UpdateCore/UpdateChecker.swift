@@ -25,6 +25,14 @@ public struct VersionTuple: Comparable, Equatable, Sendable, CustomStringConvert
         return VersionTuple(major: major, minor: minor, patch: patch)
     }
 
+    /// Parses the release base of a stamped Boss version: `1.0.N` as-is, and
+    /// `1.0.N-dev-<sha>` as `1.0.N` (a dev build is stamped with the last release
+    /// tag it descends from). `nil` for `unknown` or any other shape.
+    public static func parseReleaseBase(_ string: String) -> VersionTuple? {
+        let base = string.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
+        return parse(String(base))
+    }
+
     public static func < (lhs: VersionTuple, rhs: VersionTuple) -> Bool {
         if lhs.major != rhs.major { return lhs.major < rhs.major }
         if lhs.minor != rhs.minor { return lhs.minor < rhs.minor }
@@ -151,6 +159,12 @@ actor UpdateChecker {
     private var storedETag: String?
     private var lastResult: UpdateCheckResult = .upToDate
 
+    /// Newest installable `boss-v*` release seen in the feed, whether or not it is
+    /// newer than the running app. `nil` until a feed has been parsed. The app
+    /// reports this to the engine so the engine can say when *it* is behind —
+    /// there is deliberately no second, engine-side release poller.
+    private(set) var newestPublishedVersion: VersionTuple?
+
     static let releasesURL = URL(
         string: "https://api.github.com/repos/spinyfin/mono/releases?per_page=100"
     )!
@@ -253,6 +267,7 @@ actor UpdateChecker {
             checkerLog.info("update check: no qualifying boss-v* release found — up-to-date")
             return .upToDate
         }
+        newestPublishedVersion = latestVersion
         guard latestVersion > currentVersion else {
             checkerLog.info(
                 "update check: latest=\(latestVersion.description, privacy: .public) current=\(self.currentVersion.description, privacy: .public) — up-to-date"

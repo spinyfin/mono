@@ -1526,6 +1526,9 @@ fn tag_cases() -> Vec<TagCase> {
                 report: EngineHealthReport {
                     engine_version: "1.0.4-dev-abc123".into(),
                     engine_git_sha: "abc123".into(),
+                    newest_published_release: None,
+                    engine_release_status: Default::default(),
+                    engine_is_dev_build: false,
                     anthropic_api_key_present: true,
                     dispatch_paused: false,
                     automation_paused: false,

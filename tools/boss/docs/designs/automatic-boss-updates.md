@@ -234,6 +234,35 @@ The check flow carries `os.log` observability (`subsystem: dev.spinyfin.bossmaca
 - Swap-in-progress is brief; the main feedback is simply relaunching into the new version. A swap that succeeded but couldn't relaunch (vetoed quit, missing helper) is reported truthfully as "installed — quit to finish" (#1855), never as a failure.
 - Errors are non-blocking: a status line in the Settings pane and terminal states in the sheet/popover. We never throw a modal that interrupts work.
 
+### 6. Stale-engine indicator and apply-at-idle
+
+Added after incident 008 (postmortem in mono#3048): a fix was published as a release, but the engine that had started before it kept running for another 24 hours. Swap-on-quit and swap-on-startup only help an operator who quits. This section closes the gap for a long-lived session, without adding a second update channel: the engine still ships inside the app bundle and still follows it.
+
+**Showing it.** The engine has no release poller. The app forwards the newest installable `boss-v*` release `UpdateChecker` has seen to the engine with `ReportNewestPublishedRelease` — on every connect and whenever the value changes. The engine holds it in memory and owns the one comparison (`engine_release_freshness` in `boss-protocol`): its stamped version against that release gives `current`, `behind`, or `unknown`, plus a separate dev-build flag. The result rides on the existing health report:
+
+- `EngineHealthReport` carries `engine_version`, `newest_published_release`, `engine_release_status`, and `engine_is_dev_build`. `bossctl health` prints them.
+- When the status is `behind`, the report also carries an `engine_behind_published_release` warning naming both versions, so the app's health banner shows it with no app-side comparison.
+- A dev build that is behind is reported like any other. It is only excluded from installing.
+- `unknown` (unstamped engine, or nothing reported yet) is a status, not a warning.
+
+**Applying it.** `IdleUpdateApplier` (`UpdateCore`) decides when a staged update may be applied while Boss keeps running; `EngineFreshnessDriver` (app target) feeds it and performs the result. Applying means the existing swap plus an app relaunch through the existing relaunch helper, so the watchdog and rollback still cover it; the relaunch's launch-time fingerprint check is what replaces the engine. If the bundle is already current and only the engine is older, it restarts just the engine onto the bundled binary.
+
+| Mode                 | Behaviour                                                                                                                                                 |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Automatic            | Stages as before, then applies unattended at the first idle boundary.                                                                                     |
+| Notify / Manual      | Never applies unattended. The banner's **Update & Restart** button stages the release and queues the same apply for the first moment no workers are live. |
+| Dev build (any mode) | Indicator shown; nothing is ever installed, and the button is hidden.                                                                                     |
+
+Safety rules, all enforced in `IdleUpdateApplier.decide`:
+
+- **No live workers.** A live worker is any worker the engine reports as spawning, working, waiting for input, or idle at its prompt — the same count the quit confirmation uses. Any live worker blocks the apply; nothing is drained, interrupted, or restarted underneath.
+- **Engine reachable.** With no engine connection the worker count is stale, so that is treated as not idle.
+- **No sheet or modal dialog open.**
+- **Unattended applies only:** no live workers for 60 seconds continuously (so the gap between two back-to-back dispatches is not mistaken for idle), and no keyboard or mouse input for 120 seconds. An explicit **Update & Restart** skips both waits but not the rules above.
+- **No restart loop.** After an attempt, another is not made for 10 minutes unless the operator asks again.
+
+A host that always has live workers is never auto-restarted; it keeps the indicator until an idle moment or a quit.
+
 ### Component summary (as built)
 
 ```
