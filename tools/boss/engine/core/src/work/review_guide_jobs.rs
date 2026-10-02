@@ -870,9 +870,9 @@ impl WorkDb {
     /// An attempt is re-enqueued only when all of these hold:
     /// - it failed before start, on a build other than `running_build`;
     /// - its comparison is still the series' selected one, no newer attempt
-    ///   exists in the series, and no guide was published for that comparison;
-    /// - the root task is live and still on this series' PR (a merged or
-    ///   closed PR has moved the task to `done`/`archived`).
+    ///   exists in the series, and no guide was published for that head;
+    /// - the root task is live and still on this series' PR, and a live PR
+    ///   probe confirms it is open (probe failures are skipped).
     ///
     /// Re-enqueueing goes through [`Self::request_pr_review_guide`], the same
     /// path as a manual retry: it creates a queued attempt and a `ready`
@@ -886,6 +886,7 @@ impl WorkDb {
     pub(crate) fn reenqueue_pre_start_failed_review_guides(
         &self,
         running_build: &str,
+        pr_checker: &dyn PrStateChecker,
     ) -> Result<ReviewGuideReenqueueReport> {
         struct Candidate {
             attempt_id: String,
@@ -899,6 +900,7 @@ impl WorkDb {
                  FROM pr_review_guide_attempts a
                  JOIN pr_review_guide_source_series s ON s.id = a.series_id
                  JOIN tasks t ON t.id = s.root_task_id
+                 JOIN pr_review_guide_source_comparisons c ON c.id = a.comparison_id
                  WHERE a.status = 'failed'
                    AND a.failed_pre_start = 1
                    AND a.failed_by_build IS NOT NULL AND a.failed_by_build != ?1
@@ -911,7 +913,8 @@ impl WorkDb {
                    )
                    AND NOT EXISTS (
                        SELECT 1 FROM pr_review_guide_versions v
-                       WHERE v.series_id = a.series_id AND v.comparison_id = a.comparison_id
+                       JOIN pr_review_guide_source_comparisons published ON published.id = v.comparison_id
+                       WHERE v.series_id = a.series_id AND published.head_sha = c.head_sha
                    )
                  ORDER BY a.finished_at, a.id",
             )?;
@@ -930,6 +933,18 @@ impl WorkDb {
             reenqueued: Vec::new(),
         };
         for candidate in candidates {
+            match pr_checker.check(&candidate.pr_url) {
+                Ok(PrOpenState::Open) => {}
+                Ok(PrOpenState::Merged | PrOpenState::ClosedUnmerged) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        pr_url = %candidate.pr_url,
+                        ?err,
+                        "review-guide re-enqueue: could not confirm PR is open",
+                    );
+                    continue;
+                }
+            }
             // The token makes a repeat of this exact re-enqueue (a crash
             // between admit and dispatch, say) return the same attempt.
             let token = format!("build-change-reenqueue:{}", candidate.attempt_id);

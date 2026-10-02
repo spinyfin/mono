@@ -8,6 +8,85 @@ const PR_URL: &str = "https://github.com/acme/widget/pull/9";
 const OLD_BUILD: &str = "build-old";
 const NEW_BUILD: &str = "build-new";
 
+#[test]
+fn live_pr_state_is_required_even_when_the_task_is_still_in_review() {
+    for state in [PrOpenState::Merged, PrOpenState::ClosedUnmerged, PrOpenState::Open] {
+        let (_dir, db) = open_db();
+        let (_root, series, comparison) = seeded_open_pr(&db);
+        failed_attempt(&db, &series, &comparison, true, OLD_BUILD);
+        let report = db
+            .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(state.clone()))
+            .unwrap();
+        assert_eq!(report.reenqueued.len(), usize::from(state == PrOpenState::Open));
+    }
+}
+
+#[test]
+fn failed_pr_probe_does_not_admit_a_recovery_attempt() {
+    struct Unavailable;
+    impl PrStateChecker for Unavailable {
+        fn check(&self, pr_url: &str) -> Result<PrOpenState> {
+            assert_eq!(pr_url, PR_URL);
+            anyhow::bail!("PR probe unavailable")
+        }
+    }
+    let (_dir, db) = open_db();
+    let (_root, series, comparison) = seeded_open_pr(&db);
+    let failed = failed_attempt(&db, &series, &comparison, true, OLD_BUILD);
+    let report = db
+        .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &Unavailable)
+        .unwrap();
+    assert!(report.reenqueued.is_empty());
+    assert_eq!(attempt_for(&db, &failed.id), failed);
+    let report = db
+        .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
+    assert_eq!(report.reenqueued.len(), 1);
+}
+
+#[test]
+fn published_head_is_excluded_across_base_changes_but_a_new_head_is_eligible() {
+    for (head, expected) in [("head", 0), ("different-head", 1)] {
+        let (_dir, db) = open_db();
+        let (root, series, comparison) = seeded_open_pr(&db);
+        let published = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+        assert!(matches!(
+            db.publish_pr_review_guide_version(&published.id, "# Guide", "raw")
+                .unwrap(),
+            PublishReviewGuideOutcome::Published(_)
+        ));
+        let (new_series, new_comparison) = seed_review_guide_series_for_pr(&db, &root, PR_URL, "new-base", head);
+        assert_eq!(new_series, series);
+        assert_ne!(new_comparison, comparison);
+        failed_attempt(&db, &series, &new_comparison, true, OLD_BUILD);
+        let report = db
+            .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+            .unwrap();
+        assert_eq!(report.reenqueued.len(), expected, "{head}: {report:?}");
+    }
+}
+
+#[test]
+fn pre_start_provenance_migration_is_idempotent_and_defaults_existing_rows() {
+    let (_dir, db) = open_db();
+    let (_root, series, comparison) = seeded_open_pr(&db);
+    let attempt = failed_attempt(&db, &series, &comparison, false, OLD_BUILD);
+    let conn = db.connect().unwrap();
+    conn.execute_batch(
+        "ALTER TABLE pr_review_guide_attempts DROP COLUMN failed_pre_start;
+         ALTER TABLE pr_review_guide_attempts DROP COLUMN failed_by_build;",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        migrate_pr_review_guide_job_tables(&conn).unwrap();
+        let migrated = query_pr_review_guide_attempt(&conn, &attempt.id).unwrap().unwrap();
+        assert!(!migrated.failed_pre_start);
+        assert_eq!(migrated.failed_by_build, None);
+        assert_eq!(migrated.status, "failed");
+        assert_eq!(migrated.error, attempt.error);
+    }
+}
+
 /// An `in_review` task on `PR_URL` with a captured source series. Returns
 /// `(root, series_id, comparison_id)`.
 fn seeded_open_pr(db: &WorkDb) -> (String, String, String) {
@@ -62,10 +141,14 @@ fn pre_start_failure_is_reenqueued_after_a_build_change_but_not_on_the_same_buil
     assert!(failed.failed_pre_start);
     assert_eq!(failed.failed_by_build.as_deref(), Some(OLD_BUILD));
 
-    let same_build = db.reenqueue_pre_start_failed_review_guides(OLD_BUILD).unwrap();
+    let same_build = db
+        .reenqueue_pre_start_failed_review_guides(OLD_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
     assert!(same_build.reenqueued.is_empty(), "{same_build:?}");
 
-    let report = db.reenqueue_pre_start_failed_review_guides(NEW_BUILD).unwrap();
+    let report = db
+        .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
     assert_eq!(report.build, NEW_BUILD);
     assert_eq!(report.reenqueued.len(), 1, "{report:?}");
     let entry = &report.reenqueued[0];
@@ -89,7 +172,9 @@ fn pre_start_failure_is_reenqueued_after_a_build_change_but_not_on_the_same_buil
     assert_eq!(old.error.as_deref(), Some("spawn refused"));
 
     // A second restart on the new build finds the live attempt and does nothing.
-    let again = db.reenqueue_pre_start_failed_review_guides(NEW_BUILD).unwrap();
+    let again = db
+        .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
     assert!(again.reenqueued.is_empty(), "{again:?}");
 }
 
@@ -100,7 +185,9 @@ fn post_start_failures_are_not_reenqueued() {
     let failed = failed_attempt(&db, &series_id, &comparison_id, false, OLD_BUILD);
     assert!(!failed.failed_pre_start);
 
-    let report = db.reenqueue_pre_start_failed_review_guides(NEW_BUILD).unwrap();
+    let report = db
+        .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
     assert!(report.reenqueued.is_empty(), "{report:?}");
 }
 
@@ -117,7 +204,9 @@ fn attempts_that_failed_before_the_build_was_recorded_are_not_reenqueued() {
         )
         .unwrap();
 
-    let report = db.reenqueue_pre_start_failed_review_guides(NEW_BUILD).unwrap();
+    let report = db
+        .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
     assert!(report.reenqueued.is_empty(), "{report:?}");
 }
 
@@ -143,7 +232,9 @@ fn merged_closed_deleted_and_replaced_prs_are_not_reenqueued() {
         failed_attempt(&db, &series_id, &comparison_id, true, OLD_BUILD);
         db.connect().unwrap().execute(sql, [&root]).unwrap();
 
-        let report = db.reenqueue_pre_start_failed_review_guides(NEW_BUILD).unwrap();
+        let report = db
+            .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+            .unwrap();
         assert!(report.reenqueued.is_empty(), "{label}: {report:?}");
     }
 }
@@ -158,7 +249,9 @@ fn series_with_a_newer_attempt_or_a_published_guide_are_not_reenqueued() {
     let newer = db
         .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
         .unwrap();
-    let report = db.reenqueue_pre_start_failed_review_guides(NEW_BUILD).unwrap();
+    let report = db
+        .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
     assert!(report.reenqueued.is_empty(), "newer live attempt: {report:?}");
 
     // The newer attempt publishes a guide for the same head.
@@ -168,7 +261,9 @@ fn series_with_a_newer_attempt_or_a_published_guide_are_not_reenqueued() {
     else {
         panic!("must publish")
     };
-    let report = db.reenqueue_pre_start_failed_review_guides(NEW_BUILD).unwrap();
+    let report = db
+        .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
     assert!(report.reenqueued.is_empty(), "published guide: {report:?}");
 }
 
@@ -178,7 +273,9 @@ fn a_reenqueued_attempt_that_fails_again_is_not_retried_on_the_same_build() {
     let (_root, series_id, comparison_id) = seeded_open_pr(&db);
     failed_attempt(&db, &series_id, &comparison_id, true, OLD_BUILD);
 
-    let first = db.reenqueue_pre_start_failed_review_guides(NEW_BUILD).unwrap();
+    let first = db
+        .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
     assert_eq!(first.reenqueued.len(), 1);
     let retried = &first.reenqueued[0].new_attempt_id;
 
@@ -186,12 +283,16 @@ fn a_reenqueued_attempt_that_fails_again_is_not_retried_on_the_same_build() {
     db.fail_pr_review_guide_attempt_at(retried, "spawn refused again", true, NEW_BUILD)
         .unwrap();
     for _ in 0..2 {
-        let report = db.reenqueue_pre_start_failed_review_guides(NEW_BUILD).unwrap();
+        let report = db
+            .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+            .unwrap();
         assert!(report.reenqueued.is_empty(), "no loop on one build: {report:?}");
     }
 
     // A later, different build gets exactly one more try.
-    let next = db.reenqueue_pre_start_failed_review_guides("build-newer").unwrap();
+    let next = db
+        .reenqueue_pre_start_failed_review_guides("build-newer", &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
     assert_eq!(next.reenqueued.len(), 1, "{next:?}");
     assert_eq!(next.reenqueued[0].failed_attempt_id, *retried);
 }
@@ -260,6 +361,8 @@ fn orphaned_execution_is_not_treated_as_a_pre_start_failure() {
     let failed = attempt_for(&db, &attempt.id);
     assert_eq!(failed.status, "failed");
     assert!(!failed.failed_pre_start);
-    let report = db.reenqueue_pre_start_failed_review_guides(NEW_BUILD).unwrap();
+    let report = db
+        .reenqueue_pre_start_failed_review_guides(NEW_BUILD, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
     assert!(report.reenqueued.is_empty(), "{report:?}");
 }

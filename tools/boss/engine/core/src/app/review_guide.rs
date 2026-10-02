@@ -25,9 +25,9 @@ impl ServerState {
     /// [`crate::work::WorkDb::reenqueue_pre_start_failed_review_guides`]),
     /// and report what was done in one log line, one audit record and the
     /// health reports. Failures are logged, never fatal.
-    pub(super) fn reenqueue_pre_start_failed_review_guides(&self) {
+    pub(super) fn reenqueue_pre_start_failed_review_guides(&self, pr_checker: &dyn crate::work::PrStateChecker) {
         let build = crate::build_info::build_identity();
-        let report = match self.work_db.reenqueue_pre_start_failed_review_guides(build) {
+        let report = match self.work_db.reenqueue_pre_start_failed_review_guides(build, pr_checker) {
             Ok(report) => report,
             Err(err) => {
                 tracing::warn!(
@@ -270,6 +270,63 @@ fn wire_attempt(attempt: crate::work::PrReviewGuideAttempt) -> boss_protocol::Re
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn startup_reenqueue_reports_only_admitted_guides() {
+        use crate::test_support::{seed_published_guide, seed_review_guide_series_for_pr};
+        use crate::work::{FakePrStateChecker, PrOpenState};
+
+        let (state, _dir) = crate::app::tests::test_server_state();
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        assert!(state.review_guide_reenqueue_summary().is_none());
+        state.reenqueue_pre_start_failed_review_guides(&checker);
+        assert!(state.review_guide_reenqueue_summary().is_none());
+
+        let urls: Vec<String> = [9, 10]
+            .map(|n| format!("https://github.com/acme/widget/pull/{n}"))
+            .into();
+        for (number, url) in [9, 10].into_iter().zip(&urls) {
+            let (root, _) = seed_published_guide(&state.work_db, number);
+            state
+                .work_db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+                    [&root],
+                )
+                .unwrap();
+            let (series, comparison) = seed_review_guide_series_for_pr(&state.work_db, &root, url, "base", "new-head");
+            let attempt = state
+                .work_db
+                .create_pr_review_guide_attempt(&series, &comparison, "test")
+                .unwrap();
+            state
+                .work_db
+                .fail_pr_review_guide_attempt_pre_start(&attempt.id, "spawn refused")
+                .unwrap();
+            state
+                .work_db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE pr_review_guide_attempts SET failed_by_build = 'older-build' WHERE id = ?1",
+                    [&attempt.id],
+                )
+                .unwrap();
+        }
+        state.reenqueue_pre_start_failed_review_guides(&checker);
+        let summary = state.review_guide_reenqueue_summary().unwrap();
+        assert_eq!(summary.build, crate::build_info::build_identity());
+        assert_eq!(summary.count, 2);
+        let mut actual_urls = summary.pr_urls;
+        actual_urls.sort();
+        let mut expected_urls = urls;
+        expected_urls.sort();
+        assert_eq!(actual_urls, expected_urls);
+        state.reenqueue_pre_start_failed_review_guides(&checker);
+        assert!(state.review_guide_reenqueue_summary().is_none());
+    }
+
     #[test]
     fn attempt_diagnostics_preserve_native_usage() {
         let usage = r#"{"codex:rollout":{"total_token_usage":{"cached_input_tokens":8}}}"#;

@@ -1380,7 +1380,7 @@ pub async fn serve_with_overrides(
     }
     post_bind.mark("review_guide_attempt_reconcile");
 
-    server_state.reenqueue_pre_start_failed_review_guides();
+    server_state.reenqueue_pre_start_failed_review_guides(&crate::work::GhPrStateChecker);
     post_bind.mark("review_guide_reenqueue");
 
     let in_flight = match server_state.work_db.list_in_flight_executions() {
