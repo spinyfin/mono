@@ -725,7 +725,8 @@ pub(crate) use products_design::{
 };
 pub(crate) use review_guide_jobs::{
     PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,
-    migrate_pr_review_guide_job_tables, notify_review_guide_changed, to_wire_review_guide_summary,
+    ReviewGuideReenqueueReport, migrate_pr_review_guide_job_tables, notify_review_guide_changed,
+    to_wire_review_guide_summary,
 };
 pub(crate) use review_guide_sources::{
     PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger,

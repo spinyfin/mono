@@ -91,6 +91,16 @@ pub struct PrReviewGuideAttempt {
     pub finished_at: Option<String>,
     /// Lossless provider usage snapshots collected through the execution hook path.
     pub provider_usage_json: Option<String>,
+    /// The attempt failed before a worker session started (spawn refused,
+    /// workspace check failed, pane never came up), as opposed to failing
+    /// after a worker ran. Only these are eligible for
+    /// [`WorkDb::reenqueue_pre_start_failed_review_guides`].
+    #[builder(default)]
+    pub failed_pre_start: bool,
+    /// [`crate::build_info::build_identity`] of the engine that recorded the
+    /// failure. `None` for attempts that did not fail, or failed before this
+    /// column existed (their build is unknowable, so they are never retried).
+    pub failed_by_build: Option<String>,
 }
 
 /// One immutable, validated guide version. Never mutated after insertion —
@@ -126,6 +136,25 @@ pub struct PrReviewGuideSummary {
     pub error: Option<String>,
 }
 
+/// One guide re-enqueued by [`WorkDb::reenqueue_pre_start_failed_review_guides`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReenqueuedReviewGuide {
+    pub root_task_id: String,
+    pub pr_url: String,
+    /// The pre-start-failed attempt left in place as history.
+    pub failed_attempt_id: String,
+    pub new_attempt_id: String,
+}
+
+/// What one startup re-enqueue pass did, for the log line, the audit record
+/// and the engine health report.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewGuideReenqueueReport {
+    /// The running build the pass compared failed attempts against.
+    pub build: String,
+    pub reenqueued: Vec<ReenqueuedReviewGuide>,
+}
+
 /// Outcome of [`WorkDb::publish_pr_review_guide_version`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishReviewGuideOutcome {
@@ -151,6 +180,14 @@ pub enum RetryReviewGuideOutcome {
     /// No source series/comparison exists yet for this root task — retry has
     /// nothing to regenerate from.
     NoComparison,
+}
+
+/// What a failure records beyond the error text: whether it happened before
+/// a worker started, and which engine build observed it.
+#[derive(Clone, Copy)]
+struct FailureProvenance<'a> {
+    pre_start: bool,
+    build: &'a str,
 }
 
 pub(crate) fn migrate_pr_review_guide_job_tables(conn: &Connection) -> Result<()> {
@@ -206,6 +243,18 @@ pub(crate) fn migrate_pr_review_guide_job_tables(conn: &Connection) -> Result<()
     if !table_has_column(conn, "pr_review_guide_attempts", "provider_usage_json")? {
         conn.execute(
             "ALTER TABLE pr_review_guide_attempts ADD COLUMN provider_usage_json TEXT",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "pr_review_guide_attempts", "failed_pre_start")? {
+        conn.execute(
+            "ALTER TABLE pr_review_guide_attempts ADD COLUMN failed_pre_start INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "pr_review_guide_attempts", "failed_by_build")? {
+        conn.execute(
+            "ALTER TABLE pr_review_guide_attempts ADD COLUMN failed_by_build TEXT",
             [],
         )?;
     }
@@ -555,7 +604,30 @@ impl WorkDb {
     /// flip `guide_lifecycle` to `failed` — a newer published guide must
     /// not be downgraded by late output from an obsolete run.
     pub fn fail_pr_review_guide_attempt(&self, attempt_id: &str, error: &str) -> Result<()> {
-        self.terminate_pr_review_guide_attempt(attempt_id, PrReviewGuideAttemptStatus::Failed, Some(error), true)
+        self.fail_pr_review_guide_attempt_at(attempt_id, error, false, crate::build_info::build_identity())
+    }
+
+    /// [`Self::fail_pr_review_guide_attempt`] for a failure that happened
+    /// before any worker session started. Records that fact (and the failing
+    /// build) so [`Self::reenqueue_pre_start_failed_review_guides`] can retry
+    /// the attempt once a different build is running.
+    pub fn fail_pr_review_guide_attempt_pre_start(&self, attempt_id: &str, error: &str) -> Result<()> {
+        self.fail_pr_review_guide_attempt_at(attempt_id, error, true, crate::build_info::build_identity())
+    }
+
+    pub(crate) fn fail_pr_review_guide_attempt_at(
+        &self,
+        attempt_id: &str,
+        error: &str,
+        pre_start: bool,
+        build: &str,
+    ) -> Result<()> {
+        self.terminate_pr_review_guide_attempt(
+            attempt_id,
+            PrReviewGuideAttemptStatus::Failed,
+            Some(error),
+            Some(FailureProvenance { pre_start, build }),
+        )
     }
 
     /// Record cancellation from terminal-execution reconciliation and the
@@ -563,7 +635,7 @@ impl WorkDb {
     /// Same selected-comparison fence as [`Self::fail_pr_review_guide_attempt`]:
     /// a stale cancel leaves card lifecycle untouched.
     pub fn cancel_pr_review_guide_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
-        self.terminate_pr_review_guide_attempt(attempt_id, PrReviewGuideAttemptStatus::Cancelled, Some(reason), false)
+        self.terminate_pr_review_guide_attempt(attempt_id, PrReviewGuideAttemptStatus::Cancelled, Some(reason), None)
     }
 
     fn terminate_pr_review_guide_attempt(
@@ -571,7 +643,7 @@ impl WorkDb {
         attempt_id: &str,
         status: PrReviewGuideAttemptStatus,
         error: Option<&str>,
-        increment_retries: bool,
+        failure: Option<FailureProvenance<'_>>,
     ) -> Result<()> {
         let now = now_string();
         let mut conn = self.connect()?;
@@ -592,12 +664,22 @@ impl WorkDb {
         } else {
             status
         };
-        if increment_retries && !stale {
+        if let Some(failure) = failure
+            && !stale
+        {
             tx.execute(
                 "UPDATE pr_review_guide_attempts
-                 SET status = ?2, error = ?3, retries = retries + 1, finished_at = ?4
+                 SET status = ?2, error = ?3, retries = retries + 1, finished_at = ?4,
+                     failed_pre_start = ?5, failed_by_build = ?6
                  WHERE id = ?1",
-                params![attempt_id, final_status.as_str(), error, now],
+                params![
+                    attempt_id,
+                    final_status.as_str(),
+                    error,
+                    now,
+                    failure.pre_start,
+                    failure.build
+                ],
             )?;
         } else {
             tx.execute(
@@ -662,17 +744,25 @@ impl WorkDb {
     /// terminal status. `cancelled` executions write `Cancelled`; every other
     /// terminal status writes `Failed` with `reason`. The selected-comparison
     /// fence in [`Self::terminate_pr_review_guide_attempt`] still applies.
+    ///
+    /// `pre_start` marks a failure that happened before any worker session
+    /// started; see [`Self::fail_pr_review_guide_attempt_pre_start`]. Callers
+    /// that cannot tell pass `false`: an unrecognised failure is never retried
+    /// automatically on a build change.
     pub(crate) fn finish_pr_review_guide_attempt_for_terminal_execution(
         &self,
         execution_id: &str,
         execution_status: ExecutionStatus,
         reason: &str,
+        pre_start: bool,
     ) -> Result<()> {
         let Some(attempt) = self.pr_review_guide_attempt_for_execution(execution_id)? else {
             return Ok(());
         };
         if execution_status == ExecutionStatus::Cancelled {
             self.cancel_pr_review_guide_attempt(&attempt.id, reason)
+        } else if pre_start {
+            self.fail_pr_review_guide_attempt_pre_start(&attempt.id, reason)
         } else {
             self.fail_pr_review_guide_attempt(&attempt.id, reason)
         }
@@ -708,6 +798,7 @@ impl WorkDb {
                             execution_id,
                             execution.status,
                             &reason,
+                            false,
                         ) {
                             tracing::warn!(
                                 attempt_id = %attempt.id,
@@ -764,6 +855,109 @@ impl WorkDb {
             }
         }
         Ok(acted)
+    }
+
+    /// Startup pass: give every review guide that failed *before a worker
+    /// started* one more try, now that a different engine build is running.
+    ///
+    /// A pre-start failure (spawn refused, workspace check failed, pane never
+    /// came up) says nothing about the PR and often nothing about the
+    /// prompt: it is a defect in the build that tried to spawn. Reconcile
+    /// leaves such an attempt terminal `failed`, so without this pass an
+    /// outage (incident 008) strands every guide it touched until someone
+    /// retries each PR by hand.
+    ///
+    /// An attempt is re-enqueued only when all of these hold:
+    /// - it failed before start, on a build other than `running_build`;
+    /// - its comparison is still the series' selected one, no newer attempt
+    ///   exists in the series, and no guide was published for that comparison;
+    /// - the root task is live and still on this series' PR (a merged or
+    ///   closed PR has moved the task to `done`/`archived`).
+    ///
+    /// Re-enqueueing goes through [`Self::request_pr_review_guide`], the same
+    /// path as a manual retry: it creates a queued attempt and a `ready`
+    /// execution, which the coordinator dispatches through the review pool
+    /// and the dispatch pause like any other guide. Nothing is dispatched
+    /// here, and old attempts are never edited or deleted.
+    ///
+    /// The new attempt records `running_build` if it too fails before start,
+    /// so a restart on the same build does not retry it again; a later,
+    /// different build gets one more try.
+    pub(crate) fn reenqueue_pre_start_failed_review_guides(
+        &self,
+        running_build: &str,
+    ) -> Result<ReviewGuideReenqueueReport> {
+        struct Candidate {
+            attempt_id: String,
+            root_task_id: String,
+            pr_url: String,
+        }
+        let candidates = {
+            let conn = self.connect()?;
+            let mut stmt = conn.prepare(
+                "SELECT a.id, s.root_task_id, s.canonical_pr_url
+                 FROM pr_review_guide_attempts a
+                 JOIN pr_review_guide_source_series s ON s.id = a.series_id
+                 JOIN tasks t ON t.id = s.root_task_id
+                 WHERE a.status = 'failed'
+                   AND a.failed_pre_start = 1
+                   AND a.failed_by_build IS NOT NULL AND a.failed_by_build != ?1
+                   AND s.selected_comparison_id = a.comparison_id
+                   AND t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
+                   AND t.pr_url = s.canonical_pr_url
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pr_review_guide_attempts n
+                       WHERE n.series_id = a.series_id AND n.request_epoch > a.request_epoch
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pr_review_guide_versions v
+                       WHERE v.series_id = a.series_id AND v.comparison_id = a.comparison_id
+                   )
+                 ORDER BY a.finished_at, a.id",
+            )?;
+            stmt.query_map([running_build], |row| {
+                Ok(Candidate {
+                    attempt_id: row.get(0)?,
+                    root_task_id: row.get(1)?,
+                    pr_url: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut report = ReviewGuideReenqueueReport {
+            build: running_build.to_owned(),
+            reenqueued: Vec::new(),
+        };
+        for candidate in candidates {
+            // The token makes a repeat of this exact re-enqueue (a crash
+            // between admit and dispatch, say) return the same attempt.
+            let token = format!("build-change-reenqueue:{}", candidate.attempt_id);
+            match self.request_pr_review_guide(
+                &candidate.root_task_id,
+                Some(&candidate.pr_url),
+                Some(&token),
+                boss_review_guide::PROMPT_VERSION,
+                false,
+            ) {
+                Ok(RetryReviewGuideOutcome::Created(attempt)) => {
+                    report.reenqueued.push(ReenqueuedReviewGuide {
+                        root_task_id: candidate.root_task_id,
+                        pr_url: candidate.pr_url,
+                        failed_attempt_id: candidate.attempt_id,
+                        new_attempt_id: attempt.id,
+                    });
+                }
+                Ok(RetryReviewGuideOutcome::AlreadyRequested(_) | RetryReviewGuideOutcome::NoComparison) => {}
+                Err(err) => tracing::warn!(
+                    attempt_id = %candidate.attempt_id,
+                    root_task_id = %candidate.root_task_id,
+                    ?err,
+                    "review-guide re-enqueue: could not re-enqueue a pre-start-failed attempt",
+                ),
+            }
+        }
+        Ok(report)
     }
 
     fn root_task_id_for_series(&self, series_id: &str) -> Result<Option<String>> {
@@ -929,7 +1123,8 @@ fn classified_review_guide_terminal_reason(status: &ExecutionStatus) -> String {
 }
 
 const PR_REVIEW_GUIDE_ATTEMPT_COLUMNS: &str = "id, series_id, comparison_id, request_epoch, ordinal, execution_id, \
-     status, prompt_version, driver, model, effort_value, error, retries, idempotency_token, created_at, started_at, finished_at, provider_usage_json";
+     status, prompt_version, driver, model, effort_value, error, retries, idempotency_token, created_at, started_at, finished_at, provider_usage_json, \
+     failed_pre_start, failed_by_build";
 
 fn query_pr_review_guide_attempt(conn: &Connection, attempt_id: &str) -> Result<Option<PrReviewGuideAttempt>> {
     conn.query_row(
@@ -961,6 +1156,8 @@ fn map_pr_review_guide_attempt(row: &Row<'_>) -> rusqlite::Result<PrReviewGuideA
         started_at: row.get(15)?,
         finished_at: row.get(16)?,
         provider_usage_json: row.get(17)?,
+        failed_pre_start: row.get::<_, i64>(18)? != 0,
+        failed_by_build: row.get(19)?,
     })
 }
 
@@ -1122,3 +1319,7 @@ pub(crate) async fn notify_review_guide_changed(
 #[cfg(test)]
 #[path = "review_guide_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_guide_reenqueue_tests.rs"]
+mod reenqueue_tests;

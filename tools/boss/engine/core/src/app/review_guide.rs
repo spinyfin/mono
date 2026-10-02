@@ -6,6 +6,56 @@
 
 use super::*;
 
+impl ServerState {
+    /// Summary of the startup review-guide re-enqueue pass for the health
+    /// and `bossctl live-status debug` reports; `None` when it re-enqueued
+    /// nothing.
+    pub(super) fn review_guide_reenqueue_summary(&self) -> Option<boss_protocol::ReviewGuideReenqueueSummary> {
+        let report = self.review_guide_reenqueue.read().ok()?;
+        let report = report.as_ref().filter(|report| !report.reenqueued.is_empty())?;
+        Some(boss_protocol::ReviewGuideReenqueueSummary {
+            build: report.build.clone(),
+            count: report.reenqueued.len(),
+            pr_urls: report.reenqueued.iter().map(|g| g.pr_url.clone()).collect(),
+        })
+    }
+
+    /// Startup: re-enqueue review guides that failed before start on an
+    /// earlier build (see
+    /// [`crate::work::WorkDb::reenqueue_pre_start_failed_review_guides`]),
+    /// and report what was done in one log line, one audit record and the
+    /// health reports. Failures are logged, never fatal.
+    pub(super) fn reenqueue_pre_start_failed_review_guides(&self) {
+        let build = crate::build_info::build_identity();
+        let report = match self.work_db.reenqueue_pre_start_failed_review_guides(build) {
+            Ok(report) => report,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "engine startup: review-guide re-enqueue after a build change failed"
+                );
+                return;
+            }
+        };
+        if !report.reenqueued.is_empty() {
+            let pr_urls: Vec<&str> = report.reenqueued.iter().map(|g| g.pr_url.as_str()).collect();
+            tracing::info!(
+                build,
+                count = pr_urls.len(),
+                prs = ?pr_urls,
+                "engine startup: re-enqueued review guides that failed before start on an earlier build",
+            );
+            crate::audit::record_event(
+                "review_guide_reenqueue",
+                &serde_json::json!({ "build": build, "count": pr_urls.len(), "prs": pr_urls }),
+            );
+        }
+        if let Ok(mut slot) = self.review_guide_reenqueue.write() {
+            *slot = Some(report);
+        }
+    }
+}
+
 pub(super) async fn handle_generate_review_guide(ctx: Dispatch, req: FrontendRequest) {
     let FrontendRequest::GenerateReviewGuide {
         root_task_id,

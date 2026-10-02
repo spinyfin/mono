@@ -693,6 +693,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                         &execution.id,
                         boss_protocol::ExecutionStatus::Failed,
                         &format!("{error:#}"),
+                        true,
                     )?;
                     return Err(error);
                 }
