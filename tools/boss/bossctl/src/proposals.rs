@@ -2,7 +2,7 @@
 //! coordinator-facing read surface for the `worker_proposals` ledger.
 //!
 //! Both open `state.db` directly (same resolution `metrics`/`hosts`/`work
-//! executions` use — see [`crate::open_state_db`]), so they work even when
+//! executions` use — see [`crate::open_state_db_read_only`]), so they work even when
 //! the engine is wedged. Per the proposal-API design's §"UI visibility and
 //! provenance", proposals get no app-side listing surface; this is the full
 //! ledger, including `rejected`/`expired`/`superseded` history.
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use boss_protocol::{ProposalKind, ProposalState, WorkerProposal};
 
-use crate::open_state_db;
+use crate::open_state_db_read_only;
 
 /// `bossctl work proposals list` — optionally filtered by
 /// execution/work-item/kind/state, newest first, bounded by `limit` (`0` =
@@ -42,7 +42,7 @@ pub(crate) fn work_proposals_list(
         .context("parsing --state")?;
     let limit = if limit == 0 { None } else { Some(limit) };
 
-    let db = open_state_db(state_root)?;
+    let db = open_state_db_read_only(state_root)?;
     // Shared choke point: short ids resolve (or hard-error) before the
     // proposals filter so a bare T-form never silently matches nothing.
     let work_item_id = work_item_id
@@ -84,7 +84,7 @@ fn truncation_note(limit: Option<usize>, proposal_count: usize) -> Option<String
 /// proposal, including its payload and disposition. Opens `state.db`
 /// directly, the same as [`work_proposals_list`].
 pub(crate) fn work_proposals_show(json: bool, state_root: Option<PathBuf>, id: &str) -> Result<()> {
-    let db = open_state_db(state_root)?;
+    let db = open_state_db_read_only(state_root)?;
     let proposal = db.get_worker_proposal(id).context("reading worker proposal")?;
 
     if json {
