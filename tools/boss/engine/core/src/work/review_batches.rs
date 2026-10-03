@@ -125,11 +125,11 @@ pub const REVIEW_BATCH_STALE_SECS: u64 = 10 * 60;
 /// the alarm has always covered.
 pub const REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS: u64 = 120;
 
-/// Conservative reservation weight retained across the transition from
-/// three leaves to two, preserving capacity for in-flight legacy batches,
-/// held as one block from batch creation through supervisor completion so a
-/// later batch's leaves can never occupy the slot this batch's own
-/// supervisor will eventually need. See docs/designs/multi-agent-code-review.md,
+/// Reservation weight for up to three leaf reviewers plus the supervisor.
+/// New batches use two leaves; the extra unit covers in-flight legacy
+/// three-leaf batches. Held as one block from batch creation through supervisor
+/// completion so a later batch's leaves can never occupy the slot this
+/// batch's own supervisor will need. See docs/designs/multi-agent-code-review.md,
 /// "Expand the static review pool to 16 slots".
 pub const PRE_MERGE_BATCH_RESERVATION_UNITS: i64 = 4;
 
