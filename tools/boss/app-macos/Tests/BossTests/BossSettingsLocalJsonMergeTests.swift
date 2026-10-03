@@ -34,6 +34,12 @@ final class BossSettingsLocalJsonMergeTests: XCTestCase {
             XCTAssertTrue(permissionsAllow.contains("Bash(boss *)"))
             XCTAssertTrue(autoModeAllow.contains("$defaults"))
             XCTAssertTrue(autoModeAllow.contains("Bash(boss task delete *)"))
+            for verb in ["close", "comment", "ready", "edit"] {
+                XCTAssertTrue(permissionsAllow.contains("Bash(gh pr \(verb) *)"))
+                XCTAssertTrue(autoModeAllow.contains("Bash(gh pr \(verb) *)"))
+            }
+            XCTAssertFalse(permissionsAllow.contains { $0.contains("gh pr merge") })
+            XCTAssertFalse(autoModeAllow.contains { $0.contains("gh pr merge") })
         }
     }
 

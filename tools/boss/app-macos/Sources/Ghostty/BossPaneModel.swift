@@ -168,6 +168,11 @@ func bossShellQuote(_ value: String) -> String {
 
 /// Baseline `permissions.allow` rules the Boss coordinator session needs to run its
 /// own CLIs and inspect state without prompting.
+///
+/// `gh pr close` / `comment` / `ready` / `edit` are reversible PR housekeeping
+/// (`gh pr reopen` undoes close; comments and descriptions can be edited again).
+/// `gh pr merge` is deliberately absent — merging is not pre-cleared — and there
+/// is no blanket `gh *` / `gh pr *` wildcard.
 private let bossBaselinePermissionsAllow: [String] = [
     "Bash(boss *)",
     "Bash(bossctl *)",
@@ -175,6 +180,10 @@ private let bossBaselinePermissionsAllow: [String] = [
     "Bash(gh pr list *)",
     "Bash(gh pr checks *)",
     "Bash(gh pr comments *)",
+    "Bash(gh pr close *)",
+    "Bash(gh pr comment *)",
+    "Bash(gh pr ready *)",
+    "Bash(gh pr edit *)",
     "Bash(gh issue view *)",
     "Bash(gh issue list *)",
     "Bash(jj log *)",
@@ -199,6 +208,13 @@ private let bossBaselinePermissionsAllow: [String] = [
 /// would pre-clear the classifier for destructive verbs this list isn't meant to
 /// cover.
 ///
+/// The `gh pr close` / `comment` / `ready` / `edit` rules are repeated here from
+/// the baseline list. The classifier can refuse these verbs even though the
+/// baseline list allows them, so they are pre-cleared here too. They are
+/// reversible (`gh pr reopen` undoes close; comments and descriptions can be
+/// edited again). `gh pr merge` stays out: merging is not reversible
+/// housekeeping, so it is not pre-cleared.
+///
 /// `boss handoff write` / `show` are the coordinator session handoff (see
 /// "Session handoff" in the prompt). The write replaces a coordinator-private
 /// note and is itself the undo (write again); it must never stall on a
@@ -213,6 +229,10 @@ private let bossAutoModeAllow: [String] = [
     "Bash(boss handoff write *)",
     "Bash(boss handoff show)",
     "Bash(boss handoff show *)",
+    "Bash(gh pr close *)",
+    "Bash(gh pr comment *)",
+    "Bash(gh pr ready *)",
+    "Bash(gh pr edit *)",
 ]
 
 /// Writes the Boss coordinator session's `.claude/settings.local.json`. Merges the
