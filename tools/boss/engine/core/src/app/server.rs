@@ -1380,6 +1380,20 @@ pub async fn serve_with_overrides(
     }
     post_bind.mark("review_guide_attempt_reconcile");
 
+    // The pass probes each candidate PR with a blocking `gh pr view`, so run
+    // it off the async runtime workers.
+    {
+        let state = server_state.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            state.reenqueue_pre_start_failed_review_guides(&crate::work::GhPrStateChecker)
+        })
+        .await
+        {
+            tracing::warn!(?err, "engine startup: review-guide re-enqueue task failed");
+        }
+    }
+    post_bind.mark("review_guide_reenqueue");
+
     let in_flight = match server_state.work_db.list_in_flight_executions() {
         Ok(rows) => rows
             .into_iter()

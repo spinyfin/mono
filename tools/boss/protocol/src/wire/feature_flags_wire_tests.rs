@@ -282,6 +282,7 @@ fn engine_health_result_event_round_trips_healthy() {
             anthropic_api_key_present: true,
             dispatch_paused: false,
             automation_paused: false,
+            review_guide_reenqueue: None,
             issues: Vec::new(),
         },
     };
@@ -320,6 +321,7 @@ fn engine_health_result_event_round_trips_with_issue() {
             anthropic_api_key_present: false,
             dispatch_paused: false,
             automation_paused: false,
+            review_guide_reenqueue: None,
             issues: vec![issue.clone()],
         },
     };

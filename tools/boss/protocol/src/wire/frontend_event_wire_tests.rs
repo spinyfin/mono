@@ -322,6 +322,7 @@ fn live_status_debug_report() -> crate::LiveStatusDebugReport {
         anthropic_api_key_present: true,
         tracked_slot_count: 0,
         disabled_slot_count: 0,
+        review_guide_reenqueue: None,
         dispatcher_stats: crate::DispatcherStatsReport::default(),
         slots: vec![],
     }
@@ -1529,6 +1530,7 @@ fn tag_cases() -> Vec<TagCase> {
                     anthropic_api_key_present: true,
                     dispatch_paused: false,
                     automation_paused: false,
+                    review_guide_reenqueue: None,
                     issues: vec![],
                 },
             },

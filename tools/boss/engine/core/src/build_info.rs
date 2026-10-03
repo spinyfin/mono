@@ -95,6 +95,30 @@ pub fn git_dirty() -> bool {
     boss_build_provenance::git_dirty()
 }
 
+/// Opaque identity of the running engine build, for "did a different
+/// build run since this was recorded" comparisons. Two engines report the
+/// same identity only when they were built from the same commit.
+///
+/// The git sha, with the binary fingerprint appended when the tree was
+/// dirty (two dirty builds of one sha differ) and substituted when the sha
+/// is unstamped (a Cargo build, where every build would otherwise compare
+/// equal as `unknown`). Compare for equality only; the format is not a
+/// contract.
+pub fn build_identity() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let sha = git_sha();
+        if sha.is_empty() || sha == "unknown" {
+            format!("binary:{}", binary_fingerprint())
+        } else if git_dirty() {
+            format!("{sha}+dirty:{}", binary_fingerprint())
+        } else {
+            sha.to_owned()
+        }
+    })
+    .as_str()
+}
+
 /// Best-effort build timestamp string. Uses the stamped provenance
 /// value when available; falls back to the binary mtime sampled at
 /// first call.
@@ -140,7 +164,7 @@ fn binary_mtime_iso8601() -> Option<String> {
 /// IMPORTANT: callers must ensure this function is invoked at engine
 /// startup (via [`init`]) *before* any chance of the on-disk binary
 /// being replaced by an installer. The macOS app's version-mismatch
-/// restart path (T460) depends on the running engine reporting the
+/// restart path depends on the running engine reporting the
 /// fingerprint of the bytes it was *launched from*, not the bytes
 /// that happen to be on disk at the moment of the first query —
 /// otherwise an in-place app update silently rewrites the very file
@@ -273,6 +297,14 @@ mod tests {
     fn git_sha_returns_non_empty_string() {
         let s = git_sha();
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn build_identity_is_non_empty_and_stable_within_a_process() {
+        let a = build_identity();
+        assert!(!a.is_empty());
+        assert_ne!(a, "unknown");
+        assert_eq!(a, build_identity());
     }
 
     #[test]

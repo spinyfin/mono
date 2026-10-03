@@ -2807,6 +2807,15 @@ fn print_live_status_debug_human(report: &LiveStatusDebugReport) {
     );
     println!("  tracked_slots:              {}", report.tracked_slot_count);
     println!("  disabled_slots:             {}", report.disabled_slot_count);
+    if let Some(reenqueue) = &report.review_guide_reenqueue {
+        println!(
+            "  review_guides_reenqueued:   {} after a build change (build {})",
+            reenqueue.count, reenqueue.build,
+        );
+        for pr_url in &reenqueue.pr_urls {
+            println!("    {pr_url}");
+        }
+    }
     println!();
     print_dispatcher_stats(&report.dispatcher_stats);
     if report.slots.is_empty() {

@@ -44,9 +44,26 @@ pub struct EngineHealthReport {
     /// convenience `dispatch_paused` provides.
     #[serde(default)]
     pub automation_paused: bool,
+    /// Review guides this engine process re-enqueued at startup because
+    /// they had failed before start on a different build. `None` when it
+    /// re-enqueued nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_reenqueue: Option<ReviewGuideReenqueueSummary>,
     /// Issues the UI should render, in display order (highest priority
     /// first). Empty when the engine is healthy.
     pub issues: Vec<EngineHealthIssue>,
+}
+
+/// What the startup pass that retries pre-start-failed review guides did.
+/// Shared by the engine health report and `bossctl live-status debug`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewGuideReenqueueSummary {
+    /// Build identity of the engine that ran the pass.
+    pub build: String,
+    /// Number of guides re-enqueued (`pr_urls.len()`).
+    pub count: usize,
+    /// The PRs whose guides were re-enqueued.
+    pub pr_urls: Vec<String>,
 }
 
 /// One UI-actionable engine-health issue. Carries pre-rendered title

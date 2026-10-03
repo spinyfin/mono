@@ -68,6 +68,10 @@ pub struct LiveStatusDebugReport {
     /// Total number of slots whose summarizer is disabled by the
     /// per-slot toggle.
     pub disabled_slot_count: usize,
+    /// Review guides re-enqueued at startup after failing before start on
+    /// a different build; `None` when none were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_reenqueue: Option<crate::ReviewGuideReenqueueSummary>,
     /// Engine-wide counters for the hook-event dispatcher. These
     /// answer the question the prior debug surface couldn't:
     /// "did `set_run_transcript_path_if_unset` ever actually get
@@ -244,6 +248,7 @@ mod tests {
             anthropic_api_key_present: true,
             tracked_slot_count: 2,
             disabled_slot_count: 1,
+            review_guide_reenqueue: None,
             dispatcher_stats: DispatcherStatsReport {
                 hook_events_total: 7,
                 hook_events_dropped_missing_run_id: 1,
@@ -298,6 +303,7 @@ mod tests {
             anthropic_api_key_present: false,
             tracked_slot_count: 0,
             disabled_slot_count: 0,
+            review_guide_reenqueue: None,
             dispatcher_stats: DispatcherStatsReport::default(),
             slots: vec![],
         };
@@ -367,6 +373,7 @@ mod tests {
             anthropic_api_key_present: false,
             tracked_slot_count: 0,
             disabled_slot_count: 0,
+            review_guide_reenqueue: None,
             dispatcher_stats: DispatcherStatsReport {
                 transcript_path_persist_row_missing: 7,
                 ..DispatcherStatsReport::default()

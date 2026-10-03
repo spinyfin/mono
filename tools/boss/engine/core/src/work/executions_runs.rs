@@ -82,6 +82,7 @@ impl WorkDb {
                 execution_id,
                 ExecutionStatus::Cancelled,
                 &reason,
+                false,
             )
         {
             tracing::warn!(
@@ -199,6 +200,7 @@ impl WorkDb {
                 execution_id,
                 ExecutionStatus::Orphaned,
                 reason,
+                false,
             )
         {
             tracing::warn!(
@@ -1812,6 +1814,7 @@ impl WorkDb {
                 execution_id,
                 ExecutionStatus::Failed,
                 error_text,
+                true,
             )
         {
             tracing::warn!(
@@ -1979,7 +1982,7 @@ impl WorkDb {
         if fail_review_guide_attempt
             && let Some(reason) = normalized_error_text.as_deref()
             && let Err(err) =
-                self.finish_pr_review_guide_attempt_for_terminal_execution(execution_id, execution_status, reason)
+                self.finish_pr_review_guide_attempt_for_terminal_execution(execution_id, execution_status, reason, true)
         {
             tracing::warn!(
                 execution_id = %execution_id,

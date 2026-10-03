@@ -318,6 +318,7 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         anthropic_api_key_present,
         dispatch_paused,
         automation_paused,
+        review_guide_reenqueue: server_state.review_guide_reenqueue_summary(),
         issues,
     }
 }
@@ -416,6 +417,7 @@ pub(super) fn build_live_status_debug_report(
         anthropic_api_key_present: server_state.anthropic_api_key.is_some(),
         tracked_slot_count: active_slots.len(),
         disabled_slot_count: disabled_set.len(),
+        review_guide_reenqueue: server_state.review_guide_reenqueue_summary(),
         slots,
     }
 }
