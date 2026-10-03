@@ -1,26 +1,26 @@
 //! Grok model / effort menu tables.
 //!
-//! Sourced from authenticated `grok models` on 2026-08-18. Catalog snapshot
-//! has a current default plus a prior generation:
+//! Sourced from authenticated `grok models` on 2026-10-03 (CLI 1.0.46):
 //!
 //! ```text
-//! Default model: grok-4.6
+//! Default model: grok-4.7
 //! Available models:
-//!   * grok-4.6 (default)
+//!   * grok-4.7 (default)
+//!   - grok-4.7-build-fast
+//!   - grok-4.6
 //!   - grok-4.5
 //! ```
 //!
 //! # Refresh path
 //!
 //! `ModelMenu` is static function pointers today, so this is a baked
-//! snapshot rather than a live `grok models` parse. This table pins the
-//! provider's current default (plus whatever prior generation xAI still
-//! retains on the menu). Refresh source is the machine-readable `grok
-//! models` listing; when `grok models` reports a new default, update
-//! [`super::GROK_DESCRIPTOR`]'s `engine_default` / `model_for_reasoning` /
-//! `default_model_for_level` together and update the live pin in
-//! `conformance/version_pin.rs` (design A-11 / T-20). Never dispatch a
-//! retained prior generation as a fallback.
+//! snapshot rather than a live `grok models` parse. PR reviews use the active
+//! fast model as a latency experiment. Non-review workers deliberately remain
+//! pinned to `grok-4.6`, independently of the provider default. Refresh from
+//! authenticated `grok models` and update the catalog pin in
+//! `conformance/version_pin.rs`. Changing the non-review policy also requires
+//! updating `engine_default`, `model_for_reasoning`, and
+//! `default_model_for_level` together.
 //!
 //! Do **not** reference `grok-build-0.1` (not on the account menu) or
 //! `grok-code-fast-1` (retired 15 May 2026; silently redirects rather
@@ -68,26 +68,19 @@ pub(super) fn effort_value_for_level(level: EffortLevel) -> Option<&'static str>
     })
 }
 
-/// Capability-lever model choice. xAI exposes one current generation plus
-/// retained prior ones; Boss dispatches only the current default, so both
-/// `Standard` and `Investigation` resolve to `grok-4.6`. The retained prior
-/// generation is never selected as a lower tier or fallback — it is the
-/// field most likely to be wrong within a quarter (see module refresh
-/// path).
+/// Non-review capability policy stays pinned to `grok-4.6` for both reasoning
+/// modes; the fast-model experiment is limited to PR review members.
 pub(super) fn model_for_reasoning(_reasoning: ReasoningMode) -> &'static str {
     "grok-4.6"
 }
 
-/// xAI's current menu has no supported lower review tier. Preserve the
-/// concrete fast/balanced/strong mapping even though all three rows resolve
-/// to the current generation, so a future menu expansion changes only this
-/// table.
+/// Use the active fast model for all PR review profiles to reduce round latency.
 pub(super) fn review_model_for_tier(_tier: ReviewModelTier) -> &'static str {
-    "grok-4.6"
+    "grok-4.7-build-fast"
 }
 
 /// Legacy size-derived table. Consulted only for rows with no
-/// [`ReasoningMode`]. The current default → every level maps to `grok-4.6`.
+/// [`ReasoningMode`]. Every level remains pinned to `grok-4.6`.
 pub(super) fn default_model_for_level(_level: EffortLevel) -> &'static str {
     "grok-4.6"
 }

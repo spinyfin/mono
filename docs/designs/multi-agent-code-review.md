@@ -142,15 +142,15 @@ Only a Deep batch that contains production code is eligible for post-merge revie
 
 Extend the driver model menu with a review-specific `fast`, `balanced`, and `strong` mapping. The policy is concrete at current HEAD:
 
-| Review profile | Claude   | Codex         | Grok       | Provider effort |
-| -------------- | -------- | ------------- | ---------- | --------------- |
-| Light          | `sonnet` | `gpt-6-astra` | `grok-4.6` | `medium`        |
-| Standard       | `sonnet` | `gpt-6-astra` | `grok-4.6` | `medium`        |
-| Deep           | `opus`   | `gpt-6-astra` | `grok-4.6` | `medium`        |
+| Review profile | Claude   | Codex         | Grok                  | Provider effort |
+| -------------- | -------- | ------------- | --------------------- | --------------- |
+| Light          | `sonnet` | `gpt-6-astra` | `grok-4.7-build-fast` | `medium`        |
+| Standard       | `sonnet` | `gpt-6-astra` | `grok-4.7-build-fast` | `medium`        |
+| Deep           | `opus`   | `gpt-6-astra` | `grok-4.7-build-fast` | `medium`        |
 
 The Claude mapping follows the requested example: small/simple work uses Sonnet, while large/complex work earns Opus. Codex selects `gpt-6-astra` for Light, Standard, and Deep.
 
-Grok has no equivalent fast tier in the authenticated menu recorded by the driver: it exposes current `grok-4.6` and retained `grok-4.5`, while the former fast-code model is retired and silently redirects. Selecting an old generation merely to manufacture variability would be an unverified downgrade, so all three profiles use `grok-4.6`. This is an explicit capability limit; a future active fast model can populate the menu mapping without changing the classifier or batch schema.
+All three Grok review profiles use `grok-4.7-build-fast` as a latency experiment. Authenticated `grok models` (CLI 1.0.46, 2026-10-03) lists it as an available model alongside default `grok-4.7` and retained `grok-4.6` / `grok-4.5`. This is the active fast model, not the retired `grok-code-fast-1` alias that silently redirects. Grok implementation workers and other non-review roles remain pinned to `grok-4.6`; only the review menu mapping changes, with no classifier or batch-schema change.
 
 Every leaf receives provider effort `medium`. Model capability varies with the PR; effort does not vary with the parent task, which removes the current confound and keeps the measured comparison interpretable.
 

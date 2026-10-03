@@ -400,10 +400,9 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
 // text diff: a `--help` diff would never notice `--trust`'s removal (it was
 // never listed there), and losing it silently hangs every worker on the
 // folder-trust dialog (spike Q3). The `grok models` pin asserts the live
-// default still matches `GROK_DESCRIPTOR`'s `engine_default` (currently
-// `grok-4.6`, with `grok-4.5` retained as a prior generation) — any change
-// to the default, or to the retained-generation set, must fail this pin
-// loudly rather than be silently absorbed as a stale pin.
+// provider default and available models match the authenticated catalog snapshot.
+// Boss intentionally pins non-review workers independently to grok-4.6; both
+// that model and every review tier must remain available in the live catalog.
 
 /// Probe grok availability with a flag guaranteed to be present (`--help`).
 /// Soft-skip (return `false`, meaning "test body should return early") when
@@ -539,19 +538,24 @@ fn grok_models_menu_matches_pinned_descriptor() {
         .collect();
 
     let driver = GrokDriver::default();
-    let expected_default = driver.descriptor().model_menu.engine_default;
+    let menu = &driver.descriptor().model_menu;
+    let expected_default = "grok-4.7";
     assert_eq!(
         default_model, expected_default,
-        "`grok models` default must match the pinned descriptor's engine_default; \
+        "`grok models` default must match the pinned provider catalog; \
          got stdout={stdout:?}",
     );
-    let expected_available = vec!["grok-4.6", "grok-4.5"];
+    let expected_available = vec!["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];
     assert_eq!(
         available, expected_available,
-        "`grok models` menu changed shape ({available:?}); this pin asserts the live default \
-         still matches GROK_DESCRIPTOR's engine_default and that the retained-generation set is \
-         exactly what's expected — a genuinely new generation or a dropped retained SKU must \
-         update GROK_DESCRIPTOR's model menu (model_menu.rs) deliberately (design A-11 / T-20) \
-         rather than being silently absorbed as a stale pin. got stdout={stdout:?}",
+        "`grok models` menu changed shape; refresh the authenticated catalog snapshot deliberately in model_menu.rs and this pin. got stdout={stdout:?}",
     );
+    assert!(available.contains(&menu.engine_default));
+    for tier in [
+        boss_protocol::ReviewModelTier::Fast,
+        boss_protocol::ReviewModelTier::Balanced,
+        boss_protocol::ReviewModelTier::Strong,
+    ] {
+        assert!(available.contains(&(menu.review_model_for_tier)(tier)));
+    }
 }

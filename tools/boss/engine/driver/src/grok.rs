@@ -82,9 +82,8 @@ use super::{
 // ---------------------------------------------------------------------------
 //
 // Model menu refresh path: `grok models` is the machine-readable source.
-// The current-default table below must be refreshed whenever xAI changes the
-// catalog — update engine_default / model_for_reasoning /
-// default_model_for_level together. Do not hard-freeze forever, and never
+// Review tiers use the active fast model; non-review workers stay on grok-4.6.
+// Refresh the catalog pin independently from that deliberate policy. Never
 // reintroduce `grok-build-0.1` (not on the account menu) or
 // `grok-code-fast-1` (retired; silently redirects).
 
@@ -1396,14 +1395,41 @@ mod tests {
                 "Grok effort for {level:?} must be one of low|medium|high, got {v:?}",
             );
         }
-        // Both reasoning modes use the provider's current default.
+        // Both non-review reasoning modes retain the existing model.
         assert_eq!((menu.model_for_reasoning)(ReasoningMode::Standard), "grok-4.6");
         assert_eq!((menu.model_for_reasoning)(ReasoningMode::Investigation), "grok-4.6");
-        assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Fast), "grok-4.6");
-        assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Balanced), "grok-4.6");
-        assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Strong), "grok-4.6");
-        assert_eq!((menu.default_model_for_level)(EffortLevel::Trivial), "grok-4.6");
-        assert_eq!((menu.default_model_for_level)(EffortLevel::Max), "grok-4.6");
+        assert_eq!(
+            (menu.review_model_for_tier)(ReviewModelTier::Fast),
+            "grok-4.7-build-fast"
+        );
+        assert_eq!(
+            (menu.review_model_for_tier)(ReviewModelTier::Balanced),
+            "grok-4.7-build-fast"
+        );
+        assert_eq!(
+            (menu.review_model_for_tier)(ReviewModelTier::Strong),
+            "grok-4.7-build-fast"
+        );
+        for level in [
+            EffortLevel::Trivial,
+            EffortLevel::Small,
+            EffortLevel::Medium,
+            EffortLevel::Large,
+            EffortLevel::Max,
+        ] {
+            assert_eq!((menu.default_model_for_level)(level), "grok-4.6");
+        }
+        for profile in [
+            boss_protocol::ReviewProfile::Light,
+            boss_protocol::ReviewProfile::Standard,
+            boss_protocol::ReviewProfile::Deep,
+        ] {
+            assert_eq!(
+                (menu.review_model_for_tier)(profile.model_tier()),
+                "grok-4.7-build-fast"
+            );
+        }
+        assert!((menu.model_belongs_to_driver)("grok-4.7-build-fast"));
         assert!(!(menu.model_requires_auto_permissions)("grok-4.6"));
         assert!((menu.model_belongs_to_driver)("grok-4.6"));
         assert!((menu.model_belongs_to_driver)("GROK-4.6"));
