@@ -90,6 +90,59 @@ impl WorkDb {
         Ok(db)
     }
 
+    /// Inspect an existing database without migrations, journal-mode changes,
+    /// or any ability to write. CLI inspection must never run engine startup.
+    pub fn open_read_only(path: PathBuf) -> Result<Self> {
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening existing database {} for inspection", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        Ok(Self {
+            path,
+            memory: None,
+            conn: Arc::new(Mutex::new(conn)),
+            boothby_action: Arc::default(),
+            event_bus: Arc::new(EventBus::new()),
+        })
+    }
+
+    /// Independent WAL reader for bulk inspection. In-memory test databases
+    /// keep their anchor; production file databases never share the writer mutex.
+    pub(crate) fn reader(&self) -> Result<Self> {
+        if self.memory.is_some() {
+            return Ok(self.clone());
+        }
+        Self::open_read_only(self.path.clone())
+    }
+
+    /// Attach a CLI command to initialized state. Only engine startup runs
+    /// migrations; even a mutating CLI command must not replay them per call.
+    pub fn open_existing(path: PathBuf) -> Result<Self> {
+        let mut conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .with_context(|| format!("opening existing database {}", path.display()))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
+        conn.set_transaction_behavior(TransactionBehavior::Immediate);
+        Ok(Self {
+            path,
+            memory: None,
+            conn: Arc::new(Mutex::new(conn)),
+            boothby_action: Arc::default(),
+            event_bus: Arc::new(EventBus::new()),
+        })
+    }
+
+    /// Give an admitted frontend query its own connection. Some Get RPCs
+    /// refresh persisted state, so retain write capability and the event bus.
+    pub(crate) fn query_connection(&self) -> Result<Self> {
+        if self.memory.is_some() {
+            return Ok(self.clone());
+        }
+        let connection = Self::open_existing(self.path.clone())?;
+        let mut result = self.clone();
+        result.conn = connection.conn;
+        Ok(result)
+    }
+
     /// Create a per-call named shared-cache in-memory database. Each call
     /// gets a unique name so parallel tests never share state. The one
     /// connection opened here (held in `WorkDb::conn`) keeps the shared-cache

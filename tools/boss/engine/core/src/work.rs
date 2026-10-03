@@ -649,6 +649,8 @@ mod executions_runs;
 mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
+#[cfg(test)]
+mod read_only_tests;
 pub(crate) use feedback_target::FeedbackTarget;
 mod guide_comments;
 mod guide_feedback;
