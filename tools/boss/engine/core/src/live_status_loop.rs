@@ -36,13 +36,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use boss_protocol::WorkerActivity;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::driver::{AgentDriver, TranscriptSessionNormalizer};
 use crate::live_status::{self, SummarizerOutcome};
@@ -50,6 +51,10 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::metrics::Registry;
 use crate::transcript_tail::TranscriptTail;
 use crate::utility_model::UtilityModel;
+
+#[cfg(test)]
+#[path = "live_status_refresh_tests.rs"]
+mod refresh_tests;
 
 /// Per-slot diagnostic state captured by the trigger fan-in. The
 /// `bossctl live-status debug` verb reads this to give a one-shot view
@@ -673,6 +678,15 @@ impl LiveStatusManager {
             "live_status: start_slot — spawning per-slot summarizer task",
         );
         let (sender, receiver) = mpsc::unbounded_channel();
+        // Re-adoption retains the registry's activity and summary, but replaces
+        // this task. Seed it while installing the channel: an already Working
+        // worker need not emit another activity transition for the whole turn.
+        // Hold the manager lock through installation so a newer notification
+        // cannot be delivered ahead of this snapshot (or dropped in the gap).
+        let mut guard = self.slots.lock().expect("manager mutex poisoned");
+        if let Some(state) = registry.get(slot_id).filter(|state| state.run_id == run_id) {
+            let _ = sender.send(Trigger::ActivityChanged(state.activity));
+        }
         // Reset the diagnostic snapshot for this slot — the prior
         // entry, if any, belongs to a previous run that just
         // released. The disabled flag is sticky across re-spawns so
@@ -695,7 +709,6 @@ impl LiveStatusManager {
             debug_store: self.debug_store.clone(),
         };
         let join = tokio::spawn(run_slot_loop(cfg, receiver));
-        let mut guard = self.slots.lock().expect("manager mutex poisoned");
         guard.insert(
             slot_id,
             SlotHandle {
@@ -843,14 +856,16 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
     let mut transcript_buffer: Vec<Value> = Vec::new();
     let mut post_tool_use_count: u32 = 0;
     let mut last_success_at: Option<Instant> = None;
+    // Pin the floor to an attempt, including an empty transcript or failure.
+    // Unrelated hooks must not restart it before the first success, and a
+    // failed refresh must not leave an expired deadline spinning every 50ms.
+    let mut last_refresh_attempt = Instant::now();
     let mut last_activity = WorkerActivity::Spawning;
     let mut idle_since: Option<Instant> = None;
 
     loop {
-        // The select! arm for the timer floor only matters while we're
-        // in `Working` and have a `last_success_at` to count against.
-        // Outside of that, idle out the loop on the channel only.
-        let timer_remaining = compute_timer_delay(last_activity, last_success_at, idle_since, Instant::now());
+        let timer_remaining =
+            compute_timer_delay(last_activity, Some(last_refresh_attempt), idle_since, Instant::now());
         let (trigger, synthetic) = tokio::select! {
             t = rx.recv() => match t {
                 Some(t) => (t, false),
@@ -920,9 +935,14 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                 // No filter — Stop is the cleanest refresh boundary.
             }
             Trigger::PostToolUse => {
-                post_tool_use_count = post_tool_use_count.wrapping_add(1);
-                if !post_tool_use_count.is_multiple_of(POST_TOOL_USE_K) {
-                    continue;
+                // The timer is the refresh floor, not a fictitious tool call.
+                // Applying the modulus here used to delay initial refreshes
+                // for five timer periods when no real hooks arrived.
+                if !synthetic {
+                    post_tool_use_count = post_tool_use_count.wrapping_add(1);
+                    if !post_tool_use_count.is_multiple_of(POST_TOOL_USE_K) {
+                        continue;
+                    }
                 }
             }
         }
@@ -936,6 +956,8 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             );
             continue;
         }
+
+        last_refresh_attempt = Instant::now();
 
         // Per-slot off-switch (Q9). When the human has disabled this
         // slot, drop any prior `live_status` (so the UI falls back to
@@ -1126,9 +1148,9 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
 
 /// Decide how long until the next forced tick on the slot loop.
 ///
-/// - `Working` with no prior success → fire after `WORKING_TIMER_FLOOR`.
-/// - `Working` with a recent success → fire after the cooldown
-///   completes, so the timer floor doesn't shorten the cooldown.
+/// - `Working` → fire at the pinned attempt deadline, including when the
+///   last attempt found no transcript or failed. The success cooldown is
+///   enforced separately before making a model call.
 /// - `Idle` with the grace period running → fire when the grace
 ///   would expire so the clear-on-30s rule lands without waiting for
 ///   another hook.
@@ -1137,13 +1159,13 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
 ///   any hook event will pre-empt the sleep.
 fn compute_timer_delay(
     activity: WorkerActivity,
-    last_success_at: Option<Instant>,
+    last_refresh_attempt: Option<Instant>,
     idle_since: Option<Instant>,
     now: Instant,
 ) -> Duration {
     match activity {
         WorkerActivity::Working => {
-            let elapsed = last_success_at
+            let elapsed = last_refresh_attempt
                 .map(|t| now.saturating_duration_since(t))
                 .unwrap_or(Duration::ZERO);
             WORKING_TIMER_FLOOR
