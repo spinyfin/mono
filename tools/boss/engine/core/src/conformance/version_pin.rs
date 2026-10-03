@@ -400,10 +400,12 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
 // text diff: a `--help` diff would never notice `--trust`'s removal (it was
 // never listed there), and losing it silently hangs every worker on the
 // folder-trust dialog (spike Q3). The `grok models` pin asserts the live
-// default still matches `GROK_DESCRIPTOR`'s `engine_default` (currently
-// `grok-4.6`, with `grok-4.5` retained as a prior generation) — any change
-// to the default, or to the retained-generation set, must fail this pin
-// loudly rather than be silently absorbed as a stale pin.
+// dispatched generation still matches `GROK_DESCRIPTOR`'s `engine_default`
+// (`grok-4.7`) and that `grok-4.7` is still on the live menu (not a retired
+// redirect). The CLI default remains `grok-4.6` as of 2026-10-03; Boss
+// dispatches `grok-4.7` by operator decision. Any change to the live menu
+// or to the dispatched id must fail this pin loudly rather than be silently
+// absorbed as a stale pin.
 
 /// Probe grok availability with a flag guaranteed to be present (`--help`).
 /// Soft-skip (return `false`, meaning "test body should return early") when
@@ -541,17 +543,27 @@ fn grok_models_menu_matches_pinned_descriptor() {
     let driver = GrokDriver::default();
     let expected_default = driver.descriptor().model_menu.engine_default;
     assert_eq!(
-        default_model, expected_default,
-        "`grok models` default must match the pinned descriptor's engine_default; \
+        expected_default, "grok-4.7",
+        "GROK_DESCRIPTOR engine_default must be the dispatched generation grok-4.7",
+    );
+    assert!(
+        available.contains(&expected_default),
+        "`grok models` must still list the dispatched engine_default {expected_default:?} as an \
+         active (non-retired) id; a missing or redirected SKU must fail this pin. got stdout={stdout:?}",
+    );
+    assert_eq!(
+        default_model, "grok-4.6",
+        "`grok models` CLI default is still grok-4.6 as of the 2026-10-03 bump (Boss dispatches \
+         grok-4.7 anyway); a provider default flip must update this pin deliberately. \
          got stdout={stdout:?}",
     );
-    let expected_available = vec!["grok-4.6", "grok-4.5"];
+    let expected_available = vec!["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];
     assert_eq!(
         available, expected_available,
-        "`grok models` menu changed shape ({available:?}); this pin asserts the live default \
-         still matches GROK_DESCRIPTOR's engine_default and that the retained-generation set is \
-         exactly what's expected — a genuinely new generation or a dropped retained SKU must \
-         update GROK_DESCRIPTOR's model menu (model_menu.rs) deliberately (design A-11 / T-20) \
+        "`grok models` menu changed shape ({available:?}); this pin asserts the live catalog \
+         still matches the snapshot in GROK_DESCRIPTOR's model menu and that grok-4.7 remains \
+         an active id — a genuinely new generation or a dropped retained SKU must update \
+         GROK_DESCRIPTOR's model menu (model_menu.rs) deliberately (design A-11 / T-20) \
          rather than being silently absorbed as a stale pin. got stdout={stdout:?}",
     );
 }

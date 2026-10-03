@@ -236,7 +236,7 @@ fn codex_model_requires_auto_permissions(_model: &str) -> bool {
 /// Returns `true` iff `model` names a Codex model — any `gpt-*` slug plus the
 /// hidden `codex-auto-review` SKU. Case-insensitive. This is a real
 /// predicate: it still rejects Claude/Grok family aliases (`"opus"`,
-/// `"sonnet"`, `"claude-opus-4-7"`, `"grok-4.6"`) that must not reach the
+/// `"sonnet"`, `"claude-opus-4-7"`, `"grok-4.7"`) that must not reach the
 /// Codex CLI verbatim. Prefix-matching the whole `gpt-` family is
 /// deliberate so a catalog SKU such as `gpt-reserve` or a later
 /// generation (`gpt-7-*`) is not silently swapped for `engine_default`.

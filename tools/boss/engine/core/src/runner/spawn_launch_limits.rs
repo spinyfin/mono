@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn fail_closed_remote_limits_refuse_a_600kb_prompt() {
-        let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
+        let command = "grok --model 'grok-4.7' \"$(cat .grok/initial-prompt.txt)\"\n";
         let err = check_launch_command_arg_max_for_bytes(
             command,
             "grok",

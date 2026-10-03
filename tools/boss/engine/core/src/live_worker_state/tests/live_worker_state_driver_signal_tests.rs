@@ -8,7 +8,7 @@ fn aged_slot_with_live_shell(reg: &LiveWorkerStateRegistry, slot: u8, run: &str,
     reg.register_spawn_with_capabilities(
         slot,
         run,
-        "grok-4.6",
+        "grok-4.7",
         92697,
         None,
         awaiting_input_capable,
@@ -85,7 +85,7 @@ fn aged_readopted_slot(reg: &LiveWorkerStateRegistry, slot: u8, run: &str, evide
     reg.register_readoption(
         slot,
         run,
-        "grok-4.6",
+        "grok-4.7",
         92697,
         None,
         false,
@@ -305,7 +305,7 @@ fn mark_stalled_spawns_promotion_is_not_driver_evidence() {
 fn unverified_driver_starts_respects_the_grace_window() {
     let reg = LiveWorkerStateRegistry::new();
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
-    reg.register_spawn(1, "run-a", "grok-4.6", 92697, None);
+    reg.register_spawn(1, "run-a", "grok-4.7", 92697, None);
     reg.set_spawn_time_for_test(1, now - 5);
 
     assert!(

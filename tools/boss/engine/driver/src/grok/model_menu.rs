@@ -1,20 +1,28 @@
 //! Grok model / effort menu tables.
 //!
-//! Sourced from authenticated `grok models` on 2026-08-18. Catalog snapshot
-//! has a current default plus a prior generation:
+//! Sourced from authenticated `grok models` on 2026-10-03. Catalog snapshot
+//! has a current generation, a fast SKU, the CLI default, and a retained
+//! prior generation:
 //!
 //! ```text
 //! Default model: grok-4.6
 //! Available models:
+//!   - grok-4.7
+//!   - grok-4.7-build-fast
 //!   * grok-4.6 (default)
 //!   - grok-4.5
 //! ```
+//!
+//! Boss dispatches `grok-4.7` for ordinary (non-review) work by operator
+//! decision. The CLI default is still `grok-4.6`; `grok-4.7` is an active
+//! menu id, not a retired redirect. Review-batch member mapping stays on
+//! `grok-4.6` until a separate change moves it to the fast SKU.
 //!
 //! # Refresh path
 //!
 //! `ModelMenu` is static function pointers today, so this is a baked
 //! snapshot rather than a live `grok models` parse. This table pins the
-//! provider's current default (plus whatever prior generation xAI still
+//! generation Boss dispatches (plus whatever prior generation xAI still
 //! retains on the menu). Refresh source is the machine-readable `grok
 //! models` listing; when `grok models` reports a new default, update
 //! [`super::GROK_DESCRIPTOR`]'s `engine_default` / `model_for_reasoning` /
@@ -30,7 +38,8 @@ use boss_protocol::{EffortLevel, ReasoningMode, ReviewModelTier};
 
 /// Map a Boss effort level onto Grok's `--reasoning-effort` vocabulary.
 ///
-/// **Live ladder (model `grok-4.6`, probed 2026-08-18):**
+/// **Live ladder (model `grok-4.7`, probed 2026-10-03; same three rungs as
+/// `grok-4.6` on 2026-08-18):**
 /// only `low`, `medium`, and `high` are accepted. Anything else is rejected
 /// at request time (not at flag parse) with:
 ///
@@ -68,28 +77,29 @@ pub(super) fn effort_value_for_level(level: EffortLevel) -> Option<&'static str>
     })
 }
 
-/// Capability-lever model choice. xAI exposes one current generation plus
-/// retained prior ones; Boss dispatches only the current default, so both
-/// `Standard` and `Investigation` resolve to `grok-4.6`. The retained prior
-/// generation is never selected as a lower tier or fallback — it is the
-/// field most likely to be wrong within a quarter (see module refresh
-/// path).
+/// Capability-lever model choice. Boss dispatches `grok-4.7` for both
+/// `Standard` and `Investigation`. The CLI default (`grok-4.6`) and the
+/// older retained generation (`grok-4.5`) are never selected as a lower
+/// tier or fallback — they are the fields most likely to be wrong within a
+/// quarter (see module refresh path).
 pub(super) fn model_for_reasoning(_reasoning: ReasoningMode) -> &'static str {
-    "grok-4.6"
+    "grok-4.7"
 }
 
-/// xAI's current menu has no supported lower review tier. Preserve the
-/// concrete fast/balanced/strong mapping even though all three rows resolve
-/// to the current generation, so a future menu expansion changes only this
-/// table.
+/// Review-batch member mapping. Left on `grok-4.6` while a separate change
+/// moves the Grok review member to the fast SKU (`grok-4.7-build-fast`).
+/// Preserve the concrete fast/balanced/strong mapping even though all three
+/// rows currently resolve to the same generation, so that change touches
+/// only this table.
 pub(super) fn review_model_for_tier(_tier: ReviewModelTier) -> &'static str {
     "grok-4.6"
 }
 
 /// Legacy size-derived table. Consulted only for rows with no
-/// [`ReasoningMode`]. The current default → every level maps to `grok-4.6`.
+/// [`ReasoningMode`]. Every level maps to the dispatched generation
+/// `grok-4.7`.
 pub(super) fn default_model_for_level(_level: EffortLevel) -> &'static str {
-    "grok-4.6"
+    "grok-4.7"
 }
 
 /// Optional per-level worker-prompt addendum. Same shape as Claude/Codex

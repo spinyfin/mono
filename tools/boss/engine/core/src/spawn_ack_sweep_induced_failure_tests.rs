@@ -146,7 +146,7 @@ fn setup_incident(readopted: bool) -> IncidentFixture {
     live_states.register_spawn_with_capabilities(
         1,
         &execution_id,
-        "grok-4.6",
+        "grok-4.7",
         shell_pid,
         Some(WorkItemBinding {
             work_item_id: work_item_id.clone(),
@@ -174,7 +174,7 @@ fn setup_incident(readopted: bool) -> IncidentFixture {
         live_states.register_readoption(
             1,
             &execution_id,
-            "grok-4.6",
+            "grok-4.7",
             shell_pid,
             Some(WorkItemBinding {
                 work_item_id: work_item_id.clone(),
@@ -365,7 +365,7 @@ async fn the_same_pane_with_a_driver_signal_is_left_completely_alone() {
     live_states.register_spawn_with_capabilities(
         1,
         &execution_id,
-        "grok-4.6",
+        "grok-4.7",
         shell_pid,
         Some(WorkItemBinding {
             work_item_id: work_item_id.clone(),

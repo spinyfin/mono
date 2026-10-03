@@ -64,7 +64,7 @@ fn codex_model_belongs_to_driver_recognises_codex_vocabulary() {
 fn codex_model_belongs_to_driver_rejects_other_drivers_models() {
     // The exact bug this gate exists to catch: a Claude family alias
     // reaching the Codex CLI verbatim.
-    for model in ["opus", "sonnet", "claude-opus-4-7", "grok-4.6"] {
+    for model in ["opus", "sonnet", "claude-opus-4-7", "grok-4.7"] {
         assert!(
             !codex_model_belongs_to_driver(model),
             "{model:?} should not be recognised as a Codex model"

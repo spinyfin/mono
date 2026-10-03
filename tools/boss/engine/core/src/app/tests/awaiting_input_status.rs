@@ -371,7 +371,7 @@ async fn a_capability_less_idle_promotion_does_not_mirror_waiting_human() {
     server_state.live_worker_states.register_spawn_with_capabilities(
         SLOT,
         execution.id.clone(),
-        "grok-4.6",
+        "grok-4.7",
         4242,
         None,
         false,

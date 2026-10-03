@@ -34,7 +34,7 @@
 1. **The pane monitor is not a liveness signal** — only a pre-hook fallback pill. It is now driver-supplied end-to-end (mono#2483) with Grok's measured markers under `--no-alt-screen` (mono#2470): `Shift+Tab:mode` / `always-approve` / `Grok 4`, busy `Esc:cancel` / `[stop]`, starting `Starting session`, prompt `│ ❯`.
 2. **Esc-cancelled turns skip the `Stop` hook.** Recovery tails the constructible `events.jsonl` for `turn_ended outcome=cancelled`, with a bounded synthesis fallback (mono#2525).
 
-**Model menu follows the provider default.** Authenticated `grok models` on 2026-08-18 reports `grok-4.6` as the default and `grok-4.5` as the previous generation; Boss dispatches the default generation for both reasoning modes and its legacy fallback. `grok-build-0.1` is not on the account menu. The live effort ladder is only `low` / `medium` / `high` — the original seven-rung sketch (`xhigh` / `max` included) was wrong for the installed CLI and would fail the turn after spawn.
+**Model menu dispatches `grok-4.7`.** Authenticated `grok models` on 2026-10-03 lists `grok-4.7` and `grok-4.7-build-fast` as available, with CLI default still `grok-4.6` and `grok-4.5` retained. Boss dispatches `grok-4.7` for both reasoning modes and its legacy fallback (operator decision; `grok-4.7` is an active id, not a retired redirect). Review-batch members stay on `grok-4.6` until a separate change. `grok-build-0.1` is not on the account menu. The live effort ladder is only `low` / `medium` / `high` — the original seven-rung sketch (`xhigh` / `max` included) was wrong for the installed CLI and would fail the turn after spawn.
 
 ## Goals
 
@@ -126,7 +126,7 @@ So `--trust` is a real but undocumented flag. This is exactly the failure shape 
 
 ### Re-verified against the spike
 
-On 2026-08-18, authenticated `grok models` reported `Default model: grok-4.6` with `grok-4.5` retained as an available prior generation. No new CLI parameters or effort levels were reported.
+On 2026-10-03, authenticated `grok models` reported `Default model: grok-4.6` with available `grok-4.7`, `grok-4.7-build-fast`, `grok-4.6` (default), and `grok-4.5`. No new CLI parameters or effort levels were reported. Boss dispatches `grok-4.7` for ordinary work.
 
 ### The pinning argument
 
@@ -331,15 +331,17 @@ $ grok models
 You are logged in with grok.com.
 Default model: grok-4.6
 Available models:
+  - grok-4.7
+  - grok-4.7-build-fast
   * grok-4.6 (default)
   - grok-4.5
 ```
 
-Re-run 2026-08-18. **Current default plus prior generation.** The settled dispatch choice is the provider default, `grok-4.6`; the driver must not select retained `grok-4.5` as a fallback. This continues to resolve the open question about `grok-build-0.1`: **it is not on this account's menu, and the driver must not reference it.** `grok-code-fast-1` is retired (15 May 2026) and silently redirects rather than erroring, which makes it useless as a probe target — do not use it to test model selection.
+Re-run 2026-10-03. **Current generation plus CLI default plus retained prior.** The settled dispatch choice for ordinary work is `grok-4.7` (active on the menu, not a retired redirect). The CLI default remains `grok-4.6`; the driver must not select retained `grok-4.5` as a fallback. Review-batch members stay on `grok-4.6` until a separate change moves them to the fast SKU. This continues to resolve the open question about `grok-build-0.1`: **it is not on this account's menu, and the driver must not reference it.** `grok-code-fast-1` is retired (15 May 2026) and silently redirects rather than erroring, which makes it useless as a probe target — do not use it to test model selection.
 
 Effort is the real dial. `--reasoning-effort` (alias `--effort`) was executed at `low` in the spike and recorded as `"reasoning_effort": "low"` in the session `summary.json`.
 
-**Live ladder (grok CLI / `grok-4.6`, re-probed 2026-08-18):** only `low`, `medium`, and `high` are accepted. Passing `xhigh` or `max` is rejected at request time (spawn still succeeds; the pane then shows `--effort/--reasoning-effort: unknown effort level 'xhigh'; use one of: high, medium, low`). Older docs that listed a seven-rung ladder (`none, minimal, low, medium, high, xhigh, max`) were wrong for the installed CLI — do **not** mirror Claude's five-value vocabulary onto Grok.
+**Live ladder (grok CLI / `grok-4.7`, re-probed 2026-10-03; same three rungs as `grok-4.6` on 2026-08-18):** only `low`, `medium`, and `high` are accepted. Passing `xhigh` or `max` is rejected at request time (spawn still succeeds; the pane then shows `--effort/--reasoning-effort: unknown effort level 'xhigh'; use one of: high, medium, low`). Older docs that listed a seven-rung ladder (`none, minimal, low, medium, high, xhigh, max`) were wrong for the installed CLI — do **not** mirror Claude's five-value vocabulary onto Grok.
 
 Per-driver table (deliberate three-into-five collapse; `Medium`/`Large`/`Max` share Grok's ceiling):
 
@@ -419,7 +421,7 @@ So Grok does **not** need the Claude extraction to land first. It routes around 
 
 Fits the `ModelMenu` struct as-is. `menu_for_driver_in` already resolves per slug through `DriverRegistry` and returns `UnknownDriverError` rather than silently falling back to Claude's table (`effort/src/lib.rs`), so registering `"grok"` at `registry.rs:46-47` is the whole integration.
 
-The menu is thin: a current-default model and a three-rung effort mapping (`low`/`medium`/`high`) collapsed from Boss's five levels. `engine_default` is `grok-4.6`; `model_for_reasoning` returns `grok-4.6` for both `Standard` and `Investigation`, so neither tier can silently retain the prior generation. The legacy size fallback resolves to the same current default.
+The menu is thin: a dispatched generation and a three-rung effort mapping (`low`/`medium`/`high`) collapsed from Boss's five levels. `engine_default` is `grok-4.7`; `model_for_reasoning` returns `grok-4.7` for both `Standard` and `Investigation`, so neither tier can silently retain `grok-4.6` or `grok-4.5`. The legacy size fallback resolves to the same dispatched generation. Review-batch `review_model_for_tier` stays on `grok-4.6`.
 
 ### G-5 `ProgressObservation` — transport solved; destination named and shipped
 
@@ -611,7 +613,7 @@ export HOME=$TMPDIR/boss-grok-homes/<run_id>/process-home   # scoped; host tools
 export GROK_AUTH_PATH=<host>/.grok/auth.json                # shared credential + refresh lock
 # local macOS: Grok runs with --sandbox off and no OS-level confinement
 grok \
-  --model grok-4.6 \
+  --model grok-4.7 \
   --reasoning-effort <low|medium|high> \
   --no-alt-screen \
   --always-approve \
@@ -898,7 +900,7 @@ probe / interrupt / stop / reap on the trait; route `transient_recovery` through
 
 ### T-06 `GrokDriver` skeleton: descriptor, capability set, model menu, registry entry
 
-Slug `grok`, config dir `.grok`, `grok-4.6` menu, capability set, registry.
+Slug `grok`, config dir `.grok`, `grok-4.7` menu, capability set, registry.
 
 - **Effort:** `medium`
 - **Depends on:** none

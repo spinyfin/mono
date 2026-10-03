@@ -452,7 +452,7 @@ async fn a_readopted_worker_with_durable_driver_proof_is_not_reaped() {
     live_states.register_readoption(
         1,
         execution_id.as_str(),
-        "grok-4.6",
+        "grok-4.7",
         0,
         Some(WorkItemBinding {
             work_item_id: work_item_id.clone(),
@@ -915,7 +915,7 @@ async fn zero_pid_driver_start_timeout_is_classed_no_shell() {
     live_states.register_readoption(
         1,
         &execution_id,
-        "grok-4.6",
+        "grok-4.7",
         0,
         Some(boss_protocol::WorkItemBinding {
             work_item_id: work_item_id.clone(),
@@ -1034,7 +1034,7 @@ async fn undeterminable_attention_clears_when_a_later_probe_finds_the_transcript
     live_states.register_spawn_with_capabilities(
         1,
         &execution_id,
-        "grok-4.6",
+        "grok-4.7",
         4242,
         Some(boss_protocol::WorkItemBinding {
             work_item_id: work_item_id.clone(),

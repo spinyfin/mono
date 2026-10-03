@@ -172,7 +172,7 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
     .unwrap();
 
     let mut plan = GrokDriver::default().spawn_invocation(SpawnRequest {
-        model: "grok-4.6",
+        model: "grok-4.7",
         effort: Some("high"),
         settings_path: None,
         non_opus_auto_mode: false,
@@ -352,7 +352,7 @@ fn check_launch_command_arg_max_fails_for_a_prompt_over_this_hosts_real_arg_max(
     )
     .unwrap();
 
-    let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
+    let command = "grok --model 'grok-4.7' \"$(cat .grok/initial-prompt.txt)\"\n";
     let err = check_launch_command_arg_max(command, "grok", workspace.path(), ".grok", "initial-prompt.txt")
         .expect_err("must fail, not silently proceed with a doomed exec");
     let msg = err.to_string();
@@ -391,7 +391,7 @@ fn check_launch_command_arg_max_for_bytes_passes_for_a_600kb_prompt_on_this_host
 #[test]
 fn check_launch_command_arg_max_for_bytes_fails_for_a_prompt_over_this_hosts_real_arg_max() {
     let arg_max = local_arg_max().unwrap();
-    let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
+    let command = "grok --model 'grok-4.7' \"$(cat .grok/initial-prompt.txt)\"\n";
     let err = check_launch_command_arg_max_for_bytes(
         command,
         "grok",
@@ -444,7 +444,7 @@ async fn per_driver_small_and_large_prompts_go_through_script_preflight_and_conf
             driver_name: "grok",
             config_dir: ".grok",
             filename: "initial-prompt.txt",
-            command: "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n",
+            command: "grok --model 'grok-4.7' \"$(cat .grok/initial-prompt.txt)\"\n",
             chrome: "Grok 4.6  Shift+Tab:mode  always-approve\n│ ❯ ",
             spec: GrokDriver::default().pane_monitor_spec().expect("grok spec"),
         },

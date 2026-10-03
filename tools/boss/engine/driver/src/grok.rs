@@ -82,8 +82,8 @@ use super::{
 // ---------------------------------------------------------------------------
 //
 // Model menu refresh path: `grok models` is the machine-readable source.
-// The current-default table below must be refreshed whenever xAI changes the
-// catalog — update engine_default / model_for_reasoning /
+// The dispatched-generation table below must be refreshed whenever xAI
+// changes the catalog — update engine_default / model_for_reasoning /
 // default_model_for_level together. Do not hard-freeze forever, and never
 // reintroduce `grok-build-0.1` (not on the account menu) or
 // `grok-code-fast-1` (retired; silently redirects).
@@ -101,10 +101,12 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
-        // Authenticated `grok models` reported this as the default on
-        // 2026-08-18. Step-5 fall-through and every classified row resolve
-        // to the current generation.
-        engine_default: "grok-4.6",
+        // Authenticated `grok models` on 2026-10-03 lists `grok-4.7` as an
+        // active (non-retired) id. The CLI default is still `grok-4.6`;
+        // Boss dispatches `grok-4.7` for ordinary work. Step-5 fall-through
+        // and every classified row resolve to that generation. Review-batch
+        // members keep `review_model_for_tier` on `grok-4.6`.
+        engine_default: "grok-4.7",
         effort_value_for_level: model_menu::effort_value_for_level,
         default_model_for_level: model_menu::default_model_for_level,
         model_for_reasoning: model_menu::model_for_reasoning,
@@ -1367,14 +1369,14 @@ mod tests {
         assert_eq!(d.config_dir, ".grok");
         assert_eq!(d.agent_rules_filename, "AGENTS.md");
         assert_eq!(d.initial_prompt_filename, "initial-prompt.txt");
-        assert_eq!(d.model_menu.engine_default, "grok-4.6");
+        assert_eq!(d.model_menu.engine_default, "grok-4.7");
     }
 
     #[test]
     fn grok_model_menu_uses_current_default_with_three_rung_effort() {
         let driver = GrokDriver::default();
         let menu = &driver.descriptor().model_menu;
-        // Live Grok / grok-4.6 accepts only low|medium|high. Large and
+        // Live Grok / grok-4.7 accepts only low|medium|high. Large and
         // Max must land on `high` (Grok's ceiling), never on Claude/Codex's
         // `xhigh`/`max` — those fail the first turn in-pane after spawn.
         assert_eq!((menu.effort_value_for_level)(EffortLevel::Trivial), Some("low"));
@@ -1396,17 +1398,19 @@ mod tests {
                 "Grok effort for {level:?} must be one of low|medium|high, got {v:?}",
             );
         }
-        // Both reasoning modes use the provider's current default.
-        assert_eq!((menu.model_for_reasoning)(ReasoningMode::Standard), "grok-4.6");
-        assert_eq!((menu.model_for_reasoning)(ReasoningMode::Investigation), "grok-4.6");
+        // Both reasoning modes use the dispatched generation. Review-batch
+        // members stay on grok-4.6 until the separate fast-SKU change lands.
+        assert_eq!((menu.model_for_reasoning)(ReasoningMode::Standard), "grok-4.7");
+        assert_eq!((menu.model_for_reasoning)(ReasoningMode::Investigation), "grok-4.7");
         assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Fast), "grok-4.6");
         assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Balanced), "grok-4.6");
         assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Strong), "grok-4.6");
-        assert_eq!((menu.default_model_for_level)(EffortLevel::Trivial), "grok-4.6");
-        assert_eq!((menu.default_model_for_level)(EffortLevel::Max), "grok-4.6");
-        assert!(!(menu.model_requires_auto_permissions)("grok-4.6"));
+        assert_eq!((menu.default_model_for_level)(EffortLevel::Trivial), "grok-4.7");
+        assert_eq!((menu.default_model_for_level)(EffortLevel::Max), "grok-4.7");
+        assert!(!(menu.model_requires_auto_permissions)("grok-4.7"));
+        assert!((menu.model_belongs_to_driver)("grok-4.7"));
+        assert!((menu.model_belongs_to_driver)("GROK-4.7"));
         assert!((menu.model_belongs_to_driver)("grok-4.6"));
-        assert!((menu.model_belongs_to_driver)("GROK-4.6"));
         // A Claude/Codex family alias must not be recognised as Grok's.
         assert!(!(menu.model_belongs_to_driver)("opus"));
         assert!(!(menu.model_belongs_to_driver)("gpt-6-astra"));
@@ -1532,7 +1536,7 @@ mod tests {
         .unwrap();
         fs::write(grok_home.join("boss-workspace-path"), "/tmp/ws-spawn-test\n").unwrap();
 
-        let plan = GrokDriver::default().spawn_invocation(spawn_request("grok-4.6", run_id));
+        let plan = GrokDriver::default().spawn_invocation(spawn_request("grok-4.7", run_id));
 
         assert!(
             plan.env.iter().any(|d| matches!(
@@ -1592,7 +1596,7 @@ mod tests {
         let cmd = &plan.command;
         assert!(cmd.starts_with("grok "), "command starts with grok: {cmd}");
         assert!(cmd.contains("--model "), "has --model: {cmd}");
-        assert!(cmd.contains("grok-4.6"), "has model slug: {cmd}");
+        assert!(cmd.contains("grok-4.7"), "has model slug: {cmd}");
         assert!(cmd.contains("--reasoning-effort "), "has --reasoning-effort: {cmd}");
         assert!(cmd.contains("high"), "has effort value: {cmd}");
         assert!(cmd.contains("--no-alt-screen"), "T-03 pane mode: {cmd}");
@@ -1656,7 +1660,7 @@ mod tests {
         let auth_dest = runtime.grok_home.join("auth.json");
         assert!(!auth_dest.exists(), "per-run auth.json must not be provisioned");
         assert_eq!(runtime.auth_source_path, auth);
-        let plan = driver.spawn_invocation(spawn_request("grok-4.6", "run-prov-1"));
+        let plan = driver.spawn_invocation(spawn_request("grok-4.7", "run-prov-1"));
         assert!(plan.env.iter().any(|directive| matches!(
             directive,
             EnvDirective::Set(key, value)
@@ -1817,7 +1821,7 @@ mod tests {
         // SAFETY: serialised by ENV_LOCK, held via _guard for this test's lifetime.
         unsafe { std::env::set_var("GH_CONFIG_DIR", &real_gh_config) };
 
-        let plan = GrokDriver::default().spawn_invocation(spawn_request("grok-4.6", run_id));
+        let plan = GrokDriver::default().spawn_invocation(spawn_request("grok-4.7", run_id));
 
         let expected = real_gh_config.display().to_string();
         assert!(
@@ -2059,7 +2063,7 @@ mod tests {
                 !grok_home.join("boss-seatbelt.sb").exists(),
                 "local Grok workers must not materialize a Boss Seatbelt profile"
             );
-            let spawn = driver.spawn_invocation(spawn_request("grok-4.6", run_id));
+            let spawn = driver.spawn_invocation(spawn_request("grok-4.7", run_id));
             assert!(
                 !spawn.command.contains("sandbox-exec"),
                 "local macOS pane must launch without an outer Seatbelt: {}",
@@ -2288,7 +2292,7 @@ mod tests {
         if std::env::var(LIVE_ENFORCEMENT_TEST_ENV).as_deref() != Ok("1") {
             eprintln!(
                 "{LIVE_ENFORCEMENT_TEST_ENV} not set to 1; skipping live permission-enforcement test \
-                 (set it explicitly to run — this test makes real, billed grok-4.6 API calls)"
+                 (set it explicitly to run — this test makes real, billed grok-4.7 API calls)"
             );
             return false;
         }
@@ -2730,7 +2734,7 @@ mod tests {
             .arg("--max-turns")
             .arg("6")
             .arg("--model")
-            .arg("grok-4.6");
+            .arg("grok-4.7");
         for arg in extra_args {
             cmd.arg(arg);
         }
