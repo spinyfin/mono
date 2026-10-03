@@ -9,6 +9,7 @@ async fn guide_comment_wire_round_trip_keeps_original_context() -> Result<()> {
     })
     .await?;
     let conn = rusqlite::Connection::open(&engine.db_path)?;
+    // Keep the fixture current so background retention cannot collect it before the first comment.
     conn.execute_batch(
         "INSERT INTO pr_review_guide_source_series
          (id, root_task_id, canonical_pr_url, selected_comparison_id, created_at, updated_at)
@@ -16,15 +17,15 @@ async fn guide_comment_wire_round_trip_keeps_original_context() -> Result<()> {
          INSERT INTO pr_review_guide_source_comparisons
          (id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha,
           trigger, packet_hash, complete, captured_at)
-         VALUES ('comparison', 'guide-series', 1, 'base', 'merge', 'head', 'creation', 'packet', 1, '1');",
+         VALUES ('comparison', 'guide-series', 1, 'base', 'merge', 'head', 'creation', 'packet', 1, strftime('%s', 'now'));",
     )?;
     conn.execute_batch(
         "INSERT INTO pr_review_guide_attempts
          (id, series_id, comparison_id, request_epoch, ordinal, status, prompt_version, created_at)
-         VALUES ('attempt', 'guide-series', 'comparison', 1, 1, 'succeeded', 'review-guide-v1', '1');
+         VALUES ('attempt', 'guide-series', 'comparison', 1, 1, 'succeeded', 'review-guide-v1', strftime('%s', 'now'));
          INSERT INTO pr_review_guide_versions
          (id, series_id, comparison_id, attempt_id, markdown, raw_output, content_hash, prompt_version, generated_at)
-         VALUES ('version', 'guide-series', 'comparison', 'attempt', 'Selected quote', 'raw', 'hash', 'review-guide-v1', '1');"
+         VALUES ('version', 'guide-series', 'comparison', 'attempt', 'Selected quote', 'raw', 'hash', 'review-guide-v1', strftime('%s', 'now'));"
     )?;
     let version_id = "version".to_owned();
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
