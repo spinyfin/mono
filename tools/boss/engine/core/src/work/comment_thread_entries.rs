@@ -17,7 +17,7 @@ use super::*;
 /// Column list for every `comment_thread_entries` SELECT. Order must
 /// match [`map_comment_thread_entry`]. `pub(crate)` so callers that already
 /// hold a connection (e.g.
-/// [`crate::work::revise_doc::list_comment_thread_entries_on`]) can build the
+/// [`crate::work::comment_thread_entries::list_comment_thread_entries_on`]) can build the
 /// same SELECT without duplicating the column list.
 pub(crate) fn comment_thread_entry_columns() -> &'static str {
     "id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at"

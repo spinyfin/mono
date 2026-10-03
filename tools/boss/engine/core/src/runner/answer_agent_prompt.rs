@@ -166,6 +166,7 @@ async fn compose_guide_answer_prompt(
     let FeedbackTarget::PullRequestImplementation {
         root_task_id,
         canonical_pr,
+        pr_lifecycle,
         ..
     } = target
     else {
@@ -187,18 +188,22 @@ async fn compose_guide_answer_prompt(
     // default base, not the PR head — the prompt below must not claim
     // otherwise, and the guide answer-agent CLAUDE.md conditions the same
     // claim on this signal (see `render_answer_agent_claude_md`).
-    let checkout_positioned_on_pr_head = work_db
+    let workspace_positioned = work_db
         .get_answer_agent_run_by_execution(execution_id)
         .ok()
         .flatten()
-        .and_then(|run| run.workspace_positioned)
-        .unwrap_or(false);
+        .and_then(|run| run.workspace_positioned);
+    let checkout_positioned_on_pr_head = workspace_positioned == Some(true);
+    // Done roots include closed-unmerged chores. This lifecycle is a hint,
+    // not merge evidence; permit inspection without promising PR inclusion.
+    let inspect_default_branch =
+        *pr_lifecycle == boss_protocol::DocOwnerPrLifecycle::Merged && workspace_positioned != Some(false);
     let mut prompt = String::new();
     prompt.push_str(
         "You are a read-only \"mini-coordinator\" answer agent, spawned to answer one \
          reviewer question left as a comment on a PR review guide. The guide is an \
          immutable explanation of one comparison; the current PR may have moved on. \
-         Investigate current code and distinguish old behavior in the reply. Your \
+         Use the checkout guidance below to distinguish current code from the guide. Your \
          CLAUDE.md states the full read-only mandate and the one command you may run to \
          reply — read it before doing anything else.\n\n",
     );
@@ -230,6 +235,15 @@ async fn compose_guide_answer_prompt(
         prompt.push_str(
             "Your leased checkout is positioned on the current PR head (via `cube workspace goto --pr`); \
              inspect that code as current.\n",
+        );
+    } else if inspect_default_branch {
+        prompt.push_str(
+            "Your leased checkout is a fresh change off the default base branch. If the PR merged, \
+             that branch includes the merged change and may be inspected as current code. The task \
+             is done, but that alone does not prove a merge: closed-unmerged chores are also done. \
+             Inspect the default-branch implementation and distinguish what you can verify there \
+             from the captured PR comparison. If the PR closed unmerged or its changes are absent, \
+             state that the current PR code was not available to you.\n",
         );
     } else {
         prompt.push_str(
@@ -277,7 +291,7 @@ async fn compose_guide_answer_prompt(
                 "answer_agent execution: guide version content unavailable"
             );
             prompt.push_str(
-                "## Original guide content\n\nNot available — answer from the quoted section and current code.\n\n",
+                "## Original guide content\n\nNot available — answer from the quoted section and the evidence permitted by the checkout guidance above.\n\n",
             );
         }
     }
@@ -285,6 +299,10 @@ async fn compose_guide_answer_prompt(
         "Answer the question above as thoroughly and accurately as you can. Inspect the \
          current PR implementation, not only the quoted guide. If the guide describes \
          behavior that the current code no longer has, say so."
+    } else if inspect_default_branch {
+        "Answer the question using the quoted guide and the current default-branch implementation. \
+         Verify whether the described change is present before treating it as merged PR code; \
+         explain any difference or uncertainty in your reply."
     } else {
         "Answer the question above as thoroughly and accurately as you can, from the quoted \
          guide, the captured comparison head above, and the prior thread. Your checkout is not \
@@ -522,14 +540,9 @@ mod tests {
         );
     }
 
-    /// A comment whose feedback target is not an open PR (e.g. the PR
-    /// merged or closed) never reaches goto at all — `pr_number_for_workspace_goto`
-    /// only positions on `pr_lifecycle == Open`. The prompt must reflect
-    /// that with the same "not positioned" language as a goto failure,
-    /// since from the agent's point of view both mean "your checkout is
-    /// not the PR head".
+    /// A done root permits default-branch inspection but is not merge proof.
     #[tokio::test]
-    async fn guide_answer_prompt_states_not_positioned_for_non_open_lifecycle() {
+    async fn guide_answer_prompt_allows_default_branch_inspection_for_merged_lifecycle() {
         let (_dir, db) = open_db();
         let root = create_active_chore(&db, &create_product(&db), "impl");
         db.update_work_item(
@@ -573,6 +586,10 @@ mod tests {
             .unwrap();
 
         let prompt = compose_answer_agent_prompt(&db, &execution).await;
+        assert!(prompt.contains("If the PR merged"));
+        assert!(prompt.contains("current default-branch implementation"));
+        assert!(prompt.contains("does not prove a merge"));
+        assert!(!prompt.contains("so do not inspect it"));
         assert!(
             prompt.contains("Your leased checkout is a fresh change off the default base branch"),
             "a merged/closed PR's target is never `Open`, so goto never ran; the prompt must say so:\n{prompt}"
@@ -590,5 +607,17 @@ mod tests {
             "when not positioned, the task block must not tell the agent to inspect its \
              working copy as if it were current PR code:\n{prompt}"
         );
+
+        // A failed goto is explicit contrary evidence even if the task has
+        // since become done. Preserve the unavailable-code instructions.
+        let run = db
+            .create_answer_agent_run(&comment.id, "pr_review_guide", &series, "hash", 0)
+            .unwrap();
+        db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
+        db.set_answer_agent_run_positioning(&execution.id, false).unwrap();
+        let prompt = compose_answer_agent_prompt(&db, &execution).await;
+        assert!(prompt.contains("current PR code was not available to you"));
+        assert!(!prompt.contains("current default-branch implementation"));
+        assert!(!prompt.contains("Investigate current code"));
     }
 }

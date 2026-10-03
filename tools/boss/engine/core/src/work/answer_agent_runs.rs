@@ -22,7 +22,7 @@ pub(crate) const ANSWER_AGENT_NO_REPLY_BODY: &str = "I wasn't able to finish ans
 
 /// Column list for every `answer_agent_runs` SELECT. Order must match
 /// [`map_answer_agent_run`]. `pub(crate)` so callers that already hold a
-/// connection (e.g. [`crate::work::revise_doc::latest_answer_agent_run_for_comment_on`])
+/// connection (e.g. [`crate::work::answer_agent_runs::latest_answer_agent_run_for_comment_on`])
 /// can build the same SELECT without duplicating the column list.
 pub(crate) fn answer_agent_run_columns() -> &'static str {
     "id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn, \
@@ -33,7 +33,7 @@ pub(crate) fn answer_agent_run_columns() -> &'static str {
 /// The most recent answer-agent run for a comment (by `created_at`, then
 /// `id` as a stable tiebreak), on an already-open connection. Shared by
 /// [`WorkDb::latest_answer_agent_run_for_comment`] and by
-/// `append_comment_directive_body`, which holds the single pooled connection
+/// `revise_doc::push_comment_directive_block`, which holds the single pooled connection
 /// inside an Immediate transaction and cannot call back through
 /// `WorkDb::connect`.
 pub(crate) fn latest_answer_agent_run_for_comment_on(
