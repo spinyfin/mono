@@ -8,6 +8,9 @@ use boss_protocol::{
 
 use super::*;
 
+#[path = "review_two_leaf_tests.rs"]
+mod two_leaf;
+
 fn classification() -> ReviewClassification {
     ReviewClassification::builder()
         .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])
@@ -608,7 +611,7 @@ fn quorum_fails_the_batch_when_the_supervisor_retry_is_exhausted() {
 /// Batch persistence preserves the raw classifier result and the resolved
 /// per-member model/effort rather than referring back to mutable task policy.
 #[test]
-fn review_batch_round_trips_classification_and_member_policy() {
+fn legacy_three_leaf_batch_round_trips_classification_and_member_policy() {
     let db = WorkDb::open(temp_db_path("review-batch-roundtrip")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -646,6 +649,8 @@ fn review_batch_round_trips_classification_and_member_policy() {
 
     let stored_members = db.review_batch_members(&created.id).unwrap();
     assert_eq!(stored_members.len(), 3);
+    assert_eq!(stored_members[2].role, ReviewBatchMemberRole::GrokReviewer);
+    assert_eq!(stored_members[2].requested_driver, "grok");
     assert_eq!(stored_members[0].role, ReviewBatchMemberRole::ClaudeReviewer);
     assert_eq!(stored_members[0].execution_id.as_deref(), Some(execution.id.as_str()));
     assert_eq!(stored_members[0].provider_effort, "medium");
@@ -1239,7 +1244,7 @@ fn review_verdict_is_rejected_while_batch_is_not_supervising() {
 }
 
 #[test]
-fn leaf_dispatch_creates_three_atomic_role_pinned_executions() {
+fn leaf_dispatch_creates_two_atomic_role_pinned_executions() {
     let db = WorkDb::open(temp_db_path("review-batch-leaf-dispatch")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -1252,7 +1257,7 @@ fn leaf_dispatch_creates_three_atomic_role_pinned_executions() {
         ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
-    assert_eq!(executions.len(), 3);
+    assert_eq!(executions.len(), 2);
     assert!(
         executions
             .iter()
@@ -1260,7 +1265,7 @@ fn leaf_dispatch_creates_three_atomic_role_pinned_executions() {
     );
 
     let members = db.review_batch_members(&batch.id).unwrap();
-    assert_eq!(members.len(), 3);
+    assert_eq!(members.len(), 2);
     assert_eq!(
         members
             .iter()
@@ -1273,7 +1278,6 @@ fn leaf_dispatch_creates_three_atomic_role_pinned_executions() {
         vec![
             (ReviewBatchMemberRole::ClaudeReviewer, "claude", "medium"),
             (ReviewBatchMemberRole::CodexReviewer, "codex", "medium"),
-            (ReviewBatchMemberRole::GrokReviewer, "grok", "medium"),
         ]
     );
     assert!(
@@ -1290,7 +1294,7 @@ fn leaf_dispatch_creates_three_atomic_role_pinned_executions() {
             executions: existing_executions,
         } => {
             assert_eq!(existing.id, batch.id);
-            assert_eq!(existing_executions.len(), 3);
+            assert_eq!(existing_executions.len(), 2);
         }
         other => panic!("immutable target must reuse its batch, got {other:?}"),
     }

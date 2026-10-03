@@ -98,7 +98,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
     },
     FeatureFlagSpec {
         name: "review_batch_fanout",
-        description: "Dispatch each eligible pull request to three independent Claude, Codex, and Grok leaf reviewers, with durable per-role retry state. DEFAULT OFF — retain the established single-reviewer pipeline until the new fan-out path is explicitly enabled.",
+        description: "Dispatch each eligible pull request to two independent Claude and Codex leaf reviewers, with durable per-role retry state. DEFAULT OFF — retain the established single-reviewer pipeline until the new fan-out path is explicitly enabled.",
         category: "review",
         default_enabled: false,
         capability_id: None,

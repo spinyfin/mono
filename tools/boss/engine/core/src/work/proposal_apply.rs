@@ -494,12 +494,13 @@ fn review_verdict_unknown_source_reason(
         .findings
         .iter()
         .flat_map(|finding| finding.sources.iter())
-        .chain(
-            verdict
-                .contradictions
+        .chain(verdict.contradictions.iter().flat_map(|contradiction| {
+            contradiction
+                .positions
                 .iter()
-                .flat_map(|contradiction| contradiction.positions.iter().map(|position| &position.role)),
-        );
+                .map(|position| &position.role)
+                .chain(contradiction.resolved_in_favor_of.as_ref())
+        }));
     for role in cited {
         let member_role = match role {
             boss_pr_review::SupervisorSourceRole::Claude => "claude_reviewer",

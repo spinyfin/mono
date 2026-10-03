@@ -1,7 +1,7 @@
 //! Durable review-batch persistence.
 //!
 //! This module owns immutable batch/member creation and read APIs, plus the
-//! two-of-three quorum state machine ([`try_advance_review_batch_quorum_in_tx`])
+//! persisted-membership quorum state machine ([`try_advance_review_batch_quorum_in_tx`])
 //! that decides when enough leaf reviewers have settled to dispatch the
 //! consolidating supervisor, or to give up on the batch. It deliberately does
 //! not apply a supervisor's verdict; that is
@@ -125,8 +125,8 @@ pub const REVIEW_BATCH_STALE_SECS: u64 = 10 * 60;
 /// the alarm has always covered.
 pub const REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS: u64 = 120;
 
-/// Reservation weight of one non-terminal pre-merge batch: three parallel
-/// leaf reviewers plus the supervisor that follows them once they settle,
+/// Conservative reservation weight retained across the transition from
+/// three leaves to two, preserving capacity for in-flight legacy batches,
 /// held as one block from batch creation through supervisor completion so a
 /// later batch's leaves can never occupy the slot this batch's own
 /// supervisor will eventually need. See docs/designs/multi-agent-code-review.md,
@@ -322,7 +322,7 @@ fn leaf_reviewer_role(role: ReviewBatchMemberRole) -> bool {
 }
 
 /// Resolve one member's driver/model policy and build its create input.
-/// Shared by [`leaf_member_inputs`] (three leaf members at batch creation)
+/// Shared by [`leaf_member_inputs`] (two leaf members at batch creation)
 /// and [`try_advance_review_batch_quorum_in_tx`] (the single supervisor
 /// member, added later once the leaves have settled) so the
 /// registry-lookup-then-resolve-tier sequence lives in exactly one place.
@@ -357,10 +357,9 @@ fn leaf_member_inputs(
     let roles = [
         (ReviewBatchMemberRole::ClaudeReviewer, "claude"),
         (ReviewBatchMemberRole::CodexReviewer, "codex"),
-        (ReviewBatchMemberRole::GrokReviewer, "grok"),
     ];
     if execution_ids.len() != roles.len() {
-        bail!("review batch dispatch requires exactly three leaf execution ids");
+        bail!("review batch dispatch requires exactly two leaf execution ids");
     }
     let registry = crate::driver::DriverRegistry::default();
     roles
@@ -488,7 +487,7 @@ fn create_review_batch_in_tx(
 }
 
 /// Insert one member row and return its typed form. Shared by
-/// [`create_review_batch_in_tx`] (three leaf members at batch creation) and
+/// [`create_review_batch_in_tx`] (two leaf members at batch creation) and
 /// [`try_advance_review_batch_quorum_in_tx`] (the single supervisor member,
 /// added later once the leaves have settled).
 fn insert_batch_member_in_tx(
@@ -607,7 +606,7 @@ fn review_batch_members_in(conn: &rusqlite::Connection, batch_id: &str) -> Resul
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// The three leaf reviewer roles a batch's quorum decision is computed over.
+/// Historical leaf vocabulary; only roles persisted in a batch participate.
 /// `ReviewBatchMemberRole::Supervisor` and `PostMergeReviewer` are never part
 /// of the leaf quorum.
 const LEAF_REVIEWER_ROLES: [ReviewBatchMemberRole; 3] = [
@@ -869,7 +868,7 @@ fn file_reported_live_review_batch_member_attentions(conn: &mut Connection) -> R
     Ok(())
 }
 
-/// The two-of-three quorum state machine for one review batch.
+/// The persisted-membership quorum state machine for one review batch.
 ///
 /// Idempotent and safe to call redundantly from multiple hook points (a leaf
 /// report accepted, a leaf finalized failed, a leaf's retry exhausted, the
@@ -945,7 +944,12 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
         }
         ReviewBatchStatus::Collecting => {
             let mut reported = 0usize;
-            for role in LEAF_REVIEWER_ROLES {
+            // Membership is immutable: legacy batches retain their third leaf
+            // and its retry/quorum behavior; new batches wait for both leaves.
+            for role in LEAF_REVIEWER_ROLES
+                .into_iter()
+                .filter(|role| members.iter().any(|member| member.role == *role))
+            {
                 match latest_attempt_for_role(&members, role) {
                     Some(member) if member_attempt_is_settled(member) => {
                         if member.status == ReviewBatchMemberStatus::Reported {
@@ -988,7 +992,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                     &now,
                     "Automated reviewer: insufficient quorum",
                     format!(
-                        "Fewer than two of the three independent reviewers reported for {} \
+                        "Fewer than two independent reviewers reported for {} \
                          (batch `{batch_id}`) — the remaining role(s) exhausted their retry \
                          without submitting a report. The review cannot produce a consolidated \
                          verdict without at least two independent reports.",
@@ -1093,7 +1097,7 @@ impl WorkDb {
         Ok((pre, post))
     }
 
-    /// Atomically create an immutable pre-merge batch and the three ready leaf
+    /// Atomically create an immutable pre-merge batch and the two ready leaf
     /// executions. The durable member policy, rather than mutable task driver
     /// or effort settings, controls every later spawn and retry.
     pub fn create_pre_merge_review_batch(
@@ -1252,7 +1256,7 @@ impl WorkDb {
             None => super::resolve_repo_for_work_item(&tx, &input.cycle_root_id)?
                 .ok_or_else(|| anyhow::anyhow!("cannot start review batch: repository is unresolved"))?,
         };
-        let executions = (0..3)
+        let executions = (0..2)
             .map(|_| {
                 insert_execution(
                     &tx,

@@ -404,7 +404,7 @@ impl WorkerCompletionHandler {
             .is_enabled(crate::review_guide_capture::REVIEW_GUIDE_SOURCE_CAPTURE_FLAG)
     }
 
-    /// Whether each eligible PR is dispatched as a three-leaf review batch.
+    /// Whether each eligible PR is dispatched as a two-leaf review batch.
     pub fn review_batch_fanout_enabled(&self) -> bool {
         self.feature_flags.is_enabled("review_batch_fanout")
     }
