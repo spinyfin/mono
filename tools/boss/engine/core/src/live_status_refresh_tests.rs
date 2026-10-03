@@ -1,5 +1,9 @@
-//! Native transcript replays through the running loop. The mock model uses
-//! the newest action in the HTTP prompt, so stale input cannot pass the test.
+//! Native transcript replays through the running loop. The mock responder
+//! matches `prompt.contains(...)` in a fixed precedence order (validating,
+//! then editing, then inspecting) over the whole transcript. Tests append
+//! inspecting, then editing, then validating, so the highest matching
+//! keyword is the latest action. They drive `start_slot` and the registry
+//! directly rather than the production `worker_events.rs` notify path.
 
 use super::*;
 use crate::driver::{ClaudeDriver, CodexDriver, GrokDriver};
@@ -88,6 +92,10 @@ async fn replay(driver: Arc<dyn AgentDriver>, transcript: PathBuf) {
             if prompt.contains("retry-marker") {
                 return ResponseTemplate::new(401);
             }
+            // Precedence over the whole prompt, not "newest action".
+            // Tests append inspecting, then editing, then validating,
+            // matching this order so the highest matching keyword is
+            // the latest action.
             let summary = if prompt.contains("validating") {
                 "running validation"
             } else if prompt.contains("editing") {

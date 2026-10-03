@@ -837,6 +837,9 @@ fn start_transcript_tail(driver: &dyn AgentDriver, run_id: &str, path: PathBuf) 
 /// - `post_tool_use_count` — modulo `POST_TOOL_USE_K`.
 /// - `last_success_at` — wall-clock of the last successful set;
 ///   summary calls inside `SUCCESS_COOLDOWN` of this are coalesced.
+/// - `last_refresh_attempt` — wall-clock of the last summarizer
+///   attempt (success, failure, or empty transcript). The Working
+///   timer floor is measured from this instant.
 /// - `last_activity` — the most recent activity we've been told about.
 /// - `in_flight` — true while a summarizer HTTP call is outstanding.
 async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>) {
@@ -935,9 +938,10 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                 // No filter — Stop is the cleanest refresh boundary.
             }
             Trigger::PostToolUse => {
-                // The timer is the refresh floor, not a fictitious tool call.
-                // Applying the modulus here used to delay initial refreshes
-                // for five timer periods when no real hooks arrived.
+                // Synthetic timer ticks are the refresh floor, not tool
+                // calls: they bypass the every-POST_TOOL_USE_K filter so a
+                // worker with sparse or no PostToolUse hooks still
+                // refreshes every WORKING_TIMER_FLOOR.
                 if !synthetic {
                     post_tool_use_count = post_tool_use_count.wrapping_add(1);
                     if !post_tool_use_count.is_multiple_of(POST_TOOL_USE_K) {
@@ -1133,10 +1137,11 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                 }
                 last_success_at = Some(Instant::now());
             }
-            // On any failure, deliberately do NOT advance
-            // last_success_at so the next tick can retry immediately
-            // and the staleness UI sees the stamp freeze. The outcome
-            // is already in the debug store + tracing above.
+            // On any failure, do not advance last_success_at so the
+            // staleness UI sees the stamp freeze. Retries come from the
+            // next eligible event or from the Working timer floor
+            // measured from last_refresh_attempt. The outcome is
+            // already in the debug store + tracing above.
             SummarizerOutcome::NoApiKey(_)
             | SummarizerOutcome::EmptyAfterRedaction
             | SummarizerOutcome::ApiError { .. }
