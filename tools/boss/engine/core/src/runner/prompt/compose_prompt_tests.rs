@@ -1924,6 +1924,44 @@ fn escalation_protocol_directive_present_for_revision_implementation_seam_off() 
 }
 
 #[test]
+fn guide_comment_revision_directive_injects_guide_instructions() {
+    let work_item = revision_task_with_created_via(None, "guide-comment:rgs_1");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("Editing generated Markdown cannot satisfy an implementation request"),
+        "guide-comment revision must inject guide instructions:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("boss comment guide-outcome"),
+        "guide-comment revision must teach the outcome command:\n{prompt}",
+    );
+}
+
+#[test]
+fn ordinary_revision_directive_omits_guide_instructions() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("boss comment guide-outcome"),
+        "non-guide revision must not inject guide outcome instructions:\n{prompt}",
+    );
+}
+
+#[test]
 fn escalation_protocol_directive_teaches_boss_propose_verb_when_seam_is_on_for_revision_implementation() {
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(

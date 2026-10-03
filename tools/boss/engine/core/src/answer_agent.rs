@@ -62,14 +62,32 @@ pub const THREAD_REPLY_COMMAND: &str = "boss comment reply";
 /// PR-deliverable-oriented and would be actively wrong here) by
 /// [`crate::worker_setup::render_claude_md`] when
 /// `worker_kind == WorkerKind::AnswerAgent`.
-pub fn render_answer_agent_claude_md(lease_id: &str, workspace_path: &str) -> String {
+pub fn render_answer_agent_claude_md(
+    lease_id: &str,
+    workspace_path: &str,
+    checkout_positioned_on_pr_head: bool,
+) -> String {
+    let checkout_positioning_note = if checkout_positioned_on_pr_head {
+        "For a PR-guide question the leased checkout is the\n           \
+         current PR head — inspect that implementation, not only the quoted\n           \
+         guide."
+    } else {
+        "For a PR-guide question, if positioning the leased checkout on the\n           \
+         current PR head was possible the initial prompt says so explicitly; \
+         otherwise\n           \
+         the checkout is a fresh change off the default base, NOT the PR head — \
+         do not\n           \
+         assume it matches the PR, and say so in your reply if it matters."
+    };
     format!(
         "# Boss answer-agent rules\n\
          \n\
          You are running inside a Boss-managed **answer-agent** session. The\n\
-         engine spawned you to answer one reviewer question left as a comment on\n\
-         a design/investigation document, in that comment's thread. You are a\n\
-         read-only mini-coordinator: you can read everything the Boss\n\
+         engine spawned you to answer one reviewer question left as a comment\n\
+         in that comment's thread. Your initial prompt identifies the target:\n\
+         a design/investigation document, or a PR review guide (an immutable\n\
+         explanation of one comparison; the current PR may have moved on).\n\
+         You are a read-only mini-coordinator: you can read everything the Boss\n\
          coordinator can see and read code in a leased checkout, but you change\n\
          nothing except by posting your reply.\n\
          \n\
@@ -105,7 +123,8 @@ pub fn render_answer_agent_claude_md(lease_id: &str, workspace_path: &str) -> St
          \n\
          ## What you can read\n\
          \n\
-         - The commented-on document, the comment, and its full thread.\n\
+         - The commented-on document or review guide, the comment, and its\n\
+           full thread. {checkout_positioning_note}\n\
          - Product/project/task/execution/PR state via the coordinator's\n\
            read-only query layer.\n\
          - Code in your leased workspace — use `Read`, `Grep`, `Glob`, and\n\
@@ -132,6 +151,7 @@ pub fn render_answer_agent_claude_md(lease_id: &str, workspace_path: &str) -> St
         workspace_path = workspace_path,
         lease = lease_id,
         absolute_paths = crate::prompt_fragments::absolute_paths_fragment(),
+        checkout_positioning_note = checkout_positioning_note,
     )
 }
 
@@ -141,7 +161,7 @@ mod tests {
 
     #[test]
     fn claude_md_states_read_only_mandate_and_reply_command() {
-        let md = render_answer_agent_claude_md("lease-1", "/ws/path");
+        let md = render_answer_agent_claude_md("lease-1", "/ws/path", true);
         assert!(md.contains("Read-only mandate"));
         assert!(md.contains(THREAD_REPLY_COMMAND));
         assert!(md.contains("/ws/path"));
@@ -150,5 +170,17 @@ mod tests {
         // Standard-worker contract and is actively wrong here.
         assert!(!md.contains("PR is the deliverable"));
         assert!(!md.contains("cube pr create --branch"));
+        assert!(md.contains("design/investigation document"));
+        assert!(md.contains("PR review guide"));
+        assert!(md.contains("current PR head"));
+    }
+
+    /// When the checkout is not positioned on the PR head (fresh
+    /// `cube change create` fallback), CLAUDE.md must not claim it is.
+    #[test]
+    fn claude_md_does_not_claim_pr_head_when_not_positioned() {
+        let md = render_answer_agent_claude_md("lease-1", "/ws/path", false);
+        assert!(!md.contains("the leased checkout is the"));
+        assert!(md.contains("fresh change off the default base"));
     }
 }

@@ -8,6 +8,7 @@ use super::*;
 
 /// Outcome of the guarded batch UPDATE that claims comments for a freshly
 /// created revision/chore. See [`WorkDb::claim_revisable_comments`].
+#[derive(Debug)]
 pub(super) enum ClaimOutcome {
     /// The comments actually claimed by this call's task (may be a subset
     /// of the candidates under a partial race).
@@ -41,20 +42,19 @@ impl WorkDb {
             });
         };
 
-        let candidates = {
-            let conn = self.connect()?;
-            comments::query_revisable_comments(
-                &conn,
-                &input.artifact_kind,
-                &input.artifact_id,
-                input.comment_ids.as_deref(),
-            )?
-        };
+        let conn = self.connect()?;
+        let candidates = comments::query_revisable_comments(
+            &conn,
+            &input.artifact_kind,
+            &input.artifact_id,
+            input.comment_ids.as_deref(),
+        )?;
         if candidates.is_empty() {
             return Ok(ReviseDocOutcome::NoUnresolvedComments);
         }
 
-        let directive = compose_doc_comment_directive(self, &input.artifact_id, &candidates);
+        let directive = compose_doc_comment_directive(&conn, &input.artifact_id, &candidates);
+        drop(conn);
         let name = format!(
             "Address {} reviewer comment{}",
             candidates.len(),
@@ -252,7 +252,7 @@ pub(super) fn claim_revisable_comments_in_tx(
 /// artifact id, then each comment's block from [`push_comment_directive_block`]
 /// (design §"Risks" — "directive assembly includes doc path, quoted anchors,
 /// and comment bodies").
-fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[WorkComment]) -> String {
+fn compose_doc_comment_directive(conn: &Connection, artifact_id: &str, comments: &[WorkComment]) -> String {
     let mut out = format!(
         "Reviewer comment{} on `{artifact_id}` request{} the following change{}:\n\n",
         if comments.len() == 1 { "" } else { "s" },
@@ -260,7 +260,7 @@ fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[Wor
         if comments.len() == 1 { "" } else { "s" },
     );
     for comment in comments {
-        push_comment_directive_block(db, &mut out, comment);
+        push_comment_directive_block(conn, &mut out, comment);
     }
     out.push_str("Please update the document accordingly.");
     out
@@ -275,8 +275,10 @@ fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[Wor
 /// (`awaiting_followup → active`, design §"Reclassifying follow-ups")
 /// carries a prior answer-agent reply and the operator's follow-up that
 /// asked for the change; comments that never went through bucket 2 simply
-/// have no thread entries and this is a no-op for them.
-pub(crate) fn push_comment_directive_block(db: &WorkDb, out: &mut String, comment: &WorkComment) {
+/// have no thread entries and this is a no-op for them. Reuse the existing
+/// connection so guide revisions can compose inside their claim transaction
+/// without attempting to acquire the single pooled connection again.
+pub(crate) fn push_comment_directive_block(conn: &Connection, out: &mut String, comment: &WorkComment) {
     out.push_str("Quoted section:\n> ");
     out.push_str(&comment.anchor.exact);
     out.push_str("\n\nComment:\n> ");
@@ -289,7 +291,7 @@ pub(crate) fn push_comment_directive_block(db: &WorkDb, out: &mut String, commen
     // stale answer to a withdrawn question in front of the worker. Guarding
     // on the status rather than on `reply_body` being present keeps that
     // true even if a future terminal state starts carrying a partial body.
-    if let Ok(Some(run)) = db.latest_answer_agent_run_for_comment(&comment.id)
+    if let Ok(Some(run)) = super::answer_agent_runs::latest_answer_agent_run_for_comment_on(conn, &comment.id)
         && run.status == ANSWER_AGENT_RUN_STATUS_REPLIED
         && let Some(reply) = run.reply_body.as_deref()
     {
@@ -297,7 +299,7 @@ pub(crate) fn push_comment_directive_block(db: &WorkDb, out: &mut String, commen
         out.push_str(reply);
         out.push('\n');
     }
-    if let Ok(entries) = db.list_comment_thread_entries(&comment.id) {
+    if let Ok(entries) = super::comment_thread_entries::list_comment_thread_entries_on(conn, &comment.id) {
         for entry in entries
             .iter()
             .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)

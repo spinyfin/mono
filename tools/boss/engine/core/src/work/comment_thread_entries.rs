@@ -14,13 +14,38 @@
 //! `list_comment_thread_entries` below).
 use super::*;
 
-impl WorkDb {
-    /// Column list for every `comment_thread_entries` SELECT. Order must
-    /// match [`map_comment_thread_entry`].
-    fn comment_thread_entry_columns() -> &'static str {
-        "id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at"
-    }
+/// Column list for every `comment_thread_entries` SELECT. Order must
+/// match [`map_comment_thread_entry`]. `pub(crate)` so callers that already
+/// hold a connection (e.g.
+/// [`crate::work::revise_doc::list_comment_thread_entries_on`]) can build the
+/// same SELECT without duplicating the column list.
+pub(crate) fn comment_thread_entry_columns() -> &'static str {
+    "id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at"
+}
 
+/// List a comment's thread entries in chronological order, excluding retired
+/// `nudge` rows, on an already-open connection. Shared by
+/// [`WorkDb::list_comment_thread_entries`] — every reader (the app, `bossctl`,
+/// the CLI, the revision worker's directive, and the follow-up classifier's
+/// prompt) goes through this same filter and column list, so a caller that
+/// already holds WorkDb's single pooled connection (an Immediate transaction)
+/// gets the identical query instead of a hand-rolled copy.
+pub(crate) fn list_comment_thread_entries_on(conn: &Connection, comment_id: &str) -> Result<Vec<CommentThreadEntry>> {
+    let cols = comment_thread_entry_columns();
+    let sql = format!(
+        "SELECT {cols} FROM comment_thread_entries \
+         WHERE comment_id = ?1 AND entry_kind <> ?2 \
+         ORDER BY created_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![comment_id, boss_protocol::THREAD_ENTRY_KIND_NUDGE],
+        map_comment_thread_entry,
+    )?;
+    collect_rows(rows)
+}
+
+impl WorkDb {
     /// Append a thread entry to a comment. `entry_kind` must be one of
     /// `answer` / `operator_followup` ([`boss_protocol::THREAD_ENTRY_KIND_ANSWER`]
     /// et al.). Unvalidated against comment state — callers own the
@@ -57,7 +82,7 @@ impl WorkDb {
                 now
             ],
         )?;
-        let cols = Self::comment_thread_entry_columns();
+        let cols = comment_thread_entry_columns();
         let sql = format!("SELECT {cols} FROM comment_thread_entries WHERE id = ?1");
         conn.query_row(&sql, [&id], map_comment_thread_entry)
             .map_err(Into::into)
@@ -71,18 +96,7 @@ impl WorkDb {
     /// history.
     pub fn list_comment_thread_entries(&self, comment_id: &str) -> Result<Vec<CommentThreadEntry>> {
         let conn = self.connect()?;
-        let cols = Self::comment_thread_entry_columns();
-        let sql = format!(
-            "SELECT {cols} FROM comment_thread_entries \
-             WHERE comment_id = ?1 AND entry_kind <> ?2 \
-             ORDER BY created_at ASC, id ASC"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            params![comment_id, boss_protocol::THREAD_ENTRY_KIND_NUDGE],
-            map_comment_thread_entry,
-        )?;
-        collect_rows(rows)
+        list_comment_thread_entries_on(&conn, comment_id)
     }
 }
 

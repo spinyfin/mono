@@ -156,19 +156,46 @@ fn migrate_drops_packet_json_and_adds_omission_summary_on_existing_tables() {
 }
 
 #[test]
+fn unreferenced_walker_names_orphans_from_entry_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let orphan = dir.path().join(PACKET_ARTIFACT_DIR).join("zz").join("orphan");
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, b"orphan").unwrap();
+    let found = unreferenced_packet_blob_paths(dir.path(), &Default::default());
+    assert_eq!(
+        found,
+        vec![format!("{PACKET_ARTIFACT_DIR}/zz/orphan")],
+        "walker must report the DB-relative path even when DirEntry paths do not strip-prefix the root"
+    );
+}
+
+#[test]
 fn periodic_gc_deletes_orphaned_blobs_without_touching_live_ones() {
     let (dir, db) = open_db();
     let product = create_product(&db);
     let root = create_active_chore(&db, &product, "periodic gc");
     db.persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet("base", "head"))
         .unwrap();
-    let orphan = dir.path().join("review-guide-sources/zz/orphan");
+    let exclusive = packet_store_lock(dir.path(), true)
+        .unwrap()
+        .expect("exclusive GC lock must be free after persist returns");
+    drop(exclusive);
+    let orphan = dir.path().join(PACKET_ARTIFACT_DIR).join("zz").join("orphan");
     fs::create_dir_all(orphan.parent().unwrap()).unwrap();
     fs::write(&orphan, b"orphan").unwrap();
+    let live = {
+        let conn = db.connect().unwrap();
+        live_packet_paths(&conn).unwrap()
+    };
+    let candidates = unreferenced_packet_blob_paths(dir.path(), &live);
+    assert!(
+        candidates.iter().any(|path| path.ends_with("/orphan")),
+        "orphan must be a GC candidate before the sweep; live={live:?} candidates={candidates:?}"
+    );
     db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
     assert!(
         !orphan.exists(),
-        "crash-orphaned blob must be collected by the periodic sweep"
+        "crash-orphaned blob must be collected by the periodic sweep; live={live:?} candidates={candidates:?}"
     );
     assert_eq!(artifact_count(dir.path()), 1);
 }

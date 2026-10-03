@@ -908,8 +908,17 @@ fn delete_unreferenced_packet_artifact(conn: &Connection, artifact_root: &Path, 
         |row| row.get(0),
     )?;
     if count == 0 {
-        let _ = fs::remove_file(artifact_root.join(relative));
-        if let Some(shard) = artifact_root.join(relative).parent()
+        let path = artifact_root.join(relative);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to delete unreferenced source packet blob at {}", path.display())
+                });
+            }
+        }
+        if let Some(shard) = path.parent()
             && fs::read_dir(shard)
                 .ok()
                 .is_some_and(|mut entries| entries.next().is_none())
@@ -967,21 +976,27 @@ fn unreferenced_packet_blob_paths(artifact_root: &Path, live: &std::collections:
         if !shard_path.is_dir() {
             continue;
         }
+        let Some(shard_name) = shard.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
         let Ok(files) = fs::read_dir(&shard_path) else {
             continue;
         };
         for file in files.flatten() {
-            let path = file.path();
-            let name = file.file_name();
-            let name = name.to_string_lossy();
+            let Some(name) = file.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
             if name.ends_with(".tmp") {
                 // Staging files require the separate PID-aware sweep.
                 continue;
             }
-            if let Some(relative) = path.strip_prefix(artifact_root).ok().and_then(|p| p.to_str())
-                && !live.contains(relative)
-            {
-                candidates.push(relative.to_owned());
+            // Build the DB-relative path from directory entry names rather than
+            // `DirEntry::path().strip_prefix(artifact_root)`. On Linux sandboxes
+            // those two PathBufs can disagree about symlink resolution, and a
+            // failed strip silently skipped crash-orphaned blobs.
+            let relative = format!("{PACKET_ARTIFACT_DIR}/{shard_name}/{name}");
+            if !live.contains(&relative) {
+                candidates.push(relative);
             }
         }
     }

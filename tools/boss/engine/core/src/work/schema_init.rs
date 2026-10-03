@@ -395,6 +395,7 @@ impl WorkDb {
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
         step!(timer, conn, migrate_answer_agent_runs_table)?;
         step!(timer, conn, migrate_answer_agent_runs_execution_id_column)?;
+        step!(timer, conn, migrate_answer_agent_runs_workspace_positioned_column)?;
         // Archival provenance: tasks.archived_reason surfaces why the
         // engine auto-archived a revision (parent PR merged/closed) so
         // `boss task show` doesn't leave the operator guessing.
