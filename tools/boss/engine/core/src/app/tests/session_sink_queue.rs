@@ -377,3 +377,36 @@ async fn broker_publish_degrades_bursty_subscriber_without_disconnecting() {
     let inner = broker.inner.lock().await;
     assert!(inner.sinks.contains_key("session-1"));
 }
+
+#[tokio::test]
+async fn request_reader_stalls_until_outbound_lane_drains() {
+    let (tx, _rx) = oneshot::channel();
+    let sink = Arc::new(SessionSink::new(tx));
+    // Nothing queued: no stall.
+    tokio::time::timeout(Duration::from_millis(100), sink.wait_for_response_headroom())
+        .await
+        .expect("empty queue must not stall the reader");
+
+    for i in 0..REQUEST_BACKPRESSURE_DEPTH {
+        sink.enqueue(FrontendEventEnvelope::response(
+            format!("r{i}"),
+            FrontendEvent::Error { message: "busy".into() },
+        ));
+    }
+    let waiter = tokio::spawn({
+        let sink = sink.clone();
+        async move { sink.wait_for_response_headroom().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiter.is_finished(), "reader must pause while replies are backlogged");
+
+    // The writer draining makes room; no reply was evicted meanwhile.
+    assert!(sink.next().await.is_some());
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("reader must resume once the lane drains")
+        .unwrap();
+    let stats = sink.queue_stats();
+    assert_eq!(stats.depth, REQUEST_BACKPRESSURE_DEPTH - 1);
+    assert!(!stats.slow);
+}

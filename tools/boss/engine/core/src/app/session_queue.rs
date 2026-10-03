@@ -45,6 +45,16 @@ pub(super) const RESYNC_TOPIC: &str = "__resync__";
 /// should never hold more than a few entries in healthy operation.
 pub(super) const MAX_PRIORITY_QUEUE: usize = 64;
 
+/// Bulk-lane depth at which the reader loop stops accepting new requests
+/// until the writer drains. Correlated responses (including admission
+/// rejections) share the evictable bulk lane, so a client that pipelines
+/// faster than it reads would otherwise have replies evicted by
+/// [`SessionQueue::admit_under_pressure`] and its requests left pending with
+/// no answer. Half the lane leaves room for every response that can still
+/// be in flight from requests already accepted (connection active + pending
+/// read budgets) plus coalesced invalidations.
+pub(super) const REQUEST_BACKPRESSURE_DEPTH: usize = MAX_SESSION_QUEUE / 2;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum EnqueueOutcome {
     Enqueued,
@@ -350,6 +360,16 @@ fn is_priority_event(payload: &FrontendEvent) -> bool {
     matches!(payload, FrontendEvent::EngineRequest { .. })
 }
 
+/// The two wakeups a session's queue needs: `writer` signals new work to the
+/// writer task; `drained` signals the request reader (paused in
+/// [`SessionSink::wait_for_response_headroom`]) that the writer popped an
+/// envelope.
+#[derive(Default)]
+struct SinkWakers {
+    writer: Notify,
+    drained: Notify,
+}
+
 /// Outbound side of one connected session: a bounded coalescing queue plus
 /// the shutdown trigger the reader loop selects on. The broker fans
 /// invalidations out by calling `enqueue`; the writer task drains via
@@ -357,7 +377,7 @@ fn is_priority_event(payload: &FrontendEvent) -> bool {
 /// `close`s the sink and `trigger_shutdown` stops the reader.
 pub(super) struct SessionSink {
     pub(super) queue: StdMutex<SessionQueue>,
-    notify: Notify,
+    wakers: SinkWakers,
     shutdown: StdMutex<Option<oneshot::Sender<()>>>,
     /// In-flight population-timing traces for this session, keyed by the
     /// envelope `request_id`. The `get_work_tree` handler stashes a partial
@@ -377,7 +397,7 @@ impl SessionSink {
     pub(super) fn new(shutdown_tx: oneshot::Sender<()>) -> Self {
         Self {
             queue: StdMutex::new(SessionQueue::new()),
-            notify: Notify::new(),
+            wakers: SinkWakers::default(),
             shutdown: StdMutex::new(Some(shutdown_tx)),
             pop_traces: StdMutex::new(HashMap::new()),
             delivery_waiters: StdMutex::new(HashMap::new()),
@@ -412,7 +432,9 @@ impl SessionSink {
             self.complete_response_delivery(Some(request_id), false);
         }
         match outcome {
-            EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Degraded => self.notify.notify_one(),
+            EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Degraded => {
+                self.wakers.writer.notify_one()
+            }
             EnqueueOutcome::Closed | EnqueueOutcome::Slow => {}
         }
         outcome
@@ -460,7 +482,7 @@ impl SessionSink {
             let mut q = self.queue.lock().expect("session queue lock poisoned");
             q.closed = true;
         }
-        self.notify.notify_one();
+        self.wakers.writer.notify_one();
     }
 
     pub(super) fn trigger_shutdown(&self) {
@@ -475,7 +497,7 @@ impl SessionSink {
         loop {
             // Register interest first so a `notify_one` between our queue
             // peek and the await still wakes us.
-            let notified = self.notify.notified();
+            let notified = self.wakers.writer.notified();
             let snapshot = {
                 let mut q = self.queue.lock().expect("session queue lock poisoned");
                 if let Some(env) = q.pop_front() {
@@ -487,9 +509,29 @@ impl SessionSink {
                 }
             };
             match snapshot {
-                Some(env_opt) => return env_opt,
+                Some(env_opt) => {
+                    self.wakers.drained.notify_one();
+                    return env_opt;
+                }
                 None => notified.await,
             }
+        }
+    }
+
+    /// Backpressure for the request reader: resolves once the bulk lane has
+    /// room for the replies of requests about to be accepted (or the sink is
+    /// closed). Lets a client that pipelines faster than it reads stall in
+    /// its own socket buffer instead of having correlated replies evicted.
+    pub(super) async fn wait_for_response_headroom(&self) {
+        loop {
+            let drained = self.wakers.drained.notified();
+            {
+                let q = self.queue.lock().expect("session queue lock poisoned");
+                if q.closed || q.items.len() < REQUEST_BACKPRESSURE_DEPTH {
+                    return;
+                }
+            }
+            drained.await;
         }
     }
 }

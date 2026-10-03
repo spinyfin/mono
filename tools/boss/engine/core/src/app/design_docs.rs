@@ -129,17 +129,17 @@ pub(super) async fn handle_list_product_design_docs(ctx: Dispatch, req: Frontend
         }
     };
 
-    let design_docs = server_state.design_docs.clone();
-    tokio::spawn(async move {
-        let state = design_docs
-            .list_markdown_docs(product.repo_remote_url.as_deref(), refresh)
-            .await;
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::ProductDesignDocsList { product_id, state },
-        );
-    });
+    // Awaited, not detached: the admission permits live exactly as long as
+    // this handler, so the response must be produced before it returns.
+    let state = server_state
+        .design_docs
+        .list_markdown_docs(product.repo_remote_url.as_deref(), refresh)
+        .await;
+    send_response(
+        &sink,
+        &request_id,
+        FrontendEvent::ProductDesignDocsList { product_id, state },
+    );
 }
 
 pub(super) async fn handle_get_product_design_doc(ctx: Dispatch, req: FrontendRequest) {
@@ -160,15 +160,47 @@ pub(super) async fn handle_get_product_design_doc(ctx: Dispatch, req: FrontendRe
 
     let design_docs = server_state.design_docs.clone();
     let registry = server_state.design_doc_revalidation.clone();
-    tokio::spawn(async move {
-        get_product_design_doc(design_docs, registry, sink, request_id, repo_remote_url, path, git_ref).await;
-    });
+    // The correlated response is produced inline so it stays inside the read
+    // admission permits. Only the follow-up revalidation (network, with a
+    // backoff ladder) is detached, and it is bounded by `registry`.
+    if serve_product_design_doc(&design_docs, &sink, &request_id, &repo_remote_url, &path, &git_ref).await {
+        tokio::spawn(async move {
+            revalidate_product_design_doc(design_docs, registry, sink, repo_remote_url, path, git_ref).await;
+        });
+    }
 }
 
-/// Serve-then-revalidate body. Extracted from the spawn so tests can
-/// drive the emitted event sequence against an injected
+/// Send the correlated response from cache. Returns whether a branch-ref
+/// revalidation should follow. A cache hit does not wait on GitHub; a SHA ref
+/// never needs a follow-up.
+async fn serve_product_design_doc(
+    design_docs: &boss_engine_design_docs::DesignDocsService,
+    sink: &std::sync::Arc<super::SessionSink>,
+    request_id: &str,
+    repo_remote_url: &str,
+    path: &str,
+    git_ref: &str,
+) -> bool {
+    let first = design_docs.open_markdown_doc(repo_remote_url, path, git_ref).await;
+    let was_loaded = matches!(first, DesignDocContent::Loaded { .. });
+    send_response(
+        sink,
+        request_id,
+        FrontendEvent::ProductDesignDocContent {
+            repo_remote_url: repo_remote_url.to_owned(),
+            path: path.to_owned(),
+            git_ref: git_ref.to_owned(),
+            content: first,
+        },
+    );
+    was_loaded && !design_docs_ref_is_immutable(git_ref)
+}
+
+/// Serve-then-revalidate. Test entry point that drives the emitted event
+/// sequence against an injected
 /// [`boss_engine_design_docs::DesignDocsService::with_source`] without
 /// standing up a full `ServerState`.
+#[cfg(test)]
 async fn get_product_design_doc(
     design_docs: std::sync::Arc<boss_engine_design_docs::DesignDocsService>,
     registry: std::sync::Arc<RevalidationRegistry>,
@@ -178,32 +210,33 @@ async fn get_product_design_doc(
     path: String,
     git_ref: String,
 ) {
-    let emit = |content: DesignDocContent, as_push: bool| {
-        let event = FrontendEvent::ProductDesignDocContent {
-            repo_remote_url: repo_remote_url.clone(),
-            path: path.clone(),
-            git_ref: git_ref.clone(),
-            content,
-        };
-        if as_push {
-            send_push(&sink, event);
-        } else {
-            send_response(&sink, &request_id, event);
-        }
-    };
-
-    // Serve immediately: cache hit does not wait on GitHub. A SHA
-    // ref never needs a follow-up; a branch ref is revalidated
-    // below and the view updates only if the body changed or the
-    // refresh failed (stale banner, cache kept).
-    let first = design_docs.open_markdown_doc(&repo_remote_url, &path, &git_ref).await;
-    let was_loaded = matches!(first, DesignDocContent::Loaded { .. });
-    emit(first, false);
-
-    if !was_loaded || design_docs_ref_is_immutable(&git_ref) {
-        return;
+    if serve_product_design_doc(&design_docs, &sink, &request_id, &repo_remote_url, &path, &git_ref).await {
+        revalidate_product_design_doc(design_docs, registry, sink, repo_remote_url, path, git_ref).await;
     }
+}
 
+/// Branch-ref follow-up: the view updates only if the body changed or the
+/// refresh failed (stale banner, cache kept). Runs detached from the request
+/// so it never holds read admission permits.
+async fn revalidate_product_design_doc(
+    design_docs: std::sync::Arc<boss_engine_design_docs::DesignDocsService>,
+    registry: std::sync::Arc<RevalidationRegistry>,
+    sink: std::sync::Arc<super::SessionSink>,
+    repo_remote_url: String,
+    path: String,
+    git_ref: String,
+) {
+    let emit = |content: DesignDocContent| {
+        send_push(
+            &sink,
+            FrontendEvent::ProductDesignDocContent {
+                repo_remote_url: repo_remote_url.clone(),
+                path: path.clone(),
+                git_ref: git_ref.clone(),
+                content,
+            },
+        );
+    };
     let key: DocKey = (repo_remote_url.clone(), path.clone(), git_ref.clone());
     match design_docs
         .revalidate_markdown_doc(&repo_remote_url, &path, &git_ref)
@@ -211,7 +244,7 @@ async fn get_product_design_doc(
     {
         Some(update) => {
             let still_retryable = update.retryable();
-            emit(update, true);
+            emit(update);
             if still_retryable {
                 if let Some(ctl) = registry.try_begin(key.clone()) {
                     auto_retry_revalidation(
@@ -590,5 +623,73 @@ mod tests {
             "blob_calls={calls} looks like two ladders (cap {two_ladders})"
         );
         assert!(calls > 1 + 3, "blob_calls={calls} looks like no revalidation");
+    }
+
+    /// Delegates to [`FakeSource`] but parks every blob fetch until released,
+    /// modelling a slow document source.
+    struct GatedSource {
+        inner: Arc<FakeSource>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl GitHubTreeSource for GatedSource {
+        async fn default_branch(&self, owner: &str, repo: &str) -> Result<String, TreeApiError> {
+            self.inner.default_branch(owner, repo).await
+        }
+
+        async fn head_sha(&self, owner: &str, repo: &str, git_ref: &str) -> Result<String, TreeApiError> {
+            self.inner.head_sha(owner, repo, git_ref).await
+        }
+
+        async fn markdown_tree(&self, owner: &str, repo: &str, sha: &str) -> Result<RepoTree, TreeApiError> {
+            self.inner.markdown_tree(owner, repo, sha).await
+        }
+
+        async fn fetch_blob(
+            &self,
+            owner: &str,
+            repo: &str,
+            path: &str,
+            git_ref: &str,
+            etag: Option<&str>,
+        ) -> Result<BlobFetch, TreeApiError> {
+            self.gate.acquire().await.unwrap().forget();
+            self.inner.fetch_blob(owner, repo, path, git_ref, etag).await
+        }
+    }
+
+    /// The handler owns the admission permits, so the correlated response must
+    /// be produced before the serve step completes: a slow source keeps the
+    /// request in flight (and its permit held), and completion implies the
+    /// response is already queued.
+    #[tokio::test]
+    async fn serve_holds_the_request_open_until_the_response_is_sent() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let svc = Arc::new(DesignDocsService::with_source(Arc::new(GatedSource {
+            inner: FakeSource::new(),
+            gate: gate.clone(),
+        })));
+        let sink = make_sink();
+        let serve = tokio::spawn({
+            let (svc, sink) = (svc.clone(), sink.clone());
+            async move { serve_product_design_doc(&svc, &sink, "req-1", FLUNGE, PATH, GIT_REF).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !serve.is_finished(),
+            "request must stay in flight while the source is blocked"
+        );
+        assert_eq!(sink.queue_stats().depth, 0, "no response before the source answers");
+
+        gate.add_permits(1);
+        let needs_revalidation = serve.await.unwrap();
+        assert!(needs_revalidation, "branch ref needs a follow-up revalidation");
+        let events = contents(&drain(&sink).await);
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], (false, DesignDocContent::Loaded { .. })),
+            "{events:?}"
+        );
     }
 }
