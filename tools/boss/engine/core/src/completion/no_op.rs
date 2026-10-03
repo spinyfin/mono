@@ -59,7 +59,8 @@ impl WorkerCompletionHandler {
     /// Finalize a sanctioned no-op by ending the execution and releasing its
     /// lease/pane. Work without an owned PR closes as done; an owner with a
     /// bound PR stays in review with contradiction attention instead. Revision
-    /// no-ops retain their dedicated attention. Existing PR URLs are preserved.
+    /// no-ops retain their dedicated attention, except guide batches whose
+    /// dispositions are reconciled in the transaction. Existing PR URLs are preserved.
     ///
     /// Idempotent against an already-finalized execution: the DB write
     /// returns `None` for a non-live row, which maps to `AlreadyTerminal`.
@@ -109,7 +110,7 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DbError;
             }
         };
-        // The declined-finding attention item (when requested) was filed in
+        // The selected attention item (when needed) was filed in
         // the SAME transaction as the terminal write above, so it is either
         // both true or neither happened — never a record claiming a closure
         // that didn't. Teardown (pane / driver / cube lease) runs next;

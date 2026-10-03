@@ -321,6 +321,31 @@ impl WorkDb {
     }
 }
 
+/// Select no-op attention in the transaction that reconciles comments.
+pub(super) fn no_op_attention_on(conn: &Connection, task_id: &str) -> Result<Option<CreateAttentionItemInput>> {
+    let mut statement = conn.prepare(
+        "SELECT id FROM work_comments c WHERE revise_task_id = ?1
+         AND NOT EXISTS (SELECT 1 FROM guide_comment_outcomes o
+                         WHERE o.comment_id = c.id AND o.revise_task_id = ?1)
+         ORDER BY id",
+    )?;
+    let outstanding = statement
+        .query_map([task_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if outstanding.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(CreateAttentionItemInput {
+        kind: crate::completion::REVISION_NO_OP_ATTENTION_KIND.into(),
+        title: "Guide revision closed with outstanding comments".into(),
+        body_markdown: format!(
+            "The guide revision closed without recording a disposition for these comments: {}. They remain outstanding; inspect their threads and complete their outcomes.",
+            outstanding.join(", ")
+        ),
+        ..Default::default()
+    }))
+}
+
 /// Resolve-side of guide-aware reconciliation: document comments still
 /// resolve on task completion; guide comments resolve only when a
 /// disposition was recorded. Missing dispositions stay `in_revision`.

@@ -77,7 +77,9 @@ pub fn render_answer_agent_claude_md(
          otherwise\n           \
          the checkout is a fresh change off the default base, NOT the PR head — \
          do not\n           \
-         assume it matches the PR, and say so in your reply if it matters."
+         assume it matches the PR. Follow the initial prompt's lifecycle guidance: \
+         merged changes may be inspected on the default branch; distinguish \
+         verified code from the captured comparison in your reply."
     };
     format!(
         "# Boss answer-agent rules\n\

@@ -165,7 +165,7 @@ fn unreferenced_walker_names_orphans_from_entry_names() {
     assert_eq!(
         found,
         vec![format!("{PACKET_ARTIFACT_DIR}/zz/orphan")],
-        "walker must report the DB-relative path even when DirEntry paths do not strip-prefix the root"
+        "walker must report the DB-relative path with slash separators"
     );
 }
 
@@ -198,4 +198,42 @@ fn periodic_gc_deletes_orphaned_blobs_without_touching_live_ones() {
         "crash-orphaned blob must be collected by the periodic sweep; live={live:?} candidates={candidates:?}"
     );
     assert_eq!(artifact_count(dir.path()), 1);
+}
+
+#[test]
+fn unlink_failure_does_not_fail_stored_upgrade_or_stop_gc() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, db) = open_db();
+    let root = create_active_chore(&db, &create_product(&db), "unlink failure");
+    let incomplete = incomplete_packet("base", "head", "pinned source read failed: timeout");
+    let stored = db
+        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &incomplete)
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(stored) = stored else {
+        panic!("expected stored capture");
+    };
+    let old_path = dir.path().join(stored.packet_path.unwrap());
+    // Keep the old packet readable for the upgrade, but prohibit unlink.
+    let shard = old_path.parent().unwrap();
+    let permissions = fs::metadata(shard).unwrap().permissions();
+    fs::set_permissions(shard, fs::Permissions::from_mode(0o555)).unwrap();
+    let upgraded = db
+        .persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &packet("base", "head"))
+        .unwrap();
+    assert!(matches!(upgraded, PrSourceCapturePersistOutcome::Stored(_)));
+    assert!(
+        db.get_latest_pr_review_guide_source_capture(&root)
+            .unwrap()
+            .unwrap()
+            .complete
+    );
+    assert!(old_path.is_file());
+    let orphan = dir.path().join(PACKET_ARTIFACT_DIR).join("zz").join("later-orphan");
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, b"orphan").unwrap();
+    let swept = db.gc_unreferenced_pr_review_guide_source_artifacts();
+    fs::set_permissions(shard, permissions).unwrap();
+    swept.unwrap();
+    assert!(old_path.is_file());
+    assert!(!orphan.exists(), "a failed unlink must not abort the sweep");
 }

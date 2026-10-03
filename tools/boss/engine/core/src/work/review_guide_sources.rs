@@ -358,10 +358,17 @@ impl WorkDb {
                     drop(_publication);
                     if let Some(old_path) = superseded_path
                         && old_path != packet_path
-                        && let Some(_gc) = packet_store_lock(&artifact_root, true)?
                     {
-                        let conn = self.connect()?;
-                        delete_unreferenced_packet_artifact(&conn, &artifact_root, &old_path)?;
+                        let cleanup = (|| -> Result<()> {
+                            if let Some(_gc) = packet_store_lock(&artifact_root, true)? {
+                                let conn = self.connect()?;
+                                delete_unreferenced_packet_artifact(&conn, &artifact_root, &old_path)?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(err) = cleanup {
+                            tracing::warn!(path = %old_path, ?err, "stored capture; superseded blob cleanup failed");
+                        }
                     }
                     let mut upgraded = existing;
                     upgraded.packet_hash = packet_hash;
@@ -714,10 +721,13 @@ impl WorkDb {
             let conn = self.connect()?;
             live_packet_paths(&conn)?
         };
-        let candidates = unreferenced_packet_blob_paths(&artifact_root, &live);
+        let mut candidates = unreferenced_packet_blob_paths(&artifact_root, &live);
+        candidates.sort_unstable();
         let conn = self.connect()?;
         for relative in candidates {
-            delete_unreferenced_packet_artifact(&conn, &artifact_root, &relative)?;
+            if let Err(err) = delete_unreferenced_packet_artifact(&conn, &artifact_root, &relative) {
+                tracing::warn!(path = %relative, ?err, "source packet GC could not delete orphan; continuing sweep");
+            }
         }
         Ok(())
     }
@@ -990,10 +1000,8 @@ fn unreferenced_packet_blob_paths(artifact_root: &Path, live: &std::collections:
                 // Staging files require the separate PID-aware sweep.
                 continue;
             }
-            // Build the DB-relative path from directory entry names rather than
-            // `DirEntry::path().strip_prefix(artifact_root)`. On Linux sandboxes
-            // those two PathBufs can disagree about symlink resolution, and a
-            // failed strip silently skipped crash-orphaned blobs.
+            // The DB stores packet_path as <directory>/<shard>/<name> with
+            // '/' separators, so build that representation from entry names.
             let relative = format!("{PACKET_ARTIFACT_DIR}/{shard_name}/{name}");
             if !live.contains(&relative) {
                 candidates.push(relative);

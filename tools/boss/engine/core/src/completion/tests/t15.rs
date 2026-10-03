@@ -3,6 +3,74 @@
 use super::*;
 
 #[tokio::test]
+async fn guide_no_op_attention_matches_outstanding_dispositions() {
+    use boss_protocol::{GuideCommentDisposition, GuideCommentOutcome};
+    for all_dispositioned in [true, false] {
+        let workspace = tempdir().unwrap();
+        let pr = "https://github.com/acme/widget/pull/9";
+        let (_dir, db, _product, revision, execution_id) = revision_fixture(workspace.path(), pr, "unchanged-head");
+        let (_, _, answered) = crate::test_support::seed_published_guide_comment(&db, 9, "already correct?");
+        let (_, _, outstanding) = crate::test_support::seed_published_guide_comment(&db, 10, "what about timeout?");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET created_via = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    revision,
+                    format!("{}series", crate::work::CREATED_VIA_GUIDE_COMMENT_PREFIX)
+                ],
+            )
+            .unwrap();
+            for comment in [&answered, &outstanding] {
+                conn.execute(
+                    "UPDATE work_comments SET revise_task_id = ?2, status = 'in_revision' WHERE id = ?1",
+                    rusqlite::params![comment.id, revision],
+                )
+                .unwrap();
+            }
+        }
+        for comment in [&answered, &outstanding]
+            .into_iter()
+            .take(if all_dispositioned { 2 } else { 1 })
+        {
+            db.record_guide_comment_outcome(
+                &revision,
+                GuideCommentOutcome::builder()
+                    .comment_id(&comment.id)
+                    .disposition(GuideCommentDisposition::Answered)
+                    .response("The existing implementation handles this case.")
+                    .build(),
+            )
+            .unwrap();
+        }
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+        let execution = db.get_execution(&execution_id).unwrap();
+        let (contribution, attention) = handler.declared_run_done_no_op_inputs(&execution);
+        assert!(attention.is_some(), "exercise the production attention input");
+        let outcome = handler
+            .finalize_no_op_completion(&execution, contribution, attention)
+            .await;
+        assert!(matches!(outcome, StopOutcome::NoChangesNeeded { .. }));
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let no_op = items
+            .iter()
+            .filter(|item| item.kind == REVISION_NO_OP_ATTENTION_KIND)
+            .collect::<Vec<_>>();
+        assert_eq!(no_op.len(), usize::from(!all_dispositioned));
+        if let Some(item) = no_op.first() {
+            assert!(item.body_markdown.contains(&outstanding.id));
+            assert!(!item.body_markdown.contains(&answered.id));
+            assert!(!item.body_markdown.contains("declined"));
+        }
+        assert_eq!(db.get_comment(&answered.id).unwrap().unwrap().status, "resolved");
+        assert_eq!(
+            db.get_comment(&outstanding.id).unwrap().unwrap().status,
+            if all_dispositioned { "resolved" } else { "in_revision" }
+        );
+    }
+}
+
+#[tokio::test]
 async fn revision_no_op_survives_unavailable_proposals_and_github_for_every_driver() {
     for slug in ["claude", "codex", "grok"] {
         let workspace = tempdir().unwrap();

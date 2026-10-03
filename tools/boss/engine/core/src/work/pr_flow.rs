@@ -284,6 +284,8 @@ impl WorkDb {
                 ),
                 ..Default::default()
             })
+        } else if task.kind == TaskKind::Revision && task.created_via.starts_with(CREATED_VIA_GUIDE_COMMENT_PREFIX) {
+            super::guide_feedback::no_op_attention_on(&tx, &task.id)?
         } else {
             attention
         };

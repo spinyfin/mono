@@ -112,8 +112,8 @@ async fn answer_agent_goto_success_positions_and_stamps_true() {
 }
 
 /// A failed goto (e.g. the DB-derived `pr_lifecycle == Open` was stale) is
-/// non-fatal for `AnswerAgent`: no `cube_workspace_positioning_failed`
-/// dispatch event, `create_change` still runs, the lease is kept, and the
+/// non-fatal for `AnswerAgent`: dispatch is not failed and no start-failure
+/// attention item is filed. `create_change` still runs, the lease is kept, and the
 /// run is stamped `Some(false)`.
 #[tokio::test]
 async fn answer_agent_goto_failure_falls_back_without_failing_dispatch() {
@@ -172,4 +172,10 @@ async fn answer_agent_goto_failure_falls_back_without_failing_dispatch() {
         .unwrap()
         .expect("answer_agent_runs row must exist for this execution");
     assert_eq!(run.workspace_positioned, Some(false));
+    assert!(
+        db.list_attention_items(&execution.id)
+            .unwrap()
+            .iter()
+            .all(|item| item.kind != "cube_workspace_positioning_failed")
+    );
 }
