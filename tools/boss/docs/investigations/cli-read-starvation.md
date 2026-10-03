@@ -21,9 +21,9 @@ Environment settings are read when engine state is constructed; restart the engi
 | Setting                             | Default | Meaning                                             |
 | ----------------------------------- | ------- | --------------------------------------------------- |
 | `BOSS_RPC_READ_CONCURRENCY`         | 32      | Active bulk handlers across connections             |
-| `BOSS_RPC_READ_PER_CONNECTION`      | 4       | Active bulk handlers on one connection              |
+| `BOSS_RPC_READ_PER_CONNECTION`      | 16      | Active bulk handlers on one connection              |
 | `BOSS_RPC_READ_QUEUE`               | 128     | Pending reads across connections                    |
-| `BOSS_RPC_READ_WAIT_MS`             | 250     | Total admission wait across both concurrency limits |
+| `BOSS_RPC_READ_WAIT_MS`             | 500     | Total admission wait across both concurrency limits |
 | `BOSS_RPC_LIVE_READ_CONCURRENCY`    | 8       | Active status reads, reserved above the bulk limit  |
 | `BOSS_RPC_LIVE_READ_PER_CONNECTION` | 2       | Active status reads on one connection               |
 | `BOSS_RPC_LIVE_READ_QUEUE`          | 32      | Pending status reads across connections             |
@@ -37,3 +37,13 @@ Rejections produce a correlated `Error` response containing `engine busy, retry:
 `work::read_only_tests` holds a WAL writer transaction and shows that the old initialization path fails with a database-lock error, while the read-only opener and review query complete within one second. It also verifies that the inspection handle cannot write or create a missing database.
 
 `app::read_admission::burst_tests` runs eight and 32 simultaneous loops through the direct review-batch query path and real socket proposal reads, using a populated review batch. After every reader has completed a round, the test submits an attributed worker proposal and calls both RPCs used by `agents list`, asserting a two-second bound for the write and for the combined status calls. It prints measured latencies. Another socket test deterministically occupies every bulk permit and checks that an excess read returns the explicit busy error within two seconds while live status still succeeds, including when pipelined behind a queued read on the same connection. Admission unit tests cover per-connection isolation, global capacity, bounded queues, deadlines, and permit reclamation.
+
+## Sizing for the macOS app
+
+The app sends every UI read over one long-lived socket. On connect it pipelines roughly a dozen bulk reads (products, settings, work tree, attention groups and items, deferred scopes, planner runs, engine attempts, disabled live-status slots) plus comment reads per open viewer, and invalidation refetch adds one `ListExecutions` per visible history. The original per-connection budget of 4 active reads and a 250 ms deadline rejected reads 5 and onward whenever a slow `GetWorkTree` held its slot, and the app turns the busy reply into a generic error event with no retry. The defaults are now 16 active, 64 pending and 500 ms per connection, so one app session's connect and refetch fan-out is admitted outright. The incident is still bounded by the global cap of 32 active and 128 queued reads, which is what protects the engine from the eight-process CLI burst (each CLI process holds one socket and one request). `one_socket_pipelining_sixteen_bulk_reads_never_sees_busy` and `default_budget_admits_app_session_fan_out_behind_a_slow_read` pin this.
+
+`GetPrStatus` with `refresh: true` awaits a GitHub probe and is not a bulk read; it is bounded by its per-execution refresh budget so network latency cannot occupy bulk slots. Design-document reads await their response inside the admission permits; only the follow-up revalidation is detached.
+
+## Outbound reply delivery
+
+Busy and other correlated replies share the session's bounded outbound lane, which evicts its oldest entry under pressure. The request reader now pauses (`wait_for_response_headroom`) while that lane is half full, so a client that pipelines faster than it reads backs up in its own socket buffer rather than losing replies.
