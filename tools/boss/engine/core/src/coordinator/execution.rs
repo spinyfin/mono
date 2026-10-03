@@ -925,14 +925,16 @@ impl ExecutionCoordinator {
                     match self.work_db.cancel_execution_with(
                         &execution.id,
                         CancelExecutionOpts {
-                            reason: Some(format!("requested host became ineligible: {err}")),
+                            reason: Some(format!("requested host became ineligible: {err:#}")),
                             queued_only: true,
+                            record_failure_reason: true,
                         },
                     ) {
-                        Ok(_) => {
+                        Ok(cancelled) => {
                             // Terminal for this execution: drop the constraint so it
                             // cannot leak (selection no longer takes it itself).
                             self.take_requested_host(&execution.id);
+                            self.notify_review_guide_pre_start_failure(&cancelled);
                         }
                         Err(cancel_err) => {
                             // The cancel is what makes this row terminal. If it
@@ -2219,11 +2221,12 @@ impl ExecutionCoordinator {
         error: &anyhow::Error,
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
+        let error_text = format!("{error:#}");
         let (execution, run, outcome) = self.work_db.record_pre_start_failure(
             &execution.id,
             worker_id,
             cube_repo_id,
-            &error.to_string(),
+            &error_text,
             &self.pre_start_retry_delays,
         )?;
 
@@ -2288,11 +2291,10 @@ impl ExecutionCoordinator {
                 // Surface every permanent pre-start failure as a
                 // `WorkAttentionItem` so the failure is diagnosable in one
                 // bossctl call instead of needing a tracing-log tail.
-                let err = format!("{error:#}");
                 let attention_body = format!(
                     "Execution `{execution_id}` could not start on worker `{worker_id}` \
                      after {attempts} attempt(s).\n\n\
-                     **Error:** {err}\n\n\
+                     **Error:** {error_text}\n\n\
                      Inspect `dispatch-events/executions/{execution_id}/dispatch.jsonl` \
                      for the full stage timeline.",
                     execution_id = execution.id,
@@ -2314,6 +2316,8 @@ impl ExecutionCoordinator {
                     );
                 }
 
+                self.notify_review_guide_pre_start_failure(&execution);
+
                 // Stop the silent claim → fail → release → re-queue loop
                 // (the "waiting for a slot" vs. "failing to start"
                 // ambiguity): bounce the work item to Backlog with
@@ -2324,12 +2328,11 @@ impl ExecutionCoordinator {
                 // (`pr_review`, `ci_remediation`, `conflict_resolution`)
                 // whose work item sits in `in_review`/`blocked` — bouncing
                 // those would erase review context.
-                self.notify_review_guide_pre_start_failure(&execution);
-
-                match self
-                    .work_db
-                    .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &err)
-                {
+                match self.work_db.bounce_dispatch_failed_to_backlog(
+                    &execution.work_item_id,
+                    attention_kind,
+                    &error_text,
+                ) {
                     Ok(true) => tracing::info!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,
@@ -2381,17 +2384,6 @@ impl ExecutionCoordinator {
         Ok(())
     }
 
-    /// A recoverable pre-start failure (host adapter build, `cube repo
-    /// ensure`, workspace lease, cube change create, ...) on an execution
-    /// with a request-scoped `--host` constraint must not fall through to
-    /// [`Self::record_start_failure`]'s ordinary retry: a retry re-enters
-    /// host selection, and by then this constraint may already be the
-    /// last thing standing between "runs on the host the operator asked
-    /// for" and "runs on any eligible host with no notice" — exactly the
-    /// silent-misplacement class `--host` exists to eliminate. Cancel the
-    /// execution instead (leaving no residue queued behind an unpinned
-    /// retry) and drop the constraint, matching how the ineligible-host
-    /// case in [`Self::schedule_execution`] already behaves.
     /// Refresh the owning review-guide card after a pre-start failure. The
     /// attempt row is already terminal; this is the board-invalidation the
     /// comparison-id `work_item_id` cannot provide on its own.
@@ -2413,10 +2405,21 @@ impl ExecutionCoordinator {
         });
     }
 
+    /// A recoverable pre-start failure (host adapter build, `cube repo
+    /// ensure`, workspace lease, cube change create, ...) on an execution
+    /// with a request-scoped `--host` constraint must not fall through to
+    /// [`Self::record_start_failure`]'s ordinary retry: a retry re-enters
+    /// host selection, and by then this constraint may already be the
+    /// last thing standing between "runs on the explicitly requested host"
+    /// and "runs on any eligible host with no notice" — exactly the
+    /// silent-misplacement class `--host` exists to eliminate. Cancel the
+    /// execution instead (leaving no residue queued behind an unpinned
+    /// retry) and drop the constraint, matching how the ineligible-host
+    /// case in [`Self::schedule_execution`] already behaves.
     fn cancel_requested_host_pre_start_failure(&self, execution: &WorkExecution, stage: &str, err: &anyhow::Error) {
         // Not retried, but must still be reported: a `--host` pre-start
         // failure never reaches `record_start_failure`'s permanent-failure
-        // path, so without this the operator's requested-host dispatch can
+        // path, so without this a requested-host dispatch can
         // silently disappear as a `cancelled` row with no attention item —
         // exactly the case an SSH-unreachable remote host hits.
         let attention_body = format!(
@@ -2449,10 +2452,12 @@ impl ExecutionCoordinator {
             CancelExecutionOpts {
                 reason: Some(format!("requested host dispatch failed during {stage}: {err:#}")),
                 queued_only: true,
+                record_failure_reason: true,
             },
         ) {
-            Ok(_) => {
+            Ok(cancelled) => {
                 self.take_requested_host(&execution.id);
+                self.notify_review_guide_pre_start_failure(&cancelled);
             }
             Err(cancel_err) => {
                 // The cancel is what makes this row terminal. If it failed,

@@ -908,6 +908,14 @@ async fn slot_busy_pane_spawn_failure_requeues_without_demoting_and_holds_slot()
              immediately re-select and repeat the rejection — pool_claim_sweep reclaims it later",
     );
 
+    let failed = db.get_execution(&first_execution_id).unwrap();
+    assert!(
+        failed.last_error.as_deref().is_some_and(|err| !err.is_empty()),
+        "SlotBusy pane-spawn failure must persist last_error even though it does not increment \
+         the pre-start failure counter; got {:?}",
+        failed.last_error,
+    );
+
     // The abort is still reported at the spawn-abort point (that is what
     // makes a genuine abort attributable), but a `SlotBusy` rejection is an
     // engine/app desync that self-heals via the requeue asserted above — it
@@ -1953,4 +1961,336 @@ async fn a_spawn_abort_never_terminalizes_driverless_without_a_recorded_reason()
              item; got {attention_items:#?}",
         );
     }
+}
+
+/// A pane-spawn failure of a `PrReviewGuide` execution must fail the bound
+/// attempt with the full anyhow cause chain (`{err:#}`), invalidate the
+/// owning card (`notify_review_guide_pre_start_failure`), and paint
+/// `Task.review_guide_error` / `ReviewGuideSummary.error`.
+#[tokio::test]
+async fn pane_spawn_failure_fails_review_guide_attempt_with_cause_chain() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let fixture = seed_review_guide_dispatch(&db);
+
+    let runner = Arc::new(FakeExecutionRunner {
+        fail: true,
+        fail_message: Some("inner cause".to_owned()),
+        fail_context: Some("outer label".to_owned()),
+        ..FakeExecutionRunner::default()
+    });
+    let publisher = Arc::new(RecordingPublisher::default());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::with_publisher(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            runner,
+            publisher.clone(),
+        )
+        .with_pre_start_retry_delays(vec![]),
+    );
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &fixture.execution_id, ExecutionStatus::Failed).await;
+    wait_for_review_guide_failed(publisher.as_ref(), &fixture.product_id, &fixture.root_id).await;
+
+    let failed = db.get_execution(&fixture.execution_id).unwrap();
+    assert!(
+        failed
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("inner cause") && err.contains("outer label")),
+        "pane-spawn failure must persist the full cause chain on last_error; got {:?}",
+        failed.last_error,
+    );
+
+    let status: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM pr_review_guide_attempts WHERE id = ?1",
+            [&fixture.attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    let stored: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT error FROM pr_review_guide_attempts WHERE id = ?1",
+            [&fixture.attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored.contains("inner cause"),
+        "bound attempt error must carry the inner cause; got {stored:?}"
+    );
+
+    let summary = db
+        .get_pr_review_guide_summary_for_root(&fixture.root_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    assert!(
+        summary.error.as_deref().is_some_and(|err| err.contains("inner cause")),
+        "summary error must carry the inner cause; got {:?}",
+        summary.error,
+    );
+
+    let card = review_guide_root_card(db.as_ref(), &fixture.root_id);
+    assert_eq!(card.review_guide_lifecycle.as_deref(), Some("failed"));
+    assert!(
+        card.review_guide_error
+            .as_deref()
+            .is_some_and(|err| err.contains("inner cause")),
+        "Task.review_guide_error must carry the inner cause; got {:?}",
+        card.review_guide_error,
+    );
+}
+
+/// `SlotBusy` on a `PrReviewGuide` execution still records `last_error` and
+/// fails the bound attempt (it skips only the pre-start failure counter),
+/// so the summary error is not empty.
+#[tokio::test]
+async fn slot_busy_pane_spawn_failure_fails_review_guide_attempt() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let fixture = seed_review_guide_dispatch(&db);
+
+    let runner = Arc::new(FakeExecutionRunner {
+        slot_busy: true,
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            runner,
+        )
+        .with_pre_start_retry_delays(vec![]),
+    );
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &fixture.execution_id, ExecutionStatus::Failed).await;
+
+    let failed = db.get_execution(&fixture.execution_id).unwrap();
+    assert!(
+        failed.last_error.as_deref().is_some_and(|err| !err.is_empty()),
+        "SlotBusy review-guide spawn failure must persist last_error; got {:?}",
+        failed.last_error,
+    );
+
+    let status: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM pr_review_guide_attempts WHERE id = ?1",
+            [&fixture.attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    let stored: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT error FROM pr_review_guide_attempts WHERE id = ?1",
+            [&fixture.attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !stored.is_empty(),
+        "bound attempt error must be non-empty after SlotBusy; got {stored:?}"
+    );
+
+    let summary = db
+        .get_pr_review_guide_summary_for_root(&fixture.root_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    assert_eq!(
+        summary.error.as_deref(),
+        Some(stored.as_str()),
+        "summary error must match the bound attempt error",
+    );
+}
+
+/// `record_start_failure` must persist `{error:#}` so a chained cube-lease
+/// error keeps its inner cause on `last_error` and the bound attempt.
+#[tokio::test]
+async fn cube_lease_failure_fails_review_guide_attempt_with_cause_chain() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let fixture = seed_review_guide_dispatch(&db);
+
+    let cube = Arc::new(FakeCubeClient {
+        fail_lease: true,
+        fail_lease_inner: Some("inner cause".to_owned()),
+        fail_lease_context: Some("outer label".to_owned()),
+        ..FakeCubeClient::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![]),
+    );
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &fixture.execution_id, ExecutionStatus::Failed).await;
+
+    let failed = db.get_execution(&fixture.execution_id).unwrap();
+    assert!(
+        failed
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("inner cause") && err.contains("outer label")),
+        "record_start_failure must persist the full cause chain on last_error; got {:?}",
+        failed.last_error,
+    );
+
+    let stored: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT error FROM pr_review_guide_attempts WHERE id = ?1",
+            [&fixture.attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored.contains("inner cause"),
+        "bound attempt error must carry the inner cause; got {stored:?}"
+    );
+
+    let summary = db
+        .get_pr_review_guide_summary_for_root(&fixture.root_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    assert!(
+        summary.error.as_deref().is_some_and(|err| err.contains("inner cause")),
+        "summary error must carry the inner cause; got {:?}",
+        summary.error,
+    );
+}
+
+/// A `--host` constraint whose requested host becomes ineligible must cancel
+/// the review-guide execution with the full ineligibility cause, refresh the
+/// owning card, and paint `Task.review_guide_error`.
+#[tokio::test]
+async fn requested_host_became_ineligible_fails_review_guide_card() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let fixture = seed_review_guide_dispatch(&db);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::with_publisher(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner::default()),
+            publisher.clone(),
+        )
+        .with_pre_start_retry_delays(vec![]),
+    );
+    coordinator.mark_requested_host(&fixture.execution_id, "local".to_owned());
+    db.set_host_enabled("local", false).unwrap();
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &fixture.execution_id, ExecutionStatus::Cancelled).await;
+    wait_for_review_guide_failed(publisher.as_ref(), &fixture.product_id, &fixture.root_id).await;
+
+    let cancelled = db.get_execution(&fixture.execution_id).unwrap();
+    assert!(
+        cancelled
+            .last_error
+            .as_deref()
+            .is_some_and(|err| { err.contains("requested host became ineligible") && err.contains("disabled") }),
+        "host-ineligible cancel must persist the inner ineligibility cause on last_error; got {:?}",
+        cancelled.last_error,
+    );
+
+    let card = review_guide_root_card(db.as_ref(), &fixture.root_id);
+    assert_eq!(card.review_guide_lifecycle.as_deref(), Some("failed"));
+    assert!(
+        card.review_guide_error
+            .as_deref()
+            .is_some_and(|err| err.contains("disabled")),
+        "Task.review_guide_error must carry the inner ineligibility cause; got {:?}",
+        card.review_guide_error,
+    );
+}
+
+struct ReviewGuideDispatchFixture {
+    product_id: String,
+    root_id: String,
+    attempt_id: String,
+    execution_id: String,
+}
+
+fn seed_review_guide_dispatch(db: &WorkDb) -> ReviewGuideDispatchFixture {
+    crate::test_support::insert_host_capability(db, "local", "driver=codex", "auto");
+    let product_id = create_product(db);
+    let root_id = create_test_chore_manual(db, product_id.clone(), "Review guide root").id;
+    db.update_work_item(
+        &root_id,
+        WorkItemPatch {
+            pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+            rusqlite::params!["https://github.com/acme/widget.git", root_id],
+        )
+        .unwrap();
+    let (series_id, comparison_id) = seed_review_guide_series(db, &root_id);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    let execution = db
+        .create_pr_review_guide_execution(&comparison_id, "https://github.com/acme/widget.git")
+        .unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    ReviewGuideDispatchFixture {
+        product_id,
+        root_id,
+        attempt_id: attempt.id,
+        execution_id: execution.id,
+    }
+}
+
+fn review_guide_root_card(db: &WorkDb, root_id: &str) -> boss_protocol::Task {
+    match db.get_work_item(root_id).unwrap() {
+        WorkItem::Chore(task) | WorkItem::Task(task) => task,
+        other => panic!("expected root task/chore, got {other:?}"),
+    }
+}
+
+async fn wait_for_review_guide_failed(publisher: &RecordingPublisher, product_id: &str, root_id: &str) {
+    for _ in 0..100 {
+        let events = publisher.events.lock().await;
+        if events.iter().any(|(published_product, work_item_id, reason)| {
+            published_product == product_id && work_item_id == root_id && reason == "review_guide_failed"
+        }) {
+            return;
+        }
+        drop(events);
+        sleep(Duration::from_millis(10)).await;
+    }
+    let events = publisher.events.lock().await;
+    panic!("expected publish_work_item_changed review_guide_failed for {root_id} on {product_id}, got {events:?}");
 }

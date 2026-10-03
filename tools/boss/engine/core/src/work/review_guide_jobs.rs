@@ -1043,16 +1043,14 @@ fn query_pr_review_guide_summary_for_root(
     series_id: Option<&str>,
 ) -> rusqlite::Result<Option<PrReviewGuideSummary>> {
     conn.query_row(
-        "SELECT s.id, s.root_task_id, s.canonical_pr_url, s.guide_lifecycle, s.request_epoch,
+        &format!(
+            "SELECT s.id, s.root_task_id, s.canonical_pr_url, s.guide_lifecycle, s.request_epoch,
                 s.selected_comparison_id, s.readable_version_id,
-                CASE WHEN s.guide_lifecycle = 'failed' THEN (
-                    SELECT a.error FROM pr_review_guide_attempts a
-                    WHERE a.series_id = s.id AND a.status = 'failed' AND a.error IS NOT NULL AND a.error != ''
-                    ORDER BY a.finished_at DESC, a.id DESC LIMIT 1
-                ) ELSE NULL END
+                {REVIEW_GUIDE_LATEST_TERMINAL_ERROR_SQL}
          FROM pr_review_guide_source_series s
          WHERE s.root_task_id = ?1 AND (?2 IS NULL OR s.canonical_pr_url = ?2) AND (?3 IS NULL OR s.id = ?3)
-         ORDER BY s.latest_observation_sequence DESC, s.id DESC LIMIT 1",
+         ORDER BY s.latest_observation_sequence DESC, s.id DESC LIMIT 1"
+        ),
         params![root_task_id, pr_url, series_id],
         |row| {
             Ok(PrReviewGuideSummary {

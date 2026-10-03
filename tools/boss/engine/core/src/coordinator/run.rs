@@ -369,7 +369,13 @@ impl ExecutionCoordinator {
                         false
                     }
                 };
-                let error_text = err.to_string();
+                // Persist the same full cause chain the abort log and
+                // attention body already use (`{err:#}`). `Display` without
+                // `#` would keep only the outermost context (e.g. pane_spawn's
+                // "writing permission/hook config…" wrapper) and drop the
+                // underlying refusal reason that last_error, the card and the
+                // JSON must show.
+                let error_text = err_detail.clone();
 
                 // A `SlotBusy` app rejection means the engine and the app
                 // disagree about this specific slot's occupancy — the app
@@ -425,13 +431,12 @@ impl ExecutionCoordinator {
                         .error_text(error_text.as_str())
                         .clear_workspace_lease(released)
                         .increment_pre_start_failure_count(!is_slot_busy)
+                        .record_last_error(true)
                         .maybe_attention(attention)
                         .build(),
                 ) {
                     Ok((execution, _run, _)) => {
-                        if !is_slot_busy {
-                            self.notify_review_guide_pre_start_failure(&execution);
-                        }
+                        self.notify_review_guide_pre_start_failure(&execution);
                         // Driver teardown for this termination path already
                         // ran unconditionally above, before the cube release.
                         // The execution is now durably `failed` in the DB —

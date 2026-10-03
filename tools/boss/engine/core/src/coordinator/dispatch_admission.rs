@@ -429,6 +429,7 @@ impl ExecutionCoordinator {
                 CancelExecutionOpts {
                     reason: Some(format!("pause-only forced dispatch refused: {reason}")),
                     queued_only: true,
+                    record_failure_reason: false,
                 },
             );
             // This row can carry a `--host` routing constraint set by
@@ -516,6 +517,7 @@ impl ExecutionCoordinator {
                     CancelExecutionOpts {
                         reason: Some("--host only applies to a queued execution".to_string()),
                         queued_only: true,
+                        record_failure_reason: false,
                     },
                 );
                 bail!(

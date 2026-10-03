@@ -2013,10 +2013,33 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
             CancelExecutionOpts {
                 reason: Some("moot after work completed elsewhere".to_owned()),
                 queued_only: true,
+                record_failure_reason: false,
             },
         )
         .unwrap();
     assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+    assert_eq!(
+        cancelled.last_error, None,
+        "a never-started cancel without record_failure_reason must leave last_error unset; got {:?}",
+        cancelled.last_error,
+    );
+
+    let failure_cancel = create_ready_chore_execution(&db, chore.id.clone());
+    let recorded = db
+        .cancel_execution_with(
+            &failure_cancel.id,
+            CancelExecutionOpts {
+                reason: Some("requested host became ineligible: inner cause".to_owned()),
+                queued_only: true,
+                record_failure_reason: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        recorded.last_error.as_deref(),
+        Some("requested host became ineligible: inner cause"),
+        "a never-started cancel with record_failure_reason must persist last_error",
+    );
 
     let running = db
         .create_execution(
@@ -2033,6 +2056,7 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
             CancelExecutionOpts {
                 reason: Some("should refuse".to_owned()),
                 queued_only: true,
+                record_failure_reason: false,
             },
         )
         .unwrap_err()

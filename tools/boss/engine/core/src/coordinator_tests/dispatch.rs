@@ -550,6 +550,67 @@ async fn requested_host_pre_start_failure_cancels_instead_of_retrying_elsewhere(
         db.execution_pinned_host(&execution.id).unwrap().is_none(),
         "cancel must not leave a durable pin behind",
     );
+    let cancelled = db.get_execution(&execution.id).unwrap();
+    assert!(
+        cancelled.last_error.as_deref().is_some_and(|err| {
+            err.contains("requested host dispatch failed during host adapter build")
+                && err.contains("simulated SSH-unreachable failure")
+        }),
+        "requested-host pre-start cancel must persist the full cause chain on last_error; got {:?}",
+        cancelled.last_error,
+    );
+}
+
+/// Sibling of `requested_host_pre_start_failure_cancels_instead_of_retrying_elsewhere`
+/// for the host-selection arm: the requested host is eligible at
+/// `request_execution` time, then becomes ineligible before drain. The
+/// cancel must persist `{err:#}` (the ineligibility summary, not just the
+/// outer "became ineligible" label) onto `last_error`.
+#[tokio::test]
+async fn requested_host_became_ineligible_cancels_with_cause_chain() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Host became ineligible");
+
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        )
+        .with_pre_start_retry_delays(Vec::new()),
+    );
+
+    let execution = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .requested_host_id("zakalwe")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap();
+
+    db.set_host_enabled("zakalwe", false).unwrap();
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Cancelled).await;
+
+    let cancelled = db.get_execution(&execution.id).unwrap();
+    assert!(
+        cancelled
+            .last_error
+            .as_deref()
+            .is_some_and(|err| { err.contains("requested host became ineligible") && err.contains("disabled") }),
+        "host-ineligible cancel must persist the inner ineligibility cause on last_error; got {:?}",
+        cancelled.last_error,
+    );
 }
 
 /// The interactive-pool concurrency cap

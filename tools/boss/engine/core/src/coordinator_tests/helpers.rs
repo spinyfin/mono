@@ -79,6 +79,13 @@ pub(super) struct FakeCubeClient {
     pub(super) slow_ensure_origin: Option<String>,
     pub(super) slow_ensure_delay: Duration,
     pub(super) fail_lease: bool,
+    /// When `fail_lease` is set, the inner error text. Defaults to
+    /// `"cube workspace lease failed"`.
+    pub(super) fail_lease_inner: Option<String>,
+    /// When `fail_lease` is set and this is `Some`, wrap `fail_lease_inner`
+    /// as the inner cause under this outer context so tests can assert
+    /// `{err:#}` persistence through `record_start_failure`.
+    pub(super) fail_lease_context: Option<String>,
     /// Panic on the next `lease_workspace` call (once). Models a spawned
     /// dispatch task aborting while the row is `claimed`, so tests can
     /// assert the RAII guard reverts the row to `ready`.
@@ -197,7 +204,16 @@ crate::stub_cube_client! { FakeCubeClient {
             .into());
         }
         if self.fail_lease {
-            return Err(anyhow!("cube workspace lease failed"));
+            let err = anyhow!(
+                "{}",
+                self.fail_lease_inner
+                    .as_deref()
+                    .unwrap_or("cube workspace lease failed")
+            );
+            return Err(match &self.fail_lease_context {
+                Some(context) => err.context(context.clone()),
+                None => err,
+            });
         }
         if self.fail_lease_when_prefer_set && prefer_workspace_id.is_some() {
             return Err(anyhow!(
@@ -341,6 +357,10 @@ pub(super) struct FakeExecutionRunner {
     /// Defaults to `"worker prompt failed"` so existing spawn-failure
     /// tests keep their original message.
     pub(super) fail_message: Option<String>,
+    /// When `fail` is set and this is `Some`, wrap `fail_message` as the
+    /// inner cause under this outer context (`anyhow!(msg).context(ctx)`),
+    /// so tests can assert `{err:#}` persistence of the cause chain.
+    pub(super) fail_context: Option<String>,
     /// When `true`, `run_execution` fails with a `SlotBusy` app
     /// rejection (wrapped the same way `spawn_flow` wraps it) instead
     /// of the generic `fail` error, so tests can exercise the
@@ -386,6 +406,7 @@ impl Default for FakeExecutionRunner {
             calls: Mutex::new(Vec::new()),
             fail: false,
             fail_message: None,
+            fail_context: None,
             slot_busy: false,
             pending: false,
             slot_id: None,
@@ -424,10 +445,11 @@ impl ExecutionRunner for FakeExecutionRunner {
             return Err(anyhow::Error::new(root).context("failed to spawn worker pane"));
         }
         if self.fail {
-            return Err(anyhow!(
-                "{}",
-                self.fail_message.as_deref().unwrap_or("worker prompt failed")
-            ));
+            let err = anyhow!("{}", self.fail_message.as_deref().unwrap_or("worker prompt failed"));
+            return Err(match &self.fail_context {
+                Some(context) => err.context(context.clone()),
+                None => err,
+            });
         }
 
         if self.cancelled_during_spawn {

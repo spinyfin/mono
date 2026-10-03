@@ -933,6 +933,7 @@ pub(crate) async fn stop_active_revision_executions(
             crate::work::CancelExecutionOpts {
                 reason: Some("parent PR merged".to_owned()),
                 queued_only: false,
+                record_failure_reason: false,
             },
         );
         match &cancel_result {

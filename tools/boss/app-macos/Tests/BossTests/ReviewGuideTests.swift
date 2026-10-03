@@ -105,6 +105,28 @@ final class ReviewGuideTests: XCTestCase {
         XCTAssertEqual(viewerError, reason)
     }
 
+    func testContextMenuFailureTitleUsesErrorSummary() {
+        let reason = "Codex refused to trust the session hooks.\nSee ~/.codex/logs."
+        let failed = ReviewGuideCardPresentation.from(
+            lifecycle: "failed",
+            readableVersionId: nil,
+            error: reason
+        )
+        XCTAssertEqual(
+            failed?.contextMenuFailureTitle,
+            "Last attempt failed: Codex refused to trust the session hooks."
+        )
+
+        let ready = ReviewGuideCardPresentation.from(lifecycle: "ready", readableVersionId: "prgv_1")
+        XCTAssertNil(ready?.contextMenuFailureTitle)
+
+        let failedWithoutReason = ReviewGuideCardPresentation.from(
+            lifecycle: "failed",
+            readableVersionId: nil
+        )
+        XCTAssertNil(failedWithoutReason?.contextMenuFailureTitle)
+    }
+
     func testGeneratingPresentationKeepsProgressAndPriorDocument() {
         let initial = ReviewGuideCardPresentation.from(lifecycle: "generating", readableVersionId: nil)
         XCTAssertEqual(initial?.kind, .generating)

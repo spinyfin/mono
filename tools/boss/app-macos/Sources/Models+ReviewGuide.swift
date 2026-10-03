@@ -131,6 +131,14 @@ struct ReviewGuideCardPresentation: Equatable {
         }
     }
 
+    /// Visible context-menu row when the last attempt failed. The Generate /
+    /// Regenerate action title stays unchanged; this extra disabled row is
+    /// the discoverable reason.
+    var contextMenuFailureTitle: String? {
+        guard showsRetry, let summary = errorSummary else { return nil }
+        return "Last attempt failed: \(summary)"
+    }
+
     var tooltip: String {
         let fullError = error?.trimmingCharacters(in: .whitespacesAndNewlines)
         switch kind {

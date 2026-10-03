@@ -26,6 +26,16 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CHORE_LIKE_KINDS_SQL: &str =
     "'chore', 'project_task', 'design', 'investigation', 'followup', 'design_postmortem'";
 
+/// Error of the single most recent terminal, non-superseded review-guide
+/// attempt (`failed` or `cancelled`). Both the card-state query and the
+/// summary query embed this so the two projections cannot drift. Empty
+/// errors are returned as-is; there is no fallback to an older attempt.
+pub(crate) const REVIEW_GUIDE_LATEST_TERMINAL_ERROR_SQL: &str = "CASE WHEN s.guide_lifecycle = 'failed' THEN (
+                    SELECT a.error FROM pr_review_guide_attempts a
+                    WHERE a.series_id = s.id AND a.status IN ('failed', 'cancelled')
+                    ORDER BY a.finished_at DESC, a.id DESC LIMIT 1
+                ) ELSE NULL END";
+
 /// Sliding window for the merge-conflict churn-guard heuristic
 /// (`merge-conflict-handling-in-review.md` Q6 / Phase 6 #16): the
 /// 4th `conflict_resolutions` row for a given work item inside one

@@ -259,3 +259,44 @@ fn attach_review_guide_state_projects_failed_attempt_error() {
     let wire = crate::work::to_wire_review_guide_summary(summary);
     assert_eq!(wire.error.as_deref(), Some("Codex hook-trust gate refused the session"),);
 }
+
+/// A later cancelled attempt must replace an older failed attempt's reason
+/// on both the card projection and the series summary. Cancellation also
+/// flips `guide_lifecycle` to `failed`.
+#[test]
+fn attach_review_guide_state_projects_latest_cancelled_attempt_error() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let root = create_active_chore(&db, &product_id, "review guide cancelled reason");
+    let (series_id, comparison_id) = seed_review_guide_series(&db, &root);
+    let first = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    db.fail_pr_review_guide_attempt(&first.id, "attempt A failed").unwrap();
+    let second = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    db.cancel_pr_review_guide_attempt(&second.id, "attempt B cancelled")
+        .unwrap();
+
+    let ts = "2026-05-14T00:00:00Z";
+    let mut tasks = vec![make_bare_task(
+        &root,
+        "chore",
+        None,
+        Some("https://github.com/acme/widget/pull/9"),
+        ts,
+    )];
+    let mut chores: Vec<Task> = vec![];
+    {
+        let conn = db.connect().unwrap();
+        attach_review_guide_state(&conn, &mut tasks, &mut chores).unwrap();
+    }
+    let root_task = &tasks[0];
+    assert_eq!(root_task.review_guide_lifecycle.as_deref(), Some("failed"));
+    assert_eq!(root_task.review_guide_error.as_deref(), Some("attempt B cancelled"),);
+
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    assert_eq!(summary.error.as_deref(), Some("attempt B cancelled"));
+}
