@@ -51,3 +51,32 @@ fn live_status_and_worker_writes_do_not_use_bulk_lane() {
         state: None,
     }));
 }
+
+#[test]
+fn pr_status_refresh_probe_does_not_hold_a_bulk_slot() {
+    use boss_protocol::FrontendRequest as R;
+    let status = |refresh| R::GetPrStatus {
+        run_id: "run".into(),
+        refresh,
+    };
+    assert!(is_bulk_read(&status(false)));
+    assert!(!is_bulk_read(&status(true)));
+}
+
+/// The macOS app pipelines its connect and invalidation fan-out (about a
+/// dozen bulk reads, plus per-viewer comment reads) over one socket. With the
+/// default budget none of it may be rejected, even while one slow read
+/// (a large `GetWorkTree`) holds its slot for longer than the wait deadline.
+#[tokio::test]
+async fn default_budget_admits_app_session_fan_out_behind_a_slow_read() {
+    let gate = Arc::new(ReadAdmission::default());
+    let connection = gate.connection();
+    let slow = gate.enqueue(&connection).unwrap().acquire().await.unwrap();
+    let mut held = Vec::new();
+    for _ in 0..15 {
+        let waiting = gate.enqueue(&connection).expect("fan-out must be queueable");
+        held.push(waiting.acquire().await.expect("fan-out read rejected as busy"));
+    }
+    drop(held);
+    drop(slow);
+}

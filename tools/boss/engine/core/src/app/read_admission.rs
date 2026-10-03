@@ -32,9 +32,9 @@ impl Default for ReadAdmission {
     fn default() -> Self {
         Self::new(
             setting("BOSS_RPC_READ_CONCURRENCY", 32),
-            setting("BOSS_RPC_READ_PER_CONNECTION", 4),
+            setting("BOSS_RPC_READ_PER_CONNECTION", 16),
             setting("BOSS_RPC_READ_QUEUE", 128),
-            Duration::from_millis(setting("BOSS_RPC_READ_WAIT_MS", 250) as u64),
+            Duration::from_millis(setting("BOSS_RPC_READ_WAIT_MS", 500) as u64),
         )
     }
 }
@@ -103,6 +103,10 @@ impl WaitingRead {
 }
 
 /// Status used by `agents list` has its own reserved live-work path.
+/// `GetPrStatus` with `refresh: true` awaits a GitHub probe, so it is
+/// deliberately outside the bulk lane: network latency must not occupy slots
+/// that interactive DB reads need (it is bounded by its own per-execution
+/// refresh budget instead).
 /// Mutations, subscriptions, and worker proposals remain ordered on their
 /// connection. Bulk read replies are correlated by request id.
 pub(super) fn is_bulk_read(request: &boss_protocol::FrontendRequest) -> bool {
@@ -140,7 +144,7 @@ pub(super) fn is_bulk_read(request: &boss_protocol::FrontendRequest) -> bool {
             | R::GetIdea { .. }
             | R::GetPrBody { .. }
             | R::GetProductDesignDoc { .. }
-            | R::GetPrStatus { .. }
+            | R::GetPrStatus { refresh: false, .. }
             | R::GetReviewGuideContent { .. }
             | R::GetReviewGuideSummary { .. }
             | R::GetRun { .. }

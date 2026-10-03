@@ -2242,7 +2242,12 @@ async fn handle_frontend_connection(
                 tracing::info!(session_id = %session_id, "session shutdown triggered");
                 break;
             }
-            line = reader.next_line() => line,
+            // Stop reading requests while the outbound lane is nearly full so
+            // replies are never evicted for a client that is not draining.
+            line = async {
+                sink.wait_for_response_headroom().await;
+                reader.next_line().await
+            } => line,
         };
         let Some(line) = line_result.context("socket read failed")? else {
             break;

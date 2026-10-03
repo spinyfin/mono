@@ -223,3 +223,48 @@ async fn saturated_reads_return_busy_over_the_wire_while_status_works() {
     handler.await.unwrap().unwrap();
     drop(held);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_socket_pipelining_sixteen_bulk_reads_never_sees_busy() {
+    let (state, _dir) = crate::app::tests::test_server_state();
+    let (client, server) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(handle_frontend_connection(server, state, None));
+    let (read, mut write) = client.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let count = 16;
+    for index in 0..count {
+        let payload = match index % 4 {
+            0 => FrontendRequest::ListProducts,
+            1 => FrontendRequest::GetSettings,
+            2 => FrontendRequest::ListLiveStatusDisabledSlots,
+            _ => FrontendRequest::ListHosts,
+        };
+        let request = FrontendRequestEnvelope {
+            request_id: format!("pipelined-{index}"),
+            payload,
+        };
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+    }
+    let mut replies = 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while replies < count {
+            let event: FrontendEventEnvelope =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            if event.request_id.is_some() {
+                assert!(
+                    !matches!(&event.payload, FrontendEvent::Error { message } if message == BUSY),
+                    "pipelined read rejected as busy: {event:?}"
+                );
+                replies += 1;
+            }
+        }
+    })
+    .await
+    .expect("pipelined reads hung");
+    drop(lines);
+    drop(write);
+    handler.await.unwrap().unwrap();
+}
