@@ -171,7 +171,7 @@ func bossShellQuote(_ value: String) -> String {
 ///
 /// `gh pr close` / `comment` / `ready` / `edit` are reversible PR housekeeping
 /// (`gh pr reopen` undoes close; comments and descriptions can be edited again).
-/// `gh pr merge` is deliberately absent — the operator handles merges — and there
+/// `gh pr merge` is deliberately absent — merging is not pre-cleared — and there
 /// is no blanket `gh *` / `gh pr *` wildcard.
 private let bossBaselinePermissionsAllow: [String] = [
     "Bash(boss *)",
@@ -209,9 +209,11 @@ private let bossBaselinePermissionsAllow: [String] = [
 /// cover.
 ///
 /// The `gh pr close` / `comment` / `ready` / `edit` rules are repeated here from
-/// the baseline list: the classifier refused a `gh pr close` on a superseded PR
-/// though it is reversible (`gh pr reopen` undoes it; comments and descriptions
-/// can be edited again). `gh pr merge` stays out — the operator merges.
+/// the baseline list. The classifier can refuse these verbs even though the
+/// baseline list allows them, so they are pre-cleared here too. They are
+/// reversible (`gh pr reopen` undoes close; comments and descriptions can be
+/// edited again). `gh pr merge` stays out: merging is not reversible
+/// housekeeping, so it is not pre-cleared.
 ///
 /// `boss handoff write` / `show` are the coordinator session handoff (see
 /// "Session handoff" in the prompt). The write replaces a coordinator-private
