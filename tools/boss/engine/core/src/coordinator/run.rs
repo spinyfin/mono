@@ -6,7 +6,7 @@ use super::*;
 /// Filed against a run when the worker pane never came up (libghostty IPC
 /// drop, slot busy, prompt composition error). See
 /// [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
-/// rule: `ClearedBy::WorkResumed`, since a later run starting for the item
+/// rule: `ClearedBy::WorkResumed`, since a later spawn completing for the item
 /// is direct evidence the pane-spawn problem is no longer blocking it.
 pub const PANE_SPAWN_FAILED_ATTENTION_KIND: &str = "pane_spawn_failed";
 
@@ -45,6 +45,11 @@ impl ExecutionCoordinator {
             self.collect_revision_conflict_diagnosis_pre_spawn(&execution, &work_item, &lease)
                 .await;
         }
+
+        // Which (driver, worker kind) combination this spawn counts towards
+        // in the pre-start failure streak tracker. Resolved before the spawn
+        // so both outcomes below record against the same key.
+        let streak_key = self.pre_start_streak_key(&execution, &worker_id);
 
         let run_outcome = adapter
             .spawn_worker(
@@ -166,6 +171,21 @@ impl ExecutionCoordinator {
                 // below frees the pool slot idempotently.
             }
             Ok(outcome) => {
+                // The spawn got past every pre-start step, which ends any
+                // pre-start failure streak for this (driver, worker kind)
+                // and resolves its alert. Recorded first so nothing below
+                // can leave a stale alert up after a real success.
+                if let Some(resolved) = self.pre_start_streaks.record_success(&streak_key) {
+                    tracing::info!(
+                        driver = %resolved.driver,
+                        worker_kind = %resolved.worker_kind,
+                        consecutive_failures = resolved.consecutive_failures,
+                        first_failure_epoch_s = resolved.first_failure_epoch_s,
+                        execution_id = %execution.id,
+                        "pre-start spawn failure streak resolved: a spawn for this driver and worker \
+                         kind succeeded",
+                    );
+                }
                 // Capture the resolved spawn knobs (effort level,
                 // claude effort value, model) before `outcome` moves
                 // into `record_run_completion` — they ride along on
@@ -340,6 +360,38 @@ impl ExecutionCoordinator {
                     )
                     .await;
 
+                // Count the failure towards its (driver, worker kind) streak.
+                // This is what turns "every spawn of this kind is failing"
+                // into one fleet-level alert instead of N unrelated
+                // per-execution failures nobody is looking at (incident
+                // 008). Purely a visibility signal: it changes nothing about
+                // how this failure is handled below, and it never pauses
+                // dispatch.
+                //
+                // `SlotBusy` is excluded for the same reason it does not
+                // count as a pre-start failure on the execution row: it is a
+                // self-healing engine/app slot desync, not evidence that
+                // this driver or worker kind cannot start.
+                if !slot_busy {
+                    let effect = self.pre_start_streaks.record_failure(
+                        streak_key.clone(),
+                        &execution.id,
+                        &err_detail,
+                        boss_engine_utils::epoch_time::now_epoch_secs(),
+                    );
+                    if effect != crate::pre_start_streak::FailureEffect::BelowThreshold {
+                        tracing::error!(
+                            driver = %streak_key.driver,
+                            worker_kind = streak_key.worker_kind,
+                            newly_raised = effect == crate::pre_start_streak::FailureEffect::Raised,
+                            execution_id = %execution.id,
+                            error = %err_detail,
+                            "pre-start spawn failure streak: consecutive spawns for this driver and \
+                             worker kind have failed before a pane existed, with no success in between",
+                        );
+                    }
+                }
+
                 // Pane-spawn-failure termination path: the run is
                 // unconditionally terminal from here (marked `failed`
                 // below regardless of whether the cube release below
@@ -435,7 +487,7 @@ impl ExecutionCoordinator {
                         .maybe_attention(attention)
                         .build(),
                 ) {
-                    Ok((execution, _run, _)) => {
+                    Ok((execution, _run, attention_item)) => {
                         self.notify_review_guide_pre_start_failure(&execution);
                         // Driver teardown for this termination path already
                         // ran unconditionally above, before the cube release.
@@ -453,8 +505,21 @@ impl ExecutionCoordinator {
                             released_workspace = released,
                             "execution run failed"
                         );
+                        // Keep the dispatch trace linked to the attention item,
+                        // which the work-item listing resolves through the execution
+                        // and, for review guides, its source series' root task.
+                        let attention_item_id = attention_item.as_ref().map(|item| item.id.clone());
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            execution_kind = %execution.kind,
+                            attention_item_id = attention_item_id.as_deref().unwrap_or(""),
+                            attention_kind = PANE_SPAWN_FAILED_ATTENTION_KIND,
+                            "filed pane_spawn_failed attention item for the failed spawn",
+                        );
                         let mut error_details = serde_json::json!({
                             "run_id": run.id,
+                            "attention_item_id": attention_item_id,
                             "released_workspace": released,
                             "slot_id": slot_id,
                             "page": slot_id.and_then(worker_page_label),

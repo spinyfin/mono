@@ -112,6 +112,7 @@ impl ExecutionCoordinator {
             refused_workspaces: Mutex::new(HashMap::new()),
             max_concurrent_interactive_workers: AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS),
             pause_state_changed: tokio::sync::watch::channel(0).0,
+            pre_start_streaks: Arc::default(),
         }
     }
 
@@ -799,6 +800,39 @@ impl ExecutionCoordinator {
     /// needs the current state at startup reads it directly.
     pub fn subscribe_pause_state(&self) -> tokio::sync::watch::Receiver<u64> {
         self.pause_state_changed.subscribe()
+    }
+
+    /// The per-(driver, worker kind) pre-start failure streak tracker. The
+    /// engine health report reads its active alerts, and
+    /// `ServerState::spawn_spawn_streak_health_broadcaster` subscribes to
+    /// its changes. See [`crate::pre_start_streak`].
+    pub fn pre_start_streaks(&self) -> &Arc<crate::pre_start_streak::PreStartStreakTracker> {
+        &self.pre_start_streaks
+    }
+
+    /// The (driver, worker kind) combination a spawn of `execution` on
+    /// `worker_id` counts towards in [`Self::pre_start_streaks`].
+    ///
+    /// Resolved the same way host selection resolves the driver a spawn is
+    /// required to launch (see `select_host_for_execution`), so the label
+    /// names the driver that was actually attempted: review guides are
+    /// fixed to their one driver, a PR review uses its batch member's
+    /// requested driver, a pool worker uses its pool's driver, and
+    /// everything else uses the row / product / allocation resolution.
+    /// Resolved once, before the spawn, and used for both outcomes so a
+    /// failure and the success that ends its streak can never land on
+    /// different keys.
+    pub(super) fn pre_start_streak_key(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+    ) -> crate::pre_start_streak::StreakKey {
+        let driver = self.resolve_spawn_driver(execution, worker_id).unwrap_or_else(|err| {
+            tracing::warn!(execution_id = %execution.id, error = %format!("{err:#}"),
+                "streak tracking: failed to resolve spawn driver; treating as unknown");
+            None
+        });
+        crate::pre_start_streak::StreakKey::for_execution(driver.as_deref(), &execution.kind)
     }
 
     /// The epoch-seconds timestamp at which automation was last paused, or

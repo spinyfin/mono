@@ -21,7 +21,7 @@ const PAUSED_AT_EPOCH_S: i64 = 1_786_385_816;
 /// A session sink registered with the topic broker and subscribed to
 /// `engine.health` — exactly what the macOS app does on connect
 /// (`ChatViewModel.desiredWorkTopics`).
-async fn subscribed_health_session(state: &Arc<ServerState>) -> Arc<SessionSink> {
+pub(super) async fn subscribed_health_session(state: &Arc<ServerState>) -> Arc<SessionSink> {
     let sink = make_session_sink();
     state.topic_broker.register_session(TEST_SESSION, sink.clone()).await;
     let added = state
@@ -39,7 +39,7 @@ async fn subscribed_health_session(state: &Arc<ServerState>) -> Arc<SessionSink>
 /// The next engine-health report pushed to `sink`. Bounded, so a broadcast
 /// that never fires fails loudly here instead of hanging the suite — which
 /// is the exact failure this file exists to catch.
-async fn next_health_report(sink: &SessionSink) -> boss_protocol::EngineHealthReport {
+pub(super) async fn next_health_report(sink: &SessionSink) -> boss_protocol::EngineHealthReport {
     let envelope = tokio::time::timeout(std::time::Duration::from_secs(10), sink.next())
         .await
         .expect("no engine.health push arrived within 10s — the running app would show nothing")
