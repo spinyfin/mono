@@ -361,6 +361,7 @@ fn engine_health_result_event_round_trips_spawn_failure_streaks() {
             automation_paused: false,
             issues: Vec::new(),
             spawn_failure_streaks: vec![streak.clone()],
+            review_guide_reenqueue: None,
             engine_version: "1.0.4-dev-abc123".into(),
             engine_git_sha: "abc123".into(),
         },
