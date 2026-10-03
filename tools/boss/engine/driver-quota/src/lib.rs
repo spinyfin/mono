@@ -309,21 +309,32 @@ pub mod parse {
     pub fn parse_grok_billing(body: &str) -> DriverQuotaOutcome {
         let payload: serde_json::Value = match serde_json::from_str(body) {
             Ok(v) => v,
-            Err(err) => {
+            Err(_) => {
                 return unavailable(
                     DriverQuotaFailureKind::Unparseable,
-                    format!("billing response was not JSON: {err}"),
+                    "billing response was not JSON; top-level keys: unavailable; config keys: unavailable",
                 );
             }
         };
         // The endpoint has answered both bare and wrapped in `config`; accept
         // either rather than breaking on the wrapper.
         let config = payload.get("config").unwrap_or(&payload);
-        let Some(used_percent) = config.get("creditUsagePercent").and_then(serde_json::Value::as_f64) else {
-            return unavailable(
-                DriverQuotaFailureKind::Unparseable,
-                "billing response had no numeric `creditUsagePercent`".to_owned(),
-            );
+        let used_percent = match config.get("creditUsagePercent") {
+            Some(value) if value.is_number() => value.as_f64().unwrap(),
+            // The live credits endpoint omits zero-valued scalar fields. Only
+            // accept that default within the recognised billing structure;
+            // empty configs, error bodies and schema changes remain failures.
+            None if grok_has_billing_structure(config) => 0.0,
+            _ => {
+                return unavailable(
+                    DriverQuotaFailureKind::Unparseable,
+                    format!(
+                        "billing response had no numeric `creditUsagePercent` or recognised zero-usage billing structure; top-level keys: {}; config keys: {}",
+                        grok_object_keys(&payload),
+                        grok_object_keys(payload.get("config").unwrap_or(&serde_json::Value::Null)),
+                    ),
+                );
+            }
         };
         let window = match config
             .pointer("/currentPeriod/type")
@@ -358,6 +369,32 @@ pub mod parse {
             resets_at_text,
             source: SOURCE_GROK.to_owned(),
         })
+    }
+
+    fn grok_object_keys(value: &serde_json::Value) -> String {
+        match value.as_object() {
+            Some(object) => format!("{:?}", object.keys().collect::<Vec<_>>()),
+            None => "absent or not an object".to_owned(),
+        }
+    }
+
+    fn grok_has_billing_structure(config: &serde_json::Value) -> bool {
+        let known_period = matches!(
+            config
+                .pointer("/currentPeriod/type")
+                .and_then(serde_json::Value::as_str),
+            Some("USAGE_PERIOD_TYPE_WEEKLY" | "USAGE_PERIOD_TYPE_MONTHLY")
+        );
+        known_period
+            && grok_period_minutes(config).is_some_and(|minutes| minutes > 0)
+            && config
+                .get("isUnifiedBillingUser")
+                .and_then(serde_json::Value::as_bool)
+                .is_some()
+            && config
+                .pointer("/onDemandCap/val")
+                .and_then(serde_json::Value::as_f64)
+                .is_some()
     }
 
     /// Period length for a non-weekly Grok billing period. Returns `None` when
@@ -643,6 +680,9 @@ pub mod parse {
     }
 }
 pub mod probes;
+
+#[cfg(test)]
+mod grok_tests;
 
 pub use cache::{DEFAULT_MIN_REFRESH_INTERVAL, DEFAULT_TTL, QuotaCache, QuotaLookup, QuotaProbeSet};
 
