@@ -658,6 +658,8 @@ mod project_postmortem;
 #[cfg(test)]
 mod project_postmortem_tests;
 mod queued_wait;
+#[cfg(test)]
+mod read_only_tests;
 pub(crate) use feedback_target::FeedbackTarget;
 mod description_guard;
 mod guide_comments;

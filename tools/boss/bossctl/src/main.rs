@@ -2029,13 +2029,18 @@ pub(crate) fn resolve_db_path(state_root: Option<PathBuf>) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join("Library/Application Support/Boss/state.db"))
 }
 
+/// Open an existing database for inspection without running migrations.
+pub(crate) fn open_state_db_read_only(state_root: Option<PathBuf>) -> Result<WorkDb> {
+    WorkDb::open_read_only(resolve_db_path(state_root)?).context("opening state.db for inspection")
+}
+
 /// Resolve `state.db`'s path via [`resolve_db_path`] and open it. This bundles
-/// the `resolve_db_path` + [`WorkDb::open`] pair that every direct-DB command
+/// the `resolve_db_path` + [`WorkDb::open_existing`] pair that every direct-DB command
 /// (`comments`, `work executions`, `executions prune`, `hosts`, …) repeats,
 /// attaching the standard `"opening state.db"` context on failure.
 pub(crate) fn open_state_db(state_root: Option<PathBuf>) -> Result<WorkDb> {
     let db_path = resolve_db_path(state_root)?;
-    WorkDb::open(db_path).context("opening state.db")
+    WorkDb::open_existing(db_path).context("opening state.db")
 }
 
 /// `bossctl executions prune` — on-demand retention cleanup of terminal
@@ -2405,7 +2410,7 @@ struct MetricRow {
 }
 
 fn load_metric_rows(db_path: PathBuf, prefix: Option<&str>) -> Result<Vec<MetricRow>> {
-    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let db = WorkDb::open_existing(db_path).context("opening state.db")?;
     let (counters, gauges) = db.metrics_load_all().context("reading metrics from state.db")?;
 
     let mut rows: Vec<MetricRow> = counters
@@ -2614,7 +2619,7 @@ fn points_per_hour(points: i64, span_ms: i64) -> Option<f64> {
 /// Per-subsystem GitHub API attribution over a time window.
 fn metrics_github(json: bool, state_root: Option<PathBuf>, hours: u32) -> Result<()> {
     let db_path = resolve_db_path(state_root)?;
-    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let db = WorkDb::open_existing(db_path).context("opening state.db")?;
     let since_ms = now_epoch_ms() as i64 - (hours as i64) * 3_600_000;
 
     let buckets = db
