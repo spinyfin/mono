@@ -3,9 +3,10 @@ import Foundation
 /// Outcome of resolving a reveal target (`bossctl reveal` / attention-item
 /// jumps) to the actual card that should be scrolled to and highlighted.
 enum RevealCardResult: Equatable {
-    /// A real, visible card exists with this id — either the requested
+    /// A host card resolves to this id — either the requested
     /// item's own card, or (for a revision rolled up into its parent
-    /// because it reached `in_review`/`done`) the parent's card.
+    /// because it reached `in_review`/`done`) the parent's card. This is
+    /// resolution only, not evidence that a view scrolled successfully.
     case revealed(cardID: String)
     /// The id isn't loaded locally yet — the common cross-product case,
     /// before the target product's work tree has been fetched into this
