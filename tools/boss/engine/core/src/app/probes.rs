@@ -58,7 +58,7 @@ pub const PROBE_UNDELIVERED_ATTENTION_KIND: &str = "probe_undelivered";
 /// then `set_server_state` plumbs the upgrade target in. A probe queued
 /// through this adapter is queued from inside a `Stop` fan-out, and
 /// `dispatch_probe_on_stop` — which runs later in that same fan-out —
-/// `SendToPane`s it as if the user had typed it.
+/// types it into the pane via tmux `send-keys` as if the user had typed it.
 #[derive(Default)]
 pub(super) struct ServerStateProbeQueuer {
     server: std::sync::OnceLock<Weak<ServerState>>,
@@ -340,7 +340,7 @@ impl ServerState {
     }
 
     /// Push a pre-minted `PendingProbe` back onto the front of the queue for
-    /// `run_id`. Used when `SendToPane` fails after the probe was already
+    /// `run_id`. Used when a pane write fails after the probe was already
     /// claimed — a later delivery opportunity retries, and the caller's
     /// `probe_id` stays stable across the retry. Delivery sites should call
     /// [`Self::release_probe_reservation`], which also frees the in-flight
@@ -661,7 +661,7 @@ impl ServerState {
 
     /// Drop every not-yet-delivered probe queued for `run_id`. Used by
     /// the completion handler to discard a stale nudge (e.g. one
-    /// requeued for retry after a failed `SendToPane`) once a Stop
+    /// requeued for retry after a failed pane write) once a Stop
     /// reveals the worker reported `[blocked]`/`[effort-escalation]` —
     /// otherwise `dispatch_probe_on_stop` would pop and deliver it
     /// regardless of that Stop's own (suppressed) completion outcome.
@@ -886,8 +886,8 @@ impl ServerState {
 
     /// Whether the worker process behind `run_id` probes *dead* right now.
     ///
-    /// Used to keep [`ProbeDeliveryState::Consumed`] honest: a `SendToPane`
-    /// that returns `Ok` only proves the app wrote bytes into the pty, and a
+    /// Used to keep [`ProbeDeliveryState::Consumed`] honest: a successful
+    /// tmux `send-keys` only proves the bytes reached the pty, and a
     /// pane whose foreground process has already exited will accept those
     /// bytes with nobody to read them (observed with a `codex` pane, where the
     /// probe was nonetheless recorded `consumed`). Reuses the shared

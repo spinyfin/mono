@@ -78,6 +78,23 @@ final class AwaitingInputKanbanTests: XCTestCase {
         XCTAssertEqual(reason, AgentActivityState.identityUnavailableReason)
     }
 
+    func testInitFromLiveStateMapsMissingTmuxIdentityToErrored() {
+        let live = makeLiveState(activity: .working, tmuxHosted: false)
+        let state = AgentActivityState(runtime: makeRuntime(), liveState: live)
+        guard case let .errored(reason) = state else {
+            return XCTFail("expected .errored for tmuxHosted == false; got \(state)")
+        }
+        XCTAssertEqual(reason, AgentActivityState.identityUnavailableReason)
+    }
+
+    func testInitFromLiveStateKeepsNilTmuxHostedWorkingWorkerActive() {
+        let live = makeLiveState(activity: .working, tmuxHosted: nil)
+        let state = AgentActivityState(runtime: makeRuntime(), liveState: live)
+        guard case .active = state else {
+            return XCTFail("expected .active for nil tmuxHosted; got \(state)")
+        }
+    }
+
     func testRemoteNilTmuxHostedWorkingWorkerStaysActive() {
         let live = makeLiveState(activity: .working, tmuxHosted: nil)
         let state = AgentActivityState.forDoingCard(

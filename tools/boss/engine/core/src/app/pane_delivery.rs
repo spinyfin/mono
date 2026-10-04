@@ -78,6 +78,17 @@ use crate::tmux_adoption::TmuxIdentityObservation;
 use boss_protocol::WorkerActivity;
 use boss_tmux::Tmux;
 
+/// Why a pane has no tmux session to write into. Remote workers (virtual
+/// slots) never have one, so they must not be reported as the local
+/// missing-identity invariant failure.
+pub(super) fn missing_session_identity_message(run_id: &str, slot_id: u8) -> String {
+    if slot_id >= crate::worker_registry::REMOTE_SLOT_BASE {
+        format!("pane input is not supported for remote worker {run_id}")
+    } else {
+        "local worker has no tmux session identity".to_owned()
+    }
+}
+
 /// Whether a pane write is permitted for a given `(activity, driver)` pair,
 /// and if so at which of the two delivery postures.
 ///
@@ -620,7 +631,7 @@ impl ServerState {
             return Err("no worker pane mapped for that run id".to_owned());
         };
         if pane.tmux_session_name.as_ref().is_none_or(|name| name.is_empty()) {
-            return Err("local worker has no tmux session identity".to_owned());
+            return Err(missing_session_identity_message(run_id, pane.slot_id));
         }
         match self.work_db.tmux_identity_for_execution(run_id) {
             Ok(Some(_)) => Ok(()),
@@ -647,7 +658,7 @@ impl ServerState {
         };
         let Some(session_name) = pane.tmux_session_name.filter(|name| !name.is_empty()) else {
             return Err(PaneSendFailure::Tmux(anyhow::anyhow!(
-                "local worker has no tmux session identity"
+                missing_session_identity_message(run_id, pane.slot_id)
             )));
         };
         let tmux = self.tmux_for_pane_delivery(run_id).map_err(PaneSendFailure::Tmux)?;

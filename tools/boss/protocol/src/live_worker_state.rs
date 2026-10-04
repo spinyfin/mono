@@ -76,7 +76,7 @@ impl WorkerActivity {
     /// True iff the pane's foreground worker is **parked at its prompt**:
     /// [`Self::Idle`] (between turns) or [`Self::WaitingForInput`] (on a
     /// permission prompt / human redirect). In those postures a typed /
-    /// `SendToPane` write becomes the worker's next prompt under any driver,
+    /// pane write becomes the worker's next prompt under any driver,
     /// so this is the driver-independent floor for pane injection.
     ///
     /// This is **not** the whole injection decision, and callers must not use

@@ -361,7 +361,7 @@ fn spawn_invocation_meets_codex_tui_contract() {
 /// shell survived to consume tty-buffered injects), a persistent session
 /// is typed as a plain command at the pane's shell prompt — the same
 /// shape Claude and Grok already use — so the shell survives and can go
-/// on to accept later `SendToPane` turns.
+/// on to accept later typed pane-input turns via tmux `send-keys`.
 #[test]
 fn pane_launch_spec_does_not_use_shell_exec() {
     let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-6-astra", "run-pane-a"));

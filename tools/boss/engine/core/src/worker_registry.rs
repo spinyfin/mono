@@ -100,8 +100,9 @@ impl WorkerRegistry {
     }
 
     /// Record the libghostty slot id the engine asked the app to host
-    /// `run_id` in. The engine uses this to route follow-up
-    /// `SendToPane` requests by run id.
+    /// `run_id` in, without a tmux session identity. Local pane writes
+    /// and interrupts fail closed for such a run; tmux-hosted local
+    /// workers must use [`Self::register_tmux_run_slot`].
     pub fn register_run_slot(&self, run_id: impl Into<String>, slot_id: u8) {
         {
             let mut inner = self.inner.lock().expect("registry poisoned");

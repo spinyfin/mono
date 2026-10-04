@@ -838,8 +838,8 @@ async fn clearing_a_stale_queued_probe_records_that_it_was_dropped_and_why() {
     assert_eq!(server_state.pending_probe_count(&run_id), 0);
 }
 
-/// `consumed` must mean consumed. `SendToPane` returning `Ok` only proves the
-/// app wrote bytes into the pty; a pane whose foreground process has already
+/// `consumed` must mean consumed. A successful `send-keys` only proves tmux
+/// accepted the bytes into the pty; a pane whose foreground process has already
 /// exited accepts them with nobody reading. That is how a probe injected into
 /// a dead `codex` pane came to be reported `consumed`, which made the state
 /// useless as evidence that a worker had seen anything.
@@ -859,7 +859,7 @@ async fn a_write_into_a_pane_whose_process_is_gone_is_not_recorded_as_consumed()
         .live_worker_states
         .update_shell_pid(&run_id, a_definitely_dead_pid())
         .expect("fixture precondition: the run must have a live-state entry");
-    let _tmux = install_probe_tmux(&server_state, &run_id);
+    let runner = install_probe_tmux(&server_state, &run_id);
 
     let watch_session_id = "session-dead-pid-watch".to_owned();
     let watch_sink = make_session_sink();
@@ -876,6 +876,10 @@ async fn a_write_into_a_pane_whose_process_is_gone_is_not_recorded_as_consumed()
     let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
 
     assert_eq!(outcome, ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Orphaned));
+    assert!(
+        runner.wrote_text(),
+        "the write must have been issued before it was classified as orphaned",
+    );
     let state = server_state
         .probe_lifecycle_state(&probe_id)
         .expect("probe must have a record");
@@ -1219,8 +1223,8 @@ async fn stop_drain_requeues_after_a_failed_pane_write() {
             stop_reason: crate::protocol::StopReason::Completed,
         },
     );
-    // Deliberately no tmux identity, so the write fails closed instead of
-    // falling back to an app pane RPC.
+    // Deliberately no tmux identity: a local worker without one must fail the
+    // write closed.
     let probe_id = server_state.queue_probe(run_id.clone(), "still there?".into(), false);
 
     let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;

@@ -748,16 +748,17 @@ impl AgentDriver for GrokDriver {
         classify_grok_error(raw_output)
     }
 
-    /// Probe is typed pane input (`SendToPane`) — Grok's interactive TUI
-    /// reads stdin as the next user message, same as Claude's.
+    /// Probe is typed pane input via tmux `send-keys` — Grok's interactive
+    /// TUI reads stdin as the next user message, same as Claude's.
     fn probe(&self) -> ProbeDelivery {
         ProbeDelivery::PaneText
     }
 
-    /// Interrupt is Esc into the pane (`InterruptWorkerPane`) — verified by
-    /// the Q8 spike to cancel the in-flight turn while the process survives
-    /// and accepts a subsequent turn. Esc-cancelled turns skip the `Stop`
-    /// hook entirely (design G-7); [`Self::prepare_interrupt_recovery`] /
+    /// Interrupt is Esc delivered into the tmux pane with `send-keys Escape`
+    /// — verified by the Q8 spike to cancel the in-flight turn while the
+    /// process survives and accepts a subsequent turn. Esc-cancelled turns
+    /// skip the `Stop` hook entirely (design G-7);
+    /// [`Self::prepare_interrupt_recovery`] /
     /// [`Self::is_interrupt_recovery_turn_end`] close that gap (design T-12).
     fn interrupt(&self) -> InterruptDelivery {
         InterruptDelivery::PaneEsc
