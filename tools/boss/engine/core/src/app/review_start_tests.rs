@@ -201,8 +201,11 @@ async fn flag_on_creates_heterogeneous_batch_and_supervisor() {
         let payload = serde_json::json!({
             "batch_id": batch.id, "target_sha": "head",
             "report": {"batch_id": batch.id, "pr_url": batch.pr_url, "target_sha": "head",
-                "phase": "pre_merge", "summary": "Clean", "coverage": {
-                    "files_inspected": [], "files_omitted": [], "limitations": []}, "findings": []}
+                "phase": "pre_merge", "summary": "One defect", "coverage": {
+                    "files_inspected": [], "files_omitted": [], "limitations": []},
+                "findings": [{"severity": "high", "category": "correctness", "confidence": "high",
+                    "file": "src/lib.rs", "title": "Unchecked index", "problem": "p", "impact": "i",
+                    "suggested_fix": "f", "static_evidence": "e", "needs_runtime_verification": false}]}
         })
         .to_string();
         db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
@@ -292,7 +295,7 @@ fn stage_high_severity_supervisor_verdict(db: &WorkDb, id: &str, batch: &ReviewB
         .expect("quorum must add a supervisor member");
     let supervisor_execution_id = supervisor.execution_id.clone().unwrap();
     let verdict_payload = format!(
-        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{pr_url}","target_sha":"{target_sha}","phase":"pre_merge","summary":"One high-severity defect.","revision_warranted":true,"findings":[{{"severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":["claude"]}}],"contradictions":[]}}}}"#,
+        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{pr_url}","target_sha":"{target_sha}","phase":"pre_merge","summary":"One high-severity defect.","revision_warranted":true,"findings":[{{"id":"C1","severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":["claude-1","codex-1"]}}],"contradictions":[]}}}}"#,
         batch_id = batch.id,
         pr_url = batch.pr_url,
         target_sha = target_sha,

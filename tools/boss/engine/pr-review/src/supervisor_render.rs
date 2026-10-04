@@ -70,8 +70,14 @@ pub fn render_supervisor_claude_md(
 
 /// Render one leaf report as a labeled, embedded JSON block for the
 /// supervisor prompt.
+///
+/// Finding ids are (re)assigned here from the leaf's role and report order —
+/// the same derivation the engine's verdict validation uses — so the ids the
+/// supervisor is told to cite always match the ids the engine will accept.
 fn render_leaf_report_block(input: &SupervisorReportInput) -> String {
-    let findings_json = serde_json::to_string_pretty(&input.report.findings).unwrap_or_else(|_| "[]".to_owned());
+    let mut report = input.report.clone();
+    report.assign_finding_ids(input.role);
+    let findings_json = serde_json::to_string_pretty(&report.findings).unwrap_or_else(|_| "[]".to_owned());
     format!(
         "### {role} reviewer\n\
          \n\
@@ -182,11 +188,22 @@ pub fn render_supervisor_initial_prompt(
          \n\
          1. **Semantic dedup with source attribution.** Independent leaves \
             often flag the same underlying defect in different words. Merge \
-            those into ONE consolidated finding and list every leaf that \
-            raised it in `sources`. Do not emit near-duplicate findings as \
-            separate entries just because the wording differs — a defect two \
-            reviewers independently found is stronger signal than one, and \
-            that only shows up if you actually merge them.\n\
+            those into ONE consolidated finding and cite, in `sources`, the \
+            `id` of every leaf finding you merged into it (the `claude-1`, \
+            `codex-2` style ids on the leaf findings above). Give each \
+            consolidated finding its own unique `id` (`C1`, `C2`, ...). Do \
+            not emit near-duplicate findings as separate entries just because \
+            the wording differs — a defect two reviewers independently found \
+            is stronger signal than one, and that only shows up if you \
+            actually merge them.\n\
+         1a. **Account for every leaf finding.** Each leaf finding id must \
+            appear either in some consolidated finding's `sources` or in \
+            `rejected` as `{{\"leaf_finding_id\": ..., \"reason\": ...}}` — \
+            state why you dropped it (e.g. you re-read the file and the claim \
+            did not hold). Omitting a leaf finding is not allowed: the engine \
+            rejects a verdict that leaves any leaf finding unaccounted for, \
+            cites an id that no leaf reported, or reuses an id, and you must \
+            correct and resubmit.\n\
          2. **Contradiction handling.** When leaves disagree about the same \
             file or claim (one says a check was removed, another says it \
             moved; one calls something a regression, another disputes it), \
@@ -221,6 +238,7 @@ pub fn render_supervisor_initial_prompt(
            \"revision_warranted\": true,\n\
            \"findings\": [\n\
              {{\n\
+               \"id\": \"C1\",\n\
                \"severity\": \"critical | high | medium | low\",\n\
                \"category\": \"correctness | regression | architecture | readability | tests | edgecase | duplication | deferred_scope | agent_isms\",\n\
                \"confidence\": \"high | medium | low\",\n\
@@ -228,8 +246,11 @@ pub fn render_supervisor_initial_prompt(
                \"location\": \"fn foo, ~L42\",\n\
                \"title\": \"<short scannable title>\",\n\
                \"detail\": \"<your consolidated description + what to change>\",\n\
-               \"sources\": [\"{example_first}\", \"{example_second}\"]\n\
+               \"sources\": [\"{example_first}-1\", \"{example_second}-1\"]\n\
              }}\n\
+           ],\n\
+           \"rejected\": [\n\
+             {{ \"leaf_finding_id\": \"{example_first}-2\", \"reason\": \"<why this leaf finding was dropped>\" }}\n\
            ],\n\
            \"contradictions\": [\n\
              {{\n\
@@ -247,11 +268,13 @@ pub fn render_supervisor_initial_prompt(
          }}\n\
          ```\n\
          \n\
-         `findings` may be empty only if every leaf report was clean. `contradictions` may be\n\
-         empty when nothing conflicted. Omit `location` when it does not apply, and omit\n\
-         `resolved_in_favor_of` when the disagreement is genuinely unresolved. `role` in\n\
-         `sources`/`positions`/`resolved_in_favor_of` must cite a reported role: {allowed_roles} — never\n\
-         `\"supervisor\"`.\n",
+         `findings` may be empty only if every leaf finding was rejected (or every leaf report was\n\
+         clean). `rejected` may be empty when every leaf finding was merged into a consolidated\n\
+         finding. `contradictions` may be empty when nothing conflicted. Omit `location` when it\n\
+         does not apply, and omit `resolved_in_favor_of` when the disagreement is genuinely\n\
+         unresolved. Entries in `sources` and `rejected[].leaf_finding_id` must be leaf finding ids\n\
+         exactly as shown above; `role` in `positions`/`resolved_in_favor_of` must cite a\n\
+         reported role: {allowed_roles} — never `\"supervisor\"`.\n",
         count = reports.len(),
         example_first = reported_roles.first().copied().unwrap_or(SupervisorSourceRole::Claude),
         example_second = reported_roles.get(1).copied().unwrap_or(SupervisorSourceRole::Codex),
@@ -350,6 +373,12 @@ mod tests {
         assert!(prompt.contains("\"$BOSS_BIN\" propose review-verdict --batch-id rvb_1 --verdict-file"));
         assert!(prompt.contains("Semantic dedup with source attribution"));
         assert!(prompt.contains("Contradiction handling"));
+        // Leaf findings are shown with the engine-assigned ids the supervisor
+        // must cite, and every one must be accounted for.
+        assert!(prompt.contains("\"id\": \"claude-1\""));
+        assert!(prompt.contains("\"id\": \"codex-1\""));
+        assert!(prompt.contains("Account for every leaf finding"));
+        assert!(prompt.contains("\"rejected\": ["));
         assert!(!prompt.contains("grok"));
         assert!(!prompt.contains("did not report"));
 

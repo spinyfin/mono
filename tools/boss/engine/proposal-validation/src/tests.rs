@@ -589,26 +589,81 @@ fn review_verdict_rejects_a_verdict_batch_id_mismatch() {
     assert_eq!(message_for(&errors, "verdict.batch_id"), "must match `batch_id`");
 }
 
+fn verdict_finding(id: Option<&str>, sources: Value) -> Value {
+    let mut finding = json!({
+        "severity": "high",
+        "category": "correctness",
+        "confidence": "high",
+        "file": "src/lib.rs",
+        "title": "A finding",
+        "detail": "Something concrete.",
+        "sources": sources,
+    });
+    if let Some(id) = id {
+        finding["id"] = json!(id);
+    }
+    finding
+}
+
 /// A finding with an empty `sources` list is structurally unattributed —
 /// this must be rejected rather than left to prompt discipline, per the PR's
 /// "semantic dedup is structural, not just a prompt instruction" design.
 #[test]
 fn review_verdict_rejects_a_finding_with_no_sources() {
     let mut payload = valid_payload_for(ProposalKind::ReviewVerdict);
-    payload["verdict"]["findings"] = json!([{
-        "severity": "high",
-        "category": "correctness",
-        "confidence": "high",
-        "file": "src/lib.rs",
-        "title": "Unattributed finding",
-        "detail": "No leaf named.",
-        "sources": [],
-    }]);
+    payload["verdict"]["findings"] = json!([verdict_finding(Some("C1"), json!([]))]);
     let errors = errs(ProposalKind::ReviewVerdict, payload);
     assert!(
-        message_for(&errors, "verdict.findings[0].sources").contains("at least one source"),
+        message_for(&errors, "verdict.findings[0].sources").contains("at least one leaf finding id"),
         "{errors:?}"
     );
+}
+
+/// New submissions must give every consolidated finding an id; only stored
+/// legacy rows (which never pass through here again) may lack one.
+#[test]
+fn review_verdict_rejects_a_finding_with_no_id() {
+    let mut payload = valid_payload_for(ProposalKind::ReviewVerdict);
+    payload["verdict"]["findings"] = json!([verdict_finding(None, json!(["claude-1"]))]);
+    let errors = errs(ProposalKind::ReviewVerdict, payload);
+    assert!(
+        message_for(&errors, "verdict.findings[0].id").contains("is required"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn review_verdict_rejects_duplicate_ids_and_repeated_citations() {
+    let mut payload = valid_payload_for(ProposalKind::ReviewVerdict);
+    payload["verdict"]["findings"] = json!([
+        verdict_finding(Some("C1"), json!(["claude-1"])),
+        verdict_finding(Some("C1"), json!(["codex-1", "codex-1"])),
+    ]);
+    payload["verdict"]["rejected"] = json!([
+        {"leaf_finding_id": "claude-2", "reason": "not real"},
+        {"leaf_finding_id": "claude-2", "reason": "still not real"},
+    ]);
+    let errors = errs(ProposalKind::ReviewVerdict, payload);
+    assert!(message_for(&errors, "verdict.findings[1].id").contains("duplicate"), "{errors:?}");
+    assert!(
+        message_for(&errors, "verdict.findings[1].sources").contains("more than once"),
+        "{errors:?}"
+    );
+    assert!(
+        message_for(&errors, "verdict.rejected[1].leaf_finding_id").contains("more than once"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn review_verdict_accepts_ids_sources_and_rejected_dispositions() {
+    let mut payload = valid_payload_for(ProposalKind::ReviewVerdict);
+    payload["verdict"]["findings"] = json!([verdict_finding(Some("C1"), json!(["claude-1", "codex-1"]))]);
+    payload["verdict"]["rejected"] = json!([{"leaf_finding_id": "codex-2", "reason": "Re-read: not a defect."}]);
+    let canonical = validate_payload(ProposalKind::ReviewVerdict, &payload).expect("valid").canonical_json;
+    let canonical: Value = serde_json::from_str(&canonical).unwrap();
+    assert_eq!(canonical["verdict"]["findings"][0]["id"], "C1");
+    assert_eq!(canonical["verdict"]["rejected"][0]["leaf_finding_id"], "codex-2");
 }
 
 /// A contradiction with fewer than two positions cannot represent a genuine

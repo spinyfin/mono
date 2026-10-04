@@ -195,8 +195,27 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
             ReviewFindingCategory::DeferredScope => "deferred_scope",
             ReviewFindingCategory::AgentIsms => "agent_isms",
         };
+        // Legacy findings (no id) render exactly as before.
+        let id_line = f
+            .id
+            .as_deref()
+            .map(|id| format!("**Finding id:** `{id}`  \n"))
+            .unwrap_or_default();
+        let sources_line = if f.sources.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "**Sources:** {}  \n",
+                f.sources
+                    .iter()
+                    .map(|source| format!("`{source}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         out.push_str(&format!(
             "### [{severity}] {title}\n\
+             {id_line}{sources_line}\
              **File:** `{file}`{loc}  \n\
              **Category:** {category}  \n\
              **Confidence:** {confidence}\n\n\

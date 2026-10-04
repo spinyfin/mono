@@ -59,14 +59,54 @@ fn member(
         .build()
 }
 
+/// Move a batch to `supervising`, first giving every `reported` leaf that was
+/// seeded without a report the accepted report a real leaf has: one finding,
+/// which the engine ids `<role>-1`. Verdict validation checks citations against
+/// those stored reports, so the fixture verdicts below cite `claude-1`.
 fn force_batch_supervising(db: &WorkDb, batch_id: &str) {
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE pr_review_batches SET status = 'supervising' WHERE id = ?1",
-            rusqlite::params![batch_id],
+    let conn = db.connect().unwrap();
+    let batch = db.review_batch(batch_id).unwrap().unwrap();
+    for member in db.review_batch_members(batch_id).unwrap() {
+        let (true, None, Some(execution_id)) = (
+            member.status == ReviewBatchMemberStatus::Reported,
+            member.report_proposal_id.as_ref(),
+            member.execution_id.as_ref(),
+        ) else {
+            continue;
+        };
+        let proposal_id = format!("prop-report-{}", member.id);
+        let payload = serde_json::json!({
+            "batch_id": batch_id, "target_sha": batch.target_sha,
+            "report": {
+                "batch_id": batch_id, "pr_url": batch.pr_url, "target_sha": batch.target_sha,
+                "phase": "pre_merge", "summary": "One defect.",
+                "coverage": {"files_inspected": [], "files_omitted": [], "limitations": []},
+                "findings": [{
+                    "severity": "high", "category": "correctness", "confidence": "high",
+                    "file": "src/lib.rs", "title": "Unchecked index", "problem": "p", "impact": "i",
+                    "suggested_fix": "f", "static_evidence": "e", "needs_runtime_verification": false
+                }]
+            }
+        });
+        conn.execute(
+            "INSERT INTO worker_proposals
+                 (id, execution_id, work_item_id, kind, payload_json, idempotency_key, state, created_at)
+             VALUES (?1, ?2, (SELECT work_item_id FROM work_executions WHERE id = ?2),
+                     'review_report', ?3, ?1, 'applied', '0')",
+            rusqlite::params![proposal_id, execution_id, payload.to_string()],
         )
         .unwrap();
+        conn.execute(
+            "UPDATE pr_review_batch_members SET report_proposal_id = ?1 WHERE id = ?2",
+            rusqlite::params![proposal_id, member.id],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE pr_review_batches SET status = 'supervising' WHERE id = ?1",
+        rusqlite::params![batch_id],
+    )
+    .unwrap();
 }
 
 fn bind_open_pr(db: &WorkDb, task_id: &str) {
@@ -132,7 +172,7 @@ fn post_merge_batch_input(cycle_root_id: String, merge_sha: &str) -> ReviewBatch
 
 fn post_merge_findings_verdict_payload(batch_id: &str, target_sha: &str) -> String {
     format!(
-        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR_URL}","target_sha":"{target_sha}","phase":"post_merge","summary":"One high-severity defect.","revision_warranted":true,"findings":[{{"severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":["claude"]}}],"contradictions":[]}}}}"#
+        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR_URL}","target_sha":"{target_sha}","phase":"post_merge","summary":"One high-severity defect.","revision_warranted":true,"findings":[{{"id":"C1","severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":["claude"]}}],"contradictions":[]}}}}"#
     )
 }
 
@@ -144,7 +184,7 @@ fn clean_verdict_payload(batch_id: &str, target_sha: &str) -> String {
 
 fn findings_verdict_payload(batch_id: &str, target_sha: &str) -> String {
     format!(
-        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR_URL}","target_sha":"{target_sha}","phase":"pre_merge","summary":"One high-severity defect.","revision_warranted":true,"findings":[{{"severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":["claude"]}}],"contradictions":[]}}}}"#
+        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR_URL}","target_sha":"{target_sha}","phase":"pre_merge","summary":"One high-severity defect.","revision_warranted":true,"findings":[{{"id":"C1","severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":["claude-1"]}}],"contradictions":[]}}}}"#
     )
 }
 
@@ -714,6 +754,10 @@ fn qualifying_findings_on_an_open_origin_create_a_revision() {
     assert_eq!(task.kind, TaskKind::Revision);
     assert!(task.created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX));
     assert!(task.description.contains("finalising this revision"));
+    // Consolidated finding ids and the leaf findings they merged reach the
+    // revision worker, so downstream work can key on them.
+    assert!(task.description.contains("**Finding id:** `C1`"), "{}", task.description);
+    assert!(task.description.contains("**Sources:** `claude-1`"), "{}", task.description);
     assert_eq!(
         db.review_batch(&batch_id).unwrap().unwrap().status,
         ReviewBatchStatus::Completed

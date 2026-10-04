@@ -468,9 +468,14 @@ fn supersede_other_undecided_review_verdicts(
     Ok(())
 }
 
-/// Every source role cited in the verdict must belong to a reported leaf of
-/// this batch. A supervisor may not invent a source the batch never
-/// accepted, including a missing role in a degraded two-of-three quorum.
+/// Every leaf citation in the verdict must resolve against this batch's
+/// accepted leaf reports, and the verdict must account for every leaf
+/// finding. A supervisor may not invent a source the batch never accepted
+/// (including a missing role in a degraded two-of-three quorum), cite a leaf
+/// finding id no report contains, or leave a leaf finding unmentioned: each
+/// leaf finding must be merged into a consolidated finding's `sources` or
+/// listed in `rejected` with a reason. Omissions are rejected, never treated
+/// as implicit rejections.
 ///
 /// Does not apply to a post-merge verdict: that batch has no leaf members to
 /// corroborate against — its sole reviewer's `sources` entry names the
@@ -485,37 +490,85 @@ fn review_verdict_unknown_source_reason(
         return Ok(None);
     }
     let mut statement = tx.prepare(
-        "SELECT role FROM pr_review_batch_members
+        "SELECT role, report_proposal_id FROM pr_review_batch_members
          WHERE batch_id = ?1 AND status = 'reported'
-           AND role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')",
+           AND role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')
+         ORDER BY role",
     )?;
-    let reported: std::collections::HashSet<String> = statement
-        .query_map(rusqlite::params![batch_id], |row| row.get(0))?
+    let reported: Vec<(String, Option<String>)> = statement
+        .query_map(rusqlite::params![batch_id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let cited = verdict
-        .findings
-        .iter()
-        .flat_map(|finding| finding.sources.iter())
-        .chain(verdict.contradictions.iter().flat_map(|contradiction| {
-            contradiction
-                .positions
-                .iter()
-                .map(|position| &position.role)
-                .chain(contradiction.resolved_in_favor_of.as_ref())
-        }));
-    for role in cited {
-        let member_role = match role {
-            boss_pr_review::SupervisorSourceRole::Claude => "claude_reviewer",
-            boss_pr_review::SupervisorSourceRole::Codex => "codex_reviewer",
-            boss_pr_review::SupervisorSourceRole::Grok => "grok_reviewer",
-        };
-        if !reported.contains(member_role) {
+    let reported_roles: std::collections::HashSet<&str> = reported.iter().map(|(role, _)| role.as_str()).collect();
+    let member_role = |role: boss_pr_review::SupervisorSourceRole| match role {
+        boss_pr_review::SupervisorSourceRole::Claude => "claude_reviewer",
+        boss_pr_review::SupervisorSourceRole::Codex => "codex_reviewer",
+        boss_pr_review::SupervisorSourceRole::Grok => "grok_reviewer",
+    };
+
+    let role_citations = verdict.contradictions.iter().flat_map(|contradiction| {
+        contradiction
+            .positions
+            .iter()
+            .map(|position| &position.role)
+            .chain(contradiction.resolved_in_favor_of.as_ref())
+    });
+    for role in role_citations {
+        if !reported_roles.contains(member_role(*role)) {
             return Ok(Some(format!(
                 "verdict cites source `{role}` which has no accepted report in batch `{batch_id}`"
             )));
         }
     }
-    Ok(None)
+    let leaf_citations = verdict
+        .findings
+        .iter()
+        .flat_map(|finding| finding.sources.iter())
+        .chain(verdict.rejected.iter().map(|rejected| &rejected.leaf_finding_id));
+    for id in leaf_citations {
+        if let Some(role) = boss_pr_review::leaf_finding_role(id)
+            && !reported_roles.contains(member_role(role))
+        {
+            return Ok(Some(format!(
+                "verdict cites leaf finding `{id}` whose reviewer `{role}` has no accepted report in batch `{batch_id}`"
+            )));
+        }
+    }
+
+    // Leaf finding ids are derived from each accepted report's role and
+    // finding order — the same derivation the supervisor prompt used — never
+    // read from the report body.
+    let mut leaf_ids = Vec::new();
+    for (role, proposal_id) in &reported {
+        let Some(proposal_id) = proposal_id else {
+            continue;
+        };
+        let payload_json: String = tx.query_row(
+            "SELECT payload_json FROM worker_proposals WHERE id = ?1",
+            rusqlite::params![proposal_id],
+            |row| row.get(0),
+        )?;
+        let payload: ReviewReportProposalPayload = serde_json::from_str(&payload_json)
+            .with_context(|| format!("parsing accepted review-report proposal {proposal_id} payload"))?;
+        let report: boss_pr_review::ReviewerReport = serde_json::from_value(payload.report)
+            .with_context(|| format!("parsing accepted review-report proposal {proposal_id} report body"))?;
+        let role = match role.as_str() {
+            "claude_reviewer" => boss_pr_review::SupervisorSourceRole::Claude,
+            "codex_reviewer" => boss_pr_review::SupervisorSourceRole::Codex,
+            _ => boss_pr_review::SupervisorSourceRole::Grok,
+        };
+        leaf_ids.extend(report.finding_ids(role));
+    }
+    let errors = verdict.accounting_errors(&leaf_ids);
+    if errors.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        errors
+            .iter()
+            .map(|error| format!("verdict.{}: {}", error.path, error.message))
+            .collect::<Vec<_>>()
+            .join("; "),
+    ))
 }
 
 fn create_attention_item_row(
