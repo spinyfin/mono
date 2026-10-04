@@ -61,15 +61,18 @@ async fn rejected_candidate_after_overdue_refreshes_diagnostics_and_can_recover(
         })
         .await;
     fs::remove_file(&path).unwrap();
-    fx.sink
-        .wait_for(|_| {
-            discovery_record(fx.store.get("run-diagnostic")).is_some_and(|record| {
-                record.rejected_candidates == 0 && record.reason.contains("rollout-diagnostic-thread.jsonl")
-            })
-        })
-        .await;
+    // Removing the file does not erase its history: `rejected_candidates`
+    // and `rejections` are cumulative across the whole discovery window
+    // (matching `reason`), so a file that rotated away mid-window is still
+    // named rather than silently dropping the count back to zero.
     let removed = discovery_record(fx.store.get("run-diagnostic")).unwrap();
-    assert!(removed.rejections.is_empty());
+    assert_eq!(removed.rejected_candidates, 1);
+    assert_eq!(removed.rejections[0].file_name, "rollout-diagnostic-thread.jsonl");
+    assert!(
+        removed.reason.contains("rollout-diagnostic-thread.jsonl"),
+        "{}",
+        removed.reason
+    );
     assert!(removed.reason.contains("were seen"), "{}", removed.reason);
     fs::write(&path, rollout(&fx.workspace(), "thread")).unwrap();
     fx.sink

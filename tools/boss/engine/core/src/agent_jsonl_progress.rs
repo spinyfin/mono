@@ -136,7 +136,11 @@ pub struct DiscoveryRecord {
     /// How long discovery had been running when the record was written,
     /// measured from activation (the spawn acknowledgement), not arming.
     pub waited_secs: u64,
-    /// Rollout-shaped files that did not correlate to this run on the latest scan.
+    /// Distinct rollout-shaped files that did not correlate to this run,
+    /// cumulative across every scan of this discovery run so far — matching
+    /// `reason`'s cumulative accounting, not just the latest scan's. A file
+    /// that was rejected and then rotated, renamed, or removed still counts
+    /// here.
     pub rejected_candidates: usize,
     /// Bounded examples, including transient incomplete metadata.
     #[serde(default)]
@@ -967,10 +971,18 @@ async fn run_prepared<S>(
 
 /// Preserve the durable checkpoint schema while retaining detailed reasons
 /// in discovery logs and the checkpoint's narrative.
-fn checkpoint_rejection(reason: &crate::agent_jsonl_discovery::CandidateRejection) -> CandidateRejectReason {
+///
+/// Returns `None` for [`CandidateRejection::InBaseline`]: a previous
+/// incarnation's rollout is not an unsafe file in any sense, and the durable
+/// checkpoint schema has no variant for it. The caller must filter those out
+/// rather than durably recording them as `unsafe_file` — returning `Option`
+/// here, instead of silently folding `InBaseline` into `UnsafeFile`, makes
+/// that obligation a compile-time question at every call site.
+fn checkpoint_rejection(reason: &crate::agent_jsonl_discovery::CandidateRejection) -> Option<CandidateRejectReason> {
     use crate::agent_jsonl_discovery::CandidateRejection as R;
-    match reason {
-        R::InBaseline | R::NotSingleLinkRegularFile => CandidateRejectReason::UnsafeFile,
+    Some(match reason {
+        R::InBaseline => return None,
+        R::NotSingleLinkRegularFile => CandidateRejectReason::UnsafeFile,
         R::OutsideRoot => CandidateRejectReason::OutsideRoot,
         R::IdentityChanged => CandidateRejectReason::IdentityChanged,
         R::Empty | R::SessionMetaUnterminated { .. } => CandidateRejectReason::IncompleteSessionMeta,
@@ -979,10 +991,12 @@ fn checkpoint_rejection(reason: &crate::agent_jsonl_discovery::CandidateRejectio
             CandidateRejectReason::InvalidSessionMeta
         }
         R::SessionIdMismatch { .. } => CandidateRejectReason::SessionIdMismatch,
-        R::CwdNotResolvable { .. } | R::CwdMismatch { .. } => CandidateRejectReason::WorkspaceMismatch,
+        R::CwdNotResolvable { .. } | R::CwdMismatch { .. } | R::WorkspaceNotResolvable { .. } => {
+            CandidateRejectReason::WorkspaceMismatch
+        }
         R::NameMismatch { .. } => CandidateRejectReason::FilenameMismatch,
         R::Unreadable(_) => CandidateRejectReason::IoOrParseError,
-    }
+    })
 }
 
 /// One run's discovery: the poll loop that waits for exactly one new,
@@ -1032,18 +1046,24 @@ where
                     .collect();
                 rejected.sort_by(|a, b| a.0.cmp(&b.0));
                 let rejected_candidates = rejected.len();
+                // `filter_map`, not `map`: `checkpoint_rejection` returns
+                // `None` for `InBaseline`, which the filter above already
+                // excludes — this is the type-level backstop if that filter
+                // is ever removed or a second caller forgets it.
                 let rejections: Vec<_> = rejected
                     .into_iter()
                     .take(4)
-                    .map(|(path, reason)| CandidateRejection {
-                        file_name: path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .chars()
-                            .take(256)
-                            .collect(),
-                        reason: checkpoint_rejection(&reason),
+                    .filter_map(|(path, reason)| {
+                        Some(CandidateRejection {
+                            file_name: path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .chars()
+                                .take(256)
+                                .collect(),
+                            reason: checkpoint_rejection(&reason)?,
+                        })
                     })
                     .collect();
                 let diagnostics = (overdue, rejected_candidates, rejections.clone());

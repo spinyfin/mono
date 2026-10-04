@@ -66,7 +66,11 @@ fn checkpoint_variants_drive_reap_reading_and_attention() {
                 discovery: Some(record(DiscoveryVerdict::Overdue)),
             },
             "armed",
-            "that did not correlate to this run",
+            // The overdue narrative must surface the record's own `reason`
+            // (as the failed-verdict narrative already does), not just a
+            // rejected-file count disconnected from what was actually
+            // observed.
+            "root identity changed",
         ),
         (
             IngressCheckpoint::Armed {
