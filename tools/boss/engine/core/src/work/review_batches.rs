@@ -350,19 +350,23 @@ fn resolve_member_input(
         .build())
 }
 
+const NEW_BATCH_LEAF_ROLES: [(ReviewBatchMemberRole, &str); 2] = [
+    (ReviewBatchMemberRole::ClaudeReviewer, "claude"),
+    (ReviewBatchMemberRole::CodexReviewer, "codex"),
+];
+
 fn leaf_member_inputs(
     classification: &ReviewClassification,
     execution_ids: &[String],
 ) -> Result<Vec<ReviewBatchMemberCreateInput>> {
-    let roles = [
-        (ReviewBatchMemberRole::ClaudeReviewer, "claude"),
-        (ReviewBatchMemberRole::CodexReviewer, "codex"),
-    ];
-    if execution_ids.len() != roles.len() {
-        bail!("review batch dispatch requires exactly two leaf execution ids");
+    if execution_ids.len() != NEW_BATCH_LEAF_ROLES.len() {
+        bail!(
+            "review batch dispatch requires exactly {} leaf execution ids",
+            NEW_BATCH_LEAF_ROLES.len()
+        );
     }
     let registry = crate::driver::DriverRegistry::default();
-    roles
+    NEW_BATCH_LEAF_ROLES
         .into_iter()
         .zip(execution_ids)
         .map(|((role, driver), execution_id)| {
@@ -1256,7 +1260,7 @@ impl WorkDb {
             None => super::resolve_repo_for_work_item(&tx, &input.cycle_root_id)?
                 .ok_or_else(|| anyhow::anyhow!("cannot start review batch: repository is unresolved"))?,
         };
-        let executions = (0..2)
+        let executions = (0..NEW_BATCH_LEAF_ROLES.len())
             .map(|_| {
                 insert_execution(
                     &tx,
