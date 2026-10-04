@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use super::*;
@@ -861,6 +862,28 @@ fn observer_closed_without_answer_carries_warning_and_stderr() {
     }
 }
 
+/// Like [`fake_codex`], for scripts that stall until killed. The first exec of
+/// a freshly written script can take seconds on a loaded macOS host (the
+/// system scans it), which would eat a short stall timeout before the script
+/// ever ran. Run it once up front, exiting immediately, so the timed run
+/// measures the stall and not the first-exec scan.
+fn stalling_fake_codex(body: &str) -> (tempfile::TempDir, PathBuf) {
+    let (tmp, bin) = fake_codex(&format!("[ -n \"$FAKE_CODEX_PREWARM\" ] && exit 0\n{body}"));
+    let status = Command::new(&bin)
+        .env("FAKE_CODEX_PREWARM", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("prewarm fake codex");
+    assert!(status.success(), "prewarm fake codex: {status:?}");
+    (tmp, bin)
+}
+
+/// Generous enough that a loaded CI host still finishes the fake handshake
+/// before the deadline; the tests below assert on what was captured by then.
+const STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn short_timeout_server(bin: PathBuf, timeout: Duration) -> app_server::AppServer {
     app_server::AppServer {
         program: bin,
@@ -877,12 +900,12 @@ fn short_timeout_server(bin: PathBuf, timeout: Duration) -> app_server::AppServe
 
 #[test]
 fn timeout_keeps_a_config_warning_read_before_the_stall() {
-    let (_tmp, bin) = fake_codex(&format!("{FAKE_HANDSHAKE}exec sleep 30"));
-    let err = short_timeout_server(bin, Duration::from_secs(3))
+    let (_tmp, bin) = stalling_fake_codex(&format!("{FAKE_HANDSHAKE}exec sleep 30"));
+    let err = short_timeout_server(bin, STALL_TIMEOUT)
         .request_session("hooks/list", serde_json::json!({}))
         .unwrap_err();
     let text = err.to_string();
-    for needle in ["timed out after 3s", "WARN-DETAIL", "STDERR-LINE-1"] {
+    for needle in ["timed out after 5s", "WARN-DETAIL", "STDERR-LINE-1"] {
         assert!(text.contains(needle), "missing {needle:?} in {text}");
     }
 }
@@ -890,13 +913,13 @@ fn timeout_keeps_a_config_warning_read_before_the_stall() {
 #[test]
 fn a_grandchild_holding_stderr_open_cannot_hang_the_session() {
     // The backgrounded sleep inherits stderr and outlives the killed child.
-    let (_tmp, bin) = fake_codex(&format!("{FAKE_HANDSHAKE}sleep 20 &\nexec sleep 30"));
+    let (_tmp, bin) = stalling_fake_codex(&format!("{FAKE_HANDSHAKE}sleep 20 &\nexec sleep 30"));
     let started = std::time::Instant::now();
-    let err = short_timeout_server(bin, Duration::from_secs(3))
+    let err = short_timeout_server(bin, STALL_TIMEOUT)
         .request_session("hooks/list", serde_json::json!({}))
         .unwrap_err();
     assert!(
-        started.elapsed() < Duration::from_secs(8),
+        started.elapsed() < STALL_TIMEOUT + Duration::from_secs(5),
         "request_session blocked on the stderr drain: {:?}",
         started.elapsed()
     );
