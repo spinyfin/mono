@@ -1466,8 +1466,10 @@ pub enum FrontendRequest {
     /// classified against the engine's live registry AND its durable
     /// state — live, "engine lost track of it but durable state still
     /// corroborates a running process" (`LiveProcessNoRegistry`),
-    /// occupancy that live tmux could not corroborate
-    /// (`OccupancyInconclusive`), or a true husk. Powers `bossctl agents list --all` and worker-reference
+    /// "durable status says a worker should exist; no live-state entry"
+    /// (`DurableOccupantNoRegistry`), occupancy that live tmux could not
+    /// corroborate (`OccupancyInconclusive`), or a true husk. Powers
+    /// `bossctl agents list --all` and worker-reference
     /// resolution (crew name / slot id / run id) for every `agents` verb,
     /// both of which are otherwise structurally blind to a pane the live
     /// registry has dropped — `ListWorkerLiveStates` only reflects the

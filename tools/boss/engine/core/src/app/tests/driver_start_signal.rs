@@ -73,3 +73,57 @@ async fn a_hook_at_the_ingress_records_the_driver_start_signal() {
         "having signalled, the slot must never appear as a never-started driver",
     );
 }
+
+/// An admitted spawn-capability recovery canary that then records a
+/// driver-originated hook must clear `in_flight` and resume a Breaker-origin
+/// pause. A pane pid alone is not this proof — the breaker trips on
+/// driver-start timeouts.
+#[tokio::test]
+async fn a_driver_signal_for_an_admitted_canary_clears_in_flight_and_resumes_breaker_pause() {
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::RequestExecutionInput;
+
+    let (server_state, _dir) = test_server_state();
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+
+    server_state
+        .live_worker_states
+        .register_spawn(1, execution.id.clone(), "claude-opus-4-7", 4242, None);
+    server_state.worker_registry.register_run_slot(&execution.id, 1);
+    server_state.execution_coordinator.pause_dispatch(
+        0,
+        crate::coordinator::DispatchPauseOrigin::Breaker,
+        boss_protocol::PauseReason::new("test: breaker pause").unwrap(),
+    );
+    server_state
+        .spawn_health
+        .mark_probe_dispatched(&execution.id, boss_engine_utils::epoch_time::now_epoch_secs());
+    assert!(server_state.spawn_health.is_probe_execution(&execution.id));
+    assert!(server_state.execution_coordinator.is_dispatch_paused());
+
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+        Some(execution.id.clone()),
+        None,
+    );
+    dispatch_live_worker_state(&server_state, &event).await;
+
+    assert!(
+        !server_state.spawn_health.is_probe_execution(&execution.id),
+        "the canary's first driver signal must clear in_flight"
+    );
+    assert!(
+        !server_state.execution_coordinator.is_dispatch_paused(),
+        "a healthy canary must auto-resume a Breaker-origin pause"
+    );
+}
