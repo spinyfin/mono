@@ -39,7 +39,7 @@ pub fn render_supervisor_claude_md(
             role_heading: "supervisor",
             intro: "You are running inside a Boss-managed **review supervisor** session. \
                     The engine spawned you in a leased cube workspace checked out to the \
-                    PR head, after at least two of three independent reviewers reported \
+                    PR head, after at least two independent reviewers reported \
                     on this PR.",
             last_forbidden_bullet: "Running `cube pr create`/`cube pr update` or any Boss PR helper —\n\
                this does NOT include the `boss propose review-verdict` call named\n\
@@ -102,26 +102,29 @@ fn render_leaf_report_block(input: &SupervisorReportInput) -> String {
 /// Compose the initial prompt for a supervisor batch member.
 ///
 /// `reports` holds every leaf report the engine accepted for this batch — at
-/// least two (a batch is never dispatched to a supervisor with fewer), and
-/// possibly all three. A missing third leaf (it exhausted its retry without
-/// reporting) is named explicitly so the supervisor does not read silence as
-/// "that reviewer found nothing".
+/// least two (a batch is never dispatched to a supervisor with fewer).
+/// `configured_roles` comes from persisted membership, including Grok for
+/// legacy batches. A configured leaf that exhausted its retry is named
+/// explicitly so the supervisor does not read silence as a clean report.
 pub fn render_supervisor_initial_prompt(
     brief: &ReviewBriefPacket,
     destination: &ReviewerReportDestination,
     reports: &[SupervisorReportInput],
+    configured_roles: &[SupervisorSourceRole],
     repo_slug: &str,
 ) -> String {
     let reported_roles: Vec<SupervisorSourceRole> = reports.iter().map(|r| r.role).collect();
-    let missing_roles: Vec<&'static str> = [
-        SupervisorSourceRole::Claude,
-        SupervisorSourceRole::Codex,
-        SupervisorSourceRole::Grok,
-    ]
-    .into_iter()
-    .filter(|role| !reported_roles.contains(role))
-    .map(SupervisorSourceRole::as_str)
-    .collect();
+    let missing_roles: Vec<&'static str> = configured_roles
+        .iter()
+        .copied()
+        .filter(|role| !reported_roles.contains(role))
+        .map(SupervisorSourceRole::as_str)
+        .collect();
+    let allowed_roles = reported_roles
+        .iter()
+        .map(|role| format!("`{role}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let missing_block = if missing_roles.is_empty() {
         String::new()
     } else {
@@ -177,7 +180,7 @@ pub fn render_supervisor_initial_prompt(
          {leaf_reports_block}\
          ## Your job\n\
          \n\
-         1. **Semantic dedup with source attribution.** Two or three leaves \
+         1. **Semantic dedup with source attribution.** Independent leaves \
             often flag the same underlying defect in different words. Merge \
             those into ONE consolidated finding and list every leaf that \
             raised it in `sources`. Do not emit near-duplicate findings as \
@@ -225,7 +228,7 @@ pub fn render_supervisor_initial_prompt(
                \"location\": \"fn foo, ~L42\",\n\
                \"title\": \"<short scannable title>\",\n\
                \"detail\": \"<your consolidated description + what to change>\",\n\
-               \"sources\": [\"claude\", \"codex\"]\n\
+               \"sources\": [\"{example_first}\", \"{example_second}\"]\n\
              }}\n\
            ],\n\
            \"contradictions\": [\n\
@@ -234,11 +237,11 @@ pub fn render_supervisor_initial_prompt(
                \"location\": \"fn foo, ~L42\",\n\
                \"description\": \"<what the leaves disagree about>\",\n\
                \"positions\": [\n\
-                 {{ \"role\": \"grok\", \"claim\": \"<what this leaf claimed>\" }},\n\
-                 {{ \"role\": \"codex\", \"claim\": \"<what this leaf claimed>\" }}\n\
+                 {{ \"role\": \"{example_first}\", \"claim\": \"<what this leaf claimed>\" }},\n\
+                 {{ \"role\": \"{example_second}\", \"claim\": \"<what this leaf claimed>\" }}\n\
                ],\n\
                \"resolution\": \"<how you resolved it and why>\",\n\
-               \"resolved_in_favor_of\": \"codex\"\n\
+               \"resolved_in_favor_of\": \"{example_second}\"\n\
              }}\n\
            ]\n\
          }}\n\
@@ -247,9 +250,11 @@ pub fn render_supervisor_initial_prompt(
          `findings` may be empty only if every leaf report was clean. `contradictions` may be\n\
          empty when nothing conflicted. Omit `location` when it does not apply, and omit\n\
          `resolved_in_favor_of` when the disagreement is genuinely unresolved. `role` in\n\
-         `sources`/`positions` must be exactly `\"claude\"`, `\"codex\"`, or `\"grok\"` — never\n\
+         `sources`/`positions`/`resolved_in_favor_of` must cite a reported role: {allowed_roles} — never\n\
          `\"supervisor\"`.\n",
         count = reports.len(),
+        example_first = reported_roles.first().copied().unwrap_or(SupervisorSourceRole::Claude),
+        example_second = reported_roles.get(1).copied().unwrap_or(SupervisorSourceRole::Codex),
         repo_slug = repo_slug,
         brief_block = brief_block,
         brief_conformance = brief_conformance,
@@ -281,6 +286,7 @@ mod tests {
             &ReviewBriefPacket::from_task(task_name, task_description),
             destination,
             reports,
+            &reports.iter().map(|report| report.role).collect::<Vec<_>>(),
             repo_slug,
         )
     }
@@ -344,7 +350,22 @@ mod tests {
         assert!(prompt.contains("boss propose review-verdict --batch-id rvb_1 --verdict-file"));
         assert!(prompt.contains("Semantic dedup with source attribution"));
         assert!(prompt.contains("Contradiction handling"));
-        assert!(prompt.contains("grok did not report"));
+        assert!(!prompt.contains("grok"));
+        assert!(!prompt.contains("did not report"));
+
+        let legacy_prompt = super::render_supervisor_initial_prompt(
+            &ReviewBriefPacket::from_task("Review change", "Inspect the implementation."),
+            &destination,
+            &reports,
+            &[
+                SupervisorSourceRole::Claude,
+                SupervisorSourceRole::Codex,
+                SupervisorSourceRole::Grok,
+            ],
+            "org/repo",
+        );
+        assert!(legacy_prompt.contains("grok did not report"));
+        assert!(legacy_prompt.contains("reported role: `claude`, `codex`"));
     }
 
     #[test]
@@ -369,6 +390,8 @@ mod tests {
             "org/repo",
         );
         assert!(!prompt.contains("did not report"));
+        assert!(prompt.contains("### grok reviewer"));
+        assert!(prompt.contains("reported role: `claude`, `codex`, `grok`"));
     }
 
     #[test]

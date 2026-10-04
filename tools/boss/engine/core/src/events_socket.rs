@@ -1247,8 +1247,8 @@ mod tests {
     /// `Stop` never reached the completion path and the pane ran on. It
     /// must decode as a Grok `Stop` under the production registry.
     #[tokio::test]
-    async fn grok_review_batch_leaf_stop_decodes_as_grok_not_the_review_pool_driver() {
-        use crate::work::{ReviewBatchCreateInput, ReviewBatchDispatch};
+    async fn legacy_grok_review_batch_leaf_stop_decodes_as_grok_not_the_review_pool_driver() {
+        use crate::work::{ReviewBatchCreateInput, ReviewBatchMemberCreateInput};
         use boss_protocol::{
             CreateRunInput, ReviewBatchMemberRole, ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket,
             ReviewProfile,
@@ -1277,21 +1277,38 @@ mod tests {
             .pr_url("https://github.com/example/repo/pull/42")
             .target_sha("head-sha")
             .build();
-        let executions = match db
-            .create_pre_merge_review_batch(input, "https://github.com/example/repo")
-            .unwrap()
-        {
-            ReviewBatchDispatch::Created { executions, .. } => executions,
-            other => panic!("expected a newly-created review batch, got {other:?}"),
-        };
-        let grok_leaf = executions
-            .iter()
-            .find(|execution| {
-                db.review_batch_member_for_execution(&execution.id)
-                    .unwrap()
-                    .is_some_and(|member| member.role == ReviewBatchMemberRole::GrokReviewer)
-            })
-            .expect("a fan-out batch always has a grok leaf");
+        // Reconstruct persisted legacy membership: new dispatches omit Grok.
+        let mut members = Vec::new();
+        let mut executions = Vec::new();
+        for (role, driver) in [
+            (ReviewBatchMemberRole::ClaudeReviewer, "claude"),
+            (ReviewBatchMemberRole::CodexReviewer, "codex"),
+            (ReviewBatchMemberRole::GrokReviewer, "grok"),
+        ] {
+            let execution = db
+                .create_execution(
+                    boss_protocol::CreateExecutionInput::builder()
+                        .work_item_id(cycle_root.id.clone())
+                        .kind(boss_protocol::ExecutionKind::PrReview)
+                        .status(boss_protocol::ExecutionStatus::Ready)
+                        .build(),
+                )
+                .unwrap();
+            members.push(
+                ReviewBatchMemberCreateInput::builder()
+                    .attempt(1)
+                    .provider_effort("medium")
+                    .requested_driver(driver)
+                    .resolved_model("test-model")
+                    .role(role)
+                    .status(boss_protocol::ReviewBatchMemberStatus::Pending)
+                    .execution_id(execution.id.clone())
+                    .build(),
+            );
+            executions.push(execution);
+        }
+        db.create_review_batch(input, &members).unwrap();
+        let grok_leaf = &executions[2];
         let run = db
             .create_run(CreateRunInput {
                 execution_id: grok_leaf.id.clone(),
