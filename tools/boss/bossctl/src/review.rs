@@ -103,7 +103,7 @@ pub(crate) enum ReviewAction {
 /// question, and `bossctl` is the Boss-only CLI the coordinator session
 /// runs, not a worker-facing surface (see `bossctl`'s crate doc comment).
 pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: String) -> Result<()> {
-    let db = super::open_state_db(state_root)?;
+    let db = super::open_state_db_read_only(state_root)?;
     // Shared choke point: short ids resolve (or hard-error) before the
     // PR-status lookup so a bare T-form never reports "unknown work item"
     // when the row exists under its primary id.
@@ -236,7 +236,7 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
 
 /// `bossctl review batches <work-item>` — see [`ReviewAction::Batches`].
 pub(crate) fn review_batches(json: bool, state_root: Option<PathBuf>, work_item: String) -> Result<()> {
-    let db = super::open_state_db(state_root)?;
+    let db = super::open_state_db_read_only(state_root)?;
     let work_item = db
         .resolve_work_item_ref_strict(&work_item)
         .map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -297,7 +297,7 @@ pub(crate) fn review_batches(json: bool, state_root: Option<PathBuf>, work_item:
 
 /// `bossctl review live-batches` — see [`ReviewAction::LiveBatches`].
 pub(crate) fn review_live_batches(json: bool, state_root: Option<PathBuf>, limit: u32) -> Result<()> {
-    let db = super::open_state_db(state_root)?;
+    let db = super::open_state_db_read_only(state_root)?;
     let batches = db
         .list_live_review_batches(i64::from(limit))
         .context("reading live review batches")?;

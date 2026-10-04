@@ -1242,7 +1242,7 @@ pub(super) enum TranscriptResolution {
     ///
     /// This is the graceful-degradation path for conflict-resolution
     /// and CI-fix revision executions that are abandoned when the
-    /// spawning attempt retires before dispatch (T1291 pattern). The
+    /// spawning attempt retires before dispatch. The
     /// `execution_status` field carries the DB status for the error
     /// message so the caller can explain _why_ there is no transcript.
     NeverDispatched { execution_status: String },
@@ -1311,7 +1311,7 @@ pub(super) fn resolve_transcript_for_tail(server_state: &ServerState, run_id: &s
     if run_known || execution_known {
         // Distinguish between "execution was abandoned before a worker was
         // ever started" (no work_runs row) and "worker ran but path wasn't
-        // recorded". The former is the T1291 pattern: a conflict-resolution
+        // recorded". The former is the case where a conflict-resolution
         // or CI-fix revision execution gets abandoned by
         // `reconcile_revision_execution` when the spawning attempt retires
         // before the scheduler can pick up the execution. In that case the

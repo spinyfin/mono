@@ -337,7 +337,7 @@ impl WorkDb {
         // agent-raised, human-actionable notifications (questions +
         // followups). Design: tools/boss/docs/designs/attentions.md.
         step!(timer, conn, migrate_attentions)?;
-        // Editorial controls (P576, chore #1): per-product editorial_rules JSON
+        // Editorial controls (chore #1): per-product editorial_rules JSON
         // column, branch_naming snapshot on work_executions, and editorial_actions
         // audit table. Ships dark — no behaviour change until a product opts in.
         // Design: tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md
@@ -357,16 +357,16 @@ impl WorkDb {
         // `external_ref_boss_checksum`; the old title/body columns remain in
         // the schema but are no longer read or written.
         step!(timer, conn, migrate_external_tracker_content_checksums)?;
-        // P992 task 9: loop termination & bounds — per-PR review cycle
+        // Loop termination & bounds — per-PR review cycle
         // counter and last-reviewed SHA for the no-op skip gate.
         step!(timer, conn, migrate_tasks_review_cycle_columns)?;
-        // P783 task 2: planner_runs audit ledger + per-project idempotency gate.
+        // planner_runs audit ledger + per-project idempotency gate.
         // The UNIQUE partial index is created here (after the table) so SQLite
         // can resolve the `outcome` column. `CREATE TABLE IF NOT EXISTS` +
         // `CREATE INDEX IF NOT EXISTS` make this fully idempotent.
         // Design: tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md
         step!(timer, conn, migrate_planner_runs_table)?;
-        // P1422 task B: driver data model (mix-and-match agent-driver
+        // Driver data model (mix-and-match agent-driver
         // abstraction). Adds `tasks.driver` and `products.default_driver`
         // TEXT columns. NULL resolves to the engine default (`"claude"`).
         step!(timer, conn, migrate_tasks_driver_column)?;
@@ -378,7 +378,7 @@ impl WorkDb {
         // Done-lane bucketing fix: add completed_at so the kanban can group
         // done tasks by their actual completion time instead of updated_at.
         step!(timer, conn, migrate_tasks_completed_at)?;
-        // P783 task 5: tag tasks created by an auto-populate run with the
+        // Tag tasks created by an auto-populate run with the
         // originating planner_runs.id, so the undo path can delete exactly
         // that batch. Purely additive nullable column; NULL for every
         // non-planner task.
@@ -428,7 +428,7 @@ impl WorkDb {
         // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
         // this one and the P1a intent columns above) ride the current marker
         // rather than bumping it. Left at '22'.
-        // P1203 task 1: add score + merged_into_attention_id + linked_work_item_id
+        // Add score + merged_into_attention_id + linked_work_item_id
         // to `attentions` and create the `attention_merges` provenance ledger.
         // Design: tools/boss/docs/designs/notification-dedup-scoring.md §"Data model".
         step!(timer, conn, migrate_attentions_score_and_merges)?;
@@ -447,9 +447,9 @@ impl WorkDb {
         // stale-base re-arm path in conflict_watch can dispatch a fresh
         // attempt once a `succeeded` row's resolution has gone stale,
         // instead of colliding with that row's UNIQUE slot forever
-        // (T2396 / PR #1874).
+        // (PR #1874).
         step!(timer, conn, migrate_conflict_resolutions_widen_unique_key)?;
-        // Regression fix (T1503/T1496): SHA-delta gate in recheck_for_pr must
+        // Regression fix: SHA-delta gate in recheck_for_pr must
         // only fire for revision executions after a Stop event has been
         // observed, not the moment any commit lands on the parent PR. Without
         // this guard the gate fires immediately when a *different* worker (e.g.
@@ -461,13 +461,13 @@ impl WorkDb {
         step!(timer, conn, migrate_work_executions_stop_seen)?;
         // `revision_stop_contributed_head`: SHA that on_stop_inner's Contributed arm
         // observed for a revision_implementation execution. recheck_for_pr uses this
-        // as the T848 recovery gate: only finalize when head matches the SHA on_stop
+        // as the recovery gate: only finalize when head matches the SHA on_stop
         // previously attempted to finalize on — not on any head movement from a
         // concurrently-active parent worker.
         step!(timer, conn, migrate_work_executions_revision_stop_contributed_head)?;
         // Merge-queue sub-state: tasks.merge_queue_detail JSON blob (queue
         // position, GitHub's raw entry state, enqueued-at timestamp) for the
-        // Review card's merging indicator (T2467/mono#1904).
+        // Review card's merging indicator (mono#1904).
         step!(timer, conn, migrate_tasks_merge_queue_detail_column)?;
         // Layer 0 conflict telemetry (T1 of
         // merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md):
@@ -999,6 +999,38 @@ impl WorkDb {
         Ok(())
     }
 
+    /// The one place per-connection settings live, shared by the engine's
+    /// writer connection and every directly attached read/write opener, so a
+    /// pragma added here reaches all of them. `set_wal` is true only for the
+    /// connection that creates/initialises the database; attaching to an
+    /// existing database must not change its journal mode.
+    fn configure_connection(conn: &mut Connection, set_wal: bool) -> Result<()> {
+        // WAL lets readers and writers coexist (read-side concurrency
+        // is unaffected by an in-flight write) and `busy_timeout`
+        // turns lock contention into latency rather than an error
+        // returned to the caller. `synchronous = NORMAL` is the
+        // recommended pairing for WAL — durable across application
+        // crashes, only loses commits on OS/power loss, which is fine
+        // for engine state we can rebuild.
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        if set_wal {
+            conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        }
+        conn.execute_batch(
+            "PRAGMA synchronous = NORMAL;\n\
+             PRAGMA foreign_keys = ON;",
+        )?;
+        // Default writes to `BEGIN IMMEDIATE`. With the previous
+        // `BEGIN DEFERRED`, two concurrent writers could each open a
+        // read-mode transaction, then both try to upgrade to write,
+        // and the loser fails with `SQLITE_BUSY_SNAPSHOT` — which the
+        // busy-timeout handler does NOT retry. `IMMEDIATE` acquires
+        // the write lock up front so the second caller waits inside
+        // the busy handler instead of racing.
+        conn.set_transaction_behavior(TransactionBehavior::Immediate);
+        Ok(())
+    }
+
     /// Open the one raw connection a `WorkDb` (and every clone of it) will
     /// ever use, with every per-connection PRAGMA/behavior setting applied
     /// once up front. `WorkDb::connect()` just locks this connection's
@@ -1016,27 +1048,7 @@ impl WorkDb {
         } else {
             Connection::open(path).with_context(|| format!("failed to open work db {}", path.display()))?
         };
-        // WAL lets readers and writers coexist (read-side concurrency
-        // is unaffected by an in-flight write) and `busy_timeout`
-        // turns lock contention into latency rather than an error
-        // returned to the caller. `synchronous = NORMAL` is the
-        // recommended pairing for WAL — durable across application
-        // crashes, only loses commits on OS/power loss, which is fine
-        // for engine state we can rebuild.
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;\n\
-             PRAGMA synchronous = NORMAL;\n\
-             PRAGMA foreign_keys = ON;",
-        )?;
-        // Default writes to `BEGIN IMMEDIATE`. With the previous
-        // `BEGIN DEFERRED`, two concurrent writers could each open a
-        // read-mode transaction, then both try to upgrade to write,
-        // and the loser fails with `SQLITE_BUSY_SNAPSHOT` — which the
-        // busy-timeout handler does NOT retry. `IMMEDIATE` acquires
-        // the write lock up front so the second caller waits inside
-        // the busy handler instead of racing.
-        conn.set_transaction_behavior(TransactionBehavior::Immediate);
+        Self::configure_connection(&mut conn, true)?;
         Ok(conn)
     }
 
@@ -1061,6 +1073,57 @@ impl WorkDb {
     /// want [`Self::connect`], not this.
     pub(crate) fn connect_new(&self) -> Result<Connection> {
         Self::open_raw_connection(&self.path, self.memory.as_ref())
+    }
+
+    /// Inspect an existing database without migrations, journal-mode changes,
+    /// or any ability to write. CLI inspection must never run engine startup.
+    pub fn open_read_only(path: PathBuf) -> Result<Self> {
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening existing database {} for inspection", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        Ok(Self {
+            path,
+            memory: None,
+            conn: Arc::new(Mutex::new(conn)),
+            boothby_action: Arc::default(),
+            event_bus: Arc::new(EventBus::new()),
+        })
+    }
+
+    /// Independent WAL reader for bulk inspection. In-memory test databases
+    /// keep their anchor; production file databases never share the writer mutex.
+    pub(crate) fn reader(&self) -> Result<Self> {
+        if self.memory.is_some() {
+            return Ok(self.clone());
+        }
+        Self::open_read_only(self.path.clone())
+    }
+
+    /// Attach a CLI command to initialized state. Only engine startup runs
+    /// migrations; even a mutating CLI command must not replay them per call.
+    pub fn open_existing(path: PathBuf) -> Result<Self> {
+        let mut conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .with_context(|| format!("opening existing database {}", path.display()))?;
+        Self::configure_connection(&mut conn, false)?;
+        Ok(Self {
+            path,
+            memory: None,
+            conn: Arc::new(Mutex::new(conn)),
+            boothby_action: Arc::default(),
+            event_bus: Arc::new(EventBus::new()),
+        })
+    }
+
+    /// Give an admitted frontend query its own connection. Some Get RPCs
+    /// refresh persisted state, so retain write capability and the event bus.
+    pub(crate) fn query_connection(&self) -> Result<Self> {
+        if self.memory.is_some() {
+            return Ok(self.clone());
+        }
+        let connection = Self::open_existing(self.path.clone())?;
+        let mut result = self.clone();
+        result.conn = connection.conn;
+        Ok(result)
     }
 }
 
