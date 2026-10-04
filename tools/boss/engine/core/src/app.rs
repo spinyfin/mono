@@ -514,6 +514,8 @@ type CoordinatorInstalledVersionCache = Arc<StdMutex<Option<CoordinatorInstalled
 #[derive(Default, bon::Builder)]
 #[builder(on(String, into))]
 struct ServerStateOverrides {
+    design_docs: Option<Arc<boss_engine_design_docs::DesignDocsService>>,
+    read_admission: Option<Arc<read_admission::ReadAdmission>>,
     /// Fake live-CI probe. `None` uses `CommandMergeProbe`.
     merge_probe: Option<Arc<dyn MergeProbe>>,
     /// Fake Trunk token store. `None` uses `boss_trunk_auth::TrunkTokenStore`.
@@ -566,8 +568,8 @@ struct ServerState {
     /// without standing up a second broker.
     publisher: Arc<dyn ExecutionPublisher>,
     /// Live-CI probe shared by the `MarkCiRemediationNoop` and
-    /// `MarkCiRemediationSucceededViaRebase` validation gates (T2764
-    /// postmortem, PR spinyfin/mono#2023). Both handlers read this
+    /// `MarkCiRemediationSucceededViaRebase` validation gates (postmortem,
+    /// PR spinyfin/mono#2023). Both handlers read this
     /// instead of constructing their own `CommandMergeProbe`, so tests can
     /// inject a fake and exercise the green/pending/red classification
     /// without shelling out to `gh`. Defaults to `CommandMergeProbe::new()`
@@ -1110,6 +1112,8 @@ impl ServerState {
         overrides: ServerStateOverrides,
     ) -> Result<Arc<Self>> {
         let ServerStateOverrides {
+            design_docs: design_docs_override,
+            read_admission: read_admission_override,
             merge_probe: merge_probe_override,
             trunk_token_store: trunk_token_store_override,
             trunk_client: trunk_client_override,
@@ -1173,8 +1177,8 @@ impl ServerState {
         // updated while the engine was still running, those are the
         // *new* bytes. The macOS app would see "fingerprint matches
         // bundled engine" and silently attach to the stale engine
-        // instead of triggering the version-mismatch restart from
-        // T460. See `build_info::binary_fingerprint` doc comment.
+        // instead of triggering the version-mismatch restart.
+        // See `build_info::binary_fingerprint` doc comment.
         crate::build_info::init();
         timeline.mark("build_info_init");
         tracing::info!(
@@ -1598,9 +1602,12 @@ impl ServerState {
                 )))
                 .transcript_path_cache(Arc::new(crate::live_status_loop::TranscriptPathCache::new()))
                 .run_cost_capture(Arc::new(crate::run_cost::RunCostCapture::new()))
-                .design_docs(Arc::new(boss_engine_design_docs::DesignDocsService::new(
-                    state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),
-                )))
+                .read_admission(read_admission_override.unwrap_or_default())
+                .design_docs(design_docs_override.unwrap_or_else(|| {
+                    Arc::new(boss_engine_design_docs::DesignDocsService::new(
+                        state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),
+                    ))
+                }))
                 .staged_pr_urls(staged_pr_urls)
                 .staged_revision_pushes(staged_revision_pushes)
                 .staged_proposal_channel_errors(staged_proposal_channel_errors)
@@ -2245,7 +2252,11 @@ async fn handle_frontend_connection(
             // Stop reading requests while the outbound lane is nearly full so
             // replies are never evicted for a client that is not draining.
             line = async {
-                sink.wait_for_response_headroom().await;
+                sink.wait_for_response_headroom(
+                    server_state.read_admission.outstanding_per_connection()
+                        .saturating_add(server_state.live_read_admission.outstanding_per_connection())
+                        .saturating_add(1),
+                ).await;
                 reader.next_line().await
             } => line,
         };
