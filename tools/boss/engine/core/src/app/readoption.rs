@@ -933,9 +933,14 @@ impl ServerState {
         let outcome = match self.reconcile_worker_viewers().await {
             Ok(outcome) => outcome,
             Err(err) => {
-                tracing::error!(error = %err, "worker pane inventory failed; retrying while this app session stays registered");
-                self.schedule_worker_viewer_reattach_retry().await;
-                return;
+                tracing::error!(error = %err, "worker pane inventory failed; attaching live workers with SlotBusy recovery");
+                // SlotBusy recovery protects each attach without an inventory.
+                // Retry inventory separately to clean up stale viewers.
+                super::viewer_reconcile::WorkerViewerReconcile {
+                    live: HashSet::new(),
+                    blocked_slots: HashSet::new(),
+                    had_failures: true,
+                }
             }
         };
         if outcome.had_failures {

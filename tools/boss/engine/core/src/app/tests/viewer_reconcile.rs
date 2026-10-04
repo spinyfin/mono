@@ -345,6 +345,70 @@ async fn unconfirmed_stale_detach_still_attaches_other_live_workers() {
     assert_eq!(state.live_worker_states.get(3).unwrap().run_id, live);
 }
 
+#[tokio::test]
+async fn failed_inventory_still_reattaches_live_workers() {
+    let (state, _dir) = test_server_state();
+    seed_tmux_hosted_live_run(&state, 3, "live-session", "live-token");
+    install_tmux_override(&state);
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    let reconnecting = state.clone();
+    let pass = tokio::spawn(async move { reconnecting.reattach_worker_panes_to_registered_app().await });
+    let envelope = tokio::time::timeout(Duration::from_secs(2), sink.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let FrontendEvent::EngineRequest {
+        request_id,
+        request: EngineToAppRequest::ListHostedPanes(_),
+    } = envelope.payload
+    else {
+        panic!("expected inventory request")
+    };
+    state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Err(EngineToAppError::Timeout),
+            },
+        )
+        .await;
+    answer_attach(&state, &sink, Ok(crate::protocol::AttachWorkerPaneResult {})).await;
+    pass.await.unwrap();
+}
+
+#[tokio::test]
+async fn registered_inventory_failure_does_not_confirm_handback() {
+    use crate::pool_claim_sweep::WorkerViewerDetach;
+    let (state, _dir) = test_server_state();
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    let sweeping = state.clone();
+    let pass = tokio::spawn(async move { sweeping.confirm_viewers_detached(&["finished-run".into()]).await });
+    let envelope = tokio::time::timeout(Duration::from_secs(2), sink.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let FrontendEvent::EngineRequest {
+        request_id,
+        request: EngineToAppRequest::ListHostedPanes(_),
+    } = envelope.payload
+    else {
+        panic!("expected inventory request")
+    };
+    state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Err(EngineToAppError::Timeout),
+            },
+        )
+        .await;
+    assert!(pass.await.unwrap()[0].is_err());
+}
+
 #[tokio::test(start_paused = true)]
 async fn unconfirmed_stale_detach_retries_while_app_session_stays_registered() {
     let (state, _dir) = test_server_state();
