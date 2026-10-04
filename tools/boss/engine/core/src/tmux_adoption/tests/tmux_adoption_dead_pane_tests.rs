@@ -65,6 +65,7 @@ async fn dead_worker_pane_fails_once_and_is_not_readopted() {
         "a dead pane must not be handed to re-adoption"
     );
     assert_eq!(first.dead_panes, 1);
+    assert!(db.tmux_identity_for_execution(&execution_id).unwrap().is_some());
     assert_eq!(
         tmux_server.killed_sessions.lock().unwrap().as_slice(),
         &["boss-worker-1".to_owned()],
@@ -136,6 +137,7 @@ async fn orphaned_execution_with_dead_pane_is_not_readopted() {
     .await;
 
     assert_eq!(outcome.dead_panes, 1);
+    assert!(db.tmux_identity_for_execution(&execution_id).unwrap().is_some());
     assert_eq!(outcome.terminal_handoffs, 0);
     assert!(outcome.adopted_execution_ids.is_empty());
     assert!(convergence.calls.lock().unwrap().is_empty());
@@ -240,6 +242,7 @@ async fn completed_execution_keeps_its_diagnostics_when_retained_pane_is_dead() 
     )
     .await;
     assert_eq!(outcome.dead_panes, 1);
+    assert!(db.tmux_identity_for_execution(&execution_id).unwrap().is_some());
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Completed

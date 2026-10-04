@@ -59,7 +59,11 @@
 //!    a fresh dispatch has just re-claimed. The reconciler is a backstop
 //!    for claims stuck for a while, not the happy path.
 //! 5. Terminal execution + no live pane + past the grace = a leaked
-//!    claim. Release it via a compare-and-release
+//!    claim. Retry token-verified teardown of any recorded tmux identity.
+//!    Retain unconfirmed claims and raise attention after three passes. Confirm its
+//!    app viewer is detached (inventory once per pass, retain and retry
+//!    when disconnected or unconfirmed), then release it via a
+//!    compare-and-release
 //!    ([`ExecutionCoordinator::release_pool_claim_if_execution`]) so a
 //!    re-claim race can't yank a fresh, live claim, then emit a
 //!    `pool_claim_reconcile` dispatch event and kick the scheduler.
@@ -94,13 +98,10 @@
 //! gone — it may still be genuinely up, which is precisely what step 1
 //! above is written to avoid racing ("Releasing it here would let a
 //! fresh dispatch hit `AttachWorkerPane` `SlotBusy` against a pane that
-//! is still up"). What makes releasing it anyway acceptable once
-//! `LEAK_GRACE_SECS` has passed is that all three known producers are
-//! terminal-execution-only and self-limiting: a genuine leak (no
-//! teardown owns the slot) must be reclaimed eventually, and an
-//! unconfirmed-but-actually-alive pane loses at most one dispatch to
-//! `SlotBusy` before this sweep frees it — the cost this whole module
-//! exists to bound, not eliminate.
+//! is still up"). The grace period does not prove viewer teardown. Before
+//! handback this sweep inventories app viewers and confirms the claimed
+//! run's detach. A disconnected app leaves the claim pending until a later
+//! pass can confirm it; registration also reconciles stale viewers.
 //!
 //! The tmux adoption and husk sweeps independently reconcile physical
 //! sessions by durable spawn identity; releasing a claim is not proof that
@@ -112,7 +113,7 @@
 //! (same pattern as [`crate::dead_pid_sweep`]) so a pool left wedged by
 //! a crash self-heals at engine startup without an operator restart.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -137,6 +138,95 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 /// every terminal path stamps it) is treated as past the grace.
 pub const LEAK_GRACE_SECS: i64 = 60;
 
+/// Confirms process teardown and viewer removal before claims can be reused.
+///
+/// Process teardown must verify durable spawn identity and clear it on success.
+/// Viewer implementations inventory hosted panes once per call and detach every
+/// matching occupant under a single lock hold.
+#[async_trait::async_trait]
+pub trait WorkerViewerDetach: Send + Sync {
+    async fn confirm_process_torn_down(&self, execution_id: &str) -> Result<(), String>;
+
+    async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>>;
+}
+
+pub(crate) const TEARDOWN_ATTENTION_KIND: &str = "pool_claim_teardown_pending";
+
+/// Consecutive failed confirmations, retained across sweep passes.
+#[derive(Default)]
+pub struct TeardownRetries {
+    failures: HashMap<String, usize>,
+}
+
+impl TeardownRetries {
+    fn failed(&mut self, db: &WorkDb, execution_id: &str, reason: &str) {
+        tracing::warn!(
+            execution_id,
+            reason,
+            "pool-claim sweep: teardown unconfirmed; retaining claim for retry"
+        );
+        let count = self.failures.entry(execution_id.to_owned()).or_default();
+        *count = count.saturating_add(1);
+        if *count < 3 {
+            return;
+        }
+        match db.list_attention_items(execution_id) {
+            Ok(items)
+                if items
+                    .iter()
+                    .any(|item| item.kind == TEARDOWN_ATTENTION_KIND && item.status == "open") =>
+            {
+                return;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!(execution_id, %err, "could not inspect pool teardown attention");
+                return;
+            }
+        }
+        if let Err(err) = db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+            execution_id: Some(execution_id.to_owned()),
+            work_item_id: None,
+            kind: TEARDOWN_ATTENTION_KIND.to_owned(),
+            status: None,
+            title: "Worker pool slot retained: teardown remains unconfirmed".to_owned(),
+            body_markdown: format!("Teardown failed on {count} sweep passes. The pool slot remains held and teardown will be retried. Latest failure: {reason}"),
+            resolved_at: None,
+        }) {
+            tracing::error!(execution_id, %err, "could not file pool teardown attention");
+        }
+    }
+
+    async fn reconcile(&mut self, db: &WorkDb, coordinator: &ExecutionCoordinator) {
+        let mut claimed = HashSet::new();
+        for pool in [
+            coordinator.worker_pool(),
+            coordinator.automation_worker_pool(),
+            coordinator.review_worker_pool(),
+        ] {
+            claimed.extend(pool.claims().await.into_iter().map(|claim| claim.execution_id));
+        }
+        self.failures.retain(|execution_id, _| claimed.contains(execution_id));
+        // Durable open items are the retry queue, even after restart or
+        // another teardown path has removed the in-memory claim.
+        let items = match db.list_open_attention_items_of_kind(TEARDOWN_ATTENTION_KIND) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::error!(%err, "could not inspect pool teardown attention");
+                return;
+            }
+        };
+        for item in items {
+            if let Some(execution_id) = item.execution_id
+                && !claimed.contains(&execution_id)
+                && let Err(err) = db.resolve_attention_kind_for_execution(&execution_id, TEARDOWN_ATTENTION_KIND)
+            {
+                tracing::error!(execution_id, %err, "could not resolve pool teardown attention; retrying next pass");
+            }
+        }
+    }
+}
+
 /// Counts from one sweep pass; logged at `info` when any claim was
 /// released.
 #[derive(Debug, Default, bon::Builder)]
@@ -156,6 +246,13 @@ pub struct PoolClaimSweepOutcome {
     /// Claims that lost the compare-and-release race (freed or re-claimed
     /// by a live execution between snapshot and release). Benign.
     pub race_skipped: usize,
+    /// Unconfirmed viewer detach; the retained claim is retried next pass.
+    #[builder(default)]
+    pub viewer_detach_pending: usize,
+    /// Claims retained because durable tmux identity is still recorded,
+    /// so process teardown has not been confirmed.
+    #[builder(default)]
+    pub process_teardown_pending: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for PoolClaimSweepOutcome {
@@ -184,8 +281,12 @@ pub fn spawn_loop(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
+    viewers: Arc<dyn WorkerViewerDetach>,
 ) -> tokio::task::JoinHandle<()> {
+    let retries = Arc::new(tokio::sync::Mutex::new(TeardownRetries::default()));
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let retries = Arc::clone(&retries);
+        let viewers = Arc::clone(&viewers);
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         let coordinator = Arc::clone(&coordinator);
@@ -196,6 +297,8 @@ pub fn spawn_loop(
                 live_states.as_ref(),
                 coordinator.clone(),
                 dispatch_events.as_ref(),
+                viewers.as_ref(),
+                &mut *retries.lock().await,
             )
             .await
         }
@@ -212,6 +315,8 @@ pub async fn run_one_pass(
     live_states: &LiveWorkerStateRegistry,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
+    viewers: &dyn WorkerViewerDetach,
+    retries: &mut TeardownRetries,
 ) -> PoolClaimSweepOutcome {
     let mut outcome = PoolClaimSweepOutcome::default();
 
@@ -223,6 +328,15 @@ pub async fn run_one_pass(
     // whose execution is in this set is still owned by a live pane and
     // its teardown path — leave it alone.
     let live_run_ids: HashSet<String> = live_states.snapshot().into_iter().map(|state| state.run_id).collect();
+
+    struct LeakedClaim {
+        worker_id: String,
+        execution_id: String,
+        work_item_id: String,
+        execution_status: String,
+        pool_name: &'static str,
+    }
+    let mut leaked = Vec::new();
 
     for (pool, pool_name) in [
         (coordinator.worker_pool(), "main"),
@@ -277,304 +391,91 @@ pub async fn run_one_pass(
                 continue;
             }
 
+            match work_db.tmux_identity_for_execution(&claim.execution_id) {
+                Ok(Some(_)) => {
+                    if let Err(reason) = viewers.confirm_process_torn_down(&claim.execution_id).await {
+                        retries.failed(work_db, &claim.execution_id, &reason);
+                        outcome.process_teardown_pending += 1;
+                        continue;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        worker_id = %claim.worker_id,
+                        execution_id = %claim.execution_id,
+                        pool = pool_name,
+                        ?err,
+                        "pool-claim sweep: failed to look up tmux identity; skipping this pass",
+                    );
+                    outcome.lookup_failed_skipped += 1;
+                    continue;
+                }
+            }
+
             tracing::warn!(
                 worker_id = %claim.worker_id,
                 execution_id = %claim.execution_id,
                 pool = pool_name,
                 execution_status = %execution.status,
                 "pool-claim sweep: slot claimed by terminal execution with no live worker pane; \
-                 releasing leaked claim",
+                 confirming viewer teardown before releasing leaked claim",
             );
 
-            let released = coordinator
-                .release_pool_claim_if_execution(&claim.worker_id, &claim.execution_id)
-                .await;
-
-            if !released {
-                // Lost the compare-and-release race: the slot was freed
-                // or re-claimed by a live execution between the snapshot
-                // and now. Benign — nothing to do.
-                outcome.race_skipped += 1;
-                continue;
-            }
-
-            outcome.released += 1;
-            dispatch_events
-                .emit(
-                    DispatchEvent::new(Stage::PoolClaimReconcile, Outcome::Ok, &claim.execution_id)
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(&claim.worker_id)
-                        .with_details(serde_json::json!({
-                            "pool": pool_name,
-                            "worker_id": claim.worker_id,
-                            "execution_status": execution.status,
-                        })),
-                )
-                .await;
+            leaked.push(LeakedClaim {
+                worker_id: claim.worker_id,
+                execution_id: claim.execution_id,
+                work_item_id: execution.work_item_id,
+                execution_status: execution.status.to_string(),
+                pool_name,
+            });
         }
     }
 
+    let run_ids: Vec<String> = leaked.iter().map(|claim| claim.execution_id.clone()).collect();
+    let mut detach_results = viewers.confirm_viewers_detached(&run_ids).await.into_iter();
+    for claim in leaked {
+        let detach = detach_results
+            .next()
+            .unwrap_or_else(|| Err("viewer detach result missing".into()));
+        if let Err(reason) = detach {
+            tracing::warn!(execution_id = %claim.execution_id, %reason,
+                "pool-claim sweep: viewer detach pending; retaining claim for retry");
+            retries.failed(work_db, &claim.execution_id, &reason);
+            outcome.viewer_detach_pending += 1;
+            continue;
+        }
+
+        let released = coordinator
+            .release_pool_claim_if_execution(&claim.worker_id, &claim.execution_id)
+            .await;
+
+        if !released {
+            // Lost the compare-and-release race: the slot was freed
+            // or re-claimed by a live execution between the snapshot
+            // and now. Benign — nothing to do.
+            outcome.race_skipped += 1;
+            continue;
+        }
+
+        outcome.released += 1;
+        dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::PoolClaimReconcile, Outcome::Ok, &claim.execution_id)
+                    .with_work_item(&claim.work_item_id)
+                    .with_worker(&claim.worker_id)
+                    .with_details(serde_json::json!({
+                        "pool": claim.pool_name,
+                        "worker_id": claim.worker_id,
+                        "execution_status": claim.execution_status,
+                    })),
+            )
+            .await;
+    }
+
+    retries.reconcile(work_db, &coordinator).await;
     outcome
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use boss_protocol::WorkItemBinding;
-
-    use super::*;
-    use crate::coordinator::MAX_AUTOMATION_POOL_SIZE;
-    use crate::dispatch_events::RecordingDispatchEventSink;
-    use crate::live_worker_state::LiveWorkerStateRegistry;
-    use crate::test_support::*;
-    use crate::work::WorkDb;
-
-    fn create_execution(db: &WorkDb, work_item_id: &str) -> String {
-        use boss_protocol::RequestExecutionInput;
-        db.request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
-            .unwrap()
-            .id
-    }
-
-    /// Raw UPDATE to drive an execution to `completed` — exercises the
-    /// completion-path terminal status without a full running-run setup.
-    fn force_completed(db: &WorkDb, execution_id: &str) {
-        let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
-            rusqlite::params![execution_id],
-        )
-        .unwrap();
-    }
-
-    /// Stamp `finished_at` to `secs_ago` seconds in the past so the
-    /// leak-grace guard treats the claim as genuinely stuck (the terminal
-    /// paths stamp `finished_at = now`, which is inside the grace).
-    fn age_finished_at(db: &WorkDb, execution_id: &str, secs_ago: i64) {
-        let epoch = boss_engine_utils::epoch_time::now_epoch_secs() - secs_ago;
-        let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
-            rusqlite::params![execution_id, epoch.to_string()],
-        )
-        .unwrap();
-    }
-
-    fn register_live_pane(live_states: &LiveWorkerStateRegistry, slot_id: u8, execution_id: &str) {
-        live_states.register_spawn(
-            slot_id,
-            execution_id,
-            "claude-opus-4-8",
-            std::process::id() as i32,
-            Some(WorkItemBinding {
-                work_item_id: "wi".to_owned(),
-                work_item_name: "chore".to_owned(),
-                execution_id: execution_id.to_owned(),
-            }),
-        );
-    }
-
-    // ─── tests ───────────────────────────────────────────────────────────────
-
-    /// The core regression: claim all 3 automation slots, terminate each
-    /// holder via a DIFFERENT terminal path (orphaned / cancelled /
-    /// completed), and assert the sweep returns the pool to 0/3 (so a new
-    /// triage can dispatch) and emits one `pool_claim_reconcile` event
-    /// per freed slot.
-    #[tokio::test]
-    async fn frees_every_leaked_automation_claim_across_terminal_paths() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let db = Arc::new(db);
-
-        let coordinator = make_coordinator(db.clone(), 0);
-        let pool = coordinator.automation_worker_pool();
-
-        // Three leaked claims, each terminated via a distinct path.
-        let exec_orphaned = create_execution(&db, &create_active_chore(&db, &product_id, "a"));
-        let exec_cancelled = create_execution(&db, &create_active_chore(&db, &product_id, "b"));
-        let exec_completed = create_execution(&db, &create_active_chore(&db, &product_id, "c"));
-
-        for exec in [&exec_orphaned, &exec_cancelled, &exec_completed] {
-            let worker_id = pool.claim_worker(exec, None).await.unwrap();
-            assert!(worker_id.starts_with("auto-worker-"));
-        }
-        assert_eq!(
-            pool.idle_count().await,
-            MAX_AUTOMATION_POOL_SIZE - 3,
-            "pool must have exactly the three leaked claims outstanding",
-        );
-
-        // Terminate the holders, one per terminal path, then age each
-        // past the leak grace (the terminal paths stamp finished_at=now).
-        db.mark_execution_orphaned(&exec_orphaned, "test orphan").unwrap();
-        assert!(db.cancel_running_execution(&exec_cancelled).unwrap());
-        force_completed(&db, &exec_completed);
-        for exec in [&exec_orphaned, &exec_cancelled, &exec_completed] {
-            age_finished_at(&db, exec, 300);
-        }
-
-        // No live-state entries — this is the documented "3/3 busy, zero
-        // live workers" wedge.
-        let live_states = LiveWorkerStateRegistry::new();
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
-
-        assert_eq!(outcome.released, 3, "all three leaked claims must be freed");
-        assert_eq!(outcome.live_backed_skipped, 0);
-        assert_eq!(outcome.non_terminal_skipped, 0);
-
-        assert_eq!(
-            pool.idle_count().await,
-            MAX_AUTOMATION_POOL_SIZE,
-            "automation pool must be fully idle after the sweep — dispatch unwedged",
-        );
-        assert!(pool.claimed_execution_ids().await.is_empty(), "no claims may remain",);
-
-        // One pool_claim_reconcile event per freed slot, carrying the
-        // worker_id and terminal status so the leak is diagnosable.
-        let events = sink.events().await;
-        assert_eq!(events.len(), 3, "expected one event per released claim");
-        for event in &events {
-            assert_eq!(event.stage, "pool_claim_reconcile");
-            assert_eq!(event.outcome, "ok");
-            assert_eq!(event.details["pool"], "automation");
-            assert!(event.worker_id.as_deref().unwrap().starts_with("auto-worker-"));
-        }
-    }
-
-    /// A claim whose execution is still non-terminal (a legitimately held
-    /// slot — claimed at dispatch, spawn in flight) is left alone.
-    #[tokio::test]
-    async fn leaves_non_terminal_claims_alone() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let db = Arc::new(db);
-
-        let coordinator = make_coordinator(db.clone(), 0);
-        let pool = coordinator.automation_worker_pool();
-
-        let exec = create_execution(&db, &create_active_chore(&db, &product_id, "a"));
-        let worker_id = pool.claim_worker(&exec, None).await.unwrap();
-
-        // Execution left in `ready` (non-terminal).
-        let live_states = LiveWorkerStateRegistry::new();
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
-
-        assert_eq!(outcome.released, 0);
-        assert_eq!(outcome.non_terminal_skipped, 1);
-        assert!(
-            pool.claimed_execution_ids().await.contains(&exec),
-            "non-terminal claim must remain held",
-        );
-        assert!(sink.events().await.is_empty());
-        let _ = worker_id;
-    }
-
-    /// A terminal execution that STILL has a live worker pane is left to
-    /// the completion / dead-pid / stale-worker paths — releasing it here
-    /// would race a pane that may still be physically up (SlotBusy).
-    #[tokio::test]
-    async fn leaves_live_backed_claims_to_the_completion_path() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let db = Arc::new(db);
-
-        let coordinator = make_coordinator(db.clone(), 0);
-        let pool = coordinator.automation_worker_pool();
-
-        let exec = create_execution(&db, &create_active_chore(&db, &product_id, "a"));
-        let worker_id = pool.claim_worker(&exec, None).await.unwrap();
-        // Derive the automation slot from the claimed worker id rather than
-        // hard-coding it: the automation range floats above the interactive
-        // pool (auto-worker-1 → MAX_WORKER_POOL_SIZE + 1), so it moves when the
-        // interactive pool grows a page.
-        let slot = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
-        db.mark_execution_orphaned(&exec, "terminal but pane still up").unwrap();
-
-        let live_states = LiveWorkerStateRegistry::new();
-        register_live_pane(&live_states, slot, &exec);
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
-
-        assert_eq!(outcome.released, 0, "live-backed claim must not be released");
-        assert_eq!(outcome.live_backed_skipped, 1);
-        assert!(
-            pool.claimed_execution_ids().await.contains(&exec),
-            "live-backed claim must remain held",
-        );
-        assert!(sink.events().await.is_empty());
-        let _ = worker_id;
-    }
-
-    /// A claim whose execution went terminal just now (within the leak
-    /// grace) is left alone — a legitimate teardown may still be in
-    /// flight; releasing it could race `run_execution`'s unconditional
-    /// tail release and double-free a re-claimed slot.
-    #[tokio::test]
-    async fn leaves_freshly_terminalized_claims_within_grace() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let db = Arc::new(db);
-
-        let coordinator = make_coordinator(db.clone(), 0);
-        let pool = coordinator.automation_worker_pool();
-
-        let exec = create_execution(&db, &create_active_chore(&db, &product_id, "a"));
-        pool.claim_worker(&exec, None).await.unwrap();
-        // Terminal, finished_at = now (inside the grace window).
-        db.mark_execution_orphaned(&exec, "just terminated").unwrap();
-
-        let live_states = LiveWorkerStateRegistry::new();
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
-
-        assert_eq!(outcome.released, 0, "fresh terminal claim must wait out the grace");
-        assert_eq!(outcome.grace_skipped, 1);
-        assert!(
-            pool.claimed_execution_ids().await.contains(&exec),
-            "claim must remain held during the grace",
-        );
-        assert!(sink.events().await.is_empty());
-    }
-
-    /// A leaked MAIN-pool claim is also reconciled (the sweep walks both
-    /// pools), and the compare-and-release is idempotent across passes.
-    #[tokio::test]
-    async fn frees_main_pool_claim_and_is_idempotent() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let db = Arc::new(db);
-
-        let coordinator = make_coordinator(db.clone(), 2);
-        let pool = coordinator.worker_pool();
-
-        let exec = create_execution(&db, &create_active_chore(&db, &product_id, "a"));
-        let worker_id = pool.claim_worker(&exec, None).await.unwrap();
-        assert!(worker_id.starts_with("worker-"));
-        db.mark_execution_orphaned(&exec, "test orphan").unwrap();
-        age_finished_at(&db, &exec, 300);
-
-        let live_states = LiveWorkerStateRegistry::new();
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-
-        let first = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
-        assert_eq!(first.released, 1);
-        assert_eq!(pool.idle_count().await, 2, "main pool fully idle after release");
-
-        // Second pass: nothing left to release.
-        let second = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
-        assert_eq!(second.released, 0);
-        assert_eq!(
-            sink.events().await.len(),
-            1,
-            "no duplicate event on the idempotent pass"
-        );
-    }
-}
+mod tests;

@@ -34,7 +34,7 @@ fn batch(db: &WorkDb) -> Vec<WorkExecution> {
 }
 
 #[tokio::test]
-async fn all_three_review_batch_members_are_handed_off_in_one_drain_pass() {
+async fn both_review_batch_members_are_handed_off_in_one_drain_pass() {
     assert_single_pass_fanout(false).await;
 }
 
@@ -46,11 +46,11 @@ async fn existing_review_batch_reservation_does_not_filter_out_its_peers() {
 async fn assert_single_pass_fanout(first_already_dispatching: bool) {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    for driver in ["claude", "codex", "grok"] {
+    for driver in ["claude", "codex"] {
         crate::test_support::insert_host_capability(&db, "local", &format!("driver={driver}"), "auto");
     }
     let executions = batch(&db);
-    assert_eq!(executions.len(), 3);
+    assert_eq!(executions.len(), 2);
     let cube = Arc::new(FakeCubeClient {
         slow_ensure_origin: Some(REPO.to_owned()),
         slow_ensure_delay: Duration::from_secs(600),
@@ -106,11 +106,9 @@ fn duplicate_ready_review_execution_never_gets_a_second_reservation() {
     assert!(inflight.try_reserve(&executions[0].clone(), &db).is_none());
     assert!(inflight.blocks_execution(&executions[0], &db));
     let second = inflight.try_reserve(&executions[1], &db).unwrap();
-    let third = inflight.try_reserve(&executions[2], &db).unwrap();
     drop(first);
     assert!(inflight.try_reserve(&executions[1], &db).is_none());
-    assert!(inflight.try_reserve(&executions[2], &db).is_none());
-    drop((second, third));
+    drop(second);
     assert!(inflight.is_empty());
 }
 

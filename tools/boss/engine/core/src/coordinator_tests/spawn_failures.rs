@@ -916,12 +916,8 @@ async fn slot_busy_pane_spawn_failure_requeues_without_demoting_and_holds_slot()
         failed.last_error,
     );
 
-    // The abort is still reported at the spawn-abort point (that is what
-    // makes a genuine abort attributable), but a `SlotBusy` rejection is an
-    // engine/app desync that self-heals via the requeue asserted above — it
-    // must not be logged at ERROR, or the genuine aborts get buried. The
-    // `slot_busy` field is what keeps the two classes filterable regardless
-    // of level.
+    // Reconciliation has already exhausted its stale-viewer retry. The
+    // remaining conflict must be loud and retain its structured reason.
     let our_lines = captured_lines_for(&buffer, starting_offset, &first_execution_id);
     let abort_lines: Vec<&str> = our_lines
         .lines()
@@ -933,14 +929,117 @@ async fn slot_busy_pane_spawn_failure_requeues_without_demoting_and_holds_slot()
     );
     for line in &abort_lines {
         assert!(
-            line.contains("WARN") && !line.contains("ERROR"),
-            "a slot-busy abort must be demoted to WARN, not logged at ERROR; got:\n{line}",
+            line.contains("ERROR") && !line.contains("WARN"),
+            "an unreconciled slot-busy abort must be logged at ERROR; got:\n{line}",
         );
         assert!(
             line.contains("slot_busy=true"),
             "the abort line must carry `slot_busy=true` so the two classes stay filterable; got:\n{line}",
         );
     }
+}
+
+#[tokio::test]
+async fn viewer_abort_failure_retains_the_workspace_and_records_the_reason() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Viewer conflict");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    let cube = Arc::new(FakeCubeClient::default());
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(2),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner {
+            viewer_abort_failed: true,
+            ..FakeExecutionRunner::default()
+        }),
+    ));
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "unreaped worker must retain its workspace"
+    );
+    assert_eq!(
+        coordinator.worker_pool().idle_count().await,
+        1,
+        "one slot stays held for the unreaped spawn; the other remains free"
+    );
+    let attention = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        attention
+            .iter()
+            .any(|item| item.body_markdown.contains("injected tmux teardown failure"))
+    );
+
+    for _ in 0..50 {
+        if db
+            .list_executions(Some(&chore.id))
+            .unwrap()
+            .iter()
+            .any(|execution| execution.id != execution_id)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "unconfirmed teardown must not request a replacement execution; got {executions:#?}"
+    );
+
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-unreaped", "tok-unreaped")
+            .unwrap(),
+        "failed spawn still has a work_runs row to attach identity to"
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, "tok-unreaped", 4242)
+            .unwrap()
+    );
+    {
+        let conn = db.connect().unwrap();
+        let epoch = boss_engine_utils::epoch_time::now_epoch_secs() - crate::pool_claim_sweep::LEAK_GRACE_SECS - 5;
+        conn.execute(
+            "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+            rusqlite::params![execution_id, epoch.to_string()],
+        )
+        .unwrap();
+    }
+
+    struct AllowViewerDetach;
+    #[async_trait]
+    impl crate::pool_claim_sweep::WorkerViewerDetach for AllowViewerDetach {
+        async fn confirm_process_torn_down(&self, _: &str) -> Result<(), String> {
+            Err("test teardown refused".into())
+        }
+
+        async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>> {
+            run_ids.iter().map(|_| Ok(())).collect()
+        }
+    }
+
+    let outcome = crate::pool_claim_sweep::run_one_pass(
+        db.as_ref(),
+        &crate::live_worker_state::LiveWorkerStateRegistry::new(),
+        coordinator.clone(),
+        &crate::dispatch_events::RecordingDispatchEventSink::new(),
+        &AllowViewerDetach,
+        &mut crate::pool_claim_sweep::TeardownRetries::default(),
+    )
+    .await;
+    assert_eq!(outcome.released, 0);
+    assert_eq!(outcome.process_teardown_pending, 1);
+    assert_eq!(
+        coordinator.worker_pool().idle_count().await,
+        1,
+        "sweep must not release a claim whose process teardown is unconfirmed"
+    );
 }
 
 /// Sibling of the above for the `automation_triage` execution kind,

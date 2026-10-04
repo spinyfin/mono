@@ -46,6 +46,7 @@ pub(crate) async fn run_product_command(command: ProductCommand, ctx: &RunContex
             let patch = WorkItemPatch {
                 name: args.name,
                 description: args.description,
+                force_shrink: args.force_shrink,
                 status: args.status.map(|status| status.as_str().to_owned()),
                 repo_remote_url: args.repo_remote_url,
                 design_repo: args.design_repo,
@@ -402,6 +403,7 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
             let patch = WorkItemPatch {
                 name: args.name,
                 description: args.description,
+                force_shrink: args.force_shrink,
                 goal: args.goal,
                 status: args.status.map(|status| status.as_str().to_owned()),
                 priority: args.priority.map(|priority| priority.as_str().to_owned()),
@@ -1605,6 +1607,7 @@ pub(crate) async fn run_update_leaf(
     let patch = WorkItemPatch {
         name: args.name,
         description: args.description,
+        force_shrink: args.force_shrink,
         status: args.status.map(|status| status.as_str().to_owned()),
         priority: args.priority.map(|priority| priority.as_str().to_owned()),
         ordinal: args.ordinal,

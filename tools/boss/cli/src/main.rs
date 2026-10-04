@@ -108,9 +108,9 @@ mod idea_commands;
 mod output;
 mod project_create_args;
 mod status_args;
-mod task_update_args;
 mod time_fmt;
 mod work_cmds;
+mod work_update_args;
 
 pub(crate) use automation_cmds::*;
 pub(crate) use commands::*;
@@ -124,9 +124,9 @@ pub(crate) use idea_commands::*;
 pub(crate) use output::*;
 pub(crate) use project_create_args::*;
 pub(crate) use status_args::*;
-pub(crate) use task_update_args::*;
 pub(crate) use time_fmt::*;
 pub(crate) use work_cmds::*;
+pub(crate) use work_update_args::*;
 
 #[cfg(test)]
 mod set_doc_parse_tests;

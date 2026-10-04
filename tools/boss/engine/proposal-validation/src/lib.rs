@@ -239,6 +239,16 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                             }
                         }
                         for (index, contradiction) in parsed.contradictions.iter().enumerate() {
+                            // Grok stays readable for historical batches. The applier
+                            // checks citations against this batch's accepted reports.
+                            if let Some(role) = contradiction.resolved_in_favor_of
+                                && !contradiction.positions.iter().any(|position| position.role == role)
+                            {
+                                reader.error(
+                                    &format!("verdict.contradictions[{index}].resolved_in_favor_of"),
+                                    "must name a role represented in positions",
+                                );
+                            }
                             if contradiction.positions.len() < 2 {
                                 reader.error(
                                     &format!("verdict.contradictions[{index}].positions"),

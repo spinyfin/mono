@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use crate::driver::{AgentDriver, Capability, ProgressFidelity, ProgressIngress, ProgressObservationConfig};
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::protocol::{AttachWorkerPaneInput, EngineToAppRequest, EngineToAppResponse, EnvVar};
+use crate::protocol::{AttachWorkerPaneInput, EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar};
 use crate::work::WorkDb;
 use crate::worker_registry::WorkerRegistry;
 use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_workspace_files};
@@ -576,6 +576,14 @@ pub struct StartedWorker {
 
 #[derive(Debug, Error)]
 pub enum StartWorkerError {
+    #[error("worker viewer attach rejected: {0}")]
+    ViewerRejected(#[source] EngineToAppError),
+    #[error("worker viewer attach rejected: {error}; process teardown unconfirmed: {reason}")]
+    ViewerAbortFailed {
+        #[source]
+        error: EngineToAppError,
+        reason: String,
+    },
     #[error("writing worker config: {0}")]
     WriteFiles(std::io::Error),
     #[error("preparing progress ingress: {0}")]
@@ -598,6 +606,11 @@ pub trait WorkerSpawner: Send + Sync {
         request: EngineToAppRequest,
         timeout: Duration,
     ) -> Result<EngineToAppResponse, crate::app::SendToAppError>;
+
+    /// Abort our newly started process without detaching another run's viewer.
+    async fn abort_worker_spawn(&self, _run_id: &str) -> Result<(), String> {
+        Ok(())
+    }
 
     fn worker_registry(&self) -> &WorkerRegistry;
 
@@ -910,10 +923,11 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             return Err(err);
         }
     };
-    // The detached tmux session is now the worker's owner. Attaching a
-    // Ghostty surface is best-effort presentation only: an app restart or
-    // a missing app session must not turn a successfully-created worker
-    // into a failed spawn.
+    // The detached tmux session owns the worker, so a missing app session
+    // only means it runs without a viewer until the app reconnects. A
+    // SlotBusy rejection is different: reconciliation has already tried to
+    // clear stale occupancy, so the failure is propagated and the spawned
+    // worker is reaped.
     match spawner
         .send_to_app_request(
             EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
@@ -935,6 +949,17 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
                 session_name = tmux_host.session_name(),
                 "attached tmux-hosted worker pane",
             );
+        }
+        Ok(EngineToAppResponse::AttachWorkerPane {
+            result: Err(err @ EngineToAppError::SlotBusy { .. }),
+        }) => {
+            tracing::error!(run_id = %input.run_id, slot_id, %err, "worker viewer attach rejected; aborting spawn");
+            let teardown = spawner.abort_worker_spawn(&input.run_id).await;
+            spawner.stop_progress_ingress(&input.run_id);
+            if let Err(reason) = teardown {
+                return Err(StartWorkerError::ViewerAbortFailed { error: err, reason });
+            }
+            return Err(StartWorkerError::ViewerRejected(err));
         }
         Ok(response) => {
             tracing::warn!(
@@ -1737,8 +1762,33 @@ mod tests {
         }
     }
 
+    struct AbortTrackingSpawner {
+        inner: StubSpawner,
+        aborted: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerSpawner for AbortTrackingSpawner {
+        async fn send_to_app_request(
+            &self,
+            request: EngineToAppRequest,
+            timeout: Duration,
+        ) -> Result<EngineToAppResponse, SendToAppError> {
+            self.inner.send_to_app_request(request, timeout).await
+        }
+
+        fn worker_registry(&self) -> &WorkerRegistry {
+            &self.inner.registry
+        }
+
+        async fn abort_worker_spawn(&self, run_id: &str) -> Result<(), String> {
+            self.aborted.lock().unwrap().push(run_id.to_owned());
+            Ok(())
+        }
+    }
+
     #[tokio::test]
-    async fn busy_viewer_does_not_lose_the_tmux_worker() {
+    async fn busy_viewer_fails_spawn_with_the_occupant_reason() {
         let workspace = TempDir::new().unwrap();
         let mut spawner = ok_spawner_capturing();
         spawner.canned_response = Ok(EngineToAppResponse::AttachWorkerPane {
@@ -1746,15 +1796,23 @@ mod tests {
                 occupying_run_id: Some("run-husk".into()),
             }),
         });
-        let started = start_worker(
+        let spawner = AbortTrackingSpawner {
+            inner: spawner,
+            aborted: Default::default(),
+        };
+        let result = start_worker(
             &spawner,
-            sample_input(&workspace, spawner.tmux_runner.clone()),
+            sample_input(&workspace, spawner.inner.tmux_runner.clone()),
             StdDuration::from_secs(1),
         )
-        .await
-        .unwrap();
-        assert_eq!(started.shell_pid, 4242);
-        assert_eq!(spawner.registry.slot_for_run("run-test"), Some(3));
+        .await;
+        assert!(
+            matches!(result, Err(StartWorkerError::ViewerRejected(EngineToAppError::SlotBusy {
+            occupying_run_id: Some(ref occupant),
+        })) if occupant == "run-husk")
+        );
+        assert_eq!(spawner.inner.registry.slot_for_run("run-test"), None);
+        assert_eq!(*spawner.aborted.lock().unwrap(), ["run-test"]);
     }
 
     #[tokio::test]

@@ -1253,6 +1253,12 @@ impl WorkDb {
         Ok(all_executions)
     }
 
+    /// An absent execution is distinct from a failed database read.
+    pub(crate) fn find_execution(&self, id: &str) -> Result<Option<WorkExecution>> {
+        let conn = self.connect()?;
+        query_execution(&conn, id)
+    }
+
     pub fn get_execution(&self, id: &str) -> Result<WorkExecution> {
         let conn = self.connect()?;
         query_execution(&conn, id).require("execution", id)

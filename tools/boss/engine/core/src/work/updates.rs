@@ -228,6 +228,13 @@ impl WorkDb {
         let status_changed = patch.status.is_some();
 
         apply_text_patch(&mut product.name, patch.name);
+        if let Some(description) = patch.description.as_deref() {
+            super::description_guard::validate_description_update(
+                &product.description,
+                description,
+                patch.force_shrink,
+            )?;
+        }
         apply_text_patch(&mut product.description, patch.description);
         apply_repo_remote_url_patch(&mut product.repo_remote_url, patch.repo_remote_url);
         apply_repo_remote_url_patch(&mut product.design_repo, patch.design_repo);
@@ -295,6 +302,13 @@ impl WorkDb {
         let status_changed = patch.status.is_some();
 
         apply_text_patch(&mut project.name, patch.name);
+        if let Some(description) = patch.description.as_deref() {
+            super::description_guard::validate_description_update(
+                &project.description,
+                description,
+                patch.force_shrink,
+            )?;
+        }
         apply_text_patch(&mut project.description, patch.description);
         apply_text_patch(&mut project.goal, patch.goal);
         if let Some(status_str) = patch.status {
@@ -420,6 +434,9 @@ impl WorkDb {
         let status_changed = patch.status.is_some();
 
         apply_text_patch(&mut task.name, patch.name);
+        if let Some(description) = patch.description.as_deref() {
+            super::description_guard::validate_description_update(&task.description, description, patch.force_shrink)?;
+        }
         apply_text_patch(&mut task.description, patch.description);
         if let Some(status_str) = patch.status {
             task.status = status_str.parse::<TaskStatus>().map_err(|e| anyhow::anyhow!(e))?;

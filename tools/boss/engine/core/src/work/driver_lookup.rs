@@ -634,9 +634,9 @@ mod tests {
         );
     }
 
-    /// Build a pre-merge fan-out batch and return its three leaf executions
-    /// paired with the driver each member row requested (claude, codex,
-    /// grok — `leaf_member_inputs`' fixed role policy).
+    /// Build a pre-merge fan-out batch and return its two leaf executions
+    /// paired with the driver each member row requested (claude, codex —
+    /// `leaf_member_inputs`' fixed role policy).
     fn fan_out_batch_leaves(db: &WorkDb, cycle_root_id: &str) -> Vec<(boss_protocol::WorkExecution, String)> {
         use crate::work::{ReviewBatchCreateInput, ReviewBatchDispatch};
         use boss_protocol::{ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket, ReviewProfile};
@@ -699,7 +699,7 @@ mod tests {
         let leaves = fan_out_batch_leaves(&db, &cycle_root.id);
         assert_eq!(
             leaves.iter().map(|(_, driver)| driver.as_str()).collect::<Vec<_>>(),
-            vec!["claude", "codex", "grok"],
+            vec!["claude", "codex"],
         );
 
         for (execution, requested_driver) in &leaves {

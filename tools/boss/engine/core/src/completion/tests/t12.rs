@@ -203,7 +203,7 @@ async fn finalize_pr_transition_holds_on_admission_deferral_then_sweep_admits() 
     match recovered {
         ReviewBatchDispatch::Created { batch, executions } => {
             assert_eq!(batch.target_sha, "new-head-sha");
-            assert_eq!(executions.len(), 3);
+            assert_eq!(executions.len(), 2);
         }
         other => panic!("expected a newly created batch after a reservation freed, got {other:?}"),
     }

@@ -16,13 +16,14 @@ use crate::types::{ReviewFindingCategory, ReviewFindingConfidence, ReviewFinding
 /// attributing. Deliberately narrower than
 /// [`boss_protocol::ReviewBatchMemberRole`] (which also has `Supervisor` and
 /// `PostMergeReviewer` variants): a verdict can only ever attribute a claim to
-/// one of the three leaves that actually produce evidence, so this schema
-/// makes the invalid values unrepresentable rather than validating them away.
+/// a leaf that actually produced evidence. Grok remains deserializable for
+/// historical batches; the applier validates citations against batch reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SupervisorSourceRole {
     Claude,
     Codex,
+    /// Historical three-leaf batches only; never configured for a new batch.
     Grok,
 }
 

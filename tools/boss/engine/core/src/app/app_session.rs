@@ -233,6 +233,9 @@ impl ServerState {
         // A fresh registration means whatever channel-health streak the old
         // session accumulated no longer applies.
         self.app_channel_health.record_success();
+        self.viewer_reattach_epoch.fetch_add(1, Ordering::Relaxed);
+        self.viewer_reattach_retry_attempt.store(0, Ordering::Relaxed);
+        self.viewer_reattach_retry_scheduled.store(false, Ordering::Relaxed);
         *self
             .coordinator_attached_spawn_token
             .lock()

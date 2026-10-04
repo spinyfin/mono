@@ -631,6 +631,22 @@ fn review_verdict_rejects_a_contradiction_with_fewer_than_two_positions() {
 
 // ── run_done ────────────────────────────────────────────────────────────────
 
+#[test]
+fn review_verdict_winner_must_be_a_position_but_legacy_grok_stays_readable() {
+    let mut payload = valid_payload_for(ProposalKind::ReviewVerdict);
+    payload["verdict"]["contradictions"] = json!([{
+        "file": "src/lib.rs", "description": "Disagreement", "resolution": "Checked source",
+        "positions": [{"role": "claude", "claim": "safe"}, {"role": "codex", "claim": "unsafe"}],
+        "resolved_in_favor_of": "grok",
+    }]);
+    let errors = errs(ProposalKind::ReviewVerdict, payload.clone());
+    assert!(
+        message_for(&errors, "verdict.contradictions[0].resolved_in_favor_of").contains("represented in positions")
+    );
+    payload["verdict"]["contradictions"][0]["positions"][1]["role"] = json!("grok");
+    assert!(validate_payload(ProposalKind::ReviewVerdict, &payload).is_ok());
+}
+
 /// The declaration's outcome is a closed vocabulary and the rejection must
 /// name it, because a worker that guesses `--outcome finished` needs to be
 /// able to fix the call from the error alone. The message comes from

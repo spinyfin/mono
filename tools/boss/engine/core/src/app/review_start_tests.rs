@@ -166,7 +166,7 @@ async fn flag_on_creates_heterogeneous_batch_and_supervisor() {
     assert_eq!(batch.generation, 1);
     let db = &state.work_db;
     let members = db.review_batch_members(&batch.id).unwrap();
-    assert_eq!(members.len(), 3);
+    assert_eq!(members.len(), 2);
     let execution_ids: Vec<_> = members.iter().map(|m| m.execution_id.clone().unwrap()).collect();
     let execution = triggered_with_batch(event, Some(&batch), &execution_ids, false);
     let reused = triggered_with_batch(
@@ -179,7 +179,7 @@ async fn flag_on_creates_heterogeneous_batch_and_supervisor() {
 
     assert_eq!(
         members.iter().map(|m| m.requested_driver.as_str()).collect::<Vec<_>>(),
-        ["claude", "codex", "grok"]
+        ["claude", "codex"]
     );
     assert!(members.iter().any(|m| m.execution_id.as_deref() == Some(&execution.id)));
     for member in &members {
@@ -211,7 +211,7 @@ async fn flag_on_creates_heterogeneous_batch_and_supervisor() {
         ReviewBatchStatus::Supervising
     );
     let members = db.review_batch_members(&batch.id).unwrap();
-    assert_eq!(members.len(), 4);
+    assert_eq!(members.len(), 3);
     let supervisor = members
         .iter()
         .find(|m| m.role == ReviewBatchMemberRole::Supervisor)
@@ -238,7 +238,7 @@ async fn explicit_start_ignores_prior_head_noop_and_cycle_limit() {
                 .review_batch_members(&batch(&state, &id, "head").id)
                 .unwrap()
                 .len(),
-            3
+            2
         );
         assert_eq!(state.work_db.get_task_review_cycle_state(&id).unwrap().0, 999);
     }
@@ -429,7 +429,7 @@ async fn completed_head_gets_new_generation_but_automatic_and_live_replays_do_no
     let second = batch(&state, &id, "head");
     assert_ne!(second.id, first.id);
     assert_eq!(second.generation, 2);
-    assert_eq!(db.review_batch_members(&second.id).unwrap().len(), 3);
+    assert_eq!(db.review_batch_members(&second.id).unwrap().len(), 2);
     assert_eq!(db.review_batch(&first.id).unwrap().unwrap(), old_batch);
     assert_eq!(db.review_batch_members(&first.id).unwrap(), old_members);
     for before in old_executions {
@@ -489,13 +489,13 @@ async fn failed_head_also_gets_a_new_generation_on_explicit_retry() {
     assert_eq!(second.generation, 2);
     assert!(second.explicit);
     let second_members = db.review_batch_members(&second.id).unwrap();
-    assert_eq!(second_members.len(), 3);
+    assert_eq!(second_members.len(), 2);
     assert_eq!(
         second_members
             .iter()
             .map(|m| m.requested_driver.as_str())
             .collect::<Vec<_>>(),
-        ["claude", "codex", "grok"]
+        ["claude", "codex"]
     );
 
     // The failed batch and its members must survive untouched.
@@ -622,7 +622,7 @@ async fn terminal_batch_with_unsettled_member_rejects_next_generation() {
             ),
         );
         assert_eq!(db.review_batches_for_cycle_root(&id).unwrap().len(), 1);
-        assert_eq!(db.review_batch_members(&first.id).unwrap().len(), 3);
+        assert_eq!(db.review_batch_members(&first.id).unwrap().len(), 2);
     }
 }
 
@@ -686,5 +686,5 @@ async fn member_insert_failure_rolls_back_batch_and_all_executions() {
         .unwrap();
     triggered(request(&state, 42, None, Ok(metadata("head"))).await);
     assert_eq!(batch(&state, &id, "head").generation, 1);
-    assert_eq!(state.work_db.list_executions(Some(&id)).unwrap().len(), 3);
+    assert_eq!(state.work_db.list_executions(Some(&id)).unwrap().len(), 2);
 }

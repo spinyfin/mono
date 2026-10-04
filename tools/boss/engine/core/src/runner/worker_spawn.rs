@@ -1017,10 +1017,24 @@ pub(crate) async fn compose_worker_spawn(
                     let cycle_root_id = work_db.review_cycle_root_id(&execution.work_item_id);
                     let reports = load_batch_leaf_reports(work_db, &cycle_root_id, &destination.batch_id)
                         .context("loading accepted leaf reports for supervisor prompt")?;
+                    let mut configured_roles = work_db
+                        .review_batch_members(&destination.batch_id)?
+                        .iter()
+                        .filter_map(|member| match member.role {
+                            ReviewBatchMemberRole::ClaudeReviewer => {
+                                Some(crate::pr_review::SupervisorSourceRole::Claude)
+                            }
+                            ReviewBatchMemberRole::CodexReviewer => Some(crate::pr_review::SupervisorSourceRole::Codex),
+                            ReviewBatchMemberRole::GrokReviewer => Some(crate::pr_review::SupervisorSourceRole::Grok),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    configured_roles.dedup();
                     crate::pr_review::render_supervisor_initial_prompt(
                         &review_brief,
                         destination,
                         &reports,
+                        &configured_roles,
                         &reviewer_repo_slug,
                     )
                 }

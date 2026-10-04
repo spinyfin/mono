@@ -3,7 +3,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 use std::time::SystemTime;
@@ -129,6 +129,7 @@ mod tests;
 mod tmux_teardown;
 mod trunk_auth;
 mod trust;
+mod viewer_reconcile;
 mod work_items;
 mod worker_events;
 
@@ -297,11 +298,21 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
     ) -> Result<EngineToAppResponse, SendToAppError> {
         // Ghostty surface allocation must stay serialized even though the
         // worker processes are already running independently in tmux.
-        if matches!(request, EngineToAppRequest::AttachWorkerPane(_)) {
-            let _guard = self.attach_pane_lock.lock().await;
-            return self.send_to_app(request, timeout).await;
+        if let EngineToAppRequest::AttachWorkerPane(input) = request {
+            return self.attach_worker_viewer(input, timeout).await;
         }
         self.send_to_app(request, timeout).await
+    }
+
+    async fn abort_worker_spawn(&self, run_id: &str) -> Result<(), String> {
+        // The rejected slot belongs to another viewer. Reap only our tmux
+        // process; release_worker_pane would also detach by slot.
+        let outcome = self.reap_tmux_worker(run_id).await;
+        self.agent_jsonl_progress_manager.stop_run(run_id);
+        if outcome != tmux_teardown::TmuxTeardownOutcome::Reaped {
+            return Err("token-verified tmux teardown refused; retaining workspace for recovery".into());
+        }
+        Ok(())
     }
 
     fn worker_registry(&self) -> &WorkerRegistry {
@@ -936,6 +947,16 @@ struct ServerState {
     app_channel_health: Arc<AppChannelHealth>,
     /// Serialize app viewer allocation independently of tmux worker creation.
     attach_pane_lock: Arc<Mutex<()>>,
+    /// Bumped when the registered app session is replaced so an in-flight
+    /// viewer-reattach retry aborts instead of talking to a new session.
+    #[builder(default)]
+    viewer_reattach_epoch: AtomicU64,
+    /// True while a backed-off viewer reattach retry is sleeping.
+    #[builder(default)]
+    viewer_reattach_retry_scheduled: AtomicBool,
+    /// Consecutive failed reconcile passes for the current app session.
+    #[builder(default)]
+    viewer_reattach_retry_attempt: AtomicU32,
     /// Append-only JSONL log of every engine↔app IPC exchange. Each
     /// `send_to_app` call appends an `engine→app` record; each
     /// `deliver_app_response` call appends an `app→engine` record.

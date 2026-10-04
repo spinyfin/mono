@@ -513,7 +513,9 @@ impl ServerState {
             work_item_id: canonical_id.clone(),
             product_id,
         });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
+        // The app allows 3s for the product tree, then 3s for viewport confirmation.
+        // Keep both named app deadlines inside the transport budget, with delivery margin.
+        match self.send_to_app(request, Duration::from_secs(8)).await {
             Ok(EngineToAppResponse::RevealWorkItem { result: Ok(_) }) => Ok(canonical_id),
             Ok(EngineToAppResponse::RevealWorkItem { result: Err(err) }) => Err(RevealItemError::App(err)),
             Ok(other) => Err(RevealItemError::ResponseKindMismatch(format!("{other:?}"))),
