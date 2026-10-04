@@ -85,47 +85,6 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
     }
 }
 
-// ── Time-window parsing ──────────────────────────────────────────────
-
-/// Parse a `--since`/`--until` bound: an RFC3339 timestamp, or a
-/// relative duration ago (`24h`, `7d`, `2w`) resolved against `now`.
-fn parse_epoch_bound(input: &str, now: i64) -> Result<i64, CliError> {
-    let trimmed = input.trim();
-    if let Some(epoch) = boss_engine_utils::iso8601::parse_iso8601_lenient(trimmed) {
-        return Ok(epoch);
-    }
-    let (digits, unit_secs) = if let Some(rest) = trimmed.strip_suffix(['h', 'H']) {
-        (rest, 3_600_i64)
-    } else if let Some(rest) = trimmed.strip_suffix(['d', 'D']) {
-        (rest, 86_400_i64)
-    } else if let Some(rest) = trimmed.strip_suffix(['w', 'W']) {
-        (rest, 604_800_i64)
-    } else {
-        return Err(CliError::usage(format!(
-            "could not parse {input:?} as a time bound: expected RFC3339 (e.g. 2026-07-01T00:00:00Z) \
-             or a relative duration like 24h / 7d / 2w"
-        )));
-    };
-    let count: i64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| CliError::usage(format!("could not parse relative duration {input:?}")))?;
-    Ok(now - count.saturating_mul(unit_secs))
-}
-
-fn resolve_window(since: &str, until: Option<&str>) -> Result<(i64, i64), CliError> {
-    let now = boss_engine_utils::epoch_time::now_epoch_secs();
-    let since_epoch_s = parse_epoch_bound(since, now)?;
-    let until_epoch_s = match until {
-        Some(u) => parse_epoch_bound(u, now)?,
-        None => now,
-    };
-    if until_epoch_s <= since_epoch_s {
-        return Err(CliError::usage("--until must be after --since"));
-    }
-    Ok((since_epoch_s, until_epoch_s))
-}
-
 // ── Rendering ─────────────────────────────────────────────────────────
 
 fn format_tokens(n: i64) -> String {
@@ -368,31 +327,6 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_epoch_bound_accepts_relative_durations_case_insensitively() {
-        let now = 2_000_000_000;
-        assert_eq!(parse_epoch_bound("7d", now).unwrap(), now - 7 * 86_400);
-        assert_eq!(parse_epoch_bound("2W", now).unwrap(), now - 2 * 604_800);
-        assert_eq!(parse_epoch_bound("24H", now).unwrap(), now - 24 * 3_600);
-    }
-
-    #[test]
-    fn parse_epoch_bound_accepts_rfc3339() {
-        assert_eq!(parse_epoch_bound("2026-07-01T00:00:00Z", 0).unwrap(), 1_782_864_000);
-    }
-
-    #[test]
-    fn parse_epoch_bound_rejects_unparseable_input() {
-        let err = parse_epoch_bound("yesterday-ish", 0).unwrap_err();
-        assert!(err.to_string().contains("could not parse"));
-    }
-
-    #[test]
-    fn resolve_window_rejects_empty_or_reversed_ranges() {
-        let err = resolve_window("0h", Some("0h")).unwrap_err();
-        assert!(err.to_string().contains("--until must be after --since"));
-    }
 
     #[test]
     fn display_helpers_format_tokens() {
