@@ -577,14 +577,15 @@ fn assert_grok_posture_with_environment(
     let mut command = Command::new("grok");
     command.arg("inspect").arg("--json").current_dir(workspace);
     environment.apply_to_command(&mut command);
-    let output = command.output().with_context(|| {
-        format!(
-            "running `grok inspect --json` with GROK_HOME={} HOME={} cwd={}",
-            grok_home.display(),
-            process_home.display(),
-            workspace.display()
-        )
-    })?;
+    let output = super::preflight::run_bounded(&mut command, super::preflight::PREFLIGHT_COMMAND_TIMEOUT)
+        .with_context(|| {
+            format!(
+                "running `grok inspect --json` with GROK_HOME={} HOME={} cwd={}",
+                grok_home.display(),
+                process_home.display(),
+                workspace.display()
+            )
+        })?;
 
     if !output.status.success() {
         bail!(
