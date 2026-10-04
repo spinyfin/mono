@@ -602,13 +602,14 @@ async fn release_worker_pane_still_frees_the_slot_when_no_sweep_would_collect_it
 
 #[tokio::test(start_paused = true)]
 async fn pool_claim_sweep_reconciles_the_claim_release_worker_pane_holds() {
-    // The other half of the safety argument behind
-    // `release_worker_pane_holds_the_pool_claim_when_the_app_never_confirms`:
-    // holding the claim is only safe because `pool_claim_sweep` is
-    // guaranteed to collect it once the execution has been stuck past
-    // `LEAK_GRACE_SECS`. Without this test, a future change to the sweep's
-    // skip conditions (e.g. the live-state cross-check) could silently turn
-    // the hold into a permanent slot leak with every other test still green.
+    verify_sweep_handback(false).await;
+    verify_sweep_handback(true).await;
+}
+
+async fn verify_sweep_handback(disconnected: bool) {
+    // After the grace period a disconnected app cannot block handback. A
+    // registered app must acknowledge detach; reconnect reconciliation owns
+    // stale viewers left behind by a disconnected app.
     let (server_state, _dir) = test_server_state();
     let pool = server_state.execution_coordinator.worker_pool();
 
@@ -647,18 +648,28 @@ async fn pool_claim_sweep_reconciles_the_claim_release_worker_pane_holds() {
         .unwrap();
     }
 
-    let outcome = crate::pool_claim_sweep::run_one_pass(
-        server_state.work_db.as_ref(),
-        server_state.live_worker_states.as_ref(),
-        server_state.execution_coordinator.clone(),
-        server_state.dispatch_events.as_ref(),
-        server_state.as_ref(),
-        &mut crate::pool_claim_sweep::TeardownRetries::default(),
-    )
-    .await;
-    assert_eq!(outcome.released, 0);
-    assert_eq!(outcome.viewer_detach_pending, 1);
-    assert_eq!(pool.idle_count().await, 0);
+    if disconnected {
+        let outcome = crate::pool_claim_sweep::run_one_pass(
+            server_state.work_db.as_ref(),
+            server_state.live_worker_states.as_ref(),
+            server_state.execution_coordinator.clone(),
+            server_state.dispatch_events.as_ref(),
+            server_state.as_ref(),
+            &mut crate::pool_claim_sweep::TeardownRetries::default(),
+        )
+        .await;
+        assert_eq!(outcome.released, 1);
+        assert_eq!(outcome.viewer_detach_pending, 0);
+        assert_eq!(pool.idle_count().await, 1);
+        assert!(
+            server_state
+                .work_db
+                .list_attention_items(&execution.id)
+                .unwrap()
+                .is_empty()
+        );
+        return;
+    }
 
     let sink = make_session_sink();
     server_state

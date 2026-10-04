@@ -974,6 +974,15 @@ async fn viewer_abort_failure_retains_the_workspace_and_records_the_reason() {
             .iter()
             .any(|item| item.body_markdown.contains("injected tmux teardown failure"))
     );
+    let recovery = attention
+        .iter()
+        .find(|item| item.kind == crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND)
+        .unwrap();
+    assert!(recovery.body_markdown.contains("intentionally retained"));
+    assert!(recovery.body_markdown.contains("Manual recovery is required"));
+    assert!(recovery.body_markdown.contains("release the retained cube lease"));
+    assert!(recovery.body_markdown.contains("requeue the failed work item"));
+    assert!(!recovery.body_markdown.contains("release failed"));
 
     for _ in 0..50 {
         if db
