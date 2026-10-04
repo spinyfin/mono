@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+/// Queued (not yet active) reads allowed per active permit on one connection.
+const PENDING_PER_ACTIVE: usize = 4;
+
 pub(super) const BUSY: &str = "engine busy, retry: read admission limit exceeded";
 
 pub(super) struct ReadAdmission {
@@ -69,13 +72,13 @@ impl ReadAdmission {
     }
 
     pub(super) fn outstanding_per_connection(&self) -> usize {
-        self.per_connection.saturating_mul(5)
+        self.per_connection.saturating_mul(PENDING_PER_ACTIVE + 1)
     }
 
     pub(super) fn connection(&self) -> Arc<ConnectionReads> {
         Arc::new(ConnectionReads {
             active: Arc::new(Semaphore::new(self.per_connection)),
-            pending: Arc::new(Semaphore::new(self.per_connection.saturating_mul(4))),
+            pending: Arc::new(Semaphore::new(self.per_connection.saturating_mul(PENDING_PER_ACTIVE))),
         })
     }
 

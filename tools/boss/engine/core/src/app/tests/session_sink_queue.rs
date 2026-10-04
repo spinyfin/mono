@@ -414,30 +414,57 @@ async fn request_reader_stalls_until_outbound_lane_drains() {
     assert!(!stats.slow);
 }
 
+/// A reply at the head of a lane full of evictable pushes must survive: the
+/// oldest uncorrelated pushes are dropped instead and the session stays open.
 #[tokio::test]
-async fn response_eviction_disconnects_even_when_producer_ignores_outcome() {
-    for (response_index, first_topic) in [(0, "topic-0"), (1, "topic-0"), (1, RESYNC_TOPIC)] {
-        let (tx, rx) = oneshot::channel();
+async fn reply_at_head_is_kept_and_pushes_are_evicted_instead() {
+    for response_index in [0, 1] {
+        let (tx, mut rx) = oneshot::channel();
         let sink = SessionSink::new(tx);
         for index in 0..MAX_SESSION_QUEUE {
             let env = if index == response_index {
                 response_envelope("must-survive")
-            } else if index == 0 {
-                topic_envelope(first_topic, 1)
             } else {
                 topic_envelope(&format!("topic-{index}"), 1)
             };
             assert_eq!(sink.enqueue(env), EnqueueOutcome::Enqueued);
         }
-        let _ = sink.enqueue(topic_envelope("overflow", 1));
-        rx.await.expect("evicting a reply must explicitly disconnect");
-        assert!(sink.queue_stats().closed);
+        assert_eq!(sink.enqueue(topic_envelope("overflow", 1)), EnqueueOutcome::Degraded);
+        assert!(rx.try_recv().is_err(), "a draining client must not be shut down");
+        assert!(!sink.queue_stats().closed);
         let q = sink.queue.lock().unwrap();
-        assert!(
+        assert_eq!(q.items.len(), MAX_SESSION_QUEUE);
+        assert_eq!(
             q.items
                 .iter()
-                .any(|(_, env)| env.request_id.as_deref() == Some("must-survive"))
+                .filter(|(_, env)| env.request_id.as_deref() == Some("must-survive"))
+                .count(),
+            1
         );
-        assert_eq!(q.pending_topics.contains_key(RESYNC_TOPIC), first_topic == RESYNC_TOPIC);
+        assert!(q.pending_topics.contains_key(RESYNC_TOPIC));
+        // Every recorded topic index still points at its own envelope.
+        for (topic, &idx) in &q.pending_topics {
+            assert_eq!(topic_of(&q.items[idx].1).as_deref(), Some(topic.as_str()));
+        }
     }
+}
+
+/// With nothing evictable left (every entry a correlated reply) the sink
+/// explicitly disconnects rather than dropping a reply.
+#[tokio::test]
+async fn response_eviction_disconnects_even_when_producer_ignores_outcome() {
+    let (tx, rx) = oneshot::channel();
+    let sink = SessionSink::new(tx);
+    for index in 0..MAX_SESSION_QUEUE {
+        assert_eq!(
+            sink.enqueue(response_envelope(&format!("reply-{index}"))),
+            EnqueueOutcome::Enqueued
+        );
+    }
+    let _ = sink.enqueue(topic_envelope("overflow", 1));
+    rx.await.expect("evicting a reply must explicitly disconnect");
+    assert!(sink.queue_stats().closed);
+    let q = sink.queue.lock().unwrap();
+    assert_eq!(q.items.len(), MAX_SESSION_QUEUE, "no reply was dropped");
+    assert!(!q.pending_topics.contains_key(RESYNC_TOPIC));
 }
