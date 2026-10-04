@@ -2303,6 +2303,13 @@ impl ExecutionCoordinator {
         error: &anyhow::Error,
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
+        // Flattened chain, matching the pane-spawn termination path in
+        // `run.rs`: anyhow's `Display` renders only the outermost context,
+        // so a bare `to_string()` here persisted "cube workspace lease
+        // failed" onto the run row and dropped the cube stderr that says
+        // *why*. The truncation was never specific to one error path — it
+        // was every run-row error capture that started from an
+        // `anyhow::Error`.
         let error_text = format!("{error:#}");
         let (execution, run, outcome) = self.work_db.record_pre_start_failure(
             &execution.id,
