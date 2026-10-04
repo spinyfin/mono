@@ -269,10 +269,24 @@ async fn one_socket_pipelining_sixteen_bulk_reads_never_sees_busy() {
     handler.await.unwrap().unwrap();
 }
 
-/// Exercise the socket reader's backpressure with more requests than the
-/// outbound queue can hold, while independent topic producers keep running.
+/// No concurrent pushes: every pipelined id gets exactly one BUSY reply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn socket_saturation_delivers_every_id_or_explicitly_disconnects() {
+async fn socket_saturation_without_pushes_delivers_every_id_once() {
+    socket_saturation_delivers_every_id_once(0).await;
+}
+
+/// 300 distinct-topic pushes overflow the bulk lane while 320 replies are
+/// pending. Pushes are evicted (with a resync marker) instead of replies or
+/// the session: every id still arrives exactly once and the socket stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socket_saturation_with_distinct_topic_pushes_keeps_replies_and_connection() {
+    socket_saturation_delivers_every_id_once(300).await;
+}
+
+/// Exercise the socket reader's backpressure with more requests than the
+/// outbound queue can hold, while `push_topics` independent topic producers
+/// keep running.
+async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
     let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
         crate::app::ServerStateOverrides::builder()
             .read_admission(Arc::new(ReadAdmission::new(1, 32, 128, Duration::from_millis(50))))
@@ -314,7 +328,7 @@ async fn socket_saturation_delivers_every_id_or_explicitly_disconnects() {
     })
     .await
     .unwrap();
-    let topics: Vec<_> = (0..300)
+    let topics: Vec<_> = (0..push_topics)
         .map(|i| format!("saturation-{i}-{}", "x".repeat(2048)))
         .collect();
     state.topic_broker.subscribe(&session, &topics).await;
@@ -388,11 +402,10 @@ async fn socket_saturation_delivers_every_id_or_explicitly_disconnects() {
     })
     .await
     .expect("missing replies without an explicit socket close");
-    if !closed {
-        assert_eq!(sent, 320);
-        let expected: std::collections::HashSet<_> = (0..320).map(|index| format!("saturated-{index}")).collect();
-        assert_eq!(replies, expected);
-    }
+    assert!(!closed, "the connection must stay open: replies are never evicted");
+    assert_eq!(sent, 320);
+    let expected: std::collections::HashSet<_> = (0..320).map(|index| format!("saturated-{index}")).collect();
+    assert_eq!(replies, expected);
     publisher.await.unwrap();
     drop(lines);
     drop(write);

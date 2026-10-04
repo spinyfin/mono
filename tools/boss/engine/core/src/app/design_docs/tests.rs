@@ -321,4 +321,119 @@ async fn serve_holds_the_request_open_until_the_response_is_sent() {
     );
 }
 
+fn key(path: &str) -> DocKey {
+    (FLUNGE.to_owned(), path.to_owned(), GIT_REF.to_owned())
+}
+
+fn owner(registry: &Arc<RevalidationRegistry>, path: &str, sink: &Arc<SessionSink>) -> RevalidationGuard {
+    match registry.try_begin(key(path), sink) {
+        Begin::Owner(guard) => guard,
+        _ => panic!("expected ownership of {path}"),
+    }
+}
+
+/// A second session that coalesces onto an in-flight fetch receives the
+/// cached response and then the changed content from that one fetch.
+#[tokio::test]
+async fn coalesced_session_receives_the_changed_content() {
+    let source = FakeSource::new();
+    let svc = Arc::new(DesignDocsService::with_source(source.clone()));
+    svc.open_markdown_doc(FLUNGE, PATH, GIT_REF).await;
+    *source.blob.lock().unwrap() = "# changed".to_owned();
+
+    let registry = Arc::new(RevalidationRegistry::with_policy(zero_policy()));
+    let (a, b) = (make_sink(), make_sink());
+    // Session A's fetch is in flight (held) while session B reads the doc.
+    let guard = owner(&registry, PATH, &a);
+    run_one(svc.clone(), registry.clone(), b.clone(), "req-b").await;
+    assert_eq!(source.blob_calls(), 1, "coalescing must not start a second fetch");
+    revalidate_product_design_doc(svc, guard, FLUNGE.to_owned(), PATH.to_owned(), GIT_REF.to_owned()).await;
+
+    let b_events = contents(&drain(&b).await);
+    assert!(
+        matches!(&b_events[0], (false, DesignDocContent::Loaded { markdown, .. }) if markdown == "# doc"),
+        "{b_events:?}"
+    );
+    assert!(
+        matches!(&b_events[1], (true, DesignDocContent::Loaded { markdown, .. }) if markdown == "# changed"),
+        "{b_events:?}"
+    );
+    assert_eq!(b_events.len(), 2);
+    let a_events = contents(&drain(&a).await);
+    assert!(
+        matches!(&a_events[..], [(true, DesignDocContent::Loaded { markdown, .. })] if markdown == "# changed"),
+        "{a_events:?}"
+    );
+}
+
+/// The owning session disconnecting mid-fetch must not strand the others.
+#[tokio::test]
+async fn coalesced_session_still_receives_content_after_the_owner_disconnects() {
+    let source = FakeSource::new();
+    let svc = Arc::new(DesignDocsService::with_source(source.clone()));
+    svc.open_markdown_doc(FLUNGE, PATH, GIT_REF).await;
+    *source.blob.lock().unwrap() = "# changed".to_owned();
+
+    let registry = Arc::new(RevalidationRegistry::with_policy(zero_policy()));
+    let (a, b) = (make_sink(), make_sink());
+    let guard = owner(&registry, PATH, &a);
+    run_one(svc.clone(), registry.clone(), b.clone(), "req-b").await;
+    a.close();
+    revalidate_product_design_doc(svc, guard, FLUNGE.to_owned(), PATH.to_owned(), GIT_REF.to_owned()).await;
+
+    let b_events = contents(&drain(&b).await);
+    assert_eq!(b_events.len(), 2, "{b_events:?}");
+    assert!(matches!(&b_events[1], (true, DesignDocContent::Loaded { markdown, .. }) if markdown == "# changed"));
+    assert!(contents(&drain(&a).await).is_empty(), "closed session gets nothing");
+}
+
+/// Past the global cap a fifth distinct document is not silently left
+/// unvalidated: it gets an explicit retryable stale push, and a retry runs
+/// once a slot frees.
+#[tokio::test]
+async fn fifth_distinct_document_gets_an_explicit_stale_outcome_then_runs_after_release() {
+    let source = FakeSource::new();
+    let svc = Arc::new(DesignDocsService::with_source(source.clone()));
+    svc.open_markdown_doc(FLUNGE, PATH, GIT_REF).await;
+    let registry = Arc::new(RevalidationRegistry::with_policy(zero_policy()));
+    let holder = make_sink();
+    let mut guards: Vec<_> = (0..MAX_REVALIDATIONS)
+        .map(|i| owner(&registry, &format!("docs/held-{i}.md"), &holder))
+        .collect();
+
+    let sink = make_sink();
+    run_one(svc.clone(), registry.clone(), sink.clone(), "req-1").await;
+    assert_eq!(source.blob_calls(), 1, "no fetch while at capacity");
+    {
+        let events = contents(&drain(&sink).await);
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    (false, DesignDocContent::Loaded { stale_reason: None, .. }),
+                    (
+                        true,
+                        DesignDocContent::Loaded {
+                            stale_reason: Some(_),
+                            retryable: true,
+                            ..
+                        }
+                    )
+                ]
+            ),
+            "{events:?}"
+        );
+    }
+
+    guards.pop();
+    let sink = make_sink();
+    *source.blob.lock().unwrap() = "# changed".to_owned();
+    run_one(svc, registry, sink.clone(), "req-2").await;
+    let events = contents(&drain(&sink).await);
+    assert!(
+        matches!(&events[1], (true, DesignDocContent::Loaded { markdown, .. }) if markdown == "# changed"),
+        "{events:?}"
+    );
+}
+
 mod socket_tests;

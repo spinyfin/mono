@@ -11,7 +11,8 @@
 //! Handlers await their correlated response so read admission permits cover
 //! the entire operation. Bulk dispatch runs off the socket reader loop.
 //! Only background revalidation is detached, with ownership acquired before
-//! spawning: one probe/retry ladder per document and at most four globally.
+//! spawning: one probe/retry ladder per document (later sessions join its recipients)
+//! and at most four globally; past the cap the client gets a retryable stale push.
 
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
@@ -29,14 +30,60 @@ use super::*;
 /// request uses to address a document.
 type DocKey = (String, String, String);
 
-/// One in-flight auto-retry ladder. A later `GetProductDesignDoc` for
-/// the same triple notifies `wake` instead of stacking another probe.
+/// Most documents revalidating at once, process-wide.
+const MAX_REVALIDATIONS: usize = 4;
+
+/// One in-flight revalidation / auto-retry ladder. A later
+/// `GetProductDesignDoc` for the same triple notifies `wake` instead of
+/// stacking another probe, and registers its session in `sinks` so every
+/// requester sees the outcome of the one shared fetch.
 /// Success or a non-retryable outcome ends the owning ladder.
 struct LadderCtl {
     wake: Notify,
+    sinks: StdMutex<Vec<Arc<SessionSink>>>,
 }
 
-/// Process-wide set of at most four initial probes and auto-retry ladders.
+impl LadderCtl {
+    fn new(sink: Arc<SessionSink>) -> Self {
+        Self {
+            wake: Notify::new(),
+            sinks: StdMutex::new(vec![sink]),
+        }
+    }
+
+    /// Register a coalescing caller's session, deduplicated.
+    fn add_sink(&self, sink: &Arc<SessionSink>) {
+        let mut sinks = self.sinks.lock().unwrap_or_else(|p| p.into_inner());
+        if !sinks.iter().any(|s| Arc::ptr_eq(s, sink)) {
+            sinks.push(sink.clone());
+        }
+    }
+
+    /// Push to every registered session still open, pruning closed ones.
+    fn broadcast(&self, event: FrontendEvent) {
+        let live: Vec<_> = {
+            let mut sinks = self.sinks.lock().unwrap_or_else(|p| p.into_inner());
+            sinks.retain(|s| !s.is_closed());
+            sinks.clone()
+        };
+        for sink in live {
+            send_push(&sink, event.clone());
+        }
+    }
+}
+
+/// Result of asking the registry for revalidation ownership.
+enum Begin {
+    /// Caller owns the fetch and must drive it.
+    Owner(RevalidationGuard),
+    /// Another fetch for this document is in flight; the caller's session
+    /// was registered to receive its outcome.
+    Coalesced,
+    /// The global cap is reached; nothing will validate this document.
+    AtCapacity,
+}
+
+/// Process-wide set of at most [`MAX_REVALIDATIONS`] initial probes and auto-retry ladders.
 ///
 /// Every `GetProductDesignDoc` would otherwise spawn its own 2s / 4s / 8s
 /// schedule; while GitHub is unreachable that stacks `gh` subprocesses.
@@ -68,20 +115,23 @@ impl RevalidationRegistry {
     }
 
     /// Acquire before spawning or making any network call. Existing keys
-    /// wake their sleeper; new keys at capacity skip this refresh rather
-    /// than allocating another waiting task. A later read can try again.
-    fn try_begin(self: &Arc<Self>, key: DocKey) -> Option<RevalidationGuard> {
+    /// wake their sleeper and gain the caller's session as a recipient. New
+    /// keys at capacity report [`Begin::AtCapacity`] rather than allocating
+    /// another waiting task; the caller then tells its client the cached
+    /// copy was not validated, so the viewer can retry.
+    fn try_begin(self: &Arc<Self>, key: DocKey, sink: &Arc<SessionSink>) -> Begin {
         let mut g = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(ctl) = g.get(&key) {
+            ctl.add_sink(sink);
             ctl.wake.notify_waiters();
-            return None;
+            return Begin::Coalesced;
         }
-        if g.len() >= 4 {
-            return None;
+        if g.len() >= MAX_REVALIDATIONS {
+            return Begin::AtCapacity;
         }
-        let ctl = std::sync::Arc::new(LadderCtl { wake: Notify::new() });
+        let ctl = std::sync::Arc::new(LadderCtl::new(sink.clone()));
         g.insert(key.clone(), ctl.clone());
-        Some(RevalidationGuard {
+        Begin::Owner(RevalidationGuard {
             registry: self.clone(),
             key,
             ctl,
@@ -166,13 +216,46 @@ pub(super) async fn handle_get_product_design_doc(ctx: Dispatch, req: FrontendRe
     // The correlated response is produced inline so it stays inside the read
     // admission permits. Only the follow-up revalidation (network, with a
     // backoff ladder) is detached, and it is bounded by `registry`.
-    if serve_product_design_doc(&design_docs, &sink, &request_id, &repo_remote_url, &path, &git_ref).await
-        && let Some(guard) = registry.try_begin((repo_remote_url.clone(), path.clone(), git_ref.clone()))
-    {
-        tokio::spawn(async move {
-            revalidate_product_design_doc(design_docs, guard, sink, repo_remote_url, path, git_ref).await;
-        });
+    if !serve_product_design_doc(&design_docs, &sink, &request_id, &repo_remote_url, &path, &git_ref).await {
+        return;
     }
+    let key = (repo_remote_url.clone(), path.clone(), git_ref.clone());
+    match registry.try_begin(key, &sink) {
+        Begin::Owner(guard) => {
+            tokio::spawn(async move {
+                revalidate_product_design_doc(design_docs, guard, repo_remote_url, path, git_ref).await;
+            });
+        }
+        Begin::Coalesced => {}
+        Begin::AtCapacity => push_unvalidated(&design_docs, &sink, &repo_remote_url, &path, &git_ref).await,
+    }
+}
+
+/// The revalidation cap was hit: push the cached body again with a retryable
+/// stale banner so the client knows it was not checked against GitHub.
+async fn push_unvalidated(
+    design_docs: &boss_engine_design_docs::DesignDocsService,
+    sink: &SessionSink,
+    repo_remote_url: &str,
+    path: &str,
+    git_ref: &str,
+) {
+    let content = match design_docs.open_markdown_doc(repo_remote_url, path, git_ref).await {
+        DesignDocContent::Loaded { markdown, .. } => DesignDocContent::stale(
+            markdown,
+            "Engine busy; this copy was not checked for updates. Retry to refresh.",
+        ),
+        other => other,
+    };
+    send_push(
+        sink,
+        FrontendEvent::ProductDesignDocContent {
+            repo_remote_url: repo_remote_url.to_owned(),
+            path: path.to_owned(),
+            git_ref: git_ref.to_owned(),
+            content,
+        },
+    );
 }
 
 /// Send the correlated response from cache. Returns whether a branch-ref
@@ -215,10 +298,16 @@ async fn get_product_design_doc(
     path: String,
     git_ref: String,
 ) {
-    if serve_product_design_doc(&design_docs, &sink, &request_id, &repo_remote_url, &path, &git_ref).await
-        && let Some(guard) = registry.try_begin((repo_remote_url.clone(), path.clone(), git_ref.clone()))
-    {
-        revalidate_product_design_doc(design_docs, guard, sink, repo_remote_url, path, git_ref).await;
+    if !serve_product_design_doc(&design_docs, &sink, &request_id, &repo_remote_url, &path, &git_ref).await {
+        return;
+    }
+    let key = (repo_remote_url.clone(), path.clone(), git_ref.clone());
+    match registry.try_begin(key, &sink) {
+        Begin::Owner(guard) => {
+            revalidate_product_design_doc(design_docs, guard, repo_remote_url, path, git_ref).await;
+        }
+        Begin::Coalesced => {}
+        Begin::AtCapacity => push_unvalidated(&design_docs, &sink, &repo_remote_url, &path, &git_ref).await,
     }
 }
 
@@ -228,7 +317,6 @@ async fn get_product_design_doc(
 async fn revalidate_product_design_doc(
     design_docs: Arc<boss_engine_design_docs::DesignDocsService>,
     guard: RevalidationGuard,
-    sink: Arc<super::SessionSink>,
     repo_remote_url: String,
     path: String,
     git_ref: String,
@@ -238,15 +326,12 @@ async fn revalidate_product_design_doc(
         .await
     {
         let retryable = update.retryable();
-        send_push(
-            &sink,
-            FrontendEvent::ProductDesignDocContent {
-                repo_remote_url: repo_remote_url.clone(),
-                path: path.clone(),
-                git_ref: git_ref.clone(),
-                content: update,
-            },
-        );
+        guard.ctl.broadcast(FrontendEvent::ProductDesignDocContent {
+            repo_remote_url: repo_remote_url.clone(),
+            path: path.clone(),
+            git_ref: git_ref.clone(),
+            content: update,
+        });
         if retryable {
             guard.registry.ladders_started.fetch_add(1, Ordering::SeqCst);
             auto_retry_revalidation(
@@ -256,7 +341,6 @@ async fn revalidate_product_design_doc(
                 &repo_remote_url,
                 &path,
                 &git_ref,
-                &sink,
             )
             .await;
         }
@@ -280,7 +364,6 @@ async fn auto_retry_revalidation(
     repo_remote_url: &str,
     path: &str,
     git_ref: &str,
-    sink: &std::sync::Arc<super::SessionSink>,
 ) {
     let mut emitted_stale = true;
     let mut attempt = 1u32;
@@ -302,15 +385,12 @@ async fn auto_retry_revalidation(
             Some(content) => {
                 let retryable = content.retryable();
                 emitted_stale = content_is_stale(&content);
-                send_push(
-                    sink,
-                    FrontendEvent::ProductDesignDocContent {
-                        repo_remote_url: repo_remote_url.to_owned(),
-                        path: path.to_owned(),
-                        git_ref: git_ref.to_owned(),
-                        content,
-                    },
-                );
+                ctl.broadcast(FrontendEvent::ProductDesignDocContent {
+                    repo_remote_url: repo_remote_url.to_owned(),
+                    path: path.to_owned(),
+                    git_ref: git_ref.to_owned(),
+                    content,
+                });
                 if !retryable {
                     return;
                 }
@@ -318,15 +398,12 @@ async fn auto_retry_revalidation(
             }
             None => {
                 if emitted_stale {
-                    send_push(
-                        sink,
-                        FrontendEvent::ProductDesignDocContent {
-                            repo_remote_url: repo_remote_url.to_owned(),
-                            path: path.to_owned(),
-                            git_ref: git_ref.to_owned(),
-                            content: design_docs.open_markdown_doc(repo_remote_url, path, git_ref).await,
-                        },
-                    );
+                    ctl.broadcast(FrontendEvent::ProductDesignDocContent {
+                        repo_remote_url: repo_remote_url.to_owned(),
+                        path: path.to_owned(),
+                        git_ref: git_ref.to_owned(),
+                        content: design_docs.open_markdown_doc(repo_remote_url, path, git_ref).await,
+                    });
                 }
                 return;
             }
