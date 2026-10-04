@@ -367,6 +367,7 @@ pub(super) struct FakeExecutionRunner {
     /// hold-slot / requeue-instead-of-fail path distinctly from a
     /// genuine spawn failure. Takes priority over `fail`.
     pub(super) slot_busy: bool,
+    pub(super) viewer_abort_failed: bool,
     pub(super) pending: bool,
     /// If `Some`, the runner reports this slot id back to the
     /// coordinator in the `RunOutcome`, simulating a successful
@@ -408,6 +409,7 @@ impl Default for FakeExecutionRunner {
             fail_message: None,
             fail_context: None,
             slot_busy: false,
+            viewer_abort_failed: false,
             pending: false,
             slot_id: None,
             spawn_config: None,
@@ -437,6 +439,17 @@ impl ExecutionRunner for FakeExecutionRunner {
         ));
         if self.pending {
             pending::<()>().await;
+        }
+        if self.viewer_abort_failed {
+            return Err(
+                anyhow::Error::new(crate::spawn_flow::StartWorkerError::ViewerAbortFailed {
+                    error: EngineToAppError::SlotBusy {
+                        occupying_run_id: Some("live-occupant".into()),
+                    },
+                    reason: "injected tmux teardown failure".into(),
+                })
+                .context("spawning worker pane"),
+            );
         }
         if self.slot_busy {
             let root = EngineToAppError::SlotBusy {

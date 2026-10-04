@@ -239,6 +239,8 @@ fn truncate_pane_output(text: &str) -> String {
 
 async fn kill_retained_session(tmux: &Tmux, session_name: &str, spawn_token: &str, execution_id: &str) {
     match tmux.kill_session_verified(session_name, spawn_token).await {
+        // Owning teardown still needs the durable identity to confirm the absent
+        // session before detaching its viewer and releasing live state and pool.
         Ok(boss_tmux::KillSessionOutcome::Killed | boss_tmux::KillSessionOutcome::Absent) => {}
         Err(err) => {
             tracing::warn!(

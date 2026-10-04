@@ -82,6 +82,10 @@ impl ExecutionCoordinator {
         // will never consider terminal would leak it forever — releasing
         // normally is the safe fallback there.
         let mut hold_slot_busy = false;
+        // Set when spawn teardown could not confirm the rejected worker
+        // is gone. A replacement dispatch would violate the single-worker
+        // invariant while that tmux process may still be alive.
+        let mut abort_unconfirmed = false;
 
         match run_outcome {
             // Mid-spawn cancel: the worker was cancelled while it
@@ -287,43 +291,21 @@ impl ExecutionCoordinator {
                 // config, the initial-input script, or tmux session creation).
                 let err_detail = format!("{err:#}");
                 let slot_id = slot_id_from_worker_id(&worker_id);
-                // A `SlotBusy` rejection is a benign, self-healing engine/app
-                // desync (see the longer note at the `is_slot_busy` binding
-                // below), and it is common enough that logging it at ERROR
-                // would bury the genuine aborts this line exists to surface.
-                // Report it, but at WARN, and tag every abort with
-                // `slot_busy` so the two classes stay filterable either way.
+                // Reconciliation already retried stale occupants. A remaining
+                // rejection must be recorded as a spawn failure.
                 let slot_busy = slot_busy_occupant(&err).is_some();
-                let abort_message = "spawn aborted: ExecutionRunner::run_execution returned an \
-                                     error before any pane existed; tearing down and releasing \
-                                     the workspace";
-                if slot_busy {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        run_id = %run.id,
-                        worker_id = %worker_id,
-                        slot_id,
-                        slot_busy,
-                        cube_lease_id = %lease.lease_id,
-                        cube_workspace_id = %lease.workspace_id,
-                        error = %err_detail,
-                        "{abort_message}",
-                    );
-                } else {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        run_id = %run.id,
-                        worker_id = %worker_id,
-                        slot_id,
-                        slot_busy,
-                        cube_lease_id = %lease.lease_id,
-                        cube_workspace_id = %lease.workspace_id,
-                        error = %err_detail,
-                        "{abort_message}",
-                    );
-                }
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    run_id = %run.id,
+                    worker_id = %worker_id,
+                    slot_id,
+                    slot_busy,
+                    cube_lease_id = %lease.lease_id,
+                    cube_workspace_id = %lease.workspace_id,
+                    error = %err_detail,
+                    "spawn aborted: tearing down and releasing the workspace",
+                );
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::SpawnFailed, DispatchOutcome::Error, &execution.id)
@@ -340,33 +322,46 @@ impl ExecutionCoordinator {
                     )
                     .await;
 
-                // Pane-spawn-failure termination path: the run is
-                // unconditionally terminal from here (marked `failed`
-                // below regardless of whether the cube release below
-                // succeeds), so tear down any driver-owned state outside
-                // the workspace now — before the cube release, matching
-                // `force_release`'s ordering, so a driver that derives
-                // out-of-workspace state from the workspace path never
-                // races a concurrent re-lease of the same workspace once
-                // cube has it back.
-                crate::driver_teardown::teardown_driver_workspace(
-                    &self.work_db,
-                    &execution.id,
-                    Some(&lease.workspace_path),
-                    crate::driver_teardown::TeardownReason::SpawnFailed,
-                )
-                .await;
-                let released = match adapter.release_workspace(&lease.lease_id).await {
-                    Ok(()) => true,
-                    Err(release_err) => {
-                        tracing::error!(
-                            ?release_err,
-                            execution_id = %execution.id,
-                            run_id = %run.id,
-                            lease_id = %lease.lease_id,
-                            "failed to release workspace after run failure"
-                        );
-                        false
+                // A rejected viewer may already have a running tmux process.
+                // If verified teardown failed, preserve its workspace and driver
+                // state for recovery rather than leasing them to another worker.
+                abort_unconfirmed = err.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<crate::spawn_flow::StartWorkerError>(),
+                        Some(crate::spawn_flow::StartWorkerError::ViewerAbortFailed { .. })
+                    )
+                });
+                let released = if abort_unconfirmed {
+                    false
+                } else {
+                    // Pane-spawn-failure termination path: the run is
+                    // unconditionally terminal from here (marked `failed`
+                    // below regardless of whether the cube release below
+                    // succeeds), so tear down any driver-owned state outside
+                    // the workspace now — before the cube release, matching
+                    // `force_release`'s ordering, so a driver that derives
+                    // out-of-workspace state from the workspace path never
+                    // races a concurrent re-lease of the same workspace once
+                    // cube has it back.
+                    crate::driver_teardown::teardown_driver_workspace(
+                        &self.work_db,
+                        &execution.id,
+                        Some(&lease.workspace_path),
+                        crate::driver_teardown::TeardownReason::SpawnFailed,
+                    )
+                    .await;
+                    match adapter.release_workspace(&lease.lease_id).await {
+                        Ok(()) => true,
+                        Err(release_err) => {
+                            tracing::error!(
+                                ?release_err,
+                                execution_id = %execution.id,
+                                run_id = %run.id,
+                                lease_id = %lease.lease_id,
+                                "failed to release workspace after run failure"
+                            );
+                            false
+                        }
                     }
                 };
                 // Persist the same full cause chain the abort log and
@@ -601,7 +596,7 @@ impl ExecutionCoordinator {
                         // rather than waiting for the automation's next
                         // scheduled occurrence.
                         if execution.kind == ExecutionKind::AutomationTriage {
-                            if is_slot_busy {
+                            if is_slot_busy && !abort_unconfirmed {
                                 match self.work_db.create_automation_triage_execution(
                                     &execution.work_item_id,
                                     &execution.repo_remote_url,
@@ -649,6 +644,11 @@ impl ExecutionCoordinator {
                                         }
                                     }
                                 }
+                            } else if abort_unconfirmed {
+                                tracing::warn!(
+                                    execution_id = %execution.id,
+                                    "skipping automation triage replacement after unconfirmed spawn teardown",
+                                );
                             } else if let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
                                 &execution.id,
                                 boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
@@ -703,11 +703,10 @@ impl ExecutionCoordinator {
                 // pool-claim reconciler (`pool_claim_sweep::run_one_pass`)
                 // already frees exactly this shape of stuck claim — terminal
                 // execution, no live worker pane backing it — once its
-                // `LEAK_GRACE_SECS` grace period has passed, by which point
-                // the app side has normally torn the stray pane down itself
-                // or the husk-pane sweep has retired it. Still rescan + kick
-                // so OTHER free slots pick up the work this failure just
-                // requeued.
+                // `LEAK_GRACE_SECS` grace period has passed and the engine
+                // has confirmed both process teardown and viewer detach.
+                // Still rescan + kick so OTHER free slots pick up the work
+                // this failure just requeued.
                 self.rescan_active_dispatch_after_release();
                 // `rescan_active_dispatch` only requeues items with
                 // `autostart = 1` — but `start_execution_run_on_host`
@@ -726,15 +725,20 @@ impl ExecutionCoordinator {
                 // `AnswerAgent` (synthetic work items with no `tasks` row
                 // — `AutomationTriage` already got its own fresh execution
                 // above; `AnswerAgent` is unhandled here, matching its
-                // pre-existing scope).
-                if !matches!(
-                    execution.kind,
-                    ExecutionKind::PrReview | ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent
-                ) && let Err(err) = self.work_db.request_execution(
-                    boss_protocol::RequestExecutionInput::builder()
-                        .work_item_id(execution.work_item_id.clone())
-                        .build(),
-                ) {
+                // pre-existing scope). Also excluded: unconfirmed abort
+                // of a SlotBusy-rejected spawn (`ViewerAbortFailed`).
+                // Do not request a replacement while the rejected spawn may still run.
+                if !abort_unconfirmed
+                    && !matches!(
+                        execution.kind,
+                        ExecutionKind::PrReview | ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent
+                    )
+                    && let Err(err) = self.work_db.request_execution(
+                        boss_protocol::RequestExecutionInput::builder()
+                            .work_item_id(execution.work_item_id.clone())
+                            .build(),
+                    )
+                {
                     tracing::warn!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,

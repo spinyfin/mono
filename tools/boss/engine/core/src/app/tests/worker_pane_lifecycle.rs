@@ -626,13 +626,7 @@ async fn pool_claim_sweep_reconciles_the_claim_release_worker_pane_holds() {
         .unwrap();
     claim_slot_one_for(&server_state, &execution.id).await;
 
-    // An app session that is registered but never answers, exactly like
-    // the sibling test — the teardown goes unconfirmed and the claim is
-    // held rather than released.
-    let sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), sink.clone())
-        .await;
+    // Completion while the app is disconnected leaves the detach pending.
     server_state.release_worker_pane(&execution.id).await;
     assert_eq!(
         pool.idle_count().await,
@@ -653,14 +647,40 @@ async fn pool_claim_sweep_reconciles_the_claim_release_worker_pane_holds() {
         .unwrap();
     }
 
-    let live_states = crate::live_worker_state::LiveWorkerStateRegistry::new();
     let outcome = crate::pool_claim_sweep::run_one_pass(
         server_state.work_db.as_ref(),
-        &live_states,
+        server_state.live_worker_states.as_ref(),
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.as_ref(),
+        server_state.as_ref(),
+        &mut crate::pool_claim_sweep::TeardownRetries::default(),
     )
     .await;
+    assert_eq!(outcome.released, 0);
+    assert_eq!(outcome.viewer_detach_pending, 1);
+    assert_eq!(pool.idle_count().await, 0);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    let state = server_state.clone();
+    let pass = tokio::spawn(async move {
+        crate::pool_claim_sweep::run_one_pass(
+            state.work_db.as_ref(),
+            state.live_worker_states.as_ref(),
+            state.execution_coordinator.clone(),
+            state.dispatch_events.as_ref(),
+            state.as_ref(),
+            &mut crate::pool_claim_sweep::TeardownRetries::default(),
+        )
+        .await
+    });
+    super::worker_pane_reattach::answer_list_hosted_panes(&server_state, &sink, vec![(execution.id.clone(), 1)]).await;
+    // Claim must remain unavailable until the app acknowledges the detach.
+    assert_eq!(pool.idle_count().await, 0);
+    super::viewer_reconcile::answer_detach(&server_state, &sink, 1).await;
+    let outcome = pass.await.unwrap();
 
     assert_eq!(outcome.released, 1, "the sweep must count the held claim as released");
     assert_eq!(

@@ -383,3 +383,39 @@ async fn no_recorded_identity_refuses_local_teardown() {
         Some(ProbeDeliveryState::Queued)
     );
 }
+
+/// Exercise the sweep's production process-teardown hook across both a
+/// transient tmux failure and a failed database clear after session absence.
+#[tokio::test]
+async fn pool_teardown_hook_recovers_from_refusal_and_failed_identity_clear() {
+    use crate::pool_claim_sweep::WorkerViewerDetach;
+    let (state, _dir) = test_server_state();
+    let db = state.work_db.as_ref();
+    let product = create_product(db);
+    let item = create_active_chore(db, &product, "teardown recovery");
+    let exec = seed_tmux_run(db, &item, "boss-recovery-test", "tok-recovery", 999_999);
+    let (tmux, runner) = fake_tmux([
+        failure("temporary tmux failure"),
+        failure("can't find session: boss-recovery-test"),
+        failure("can't find session: boss-recovery-test"),
+    ]);
+    state.set_tmux_override_for_test(tmux);
+    assert!(state.confirm_process_torn_down(&exec).await.is_err());
+    assert!(db.tmux_identity_for_execution(&exec).unwrap().is_some());
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_identity_clear BEFORE UPDATE OF tmux_spawn_token ON work_runs
+         WHEN NEW.tmux_spawn_token IS NULL BEGIN SELECT RAISE(ABORT, 'clear unavailable'); END;",
+        )
+        .unwrap();
+    assert!(state.confirm_process_torn_down(&exec).await.is_err());
+    assert!(db.tmux_identity_for_execution(&exec).unwrap().is_some());
+    db.connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_identity_clear")
+        .unwrap();
+    state.confirm_process_torn_down(&exec).await.unwrap();
+    assert!(db.tmux_identity_for_execution(&exec).unwrap().is_none());
+    assert_eq!(runner.calls().len(), 3, "absent session needs no kill");
+}

@@ -382,6 +382,7 @@ mod tmux_teardown;
 mod tmux_worker_statuses;
 mod transient_recovery_slot_release;
 mod trust_authorization;
+mod viewer_reconcile;
 mod worker_pane_interaction;
 mod worker_pane_lifecycle;
 mod worker_pane_reattach;

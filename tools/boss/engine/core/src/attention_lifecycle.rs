@@ -284,6 +284,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     // ── The producer owns resolution ────────────────────────────────────
     entry(
+        crate::pool_claim_sweep::TEARDOWN_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The pool-claim sweep retries process and viewer teardown and resolves this signal when both are confirmed.",
+    ),
+    entry(
         crate::local_worker_quarantine::ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "Startup re-probes historical local workers after rollback/drain and resolves this attention only when their quarantine clears.",
@@ -668,6 +673,7 @@ mod tests {
     #[test]
     fn every_attention_kind_constant_in_the_crate_is_registered() {
         let declared: &[&str] = &[
+            crate::pool_claim_sweep::TEARDOWN_ATTENTION_KIND,
             crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND,
             crate::work::DISPATCH_STAGE_STALLED_ATTENTION_KIND,
             crate::work::ATTENTION_KIND_RECOVERY_PERMANENT,
