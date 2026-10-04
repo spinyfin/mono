@@ -160,26 +160,17 @@ async fn concurrent_cached_reads_start_one_revalidation_fetch() {
 
 #[test]
 fn revalidation_capacity_is_global_and_released_on_drop() {
+    let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
+    let sink = Arc::new(SessionSink::new(shutdown_tx));
     let registry = Arc::new(RevalidationRegistry::default());
     let mut guards = Vec::new();
     for index in 0..4 {
-        guards.push(
-            registry
-                .try_begin((FLUNGE.into(), format!("{index}.md"), GIT_REF.into()))
-                .unwrap(),
-        );
+        guards.push(owner(&registry, &format!("{index}.md"), &sink));
     }
-    assert!(
-        registry
-            .try_begin((FLUNGE.into(), "extra.md".into(), GIT_REF.into()))
-            .is_none()
-    );
+    assert!(matches!(registry.try_begin(key("extra.md"), &sink), Begin::AtCapacity));
+    assert!(matches!(registry.try_begin(key("0.md"), &sink), Begin::Coalesced));
     guards.pop();
-    assert!(
-        registry
-            .try_begin((FLUNGE.into(), "extra.md".into(), GIT_REF.into()))
-            .is_some()
-    );
+    assert!(matches!(registry.try_begin(key("extra.md"), &sink), Begin::Owner(_)));
     drop(guards);
     assert!(registry.in_flight.lock().unwrap().is_empty());
 }

@@ -196,8 +196,8 @@ impl SessionQueue {
     /// of only ~1.3-1.8s, i.e. the client was draining fine, just not fast
     /// enough for an instant). A stuck client (past [`STUCK_CLIENT_AGE_MS`])
     /// still gets `Slow`, which callers turn into a disconnect. A bursty-but-
-    /// alive client instead has its oldest pending entry dropped to make
-    /// room — bounded, O(1), never grows the queue past `MAX_SESSION_QUEUE`
+    /// alive client instead has its oldest uncorrelated push dropped to make
+    /// room — bounded, never grows the queue past `MAX_SESSION_QUEUE`
     /// — and a [`RESYNC_TOPIC`] marker is admitted alongside it (dropping a
     /// second entry to make room if one isn't already pending) so the
     /// client knows to refetch rather than silently miss the dropped
@@ -210,30 +210,33 @@ impl SessionQueue {
             .front()
             .map(|(enqueued_at, _)| Instant::now().saturating_duration_since(*enqueued_at).as_millis() as u64)
             .unwrap_or(0);
-        // Never evict correlated replies, including for the resync marker.
-        // The sink turns this outcome into an explicit disconnect.
-        let evictions = if self.pending_topics.get(RESYNC_TOPIC).is_some_and(|&index| index > 0) {
-            1
-        } else {
-            2
-        };
-        if self
-            .items
-            .iter()
-            .take(evictions)
-            .any(|(_, item)| item.request_id.is_some())
-        {
-            self.slow = true;
-            return EnqueueOutcome::Slow;
-        }
         if oldest_age_ms >= STUCK_CLIENT_AGE_MS {
             self.slow = true;
             return EnqueueOutcome::Slow;
         }
-
-        self.evict_oldest_bulk();
-        if !self.pending_topics.contains_key(RESYNC_TOPIC) {
-            self.evict_oldest_bulk();
+        // Never evict correlated replies or the resync marker: drop the
+        // oldest uncorrelated pushes instead, wherever they sit in the lane.
+        // Only when too few evictable pushes remain (a lane of replies) is
+        // the client treated as unable to keep up; the sink then disconnects.
+        let marker_idx = self.pending_topics.get(RESYNC_TOPIC).copied();
+        let needed = if marker_idx.is_some() { 1 } else { 2 };
+        let victims: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, item))| item.request_id.is_none() && Some(*i) != marker_idx)
+            .map(|(i, _)| i)
+            .take(needed)
+            .collect();
+        if victims.len() < needed {
+            self.slow = true;
+            return EnqueueOutcome::Slow;
+        }
+        // Remove highest index first so earlier indices stay valid.
+        for &i in victims.iter().rev() {
+            self.evict_at(i);
+        }
+        if marker_idx.is_none() {
             let idx = self.items.len();
             self.items.push_back((Instant::now(), resync_envelope()));
             self.pending_topics.insert(RESYNC_TOPIC.to_owned(), idx);
@@ -249,19 +252,22 @@ impl SessionQueue {
 
     /// Pop the oldest bulk-lane entry (if any), keeping `pending_topics`
     /// indices front-relative. Shared by [`SessionQueue::pop_front`]'s
-    /// normal drain and [`SessionQueue::admit_under_pressure`]'s
-    /// drop-oldest burst handling.
+    /// normal drain.
     fn evict_oldest_bulk(&mut self) -> Option<(Instant, FrontendEventEnvelope)> {
-        let popped = self.items.pop_front()?;
-        let mut next = HashMap::with_capacity(self.pending_topics.len());
-        for (topic, idx) in self.pending_topics.drain() {
-            if idx == 0 {
-                continue;
+        self.evict_at(0)
+    }
+
+    /// Remove the bulk-lane entry at `index`, dropping its pending-topic
+    /// slot and shifting later topic indices down.
+    fn evict_at(&mut self, index: usize) -> Option<(Instant, FrontendEventEnvelope)> {
+        let removed = self.items.remove(index)?;
+        self.pending_topics.retain(|_, idx| *idx != index);
+        for idx in self.pending_topics.values_mut() {
+            if *idx > index {
+                *idx -= 1;
             }
-            next.insert(topic, idx - 1);
         }
-        self.pending_topics = next;
-        Some(popped)
+        Some(removed)
     }
 
     pub(super) fn pop_front(&mut self) -> Option<FrontendEventEnvelope> {
@@ -465,6 +471,10 @@ impl SessionSink {
     /// backpressure/closed flags for diagnostics.
     pub(super) fn queue_stats(&self) -> QueueStats {
         self.queue.lock().expect("session queue lock poisoned").stats()
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.queue.lock().expect("session queue lock poisoned").closed
     }
 
     pub(super) fn close(&self) {

@@ -337,7 +337,7 @@ impl WorkDb {
         // agent-raised, human-actionable notifications (questions +
         // followups). Design: tools/boss/docs/designs/attentions.md.
         step!(timer, conn, migrate_attentions)?;
-        // Editorial controls (P576, chore #1): per-product editorial_rules JSON
+        // Editorial controls (chore #1): per-product editorial_rules JSON
         // column, branch_naming snapshot on work_executions, and editorial_actions
         // audit table. Ships dark — no behaviour change until a product opts in.
         // Design: tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md
@@ -357,16 +357,16 @@ impl WorkDb {
         // `external_ref_boss_checksum`; the old title/body columns remain in
         // the schema but are no longer read or written.
         step!(timer, conn, migrate_external_tracker_content_checksums)?;
-        // P992 task 9: loop termination & bounds — per-PR review cycle
+        // Loop termination & bounds — per-PR review cycle
         // counter and last-reviewed SHA for the no-op skip gate.
         step!(timer, conn, migrate_tasks_review_cycle_columns)?;
-        // P783 task 2: planner_runs audit ledger + per-project idempotency gate.
+        // planner_runs audit ledger + per-project idempotency gate.
         // The UNIQUE partial index is created here (after the table) so SQLite
         // can resolve the `outcome` column. `CREATE TABLE IF NOT EXISTS` +
         // `CREATE INDEX IF NOT EXISTS` make this fully idempotent.
         // Design: tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md
         step!(timer, conn, migrate_planner_runs_table)?;
-        // P1422 task B: driver data model (mix-and-match agent-driver
+        // Driver data model (mix-and-match agent-driver
         // abstraction). Adds `tasks.driver` and `products.default_driver`
         // TEXT columns. NULL resolves to the engine default (`"claude"`).
         step!(timer, conn, migrate_tasks_driver_column)?;
@@ -378,7 +378,7 @@ impl WorkDb {
         // Done-lane bucketing fix: add completed_at so the kanban can group
         // done tasks by their actual completion time instead of updated_at.
         step!(timer, conn, migrate_tasks_completed_at)?;
-        // P783 task 5: tag tasks created by an auto-populate run with the
+        // Tag tasks created by an auto-populate run with the
         // originating planner_runs.id, so the undo path can delete exactly
         // that batch. Purely additive nullable column; NULL for every
         // non-planner task.
@@ -428,7 +428,7 @@ impl WorkDb {
         // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
         // this one and the P1a intent columns above) ride the current marker
         // rather than bumping it. Left at '22'.
-        // P1203 task 1: add score + merged_into_attention_id + linked_work_item_id
+        // Add score + merged_into_attention_id + linked_work_item_id
         // to `attentions` and create the `attention_merges` provenance ledger.
         // Design: tools/boss/docs/designs/notification-dedup-scoring.md §"Data model".
         step!(timer, conn, migrate_attentions_score_and_merges)?;
@@ -447,9 +447,9 @@ impl WorkDb {
         // stale-base re-arm path in conflict_watch can dispatch a fresh
         // attempt once a `succeeded` row's resolution has gone stale,
         // instead of colliding with that row's UNIQUE slot forever
-        // (T2396 / PR #1874).
+        // (PR #1874).
         step!(timer, conn, migrate_conflict_resolutions_widen_unique_key)?;
-        // Regression fix (T1503/T1496): SHA-delta gate in recheck_for_pr must
+        // Regression fix: SHA-delta gate in recheck_for_pr must
         // only fire for revision executions after a Stop event has been
         // observed, not the moment any commit lands on the parent PR. Without
         // this guard the gate fires immediately when a *different* worker (e.g.
@@ -461,13 +461,13 @@ impl WorkDb {
         step!(timer, conn, migrate_work_executions_stop_seen)?;
         // `revision_stop_contributed_head`: SHA that on_stop_inner's Contributed arm
         // observed for a revision_implementation execution. recheck_for_pr uses this
-        // as the T848 recovery gate: only finalize when head matches the SHA on_stop
+        // as the recovery gate: only finalize when head matches the SHA on_stop
         // previously attempted to finalize on — not on any head movement from a
         // concurrently-active parent worker.
         step!(timer, conn, migrate_work_executions_revision_stop_contributed_head)?;
         // Merge-queue sub-state: tasks.merge_queue_detail JSON blob (queue
         // position, GitHub's raw entry state, enqueued-at timestamp) for the
-        // Review card's merging indicator (T2467/mono#1904).
+        // Review card's merging indicator (mono#1904).
         step!(timer, conn, migrate_tasks_merge_queue_detail_column)?;
         // Layer 0 conflict telemetry (T1 of
         // merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md):
