@@ -160,6 +160,20 @@ final class RevealClearsFiltersTests: XCTestCase {
         guard case .success = result else { return XCTFail("expected confirmed success") }
     }
 
+    func testDelayedTreeGetsFullVisibilityDeadline() async throws {
+        let model = makeModel()
+        var result: EngineRevealResult?
+        model.revealWorkCard("later", productID: "prod_test") { result = $0 }
+        let treeDeadline = model.revealDeadlineToken
+        try await Task.sleep(for: .milliseconds(2000))
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "later", name: "Later")]))
+        XCTAssertNotEqual(model.revealDeadlineToken, treeDeadline)
+        try await Task.sleep(for: .milliseconds(1300))
+        XCTAssertNil(result, "the original tree deadline must not expire the visibility phase")
+        model.confirmReveal(cardID: "later", generation: model.revealGeneration)
+        guard case .success = result else { return XCTFail("expected confirmed success") }
+    }
+
     func testLoadedTreeMissingDeferredTargetFailsWithReason() {
         let model = makeModel()
         var result: EngineRevealResult?

@@ -1053,7 +1053,7 @@ struct ContentView: View {
                 ScrollView(.horizontal) {
                     HStack(alignment: .top, spacing: columnSpacing) {
                         ForEach(WorkBoardColumnKey.allCases) { column in
-                            workColumn(column, width: columnWidth)
+                            workColumn(column, width: columnWidth, boardProxy: boardProxy)
                                 .id(column)
                         }
                     }
@@ -1062,19 +1062,13 @@ struct ContentView: View {
                     .frame(maxHeight: .infinity, alignment: .top)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .task(id: model.revealScrollTarget.map { "\(model.revealGeneration)-\($0)" }) {
-                    guard let target = model.revealScrollTarget,
-                          let column = WorkBoardColumnKey.allCases.first(where: {
-                              model.workItems(in: $0).contains { $0.id == target }
-                          }) else { return }
-                    boardProxy.scrollTo(column, anchor: .center)
-                }
+                .background(RevealBoardViewport(model: model))
             }
         }
         .environment(\.kanbanBoardStyle, kanbanBoardStyle)
     }
 
-    private func workColumn(_ column: WorkBoardColumnKey, width: CGFloat = workBoardColumnWidth) -> some View {
+    private func workColumn(_ column: WorkBoardColumnKey, width: CGFloat = workBoardColumnWidth, boardProxy: ScrollViewProxy) -> some View {
         let sections = model.workSections(in: column)
         let itemCount = sections.reduce(0) { $0 + $1.items.count }
 
@@ -1123,9 +1117,10 @@ struct ContentView: View {
                         // Wait for disclosure expansion and lazy card layout. Retry
                         // until the card's viewport probe acknowledges this request.
                         for _ in 0..<40 {
-                            do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
-                            guard model.revealScrollTarget == target else { return }
+                            guard !Task.isCancelled, model.revealScrollTarget == target else { return }
+                            boardProxy.scrollTo(column, anchor: .center)
                             proxy.scrollTo(target, anchor: .center)
+                            do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
                         }
                     }
                 }
@@ -1206,7 +1201,13 @@ struct ContentView: View {
                     shortIDLabel: sectionProject?.shortID.map { "P" + String($0) },
                     banner: section.queueBannerText,
                     revealGeneration: section.items.contains { $0.id == model.revealScrollTarget }
-                        ? model.revealGeneration : nil
+                        ? model.revealGeneration : nil,
+                    onDrop: { items, expanded in
+                        guard let taskID = items.first else { return false }
+                        return model.attemptDrop(
+                            taskID, onColumn: column, group: expanded ? section.groupKey : nil
+                        )
+                    }
                 ) {
                     if let sectionProject {
                         HStack(spacing: 6) {

@@ -13,6 +13,10 @@ import UpdateCore
 /// actually see (`WorkBoardSection.dropGroupKey`). Two copies of this
 /// derivation could disagree about whether a section is open.
 enum WorkBoardSectionCollapse {
+    static func isExpanded(defaultExpanded: Bool, userToggled: Bool, revealExpanded: Bool) -> Bool {
+        revealExpanded || (userToggled ? !defaultExpanded : defaultExpanded)
+    }
+
     static func storageKey(sectionID: String) -> String {
         "boss.kanban.section.\(sectionID).userToggled"
     }
@@ -40,10 +44,12 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
     /// queue is noticeable without expanding the section.
     var banner: String? = nil
     var revealGeneration: UUID? = nil
+    var onDrop: (([String], Bool) -> Bool)?
     @ViewBuilder let accessory: () -> Accessory
     @ViewBuilder let content: () -> Content
 
     @State private var userToggled: Bool
+    @State private var revealExpanded = false
 
     init(
         sectionID: String,
@@ -53,6 +59,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
         shortIDLabel: String? = nil,
         banner: String? = nil,
         revealGeneration: UUID? = nil,
+        onDrop: (([String], Bool) -> Bool)? = nil,
         @ViewBuilder accessory: @escaping () -> Accessory = { EmptyView() },
         @ViewBuilder content: @escaping () -> Content
     ) {
@@ -63,6 +70,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
         self.shortIDLabel = shortIDLabel
         self.banner = banner
         self.revealGeneration = revealGeneration
+        self.onDrop = onDrop
         self.accessory = accessory
         self.content = content
         self._userToggled = State(
@@ -71,14 +79,17 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
     }
 
     private var isExpanded: Bool {
-        userToggled ? !defaultExpanded : defaultExpanded
+        WorkBoardSectionCollapse.isExpanded(
+            defaultExpanded: defaultExpanded, userToggled: userToggled, revealExpanded: revealExpanded
+        )
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
                 Button {
-                    let next = !userToggled
+                    let next = isExpanded == defaultExpanded
+                    revealExpanded = false
                     userToggled = next
                     BossDefaults.store.set(
                         next, forKey: WorkBoardSectionCollapse.storageKey(sectionID: sectionID)
@@ -121,12 +132,14 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
             }
         }
         .id(sectionID)
+        .dropDestination(for: String.self) { items, _ -> Bool in
+            return onDrop?(items, isExpanded) ?? false
+        }
         .onChange(of: revealGeneration, initial: true) { _, generation in
             guard generation != nil else { return }
-            userToggled = !defaultExpanded
-            BossDefaults.store.set(
-                userToggled, forKey: WorkBoardSectionCollapse.storageKey(sectionID: sectionID)
-            )
+            // Keep the card open for this view's lifetime without changing
+            // the saved disclosure preference.
+            revealExpanded = true
         }
     }
 }

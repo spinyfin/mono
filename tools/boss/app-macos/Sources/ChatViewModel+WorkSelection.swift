@@ -189,19 +189,11 @@ extension ChatViewModel {
         let outcome: RevealCardResult
         if switching || task(withID: taskID) == nil {
             pendingRevealScrollID = taskID
+            armRevealDeadline(taskID: taskID, waitingForTree: true)
             if !switching { engine.sendGetWorkTree(productId: productID, flow: .manualRefresh) }
             outcome = .deferred
         } else {
             outcome = prepareReveal(taskID)
-        }
-        let generation = revealGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, self.revealGeneration == generation else { return }
-            self.finishReveal(.failure(.internalFailure(
-                "could not reveal \(taskID): " + (self.pendingRevealScrollID != nil
-                    ? "target product work tree did not arrive"
-                    : "target card did not become visible in the board viewport")
-            )))
         }
         return outcome
     }

@@ -23,6 +23,7 @@ extension ChatViewModel {
         }
         selectedWorkCardID = cardID
         revealScrollTarget = cardID
+        armRevealDeadline(taskID: taskID, waitingForTree: false)
         return outcome
     }
 
@@ -36,7 +37,23 @@ extension ChatViewModel {
         }
     }
 
+    func armRevealDeadline(taskID: String, waitingForTree: Bool) {
+        let generation = revealGeneration
+        let token = UUID()
+        revealDeadlineToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.revealGeneration == generation,
+                  self.revealDeadlineToken == token else { return }
+            self.finishReveal(.failure(.internalFailure(
+                "could not reveal \(taskID): " + (waitingForTree
+                    ? "target product work tree did not arrive"
+                    : "target card did not become visible in the board viewport")
+            )))
+        }
+    }
+
     func finishReveal(_ result: EngineRevealResult) {
+        revealDeadlineToken = UUID()
         let completion = revealCompletion
         revealCompletion = nil
         revealScrollTarget = nil

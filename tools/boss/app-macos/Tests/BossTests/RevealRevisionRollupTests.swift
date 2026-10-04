@@ -1,7 +1,7 @@
 import XCTest
 @testable import Boss
 
-/// Regression coverage for the `reveal_work_item` bug (T2189/T2143): a
+/// Regression coverage for revealing revisions rolled up onto parent cards: a
 /// revision that has reached `in_review`/`done` never gets a standalone
 /// kanban card — it only ever surfaces as a rollup line on its PARENT's
 /// card (see `ContentView`'s `inReviewRevisions` computation). Revealing

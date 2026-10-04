@@ -22,7 +22,7 @@ extension ChatViewModel {
     ) {
         // Fan-out regression counter (design entry 2): full work-tree applies.
         UIUpdateCounters.shared.recordApplyWorkTree()
-        // Population-timing (T2101 R1): time this @MainActor apply burst
+        // Population timing: measure this @MainActor apply burst
         // and its two hot sub-steps. `popCtx` carries the flow/seq tag
         // decoded off-main so every segment of one fetch reads together.
         let popCtx = PopulationTiming.shared.takeContextForApply(productId: product.id)

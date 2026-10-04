@@ -303,6 +303,8 @@ final class ChatViewModel: ObservableObject {
     @Published var revealGeneration = UUID()
     var revealCompletion: ((EngineRevealResult) -> Void)?
     var revealProductID: String?
+    var revealDeadlineToken = UUID()
+    weak var revealBoardViewport: NSView?
     /// Task id whose card should be scrolled to once its product's
     /// work tree arrives. Used when a reveal crosses a product
     /// boundary — `revealWorkCard` sets this and the `workTree`
