@@ -268,3 +268,138 @@ async fn one_socket_pipelining_sixteen_bulk_reads_never_sees_busy() {
     drop(write);
     handler.await.unwrap().unwrap();
 }
+
+/// Exercise the socket reader's backpressure with more requests than the
+/// outbound queue can hold, while independent topic producers keep running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socket_saturation_delivers_every_id_or_explicitly_disconnects() {
+    let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
+        crate::app::ServerStateOverrides::builder()
+            .read_admission(Arc::new(ReadAdmission::new(1, 32, 128, Duration::from_millis(50))))
+            .build(),
+    );
+    let held = state
+        .read_admission
+        .enqueue(&state.read_admission.connection())
+        .unwrap()
+        .acquire()
+        .await
+        .unwrap();
+    let (client, server) = UnixStream::pair().unwrap();
+    // Hold all 320 small request frames in the socket even when the reader
+    // pauses; this lets the test finish pipelining before it begins draining.
+    use std::os::fd::AsRawFd;
+    let capacity: libc::c_int = 65_536;
+    for (socket, option) in [(&client, libc::SO_SNDBUF), (&server, libc::SO_RCVBUF)] {
+        // SAFETY: both descriptors and the integer option buffer remain live.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&capacity as *const libc::c_int).cast(),
+                std::mem::size_of_val(&capacity) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "socket buffer: {}", std::io::Error::last_os_error());
+    }
+    let handler = tokio::spawn(handle_frontend_connection(server, state.clone(), None));
+    let session = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(id) = state.topic_broker.inner.lock().await.sinks.keys().next().cloned() {
+                break id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let topics: Vec<_> = (0..300)
+        .map(|i| format!("saturation-{i}-{}", "x".repeat(2048)))
+        .collect();
+    state.topic_broker.subscribe(&session, &topics).await;
+    let publisher = tokio::spawn({
+        let state = state.clone();
+        async move {
+            for topic in topics {
+                state
+                    .topic_broker
+                    .publish(
+                        &topic,
+                        FrontendEventEnvelope::push(FrontendEvent::TopicEvent {
+                            topic: topic.clone(),
+                            revision: 1,
+                            origin_session_id: String::new(),
+                            origin_request_id: None,
+                            event: boss_protocol::TopicEventPayload::ResyncRequired,
+                        }),
+                    )
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    let (read, mut write) = client.into_split();
+    let sender = tokio::spawn(async move {
+        let mut sent = 0;
+        for index in 0..320 {
+            let request = FrontendRequestEnvelope {
+                request_id: format!("saturated-{index}"),
+                payload: FrontendRequest::ListProducts,
+            };
+            if write
+                .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            sent += 1;
+        }
+        (write, sent)
+    });
+    let (write, sent) = tokio::time::timeout(Duration::from_secs(5), sender)
+        .await
+        .expect("pipelining must finish before reads begin")
+        .unwrap();
+    // Deliberately do not drain either Hello, pushes or BUSY responses yet.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let mut lines = BufReader::new(read).lines();
+    let mut replies = std::collections::HashSet::new();
+    let closed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let env: FrontendEventEnvelope = serde_json::from_str(&line).unwrap();
+                    if let Some(id) = env.request_id {
+                        assert!(id.starts_with("saturated-"));
+                        assert!(matches!(env.payload, FrontendEvent::Error { message } if message == BUSY));
+                        assert!(replies.insert(id), "duplicate correlated reply");
+                        if replies.len() == 320 {
+                            break false;
+                        }
+                    }
+                }
+                Ok(None) => break true,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break true,
+                Err(error) => panic!("unexpected read error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("missing replies without an explicit socket close");
+    if !closed {
+        assert_eq!(sent, 320);
+        let expected: std::collections::HashSet<_> = (0..320).map(|index| format!("saturated-{index}")).collect();
+        assert_eq!(replies, expected);
+    }
+    publisher.await.unwrap();
+    drop(lines);
+    drop(write);
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), handler)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

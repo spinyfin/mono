@@ -46,4 +46,6 @@ The app sends every UI read over one long-lived socket. On connect it pipelines 
 
 ## Outbound reply delivery
 
-Busy and other correlated replies share the session's bounded outbound lane, which evicts its oldest entry under pressure. The request reader now pauses (`wait_for_response_headroom`) while that lane is half full, so a client that pipelines faster than it reads backs up in its own socket buffer rather than losing replies.
+Busy and other correlated replies share the session's bounded outbound lane. Only uncorrelated pushes can be evicted; pressure that would evict a reply triggers an explicit disconnect. The request reader pauses with headroom derived from the configured active and pending bulk and live limits, reducing pressure before the enqueue-boundary guarantee is needed.
+
+Design-doc foreground reads deliberately retain bulk admission through GitHub fetches and the correlated response, including cache misses and refreshes. Unlike PR-status refresh, they have no separate foreground budget. Background document revalidation coalesces by document before spawning and permits at most four concurrent probe/retry ladders across keys. Response pressure disconnects explicitly if eviction would lose a correlated reply; reader headroom derives from configured bulk and live admission limits.

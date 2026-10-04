@@ -40,6 +40,12 @@ fn topic_of(env: &FrontendEventEnvelope) -> Option<String> {
 /// `TempDir` must be kept alive for as long as the `ServerState` is used —
 /// dropping it deletes the backing `state.db`.
 pub(super) fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
+    test_server_state_with_overrides(ServerStateOverrides::default())
+}
+
+pub(super) fn test_server_state_with_overrides(
+    overrides: ServerStateOverrides,
+) -> (Arc<ServerState>, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
         crate::config::WorkConfig::builder()
@@ -48,8 +54,7 @@ pub(super) fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
             .build(),
         None,
     ));
-    let state =
-        ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, ServerStateOverrides::default()).unwrap();
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, overrides).unwrap();
     (state, temp)
 }
 

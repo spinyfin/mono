@@ -68,6 +68,10 @@ impl ReadAdmission {
         }
     }
 
+    pub(super) fn outstanding_per_connection(&self) -> usize {
+        self.per_connection.saturating_mul(5)
+    }
+
     pub(super) fn connection(&self) -> Arc<ConnectionReads> {
         Arc::new(ConnectionReads {
             active: Arc::new(Semaphore::new(self.per_connection)),
@@ -104,9 +108,10 @@ impl WaitingRead {
 
 /// Status used by `agents list` has its own reserved live-work path.
 /// `GetPrStatus` with `refresh: true` awaits a GitHub probe, so it is
-/// deliberately outside the bulk lane: network latency must not occupy slots
-/// that interactive DB reads need (it is bounded by its own per-execution
-/// refresh budget instead).
+/// outside the bulk lane because its per-execution refresh budget already
+/// bounds probes. Design-doc reads deliberately use the bulk budget through
+/// their network fetch and correlated response; they have no separate
+/// foreground budget and must not escape admission on cache misses.
 /// Mutations, subscriptions, and worker proposals remain ordered on their
 /// connection. Bulk read replies are correlated by request id.
 pub(super) fn is_bulk_read(request: &boss_protocol::FrontendRequest) -> bool {

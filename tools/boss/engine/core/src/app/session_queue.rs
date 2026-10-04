@@ -45,24 +45,13 @@ pub(super) const RESYNC_TOPIC: &str = "__resync__";
 /// should never hold more than a few entries in healthy operation.
 pub(super) const MAX_PRIORITY_QUEUE: usize = 64;
 
-/// Bulk-lane depth at which the reader loop stops accepting new requests
-/// until the writer drains. Correlated responses (including admission
-/// rejections) share the evictable bulk lane, so a client that pipelines
-/// faster than it reads would otherwise have replies evicted by
-/// [`SessionQueue::admit_under_pressure`] and its requests left pending with
-/// no answer. Half the lane leaves room for every response that can still
-/// be in flight from requests already accepted (connection active + pending
-/// read budgets) plus coalesced invalidations.
-pub(super) const REQUEST_BACKPRESSURE_DEPTH: usize = MAX_SESSION_QUEUE / 2;
-
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum EnqueueOutcome {
     Enqueued,
     Coalesced,
     Closed,
-    /// The bulk lane is full and has made no socket write progress for
-    /// [`STUCK_CLIENT_AGE_MS`].
-    /// Callers disconnect the session on this outcome.
+    /// A lane is stuck without socket write progress, or admitting an
+    /// envelope would evict a correlated reply. The sink disconnects.
     Slow,
     /// The bulk lane was full but the client is actively draining (just
     /// slower than a burst's publish rate): the oldest pending entry was
@@ -126,14 +115,6 @@ pub(super) struct SessionQueue {
     /// of silently dropping every subsequent enqueue forever.
     #[builder(default = false)]
     pub(super) slow: bool,
-    /// `request_id`s of response envelopes [`SessionQueue::admit_under_pressure`]
-    /// dropped to make room, rather than actually delivering. Drained by
-    /// [`SessionSink::enqueue`] after each call so it can fail fast any
-    /// delivery waiter for a dropped response instead of leaving it to time
-    /// out. Never populated by [`SessionQueue::pop_front`]'s ordinary drain
-    /// — only an eviction under pressure is a drop.
-    #[builder(default)]
-    pub(super) dropped_response_request_ids: Vec<String>,
     /// Updated only after the socket accepts bytes, never on enqueue/eviction.
     pub(super) last_write_progress: Option<tokio::time::Instant>,
     pub(super) in_flight: Option<super::session_write::EnvelopeSummary>,
@@ -147,7 +128,6 @@ impl SessionQueue {
             pending_topics: HashMap::new(),
             closed: false,
             slow: false,
-            dropped_response_request_ids: Vec::new(),
             last_write_progress: None,
             in_flight: None,
         }
@@ -182,7 +162,9 @@ impl SessionQueue {
             return EnqueueOutcome::Slow;
         }
 
-        if let Some(topic) = topic_event_topic(&env.payload) {
+        if env.request_id.is_none()
+            && let Some(topic) = topic_event_topic(&env.payload)
+        {
             if let Some(&idx) = self.pending_topics.get(&topic) {
                 debug_assert!(idx < self.items.len());
                 // Overwrite the stale invalidation in place, keeping the
@@ -218,19 +200,31 @@ impl SessionQueue {
             .front()
             .map(|(enqueued_at, _)| Instant::now().saturating_duration_since(*enqueued_at).as_millis() as u64)
             .unwrap_or(0);
+        // Never evict correlated replies, including for the resync marker.
+        // The sink turns this outcome into an explicit disconnect.
+        let evictions = if self.pending_topics.get(RESYNC_TOPIC).is_some_and(|&index| index > 0) {
+            1
+        } else {
+            2
+        };
+        if self
+            .items
+            .iter()
+            .take(evictions)
+            .any(|(_, item)| item.request_id.is_some())
+        {
+            self.slow = true;
+            return EnqueueOutcome::Slow;
+        }
         let write_idle_ms = self.last_write_progress.map(|at| at.elapsed().as_millis() as u64);
         if oldest_age_ms >= STUCK_CLIENT_AGE_MS && write_idle_ms.is_none_or(|age| age >= STUCK_CLIENT_AGE_MS) {
             self.slow = true;
             return EnqueueOutcome::Slow;
         }
 
-        if let Some((_, dropped)) = self.evict_oldest_bulk() {
-            self.record_dropped_response(dropped);
-        }
+        self.evict_oldest_bulk();
         if !self.pending_topics.contains_key(RESYNC_TOPIC) {
-            if let Some((_, dropped)) = self.evict_oldest_bulk() {
-                self.record_dropped_response(dropped);
-            }
+            self.evict_oldest_bulk();
             let idx = self.items.len();
             self.items.push_back((Instant::now(), resync_envelope()));
             self.pending_topics.insert(RESYNC_TOPIC.to_owned(), idx);
@@ -259,16 +253,6 @@ impl SessionQueue {
         }
         self.pending_topics = next;
         Some(popped)
-    }
-
-    /// Record that `env` was dropped (never sent) by [`Self::admit_under_pressure`],
-    /// so [`SessionSink::enqueue`] can fail fast any delivery waiter registered
-    /// for it instead of leaving the caller blocked for the full delivery
-    /// timeout.
-    fn record_dropped_response(&mut self, env: FrontendEventEnvelope) {
-        if let Some(request_id) = env.request_id {
-            self.dropped_response_request_ids.push(request_id);
-        }
     }
 
     pub(super) fn pop_front(&mut self) -> Option<FrontendEventEnvelope> {
@@ -423,19 +407,16 @@ impl SessionSink {
     }
 
     pub(super) fn enqueue(&self, env: FrontendEventEnvelope) -> EnqueueOutcome {
-        let (outcome, dropped_response_request_ids) = {
-            let mut q = self.queue.lock().expect("session queue lock poisoned");
-            let outcome = q.enqueue(env);
-            (outcome, std::mem::take(&mut q.dropped_response_request_ids))
-        };
-        for request_id in &dropped_response_request_ids {
-            self.complete_response_delivery(Some(request_id), false);
-        }
+        let outcome = self.queue.lock().expect("session queue lock poisoned").enqueue(env);
         match outcome {
             EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Degraded => {
                 self.wakers.writer.notify_one()
             }
-            EnqueueOutcome::Closed | EnqueueOutcome::Slow => {}
+            EnqueueOutcome::Slow => {
+                self.close();
+                self.trigger_shutdown();
+            }
+            EnqueueOutcome::Closed => {}
         }
         outcome
     }
@@ -520,14 +501,15 @@ impl SessionSink {
 
     /// Backpressure for the request reader: resolves once the bulk lane has
     /// room for the replies of requests about to be accepted (or the sink is
-    /// closed). Lets a client that pipelines faster than it reads stall in
-    /// its own socket buffer instead of having correlated replies evicted.
-    pub(super) async fn wait_for_response_headroom(&self) {
+    /// closed). The caller includes configured active and pending bulk/live
+    /// budgets plus the next request. This reduces pressure; enqueue still
+    /// enforces reply-or-disconnect when concurrent producers fill the lane.
+    pub(super) async fn wait_for_response_headroom(&self, outstanding: usize) {
         loop {
             let drained = self.wakers.drained.notified();
             {
                 let q = self.queue.lock().expect("session queue lock poisoned");
-                if q.closed || q.items.len() < REQUEST_BACKPRESSURE_DEPTH {
+                if q.closed || q.items.len() < MAX_SESSION_QUEUE.saturating_sub(outstanding).max(1) {
                     return;
                 }
             }
@@ -662,9 +644,9 @@ impl TopicBroker {
         // A push with zero recipients means the topic currently has no
         // subscribed session — the event is silently dropped rather than
         // queued, so this is the one line that turns a "missed frontend
-        // push" report from forensics into a grep (see T2764: a
+        // push" report from forensics into a grep: a
         // `CiRemediationStarted` push vanished during an unsubscribed
-        // window and stranded a stale badge for up to 24h).
+        // window and stranded a stale badge for up to 24h.
         if sinks.is_empty() {
             tracing::debug!(topic, "topic broker: publish had no subscribed sessions");
         }
