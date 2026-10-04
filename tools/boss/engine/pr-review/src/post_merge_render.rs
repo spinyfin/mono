@@ -178,6 +178,7 @@ pub fn render_post_merge_reviewer_initial_prompt(
            \"revision_warranted\": true,\n\
            \"findings\": [\n\
              {{\n\
+               \"id\": \"C1\",\n\
                \"severity\": \"critical | high | medium | low\",\n\
                \"category\": \"correctness | regression | architecture | readability | tests | edgecase | duplication | deferred_scope | agent_isms\",\n\
                \"confidence\": \"high | medium | low\",\n\
@@ -193,8 +194,10 @@ pub fn render_post_merge_reviewer_initial_prompt(
          ```\n\
          \n\
          `findings` may be empty if the landed code is clean. `contradictions` is always \
-         `[]` here — there is no second reviewer to disagree with. `sources` on every \
-         finding must be exactly `[\"claude\"]`; omit `location` when it does not apply.\n",
+         `[]` here — there is no second reviewer to disagree with. Give every finding a \
+         unique `id` (`C1`, `C2`, ...); `sources` on every finding must be exactly \
+         `[\"claude\"]`; omit `location` when it does not apply. There are no leaf \
+         findings in a post-merge review, so omit `rejected`.\n",
         repo_slug = repo_slug,
         brief_block = brief_block,
         brief_conformance = brief_conformance,
