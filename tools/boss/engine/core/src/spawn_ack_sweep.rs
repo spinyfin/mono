@@ -779,6 +779,16 @@ pub(crate) async fn reap_never_started_spawn(
                 DriverSignalKind::CorrelatedTranscriptUnattachable
             };
             let recorded_slot = ctx.live_states.record_driver_signal(execution_id, kind);
+            if recorded_slot.is_some() {
+                crate::spawn_health::maybe_resume_after_canary_driver_signal(
+                    ctx.spawn_health,
+                    ctx.work_db,
+                    &ctx.coordinator,
+                    ctx.dispatch_events,
+                    execution_id,
+                )
+                .await;
+            }
             match recorded_slot {
                 Some(recorded_slot) => tracing::error!(
                     execution_id,

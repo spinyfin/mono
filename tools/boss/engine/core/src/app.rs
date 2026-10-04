@@ -420,13 +420,11 @@ impl crate::stale_worker_sweep::StaleWorkerReaper for ServerState {
 
 #[async_trait]
 impl crate::spawn_ack_sweep::SpawnAckReaper for ServerState {
-    /// Route the spawn-ack-timeout reconcile through the same
-    /// `release_worker_pane` teardown as the stale-worker sweep: tears
-    /// down whatever (possibly ghost) pane the app is holding for the
-    /// slot, signals the recorded shell pid's process group as a
-    /// backstop (a no-op when `shell_pid == 0`, which is always true for
-    /// this sweep's candidates), releases the pool slot, and drops the
-    /// live-state entry.
+    /// Route the driver-start-timeout reap through the same
+    /// `release_worker_pane` tmux teardown as the stale-worker sweep:
+    /// verifies and kills the recorded tmux session, signals the
+    /// recorded pane pid's process group, releases the pool slot, and
+    /// drops the live-state entry.
     async fn reap_worker(&self, execution_id: &str) {
         let _ = ServerState::release_worker_pane(self, execution_id).await;
     }
@@ -2011,7 +2009,7 @@ impl ServerState {
                     .release_pool_claim_if_execution(&worker_id, run_id)
                     .await;
                 self.live_worker_states.release_slot_for_run(run_id);
-                self.live_status_manager.stop_slot(slot_id);
+                self.live_status_manager.stop_slot_for_run(slot_id, run_id);
                 self.broadcast_live_worker_states().await;
             }
         }
