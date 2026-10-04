@@ -190,7 +190,7 @@ fn retention_keeps_selection_and_recent_history_then_expires_terminal_series() {
 }
 
 #[test]
-fn gc_preserves_in_progress_publication_and_live_staging_files() {
+fn gc_fails_loudly_instead_of_silently_skipping_while_publication_holds_the_lock() {
     let (dir, db) = open_db();
     let _publisher = packet_store_lock(dir.path(), false).unwrap();
     let relative = publish_packet_artifact(
@@ -199,8 +199,21 @@ fn gc_preserves_in_progress_publication_and_live_staging_files() {
         &serde_json::to_vec(&packet("base", "head")).unwrap(),
     )
     .unwrap();
-    db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
-    assert!(dir.path().join(&relative).exists());
+    // The publisher holds the shared lock for the whole test, so every retry
+    // inside `packet_store_lock_for_gc` is exhausted: GC must surface that as
+    // an error a caller can distinguish from a completed pass, not return
+    // `Ok(())` having collected nothing.
+    let error = db
+        .gc_unreferenced_pr_review_guide_source_artifacts()
+        .expect_err("a fully contended sweep must fail loudly, not silently no-op");
+    assert!(
+        error.to_string().contains("exclusive packet store lock"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        dir.path().join(&relative).exists(),
+        "an errored pass must not have collected anything"
+    );
     drop(_publisher);
     let own = dir.path().join(format!("{relative}.{}.1.tmp", std::process::id()));
     let live = dir.path().join(format!("{relative}.1.1.tmp"));
@@ -215,6 +228,31 @@ fn gc_preserves_in_progress_publication_and_live_staging_files() {
     assert!(unknown.exists());
     assert!(!dead.exists());
     assert!(!dir.path().join(relative).exists());
+}
+
+#[test]
+fn gc_retries_through_transient_contention_and_collects_once_the_lock_clears() {
+    let (dir, db) = open_db();
+    let publisher = packet_store_lock(dir.path(), false).unwrap();
+    let relative = publish_packet_artifact(
+        dir.path(),
+        &packet("base", "head").content_hash().unwrap(),
+        &serde_json::to_vec(&packet("base", "head")).unwrap(),
+    )
+    .unwrap();
+    // Release well within the retry budget, simulating a publisher that
+    // finishes its capture transaction mid-sweep rather than staying stuck.
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(publisher);
+    });
+    db.gc_unreferenced_pr_review_guide_source_artifacts()
+        .expect("GC must ride out transient contention instead of failing on the first busy attempt");
+    releaser.join().unwrap();
+    assert!(
+        !dir.path().join(&relative).exists(),
+        "the unreferenced blob must be collected once the lock becomes available"
+    );
 }
 use crate::test_support::{create_active_chore, create_product, open_db};
 use crate::work::{FakePrStateChecker, PrOpenState};
