@@ -760,6 +760,7 @@ mod tests {
                 format!(r#"{{"batch_id":"rvb_missing","verdict":{{"outcome":"approved_{i}"}}}}"#)
             }
             ProposalKind::RunDone => format!(r#"{{"outcome":"delivered","summary":"S{i}"}}"#),
+            ProposalKind::Wait => format!(r#"{{"reason":"wait {i}","duration_secs":60}}"#),
         }
     }
 

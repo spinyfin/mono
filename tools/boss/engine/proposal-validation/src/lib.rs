@@ -36,7 +36,7 @@ use boss_protocol::{
     EffortEscalationProposalPayload, FollowupTaskProposalPayload, PROPOSAL_CAP_PER_KIND_PER_EXECUTION,
     PROPOSAL_CAP_TOTAL_PER_EXECUTION, PrCreatedProposalPayload, ProposalErrorCode, ProposalFieldError, ProposalKind,
     ProposalSubmissionError, ReviewReportProposalPayload, ReviewVerdictProposalPayload, RunDoneOutcome,
-    RunDoneProposalPayload,
+    RunDoneProposalPayload, WAIT_MAX_DURATION_SECS, WaitProposalPayload,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -266,6 +266,17 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
             to_json(&RunDoneProposalPayload {
                 outcome: outcome.unwrap_or(RunDoneOutcome::Blocked),
                 summary: summary.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Wait => {
+            let duration_secs = reader.required_u64("duration_secs", 1, WAIT_MAX_DURATION_SECS);
+            let reason = reader.required_text("reason", MAX_SHORT_FIELD_CHARS);
+            let waiting_on = reader.optional_text("waiting_on", MAX_SHORT_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&WaitProposalPayload {
+                duration_secs: duration_secs.unwrap_or(1),
+                reason: reason.unwrap_or_default(),
+                waiting_on,
             })
         }
     };
@@ -513,6 +524,26 @@ impl<'a> PayloadReader<'a> {
     fn raw(&mut self, field: &'static str) -> Option<&'a Value> {
         self.known.insert(field);
         self.object.get(field).filter(|v| !v.is_null())
+    }
+
+    /// Read `field` as a required integer in `[min, max]` inclusive.
+    fn required_u64(&mut self, field: &'static str, min: u64, max: u64) -> Option<u64> {
+        let Some(value) = self.raw(field) else {
+            self.error(field, "required field is missing");
+            return None;
+        };
+        let Some(n) = value.as_u64() else {
+            self.error(
+                field,
+                format!("expected a non-negative integer, got {}", json_type_name(value)),
+            );
+            return None;
+        };
+        if n < min || n > max {
+            self.error(field, format!("must be between {min} and {max} seconds inclusive"));
+            return None;
+        }
+        Some(n)
     }
 
     /// Read `field` as a present, non-empty, length-bounded string.

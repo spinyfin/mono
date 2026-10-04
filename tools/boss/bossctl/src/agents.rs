@@ -1730,6 +1730,10 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
     if state.held {
         println!("  held:          true (exempt from idle-park/auto-reap sweeps)");
     }
+    if let Some(reason) = &state.wait_reason {
+        let expiry = state.wait_expires_at.as_deref().unwrap_or("unknown");
+        println!("  wait:          {reason} (expires {expiry})");
+    }
     if let Some(recovery) = &state.recovery_status {
         println!("  recovery:      {recovery}");
     }
@@ -1871,6 +1875,10 @@ fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) 
     }
     if state.held {
         line.push_str("  held=true");
+    }
+    if let Some(reason) = &state.wait_reason {
+        let expiry = state.wait_expires_at.as_deref().unwrap_or("-");
+        line.push_str(&format!("  wait_reason=\"{reason}\"  wait_expires_at={expiry}"));
     }
     match tmux {
         TmuxListEvidence::Present(status) => {

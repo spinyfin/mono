@@ -113,6 +113,7 @@ pub mod merge_poller;
 pub mod merge_queue_renumber;
 pub mod merge_when_ready;
 mod run_cost;
+pub mod wait_registry;
 // The metrics framework lives in its own crate; alias it under the
 // module path the engine has always used it by. `metrics_init` holds
 // the engine-specific startup registration that can't move down
