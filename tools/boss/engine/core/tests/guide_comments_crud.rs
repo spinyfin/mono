@@ -9,7 +9,7 @@ async fn guide_comment_wire_round_trip_keeps_original_context() -> Result<()> {
     })
     .await?;
     let conn = rusqlite::Connection::open(&engine.db_path)?;
-    // Keep the fixture current so background retention cannot collect it before the first comment.
+    // Keep the fixture current: startup retention collects aged guide rows without a live root task.
     conn.execute_batch(
         "INSERT INTO pr_review_guide_source_series
          (id, root_task_id, canonical_pr_url, selected_comparison_id, created_at, updated_at)

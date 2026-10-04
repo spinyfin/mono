@@ -365,6 +365,7 @@ mod pr_status;
 mod probe_delivery;
 mod probe_interrupt;
 mod proposals;
+mod reveal_deadline;
 mod review_guide;
 mod revision_no_op_live_seam_reproduction;
 mod selected_product;

@@ -719,14 +719,8 @@ extension ChatViewModel {
             let result = paneFocusHandler.map { $0(slotId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendFocusWorkerPaneResponse(requestId: requestId, result: result)
         case .revealWorkItem(let workItemId, let productId):
-            switch revealWorkCard(workItemId, productID: productId) {
-            case .revealed, .deferred:
-                engine.sendRevealWorkItemResponse(requestId: requestId, result: .success)
-            case .unreachable(let reason):
-                engine.sendRevealWorkItemResponse(
-                    requestId: requestId,
-                    result: .failure(.internalFailure(reason))
-                )
+            revealWorkCard(workItemId, productID: productId) { [weak self] result in
+                self?.engine.sendRevealWorkItemResponse(requestId: requestId, result: result)
             }
         case .openDocument(let path):
             // Reuses the exact File ▸ Open code path

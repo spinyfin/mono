@@ -1049,22 +1049,26 @@ struct ContentView: View {
                 }
             }()
             let columnSpacing: CGFloat = kanbanBoardStyle == .minimal ? 24 : workBoardColumnSpacing
-            ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: columnSpacing) {
-                    ForEach(WorkBoardColumnKey.allCases) { column in
-                        workColumn(column, width: columnWidth)
+            ScrollViewReader { boardProxy in
+                ScrollView(.horizontal) {
+                    HStack(alignment: .top, spacing: columnSpacing) {
+                        ForEach(WorkBoardColumnKey.allCases) { column in
+                            workColumn(column, width: columnWidth, boardProxy: boardProxy)
+                                .id(column)
+                        }
                     }
+                    .padding(.horizontal, workBoardHorizontalPadding)
+                    .padding(.top, workBoardHorizontalPadding)
+                    .frame(maxHeight: .infinity, alignment: .top)
                 }
-                .padding(.horizontal, workBoardHorizontalPadding)
-                .padding(.top, workBoardHorizontalPadding)
-                .frame(maxHeight: .infinity, alignment: .top)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(RevealBoardViewport(model: model))
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .environment(\.kanbanBoardStyle, kanbanBoardStyle)
     }
 
-    private func workColumn(_ column: WorkBoardColumnKey, width: CGFloat = workBoardColumnWidth) -> some View {
+    private func workColumn(_ column: WorkBoardColumnKey, width: CGFloat = workBoardColumnWidth, boardProxy: ScrollViewProxy) -> some View {
         let sections = model.workSections(in: column)
         let itemCount = sections.reduce(0) { $0 + $1.items.count }
 
@@ -1106,11 +1110,18 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
                     .frame(maxHeight: .infinity)
-                    .onChange(of: model.revealScrollTarget) { _, target in
-                        guard let target else { return }
+                    .task(id: model.revealScrollTarget.map { "\(model.revealGeneration)-\($0)" }) {
+                        guard let target = model.revealScrollTarget else { return }
                         let columnIDs = sections.flatMap { $0.items.map(\.id) }
                         guard columnIDs.contains(target) else { return }
-                        withAnimation { proxy.scrollTo(target, anchor: .center) }
+                        // Wait for disclosure expansion and lazy card layout. Retry
+                        // until the card's viewport probe acknowledges this request.
+                        for _ in 0..<40 {
+                            guard !Task.isCancelled, model.revealScrollTarget == target else { return }
+                            boardProxy.scrollTo(column, anchor: .center)
+                            proxy.scrollTo(target, anchor: .center)
+                            do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
+                        }
                     }
                 }
             }
@@ -1188,7 +1199,15 @@ struct ContentView: View {
                     count: section.items.count,
                     defaultExpanded: section.defaultExpanded,
                     shortIDLabel: sectionProject?.shortID.map { "P" + String($0) },
-                    banner: section.queueBannerText
+                    banner: section.queueBannerText,
+                    revealGeneration: section.items.contains { $0.id == model.revealScrollTarget }
+                        ? model.revealGeneration : nil,
+                    onDrop: { items, expanded in
+                        guard let taskID = items.first else { return false }
+                        return model.attemptDrop(
+                            taskID, onColumn: column, group: expanded ? section.groupKey : nil
+                        )
+                    }
                 ) {
                     if let sectionProject {
                         HStack(spacing: 6) {
