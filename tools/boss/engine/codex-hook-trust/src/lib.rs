@@ -284,7 +284,10 @@ pub enum TrustGateError {
     /// A post-observation refusal annotated with what Codex itself reported
     /// (hooks/list errors, configWarnings, stderr). The gate's decision is the
     /// wrapped `cause`; `context` is display-only.
-    WithCodexContext { cause: Box<TrustGateError>, context: String },
+    WithCodexContext {
+        cause: Box<TrustGateError>,
+        context: String,
+    },
 }
 
 impl std::fmt::Display for TrustGateError {
@@ -913,55 +916,58 @@ pub fn arm_and_attest_with_observer<O: TrustObserver>(
     let stamped_map: BTreeMap<String, String> = stamped.into_iter().collect();
 
     // 4. Observe — silence is not success.
-    let Observation { hooks: observed, diagnostics } = observer.observe(&codex_home, &request.cwd)?;
+    let Observation {
+        hooks: observed,
+        diagnostics,
+    } = observer.observe(&codex_home, &request.cwd)?;
     let observed_map: BTreeMap<String, ObservedHook> = observed.into_iter().map(|h| (h.key.clone(), h)).collect();
 
     // Every refusal below keeps its decision; Codex's own cause rides along.
     let entries = (|| {
-    let mut entries = Vec::with_capacity(request.hooks.len());
-    for hook in &request.hooks {
-        let command = resolve_absolute(&hook.command);
-        let command_str = command.to_string_lossy().into_owned();
-        let key = hook_state_key(&config_path, hook.event, hook.group_index, hook.handler_index);
-        let stamped_hash = stamped_map
-            .get(&key)
-            .ok_or_else(|| TrustGateError::AttestationIncomplete {
-                detail: format!("stamped map missing key `{key}`"),
-            })?;
-        let obs = observed_map
-            .get(&key)
-            .ok_or_else(|| TrustGateError::HookNotListed { key: key.clone() })?;
+        let mut entries = Vec::with_capacity(request.hooks.len());
+        for hook in &request.hooks {
+            let command = resolve_absolute(&hook.command);
+            let command_str = command.to_string_lossy().into_owned();
+            let key = hook_state_key(&config_path, hook.event, hook.group_index, hook.handler_index);
+            let stamped_hash = stamped_map
+                .get(&key)
+                .ok_or_else(|| TrustGateError::AttestationIncomplete {
+                    detail: format!("stamped map missing key `{key}`"),
+                })?;
+            let obs = observed_map
+                .get(&key)
+                .ok_or_else(|| TrustGateError::HookNotListed { key: key.clone() })?;
 
-        if !obs.enabled {
-            return Err(TrustGateError::HookNotEnabled { key: key.clone() });
-        }
-        if !obs.trust_status.eq_ignore_ascii_case("trusted") {
-            return Err(TrustGateError::HookNotTrusted {
+            if !obs.enabled {
+                return Err(TrustGateError::HookNotEnabled { key: key.clone() });
+            }
+            if !obs.trust_status.eq_ignore_ascii_case("trusted") {
+                return Err(TrustGateError::HookNotTrusted {
+                    key: key.clone(),
+                    status: obs.trust_status.clone(),
+                    current_hash: obs.current_hash.clone(),
+                    stamped_hash: stamped_hash.clone(),
+                });
+            }
+            if obs.current_hash != *stamped_hash {
+                return Err(TrustGateError::HashMismatch {
+                    key: key.clone(),
+                    stamped: stamped_hash.clone(),
+                    observed: obs.current_hash.clone(),
+                });
+            }
+
+            entries.push(HookAttestationEntry {
                 key: key.clone(),
-                status: obs.trust_status.clone(),
-                current_hash: obs.current_hash.clone(),
-                stamped_hash: stamped_hash.clone(),
+                event: hook.event.key_label().to_string(),
+                command: command_str,
+                matcher: hook.matcher.clone(),
+                trusted_hash: stamped_hash.clone(),
+                guard_content_sha256: content_hashes.get(&key).cloned().flatten(),
+                observed_trust_status: obs.trust_status.clone(),
             });
         }
-        if obs.current_hash != *stamped_hash {
-            return Err(TrustGateError::HashMismatch {
-                key: key.clone(),
-                stamped: stamped_hash.clone(),
-                observed: obs.current_hash.clone(),
-            });
-        }
-
-        entries.push(HookAttestationEntry {
-            key: key.clone(),
-            event: hook.event.key_label().to_string(),
-            command: command_str,
-            matcher: hook.matcher.clone(),
-            trusted_hash: stamped_hash.clone(),
-            guard_content_sha256: content_hashes.get(&key).cloned().flatten(),
-            observed_trust_status: obs.trust_status.clone(),
-        });
-    }
-    Ok(entries)
+        Ok(entries)
     })()
     .map_err(|err| match diagnostics {
         Some(context) => TrustGateError::WithCodexContext {

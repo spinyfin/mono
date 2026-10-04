@@ -83,7 +83,7 @@ mod tests {
         // retain the marker at the end.
         let mut child = Command::new("/bin/sh")
             .arg("-c")
-            .arg("/bin/dd if=/dev/zero bs=1024 count=256 1>&2; printf 'TAIL-END-MARKER' >&2")
+            .arg("i=0; while [ $i -lt 256 ]; do printf '%01024d' 0 >&2; i=$((i+1)); done; printf 'TAIL-END-MARKER' >&2")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -108,13 +108,13 @@ mod tests {
             tail.ends_with("TAIL-END-MARKER"),
             "expected the retained tail to end with the marker, got {tail:?}"
         );
-        // The 256 KiB of zeros really reached the pipe: the tail is exactly
-        // the cap, a zero prefix followed by the marker.
+        // The 256 KiB of '0' bytes really reached the pipe: the tail is exactly
+        // the cap, a '0' prefix followed by the marker.
         let marker = "TAIL-END-MARKER";
         assert_eq!(tail.len(), 64, "tail should be exactly the cap: {tail:?}");
         assert!(
-            tail[..64 - marker.len()].bytes().all(|b| b == 0),
-            "expected a zero prefix, got {tail:?}"
+            tail[..64 - marker.len()].bytes().all(|b| b == b'0'),
+            "expected a '0' prefix, got {tail:?}"
         );
     }
 }
