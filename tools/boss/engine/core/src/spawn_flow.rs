@@ -605,6 +605,8 @@ impl StartWorkerError {
     /// same as `Stage::as_str()` and do not rename them casually.
     pub fn class(&self) -> &'static str {
         match self {
+            Self::ViewerRejected(_) => "viewer_rejected",
+            Self::ViewerAbortFailed { .. } => "viewer_abort_failed",
             Self::WriteFiles(_) => "write_files",
             Self::ProgressIngress(_) => "progress_ingress",
             Self::Tmux(_) => "tmux_host",
