@@ -410,6 +410,11 @@ impl ExecutionCoordinator {
                         ws = lease.workspace_id,
                         release_state = if released {
                             "released back to cube"
+                        } else if abort_unconfirmed {
+                            "intentionally retained because worker process teardown could not be confirmed. \
+                             Manual recovery is required: confirm the worker has stopped, clean up its driver \
+                             state, release the retained cube lease, and requeue the failed work item. \
+                             The pool sweep only reclaims the slot; it does not perform workspace cleanup or requeue"
                         } else {
                             "still held by the engine (release failed — see the engine log)"
                         },
@@ -432,8 +437,9 @@ impl ExecutionCoordinator {
                 ) {
                     Ok((execution, _run, _)) => {
                         self.notify_review_guide_pre_start_failure(&execution);
-                        // Driver teardown for this termination path already
-                        // ran unconditionally above, before the cube release.
+                        // Driver teardown ran before cube release unless the
+                        // worker abort was unconfirmed. That path deliberately
+                        // retains driver state and the lease for manual recovery.
                         // The execution is now durably `failed` in the DB —
                         // safe to have `pool_claim_sweep` own reclaiming this
                         // slot instead of releasing it immediately (see the

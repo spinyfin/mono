@@ -12,16 +12,7 @@ pub(super) struct WorkerViewerReconcile {
 }
 
 impl ServerState {
-    fn clear_viewer_failure(&self, run_id: &str) {
-        if let Err(err) = self
-            .work_db
-            .resolve_attention_kind_for_execution(run_id, crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND)
-        {
-            tracing::error!(run_id, %err, "could not resolve worker viewer failure");
-        }
-    }
-
-    pub(super) async fn hosted_worker_viewers(&self) -> Result<Vec<HostedPaneEntry>, String> {
+    pub(super) async fn hosted_worker_viewers(&self) -> Result<Option<Vec<HostedPaneEntry>>, String> {
         match self
             .send_to_app(
                 EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {}),
@@ -29,7 +20,9 @@ impl ServerState {
             )
             .await
         {
-            Ok(EngineToAppResponse::ListHostedPanes { result: Ok(result) }) => Ok(result.panes),
+            Ok(EngineToAppResponse::ListHostedPanes { result: Ok(result) }) => Ok(Some(result.panes)),
+            // Registration reconciliation owns viewers when the app reconnects.
+            Err(SendToAppError::NotRegistered) => Ok(None),
             other => Err(format!("cannot inventory app viewers: {other:?}")),
         }
     }
@@ -65,7 +58,7 @@ impl ServerState {
         let mut live = HashSet::new();
         let mut blocked_slots = HashSet::new();
         let mut had_failures = false;
-        for pane in self.hosted_worker_viewers().await? {
+        for pane in self.hosted_worker_viewers().await?.unwrap_or_default() {
             match self.viewer_is_stale(&pane.run_id) {
                 Ok(true) => match self.detach_viewer(pane.slot_id).await {
                     Ok(()) => {
@@ -112,15 +105,11 @@ impl ServerState {
         let _guard = self.attach_pane_lock.lock().await;
         let request = EngineToAppRequest::AttachWorkerPane(input.clone());
         let response = self.send_to_app(request.clone(), timeout).await?;
-        if matches!(response, EngineToAppResponse::AttachWorkerPane { result: Ok(_) }) {
-            self.clear_viewer_failure(&input.run_id);
-        }
         if let EngineToAppResponse::AttachWorkerPane {
             result: Err(EngineToAppError::SlotBusy { occupying_run_id }),
         } = &response
         {
             if occupying_run_id.as_deref() == Some(input.run_id.as_str()) {
-                self.clear_viewer_failure(&input.run_id);
                 return Ok(EngineToAppResponse::AttachWorkerPane {
                     result: Ok(AttachWorkerPaneResult {}),
                 });
@@ -133,7 +122,6 @@ impl ServerState {
             if stale && self.detach_viewer(input.slot_id).await.is_ok() {
                 let retry = self.send_to_app(request, timeout).await;
                 if matches!(retry, Ok(EngineToAppResponse::AttachWorkerPane { result: Ok(_) })) {
-                    self.clear_viewer_failure(&input.run_id);
                     return retry;
                 }
                 tracing::error!(run_id = %input.run_id, ?retry, "worker viewer attach retry failed after SlotBusy");
@@ -165,7 +153,8 @@ impl crate::pool_claim_sweep::WorkerViewerDetach for ServerState {
         let wanted: HashSet<&str> = run_ids.iter().map(String::as_str).collect();
         let _guard = self.attach_pane_lock.lock().await;
         let panes = match self.hosted_worker_viewers().await {
-            Ok(panes) => panes,
+            Ok(Some(panes)) => panes,
+            Ok(None) => return run_ids.iter().map(|_| Ok(())).collect(),
             Err(err) => return run_ids.iter().map(|_| Err(err.clone())).collect(),
         };
         let mut failed: HashMap<String, String> = HashMap::new();
