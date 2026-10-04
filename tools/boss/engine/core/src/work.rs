@@ -650,6 +650,7 @@ mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
 pub(crate) use feedback_target::FeedbackTarget;
+mod description_guard;
 mod guide_comments;
 mod guide_feedback;
 mod host_reconcile_queries;

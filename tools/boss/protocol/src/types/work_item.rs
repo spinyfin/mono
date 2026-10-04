@@ -184,6 +184,11 @@ pub struct WorkItemPatch {
     pub default_driver: Option<String>,
 
     pub description: Option<String>,
+    /// Allow deliberate clearing or shrinking below 10% of a description of at least 500 bytes.
+    /// Placeholder values (`null`, `undefined`, `None`) remain invalid on update.
+    #[serde(default)]
+    #[builder(default)]
+    pub force_shrink: bool,
     /// Product-level design-task repo override. Only honoured on
     /// product-targeted updates; ignored when patching a task /
     /// chore / project. `None` → leave unchanged. `Some("")` →

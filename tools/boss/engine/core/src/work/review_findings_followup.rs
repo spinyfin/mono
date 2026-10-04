@@ -128,6 +128,9 @@ pub(crate) fn convert_revision_to_review_findings_followup(
     autostart: bool,
 ) -> Result<(usize, TaskKind)> {
     let plan = plan_review_findings_followup(conn, chain_root_id, &rev.description)?;
+    if plan.description != rev.description {
+        super::description_guard::validate_description_update(&rev.description, &plan.description, false)?;
+    }
     let rows_changed = conn.execute(
         "UPDATE tasks
          SET project_id           = NULL,
