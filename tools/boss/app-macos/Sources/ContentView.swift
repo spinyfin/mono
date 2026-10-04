@@ -547,7 +547,12 @@ struct ContentView: View {
             if model.isConnected, !model.bannerHealthIssues.isEmpty {
                 EngineHealthBanner(
                     issues: model.bannerHealthIssues,
-                    onUnpauseDispatch: { model.resumeDispatch() }
+                    onUnpauseDispatch: { model.resumeDispatch() },
+                    onUpdateAndRestart: updateModel.isDevBuild
+                        ? nil
+                        : { updateModel.requestUpdateAndRestart() },
+                    updateAndRestartQueued: updateModel.applyWhenIdleRequested,
+                    updateAndRestartStatus: updateModel.idleApplyStatus
                 )
                 .transition(bannerTransition)
             }

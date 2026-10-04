@@ -418,6 +418,16 @@ final class ChatViewModel: ObservableObject {
     /// `issues` list. `true` until the engine answers at least once,
     /// so the banner doesn't flash on a transient reconnect.
     @Published var engineAnthropicApiKeyPresent: Bool = true
+    /// The engine's running version against the newest published
+    /// release, from the same `get_engine_health` reply. `nil` until a
+    /// report arrives, or from an engine too old to send one.
+    @Published var engineRelease: EngineReleaseInfo?
+
+    /// Forward the updater's newest published release (`1.0.N`) to the
+    /// engine, which has no release poller of its own.
+    func reportNewestPublishedRelease(_ version: String) {
+        engine.sendReportNewestPublishedRelease(version: version)
+    }
 
     /// Current driver traffic split: how eligible, `standard`-reasoning
     /// implementation work is allocated between the `grok`, `claude`, and

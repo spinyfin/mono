@@ -154,10 +154,21 @@ public final class UpdateModel: ObservableObject {
     /// Install & Relaunch / Quit to Finish. The sheet is re-presented with a
     /// status line so a cancelled or vetoed quit is never silent.
     @Published public private(set) var quitReturnedWithoutTerminating: Bool = false
+    /// Newest installable `boss-v*` release the checker has seen, even when the app
+    /// itself is already on it. Reported to the engine for its running-vs-published
+    /// comparison. `nil` until a check has parsed the feed.
+    @Published public private(set) var newestPublishedVersion: VersionTuple?
+    /// The operator pressed "Update & Restart": apply at the next moment no workers
+    /// are live, in any mode. Cleared once the apply is attempted or found impossible.
+    @Published public private(set) var applyWhenIdleRequested: Bool = false
+    /// One-line, user-visible state of the apply-at-idle path ("waiting for 2 live
+    /// workers…"). `nil` when there is nothing to say.
+    @Published public private(set) var idleApplyStatus: String?
 
     // MARK: - Private
 
     private var toastDismissTask: Task<Void, Never>?
+    private var applyRequestResolving = false
     private var stagingTask: Task<Void, Never>?
 
     private enum StorageKeys {
@@ -321,6 +332,10 @@ public final class UpdateModel: ObservableObject {
         defer { isChecking = false }
         let result = await checker.checkForUpdates()
         lastCheckResult = result
+        let newest = await checker.newestPublishedVersion
+        if newest != newestPublishedVersion {
+            newestPublishedVersion = newest
+        }
         let now = Date()
         lastCheckDate = now
         defaults.set(now.timeIntervalSince1970, forKey: StorageKeys.lastCheck)
@@ -409,6 +424,52 @@ public final class UpdateModel: ObservableObject {
     public func downloadAvailableUpdate() {
         guard !isDevBuild, case .available(let update) = lastCheckResult else { return }
         beginStaging(update)
+    }
+
+    // MARK: - Apply at idle
+
+    /// One-click "Update & Restart". Records the request, makes sure the newest
+    /// release is known, and stages it. The idle applier then installs it — and
+    /// restarts onto it — at the first moment no workers are live; it never
+    /// restarts under a live worker. Dev builds never install, so this is a no-op
+    /// for them.
+    public func requestUpdateAndRestart() {
+        guard !isDevBuild else { return }
+        modelLog.info("update apply: operator requested update and restart at idle")
+        applyWhenIdleRequested = true
+        applyRequestResolving = true
+        Task {
+            if case .available = lastCheckResult {} else { await checkNow() }
+            downloadAvailableUpdate()
+            applyRequestResolving = false
+        }
+    }
+
+    /// `true` while a requested apply is still finding or downloading its update.
+    public var isPreparingUpdate: Bool {
+        if applyRequestResolving || isChecking { return true }
+        if case .downloading = downloadState { return true }
+        return false
+    }
+
+    /// The version that is staged and can be swapped in now, if any. Includes a
+    /// swap that was already applied and is only waiting for its relaunch.
+    public var versionReadyToApply: VersionTuple? {
+        switch downloadState {
+        case .readyToInstall(let version): return version
+        case .installedPendingRelaunch(let version, let willRelaunch) where willRelaunch: return version
+        default: return nil
+        }
+    }
+
+    public func clearApplyWhenIdleRequest() {
+        applyWhenIdleRequested = false
+    }
+
+    public func setIdleApplyStatus(_ status: String?) {
+        if status != idleApplyStatus {
+            idleApplyStatus = status
+        }
     }
 
     /// Automatic-mode auto-stage: begin downloading/staging an available update so a
