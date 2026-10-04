@@ -39,8 +39,10 @@ final class RevealRevisionRollupTests: XCTestCase {
         XCTAssertEqual(outcome, .revealed(cardID: "task_parent"), "reveal must redirect to the parent's card")
 
         model.revealWorkCard("task_revision", productID: "prod_test")
-        XCTAssertEqual(model.revealHighlightID, "task_parent", "highlight must land on the parent's card")
+        XCTAssertNil(model.revealHighlightID, "do not flash before the card is visible")
         XCTAssertEqual(model.revealScrollTarget, "task_parent", "scroll must target the parent's card")
+        model.confirmReveal(cardID: "task_parent", generation: model.revealGeneration)
+        XCTAssertEqual(model.revealHighlightID, "task_parent", "highlight must land on the parent's card")
         XCTAssertEqual(model.selectedWorkCardID, "task_parent")
     }
 
@@ -85,6 +87,23 @@ final class RevealRevisionRollupTests: XCTestCase {
         ]))
 
         XCTAssertEqual(model.revealCardTarget(for: "task_a"), .revealed(cardID: "task_a"))
+    }
+
+    func testUnreachableRevealClearsThePreviousCardsFlash() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [
+            makeTask(id: "previous", name: "Previous", status: "active"),
+            makeTask(id: "unreachable", name: "Revision", status: "done", kind: "revision"),
+        ]))
+        model.revealWorkCard("previous", productID: "prod_test")
+        model.confirmReveal(cardID: "previous", generation: model.revealGeneration)
+        XCTAssertEqual(model.revealHighlightID, "previous")
+
+        guard case .unreachable = model.revealWorkCard("unreachable", productID: "prod_test") else {
+            return XCTFail("a revision without its parent has no host card")
+        }
+        XCTAssertNil(model.revealHighlightID, "an unsuccessful reveal must not leave an unrelated card flashing")
+        XCTAssertNil(model.revealScrollTarget)
     }
 
     func testRevealOfUnknownIdIsDeferredNotUnreachable() {

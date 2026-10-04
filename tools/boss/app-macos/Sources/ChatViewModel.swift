@@ -273,7 +273,7 @@ final class ChatViewModel: ObservableObject {
     }
     @Published var selectedWorkCardID: String?
     /// Task id that the reveal animation is currently highlighting.
-    /// Set by `revealWorkCard`; cleared after 1.5 s. Views observe
+    /// Set after viewport confirmation; cleared after 1.5 s. Views observe
     /// this to apply a transient border-glow overlay on the matching
     /// card.
     @Published var revealHighlightID: String?
@@ -297,14 +297,16 @@ final class ChatViewModel: ObservableObject {
         revisionHighlightStore.highlightedIDs
     }
     /// Task id that scroll views should bring into the visible area.
-    /// Set by `revealWorkCard`; cleared after a short delay once the
-    /// scroll has been triggered. Views observe this via `.onChange`
-    /// on their `ScrollViewReader` proxies.
+    /// Retained until viewport confirmation or failure. The generation
+    /// distinguishes repeated requests for the same card from stale work.
     @Published var revealScrollTarget: String?
+    @Published var revealGeneration = UUID()
+    var revealCompletion: ((EngineRevealResult) -> Void)?
+    var revealProductID: String?
     /// Task id whose card should be scrolled to once its product's
     /// work tree arrives. Used when a reveal crosses a product
     /// boundary — `revealWorkCard` sets this and the `workTree`
-    /// event handler promotes it to `revealScrollTarget`.
+    /// event handler resolves it against the newly loaded board.
     var pendingRevealScrollID: String?
     @Published var workBoardGrouping: WorkBoardGrouping = .none {
         didSet { notePublishedWorkInputChanged() }

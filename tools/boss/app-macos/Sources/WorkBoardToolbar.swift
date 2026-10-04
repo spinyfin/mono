@@ -39,6 +39,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
     /// header, always visible regardless of collapse state so a stalled
     /// queue is noticeable without expanding the section.
     var banner: String? = nil
+    var revealGeneration: UUID? = nil
     @ViewBuilder let accessory: () -> Accessory
     @ViewBuilder let content: () -> Content
 
@@ -51,6 +52,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
         defaultExpanded: Bool,
         shortIDLabel: String? = nil,
         banner: String? = nil,
+        revealGeneration: UUID? = nil,
         @ViewBuilder accessory: @escaping () -> Accessory = { EmptyView() },
         @ViewBuilder content: @escaping () -> Content
     ) {
@@ -60,6 +62,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
         self.defaultExpanded = defaultExpanded
         self.shortIDLabel = shortIDLabel
         self.banner = banner
+        self.revealGeneration = revealGeneration
         self.accessory = accessory
         self.content = content
         self._userToggled = State(
@@ -118,6 +121,13 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
             }
         }
         .id(sectionID)
+        .onChange(of: revealGeneration, initial: true) { _, generation in
+            guard generation != nil else { return }
+            userToggled = !defaultExpanded
+            BossDefaults.store.set(
+                userToggled, forKey: WorkBoardSectionCollapse.storageKey(sectionID: sectionID)
+            )
+        }
     }
 }
 

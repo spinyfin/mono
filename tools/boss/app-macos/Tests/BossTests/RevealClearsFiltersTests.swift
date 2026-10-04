@@ -89,6 +89,89 @@ final class RevealClearsFiltersTests: XCTestCase {
         XCTAssertTrue(model.selectedProjectFilterIDs.isEmpty, "reveal must clear the project filter")
     }
 
+    func testEveryLifecycleStateRequiresExactViewportConfirmation() {
+        for status in ["todo", "active", "blocked", "in_review", "done", "archived"] {
+            let model = makeModel()
+            var task = makeTask(id: "target", name: "Target", status: status)
+            task.prURL = "https://github.com/example/repo/pull/42"
+            model.applyEventForTest(makeWorkTreeEvent(tasks: [task]))
+            var result: EngineRevealResult?
+            XCTAssertEqual(
+                model.revealWorkCard("target", productID: "prod_test") { result = $0 },
+                .revealed(cardID: "target"), status
+            )
+            XCTAssertNil(result, status)
+            XCTAssertNil(model.revealHighlightID, status)
+            model.confirmReveal(cardID: "target", generation: model.revealGeneration)
+            guard case .success = result else { return XCTFail("expected visible \(status) card") }
+            XCTAssertEqual(model.revealHighlightID, "target", status)
+        }
+    }
+
+    func testNoVisibleCardNeverReportsSuccess() async throws {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "done", name: "Done", status: "done")]))
+        var result: EngineRevealResult?
+        model.revealWorkCard("done", productID: "prod_test") { result = $0 }
+        XCTAssertNil(result, "scheduling a scroll is not success")
+        XCTAssertNil(model.revealHighlightID)
+        try await Task.sleep(for: .milliseconds(3200))
+        guard case .failure(.internalFailure(let reason)) = result else {
+            return XCTFail("a card with no mounted viewport must fail")
+        }
+        XCTAssertTrue(reason.contains("did not become visible"))
+        XCTAssertNil(model.revealScrollTarget)
+        XCTAssertNil(model.revealHighlightID)
+    }
+
+    func testOnlyCurrentExactCardCanAcknowledgeReveal() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [
+            makeTask(id: "first", name: "First"), makeTask(id: "second", name: "Second"),
+        ]))
+        var first: EngineRevealResult?
+        var second: EngineRevealResult?
+        model.revealWorkCard("first", productID: "prod_test") { first = $0 }
+        let stale = model.revealGeneration
+        model.revealWorkCard("second", productID: "prod_test") { second = $0 }
+        guard case .failure(.internalFailure(let reason)) = first else {
+            return XCTFail("superseded request must fail")
+        }
+        XCTAssertTrue(reason.contains("superseded"))
+        model.confirmReveal(cardID: "first", generation: stale)
+        model.confirmReveal(cardID: "first", generation: model.revealGeneration)
+        model.confirmReveal(cardID: "second", generation: stale)
+        XCTAssertNil(second)
+        XCTAssertNil(model.revealHighlightID)
+        model.confirmReveal(cardID: "second", generation: model.revealGeneration)
+        guard case .success = second else { return XCTFail("visible exact target must succeed") }
+        XCTAssertEqual(model.revealHighlightID, "second")
+    }
+
+    func testDeferredRevealResolvesAfterTreeAndStillWaitsForViewport() {
+        let model = makeModel()
+        var result: EngineRevealResult?
+        model.revealWorkCard("later", productID: "prod_test") { result = $0 }
+        XCTAssertNil(result)
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "later", name: "Later")]))
+        XCTAssertEqual(model.revealScrollTarget, "later")
+        XCTAssertNil(result)
+        model.confirmReveal(cardID: "later", generation: model.revealGeneration)
+        guard case .success = result else { return XCTFail("expected confirmed success") }
+    }
+
+    func testLoadedTreeMissingDeferredTargetFailsWithReason() {
+        let model = makeModel()
+        var result: EngineRevealResult?
+        model.revealWorkCard("missing", productID: "prod_test") { result = $0 }
+        model.applyEventForTest(makeWorkTreeEvent())
+        guard case .failure(.internalFailure(let reason)) = result else {
+            return XCTFail("a loaded tree without the target must fail")
+        }
+        XCTAssertTrue(reason.contains("missing"))
+        XCTAssertTrue(reason.contains("no card"))
+    }
+
     // MARK: - Helpers
 
     private func makeTask(

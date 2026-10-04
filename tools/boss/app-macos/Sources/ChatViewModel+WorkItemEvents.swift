@@ -93,12 +93,9 @@ extension ChatViewModel {
         engine.sendListAttentionItemsForWorkItem(workItemID: product.id)
         engine.sendListAttentionGroups(productId: product.id)
         workErrorMessage = nil
-        if let pending = pendingRevealScrollID {
-            let allIDs = Set(tasks.map(\.id) + chores.map(\.id))
-            if allIDs.contains(pending) {
-                pendingRevealScrollID = nil
-                triggerRevealScroll(pending)
-            }
+        if let pending = pendingRevealScrollID, revealProductID == product.id {
+            pendingRevealScrollID = nil
+            prepareReveal(pending)
         }
         recordPopulationApplyBurst(
             context: popCtx,

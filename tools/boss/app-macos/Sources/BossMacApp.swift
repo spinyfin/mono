@@ -522,7 +522,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Agent-capture path: self-render via cacheDisplay and exit.
         // Never ordered front, never takes focus, no screen-recording grant.
-        if let path = BossCaptureArgs.shared.captureTo {
+        if BossRevealCapture.state != nil {
+            BossRevealCapture.start(updateModel: updateModel)
+        } else if let path = BossCaptureArgs.shared.captureTo {
             BossWindowCapture.scheduleCapture(
                 to: path,
                 after: BossCaptureArgs.shared.captureAfter

@@ -85,6 +85,12 @@ struct WorkBoardSectionItemsView: View {
                         ? mergeFeedback?.message : nil
                 )
                 .id(task.id)
+                .background {
+                    if model.revealScrollTarget == task.id {
+                        RevealCardViewport(cardID: task.id, generation: model.revealGeneration, model: model)
+                            .allowsHitTesting(false)
+                    }
+                }
             }
         }
     }

@@ -165,44 +165,43 @@ extension ChatViewModel {
     /// blocked-only / chores-only toggle, a project filter, or chores
     /// being hidden — all of which can exclude the card and make the
     /// scroll silently land on nothing (#1249). We reset the board to its
-    /// unfiltered state before scrolling so the revealed card is
-    /// guaranteed visible.
+    /// unfiltered state before asking the view to expand and scroll.
     ///
     /// `taskID` itself is not always the card that gets scrolled to/
     /// highlighted — see `revealCardTarget(for:)`: a revision rolled up
     /// onto its parent's card redirects to the parent. The returned
-    /// `RevealCardResult` tells the caller (the `reveal_work_item` IPC
-    /// handler) whether a real card was reached, deferred pending a
-    /// product-tree fetch, or unreachable — so it can answer bossctl
-    /// truthfully instead of always claiming success.
+    /// `RevealCardResult` describes target resolution only. The completion
+    /// reports success only after the view confirms the card is visible.
     @discardableResult
-    func revealWorkCard(_ taskID: String, productID: String) -> RevealCardResult {
-        let outcome = revealCardTarget(for: taskID)
-        let hostCardID: String
-        switch outcome {
-        case .revealed(let cardID):
-            hostCardID = cardID
-        case .deferred:
-            hostCardID = taskID
-        case .unreachable:
-            return outcome
-        }
+    func revealWorkCard(
+        _ taskID: String, productID: String,
+        completion: ((EngineRevealResult) -> Void)? = nil
+    ) -> RevealCardResult {
+        finishReveal(.failure(.internalFailure("reveal superseded by a newer request")))
+        revealGeneration = UUID()
+        revealHighlightID = nil
+        revealCompletion = completion
+        revealProductID = productID
         setNavigationMode(.work)
         clearWorkFiltersForReveal()
-        selectedWorkCardID = hostCardID
-        let isProductSwitch = currentSelectedProductID != productID
-        if isProductSwitch {
-            selectWorkProduct(productID)
-            pendingRevealScrollID = hostCardID
+        let switching = currentSelectedProductID != productID
+        if switching { selectWorkProduct(productID) }
+        let outcome: RevealCardResult
+        if switching || task(withID: taskID) == nil {
+            pendingRevealScrollID = taskID
+            if !switching { engine.sendGetWorkTree(productId: productID, flow: .manualRefresh) }
+            outcome = .deferred
         } else {
-            triggerRevealScroll(hostCardID)
+            outcome = prepareReveal(taskID)
         }
-        revealHighlightID = hostCardID
-        let capturedID = hostCardID
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            if self?.revealHighlightID == capturedID {
-                self?.revealHighlightID = nil
-            }
+        let generation = revealGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.revealGeneration == generation else { return }
+            self.finishReveal(.failure(.internalFailure(
+                "could not reveal \(taskID): " + (self.pendingRevealScrollID != nil
+                    ? "target product work tree did not arrive"
+                    : "target card did not become visible in the board viewport")
+            )))
         }
         return outcome
     }
@@ -220,16 +219,6 @@ extension ChatViewModel {
         filterToChoresOnly = false
         includeChores = true
         reviewReadyOnly = false
-    }
-
-    func triggerRevealScroll(_ taskID: String) {
-        revealScrollTarget = taskID
-        let capturedID = taskID
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            if self?.revealScrollTarget == capturedID {
-                self?.revealScrollTarget = nil
-            }
-        }
     }
 
     func setWorkBoardGrouping(_ grouping: WorkBoardGrouping) {
