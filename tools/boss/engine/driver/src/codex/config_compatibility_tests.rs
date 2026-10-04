@@ -109,3 +109,67 @@ fn expected_guards(kind: WorkerKind, remote: bool, revision: bool) -> Vec<&'stat
     }
     names
 }
+
+#[test]
+fn missing_review_guide_permissions_reports_loader_error() {
+    use boss_engine_codex_hook_trust::{ArmRequest, CommandHookSpec, HookEvent, arm_and_attest};
+    use std::os::unix::fs::PermissionsExt;
+    let binary = PathBuf::from(std::env::var_os("BOSS_TEST_CODEX").expect("Bazel must provide pinned Codex"))
+        .canonicalize()
+        .unwrap();
+    let version = Command::new(&binary).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        format!("codex-cli {}", env!("CODEX_CLI_VERSION")),
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    let guard = root.join("guard.sh");
+    fs::write(&guard, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&guard, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = render_review_guide_config(&workspace, &root.join("guide.sock"));
+    config.push_str(&format!(
+        "\n[[hooks.PreToolUse]]\nmatcher = \".*\"\nhooks = [{{ type = \"command\", command = {} }}]\n",
+        super::toml_basic_string(&guard.display().to_string()),
+    ));
+    let request = ArmRequest {
+        codex_home: home.clone(),
+        config_path: home.join("config.toml"),
+        cwd: workspace,
+        hooks: vec![
+            CommandHookSpec::builder()
+                .event(HookEvent::PreToolUse)
+                .matcher(".*")
+                .command(guard)
+                .build(),
+        ],
+        codex_bin: binary,
+    };
+
+    // Reproduce the pre-fix failure through the unchanged production gate.
+    // No CLI overrides: this is exactly how the pre-spawn observer loads it.
+    fs::write(
+        &request.config_path,
+        config.replace("default_permissions = \"review-guide\"\n", ""),
+    )
+    .unwrap();
+    let error = arm_and_attest(&request).expect_err("missing profile selection must refuse the worker");
+    let text = error.to_string();
+    assert!(text.contains("hooks/list returned no hook entries"), "{text}");
+    assert!(
+        text.contains("default_permissions"),
+        "refusal must carry Codex's loader error, got {text}"
+    );
+
+    fs::write(&request.config_path, config).unwrap();
+    let attestation = arm_and_attest(&request).expect("rendered guide config must load and arm its guard");
+    assert_eq!(attestation.hooks.len(), 1);
+    assert_eq!(attestation.hooks[0].observed_trust_status, "trusted");
+    assert!(attestation.hooks[0].guard_content_sha256.is_some());
+}

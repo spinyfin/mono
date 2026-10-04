@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use super::*;
@@ -471,6 +472,66 @@ fn parse_hooks_list_response_rejects_empty_data() {
 }
 
 #[test]
+fn parse_hooks_list_response_empty_hooks_includes_errors_array() {
+    let resp = serde_json::json!({
+        "id": 2,
+        "result": {
+            "data": [{
+                "cwd": "/tmp/repo",
+                "hooks": [],
+                "errors": [{
+                    "path": "/tmp/home/config.toml",
+                    "message": "config defines `[permissions]` profiles but does not set `default_permissions`"
+                }]
+            }]
+        }
+    });
+    let err = parse_hooks_list_response(&resp).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("hooks/list returned no hook entries"), "{text}");
+    assert!(text.contains("codex reported:"), "{text}");
+    assert!(text.contains("default_permissions"), "{text}");
+    assert!(
+        matches!(err, TrustGateError::ObservationFailed { .. }),
+        "gate must still refuse: {err:?}"
+    );
+}
+
+#[test]
+fn parse_hooks_list_response_empty_hooks_includes_config_warning() {
+    let resp = serde_json::json!({
+        "id": 2,
+        "result": {
+            "data": [{
+                "cwd": "/tmp/repo",
+                "hooks": []
+            }]
+        }
+    });
+    let err = parse_hooks_list_response_with_reports(
+        &resp,
+        &["config defines `[permissions]` profiles but does not set `default_permissions`".into()],
+        "",
+    )
+    .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("hooks/list returned no hook entries"), "{text}");
+    assert!(text.contains("codex reported:"), "{text}");
+    assert!(text.contains("default_permissions"), "{text}");
+}
+
+#[test]
+fn parse_hooks_list_response_empty_hooks_includes_stderr_tail() {
+    let resp = serde_json::json!({
+        "id": 2,
+        "result": { "data": [{ "cwd": "/tmp/repo", "hooks": [] }] }
+    });
+    let err = parse_hooks_list_response_with_reports(&resp, &[], "loader: default_permissions missing").unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("stderr: loader: default_permissions missing"), "{text}");
+}
+
+#[test]
 fn parse_hooks_list_response_extracts_entries() {
     let resp = serde_json::json!({
         "id": 2,
@@ -737,4 +798,195 @@ fn which_codex() -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ── Diagnostics wiring ──────────────────────────────────────────────────────
+
+/// Write an executable fake `codex` that runs `body` as a shell script.
+fn fake_codex(body: &str) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("codex");
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).unwrap();
+    (tmp, path)
+}
+
+/// Shell prologue: answer `initialize`, swallow `initialized` and the request.
+const FAKE_HANDSHAKE: &str = r#"read l1
+echo '{"id":1,"result":{}}'
+read l2
+read l3
+echo '{"method":"configWarning","params":{"summary":"Invalid configuration","details":"WARN-DETAIL no default_permissions"}}'
+echo 'STDERR-LINE-1' >&2
+"#;
+
+fn observe_with_fake(script: &str) -> Result<Observation, TrustGateError> {
+    let (_tmp, bin) = fake_codex(script);
+    let home = tempfile::tempdir().unwrap();
+    CodexAppServerObserver { codex_bin: bin }.observe(home.path(), home.path())
+}
+
+#[test]
+fn observer_refusal_carries_warning_reply_errors_and_stderr() {
+    let err = observe_with_fake(&format!(
+        "{FAKE_HANDSHAKE}echo '{{\"id\":2,\"result\":{{\"data\":[{{\"cwd\":\"/tmp\",\"hooks\":[],\"errors\":[{{\"message\":\"LIST-ERROR\"}}]}}]}}}}'"
+    ))
+    .unwrap_err();
+    let text = err.to_string();
+    for needle in ["no hook entries", "WARN-DETAIL", "LIST-ERROR", "STDERR-LINE-1"] {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+#[test]
+fn observer_rpc_error_carries_warning_and_stderr() {
+    let err = observe_with_fake(&format!(
+        "{FAKE_HANDSHAKE}echo '{{\"id\":2,\"error\":{{\"message\":\"RPC-BOOM\"}}}}'"
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TrustGateError::ObservationFailed { .. }), "{err:?}");
+    let text = err.to_string();
+    for needle in ["RPC-BOOM", "WARN-DETAIL", "STDERR-LINE-1"] {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+#[test]
+fn observer_closed_without_answer_carries_warning_and_stderr() {
+    let err = observe_with_fake(FAKE_HANDSHAKE).unwrap_err();
+    let text = err.to_string();
+    for needle in ["closed without answering", "WARN-DETAIL", "STDERR-LINE-1"] {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+/// Like [`fake_codex`], for scripts that stall until killed. The first exec of
+/// a freshly written script can take seconds on a loaded macOS host (the
+/// system scans it), which would eat a short stall timeout before the script
+/// ever ran. Run it once up front, exiting immediately, so the timed run
+/// measures the stall and not the first-exec scan.
+fn stalling_fake_codex(body: &str) -> (tempfile::TempDir, PathBuf) {
+    let (tmp, bin) = fake_codex(&format!("[ -n \"$FAKE_CODEX_PREWARM\" ] && exit 0\n{body}"));
+    let status = Command::new(&bin)
+        .env("FAKE_CODEX_PREWARM", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("prewarm fake codex");
+    assert!(status.success(), "prewarm fake codex: {status:?}");
+    (tmp, bin)
+}
+
+/// Generous enough that a loaded CI host still finishes the fake handshake
+/// before the deadline; the tests below assert on what was captured by then.
+const STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn short_timeout_server(bin: PathBuf, timeout: Duration) -> app_server::AppServer {
+    app_server::AppServer {
+        program: bin,
+        extra_env: Vec::new(),
+        cwd: None,
+        client_info: app_server::ClientInfo {
+            name: "test".into(),
+            title: None,
+            version: "0".into(),
+        },
+        timeout,
+    }
+}
+
+#[test]
+fn timeout_keeps_a_config_warning_read_before_the_stall() {
+    let (_tmp, bin) = stalling_fake_codex(&format!("{FAKE_HANDSHAKE}exec sleep 30"));
+    let err = short_timeout_server(bin, STALL_TIMEOUT)
+        .request_session("hooks/list", serde_json::json!({}))
+        .unwrap_err();
+    let text = err.to_string();
+    for needle in ["timed out after 5s", "WARN-DETAIL", "STDERR-LINE-1"] {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+#[test]
+fn a_grandchild_holding_stderr_open_cannot_hang_the_session() {
+    // The backgrounded sleep inherits stderr and outlives the killed child.
+    let (_tmp, bin) = stalling_fake_codex(&format!("{FAKE_HANDSHAKE}sleep 20 &\nexec sleep 30"));
+    let started = std::time::Instant::now();
+    let err = short_timeout_server(bin, STALL_TIMEOUT)
+        .request_session("hooks/list", serde_json::json!({}))
+        .unwrap_err();
+    assert!(
+        started.elapsed() < STALL_TIMEOUT + Duration::from_secs(5),
+        "request_session blocked on the stderr drain: {:?}",
+        started.elapsed()
+    );
+    assert!(err.to_string().contains("STDERR-LINE-1"), "{err}");
+}
+
+struct DiagnosticObserver {
+    hooks: Vec<ObservedHook>,
+    diagnostics: Option<String>,
+}
+
+impl TrustObserver for DiagnosticObserver {
+    fn observe_hooks(&self, _codex_home: &Path, _cwd: &Path) -> Result<Vec<ObservedHook>, TrustGateError> {
+        Ok(self.hooks.clone())
+    }
+
+    fn observe(&self, _codex_home: &Path, _cwd: &Path) -> Result<Observation, TrustGateError> {
+        Ok(Observation {
+            hooks: self.hooks.clone(),
+            diagnostics: self.diagnostics.clone(),
+        })
+    }
+}
+
+#[test]
+fn post_observation_refusal_carries_codex_diagnostics_without_changing_the_decision() {
+    let fx = setup_fixture("#!/bin/sh\necho guard\n");
+    let hooks = standard_hooks(&fx);
+    let observed = hooks
+        .iter()
+        .map(|hook| ObservedHook {
+            key: hook_state_key(&fx.config_path, hook.event, hook.group_index, hook.handler_index),
+            trust_status: "untrusted".into(),
+            current_hash: expected_hash(&fx, hook.event, hook.matcher.as_deref()),
+            enabled: true,
+        })
+        .collect();
+    let req = ArmRequest {
+        codex_home: fx.codex_home.clone(),
+        config_path: fx.config_path.clone(),
+        cwd: fx.cwd.clone(),
+        hooks,
+        codex_bin: PathBuf::from("codex"),
+    };
+    let observer = DiagnosticObserver {
+        hooks: observed,
+        diagnostics: Some("codex reported: LOADER-CAUSE; stderr: STDERR-LINE".into()),
+    };
+    let err = arm_and_attest_with_observer(&req, &observer).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("trustStatus=untrusted"), "{text}");
+    assert!(text.contains("LOADER-CAUSE") && text.contains("STDERR-LINE"), "{text}");
+    match err {
+        TrustGateError::WithCodexContext { cause, .. } => {
+            assert!(matches!(*cause, TrustGateError::HookNotTrusted { .. }), "{cause:?}");
+        }
+        other => panic!("expected WithCodexContext, got {other:?}"),
+    }
+}
+
+#[test]
+fn stderr_in_a_refusal_is_a_bounded_single_line() {
+    let long: String = (0..2000).map(|i| format!("line-{i}\n")).collect();
+    let text = format_codex_reports(&[], &long).unwrap();
+    assert!(!text.contains('\n'), "{text}");
+    assert!(text.len() < STDERR_DISPLAY_BYTES + 64, "len={}", text.len());
+    assert!(text.ends_with("line-1999"), "{text}");
+    // The leading partial line is dropped, not shown mid-word.
+    assert!(text.starts_with("stderr: line-"), "{text}");
 }

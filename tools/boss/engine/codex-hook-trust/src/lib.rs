@@ -84,6 +84,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 
+mod stderr_tail;
+
 #[cfg(test)]
 mod tests;
 
@@ -279,6 +281,13 @@ pub enum TrustGateError {
     AttestationStale { detail: String },
     /// Attestation re-check failed: required entry missing.
     AttestationIncomplete { detail: String },
+    /// A post-observation refusal annotated with what Codex itself reported
+    /// (hooks/list errors, configWarnings, stderr). The gate's decision is the
+    /// wrapped `cause`; `context` is display-only.
+    WithCodexContext {
+        cause: Box<TrustGateError>,
+        context: String,
+    },
 }
 
 impl std::fmt::Display for TrustGateError {
@@ -372,6 +381,7 @@ impl std::fmt::Display for TrustGateError {
             Self::AttestationIncomplete { detail } => {
                 write!(f, "Codex hook-trust gate: attestation incomplete: {detail}")
             }
+            Self::WithCodexContext { cause, context } => write!(f, "{cause}; {context}"),
         }
     }
 }
@@ -616,6 +626,23 @@ pub struct ObservedHook {
 /// Codex. Production uses [`CodexAppServerObserver`].
 pub trait TrustObserver {
     fn observe_hooks(&self, codex_home: &Path, cwd: &Path) -> Result<Vec<ObservedHook>, TrustGateError>;
+
+    /// Like [`Self::observe_hooks`], but also carries Codex's own diagnostics
+    /// (hooks/list errors, configWarnings, stderr) so the gate can attach them
+    /// to any later refusal. Observers with no diagnostics keep the default.
+    fn observe(&self, codex_home: &Path, cwd: &Path) -> Result<Observation, TrustGateError> {
+        self.observe_hooks(codex_home, cwd).map(|hooks| Observation {
+            hooks,
+            diagnostics: None,
+        })
+    }
+}
+
+/// Parsed `hooks/list` rows plus the Codex-reported cause text, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observation {
+    pub hooks: Vec<ObservedHook>,
+    pub diagnostics: Option<String>,
 }
 
 /// Live observer: `codex app-server` over stdio, `hooks/list` RPC.
@@ -624,8 +651,8 @@ pub trait TrustObserver {
 ///
 /// Observation is hard-capped by [`OBSERVE_TIMEOUT`]. A hung `read_line` is
 /// not a silent success — the child is killed and the gate refuses.
-/// `stderr` is discarded (`Stdio::null`) so a chatty app-server cannot
-/// deadlock the pipe buffer.
+/// Stderr is drained on a background thread into a bounded tail so a chatty
+/// app-server cannot deadlock the pipe; the tail is attached to the refusal.
 #[derive(Debug, Clone)]
 pub struct CodexAppServerObserver {
     pub codex_bin: PathBuf,
@@ -633,10 +660,14 @@ pub struct CodexAppServerObserver {
 
 impl TrustObserver for CodexAppServerObserver {
     fn observe_hooks(&self, codex_home: &Path, cwd: &Path) -> Result<Vec<ObservedHook>, TrustGateError> {
+        self.observe(codex_home, cwd).map(|observation| observation.hooks)
+    }
+
+    fn observe(&self, codex_home: &Path, cwd: &Path) -> Result<Observation, TrustGateError> {
         // Shared client: spawn + initialize + notifications/initialized +
         // method, under OBSERVE_TIMEOUT, then kill/reap. Never passes a
         // bypass-hook-trust flag or env.
-        let result = AppServer {
+        let session = AppServer {
             program: self.codex_bin.clone(),
             extra_env: vec![("CODEX_HOME".into(), codex_home.display().to_string())],
             cwd: Some(cwd.to_path_buf()),
@@ -647,45 +678,74 @@ impl TrustObserver for CodexAppServerObserver {
             },
             timeout: OBSERVE_TIMEOUT,
         }
-        .request("hooks/list", serde_json::json!({}))
+        .request_session("hooks/list", serde_json::json!({}))
         .map_err(|err| TrustGateError::ObservationFailed {
             detail: err.to_string(),
         })?;
-        parse_hooks_list_response(&serde_json::json!({ "result": result }))
+        parse_observation(
+            &serde_json::json!({ "result": session.result }),
+            &session.config_warnings,
+            &session.stderr_tail,
+        )
     }
 }
 
+#[cfg(test)]
 fn parse_hooks_list_response(resp: &JsonValue) -> Result<Vec<ObservedHook>, TrustGateError> {
+    parse_hooks_list_response_with_reports(resp, &[], "")
+}
+
+#[cfg(test)]
+fn parse_hooks_list_response_with_reports(
+    resp: &JsonValue,
+    extra_reports: &[String],
+    stderr_tail: &str,
+) -> Result<Vec<ObservedHook>, TrustGateError> {
+    parse_observation(resp, extra_reports, stderr_tail).map(|observation| observation.hooks)
+}
+
+fn parse_observation(
+    resp: &JsonValue,
+    extra_reports: &[String],
+    stderr_tail: &str,
+) -> Result<Observation, TrustGateError> {
+    let mut reports = Vec::new();
+    for extra in extra_reports {
+        push_unique_report(&mut reports, extra);
+    }
+
     let result = resp.get("result").ok_or_else(|| TrustGateError::ObservationFailed {
-        detail: format!("hooks/list response missing result: {resp}"),
+        detail: extend_observation_detail(
+            format!("hooks/list response missing result: {resp}"),
+            &reports,
+            stderr_tail,
+        ),
     })?;
-    // Shape: { "data": [ { "cwd": "...", "hooks": [ {...}, ... ] } ] }
+    collect_hooks_list_reports(result, &mut reports);
+
+    let fail = |detail: String| TrustGateError::ObservationFailed {
+        detail: extend_observation_detail(detail, &reports, stderr_tail),
+    };
+
+    // Shape: { "data": [ { "cwd": "...", "hooks": [ {...}, ... ], "errors": [...] } ] }
     let data = result
         .get("data")
         .and_then(|d| d.as_array())
-        .ok_or_else(|| TrustGateError::ObservationFailed {
-            detail: "hooks/list result.data missing or not an array".into(),
-        })?;
+        .ok_or_else(|| fail("hooks/list result.data missing or not an array".into()))?;
     if data.is_empty() {
-        return Err(TrustGateError::ObservationFailed {
-            detail: "hooks/list returned empty data — silence is not success".into(),
-        });
+        return Err(fail("hooks/list returned empty data — silence is not success".into()));
     }
     let mut out = Vec::new();
     for group in data {
         let hooks = group
             .get("hooks")
             .and_then(|h| h.as_array())
-            .ok_or_else(|| TrustGateError::ObservationFailed {
-                detail: "hooks/list group missing hooks array".into(),
-            })?;
+            .ok_or_else(|| fail("hooks/list group missing hooks array".into()))?;
         for h in hooks {
             let key = h
                 .get("key")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| TrustGateError::ObservationFailed {
-                    detail: "hook entry missing key".into(),
-                })?
+                .ok_or_else(|| fail("hook entry missing key".into()))?
                 .to_string();
             let trust_status = h
                 .get("trustStatus")
@@ -701,9 +761,9 @@ fn parse_hooks_list_response(resp: &JsonValue) -> Result<Vec<ObservedHook>, Trus
                 .to_string();
             let enabled = h.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
             if trust_status.is_empty() || current_hash.is_empty() {
-                return Err(TrustGateError::ObservationFailed {
-                    detail: format!("hook `{key}` missing trustStatus/currentHash — unobservable arming"),
-                });
+                return Err(fail(format!(
+                    "hook `{key}` missing trustStatus/currentHash — unobservable arming"
+                )));
             }
             out.push(ObservedHook {
                 key,
@@ -714,11 +774,97 @@ fn parse_hooks_list_response(resp: &JsonValue) -> Result<Vec<ObservedHook>, Trus
         }
     }
     if out.is_empty() {
-        return Err(TrustGateError::ObservationFailed {
-            detail: "hooks/list returned no hook entries — silence is not success".into(),
-        });
+        return Err(fail(
+            "hooks/list returned no hook entries — silence is not success".into(),
+        ));
     }
-    Ok(out)
+    Ok(Observation {
+        hooks: out,
+        diagnostics: format_codex_reports(&reports, stderr_tail),
+    })
+}
+
+fn collect_hooks_list_reports(result: &JsonValue, reports: &mut Vec<String>) {
+    push_error_values(reports, result.get("errors"));
+    let Some(data) = result.get("data").and_then(|d| d.as_array()) else {
+        return;
+    };
+    for group in data {
+        push_error_values(reports, group.get("errors"));
+    }
+}
+
+fn push_error_values(reports: &mut Vec<String>, value: Option<&JsonValue>) {
+    let Some(items) = value.and_then(|v| v.as_array()) else {
+        return;
+    };
+    for item in items {
+        if let Some(message) = item.as_str() {
+            push_unique_report(reports, message);
+        } else if let Some(message) = item.get("message").and_then(|m| m.as_str()) {
+            push_unique_report(reports, message);
+        }
+    }
+}
+
+fn push_unique_report(reports: &mut Vec<String>, message: &str) {
+    let message = message.trim();
+    if message.is_empty() {
+        return;
+    }
+    if reports.iter().any(|existing| existing == message) {
+        return;
+    }
+    reports.push(message.to_string());
+}
+
+fn format_codex_reports(reports: &[String], stderr_tail: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    if !reports.is_empty() {
+        parts.push(format!("codex reported: {}", reports.join("; ")));
+    }
+    let stderr = display_stderr(stderr_tail);
+    if !stderr.is_empty() {
+        parts.push(format!("stderr: {stderr}"));
+    }
+    if parts.is_empty() { None } else { Some(parts.join("; ")) }
+}
+
+/// Bytes of stderr shown in a refusal. The capture buffer is larger; the
+/// text that lands in spawn-aborted records and failure reasons is not.
+const STDERR_DISPLAY_BYTES: usize = 2 * 1024;
+
+/// Last [`STDERR_DISPLAY_BYTES`] of `tail` on a single line: lines are
+/// joined with ` | `, and a leading partial line is dropped when the tail
+/// had to be cut.
+fn display_stderr(tail: &str) -> String {
+    const SEPARATOR: &str = " | ";
+    let joined = tail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(SEPARATOR);
+    if joined.len() <= STDERR_DISPLAY_BYTES {
+        return joined;
+    }
+    let mut start = joined.len() - STDERR_DISPLAY_BYTES;
+    while !joined.is_char_boundary(start) {
+        start += 1;
+    }
+    let shown = &joined[start..];
+    match shown.find(SEPARATOR) {
+        Some(at) => shown[at + SEPARATOR.len()..].to_string(),
+        None => shown.to_string(),
+    }
+}
+
+fn extend_observation_detail(base: String, reports: &[String], stderr_tail: &str) -> String {
+    match format_codex_reports(reports, stderr_tail) {
+        Some(extra) if base.is_empty() => extra,
+        Some(extra) => format!("{base}; {extra}"),
+        None => base,
+    }
 }
 
 // ── Full gate ───────────────────────────────────────────────────────────────
@@ -770,52 +916,66 @@ pub fn arm_and_attest_with_observer<O: TrustObserver>(
     let stamped_map: BTreeMap<String, String> = stamped.into_iter().collect();
 
     // 4. Observe — silence is not success.
-    let observed = observer.observe_hooks(&codex_home, &request.cwd)?;
+    let Observation {
+        hooks: observed,
+        diagnostics,
+    } = observer.observe(&codex_home, &request.cwd)?;
     let observed_map: BTreeMap<String, ObservedHook> = observed.into_iter().map(|h| (h.key.clone(), h)).collect();
 
-    let mut entries = Vec::with_capacity(request.hooks.len());
-    for hook in &request.hooks {
-        let command = resolve_absolute(&hook.command);
-        let command_str = command.to_string_lossy().into_owned();
-        let key = hook_state_key(&config_path, hook.event, hook.group_index, hook.handler_index);
-        let stamped_hash = stamped_map
-            .get(&key)
-            .ok_or_else(|| TrustGateError::AttestationIncomplete {
-                detail: format!("stamped map missing key `{key}`"),
-            })?;
-        let obs = observed_map
-            .get(&key)
-            .ok_or_else(|| TrustGateError::HookNotListed { key: key.clone() })?;
+    // Every refusal below keeps its decision; Codex's own cause rides along.
+    let entries = (|| {
+        let mut entries = Vec::with_capacity(request.hooks.len());
+        for hook in &request.hooks {
+            let command = resolve_absolute(&hook.command);
+            let command_str = command.to_string_lossy().into_owned();
+            let key = hook_state_key(&config_path, hook.event, hook.group_index, hook.handler_index);
+            let stamped_hash = stamped_map
+                .get(&key)
+                .ok_or_else(|| TrustGateError::AttestationIncomplete {
+                    detail: format!("stamped map missing key `{key}`"),
+                })?;
+            let obs = observed_map
+                .get(&key)
+                .ok_or_else(|| TrustGateError::HookNotListed { key: key.clone() })?;
 
-        if !obs.enabled {
-            return Err(TrustGateError::HookNotEnabled { key: key.clone() });
-        }
-        if !obs.trust_status.eq_ignore_ascii_case("trusted") {
-            return Err(TrustGateError::HookNotTrusted {
+            if !obs.enabled {
+                return Err(TrustGateError::HookNotEnabled { key: key.clone() });
+            }
+            if !obs.trust_status.eq_ignore_ascii_case("trusted") {
+                return Err(TrustGateError::HookNotTrusted {
+                    key: key.clone(),
+                    status: obs.trust_status.clone(),
+                    current_hash: obs.current_hash.clone(),
+                    stamped_hash: stamped_hash.clone(),
+                });
+            }
+            if obs.current_hash != *stamped_hash {
+                return Err(TrustGateError::HashMismatch {
+                    key: key.clone(),
+                    stamped: stamped_hash.clone(),
+                    observed: obs.current_hash.clone(),
+                });
+            }
+
+            entries.push(HookAttestationEntry {
                 key: key.clone(),
-                status: obs.trust_status.clone(),
-                current_hash: obs.current_hash.clone(),
-                stamped_hash: stamped_hash.clone(),
+                event: hook.event.key_label().to_string(),
+                command: command_str,
+                matcher: hook.matcher.clone(),
+                trusted_hash: stamped_hash.clone(),
+                guard_content_sha256: content_hashes.get(&key).cloned().flatten(),
+                observed_trust_status: obs.trust_status.clone(),
             });
         }
-        if obs.current_hash != *stamped_hash {
-            return Err(TrustGateError::HashMismatch {
-                key: key.clone(),
-                stamped: stamped_hash.clone(),
-                observed: obs.current_hash.clone(),
-            });
-        }
-
-        entries.push(HookAttestationEntry {
-            key: key.clone(),
-            event: hook.event.key_label().to_string(),
-            command: command_str,
-            matcher: hook.matcher.clone(),
-            trusted_hash: stamped_hash.clone(),
-            guard_content_sha256: content_hashes.get(&key).cloned().flatten(),
-            observed_trust_status: obs.trust_status.clone(),
-        });
-    }
+        Ok(entries)
+    })()
+    .map_err(|err| match diagnostics {
+        Some(context) => TrustGateError::WithCodexContext {
+            cause: Box::new(err),
+            context,
+        },
+        None => err,
+    })?;
 
     let generated_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1113,7 +1273,7 @@ pub mod app_server {
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::Duration;
 
@@ -1181,18 +1341,36 @@ pub mod app_server {
     pub enum ServerLine {
         Result(String),
         Error(String),
+        /// `configWarning` notification. The string is Codex's details (or
+        /// summary/message when details is absent).
+        ConfigWarning(String),
         Other,
+    }
+
+    /// One completed app-server RPC, plus diagnostics collected during the
+    /// session. Quota probes use [`AppServer::request`] and ignore these;
+    /// the hook-trust gate folds them into [`super::TrustGateError`].
+    #[derive(Debug, Clone)]
+    pub struct Session {
+        pub result: serde_json::Value,
+        pub config_warnings: Vec<String>,
+        pub stderr_tail: String,
     }
 
     /// Classify one stdout line against `awaiting_id`.
     ///
     /// The app-server interleaves unsolicited notifications with replies, so a
     /// caller cannot take the next line — it matches on `id` and ignores
-    /// everything else, including non-JSON noise.
+    /// everything else, including non-JSON noise. `configWarning` is kept:
+    /// Codex reports loader failures there (and as `hooks/list` `errors`)
+    /// while still answering with `hooks: []`.
     pub fn classify_line(line: &str, awaiting_id: u64) -> ServerLine {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             return ServerLine::Other;
         };
+        if let Some(warning) = config_warning_text(&value) {
+            return ServerLine::ConfigWarning(warning);
+        }
         if value.get("id").and_then(serde_json::Value::as_u64) != Some(awaiting_id) {
             return ServerLine::Other;
         }
@@ -1209,6 +1387,25 @@ pub mod app_server {
             Some(result) => ServerLine::Result(result.to_string()),
             None => ServerLine::Error("reply carried neither `result` nor `error`".to_owned()),
         }
+    }
+
+    fn config_warning_text(value: &serde_json::Value) -> Option<String> {
+        let method = value.get("method")?.as_str()?;
+        if method != "configWarning" && !method.ends_with("/configWarning") {
+            return None;
+        }
+        let params = value.get("params")?;
+        for key in ["details", "summary", "message"] {
+            if let Some(text) = params
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(text.to_string());
+            }
+        }
+        None
     }
 
     fn request_value(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -1254,7 +1451,11 @@ pub mod app_server {
         Ok(())
     }
 
-    fn read_until_id(reader: &mut BufReader<ChildStdout>, want_id: u64) -> Result<serde_json::Value, Error> {
+    fn read_until_id(
+        reader: &mut impl BufRead,
+        want_id: u64,
+        warnings: &Mutex<Vec<String>>,
+    ) -> Result<serde_json::Value, Error> {
         let mut line = String::new();
         for _ in 0..200 {
             line.clear();
@@ -1268,6 +1469,11 @@ pub mod app_server {
             }
             match classify_line(line.trim(), want_id) {
                 ServerLine::Other => continue,
+                ServerLine::ConfigWarning(message) => {
+                    let mut warnings = warnings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    super::push_unique_report(&mut warnings, &message);
+                    continue;
+                }
                 ServerLine::Error(message) => {
                     return Err(Error::Rpc {
                         method: format!("id={want_id}"),
@@ -1292,32 +1498,67 @@ pub mod app_server {
         client_info: ClientInfo,
         method: String,
         params: serde_json::Value,
+        warnings: &Mutex<Vec<String>>,
     ) -> Result<serde_json::Value, Error> {
-        let mut reader = BufReader::new(stdout);
-        write_rpc_line(
-            &mut stdin,
-            &request_value(ID_INITIALIZE, "initialize", initialize_params(&client_info)),
-        )?;
-        let _init = read_until_id(&mut reader, ID_INITIALIZE).map_err(|err| match err {
-            Error::Rpc { message, .. } => Error::Rpc {
-                method: "initialize".into(),
-                message,
+        (|| {
+            let mut reader = BufReader::new(stdout);
+            write_rpc_line(
+                &mut stdin,
+                &request_value(ID_INITIALIZE, "initialize", initialize_params(&client_info)),
+            )?;
+            let _init = read_until_id(&mut reader, ID_INITIALIZE, warnings).map_err(|err| match err {
+                Error::Rpc { message, .. } => Error::Rpc {
+                    method: "initialize".into(),
+                    message,
+                },
+                other => other,
+            })?;
+            write_rpc_line(&mut stdin, &initialized_notification())?;
+            write_rpc_line(&mut stdin, &request_value(ID_REQUEST, &method, params))?;
+            read_until_id(&mut reader, ID_REQUEST, warnings).map_err(|err| match err {
+                Error::Io { detail } if detail.contains("closed stdout") => Error::Closed { method },
+                Error::Rpc { message, .. } => Error::Rpc { method, message },
+                other => other,
+            })
+        })()
+    }
+
+    fn attach_session_diagnostics(err: Error, warnings: &[String], stderr_tail: &str) -> Error {
+        let Some(extra) = super::format_codex_reports(warnings, stderr_tail) else {
+            return err;
+        };
+        match err {
+            Error::Io { detail } => Error::Io {
+                detail: format!("{detail}; {extra}"),
             },
-            other => other,
-        })?;
-        write_rpc_line(&mut stdin, &initialized_notification())?;
-        write_rpc_line(&mut stdin, &request_value(ID_REQUEST, &method, params))?;
-        read_until_id(&mut reader, ID_REQUEST).map_err(|err| match err {
-            Error::Io { detail } if detail.contains("closed stdout") => Error::Closed { method },
-            Error::Rpc { message, .. } => Error::Rpc { method, message },
-            other => other,
-        })
+            Error::Spawn { program, detail } => Error::Spawn {
+                program,
+                detail: format!("{detail}; {extra}"),
+            },
+            Error::Rpc { method, message } => Error::Rpc {
+                method,
+                message: format!("{message}; {extra}"),
+            },
+            Error::Timeout { after } => Error::Io {
+                detail: format!("codex app-server timed out after {}s; {extra}", after.as_secs()),
+            },
+            Error::Closed { method } => Error::Io {
+                detail: format!("codex app-server closed without answering {method}; {extra}"),
+            },
+            Error::NotFound { program } => Error::NotFound { program },
+        }
     }
 
     impl AppServer {
         /// Spawn `codex app-server --listen stdio://`, handshake, call `method`,
         /// then kill the child. Returns the JSON-RPC `result` payload.
         pub fn request(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, Error> {
+            self.request_session(method, params).map(|session| session.result)
+        }
+
+        /// Like [`Self::request`], but keeps `configWarning` notifications and
+        /// a bounded stderr tail so a refusal can name Codex's actual cause.
+        pub fn request_session(&self, method: &str, params: serde_json::Value) -> Result<Session, Error> {
             let mut command = Command::new(&self.program);
             command.args(APP_SERVER_ARGS);
             if let Some(cwd) = &self.cwd {
@@ -1329,7 +1570,7 @@ pub mod app_server {
             command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null());
+                .stderr(Stdio::piped());
 
             let mut child = match command.spawn() {
                 Ok(child) => child,
@@ -1352,17 +1593,30 @@ pub mod app_server {
             let stdout = child.stdout.take().ok_or_else(|| Error::Io {
                 detail: "app-server stdout not piped".into(),
             })?;
+            let stderr_shared = Arc::new(Mutex::new(Vec::new()));
+            let (stderr_done_tx, stderr_done_rx) = mpsc::channel();
+            if let Some(stderr) = child.stderr.take() {
+                let shared = Arc::clone(&stderr_shared);
+                thread::spawn(move || {
+                    crate::stderr_tail::drain_into(stderr, &shared, crate::stderr_tail::STDERR_TAIL_BYTES);
+                    let _ = stderr_done_tx.send(());
+                });
+            }
 
+            // Shared with the drive thread so warnings read before a stall
+            // survive the timeout / disconnect paths.
+            let warnings = Arc::new(Mutex::new(Vec::new()));
             let (tx, rx) = mpsc::channel();
             let client_info = self.client_info.clone();
             let method_owned = method.to_owned();
+            let drive_warnings = Arc::clone(&warnings);
             thread::spawn(move || {
-                let result = drive_request(stdin, stdout, client_info, method_owned, params);
-                let _ = tx.send(result);
+                let output = drive_request(stdin, stdout, client_info, method_owned, params, &drive_warnings);
+                let _ = tx.send(output);
             });
 
-            let result = match rx.recv_timeout(self.timeout) {
-                Ok(r) => r,
+            let driven = match rx.recv_timeout(self.timeout) {
+                Ok(output) => output,
                 Err(mpsc::RecvTimeoutError::Timeout) => Err(Error::Timeout { after: self.timeout }),
                 Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::Io {
                     detail: "app-server observer thread disconnected before responding".into(),
@@ -1371,7 +1625,20 @@ pub mod app_server {
 
             let _ = child.kill();
             let _ = child.wait();
-            result
+            // A descendant can keep the stderr pipe open after the child dies,
+            // so never join: wait a short grace, then use what was captured.
+            let _ = stderr_done_rx.recv_timeout(crate::stderr_tail::STDERR_DRAIN_GRACE);
+            let stderr_tail = crate::stderr_tail::snapshot(&stderr_shared);
+            let config_warnings = warnings.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+
+            match driven {
+                Ok(result) => Ok(Session {
+                    result,
+                    config_warnings,
+                    stderr_tail,
+                }),
+                Err(err) => Err(attach_session_diagnostics(err, &config_warnings, &stderr_tail)),
+            }
         }
     }
 
@@ -1427,6 +1694,57 @@ pub mod app_server {
         fn unsolicited_notification_is_ignored() {
             let line = r#"{"method":"remoteControl/status/changed","params":{"status":"disabled"}}"#;
             assert_eq!(classify_line(line, ID_REQUEST), ServerLine::Other);
+        }
+
+        #[test]
+        fn config_warning_notification_is_captured() {
+            let line = serde_json::json!({
+                "method": "configWarning",
+                "params": {
+                    "summary": "Invalid configuration; using defaults.",
+                    "details": "config defines `[permissions]` profiles but does not set `default_permissions`"
+                }
+            })
+            .to_string();
+            match classify_line(&line, ID_REQUEST) {
+                ServerLine::ConfigWarning(message) => {
+                    assert!(
+                        message.contains("default_permissions"),
+                        "expected details, got {message}"
+                    );
+                }
+                other => panic!("expected a configWarning, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn config_warning_falls_back_to_summary_when_details_absent() {
+            let line = r#"{"method":"configWarning","params":{"summary":"Invalid configuration; using defaults."}}"#;
+            match classify_line(line, ID_INITIALIZE) {
+                ServerLine::ConfigWarning(message) => {
+                    assert!(message.contains("Invalid configuration"), "{message}");
+                }
+                other => panic!("expected a configWarning, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn read_until_id_collects_config_warning_emitted_before_the_result() {
+            let stdout = concat!(
+                r#"{"method":"configWarning","params":{"summary":"Invalid configuration; using defaults.","details":"config defines `[permissions]` profiles but does not set `default_permissions`"}}"#,
+                "\n",
+                r#"{"id":2,"result":{"data":[{"cwd":"/tmp","hooks":[]}]}}"#,
+                "\n",
+            );
+            let mut reader = BufReader::new(std::io::Cursor::new(stdout));
+            let warnings = Mutex::new(Vec::new());
+            let result = read_until_id(&mut reader, ID_REQUEST, &warnings).expect("result");
+            let warnings = warnings.into_inner().unwrap();
+            assert!(
+                warnings.iter().any(|w| w.contains("default_permissions")),
+                "warnings={warnings:?}"
+            );
+            assert_eq!(result["data"][0]["hooks"], serde_json::json!([]));
         }
 
         #[test]
