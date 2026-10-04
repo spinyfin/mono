@@ -21,8 +21,9 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         let session = model.slots.first(where: { $0.slotId == 1 })?.session
         XCTAssertEqual(session?.launchSpec.initialInput, "exec tmux -S '/state/boss/tmux.sock' attach-session -t 'boss-1-run-tmux'\n")
         XCTAssertTrue(session?.launchSpec.env.isEmpty ?? false)
+        XCTAssertEqual(session?.launchSpec.workingDirectory, FileManager.default.homeDirectoryForCurrentUser.path)
 
-        let launch = EngineSpawnRequest(attaching: EngineAttachRequest(
+        let launch = WorkerViewerLaunch(attaching: EngineAttachRequest(
             runId: "run-tmux",
             slotId: 1,
             sessionName: "boss-1-run-tmux",
