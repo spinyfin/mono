@@ -1941,57 +1941,6 @@ pub(crate) struct ProductCreateArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct ProductUpdateArgs {
-    pub(crate) selector: String,
-
-    #[arg(long)]
-    pub(crate) name: Option<String>,
-
-    #[arg(long)]
-    pub(crate) description: Option<String>,
-
-    #[arg(long = "repo")]
-    #[arg(alias = "repo-remote-url")]
-    pub(crate) repo_remote_url: Option<String>,
-
-    /// Set or clear the per-product design-task repo override. Pass a
-    /// URL to set it, `""` to clear, or omit to leave unchanged. See
-    /// `ProductCreateArgs::design_repo`.
-    #[arg(long = "design-repo")]
-    pub(crate) design_repo: Option<String>,
-
-    /// Set or clear the per-product investigation-task ("docs") repo
-    /// override. Pass a URL to set it, `""` to clear (→ fall through to
-    /// `BOSS_USER_DOCS_REPO`), or omit to leave unchanged. See
-    /// `ProductCreateArgs::docs_repo`.
-    #[arg(long = "docs-repo")]
-    pub(crate) docs_repo: Option<String>,
-
-    #[arg(long)]
-    pub(crate) status: Option<ProductStatus>,
-
-    /// Text prepended to every worker's initial context at spawn time,
-    /// wrapped in visible `[product-preamble]…[/product-preamble]`
-    /// markers. Pass `""` to clear an existing preamble.
-    #[arg(long)]
-    pub(crate) dispatch_preamble: Option<String>,
-
-    /// Markdown guidance injected into the `[product-design-guidance]…[/product-design-guidance]`
-    /// block of the design-task prompt directive only — unlike
-    /// `--dispatch-preamble`, it never reaches other execution kinds on this
-    /// product. Pass `""` to clear an existing value.
-    #[arg(long = "design-guidance")]
-    pub(crate) design_guidance: Option<String>,
-
-    /// Set or clear the leading prefix for worker branch names. Pass a
-    /// prefix to set it (e.g. `bduff/`), `""` to clear (→ engine
-    /// default `boss/`), or omit to leave unchanged. A trailing `/` is
-    /// added if you omit it. See `ProductCreateArgs::worker_branch_prefix`.
-    #[arg(long = "worker-branch-prefix")]
-    pub(crate) worker_branch_prefix: Option<String>,
-}
-
-#[derive(Debug, Clone, Args)]
 pub(crate) struct ProjectListArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
@@ -2049,30 +1998,6 @@ pub(crate) struct ProjectShowArgs {
     /// Project id, short id (#42 or 42), or slug.
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) selector: String,
-}
-
-#[derive(Debug, Clone, Args)]
-pub(crate) struct ProjectUpdateArgs {
-    #[arg(long)]
-    pub(crate) product: Option<String>,
-
-    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
-    pub(crate) selector: String,
-
-    #[arg(long)]
-    pub(crate) name: Option<String>,
-
-    #[arg(long)]
-    pub(crate) description: Option<String>,
-
-    #[arg(long)]
-    pub(crate) goal: Option<String>,
-
-    #[arg(long)]
-    pub(crate) status: Option<ProjectStatusArg>,
-
-    #[arg(long)]
-    pub(crate) priority: Option<ProjectPriority>,
 }
 
 /// Args for `boss project set-design-doc`. Either `--path` (with

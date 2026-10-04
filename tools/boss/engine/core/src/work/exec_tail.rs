@@ -620,9 +620,14 @@ impl WorkDb {
     ) -> Result<bool> {
         let upstream_checksum = content_checksum(upstream_title, upstream_body);
         let boss_checksum = content_checksum(new_name, new_description);
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let Some(task) = query_task(&tx, work_item_id)?.filter(|task| task.deleted_at.is_none()) else {
+            return Ok(false);
+        };
+        super::description_guard::validate_description_update(&task.description, new_description, false)?;
         let now = now_string();
-        let n = conn.execute(
+        let n = tx.execute(
             "UPDATE tasks
              SET name                               = ?2,
                  description                        = ?3,
@@ -640,6 +645,7 @@ impl WorkDb {
                 now
             ],
         )?;
+        tx.commit()?;
         Ok(n > 0)
     }
 }
