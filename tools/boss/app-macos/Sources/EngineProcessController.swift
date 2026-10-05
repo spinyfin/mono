@@ -297,6 +297,15 @@ final class EngineProcessController: @unchecked Sendable {
                     emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to \(describe(running))")
                     return
                 }
+                // Never stop an engine that has live workers: the upgrade would kill
+                // them. Attach instead; the app's idle applier restarts the engine
+                // later, once nothing is live. An engine too old to report a count
+                // (nil) is replaced as before, since that is the only way it can
+                // ever pick up the field.
+                if let live = socketControl.liveWorkerCount(socketPath: running.socketPath, timeoutSeconds: 3.0), live > 0 {
+                    emit("[engine upgrade deferred] running=\(runningFP) bundled=\(bundledFP) — \(live) live worker(s); attaching to \(describe(running))")
+                    return
+                }
                 emit("[engine upgrade] running=\(runningFP) bundled=\(bundledFP) — replacing \(describe(running))")
                 try stopRunningEngine(running)
                 emit("[engine upgrade] old engine stopped — launching new engine from bundle")
@@ -423,11 +432,26 @@ final class EngineProcessController: @unchecked Sendable {
     /// so a concurrent `start()` can't race and end up with two
     /// engines fighting over the same socket. Safe to call when no
     /// engine is running — falls through to the launch step.
-    func restart() throws {
+    ///
+    /// With `onlyIfNoLiveWorkers`, the check happens here, under the start lock
+    /// and immediately before the engine is stopped, so a worker dispatched after
+    /// the caller decided to restart is not killed. Returns `false` when the
+    /// restart was skipped for that reason (the engine is left running).
+    @discardableResult
+    func restart(onlyIfNoLiveWorkers: Bool = false) throws -> Bool {
         disableSupervision()
+        var skipped = false
         do {
             try withStartLock {
                 if let running = discoverRunningEngine() {
+                    if onlyIfNoLiveWorkers,
+                       let live = socketControl.liveWorkerCount(socketPath: running.socketPath, timeoutSeconds: 3.0),
+                       live > 0
+                    {
+                        emit("[engine restart deferred] \(live) live worker(s); keeping \(describe(running))")
+                        skipped = true
+                        return
+                    }
                     emit("[engine restart] terminating existing engine \(describe(running))")
                     try stopRunningEngine(running)
                 }
@@ -440,6 +464,7 @@ final class EngineProcessController: @unchecked Sendable {
                 emit("[engine restart] detached pid=\(pid) socket=\(socketPath) \(command)")
             }
             enableSupervision(resetRestartBudget: true)
+            return !skipped
         } catch {
             reportLaunchFailure(error, attempt: nil)
             throw error

@@ -273,6 +273,32 @@ final class EngineProcessControllerTests: XCTestCase {
         XCTAssertTrue(fixture.processObserver.signals.isEmpty)
     }
 
+    func testLaunchTimeUpgradeDoesNotStopAnEngineWithLiveWorkers() throws {
+        let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
+        fixture.socketControl.liveWorkers = 2
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
+    }
+
+    func testGuardedRestartLeavesAnEngineWithLiveWorkersRunning() throws {
+        let fixture = try Fixture(reachableSocket: .primary)
+        fixture.socketControl.liveWorkers = 1
+        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, _ in 4242 }
+        defer { controller.stop() }
+
+        XCTAssertFalse(try controller.restart(onlyIfNoLiveWorkers: true))
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+    }
+
     func testStopEscalatesSIGTERMThenSIGKILLWhenPidSurvivesSocketClose() throws {
         let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
         fixture.processObserver.markRunning(fixture.runningPid)
@@ -485,6 +511,8 @@ private extension EngineProcessControllerTests {
         private let runningPid: pid_t?
         private var requests: [String] = []
         private var shutdowns: [String] = []
+        /// What the engine reports as live; `nil` models an engine that predates the field.
+        var liveWorkers: Int?
 
         init(reachableSocket: String, expectedFingerprint: String?, runningPid: pid_t?) {
             self.reachableSocket = reachableSocket
@@ -511,6 +539,10 @@ private extension EngineProcessControllerTests {
         func fingerprint(socketPath: String, timeoutSeconds _: Double) -> String? {
             lock.withLock { requests.append(socketPath) }
             return expectedFingerprint
+        }
+
+        func liveWorkerCount(socketPath _: String, timeoutSeconds _: Double) -> Int? {
+            liveWorkers
         }
 
         func shutdown(socketPath: String, tokenPath _: String, timeoutSeconds _: Double) throws -> pid_t? {

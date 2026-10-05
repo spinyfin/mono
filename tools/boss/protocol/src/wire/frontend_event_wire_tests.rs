@@ -1517,6 +1517,7 @@ fn tag_cases() -> Vec<TagCase> {
                 git_sha: "abc123".into(),
                 build_time: "2026-01-01T00:00:00Z".into(),
                 binary_fingerprint: "def456".into(),
+                live_worker_count: Some(0),
             },
             expected_tag: "engine_version_result",
         },

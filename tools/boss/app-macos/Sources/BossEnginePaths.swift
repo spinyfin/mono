@@ -236,11 +236,16 @@ protocol EngineSocketControlling: Sendable {
     func isReachable(socketPath: String, timeoutSeconds: Double) -> Bool
     func peerPID(socketPath: String, timeoutSeconds: Double) -> pid_t?
     func fingerprint(socketPath: String, timeoutSeconds: Double) -> String?
+    /// Workers the engine reports as spawning, working, waiting or idle at a
+    /// prompt. `nil` when the engine did not answer or predates the field.
+    func liveWorkerCount(socketPath: String, timeoutSeconds: Double) -> Int?
     func shutdown(socketPath: String, tokenPath: String, timeoutSeconds: Double) throws -> pid_t?
     func waitForClose(socketPath: String, timeoutSeconds: Double) -> Bool
 }
 
 extension EngineSocketControlling {
+    func liveWorkerCount(socketPath _: String, timeoutSeconds _: Double) -> Int? { nil }
+
     func isReachable(socketPath: String) -> Bool {
         isReachable(socketPath: socketPath, timeoutSeconds: 1)
     }
@@ -288,6 +293,19 @@ struct EngineSocketControl: EngineSocketControlling {
             return nil
         }
         return payload["binary_fingerprint"] as? String
+    }
+
+    func liveWorkerCount(socketPath: String, timeoutSeconds: Double) -> Int? {
+        guard let payload = request(
+            socketPath: socketPath,
+            requestID: "live-worker-check",
+            payload: ["type": "get_engine_version"],
+            timeoutSeconds: timeoutSeconds
+        ), payload["type"] as? String == "engine_version_result"
+        else {
+            return nil
+        }
+        return (payload["live_worker_count"] as? NSNumber)?.intValue
     }
 
     func readShutdownCredential(tokenPath: String) throws -> ShutdownCredential {

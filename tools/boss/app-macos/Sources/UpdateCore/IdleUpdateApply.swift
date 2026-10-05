@@ -3,7 +3,7 @@ import os.log
 
 private let idleApplyLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "updater")
 
-// Applying a published release without waiting for the operator to quit.
+// Applying a published release without waiting for an app quit.
 //
 // The engine ships inside the app bundle and follows it, so "get the engine onto
 // the newest release" means "swap the bundle and relaunch the app" — the launch-time
@@ -16,13 +16,13 @@ private let idleApplyLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category
 // - Never when the engine is unreachable, because then the worker count is stale.
 // - Never over a dev build.
 // - Unattended (automatic mode) applies also wait for a quiet period with no live
-//   workers and for the operator to be away from the keyboard.
+//   workers and for the user to be away from the keyboard.
 
 /// Everything the apply-at-idle decision reads, captured at one instant.
 public struct IdleApplySnapshot: Equatable, Sendable {
     public var mode: UpdateMode
     public var isDevBuild: Bool
-    /// The operator pressed "Update & Restart".
+    /// "Update & Restart" was pressed.
     public var userRequested: Bool
     /// A requested update is still being found or downloaded.
     public var isPreparingUpdate: Bool
@@ -30,6 +30,10 @@ public struct IdleApplySnapshot: Equatable, Sendable {
     public var stagedVersion: VersionTuple?
     /// The running engine is older than the engine inside this app bundle.
     public var engineBehindBundle: Bool
+    /// Identifies the (engine version, bundle version) pair behind `engineBehindBundle`,
+    /// so an unattended engine-only restart that did not change the engine version is
+    /// not repeated for the same pair.
+    public var engineRestartKey: String?
     public var engineReachable: Bool
     /// Workers the engine reports as alive, whether mid-turn or idle at a prompt.
     public var liveWorkerCount: Int
@@ -44,6 +48,7 @@ public struct IdleApplySnapshot: Equatable, Sendable {
         isPreparingUpdate: Bool = false,
         stagedVersion: VersionTuple?,
         engineBehindBundle: Bool,
+        engineRestartKey: String? = nil,
         engineReachable: Bool,
         liveWorkerCount: Int,
         hasModalUI: Bool = false,
@@ -55,6 +60,7 @@ public struct IdleApplySnapshot: Equatable, Sendable {
         self.isPreparingUpdate = isPreparingUpdate
         self.stagedVersion = stagedVersion
         self.engineBehindBundle = engineBehindBundle
+        self.engineRestartKey = engineRestartKey
         self.engineReachable = engineReachable
         self.liveWorkerCount = liveWorkerCount
         self.hasModalUI = hasModalUI
@@ -152,6 +158,8 @@ public final class IdleUpdateApplier {
 
     private var workersIdleSince: Date?
     private var lastAttemptAt: Date?
+    /// The engine/bundle pair of the last unattended engine-only restart.
+    private var lastUnattendedEngineRestartKey: String?
     public private(set) var lastDecision: IdleApplyDecision = .notEligible
 
     public init(
@@ -166,21 +174,26 @@ public final class IdleUpdateApplier {
         self.now = now
     }
 
-    /// A fresh operator request overrides the retry cooldown.
+    /// An explicit request overrides the retry cooldown and the non-convergence guard.
     public func noteUserRequest() {
         lastAttemptAt = nil
+        lastUnattendedEngineRestartKey = nil
     }
 
     /// Evaluate once and, if the decision is `.apply`, perform it.
     @discardableResult
     public func tick() -> IdleApplyDecision {
-        let decision = decide(snapshot(), at: now())
+        let current = snapshot()
+        let decision = decide(current, at: now())
         if decision != lastDecision {
             idleApplyLog.info("update apply-at-idle: \(String(describing: decision), privacy: .public)")
             lastDecision = decision
         }
         if case .apply(let action) = decision {
             lastAttemptAt = now()
+            if action == .restartEngine, !current.userRequested {
+                lastUnattendedEngineRestartKey = current.engineRestartKey
+            }
             perform(action)
         }
         return decision
@@ -200,13 +213,28 @@ public final class IdleUpdateApplier {
         // Dev builds are reported as behind elsewhere; they are never installed over.
         guard !snapshot.isDevBuild else { return .notEligible }
 
+        // Order matters: a staged release wins; then anything still being found or
+        // downloaded (an engine-only restart now would consume the request and strand
+        // the newer release); then the engine-only restart.
         let action: IdleApplyAction
         if let version = snapshot.stagedVersion {
             action = .relaunchIntoStagedUpdate(version)
+        } else if snapshot.isPreparingUpdate {
+            // A requested download is still in flight; restarting only the engine now
+            // would consume the request and strand the newer release.
+            return .wait(.preparingUpdate)
         } else if snapshot.engineBehindBundle {
+            // An unattended restart that left the engine version unchanged would
+            // repeat forever; only an explicit request retries that pair.
+            if !snapshot.userRequested,
+               let key = snapshot.engineRestartKey,
+               key == lastUnattendedEngineRestartKey
+            {
+                return .nothingToApply
+            }
             action = .restartEngine
         } else {
-            return snapshot.isPreparingUpdate ? .wait(.preparingUpdate) : .nothingToApply
+            return .nothingToApply
         }
 
         if let lastAttemptAt, date.timeIntervalSince(lastAttemptAt) < policy.retryCooldownSeconds {
@@ -216,7 +244,7 @@ public final class IdleUpdateApplier {
         guard snapshot.liveWorkerCount == 0 else { return .wait(.liveWorkers(snapshot.liveWorkerCount)) }
         guard !snapshot.hasModalUI else { return .wait(.modalUI) }
 
-        // The operator asked for it and nothing is live: apply now.
+        // Explicitly requested and nothing is live: apply now.
         if snapshot.userRequested { return .apply(action) }
 
         let idleFor = workersIdleSince.map { date.timeIntervalSince($0) } ?? 0
@@ -231,4 +259,18 @@ public final class IdleUpdateApplier {
 public func engineIsBehindBundle(engineVersion: String, bundleVersion: VersionTuple?) -> Bool {
     guard let bundleVersion, let engine = VersionTuple.parseReleaseBase(engineVersion) else { return false }
     return engine < bundleVersion
+}
+
+/// Status shown when an "Update & Restart" request ends with nothing to apply.
+/// A failed download or install is named as such rather than reported as "no
+/// newer build".
+public func unfulfillableRequestMessage(downloadState: UpdateDownloadState) -> String {
+    switch downloadState {
+    case .failed(_, let reason):
+        return "Update & Restart could not download the update: \(reason)"
+    case .installFailed(_, let reason):
+        return "Update & Restart could not install the update: \(reason)"
+    default:
+        return "Update & Restart found no newer installable build to apply."
+    }
 }

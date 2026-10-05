@@ -204,12 +204,29 @@ pub(super) async fn handle_worker_pool_summary(ctx: Dispatch, req: FrontendReque
     }
 }
 
+/// Workers that hold a slot and a conversation: everything except errored
+/// and terminated, matching the app's own "live" definition.
+fn count_live_workers(states: &[boss_protocol::LiveWorkerState]) -> u32 {
+    use boss_protocol::WorkerActivity::{Idle, Spawning, WaitingForInput, Working};
+    let live = states
+        .iter()
+        .filter(|s| matches!(s.activity, Spawning | Working | WaitingForInput | Idle))
+        .count();
+    u32::try_from(live).unwrap_or(u32::MAX)
+}
+
 pub(super) async fn handle_get_engine_version(ctx: Dispatch, req: FrontendRequest) {
-    let Dispatch { sink, request_id, .. } = ctx;
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
     let FrontendRequest::GetEngineVersion = req else {
         unreachable!()
     };
     {
+        let live_worker_count = count_live_workers(&server_state.live_worker_states.snapshot());
         send_response(
             &sink,
             &request_id,
@@ -218,6 +235,7 @@ pub(super) async fn handle_get_engine_version(ctx: Dispatch, req: FrontendReques
                 git_sha: crate::build_info::git_sha().to_owned(),
                 build_time: crate::build_info::build_time().to_owned(),
                 binary_fingerprint: crate::build_info::binary_fingerprint().to_owned(),
+                live_worker_count: Some(live_worker_count),
             },
         );
     }

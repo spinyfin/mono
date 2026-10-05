@@ -158,7 +158,7 @@ public final class UpdateModel: ObservableObject {
     /// itself is already on it. Reported to the engine for its running-vs-published
     /// comparison. `nil` until a check has parsed the feed.
     @Published public private(set) var newestPublishedVersion: VersionTuple?
-    /// The operator pressed "Update & Restart": apply at the next moment no workers
+    /// "Update & Restart" was pressed: apply at the next moment no workers
     /// are live, in any mode. Cleared once the apply is attempted or found impossible.
     @Published public private(set) var applyWhenIdleRequested: Bool = false
     /// One-line, user-visible state of the apply-at-idle path ("waiting for 2 live
@@ -246,7 +246,7 @@ public final class UpdateModel: ObservableObject {
     /// the bundle's `CFBundleShortVersionString` is unavailable (e.g. `swift run` without plist).
     ///
     /// Callers in the macOS app must pass `BossDefaults.store` so isolated capture
-    /// instances keep update prefs out of the operator's production defaults suite.
+    /// instances keep update prefs out of the production defaults suite.
     public static func makeForApp(defaults: UserDefaults = .standard) -> UpdateModel {
         if let model = fromBundle(defaults: defaults) { return model }
         // No `.app` bundle (e.g. `swift run` / bazel-run local dev). This is always a
@@ -435,7 +435,7 @@ public final class UpdateModel: ObservableObject {
     /// for them.
     public func requestUpdateAndRestart() {
         guard !isDevBuild else { return }
-        modelLog.info("update apply: operator requested update and restart at idle")
+        modelLog.info("update apply: update and restart requested at idle")
         applyWhenIdleRequested = true
         applyRequestResolving = true
         Task {

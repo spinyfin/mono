@@ -337,6 +337,11 @@ async fn get_engine_version_response_matches_swift_app_parser() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let (server_state, _dir) = test_server_state();
+    // One freshly spawned worker: the app must see it in the version reply
+    // so a launch-time upgrade does not stop an engine with live workers.
+    server_state
+        .live_worker_states
+        .register_spawn(1, "run-live", "model", 4242, None);
     let (engine_side, app_side) = tokio::net::UnixStream::pair().unwrap();
     let conn = tokio::spawn(handle_frontend_connection(engine_side, server_state, None));
 
@@ -374,6 +379,7 @@ async fn get_engine_version_response_matches_swift_app_parser() {
         crate::build_info::git_sha()
     );
     assert!(parsed["payload"]["build_time"].is_string());
+    assert_eq!(parsed["payload"]["live_worker_count"], 1);
 
     // Drop the writer so the engine-side reader unblocks and the
     // task exits without us having to call any shutdown verb.

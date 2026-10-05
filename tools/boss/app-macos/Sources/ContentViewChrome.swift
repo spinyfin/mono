@@ -242,7 +242,7 @@ struct EngineHealthBanner: View {
     /// `nil` hides the button — dev builds are shown the warning but are
     /// never installed over.
     var onUpdateAndRestart: (() -> Void)? = nil
-    /// The operator already pressed it and the apply is waiting for idle.
+    /// It was already pressed and the apply is waiting for idle.
     var updateAndRestartQueued: Bool = false
     /// What the apply is waiting on, when there is something to say.
     var updateAndRestartStatus: String? = nil

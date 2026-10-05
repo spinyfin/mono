@@ -94,7 +94,7 @@ final class IdleUpdateApplyTests: XCTestCase {
 
     // MARK: - Other safety rules
 
-    func testAutomaticWaitsForOperatorToBeAway() {
+    func testAutomaticWaitsForUserToBeAway() {
         let world = World(automaticSnapshot(liveWorkers: 0))
         world.snapshot.secondsSinceUserInput = 5
         let applier = makeApplier(world)
@@ -153,7 +153,7 @@ final class IdleUpdateApplyTests: XCTestCase {
         let world = World(automaticSnapshot(liveWorkers: 3))
         world.snapshot.mode = .notify
         world.snapshot.userRequested = true
-        world.snapshot.secondsSinceUserInput = 0  // the operator just clicked
+        world.snapshot.secondsSinceUserInput = 0  // just clicked
         let applier = makeApplier(world)
 
         XCTAssertEqual(applier.tick(), .wait(.liveWorkers(3)))
@@ -221,7 +221,7 @@ final class IdleUpdateApplyTests: XCTestCase {
         XCTAssertEqual(world.performed.count, 2)
     }
 
-    func testAFreshOperatorRequestOverridesTheCooldown() {
+    func testAnExplicitRequestOverridesTheCooldown() {
         let world = World(automaticSnapshot(liveWorkers: 0))
         world.snapshot.userRequested = true
         let applier = makeApplier(world)
@@ -229,6 +229,49 @@ final class IdleUpdateApplyTests: XCTestCase {
         XCTAssertEqual(applier.tick(), .wait(.recentAttempt))
         applier.noteUserRequest()
         XCTAssertEqual(applier.tick(), .apply(.relaunchIntoStagedUpdate(staged)))
+    }
+
+    func testEngineRestartDoesNotPreemptAnInFlightDownload() {
+        let world = World(automaticSnapshot(liveWorkers: 0))
+        world.snapshot.mode = .notify
+        world.snapshot.userRequested = true
+        world.snapshot.stagedVersion = nil
+        world.snapshot.engineBehindBundle = true
+        world.snapshot.isPreparingUpdate = true
+        let applier = makeApplier(world)
+        XCTAssertEqual(applier.tick(), .wait(.preparingUpdate))
+        XCTAssertEqual(world.performed, [])
+    }
+
+    func testUnattendedEngineRestartIsNotRepeatedForTheSamePair() {
+        let world = World(automaticSnapshot(liveWorkers: 0))
+        world.snapshot.stagedVersion = nil
+        world.snapshot.engineBehindBundle = true
+        world.snapshot.engineRestartKey = "1.0.1->1.0.2"
+        let applier = makeApplier(world)
+        _ = applier.tick()
+        world.now.addTimeInterval(60)
+        XCTAssertEqual(applier.tick(), .apply(.restartEngine))
+
+        // Still behind after the cooldown: the same pair is not retried unattended.
+        world.now.addTimeInterval(3600)
+        XCTAssertEqual(applier.tick(), .nothingToApply)
+        XCTAssertEqual(world.performed.count, 1)
+
+        // A different pair is eligible again, and an explicit request overrides.
+        world.snapshot.engineRestartKey = "1.0.1->1.0.3"
+        XCTAssertEqual(applier.tick(), .apply(.restartEngine))
+        world.now.addTimeInterval(3600)
+        world.snapshot.userRequested = true
+        XCTAssertEqual(applier.tick(), .apply(.restartEngine))
+    }
+
+    func testFailedDownloadIsNotReportedAsNoNewerBuild() {
+        let failed = UpdateDownloadState.failed(version: staged, reason: "network down")
+        XCTAssertTrue(unfulfillableRequestMessage(downloadState: failed).contains("network down"))
+        let installFailed = UpdateDownloadState.installFailed(version: staged, reason: "swap failed")
+        XCTAssertTrue(unfulfillableRequestMessage(downloadState: installFailed).contains("swap failed"))
+        XCTAssertTrue(unfulfillableRequestMessage(downloadState: .idle).contains("no newer"))
     }
 
     // MARK: - Engine vs. bundle comparison

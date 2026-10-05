@@ -980,7 +980,11 @@ final class ChatViewModel: ObservableObject {
     /// `startIfNeeded()` uses so the main thread never blocks on
     /// `terminateEngine`'s up-to-5s SIGKILL wait. `isRestartingEngine`
     /// drives the banner button's `.disabled` state.
-    func restartEngine() {
+    ///
+    /// With `onlyIfNoLiveWorkers` the controller re-checks the engine's own
+    /// live-worker count at the moment it would stop the engine, and leaves
+    /// the engine running if any worker is live (used by update applies).
+    func restartEngine(onlyIfNoLiveWorkers: Bool = false) {
         guard !isRestartingEngine else { return }
         isRestartingEngine = true
 
@@ -988,7 +992,7 @@ final class ChatViewModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var restartError: Error?
             do {
-                try processController.restart()
+                try processController.restart(onlyIfNoLiveWorkers: onlyIfNoLiveWorkers)
             } catch {
                 restartError = error
             }

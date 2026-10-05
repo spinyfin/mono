@@ -13,7 +13,7 @@ private let freshnessLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category
 ///    engine on every connect and whenever it changes, so the engine's health report
 ///    (and `bossctl health`) can say when the running engine is behind it.
 /// 2. **Apply at idle.** Tick ``IdleUpdateApplier``, which decides when a staged
-///    update may be swapped in without waiting for the operator to quit. The rules
+///    update may be swapped in without waiting for an app quit. The rules
 ///    live there and are unit-tested; this type only gathers the inputs and performs
 ///    the two side effects (relaunch the app, or restart the engine).
 ///
@@ -58,7 +58,7 @@ final class EngineFreshnessDriver {
             }
             .store(in: &cancellables)
 
-        // An operator request overrides the retry cooldown and is evaluated at once.
+        // An explicit request overrides the retry cooldown and is evaluated at once.
         updateModel.$applyWhenIdleRequested
             .removeDuplicates()
             .sink { [weak self] requested in
@@ -92,10 +92,10 @@ final class EngineFreshnessDriver {
         let decision = applier.tick()
         switch decision {
         case .nothingToApply where updateModel.applyWhenIdleRequested:
-            // The operator asked, but there is no installable newer build and the
-            // engine already matches this bundle. Say so instead of queueing forever.
+            // Requested, but nothing could be applied: no installable newer build, or a
+            // failed download/install. Say which instead of queueing forever.
             updateModel.clearApplyWhenIdleRequest()
-            updateModel.setIdleApplyStatus("Update & Restart found no newer installable build to apply.")
+            updateModel.setIdleApplyStatus(unfulfillableRequestMessage(downloadState: updateModel.downloadState))
             showingUnfulfillableRequest = true
         case .notEligible, .nothingToApply:
             if !showingUnfulfillableRequest {
@@ -124,6 +124,7 @@ final class EngineFreshnessDriver {
             isPreparingUpdate: updateModel.isPreparingUpdate,
             stagedVersion: updateModel.versionReadyToApply,
             engineBehindBundle: engineBehindBundle,
+            engineRestartKey: engineBehindBundle ? chatModel?.engineRelease.map { "\($0.engineVersion)->\(UpdateLifecycle.runningVersion?.description ?? "?")" } : nil,
             engineReachable: chatModel?.isConnected ?? false,
             liveWorkerCount: liveWorkerStates.activeAgentCount,
             hasModalUI: NSApp.modalWindow != nil || NSApp.windows.contains { $0.attachedSheet != nil },
@@ -157,7 +158,7 @@ final class EngineFreshnessDriver {
         switch action {
         case .restartEngine:
             freshnessLog.info("update apply-at-idle: restarting engine onto the bundled build (no live workers)")
-            chatModel?.restartEngine()
+            chatModel?.restartEngine(onlyIfNoLiveWorkers: true)
 
         case .relaunchIntoStagedUpdate(let version):
             // A swap already applied by an earlier Install & Relaunch whose quit was
@@ -176,9 +177,13 @@ final class EngineFreshnessDriver {
             }
             freshnessLog.info(
                 "update apply-at-idle: relaunching into \(version.description, privacy: .public) (no live workers, userRequested=\(userRequested, privacy: .public))")
-            // `applicationShouldTerminate` re-checks the live-worker count in this
-            // same main-actor turn, so it cannot have changed since the decision.
-            // `applicationWillTerminate` then arms the relaunch helper.
+            // `applicationShouldTerminate` re-checks the app's cached live-worker
+            // count, but the detached engine keeps dispatching while the app quits
+            // and relaunches. The guarantee that no worker is killed lives where
+            // the engine is actually stopped: the relaunched app's launch-time
+            // upgrade attaches to an engine that reports live workers instead of
+            // replacing it, and this applier restarts it later once it is idle.
+            // `applicationWillTerminate` arms the relaunch helper.
             NSApp.terminate(nil)
         }
     }
