@@ -97,21 +97,118 @@ final class WorkDependencyKanbanTests: XCTestCase {
         XCTAssertEqual(model.dependencyPrereqs(for: phase4.id).map(\.status), ["archived"])
     }
 
-    /// Drag refusal: dropping a gated row out of Blocked must be
-    /// rejected and surface an inline notice keyed to the source
-    /// card's id. The lane never sees the move; the warning replaces
-    /// it.
-    func testAttemptDropRefusesGatedDrag() {
+    /// Dragging a gated row to Doing is NOT refused client-side. The
+    /// engine owns the dependency rule (and it is kind-aware in a way a
+    /// client mirror drifted from — see
+    /// `testRevisionIsNotLabelledGatedByInReviewPrerequisite`), so the
+    /// drop is forwarded and the card is placed optimistically. When the
+    /// engine does refuse, its `work_error` bounces the card back and the
+    /// inline notice carries the engine's own reason — never a silent
+    /// snap-back.
+    func testAttemptDropForwardsGatedDragAndSurfacesEngineRefusal() {
         let model = makeFixture()
         guard let dependent = model.taskByName("Phase 4") else {
             XCTFail("expected fixture"); return
         }
+        let origin = model.effectiveBoardColumn(for: dependent)
+        XCTAssertNotEqual(origin, .doing)
+
         let accepted = model.attemptDrop(dependent.id, onColumn: .doing, group: nil)
-        XCTAssertFalse(accepted)
-        XCTAssertEqual(model.dragRefusalNotice?.taskID, dependent.id)
-        XCTAssertTrue(
-            (model.dragRefusalNotice?.message ?? "").contains("gated by 1 incomplete prerequisite")
+        XCTAssertTrue(accepted, "a gated drop is the engine's call, not the client's")
+        XCTAssertNil(model.dragRefusalNotice, "no client-side refusal before the engine answers")
+        XCTAssertEqual(
+            model.effectiveBoardColumn(for: dependent), .doing,
+            "the card is placed optimistically while the engine decides"
         )
+
+        // The engine's reply for a genuinely gated row.
+        let reason = "cannot move \(dependent.id) to active: gated by [task_p2] (use `boss <kind> depend rm` to remove)"
+        model.applyEventForTest(.workError(message: reason, requestId: nil))
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: dependent), origin, "a refused drop bounces back")
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, dependent.id)
+        XCTAssertEqual(model.dragRefusalNotice?.message, reason, "the operator sees the engine's reason verbatim")
+        XCTAssertNil(model.workErrorMessage, "a kanban refusal is inline, not modal")
+    }
+
+    /// The display rule mirrors the engine's `status_satisfies_for_dependent`:
+    /// `done`/`archived` satisfy everyone; `in_review` additionally
+    /// satisfies a `revision` dependent (its prerequisite's commits are
+    /// pushed and the PR is open — all the next writer needs).
+    func testPrerequisiteStatusSatisfiesMirrorsEngineRule() {
+        for kind in ["task", "chore", "revision", "project_task"] {
+            XCTAssertTrue(ChatViewModel.prerequisiteStatusSatisfies("done", dependentKind: kind), kind)
+            XCTAssertTrue(ChatViewModel.prerequisiteStatusSatisfies("archived", dependentKind: kind), kind)
+            XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("todo", dependentKind: kind), kind)
+            XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("active", dependentKind: kind), kind)
+            XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("blocked", dependentKind: kind), kind)
+        }
+        XCTAssertTrue(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: "revision"))
+        XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: "chore"))
+        XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: "task"))
+        XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: nil))
+    }
+
+    /// The operator's row: a CI-fix revision parked `blocked /
+    /// worker_failed` behind a sibling revision that is `in_review`. The
+    /// kanban must not label it as gated (no chain badge, no "Blocked by"
+    /// text, empty gating list) — the engine would dispatch it, and
+    /// `bossctl work start` did. A chore behind the same `in_review` row
+    /// stays labelled gated, matching the engine's kind-specific rule.
+    func testRevisionIsNotLabelledGatedByInReviewPrerequisite() {
+        let model = makeFixture()
+        guard let root = model.taskByName("Phase 2") else {
+            XCTFail("expected fixture"); return
+        }
+        model.upsertTaskForTest(
+            id: "task_rev_findings",
+            name: "Address review findings",
+            status: "in_review",
+            lastStatusActor: "engine",
+            kind: "revision",
+            parentTaskId: root.id,
+            revisionSeq: 1
+        )
+        model.upsertTaskForTest(
+            id: "task_rev_cifix",
+            name: "Fix failing CI",
+            status: "blocked",
+            lastStatusActor: "engine",
+            kind: "revision",
+            parentTaskId: root.id,
+            revisionSeq: 2
+        )
+        model.upsertTaskForTest(
+            id: "task_chore_behind",
+            name: "Chore behind the findings revision",
+            status: "blocked",
+            lastStatusActor: "engine",
+            kind: "chore"
+        )
+        model.dependenciesByProductID["prod_test", default: []].append(contentsOf: [
+            WorkItemDependency(dependentID: "task_rev_cifix", prerequisiteID: "task_rev_findings", relation: "blocks"),
+            WorkItemDependency(dependentID: "task_chore_behind", prerequisiteID: "task_rev_findings", relation: "blocks"),
+        ])
+        model.invalidateWorkCache(.dependencies)
+        guard let ciFix = model.taskByName("Fix failing CI"),
+              let chore = model.taskByName("Chore behind the findings revision")
+        else {
+            XCTFail("expected injected rows"); return
+        }
+
+        XCTAssertEqual(model.gatingPrereqs(for: ciFix.id), [], "an in_review sibling does not gate a revision")
+        XCTAssertEqual(model.gatingPrereqsByTaskID[ciFix.id] ?? [], [], "cached view agrees with the live helper")
+        XCTAssertFalse(model.isAutoBlocked(ciFix), "no chain badge for a startable revision")
+        XCTAssertNil(model.blockedByLabel(for: ciFix), "no \"Blocked by\" text for a startable revision")
+        XCTAssertEqual(
+            model.dependencyPrereqs(for: ciFix.id).map(\.title), ["Address review findings"],
+            "the edge itself is still listed in the popover"
+        )
+
+        XCTAssertEqual(model.gatingPrereqs(for: chore.id).map(\.title), ["Address review findings"])
+        XCTAssertEqual(model.gatingPrereqsByTaskID[chore.id]?.map(\.title), ["Address review findings"])
+        XCTAssertTrue(model.isAutoBlocked(chore), "a chore behind an in_review row is still gated")
+        XCTAssertEqual(model.blockedByLabel(for: chore), "Address review findings")
     }
 
     /// Default grouping (`.none`) renders the project badge on the

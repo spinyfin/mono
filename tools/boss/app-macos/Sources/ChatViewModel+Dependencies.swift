@@ -54,7 +54,7 @@ extension ChatViewModel {
                 return nil
             }
             guard let name = workItemName(for: edge.prerequisiteID),
-                  !isWorkItemSatisfied(edge.prerequisiteID)
+                  !isWorkItemSatisfied(edge.prerequisiteID, forDependentKind: task.kind)
             else {
                 return nil
             }
@@ -96,10 +96,15 @@ extension ChatViewModel {
     }
 
     /// Subset of `dependencyPrereqs` that are still gating the row —
-    /// i.e. not yet in a satisfied status. Drives the chain badge's
-    /// hover tooltip ("gated by …") and the auto-block predicate.
+    /// i.e. not yet in a status that satisfies *this* dependent. Drives
+    /// the chain badge's hover tooltip ("gated by …") and the auto-block
+    /// predicate. Display only: the drag path never consults it — the
+    /// engine owns the gate (see `attemptDrop`).
     func gatingPrereqs(for taskID: String) -> [WorkDependencyRow] {
-        dependencyPrereqs(for: taskID).filter { !isWorkItemSatisfied($0.id) }
+        let dependentKind = task(withID: taskID)?.kind
+        return dependencyPrereqs(for: taskID).filter {
+            !isWorkItemRowSatisfied($0, forDependentKind: dependentKind)
+        }
     }
 
     /// True iff the engine parked the row in `blocked` (rather than the
@@ -110,14 +115,6 @@ extension ChatViewModel {
         task.status == "blocked"
             && task.lastStatusActor == "engine"
             && !gatingPrereqs(for: task.id).isEmpty
-    }
-
-    /// True iff the row currently has at least one unsatisfied gating
-    /// prereq. Drag refusal keys on this rather than `lastStatusActor`
-    /// because the engine refuses *any* manual move out of `blocked`
-    /// while gated, regardless of who set the status last (Q4).
-    func hasGatingPrereqs(_ task: WorkTask) -> Bool {
-        !gatingPrereqs(for: task.id).isEmpty
     }
 
     // MARK: - Dependency badge hover / frontier highlight
@@ -260,8 +257,11 @@ extension ChatViewModel {
                 guard !visited.contains(prereqID) else { continue }
                 visited.insert(prereqID)
 
-                // Skip already-satisfied (terminal) items — they aren't open.
-                guard !isWorkItemSatisfied(prereqID) else { continue }
+                // Skip prereqs that already satisfy `current`'s gate — they
+                // aren't holding anything up (for a revision dependent that
+                // includes an `in_review` prereq, same as the engine).
+                guard !isWorkItemSatisfied(prereqID, forDependentKind: task(withID: current)?.kind)
+                else { continue }
 
                 // An unblocked, open item is exactly what "actionable" means.
                 if gatingPrereqs(for: prereqID).isEmpty {
@@ -297,20 +297,39 @@ extension ChatViewModel {
                 // Filter on the status already resolved into each row rather
                 // than calling isWorkItemSatisfied(_:), which would look the
                 // same id up a second time — halving the lookups per edge.
-                gating[taskID] = rows.filter { !isWorkItemRowSatisfied($0) }
+                // The dependent's own kind decides what "satisfied" means.
+                let dependentKind = task(withID: taskID)?.kind
+                gating[taskID] = rows.filter { !isWorkItemRowSatisfied($0, forDependentKind: dependentKind) }
             }
         }
         cachedDependencyPrereqs = prereqs
         cachedGatingPrereqs = gating
     }
 
-    /// Row-status equivalent of `isWorkItemSatisfied(_:)`: mirrors the
-    /// engine's `status_satisfies` rule — every work item kind (task,
-    /// chore, or project) is satisfied at `done` or `archived`. An
-    /// unresolved prereq (kind `.unknown`, status `"unknown"`) is treated
-    /// as unsatisfied, matching the id-based helper's nil-lookup behaviour.
-    private func isWorkItemRowSatisfied(_ row: WorkDependencyRow) -> Bool {
-        return row.status == "done" || row.status == "archived"
+    /// Row-status equivalent of `isWorkItemSatisfied(_:forDependentKind:)`.
+    /// An unresolved prereq (kind `.unknown`, status `"unknown"`) is
+    /// treated as unsatisfied, matching the id-based helper's nil-lookup
+    /// behaviour.
+    private func isWorkItemRowSatisfied(_ row: WorkDependencyRow, forDependentKind dependentKind: String?) -> Bool {
+        Self.prerequisiteStatusSatisfies(row.status, dependentKind: dependentKind)
+    }
+
+    /// Display mirror of the engine's `status_satisfies_for_dependent`
+    /// rule (`work_dependencies.rs`), which is what the engine's drop and
+    /// explicit-start paths both enforce:
+    ///   - every prerequisite satisfies at `done` or `archived`;
+    ///   - for a `revision` dependent, `in_review` also satisfies — the
+    ///     prerequisite's commits are pushed and the PR is open, which is
+    ///     all the next writer on that PR needs. Waiting for `done` would
+    ///     deadlock a CI-fix revision behind a PR that cannot merge until
+    ///     that very fix lands.
+    /// This decides only what the kanban *labels* as gating; the engine
+    /// decides whether a move or start is actually refused.
+    static func prerequisiteStatusSatisfies(_ status: String, dependentKind: String?) -> Bool {
+        if dependentKind == "revision", status == "in_review" {
+            return true
+        }
+        return status == "done" || status == "archived"
     }
 
     private func workDependencyRow(forID id: String) -> WorkDependencyRow {
@@ -341,17 +360,18 @@ extension ChatViewModel {
         return task(withID: id)?.name
     }
 
-    /// Mirrors the engine's `status_satisfies` rule: every work item kind
-    /// (task, chore, or project) is satisfied at `done` or `archived`.
-    /// Used to hide already-finished prereqs from the "Blocked by …"
-    /// label on the off-chance an edge survives a status change
-    /// momentarily.
-    private func isWorkItemSatisfied(_ id: String) -> Bool {
+    /// Whether prerequisite `id` satisfies a dependent of `dependentKind`
+    /// — see `prerequisiteStatusSatisfies`. Used to hide already-satisfied
+    /// prereqs from the "Blocked by …" label on the off-chance an edge
+    /// survives a status change momentarily.
+    private func isWorkItemSatisfied(_ id: String, forDependentKind dependentKind: String?) -> Bool {
+        let status: String?
         if id.hasPrefix("proj_") {
-            guard let status = project(withID: id)?.status else { return false }
-            return status == "done" || status == "archived"
+            status = project(withID: id)?.status
+        } else {
+            status = task(withID: id)?.status
         }
-        guard let status = task(withID: id)?.status else { return false }
-        return status == "done" || status == "archived"
+        guard let status else { return false }
+        return Self.prerequisiteStatusSatisfies(status, dependentKind: dependentKind)
     }
 }

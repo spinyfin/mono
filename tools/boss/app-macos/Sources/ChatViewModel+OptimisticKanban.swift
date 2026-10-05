@@ -89,18 +89,18 @@ extension ChatViewModel {
             return true
         }
 
-        if task.status == "blocked",
-           hasGatingPrereqs(task)
-        {
-            let count = gatingPrereqs(for: task.id).count
-            let plural = count == 1 ? "prerequisite" : "prerequisites"
-            dragRefusalNotice = DragRefusalNotice(
-                taskID: task.id,
-                message: "\(task.name) is gated by \(count) incomplete \(plural) — clear them or remove the edge first."
-            )
-            scheduleDragRefusalDismiss(for: task.id)
-            return false
-        }
+        // Dependency gating is NOT pre-checked here. The engine owns that
+        // rule — `refuse_manual_move_off_blocked_while_gated` for a drop,
+        // and the identical `gating_prereqs_for` check for an explicit
+        // `RequestExecution` / `bossctl work start` — and it is kind-aware
+        // in a way a client mirror kept drifting from: a `revision` is
+        // runnable once its prerequisite reaches `in_review`, because its
+        // whole job is to push another commit to that still-open PR. A
+        // client-side `done`/`archived`-only mirror refused exactly that
+        // drop, bouncing a startable CI-fix revision that `bossctl work
+        // start` dispatched moments later. Forward the drop; a genuine
+        // refusal comes back as `work_error` with the engine's reason and
+        // `bounceBackOptimisticMoves` surfaces it inline on the card.
 
         // Moving out of Doing while a live worker is attached is blocked
         // except for two intentional gestures — see `moveTask`, which applies
