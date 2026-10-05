@@ -349,16 +349,33 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         None => derive_idempotency_key(&caller.execution_id, kind, &validated.canonical_json),
     };
 
+    // Serialise the whole wait submission per execution (replay lookup,
+    // budget check, DB acceptance, grant commit) so concurrent declarations
+    // cannot both pass the budget check and leave an accepted row with no
+    // grant. Held until the end of the handler's wait handling.
+    let wait_lock = (kind == ProposalKind::Wait)
+        .then(|| server_state.wait_registry.submit_lock(&caller.execution_id));
+    let _wait_guard = match &wait_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+
     // Validate the wait read-only first so a duration/cap refusal never
     // leaves an `applied` audit row. The grant itself is committed only after
-    // the row is freshly accepted (below): a replayed idempotency key or a
-    // refused/failed insert must neither renew the wait nor charge the budget.
+    // the row is freshly accepted (below). The budget check applies only to
+    // fresh declarations: a keyed replay of an accepted wait must resolve to
+    // the original row even when the budget is now spent.
     let wait_payload = if kind == ProposalKind::Wait {
         match serde_json::from_str::<WaitProposalPayload>(&validated.canonical_json) {
             Ok(payload) => {
-                if let Err(err) = server_state
-                    .wait_registry
-                    .check(&caller.execution_id, payload.duration_secs)
+                let is_replay = matches!(
+                    work_db.find_worker_proposal_by_idempotency_key(&caller.execution_id, &idempotency_key),
+                    Ok(Some(_))
+                );
+                if !is_replay
+                    && let Err(err) = server_state
+                        .wait_registry
+                        .check(&caller.execution_id, payload.duration_secs)
                 {
                     let error = ProposalSubmissionError::validation(vec![ProposalFieldError::new(
                         "duration_secs",
@@ -433,11 +450,24 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                             state.broadcast_live_worker_states().await;
                         });
                     }
-                    Err(err) => tracing::warn!(
-                        execution_id = %caller.execution_id,
-                        %err,
-                        "submit_proposal: wait row accepted but the registry refused the grant"
-                    ),
+                    Err(err) => {
+                        // Unreachable under the per-execution submit lock
+                        // (the check above covered this exact budget), but
+                        // never acknowledge a wait that holds nothing.
+                        tracing::error!(
+                            execution_id = %caller.execution_id,
+                            %err,
+                            "submit_proposal: wait row accepted but the registry refused the grant"
+                        );
+                        return send_rejection(
+                            &sink,
+                            &request_id,
+                            ProposalSubmissionError::new(
+                                ProposalErrorCode::Internal,
+                                format!("wait was recorded but could not be granted: {err}"),
+                            ),
+                        );
+                    }
                 }
             }
             tracing::info!(

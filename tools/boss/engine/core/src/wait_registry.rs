@@ -88,11 +88,25 @@ struct WaitState {
 #[derive(Debug, Default)]
 pub struct WaitRegistry {
     inner: Mutex<HashMap<String, WaitState>>,
+    submit_locks: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl WaitRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Per-execution async lock that serialises the whole wait submission
+    /// (replay lookup, budget check, DB acceptance, grant commit). Without
+    /// it two concurrent declarations can both pass [`check`](Self::check)
+    /// against a budget that covers only one.
+    pub fn submit_lock(&self, execution_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.submit_locks
+            .lock()
+            .expect("WaitRegistry mutex poisoned")
+            .entry(execution_id.to_owned())
+            .or_default()
+            .clone()
     }
 
     /// Read-only pre-check: would [`declare`](Self::declare) accept
@@ -201,6 +215,10 @@ impl WaitRegistry {
     /// ends so a later occupant of the same map slot cannot inherit budget.
     pub fn forget(&self, execution_id: &str) {
         self.inner
+            .lock()
+            .expect("WaitRegistry mutex poisoned")
+            .remove(execution_id);
+        self.submit_locks
             .lock()
             .expect("WaitRegistry mutex poisoned")
             .remove(execution_id);

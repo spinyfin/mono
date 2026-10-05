@@ -147,6 +147,18 @@ pub(super) fn find_worker_proposal_by_id(conn: &Connection, id: &str) -> Result<
 // ---- WorkDb accessors ----
 
 impl WorkDb {
+    /// Read-only replay lookup for `(execution_id, idempotency_key)`, so a
+    /// caller can tell a replay from a fresh submission before applying
+    /// checks that must only gate fresh ones.
+    pub fn find_worker_proposal_by_idempotency_key(
+        &self,
+        execution_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<WorkerProposal>> {
+        let conn = self.connect()?;
+        find_by_idempotency_key(&conn, execution_id, idempotency_key)
+    }
+
     /// Insert a proposal row, or return the existing one when this
     /// `(execution_id, idempotency_key)` has already been submitted.
     ///
