@@ -427,10 +427,10 @@ final class GhosttyRuntime: @unchecked Sendable {
             resolved.host?.applyColorChange(change)
 
         case .ringBell:
-            // Log every BEL before deciding whether it is audible, so a beep
-            // the operator hears can be matched to a `bell` line with
-            // `rang_system_alert: true` — or, absent one, attributed to
-            // AppKit's unhandled-key beep instead (see [[TerminalInputMonitor]]).
+            // Log every BEL before deciding whether it is audible, so an
+            // audible beep can be matched to a `bell` line with
+            // `rang_system_alert: true`, or, absent one, attributed to
+            // AppKit's unhandled-key beep (see [[TerminalInputMonitor]]).
             // Both paths end in the same system alert sound; the log is the
             // only way to tell them apart.
             let rings = Self.shouldRingBell(role: resolved.host?.session.role)

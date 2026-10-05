@@ -57,6 +57,11 @@ final class TerminalInputMonitor: NSObject {
     private var keyMonitor: Any?
     private var heartbeat: DispatchSourceTimer?
     private var lastBeatNanos: UInt64 = 0
+    /// Redacted description of the most recent keyDown routed to a
+    /// non-terminal responder, so a window-level `no_responder_window` can
+    /// be matched to the key that caused it.
+    private var lastKeyFields: [String: Any] = [:]
+    private var lastKeyNanos: UInt64 = 0
     private var windows: [ObjectIdentifier: WindowEntry] = [:]
     /// Windows a pane joined before `start()` ran; registered on start.
     private var pendingWindows: [WeakWindow] = []
@@ -125,6 +130,7 @@ final class TerminalInputMonitor: NSObject {
             name: NSWindow.willCloseNotification, object: nil
         )
 
+        Self.installWindowNoResponderProbe()
         startHeartbeat()
         libghosttyMirror.start()
         log.record(event: "monitor_started", fields: [
@@ -279,19 +285,20 @@ final class TerminalInputMonitor: NSObject {
             }
             entry.textInputKeys += 1
 
-        case .other, .none:
+        case .window, .other, .none:
             flushTextInputEpisode(entry, now: now)
-            log.record(event: "key_not_delivered", fields: [
-                "window": window.windowNumber,
-                "is_key_window": window.isKeyWindow,
-                "responder": Self.describe(responder),
-                "responder_kind": kind.rawValue,
-                "key": TerminalInputDescribe.keyName(keyCode: keyCode, characters: characters),
-                "key_code": Int(keyCode),
-                "mods": TerminalInputDescribe.modifierDescription(modifierFlags),
-                "is_repeat": isRepeat,
-                "since_responder_change_ms": Self.elapsedMs(from: entry.lastResponderChangeNanos, to: now),
-            ])
+            var fields = TerminalInputDescribe.keyFields(
+                keyCode: keyCode, characters: characters, modifierFlags: modifierFlags
+            )
+            lastKeyFields = fields
+            lastKeyNanos = now
+            fields["window"] = window.windowNumber
+            fields["is_key_window"] = window.isKeyWindow
+            fields["responder"] = Self.describe(responder)
+            fields["responder_kind"] = kind.rawValue
+            fields["is_repeat"] = isRepeat
+            fields["since_responder_change_ms"] = Self.elapsedMs(from: entry.lastResponderChangeNanos, to: now)
+            log.record(event: "key_not_delivered", fields: fields)
         }
     }
 
@@ -305,6 +312,50 @@ final class TerminalInputMonitor: NSObject {
         ])
         entry.textInputKeys = 0
         entry.textInputResponder = nil
+    }
+
+    // MARK: - Window-level beep site
+
+    private static var probeInstalled = false
+
+    /// Adds an `NSWindow.noResponder(for:)` override that records the call
+    /// and then runs AppKit's original implementation, so the beep is
+    /// unchanged. This is where an unhandled `keyDown` ends once focus has
+    /// left the pane; the pane's own override never sees that case. The
+    /// override is added to `NSWindow` itself (not `NSResponder`), and
+    /// windows that do not host a terminal pane are passed straight through.
+    private static func installWindowNoResponderProbe() {
+        guard !probeInstalled else { return }
+        probeInstalled = true
+        let selector = #selector(NSResponder.noResponder(for:))
+        guard let method = class_getInstanceMethod(NSWindow.self, selector) else { return }
+        typealias Original = @convention(c) (AnyObject, Selector, Selector) -> Void
+        let original = unsafeBitCast(method_getImplementation(method), to: Original.self)
+        let block: @convention(block) (NSWindow, Selector) -> Void = { window, eventSelector in
+            MainActor.assumeIsolated {
+                TerminalInputMonitor.shared.windowNoResponder(window: window, selector: eventSelector)
+            }
+            original(window, selector, eventSelector)
+        }
+        let imp = imp_implementationWithBlock(block)
+        if !class_addMethod(NSWindow.self, selector, imp, method_getTypeEncoding(method)) {
+            method_setImplementation(method, imp)
+        }
+    }
+
+    private func windowNoResponder(window: NSWindow, selector: Selector) {
+        guard entry(for: window) != nil else { return }
+        let now = Self.nowNanos()
+        var fields = lastKeyFields
+        fields["window"] = window.windowNumber
+        fields["is_key_window"] = window.isKeyWindow
+        fields["selector"] = NSStringFromSelector(selector)
+        fields["responder"] = Self.describe(window.firstResponder)
+        fields["responder_kind"] = Self.kind(of: window.firstResponder).rawValue
+        if lastKeyNanos != 0 {
+            fields["since_last_key_ms"] = Self.elapsedMs(from: lastKeyNanos, to: now)
+        }
+        log.record(event: "no_responder_window", fields: fields)
     }
 
     // MARK: - Main-thread heartbeat
@@ -386,13 +437,14 @@ final class TerminalInputMonitor: NSObject {
 /// `write error: <errno>`; nothing in the C API surfaces that to the
 /// embedder, so reading it back from the log store is the only way Boss
 /// can record a pty write failure next to the keystroke that caused it.
-/// (A *short* write is not logged by libghostty at all and remains
-/// invisible from here.)
+/// (A *short* write is not logged by libghostty at all; see the
+/// "not observable" note in `terminal-input-diagnostics.md`.)
 ///
 /// Polls `OSLogStore(scope: .currentProcessIdentifier)` on a utility queue
 /// every `pollIntervalSeconds`, reading only entries newer than the last
 /// one seen. Error-and-above only, capped per poll so a libghostty warning
-/// storm cannot flood the file.
+/// storm cannot flood the file; the cap never drops a pty write error, and
+/// any other overflow is summarised in a `libghostty_log_dropped` line.
 final class LibghosttyLogMirror: @unchecked Sendable {
     static let subsystem = "com.mitchellh.ghostty"
     static let pollIntervalSeconds: Double = 2
@@ -451,6 +503,46 @@ final class LibghosttyLogMirror: @unchecked Sendable {
         }
     }
 
+    /// One mirrorable libghostty entry, decoupled from `OSLogEntryLog` so
+    /// the cap logic is testable.
+    struct Candidate: Equatable {
+        let date: Date
+        let category: String
+        let level: String
+        let message: String
+    }
+
+    /// Whether `message` is the pty writer's failed-write line. Those are
+    /// the entries this mirror exists for, so the per-poll cap never drops
+    /// them.
+    static func isPtyWriteError(_ message: String) -> Bool {
+        message.contains("write error")
+    }
+
+    /// Apply the per-poll cap: the first `cap` entries are mirrored, later
+    /// ones are dropped — except pty write errors, which always are. The
+    /// dropped remainder is summarised (count and time range) so an overflow
+    /// is visible in the log rather than silent.
+    static func plan(
+        _ candidates: [Candidate], cap: Int
+    ) -> (mirrored: [Candidate], dropped: (count: Int, first: Date, last: Date)?) {
+        var mirrored: [Candidate] = []
+        var droppedCount = 0
+        var first: Date?
+        var last: Date?
+        for candidate in candidates {
+            if mirrored.count < cap || isPtyWriteError(candidate.message) {
+                mirrored.append(candidate)
+            } else {
+                droppedCount += 1
+                first = first ?? candidate.date
+                last = candidate.date
+            }
+        }
+        guard let first, let last else { return (mirrored, nil) }
+        return (mirrored, (droppedCount, first, last))
+    }
+
     private func poll() {
         let store: OSLogStore
         if let existing = self.store {
@@ -490,18 +582,31 @@ final class LibghosttyLogMirror: @unchecked Sendable {
             return
         }
 
-        var emitted = 0
+        var candidates: [Candidate] = []
         var newest = lastSeen
         for case let entry as OSLogEntryLog in entries {
             guard entry.date > lastSeen else { continue }
             if entry.date > newest { newest = entry.date }
-            guard Self.shouldMirror(level: entry.level), emitted < Self.perPollCap else { continue }
-            emitted += 1
+            guard Self.shouldMirror(level: entry.level) else { continue }
+            candidates.append(Candidate(
+                date: entry.date, category: entry.category, level: Self.levelName(entry.level),
+                message: String(entry.composedMessage.prefix(Self.maxMessageLength))
+            ))
+        }
+        let plan = Self.plan(candidates, cap: Self.perPollCap)
+        for candidate in plan.mirrored {
             log.record(event: "libghostty_log", fields: [
-                "category": entry.category,
-                "level": Self.levelName(entry.level),
-                "message": String(entry.composedMessage.prefix(Self.maxMessageLength)),
-                "logged_at_epoch_ms": Int64(entry.date.timeIntervalSince1970 * 1000),
+                "category": candidate.category,
+                "level": candidate.level,
+                "message": candidate.message,
+                "logged_at_epoch_ms": Int64(candidate.date.timeIntervalSince1970 * 1000),
+            ])
+        }
+        if let dropped = plan.dropped {
+            log.record(event: "libghostty_log_dropped", fields: [
+                "count": dropped.count,
+                "first_logged_at_epoch_ms": Int64(dropped.first.timeIntervalSince1970 * 1000),
+                "last_logged_at_epoch_ms": Int64(dropped.last.timeIntervalSince1970 * 1000),
             ])
         }
         lastSeen = newest

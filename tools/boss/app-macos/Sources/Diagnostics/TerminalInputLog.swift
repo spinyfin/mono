@@ -21,10 +21,13 @@ import os
 /// - `first_responder_changed` — the host window's first responder moved
 ///   (old/new responder types, whether either is a terminal pane).
 /// - `key_window_changed` — a terminal-hosting window gained or lost key.
-/// - `key_not_delivered` — a `keyDown` arrived in a terminal-hosting window
-///   while something other than a terminal pane was first responder. This
-///   is the AppKit path that ends in `noResponder(for:)` → `NSBeep` when
-///   the responder chain does not handle the key.
+/// - `key_not_delivered` — routing context: a `keyDown` arrived in a
+///   terminal-hosting window while something other than a terminal pane was
+///   first responder. Logged before dispatch, so it does not say whether
+///   that responder handled the key or whether AppKit beeped.
+/// - `no_responder_window` — a terminal-hosting window's responder chain
+///   ended in `noResponder(for:)` (the AppKit beep site), with the redacted
+///   most recent key and the first responder at that moment.
 /// - `key_to_text_input` — same, but the responder was a legitimate text
 ///   field; coalesced per focus episode and without key codes.
 /// - `terminal_focus` — a pane itself became / resigned first responder.
@@ -41,8 +44,9 @@ import os
 /// - `libghostty_log` — a warning/error libghostty wrote to unified logging
 ///   (its pty writer logs `write error: …` here on a failed pty write).
 ///
-/// Keystroke content is never recorded: letters and digits are reduced to
-/// a class (`letter`, `digit`); only control / function keys are named.
+/// Keystroke content is never recorded: letters, digits, symbols and space
+/// are reduced to a class and carry no `key_code`; only named, control and
+/// function keys are identified (see `TerminalInputDescribe.keyFields`).
 final class TerminalInputLog: @unchecked Sendable {
     /// Isolated / capture instances keep the os_log mirror but write no
     /// file: the diagnostics directory belongs to the production app's
@@ -60,31 +64,20 @@ final class TerminalInputLog: @unchecked Sendable {
 
     static let filePrefix = "terminal-input-"
 
-    /// `nil` directory means no disk mirror (used by tests).
-    private let directory: String?
-    private let retainDays: Int
-    private let queue = DispatchQueue(label: "Boss.TerminalInputLog")
+    private let writer: DayRotatedJSONLWriter
     private let logger = Logger(subsystem: "com.boss.app", category: "terminal-input")
-    private var currentDate = ""
-    private var fileHandle: FileHandle?
-    /// Throttles the write-failure warning to at most one per rotation —
-    /// see [[DiagnosticWrite]].
-    private var writeFailureWarned = false
-    private let dateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"
-        f.timeZone = TimeZone(identifier: "UTC")
-        return f
-    }()
 
+    /// `nil` directory means no disk mirror (used by tests).
     init(directory: String?, retainDays: Int = 7) {
-        self.directory = directory
-        self.retainDays = retainDays
+        writer = DayRotatedJSONLWriter(
+            directory: directory, filePrefix: Self.filePrefix, retainDays: retainDays,
+            site: "TerminalInputLog"
+        )
     }
 
     /// Append one event. Safe from any thread; the JSON line is built on
     /// the caller's thread (so `fields` need not be Sendable) and the file
-    /// write happens on the private queue.
+    /// write happens on the writer's private queue.
     func record(event: String, fields: [String: Any] = [:]) {
         let now = Date()
         let epochMs = Int64(now.timeIntervalSince1970 * 1000)
@@ -94,27 +87,12 @@ final class TerminalInputLog: @unchecked Sendable {
         if let text = String(data: lineData, encoding: .utf8) {
             logger.notice("\(text.trimmingCharacters(in: .newlines), privacy: .public)")
         }
-
-        queue.async { [self] in
-            guard directory != nil else { return }
-            let dateStr = dateFormatter.string(from: now)
-            if dateStr != currentDate || fileHandle == nil {
-                if dateStr != currentDate {
-                    pruneOldFiles()
-                }
-                openFile(dateStr: dateStr)
-            }
-            if let handle = fileHandle {
-                DiagnosticWrite.append(
-                    lineData, to: handle, site: "TerminalInputLog", warned: &writeFailureWarned
-                )
-            }
-        }
+        writer.append(lineData: lineData, at: now)
     }
 
     /// Block until queued file writes have drained. Test-only helper.
     func flushForTesting() {
-        queue.sync {}
+        writer.flushForTesting()
     }
 
     /// Pure, testable builder for one JSONL line (trailing newline
@@ -135,42 +113,6 @@ final class TerminalInputLog: @unchecked Sendable {
         }
         return jsonData + Data([0x0A])
     }
-
-    private func openFile(dateStr: String) {
-        guard let directory else { return }
-        DiagnosticWrite.closeQuietly(fileHandle)
-        fileHandle = nil
-
-        do {
-            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
-        } catch {
-            return
-        }
-
-        let path = (directory as NSString).appendingPathComponent("\(Self.filePrefix)\(dateStr).jsonl")
-        guard let handle = DiagnosticWrite.openForAppending(atPath: path) else { return }
-        fileHandle = handle
-        currentDate = dateStr
-        writeFailureWarned = false
-    }
-
-    private func pruneOldFiles() {
-        guard let directory else { return }
-        let cutoff = Date().addingTimeInterval(-Double(retainDays) * 86_400)
-        let cutoffStr = dateFormatter.string(from: cutoff)
-
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: directory) else {
-            return
-        }
-        for name in entries {
-            guard name.hasPrefix(Self.filePrefix), name.hasSuffix(".jsonl") else { continue }
-            let dateStr = String(name.dropFirst(Self.filePrefix.count).dropLast(".jsonl".count))
-            if dateStr < cutoffStr {
-                let fullPath = (directory as NSString).appendingPathComponent(name)
-                try? FileManager.default.removeItem(atPath: fullPath)
-            }
-        }
-    }
 }
 
 // MARK: - Pure description helpers
@@ -185,11 +127,12 @@ enum TerminalInputDescribe {
         case terminal
         /// A text field / text view that legitimately owns typing.
         case textInput = "text_input"
-        /// Anything else (window, hosting view, button, …). A `keyDown`
-        /// here that nothing in the chain handles is the AppKit beep.
+        /// The window itself is first responder: focus fell off every view.
+        case window
+        /// Anything else (hosting view, button, …). A `keyDown` here that
+        /// nothing in the chain handles ends in AppKit's beep.
         case other
-        /// No first responder at all (AppKit treats the window as the
-        /// responder; the beep path).
+        /// A nil first responder.
         case none
     }
 
@@ -198,6 +141,7 @@ enum TerminalInputDescribe {
     static func responderKind(_ responder: NSResponder?, isTerminal: Bool) -> ResponderKind {
         guard let responder else { return .none }
         if isTerminal { return .terminal }
+        if responder is NSWindow { return .window }
         if responder is NSTextInputClient || responder is NSText { return .textInput }
         return .other
     }
@@ -240,6 +184,28 @@ enum TerminalInputDescribe {
         if scalar.properties.isWhitespace { return "space" }
         return "symbol"
     }
+
+    /// Content-free key fields for the input log: `key`, `mods`, and
+    /// `key_code` only for named, control and function keys. Letters,
+    /// digits, symbols and space omit `key_code` — a virtual key code
+    /// identifies the physical key, so logging it would let typed text be
+    /// rebuilt from the log.
+    static func keyFields(
+        keyCode: UInt16, characters: String?, modifierFlags: NSEvent.ModifierFlags
+    ) -> [String: Any] {
+        let name = keyName(keyCode: keyCode, characters: characters)
+        var fields: [String: Any] = [
+            "key": name,
+            "mods": modifierDescription(modifierFlags),
+        ]
+        if !redactedKeyClasses.contains(name) {
+            fields["key_code"] = Int(keyCode)
+        }
+        return fields
+    }
+
+    /// Key names that are classes of printable keys, not specific keys.
+    private static let redactedKeyClasses: Set<String> = ["letter", "digit", "symbol", "space"]
 
     /// Compact modifier string in a stable order, e.g. `"shift+cmd"`;
     /// `"none"` when no device-independent modifier is held.

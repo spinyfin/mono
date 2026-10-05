@@ -1282,7 +1282,7 @@ final class GhosttyTerminalHostView: NSView {
         // libghostty answers "not consumed" when the key produced no
         // encoding and matched no binding — nothing was queued for the pty.
         // Releases are routinely unconsumed and are not interesting; a
-        // press/repeat that carried text and was still refused is.
+        // press/repeat is logged, and `had_text` marks the printable ones.
         if !consumed, action != GHOSTTY_ACTION_RELEASE {
             var fields = Self.keyFields(for: event)
             fields["had_text"] = hadText
@@ -1291,16 +1291,14 @@ final class GhosttyTerminalHostView: NSView {
     }
 
     /// Content-free key identity for the input log (see
-    /// `TerminalInputDescribe.keyName` for the redaction rule).
+    /// `TerminalInputDescribe.keyFields` for the redaction rule).
     private static func keyFields(for event: NSEvent) -> [String: Any] {
-        [
-            "key": TerminalInputDescribe.keyName(
-                keyCode: event.keyCode, characters: event.charactersIgnoringModifiers
-            ),
-            "key_code": Int(event.keyCode),
-            "mods": TerminalInputDescribe.modifierDescription(event.modifierFlags),
-            "is_repeat": event.isARepeat,
-        ]
+        var fields = TerminalInputDescribe.keyFields(
+            keyCode: event.keyCode, characters: event.charactersIgnoringModifiers,
+            modifierFlags: event.modifierFlags
+        )
+        fields["is_repeat"] = event.isARepeat
+        return fields
     }
 
     private func ghosttyCharacters(for event: NSEvent) -> String? {

@@ -99,6 +99,27 @@ final class TerminalInputDiagnosticsTests: XCTestCase {
         XCTAssertEqual(TerminalInputDescribe.modifierDescription(withDeviceBits), "shift")
     }
 
+    func testKeyFieldsOmitKeyCodeForPrintableClasses() {
+        for (code, chars) in [(UInt16(0x00), "a"), (0x12, "1"), (0x2B, ","), (0x31, " ")] {
+            let fields = TerminalInputDescribe.keyFields(
+                keyCode: code, characters: chars, modifierFlags: []
+            )
+            XCTAssertNil(fields["key_code"], "key_code must not identify \(chars.debugDescription): \(fields)")
+            XCTAssertEqual(fields["mods"] as? String, "none")
+        }
+        let letter = TerminalInputDescribe.keyFields(keyCode: 0x00, characters: "a", modifierFlags: [])
+        XCTAssertEqual(Set(letter.keys), ["key", "mods"])
+        XCTAssertEqual(letter["key"] as? String, "letter")
+    }
+
+    func testKeyFieldsKeepKeyCodeForNamedAndFunctionKeys() {
+        let ret = TerminalInputDescribe.keyFields(keyCode: 0x24, characters: "\r", modifierFlags: [])
+        XCTAssertEqual(ret["key"] as? String, "return")
+        XCTAssertEqual(ret["key_code"] as? Int, 0x24)
+        let fkey = TerminalInputDescribe.keyFields(keyCode: 0x60, characters: "\u{F708}", modifierFlags: [])
+        XCTAssertEqual(fkey["key_code"] as? Int, 0x60)
+    }
+
     // MARK: - Responder classification
 
     @MainActor
@@ -108,6 +129,8 @@ final class TerminalInputDiagnosticsTests: XCTestCase {
         XCTAssertEqual(TerminalInputDescribe.responderKind(NSTextView(frame: .zero), isTerminal: false), .textInput)
         XCTAssertEqual(TerminalInputDescribe.responderKind(NSView(frame: .zero), isTerminal: false), .other)
         XCTAssertEqual(TerminalInputDescribe.responderKind(NSResponder(), isTerminal: false), .other)
+        let window = NSWindow(contentRect: .zero, styleMask: [], backing: .buffered, defer: true)
+        XCTAssertEqual(TerminalInputDescribe.responderKind(window, isTerminal: false), .window)
     }
 
     @MainActor
@@ -190,5 +213,33 @@ final class TerminalInputDiagnosticsTests: XCTestCase {
         XCTAssertEqual(LibghosttyLogMirror.levelName(.error), "error")
         XCTAssertEqual(LibghosttyLogMirror.levelName(.undefined), "undefined")
         XCTAssertEqual(LibghosttyLogMirror.subsystem, "com.mitchellh.ghostty")
+    }
+
+    // MARK: - libghostty mirror cap
+
+    private func candidate(_ index: Int, _ message: String) -> LibghosttyLogMirror.Candidate {
+        .init(
+            date: Date(timeIntervalSince1970: 1_700_000_000 + Double(index)),
+            category: "io_exec", level: "error", message: message
+        )
+    }
+
+    func testCapDoesNotDropPtyWriteErrorsAfterTheCap() {
+        var entries = (0..<25).map { candidate($0, "noise \($0)") }
+        entries.append(candidate(25, "write error: errno 32"))
+        entries.append(candidate(26, "more noise"))
+        let plan = LibghosttyLogMirror.plan(entries, cap: LibghosttyLogMirror.perPollCap)
+        XCTAssertEqual(plan.mirrored.count, LibghosttyLogMirror.perPollCap + 1)
+        XCTAssertTrue(plan.mirrored.contains { $0.message == "write error: errno 32" })
+        let dropped = try? XCTUnwrap(plan.dropped)
+        XCTAssertEqual(dropped?.count, 6)
+        XCTAssertEqual(dropped?.first, entries[20].date)
+        XCTAssertEqual(dropped?.last, entries[26].date)
+    }
+
+    func testCapUnderLimitDropsNothing() {
+        let plan = LibghosttyLogMirror.plan((0..<5).map { candidate($0, "n") }, cap: 20)
+        XCTAssertEqual(plan.mirrored.count, 5)
+        XCTAssertNil(plan.dropped)
     }
 }
