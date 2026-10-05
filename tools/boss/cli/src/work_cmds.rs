@@ -573,6 +573,25 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
             let result = plan_project(&mut client, &project.id, args.force, args.dry_run, args.cap).await?;
             print_entity(ctx, &result, || print_plan_project_result(&result))
         }
+        ProjectCommand::Postmortem(args) => {
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let (task, created) = start_project_postmortem(&mut client, &project.id).await?;
+            let message = if created {
+                format!("Started project postmortem: {}", task.id)
+            } else {
+                format!("Project postmortem already exists: {} (no-op)", task.id)
+            };
+            print_entity(
+                ctx,
+                &serde_json::json!({ "task": task, "created": created, "message": message }),
+                || {
+                    if !ctx.quiet {
+                        println!("{message}");
+                    }
+                },
+            )
+        }
         ProjectCommand::Release(args) => {
             let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
             let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;

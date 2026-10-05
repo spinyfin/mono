@@ -303,6 +303,18 @@ pub(crate) async fn plan_project(
     )
 }
 
+pub(crate) async fn start_project_postmortem(
+    client: &mut BossClient,
+    project_id: &str,
+) -> Result<(Task, bool), CliError> {
+    rpc_call!(
+        client,
+        FrontendRequest::StartProjectPostmortem { project_id: project_id.to_owned() },
+        "start project postmortem",
+        FrontendEvent::ProjectPostmortemResult { task, created } => (task, created),
+    )
+}
+
 pub(crate) async fn release_project(client: &mut BossClient, project_id: &str) -> Result<(String, usize), CliError> {
     rpc_call!(
         client,

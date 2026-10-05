@@ -409,9 +409,9 @@ pub enum TaskKind {
     Followup,
     Investigation,
     /// Auto-scheduled by `project_postmortem_sweep` when a project's
-    /// non-terminal task count (`project_task`/`design`/`investigation`,
-    /// deliberately excluding this kind itself — see that module's doc
-    /// comment) drops to zero. Reviews the project's merged PRs since the
+    /// completion signal fires (open work closes or leaves the project, or
+    /// the project is marked done) and nothing else is open. Also started by
+    /// `boss project postmortem`. Reviews the project's merged PRs since the
     /// last postmortem and updates the project's design doc to reflect
     /// what actually shipped. Project-scoped only (always has a
     /// `project_id`); deliverable is a doc PR against the project's

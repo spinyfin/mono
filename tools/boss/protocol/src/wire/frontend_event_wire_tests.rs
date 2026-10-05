@@ -1377,6 +1377,14 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "plan_project_result",
         },
         TagCase {
+            label: "ProjectPostmortemResult",
+            event: FrontendEvent::ProjectPostmortemResult {
+                task: task(),
+                created: true,
+            },
+            expected_tag: "project_postmortem_result",
+        },
+        TagCase {
             label: "ReleaseProjectResult",
             event: FrontendEvent::ReleaseProjectResult {
                 project_id: "proj_1".into(),
@@ -2196,6 +2204,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::PlannerRunsList { .. }
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }
+        | FrontendEvent::ProjectPostmortemResult { .. }
         | FrontendEvent::ProposalSubmitted { .. }
         | FrontendEvent::ProposalRejected { .. }
         | FrontendEvent::ProposalsList { .. }

@@ -1,11 +1,8 @@
 //! DB-layer support for `kind = 'design_postmortem'` tasks — the
 //! auto-scheduled task that reviews a project's merged PRs against its
 //! design doc once the project's implementation work drains to zero.
-//! The edge-trigger / dedup / precondition decision logic lives in
-//! `crate::project_postmortem_sweep`; this module only owns the two DB
-//! operations that sweep needs: finding the most recent postmortem for a
-//! project (dedup gate + "since last postmortem" cutoff) and inserting a
-//! new one.
+//! Completion eligibility and serialized scheduling live in
+//! `project_postmortem`; this module provides task queries and insertion.
 
 use super::*;
 
@@ -23,8 +20,6 @@ use super::*;
 pub(crate) struct TriggerTaskSnapshot {
     pub kind: TaskKind,
     pub status: TaskStatus,
-    pub name: String,
-    pub pr_url: Option<String>,
     pub completed_at: Option<String>,
 }
 
@@ -40,7 +35,7 @@ impl WorkDb {
     ) -> Result<Vec<TriggerTaskSnapshot>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT kind, status, name, pr_url, completed_at
+            "SELECT kind, status, completed_at
              FROM tasks
              WHERE product_id = ?1 AND project_id = ?2
                AND kind IN ('project_task', 'design', 'investigation')
@@ -66,9 +61,7 @@ impl WorkDb {
             Ok(TriggerTaskSnapshot {
                 kind,
                 status,
-                name: row.get(2)?,
-                pr_url: row.get::<_, Option<String>>(3)?.filter(|s| !s.is_empty()),
-                completed_at: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+                completed_at: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
             })
         })?;
         collect_rows(rows)
@@ -79,17 +72,8 @@ impl WorkDb {
     /// Most recently created `design_postmortem` task for `project_id`
     /// (deleted or not), or `None` if the project has never had one.
     ///
-    /// Used by `project_postmortem_sweep` solely as the timestamp cutoff for
-    /// "implementation work completed since the last postmortem" (a wave of
-    /// zero net work must not spawn another one). For the dedup gate itself
-    /// (skip scheduling while a postmortem is still open), use
-    /// [`Self::last_live_design_postmortem_for_project`] instead — mixing
-    /// the two concerns into one row let a newer *deleted* postmortem mask
-    /// an older *live, still-open* one and defeat the gate. Deliberately
-    /// includes soft-deleted rows: excluding them would let deleting an
-    /// unwanted postmortem erase its "already reviewed up to here" boundary,
-    /// re-arming the trigger and causing the sweep to immediately re-
-    /// backfill the very history the deletion was meant to dismiss.
+    /// Includes tombstones; they remain the cutoff anchor for automatic
+    /// scheduling.
     pub fn last_design_postmortem_for_project(&self, project_id: &str) -> Result<Option<Task>> {
         let conn = self.connect()?;
         let id: Option<String> = conn
@@ -111,13 +95,7 @@ impl WorkDb {
     /// Most recently created *live* (non-deleted) `design_postmortem` task
     /// for `project_id`, or `None` if there isn't one.
     ///
-    /// This is `project_postmortem_sweep`'s dedup gate: a live, non-terminal
-    /// postmortem blocks scheduling a duplicate; a soft-deleted one never
-    /// does. Sibling to [`Self::last_design_postmortem_for_project`], which
-    /// answers a different question (the cutoff anchor, which must keep
-    /// considering tombstones, see its doc comment) and must not be reused
-    /// for this purpose: a newer deleted row from that query would mask an
-    /// older, still-live, still-open one and defeat the gate.
+    /// For callers displaying live history.
     pub fn last_live_design_postmortem_for_project(&self, project_id: &str) -> Result<Option<Task>> {
         let conn = self.connect()?;
         let id: Option<String> = conn
