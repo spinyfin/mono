@@ -373,7 +373,11 @@ fn enqueue_resolves_product_repository_and_task_override() {
     }
 }
 
-async fn auto_capture_stored(kind: &str) -> bool {
+/// Run automatic capture with both flags on for a root of `kind`, optionally
+/// requested through a revision of that root (as the merge poller does).
+/// Returns whether a capture row exists and how many live generation
+/// attempts were enqueued for its series.
+async fn auto_run(kind: &str, via_revision: bool) -> (bool, usize) {
     let (dir, db) = open_db();
     let db = Arc::new(db);
     let product = create_product(&db);
@@ -382,6 +386,19 @@ async fn auto_capture_stored(kind: &str) -> bool {
         .unwrap()
         .execute("UPDATE tasks SET kind = ?1 WHERE id = ?2", [kind, root.as_str()])
         .unwrap();
+    let requested = if via_revision {
+        let revision = create_active_chore(&db, &product, "kind gate revision");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET kind = 'revision', parent_task_id = ?1 WHERE id = ?2",
+                rusqlite::params![root, revision],
+            )
+            .unwrap();
+        revision
+    } else {
+        root.clone()
+    };
     let url = "https://github.com/acme/widget/pull/91";
     let packet = crate::test_support::source_capture_packet(url, "base", "head");
     let output = packet.clone();
@@ -392,8 +409,9 @@ async fn auto_capture_stored(kind: &str) -> bool {
     let collector = SourcePacketCollector::fixture(collect, packet);
     let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("flags.toml")));
     flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
     let request = SourceCaptureRequest::builder()
-        .root_task_id(root.clone())
+        .root_task_id(requested)
         .pr_url(url)
         .trigger(PrSourceCaptureTrigger::Creation)
         .build();
@@ -401,17 +419,37 @@ async fn auto_capture_stored(kind: &str) -> bool {
     if let Some(handle) = handle {
         handle.await.unwrap();
     }
-    db.get_latest_pr_review_guide_source_capture(&root).unwrap().is_some()
+    let Some(capture) = db.get_latest_pr_review_guide_source_capture(&root).unwrap() else {
+        return (false, 0);
+    };
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    for attempt in &live {
+        let execution = db
+            .get_execution(attempt.execution_id.as_deref().expect("must dispatch"))
+            .unwrap();
+        assert_eq!(execution.kind, ExecutionKind::PrReviewGuide);
+    }
+    (true, live.len())
 }
 
 #[tokio::test]
-async fn design_task_pr_is_not_auto_captured() {
-    assert!(!auto_capture_stored("design").await);
+async fn design_task_pr_is_not_auto_captured_or_generated() {
+    assert_eq!(auto_run("design", false).await, (false, 0));
 }
 
 #[tokio::test]
-async fn chore_pr_is_still_auto_captured() {
-    assert!(auto_capture_stored("chore").await);
+async fn revision_of_design_task_is_not_auto_captured_or_generated() {
+    assert_eq!(auto_run("design", true).await, (false, 0));
+}
+
+#[tokio::test]
+async fn chore_pr_is_still_auto_captured_and_generated() {
+    assert_eq!(auto_run("chore", false).await, (true, 1));
+}
+
+#[tokio::test]
+async fn project_task_pr_is_still_auto_captured_and_generated() {
+    assert_eq!(auto_run("project_task", false).await, (true, 1));
 }
 
 #[tokio::test]
