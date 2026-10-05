@@ -221,6 +221,32 @@ final class IdleUpdateApplyTests: XCTestCase {
         XCTAssertEqual(world.performed.count, 2)
     }
 
+    func testAFailedOutcomeClearsOnceTheEngineConvergesAnotherWay() {
+        let world = World(automaticSnapshot(liveWorkers: 0))
+        world.snapshot.stagedVersion = nil
+        world.snapshot.engineBehindBundle = true
+        let applier = IdleUpdateApplier(
+            policy: .init(workerQuietSeconds: 60, userIdleSeconds: 120, retryCooldownSeconds: 600),
+            snapshot: { world.snapshot },
+            perform: { _, completion in completion(.failed("Failed to restart engine")) },
+            now: { world.now }
+        )
+        _ = applier.tick()
+        world.now.addTimeInterval(60)
+        XCTAssertEqual(applier.tick(), .apply(.restartEngine))
+        XCTAssertEqual(applier.outcome, .failed("Failed to restart engine"))
+
+        // Still pending (cooldown): the failure stays visible.
+        world.now.addTimeInterval(1)
+        XCTAssertEqual(applier.tick(), .wait(.recentAttempt))
+        XCTAssertEqual(applier.outcome, .failed("Failed to restart engine"))
+
+        // A manual Restart Engine converged the engine: nothing left to apply.
+        world.snapshot.engineBehindBundle = false
+        XCTAssertEqual(applier.tick(), .nothingToApply)
+        XCTAssertNil(applier.outcome)
+    }
+
     func testAnExplicitRequestOverridesTheCooldown() {
         let world = World(automaticSnapshot(liveWorkers: 0))
         world.snapshot.userRequested = true

@@ -356,6 +356,48 @@ final class EngineProcessControllerTests: XCTestCase {
         }
     }
 
+    func testAcceptedGuardedStopOnLaunchSendsOnlyIfIdleAndRelaunchesOnce() throws {
+        let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
+        fixture.socketControl.liveWorkers = 0
+        let recorder = LaunchRecorder()
+        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, path in
+            recorder.record(path)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.shutdownOnlyIfIdleFlags, [true])
+        XCTAssertEqual(recorder.socketPaths.count, 1)
+    }
+
+    func testAcceptedGuardedRestartSendsOnlyIfIdleAndPerformsWithOneRelaunch() throws {
+        let fixture = try Fixture(reachableSocket: .primary)
+        fixture.socketControl.liveWorkers = 0
+        let recorder = LaunchRecorder()
+        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, path in
+            recorder.record(path)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        XCTAssertEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
+
+        XCTAssertEqual(fixture.socketControl.shutdownOnlyIfIdleFlags, [true])
+        XCTAssertEqual(recorder.socketPaths.count, 1)
+    }
+
+    func testLegacyEngineLaunchPathStillSendsUnguardedShutdown() throws {
+        let fixture = try Fixture(reachableSocket: .legacy, runningFingerprint: "stale-engine")
+        let controller = fixture.makeController { _, _, _ in 4242 }
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.shutdownOnlyIfIdleFlags, [false])
+    }
+
     func testGuardedRestartLeavesAnEngineWithLiveWorkersRunning() throws {
         let fixture = try Fixture(reachableSocket: .primary)
         fixture.socketControl.liveWorkers = 1
@@ -578,6 +620,7 @@ private extension EngineProcessControllerTests {
         private let runningPid: pid_t?
         private var requests: [String] = []
         private var shutdowns: [String] = []
+        private var shutdownIdleFlags: [Bool] = []
         var refuseShutdown = false
         var queryFailed = false
         /// What the engine reports as live; `nil` models an engine that predates the field.
@@ -597,6 +640,11 @@ private extension EngineProcessControllerTests {
             lock.withLock { shutdowns }
         }
 
+        /// The `onlyIfIdle` value of each shutdown request, in order.
+        var shutdownOnlyIfIdleFlags: [Bool] {
+            lock.withLock { shutdownIdleFlags }
+        }
+
         func isReachable(socketPath: String, timeoutSeconds _: Double) -> Bool {
             socketPath == reachableSocket
         }
@@ -612,7 +660,10 @@ private extension EngineProcessControllerTests {
         }
 
         func shutdown(socketPath: String, tokenPath _: String, timeoutSeconds _: Double, onlyIfIdle: Bool) throws -> pid_t? {
-            lock.withLock { shutdowns.append(socketPath) }
+            lock.withLock {
+                shutdowns.append(socketPath)
+                shutdownIdleFlags.append(onlyIfIdle)
+            }
             if refuseShutdown { throw NSError(domain: "test guarded refusal", code: 1) }
             return runningPid
         }

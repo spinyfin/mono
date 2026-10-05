@@ -971,6 +971,9 @@ final class ChatViewModel: ObservableObject {
     /// or has exhausted its bounded retry policy.
     @Published private(set) var engineSupervisionState: EngineSupervisionState = .running
 
+    /// Identifies the bundled-engine fingerprint mismatch the process controller last saw, if any.
+    var bundledEngineMismatchKey: String? { processController.bundledEngineMismatchKey }
+
     /// User-initiated recovery from the unreachable banner. Discovers the
     /// reachable engine by socket (token-auth shutdown RPC first, then a
     /// validated peer/pid-file SIGTERM/SIGKILL fallback) and
@@ -985,8 +988,12 @@ final class ChatViewModel: ObservableObject {
     /// With `onlyIfNoLiveWorkers` the controller re-checks the engine's own
     /// live-worker count at the moment it would stop the engine, and leaves
     /// the engine running if any worker is live (used by update applies).
-    var bundledEngineMismatchKey: String? { processController.bundledEngineMismatchKey }
-
+    ///
+    /// `completion`, when given, runs on the main actor once the restart settles:
+    /// `.performed` — the engine was stopped and relaunched; `.deferred(message)` —
+    /// the engine was left running (live workers, a refused guarded stop, or a
+    /// restart already in flight) and the caller should retry later; `.failed(message)`
+    /// — the restart errored and the engine may be down.
     func restartEngine(onlyIfNoLiveWorkers: Bool = false, completion: (@MainActor @Sendable (IdleApplyOutcome) -> Void)? = nil) {
         guard !isRestartingEngine else {
             completion?(.deferred("Waiting for the current engine restart."))

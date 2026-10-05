@@ -201,6 +201,15 @@ public final class IdleUpdateApplier {
         if case .deferred = outcome { outcome = nil }
         let current = snapshot()
         let decision = decide(current, at: now())
+        // A failure stays visible while something is still pending, but not once the engine
+        // has converged some other way (e.g. a manual Restart Engine): there is nothing
+        // left to apply, so the stale warning would hide later statuses.
+        if case .failed = outcome {
+            switch decision {
+            case .nothingToApply, .notEligible: outcome = nil
+            case .wait, .apply: break
+            }
+        }
         if decision != lastDecision {
             idleApplyLog.info("update apply-at-idle: \(String(describing: decision), privacy: .public)")
             lastDecision = decision

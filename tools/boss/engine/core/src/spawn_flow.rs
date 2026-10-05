@@ -671,14 +671,16 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     input: StartWorkerInput,
     spawn_timeout: StdDuration,
 ) -> Result<StartedWorker, StartWorkerError> {
-    let _admission = if let Some(states) = spawner.live_worker_state_registry() {
-        let admission = states.shutdown_admission.read().await;
-        if *admission {
-            return Err(StartWorkerError::Tmux(anyhow!("engine is shutting down")));
-        }
-        Some(admission)
-    } else {
-        None
+    // Dispatch already holds an admission across this call; this one keeps direct
+    // callers (resume, tests) behind the same boundary. Reads never queue behind a
+    // writer because shutdown only ever `try_write`s.
+    let _admission = match spawner.live_worker_state_registry() {
+        Some(states) => Some(
+            states
+                .try_admit_spawn()
+                .map_err(|refusal| StartWorkerError::Tmux(anyhow!(refusal)))?,
+        ),
+        None => None,
     };
     // Local dispatch is only recoverable when the driver supplies Rich
     // per-tool progress boundaries. A Coarse/Minimal driver would silently
