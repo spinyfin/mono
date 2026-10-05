@@ -413,8 +413,8 @@ pub enum FrontendEvent {
     },
     /// Engine acknowledges a stop request — the pane release has
     /// been kicked off and (if applicable) the cube workspace lease
-    /// released. The reply does not wait for the libghostty pane to
-    /// fully drain; teardown is asynchronous.
+    /// released. The reply does not wait for the tmux session
+    /// teardown to finish; teardown is asynchronous.
     RunStopped {
         run_id: String,
     },

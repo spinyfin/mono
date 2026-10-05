@@ -76,9 +76,12 @@
 //! observable states are "claimed + live entry" → "free + live entry" →
 //! "free + no entry" — never "claimed + no entry" on that path.
 //!
-//! But an UNCONFIRMED teardown deliberately produces "claimed + no live
-//! entry": when tmux process teardown or app viewer detach cannot be
-//! confirmed (a missing session, timed-out request, or unexpected response),
+//! A failed or unverified tmux teardown returns early from
+//! `release_worker_pane` (`NoLiveWorker`) and keeps the worker's registry
+//! and live state, so it never yields this shape. But an unconfirmed app
+//! viewer detach AFTER a verified tmux teardown deliberately produces
+//! "claimed + no live entry": when the detach cannot be confirmed (a
+//! missing session, timed-out request, or unexpected response),
 //! `release_worker_pane` holds the pool claim instead of releasing it
 //! (see the `sweep_owns_handback` branch there) while still dropping the
 //! live-state entry unconditionally just below. This module is exactly
@@ -86,7 +89,7 @@
 //! shape:
 //!
 //! * a rejected viewer attachment in `coordinator/run.rs` (`hold_slot_busy`);
-//! * an unconfirmed teardown in `release_worker_pane` (`sweep_owns_handback`);
+//! * an unconfirmed viewer detach in `release_worker_pane` (`sweep_owns_handback`);
 //! * `TransientRecoveryReaper::reap_worker` dropping the live-state entry
 //!   for a claim `release_worker_pane` never held or released, when
 //!   transient-recovery finds no run→slot mapping. That path is reached

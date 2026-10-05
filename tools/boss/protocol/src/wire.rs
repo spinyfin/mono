@@ -303,7 +303,8 @@ pub enum FrontendRequest {
 
     /// Cancel a non-terminal execution. Marks the execution row
     /// `cancelled`, releases any cube workspace lease it still holds,
-    /// and tears down the libghostty pane (if one was allocated).
+    /// and performs a token-verified teardown of the run's tmux session
+    /// (if one was allocated), detaching any app viewer.
     /// Already-terminal rows return `WorkError` (not a silent no-op).
     ///
     /// When `queued_only` is true (used by `bossctl executions cancel`),
@@ -2558,8 +2559,9 @@ pub enum FrontendRequest {
         project_id: String,
     },
 
-    /// Boss-tier RPC: tear down the libghostty pane hosting `run_id`
-    /// and release the cube workspace its execution still holds.
+    /// Boss-tier RPC: tear down (token-verified) the tmux session hosting
+    /// `run_id`, detach the app viewer, and release the cube workspace
+    /// its execution still holds.
     /// Used by `bossctl agents stop`. Idempotent — duplicate requests
     /// (or one racing with completion-detection) collapse to a no-op
     /// on the second pass.
