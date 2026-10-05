@@ -193,10 +193,13 @@ impl WorkDb {
 
     /// Whether the canonical root of a review-guide series is a design task,
     /// whose PR is a design doc. Automatic capture and generation skip these;
-    /// explicit on-demand generation does not consult this.
+    /// explicit on-demand generation does not consult this. A revision id is
+    /// resolved to its chain root first, since some callers (the merge
+    /// poller) pass the work item id unresolved.
     pub(crate) fn review_guide_root_is_design(&self, root_task_id: &str) -> Result<bool> {
         let conn = self.connect()?;
-        let task = query_task(&conn, root_task_id).require("task", root_task_id)?;
+        let root_id = chain_root(&conn, root_task_id)?;
+        let task = query_task(&conn, &root_id).require("task", &root_id)?;
         Ok(task.kind == TaskKind::Design)
     }
 
