@@ -57,11 +57,6 @@ final class TerminalInputMonitor: NSObject {
     private var keyMonitor: Any?
     private var heartbeat: DispatchSourceTimer?
     private var lastBeatNanos: UInt64 = 0
-    /// Redacted description of the most recent keyDown routed to a
-    /// non-terminal responder, so a window-level `no_responder_window` can
-    /// be matched to the key that caused it.
-    private var lastKeyFields: [String: Any] = [:]
-    private var lastKeyNanos: UInt64 = 0
     private var windows: [ObjectIdentifier: WindowEntry] = [:]
     /// Windows a pane joined before `start()` ran; registered on start.
     private var pendingWindows: [WeakWindow] = []
@@ -72,8 +67,10 @@ final class TerminalInputMonitor: NSObject {
 
     /// Per-window observation state. `window` is weak so a closed window is
     /// pruned rather than retained by the monitor.
+    @MainActor
     private final class WindowEntry {
         weak var window: NSWindow?
+        let keyContext = TerminalInputKeyContext()
         var observation: NSKeyValueObservation?
         var lastResponderChangeNanos: UInt64 = 0
         /// Coalescing state for keys delivered to a legitimate text field:
@@ -102,16 +99,8 @@ final class TerminalInputMonitor: NSObject {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // Local monitors fire on the main thread before dispatch. We
             // only observe: the event is always returned unchanged.
-            let window = event.window
-            let keyCode = event.keyCode
-            let mods = event.modifierFlags
-            let chars = event.charactersIgnoringModifiers
-            let isRepeat = event.isARepeat
             MainActor.assumeIsolated {
-                self?.handleKeyDown(
-                    window: window, keyCode: keyCode, modifierFlags: mods,
-                    characters: chars, isRepeat: isRepeat
-                )
+                self?.handleKeyDown(event)
             }
             return event
         }
@@ -199,6 +188,7 @@ final class TerminalInputMonitor: NSObject {
         log.record(event: "terminal_window_registered", fields: [
             "window": window.windowNumber,
             "first_responder": Self.describe(window.firstResponder),
+            "responder_chain_tail": Self.describe(TerminalInputFallback.tail(of: window)),
         ])
     }
 
@@ -260,14 +250,9 @@ final class TerminalInputMonitor: NSObject {
 
     // MARK: - keyDown routing
 
-    private func handleKeyDown(
-        window: NSWindow?,
-        keyCode: UInt16,
-        modifierFlags: NSEvent.ModifierFlags,
-        characters: String?,
-        isRepeat: Bool
-    ) {
-        guard let window, let entry = entry(for: window) else { return }
+    private func handleKeyDown(_ event: NSEvent) {
+        guard let window = event.window, let entry = entry(for: window) else { return }
+        entry.keyContext.record(event, window: window)
         let responder = window.firstResponder
         let kind = Self.kind(of: responder)
         let now = Self.nowNanos()
@@ -287,16 +272,14 @@ final class TerminalInputMonitor: NSObject {
 
         case .window, .other, .none:
             flushTextInputEpisode(entry, now: now)
-            var fields = TerminalInputDescribe.keyFields(
-                keyCode: keyCode, characters: characters, modifierFlags: modifierFlags
+            var fields = entry.keyContext.fields(
+                for: event, window: window, selector: #selector(NSResponder.keyDown(with:))
             )
-            lastKeyFields = fields
-            lastKeyNanos = now
             fields["window"] = window.windowNumber
             fields["is_key_window"] = window.isKeyWindow
             fields["responder"] = Self.describe(responder)
             fields["responder_kind"] = kind.rawValue
-            fields["is_repeat"] = isRepeat
+            fields["is_repeat"] = event.isARepeat
             fields["since_responder_change_ms"] = Self.elapsedMs(from: entry.lastResponderChangeNanos, to: now)
             log.record(event: "key_not_delivered", fields: fields)
         }
@@ -318,43 +301,35 @@ final class TerminalInputMonitor: NSObject {
 
     private static var probeInstalled = false
 
-    /// Adds an `NSWindow.noResponder(for:)` override that records the call
-    /// and then runs AppKit's original implementation, so the beep is
-    /// unchanged. This is where an unhandled `keyDown` ends once focus has
-    /// left the pane; the pane's own override never sees that case. The
-    /// override is added to `NSWindow` itself (not `NSResponder`), and
-    /// windows that do not host a terminal pane are passed straight through.
+    /// Observe the base implementation so window controllers after a window
+    /// are covered too. Always preserve AppKit's implementation for all selectors.
     private static func installWindowNoResponderProbe() {
         guard !probeInstalled else { return }
         probeInstalled = true
         let selector = #selector(NSResponder.noResponder(for:))
-        guard let method = class_getInstanceMethod(NSWindow.self, selector) else { return }
+        guard let method = class_getInstanceMethod(NSResponder.self, selector) else { return }
         typealias Original = @convention(c) (AnyObject, Selector, Selector) -> Void
         let original = unsafeBitCast(method_getImplementation(method), to: Original.self)
-        let block: @convention(block) (NSWindow, Selector) -> Void = { window, eventSelector in
+        let block: @convention(block) (NSResponder, Selector) -> Void = { responder, eventSelector in
             MainActor.assumeIsolated {
-                TerminalInputMonitor.shared.windowNoResponder(window: window, selector: eventSelector)
+                TerminalInputMonitor.shared.windowNoResponder(responder: responder, selector: eventSelector)
             }
-            original(window, selector, eventSelector)
+            original(responder, selector, eventSelector)
         }
-        let imp = imp_implementationWithBlock(block)
-        if !class_addMethod(NSWindow.self, selector, imp, method_getTypeEncoding(method)) {
-            method_setImplementation(method, imp)
-        }
+        method_setImplementation(method, imp_implementationWithBlock(block))
     }
 
-    private func windowNoResponder(window: NSWindow, selector: Selector) {
-        guard entry(for: window) != nil else { return }
-        let now = Self.nowNanos()
-        var fields = lastKeyFields
+    private func windowNoResponder(responder: NSResponder, selector: Selector) {
+        guard let window = TerminalInputFallback.window(for: responder),
+              let entry = entry(for: window) else { return }
+        var fields = entry.keyContext.fields(for: NSApp.currentEvent, window: window, selector: selector)
         fields["window"] = window.windowNumber
         fields["is_key_window"] = window.isKeyWindow
         fields["selector"] = NSStringFromSelector(selector)
+        fields["beep_candidate"] = TerminalInputFallback.isBeepCandidate(selector)
+        fields["receiver"] = Self.describe(responder)
         fields["responder"] = Self.describe(window.firstResponder)
         fields["responder_kind"] = Self.kind(of: window.firstResponder).rawValue
-        if lastKeyNanos != 0 {
-            fields["since_last_key_ms"] = Self.elapsedMs(from: lastKeyNanos, to: now)
-        }
         log.record(event: "no_responder_window", fields: fields)
     }
 

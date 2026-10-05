@@ -50,8 +50,9 @@ Both candidate beep sources end in the **same system alert sound**:
 
 The log separates them: every BEL produces a `bell` line with
 `rang_system_alert`; a beep with **no** `bell` line within a few hundred
-milliseconds is AppKit's, and there should be a `no_responder_window` line
-(the window's responder chain ended unhandled) next to it instead.
+milliseconds needs further attribution. A `no_responder_window` line with
+`selector: keyDown:` identifies the AppKit unhandled-key beep path; absence
+of either line does not prove a source.
 
 ## Event vocabulary
 
@@ -62,11 +63,11 @@ Every line has `ts_epoch_ms` and `event`. Pane-scoped lines carry
 | `event`                      | Emitted when                                                                                                                                                                                                                             | Key fields                                                                                                           |
 | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `monitor_started`            | App launch (non-isolated instances only).                                                                                                                                                                                                | `stall_threshold_ms`, `heartbeat_interval_ms`                                                                        |
-| `terminal_window_registered` | A pane first joins a window; KVO on that window's `firstResponder` begins.                                                                                                                                                               | `window`, `first_responder`                                                                                          |
+| `terminal_window_registered` | A pane first joins a window; KVO on that window's `firstResponder` begins.                                                                                                                                                               | `window`, `first_responder`, `responder_chain_tail`                                                                  |
 | `first_responder_changed`    | The window's first responder moved (KVO).                                                                                                                                                                                                | `old`, `new`, `old_kind`, `new_kind` (`terminal` / `text_input` / `window` / `other` / `none`), `is_key_window`      |
 | `key_window_changed`         | A terminal-hosting window became / resigned key.                                                                                                                                                                                         | `became_key`, `first_responder`, `app_key_window`                                                                    |
 | `key_not_delivered`          | Routing context: a `keyDown` arrived in a terminal-hosting window while the first responder was **not** a terminal pane and **not** a text field. Logged before dispatch; it does not say the key was unhandled or that anything beeped. | `responder`, `responder_kind`, `key`, `key_code` (named keys only), `mods`, `is_repeat`, `since_responder_change_ms` |
-| `no_responder_window`        | A terminal-hosting window's responder chain ended in `noResponder(for:)` — **the AppKit beep site** when focus has left the pane. Carries the most recent redacted key.                                                                  | `selector`, `responder`, `responder_kind`, `key`, `key_code` (named keys only), `mods`, `since_last_key_ms`          |
+| `no_responder_window`        | A terminal-hosting window's responder chain ended in `noResponder(for:)` (including a window controller at the tail). Only `selector: keyDown:` is a beep candidate; key fields require a matching current event and window.             | `selector`, `responder`, `responder_kind`, `key`, `key_code` (named keys only), `mods`, `beep_candidate`, `receiver` |
 | `key_to_text_input`          | Keys went to a legitimate text field; one line per focus episode.                                                                                                                                                                        | `responder`, `count`, `episode_ms`                                                                                   |
 | `terminal_focus`             | A pane became / resigned first responder (pane-side view of the KVO line).                                                                                                                                                               | `change` (`become` / `resign`), `accepted`, `has_surface`                                                            |
 | `host_window_detached`       | A pane's NSView is leaving its window. AppKit resets the first responder when the responder's view leaves — if `was_first_responder` is true, focus is lost here.                                                                        | `window`, `new_window`, `was_first_responder`                                                                        |
@@ -103,12 +104,15 @@ bossctl logs terminal-input --since 5m
    The beep was a terminal BEL (program / tmux / shell), not AppKit. Look
    at the pane's program for why it rang; the drop is a separate question
    (check `key_not_consumed`, `main_thread_stall`, `libghostty_log`).
-2. **Is there a `no_responder_window` line at ~T?** AppKit beeped: the key
+2. **Is there a `no_responder_window` line with `selector: keyDown:` at ~T?**
+   This is the AppKit beep path: the key
    reached the end of the responder chain unhandled. A `key_not_delivered`
    line alone is only routing context (the key went to `responder`
    instead of the terminal; a non-terminal responder may well have
    handled it), so require the `no_responder_window` line before calling
-   it a beep. Read the `first_responder_changed` lines just before it:
+   it a beep. Other selectors (including `keyUp:`) do not beep and carry
+   no key context. Missing key fields mean no matching active event was
+   observed, not that an older key caused the fallback. Read the `first_responder_changed` lines just before it:
    - `old_kind: terminal` → `new_kind: other` with a small
      `since_responder_change_ms` on the dropped key means a transient
      first-responder move during a re-render. A preceding
