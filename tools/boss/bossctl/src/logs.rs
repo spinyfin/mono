@@ -27,7 +27,19 @@ fn shared_source(source: &LogSource) -> boss_log_files::LogSource {
         LogSource::Dispatch => boss_log_files::LogSource::Dispatch,
         LogSource::Spawn => boss_log_files::LogSource::Spawn,
         LogSource::PopulationTiming => boss_log_files::LogSource::PopulationTiming,
+        LogSource::TerminalInput => boss_log_files::LogSource::TerminalInput,
     }
+}
+
+/// Day-rotated sources: `--follow` tails the newest day file and must
+/// re-resolve after midnight.
+fn is_day_rotated(source: boss_log_files::LogSource) -> bool {
+    matches!(
+        source,
+        boss_log_files::LogSource::Spawn
+            | boss_log_files::LogSource::PopulationTiming
+            | boss_log_files::LogSource::TerminalInput
+    )
 }
 
 /// CLI query options collected from `bossctl logs` flags.
@@ -118,12 +130,13 @@ fn display_label(source: boss_log_files::LogSource, root: &Path, scanned: &[Path
 /// Live path to poll under `--follow`. For day-rotated sources this is the
 /// newest day file (or the diagnostics directory placeholder if none exist).
 fn follow_live_path(source: boss_log_files::LogSource, root: &Path, paths: &[PathBuf]) -> PathBuf {
-    match source {
-        boss_log_files::LogSource::Spawn | boss_log_files::LogSource::PopulationTiming => paths
+    if is_day_rotated(source) {
+        paths
             .last()
             .cloned()
-            .unwrap_or_else(|| resolve_log_source_path(source, root)),
-        _ => resolve_log_source_path(source, root),
+            .unwrap_or_else(|| resolve_log_source_path(source, root))
+    } else {
+        resolve_log_source_path(source, root)
     }
 }
 
@@ -192,10 +205,7 @@ pub(crate) async fn logs_follow(source: LogSource, state_root: Option<PathBuf>, 
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
         // Day-rotated sources: pick up a new day file after midnight.
-        if matches!(
-            shared,
-            boss_log_files::LogSource::Spawn | boss_log_files::LogSource::PopulationTiming
-        ) {
+        if is_day_rotated(shared) {
             let refreshed = resolve_log_source_files(shared, &root);
             if let Some(newest) = refreshed.last()
                 && newest != &follow_path

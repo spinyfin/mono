@@ -55,6 +55,10 @@ root-cause rule as the section below.
   Bazel build in a worker, how the composed `PATH` is sealed across
   driver tool shells, and what that seal does not cover):
   [`tools/boss/docs/worker-tool-environment.md`](tools/boss/docs/worker-tool-environment.md)
+- Terminal keyboard-input diagnostics (what `bossctl logs terminal-input`
+  records, how to tell an AppKit unhandled-key beep from a terminal BEL,
+  and how to read a dropped-keystroke incident):
+  [`tools/boss/docs/terminal-input-diagnostics.md`](tools/boss/docs/terminal-input-diagnostics.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 

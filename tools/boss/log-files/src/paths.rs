@@ -62,6 +62,12 @@ pub const POPULATION_TIMING_PREFIX: &str = "engine-population-timing-";
 /// `population-timing` log source.
 pub const APP_POPULATION_TIMING_PREFIX: &str = "population-timing-";
 
+/// Day-rotated filename prefix for the macOS app's terminal keyboard-input
+/// diagnostics (`terminal-input-YYYY-MM-DD.jsonl` under `diagnostics/`):
+/// first-responder / key-window changes, keys that reached a non-terminal
+/// responder, bells, main-thread stalls, libghostty pty write errors.
+pub const TERMINAL_INPUT_PREFIX: &str = "terminal-input-";
+
 /// Which engine log / diagnostic stream a reader is targeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSource {
@@ -77,6 +83,9 @@ pub enum LogSource {
     /// `population-timing-YYYY-MM-DD.jsonl` and
     /// `engine-population-timing-YYYY-MM-DD.jsonl`.
     PopulationTiming,
+    /// `diagnostics/terminal-input-YYYY-MM-DD.jsonl` — the macOS app's
+    /// terminal keyboard-input diagnostics.
+    TerminalInput,
 }
 
 impl LogSource {
@@ -88,6 +97,7 @@ impl LogSource {
             LogSource::Dispatch => "dispatch",
             LogSource::Spawn => "spawn",
             LogSource::PopulationTiming => "population-timing",
+            LogSource::TerminalInput => "terminal-input",
         }
     }
 
@@ -106,7 +116,7 @@ impl LogSource {
             LogSource::EngineTrace => Some(ENGINE_TRACE_FILENAME),
             LogSource::Audit => Some(ENGINE_AUDIT_FILENAME),
             LogSource::Dispatch => Some(DISPATCH_EVENTS_LIVE_FILENAME),
-            LogSource::Spawn | LogSource::PopulationTiming => None,
+            LogSource::Spawn | LogSource::PopulationTiming | LogSource::TerminalInput => None,
         }
     }
 }
@@ -410,7 +420,7 @@ pub fn resolve_log_source_path(source: LogSource, state_root: &Path) -> PathBuf 
         },
         LogSource::EngineTrace => state_root.join(ENGINE_TRACE_FILENAME),
         LogSource::Dispatch => state_root.join(DISPATCH_EVENTS_DIR).join(DISPATCH_EVENTS_LIVE_FILENAME),
-        LogSource::Spawn | LogSource::PopulationTiming => state_root.join(DIAGNOSTICS_DIR),
+        LogSource::Spawn | LogSource::PopulationTiming | LogSource::TerminalInput => state_root.join(DIAGNOSTICS_DIR),
     }
 }
 
@@ -434,6 +444,7 @@ pub fn resolve_log_source_files(source: LogSource, state_root: &Path) -> Vec<Pat
             &state_root.join(DIAGNOSTICS_DIR),
             &[POPULATION_TIMING_PREFIX, APP_POPULATION_TIMING_PREFIX],
         ),
+        LogSource::TerminalInput => day_rotated_files(&state_root.join(DIAGNOSTICS_DIR), TERMINAL_INPUT_PREFIX),
     }
 }
 
@@ -708,6 +719,32 @@ mod tests {
         std::fs::write(diag.join("spawn-2026-07-26.jsonl"), b"{}\n").unwrap();
         let files = resolve_log_source_files(LogSource::Spawn, dir.path());
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn resolve_log_source_files_terminal_input_lists_only_its_day_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let diag = dir.path().join(DIAGNOSTICS_DIR);
+        std::fs::create_dir_all(&diag).unwrap();
+        std::fs::write(diag.join("terminal-input-2026-10-05.jsonl"), b"{}\n").unwrap();
+        std::fs::write(diag.join("terminal-input-2026-10-04.jsonl"), b"{}\n").unwrap();
+        // Noise: sibling diagnostics in the same directory must not appear.
+        std::fs::write(diag.join("spawn-2026-10-05.jsonl"), b"{}\n").unwrap();
+        std::fs::write(diag.join("terminal-loop-2026-10-05.jsonl"), b"{}\n").unwrap();
+
+        let files = resolve_log_source_files(LogSource::TerminalInput, dir.path());
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["terminal-input-2026-10-04.jsonl", "terminal-input-2026-10-05.jsonl"]
+        );
+        assert_eq!(LogSource::TerminalInput.as_str(), "terminal-input");
+        assert_eq!(LogSource::TerminalInput.filename(), None);
+        assert!(!LogSource::TerminalInput.uses_timestamp_rotation());
+        assert_eq!(resolve_log_source_path(LogSource::TerminalInput, dir.path()), diag);
     }
 
     #[test]

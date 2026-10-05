@@ -427,7 +427,20 @@ final class GhosttyRuntime: @unchecked Sendable {
             resolved.host?.applyColorChange(change)
 
         case .ringBell:
-            if Self.shouldRingBell(role: resolved.host?.session.role) {
+            // Log every BEL before deciding whether it is audible, so a beep
+            // the operator hears can be matched to a `bell` line with
+            // `rang_system_alert: true` — or, absent one, attributed to
+            // AppKit's unhandled-key beep instead (see [[TerminalInputMonitor]]).
+            // Both paths end in the same system alert sound; the log is the
+            // only way to tell them apart.
+            let rings = Self.shouldRingBell(role: resolved.host?.session.role)
+            TerminalInputLog.shared.record(
+                event: "bell",
+                fields: Self.bellLogFields(
+                    paneId: resolved.host?.session.id, role: resolved.host?.session.role, rangSystemAlert: rings
+                )
+            )
+            if rings {
                 NSSound.beep()
             }
 
@@ -509,6 +522,28 @@ final class GhosttyRuntime: @unchecked Sendable {
     /// of its own, so a worker's bell must never reach `NSSound.beep()`.
     static func shouldRingBell(role: PaneRole?) -> Bool {
         role == .boss
+    }
+
+    /// Fields for the `bell` line in [[TerminalInputLog]]. `pane` is the
+    /// session id (or `"unresolved"` when libghostty's target did not map
+    /// to a live host view), `role` is `boss` / `worker` / `unresolved`,
+    /// and `rang_system_alert` records whether `NSSound.beep()` followed.
+    /// Static and pure so the shape is unit-testable.
+    static func bellLogFields(paneId: String?, role: PaneRole?, rangSystemAlert: Bool) -> [String: Any] {
+        var fields: [String: Any] = [
+            "pane": paneId ?? "unresolved",
+            "rang_system_alert": rangSystemAlert,
+        ]
+        switch role {
+        case .boss:
+            fields["role"] = "boss"
+        case .worker(let slot):
+            fields["role"] = "worker"
+            fields["slot"] = slot
+        case nil:
+            fields["role"] = "unresolved"
+        }
+        return fields
     }
 
     /// Classify libghostty's close callback using the facts that actually
