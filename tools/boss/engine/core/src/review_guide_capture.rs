@@ -247,6 +247,19 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
         expected_head_branch,
         observation_sequence,
     } = request;
+    match work_db.review_guide_root_is_design(&root_task_id) {
+        Ok(true) => {
+            tracing::info!(root_task_id, pr_url, "review guide not auto-generated: design task",);
+            return None;
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            root_task_id,
+            pr_url,
+            ?error,
+            "review-guide source capture: could not read root task kind; proceeding",
+        ),
+    }
     let observation_sequence = match observation_sequence {
         Some(sequence) => sequence,
         None => match work_db.allocate_pr_review_guide_source_observation_sequence() {

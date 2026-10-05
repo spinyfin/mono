@@ -372,3 +372,67 @@ fn enqueue_resolves_product_repository_and_task_override() {
         assert_eq!(execution.status, ExecutionStatus::Ready);
     }
 }
+
+async fn auto_capture_stored(kind: &str) -> bool {
+    let (dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "kind gate");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET kind = ?1 WHERE id = ?2", [kind, root.as_str()])
+        .unwrap();
+    let url = "https://github.com/acme/widget/pull/91";
+    let packet = crate::test_support::source_capture_packet(url, "base", "head");
+    let output = packet.clone();
+    let collect: PacketCollectFn = Arc::new(move |_, _, _, _| {
+        let packet = output.clone();
+        Box::pin(async move { Ok(packet) })
+    });
+    let collector = SourcePacketCollector::fixture(collect, packet);
+    let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("flags.toml")));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    let request = SourceCaptureRequest::builder()
+        .root_task_id(root.clone())
+        .pr_url(url)
+        .trigger(PrSourceCaptureTrigger::Creation)
+        .build();
+    let handle = reconcile_review_guide_source_with_collector(db.clone(), flags, request, collector);
+    if let Some(handle) = handle {
+        handle.await.unwrap();
+    }
+    db.get_latest_pr_review_guide_source_capture(&root).unwrap().is_some()
+}
+
+#[tokio::test]
+async fn design_task_pr_is_not_auto_captured() {
+    assert!(!auto_capture_stored("design").await);
+}
+
+#[tokio::test]
+async fn chore_pr_is_still_auto_captured() {
+    assert!(auto_capture_stored("chore").await);
+}
+
+#[tokio::test]
+async fn manual_capture_still_works_for_design_task() {
+    let (_dir, db) = open_db();
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "manual design");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET kind = 'design' WHERE id = ?1", [root.as_str()])
+        .unwrap();
+    let url = "https://github.com/acme/widget/pull/92";
+    let packet = crate::test_support::source_capture_packet(url, "base", "head");
+    let output = packet.clone();
+    let collect: PacketCollectFn = Arc::new(move |_, _, _, _| {
+        let packet = output.clone();
+        Box::pin(async move { Ok(packet) })
+    });
+    let collector = SourcePacketCollector::fixture(collect, packet);
+    capture_review_guide_source_manually(&db, &root, url, &collector)
+        .await
+        .unwrap();
+    assert!(db.get_latest_pr_review_guide_source_capture(&root).unwrap().is_some());
+}

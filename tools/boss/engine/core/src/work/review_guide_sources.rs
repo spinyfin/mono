@@ -191,6 +191,15 @@ impl WorkDb {
         Ok(task.id)
     }
 
+    /// Whether the canonical root of a review-guide series is a design task,
+    /// whose PR is a design doc. Automatic capture and generation skip these;
+    /// explicit on-demand generation does not consult this.
+    pub(crate) fn review_guide_root_is_design(&self, root_task_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let task = query_task(&conn, root_task_id).require("task", root_task_id)?;
+        Ok(task.kind == TaskKind::Design)
+    }
+
     /// Map a work-item id to the board item that owns it for attention/audit
     /// purposes. A review-guide comparison id (`prgc_`) is not a
     /// product-scoped work item; it resolves to the comparison series' root
