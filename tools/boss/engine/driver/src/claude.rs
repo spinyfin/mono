@@ -1148,7 +1148,7 @@ impl AgentDriver for ClaudeDriver {
         }
     }
 
-    /// Probe is typed pane input (`SendToPane`) — Claude's interactive TUI
+    /// Probe is typed pane input (tmux `send-keys`) — Claude's interactive TUI
     /// reads stdin as the next user message.
     fn probe(&self) -> ProbeDelivery {
         ProbeDelivery::PaneText

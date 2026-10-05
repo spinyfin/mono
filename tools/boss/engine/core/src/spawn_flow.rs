@@ -123,7 +123,7 @@ impl WorkerPaneLaunch {
 /// `BOSS_CONTROL_SOCKET` left over from an interactive run, or
 /// arbitrary tokens carried from the user's shell) from reaching
 /// workers. Standard env (HOME, USER, SHELL, TERM, LANG, locale)
-/// inherits naturally from the app process and is not in this list
+/// inherits naturally from the engine process and is not in this list
 /// because we never set it explicitly here.
 const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
     "BOSS_TASK_ID",
@@ -798,14 +798,9 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         EnvVar {
             // Read by `boss-event` and embedded in every hook payload
             // as `_boss_run_id`. The engine uses this to correlate
-            // hook events to runs without depending on a working
-            // shell-pid lookup. `proc_listpids` in the app side is
-            // still a TODO, and without it `WorkerRegistry`'s pid
-            // map stays empty, `lookup_with_ancestor_walk` returns
-            // None, and `dispatch_live_worker_state` silently skips
-            // every event — that's the bug that pinned every worker's
-            // activity at `Spawning` regardless of what the worker
-            // was actually doing.
+            // hook events to runs even before the tmux pane pid has
+            // been registered. Startup hooks must not depend on a
+            // shell-pid lookup that can race process creation.
             key: "BOSS_RUN_ID".into(),
             value: input.run_id.clone(),
         },
@@ -1127,6 +1122,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingTmuxStore {
         steps: std::sync::Mutex<Vec<&'static str>>,
+        fail_intent: bool,
+        missing_run: bool,
     }
 
     impl RecordingTmuxStore {
@@ -1144,7 +1141,10 @@ mod tests {
             _spawn_token: &str,
         ) -> anyhow::Result<bool> {
             self.steps.lock().unwrap().push("intent");
-            Ok(true)
+            if self.fail_intent {
+                anyhow::bail!("intent write failed");
+            }
+            Ok(!self.missing_run)
         }
 
         fn record_tmux_session_created(
@@ -2643,6 +2643,32 @@ mod tests {
             assert_eq!(spawner.registry.slot_for_run("run-test"), Some(3));
         }
     }
+    #[tokio::test]
+    async fn local_spawn_requires_successfully_persisted_identity() {
+        for fail_intent in [false, true] {
+            let workspace = TempDir::new().unwrap();
+            let spawner = ok_spawner_capturing();
+            let store = Arc::new(RecordingTmuxStore {
+                fail_intent,
+                missing_run: !fail_intent,
+                ..Default::default()
+            });
+            let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
+            input.tmux_host.spawn_store = store.clone();
+
+            let result = start_worker(&spawner, input, StdDuration::from_secs(1)).await;
+
+            assert!(matches!(result, Err(StartWorkerError::Tmux(_))), "{result:?}");
+            assert_eq!(store.steps(), ["intent"]);
+            assert!(
+                spawner.tmux_runner.calls().is_empty(),
+                "no process before durable identity"
+            );
+            assert_eq!(spawner.spawn_calls.load(Ordering::SeqCst), 0);
+            assert!(spawner.registry.slot_for_run("run-test").is_none());
+        }
+    }
+
     #[tokio::test]
     async fn tmux_failure_is_an_explicit_local_failure_without_app_fallback() {
         let workspace = TempDir::new().unwrap();

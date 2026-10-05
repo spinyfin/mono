@@ -1,5 +1,7 @@
 # Agent-driver abstraction: decouple Boss from Claude Code (capabilities-oriented, mix-and-match)
 
+> **Pane-hosting update:** Local agent CLIs now run in engine-owned tmux sessions with durable identity. Ghostty is an attached viewer; engine input uses tmux, and remote SSH workers remain detached. App-owned spawn and input references in the original coupling survey below are historical. See [Tmux-only local worker panes](./make-tmux-the-only-pane-hosting-mode.md).
+
 - **Status:** built. The seam, the capability model, the dispatch gate, the `driver` data model, and the reference Claude driver all shipped; the outstanding residue is named in [Implementation status](#implementation-status).
 - **Scope:** engine-side only. No Swift/app changes; the execution model stays "embed the agent CLI in a ghostty pane".
 - **Downstream:** [Copilot CLI as alternative worker backend](copilot-cli-as-alternative-worker-backend.md), [Codex as a first-class agent driver](codex-as-a-first-class-agent-driver.md), [Grok as a first-class interactive agent driver](grok-as-a-first-class-interactive-agent-driver.md) — all three are concrete drivers on the seam this project defines.

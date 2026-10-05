@@ -329,8 +329,8 @@ pub trait WorkerTerminalInspector: Send + Sync {
     }
 }
 
-/// Production tmux inspector. A run without tmux identity returns `None` so
-/// the legacy cadence fallback remains available while pools migrate.
+/// Production tmux inspector. A run without tmux identity (a remote detached
+/// worker) returns `None` so it takes the cadence-only path.
 pub struct TmuxWorkerTerminalInspector {
     work_db: Arc<WorkDb>,
     tmux: Tmux,
@@ -627,14 +627,15 @@ impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
 pub struct StaleWorkerSweepDeps {
     pub work_db: Arc<WorkDb>,
     pub live_states: Arc<LiveWorkerStateRegistry>,
-    /// Present for tmux-hosted pools. Missing terminal evidence falls back to
-    /// the legacy cadence path until that pool migrates.
+    /// `None` only when tmux could not be resolved at startup. Runs with no
+    /// tmux identity — remote detached workers, which never have one — take
+    /// the conservative cadence-only path instead.
     pub terminal_inspector: Option<Arc<dyn WorkerTerminalInspector>>,
     pub coordinator: Arc<ExecutionCoordinator>,
     pub dispatch_events: Arc<dyn DispatchEventSink>,
     pub reaper: Arc<dyn StaleWorkerReaper>,
     pub hold_registry: Arc<HoldRegistry>,
-    /// Forwarded to [`crate::dead_pid_sweep::reap_reported_pane_death`] so a
+    /// Forwarded to [`crate::dead_pid_sweep::reap_observed_worker_death`] so a
     /// tmux-confirmed dead pane can force-release its cube lease.
     pub cube_client: Arc<dyn CubeClient>,
 }

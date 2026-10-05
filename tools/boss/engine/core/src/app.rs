@@ -865,8 +865,7 @@ struct ServerState {
     /// Pending probes per run, FIFO. Each entry is the engine-minted
     /// `probe_id` paired with the verbatim text the caller queued.
     /// The events-socket consumer pops one entry per `Stop` hook event
-    /// for the matching run and dispatches it as `SendToPane` to the
-    /// app.
+    /// for the matching run and writes it into the worker's tmux pane.
     pending_probes: StdMutex<HashMap<String, VecDeque<PendingProbe>>>,
     /// Probes that have been dispatched into a worker pane and are
     /// awaiting the *next* `Stop` boundary so the engine can extract
@@ -1306,10 +1305,10 @@ impl ServerState {
 
         // Load per-installation settings. A missing or unreadable file
         // falls back to registry defaults; ordinary parse failures are
-        // logged but don't block startup. A leftover
-        // `workers.tmux_hosting` key is the exception: accepting it as
-        // a no-op would start workers under a different ownership
-        // model than the file claims.
+        // logged but don't block startup. A leftover removed hosting-mode
+        // key (see `settings::is_removed_tmux_hosting_error`) is the
+        // exception: accepting it as a no-op would start workers under a
+        // different ownership model than the file claims.
         let settings = Arc::new(crate::settings::SettingsStore::new(
             crate::settings::SettingsStore::default_path(&state_root),
         ));
@@ -2029,7 +2028,7 @@ impl ServerState {
 }
 
 /// Enable the transient-recovery sweep to nudge a live idle worker via
-/// the same `SendToPane` path that `bossctl agents send` uses.
+/// the same tmux pane-write path that `bossctl agents send` uses.
 /// `Arc<ServerState>` can then be coerced to `Arc<dyn WorkerNudger>`.
 #[async_trait]
 impl crate::transient_recovery::WorkerNudger for ServerState {

@@ -838,8 +838,8 @@ async fn clearing_a_stale_queued_probe_records_that_it_was_dropped_and_why() {
     assert_eq!(server_state.pending_probe_count(&run_id), 0);
 }
 
-/// `consumed` must mean consumed. `SendToPane` returning `Ok` only proves the
-/// app wrote bytes into the pty; a pane whose foreground process has already
+/// `consumed` must mean consumed. A pane write returning `Ok` only proves tmux
+/// accepted the keys; a pane whose foreground process has already
 /// exited accepts them with nobody reading. That is how a probe injected into
 /// a dead `codex` pane came to be reported `consumed`, which made the state
 /// useless as evidence that a worker had seen anything.

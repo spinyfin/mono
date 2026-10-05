@@ -607,7 +607,7 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
             // immediate path then declined to deliver, which is the engine
             // breaking a commitment it made in the response it already sent.
             // `Orphaned` still counts as the commitment honoured: it is recorded
-            // only after a successful `SendToPane` write, when the pane's pid
+            // only after a successful pane write, when the pane's pid
             // liveness check failed after the fact (see
             // `ProbeDeliveryState::is_undeliverable`'s doc) — the pane got the
             // bytes, and a later `Replied` can still correct the record.

@@ -1,4 +1,4 @@
-//! Coverage for [`ServerState::shutdown_workers`]: app-hosted workers are
+//! Coverage for [`ServerState::shutdown_workers`]: historical app-hosted workers are
 //! preserved for rollback/drain; tmux workers survive with identity
 //! columns intact so boot-time adoption can re-attach them.
 

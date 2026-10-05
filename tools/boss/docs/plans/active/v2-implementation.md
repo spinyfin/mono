@@ -460,17 +460,16 @@ Response / Error` enums in `boss-protocol` (PR #152).
   [`designs/engine-app-rpc`](../../designs/engine-app-rpc.md)
   (PR #149).
 
-**Pending.** Nothing load-bearing. The
-`WorkersWorkspaceModel.spawnWorkerPane` still has a TODO for
-`proc_listpids` to compute the real shell pid, but PR #197 made
-hook correlation independent of it; the TODO is now a
-nice-to-have rather than a Phase 6 blocker.
+**Current implementation.** Local workers run in engine-created tmux sessions;
+the app attaches a viewer. The engine reads the pane pid from tmux, and hook
+correlation uses the durable run id. The former app-owned spawn and pid-discovery
+TODO no longer exist.
 
 **Done when (acceptance).**
 
 - Human can run `boss task create --name X` from terminal; engine
   picks up the task, leases a workspace, spawns `claude` in a
-  libghostty pane, the worker does the work and opens a PR. Engine
+  tmux session with a libghostty viewer, the worker does the work and opens a PR. Engine
   observes the full lifecycle via WorkerEvents.
 
 **Build-system gap (still tracked as Phase 11).** Phase 6f shipped
@@ -548,7 +547,7 @@ interrupt, launch, stop, transcript}`, `probe <run_id> <text>`,
   `FrontendEvent::ProbeQueued { run_id, probe_id }` response
   threads through to `bossctl probe`. The events-socket consumer
   pops one entry per `Stop` hook boundary, captures the current
-  transcript byte offset on successful `SendToPane`, and tracks
+  transcript byte offset on successful tmux pane write, and tracks
   the dispatched probe in `in_flight_probes`. The follow-up Stop
   reads the assistant turn written after that offset and emits
   `FrontendEvent::ProbeReplied { run_id, probe_id, text }` on
@@ -613,7 +612,7 @@ interrupt, launch, stop, transcript}`, `probe <run_id> <text>`,
 - ~~`ProbeReplied` event on the follow-up `Stop`~~ — landed.
   `dispatch_probe_reply_on_stop` runs ahead of the dispatcher,
   consumes the in-flight entry recorded by the previous Stop's
-  successful `SendToPane`, reads the new transcript region, and
+  successful tmux pane write, reads the new transcript region, and
   publishes `FrontendEvent::ProbeReplied { run_id, probe_id,
 text }` on the per-run [`probe_topic`]. Idempotent on
   duplicate Stops (the in-flight entry is taken on first emit).

@@ -59,8 +59,8 @@
 //!
 //! ### Liveness corroboration (the shell-pid false-reap fix)
 //!
-//! The registered `shell_pid` is the pty *foreground* pid captured once
-//! at surface-init (`ghostty_surface_foreground_pid`). That identity is
+//! The registered `shell_pid` is the tmux `#{pane_pid}` captured once
+//! at session creation. That identity is
 //! not stable for the worker's lifetime: a wrapper/login shell can exit
 //! or `exec` while the real `claude` process lives on under a different
 //! pid, and macOS aggressively reuses pids (the observed reused pid,
@@ -93,7 +93,7 @@
 //!
 //! ## Immediate reconciliation
 //!
-//! [`reap_reported_pane_death`] is the event-driven counterpart: the
+//! [`reap_driver_exit_at_pane_input`] is the event-driven counterpart: the
 //! pane-input boundary calls it when its fresh foreground-driver check finds
 //! the agent gone. It shares [`run_one_pass`]'s reap effects but skips the
 //! grace period and PID probe, since that is a direct observation rather
@@ -118,7 +118,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{LiveWorkerState, WorkExecution, WorkerPaneDeathReason};
+use boss_protocol::{LiveWorkerState, WorkExecution};
 
 use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -345,6 +345,7 @@ pub async fn run_one_pass(
                 .now_epoch_secs(now_epoch_secs)
                 .cube_client(cube_client)
                 .probe_observation(&observation)
+                .evidence(DeathEvidence::PidProbe)
                 .build(),
         )
         .await;
@@ -356,29 +357,26 @@ pub async fn run_one_pass(
     outcome
 }
 
-/// Immediately reap the execution behind `run_id` after a direct pane-death
-/// observation: the pane-input boundary reports a driver that returned to
-/// a shell.
+/// Immediately reap the execution behind `run_id` after a direct observation
+/// at the pane-input boundary: the worker's CLI has returned and a shell (or
+/// nothing) owns the pane, so delivering text would type into a shell.
 ///
 /// Unlike [`run_one_pass`], this skips [`DEAD_PID_GRACE_SECS`] and the
 /// `kill(pid, 0)` liveness probe: those exist to protect the periodic
 /// sweep's *speculative* signal (a PID it can no longer find) from
-/// racing a worker that is merely slow to start. Here the caller is
-/// reporting a *direct observation*, so there is
+/// racing a worker that is merely slow to start. Here the caller has made
+/// a *direct observation*, so there is
 /// nothing to protect against racing — waiting the grace period would
 /// only delay reconciliation for no benefit. Returns `true` if an
 /// execution was actually reaped.
-pub async fn reap_reported_pane_death(
+pub async fn reap_driver_exit_at_pane_input(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
     cube_client: &dyn CubeClient,
     run_id: &str,
-    report_reason: WorkerPaneDeathReason,
 ) -> bool {
-    let detail = report_reason.describe();
-    let reason = format!("worker-pane-died: reported {detail}");
     reap_live_nonterminal_worker(
         work_db,
         live_states,
@@ -386,17 +384,16 @@ pub async fn reap_reported_pane_death(
         dispatch_events,
         cube_client,
         run_id,
-        &reason,
-        Some(report_reason),
+        "driver-exited: worker driver exited before the engine delivered pane input",
+        DeathEvidence::DriverExitAtPaneInput,
     )
     .await
 }
 
 /// Reap a worker the engine itself observed as dead (tmux `#{pane_dead}`,
 /// an absent session after pid corroboration, a spawn-token mismatch).
-/// Unlike [`reap_reported_pane_death`], `reason` is recorded as-is — this
-/// is not an app pane-death callback, so the durable narrative must not
-/// claim the app reported a child-process exit.
+/// Unlike [`reap_driver_exit_at_pane_input`], `reason` is recorded as-is, so
+/// the durable narrative names the evidence the caller actually had.
 pub async fn reap_observed_worker_death(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
@@ -414,7 +411,7 @@ pub async fn reap_observed_worker_death(
         cube_client,
         run_id,
         reason,
-        None,
+        DeathEvidence::TmuxObservation,
     )
     .await
 }
@@ -428,12 +425,12 @@ async fn reap_live_nonterminal_worker(
     cube_client: &dyn CubeClient,
     run_id: &str,
     reason: &str,
-    app_report_reason: Option<WorkerPaneDeathReason>,
+    evidence: DeathEvidence,
 ) -> bool {
     let Some(state) = live_states.snapshot().into_iter().find(|s| s.run_id == run_id) else {
         tracing::warn!(
             run_id,
-            "worker_pane_died: no live slot found for run_id (already released?)"
+            "dead-worker reap: no live slot found for run_id (already released?)"
         );
         return false;
     };
@@ -446,13 +443,13 @@ async fn reap_live_nonterminal_worker(
     let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
         work_db,
         run_id,
-        "worker_pane_died: failed to look up execution; skipping reap",
+        "dead-worker reap: failed to look up execution; skipping reap",
     ) else {
         return false;
     };
 
     if execution.status.is_terminal() {
-        // Completion path raced the app's report; nothing to do.
+        // Completion path raced this reap; nothing to do.
         return false;
     }
 
@@ -468,7 +465,7 @@ async fn reap_live_nonterminal_worker(
             .reason(reason)
             .now_epoch_secs(now_epoch_secs)
             .cube_client(cube_client)
-            .maybe_app_report_reason(app_report_reason)
+            .evidence(evidence)
             .build(),
     )
     .await
@@ -479,8 +476,8 @@ async fn reap_live_nonterminal_worker(
 /// and `dead_pid_reconcile` dispatch-event details so a future death is
 /// explainable from the run's record — a reaped run's transcript must
 /// never "just stop" with no indication of why.
-/// Only produced on the speculative periodic path; the app-reported
-/// pane-death reap has no probe to describe.
+/// Only produced on the speculative periodic path; a direct pane-input
+/// observation has no probe to describe.
 struct LivenessProbeObservation {
     /// The liveness probe performed, e.g. `"kill(pid,0)"`.
     probe: &'static str,
@@ -538,6 +535,43 @@ impl LivenessProbeObservation {
     }
 }
 
+/// What established that a worker was dead. Recorded in the orphan audit
+/// line and as `detection_source` on the `dead_pid_reconcile` event, so the
+/// durable narrative never claims stronger evidence than the caller had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeathEvidence {
+    /// The periodic sweep's `kill(pid, 0) == ESRCH` verdict, corroborated
+    /// against hook activity.
+    PidProbe,
+    /// The engine read tmux state directly (`#{pane_dead}`, an absent
+    /// session after pid corroboration, a spawn-token mismatch).
+    TmuxObservation,
+    /// The pane-input boundary's fresh foreground-driver check found the
+    /// agent's CLI had returned.
+    DriverExitAtPaneInput,
+}
+
+impl DeathEvidence {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PidProbe => "pid_probe",
+            Self::TmuxObservation => "tmux_observation",
+            Self::DriverExitAtPaneInput => "driver_exit_at_pane_input",
+        }
+    }
+
+    /// Phrase for the orphan audit line. A foreground-driver refusal is
+    /// deliberately not labelled as a PID probe: that would hide the safety
+    /// boundary that refused pane input before a shell could receive it.
+    fn audit_source(self) -> &'static str {
+        match self {
+            Self::PidProbe => "a PID probe",
+            Self::TmuxObservation => "a tmux observation",
+            Self::DriverExitAtPaneInput => "the pre-write driver liveness check",
+        }
+    }
+}
+
 /// Per-reap parameters that don't identify *what* is being reaped (that's
 /// `state`/`execution`) but *how* to record and report the reap. Bundled
 /// to keep [`reap_dead_execution`]'s argument count under the
@@ -547,12 +581,11 @@ struct ReapOptions<'a> {
     reason: &'a str,
     now_epoch_secs: i64,
     /// What the liveness probe observed, when the reap came from the
-    /// speculative periodic sweep. `None` for the app-reported pane-death
+    /// speculative periodic sweep. `None` for a direct pane-input
     /// reap, which has no speculative probe to describe.
     probe_observation: Option<&'a LivenessProbeObservation>,
-    /// Callback provenance for an app-reported reap. `None` on periodic
-    /// PID-probe paths.
-    app_report_reason: Option<WorkerPaneDeathReason>,
+    /// What established that the worker was dead.
+    evidence: DeathEvidence,
     /// Used to best-effort force-release the reaped execution's cube lease
     /// (if any) — see the release step in [`reap_dead_execution`].
     cube_client: &'a dyn CubeClient,
@@ -562,7 +595,7 @@ struct ReapOptions<'a> {
 /// orphaned, back up uncommitted workspace work, append the
 /// `[engine-reconcile]` audit line, release the pool slot, and emit a
 /// `dead_pid_reconcile` dispatch event. Shared between [`run_one_pass`],
-/// [`reap_reported_pane_death`], and [`reap_observed_worker_death`] so all
+/// [`reap_driver_exit_at_pane_input`], and [`reap_observed_worker_death`] so all
 /// paths — the periodic sweep, a directly observed pane-input-boundary
 /// death, and a death the engine itself observed in tmux — leave the DB,
 /// pool, and audit trail in the same shape.
@@ -582,7 +615,7 @@ async fn reap_dead_execution(
         now_epoch_secs,
         cube_client,
         probe_observation,
-        app_report_reason,
+        evidence,
     } = options;
     let execution_id = &state.run_id;
 
@@ -613,7 +646,7 @@ async fn reap_dead_execution(
 
     // Every dead-worker reap removes this slot from the live-state registry.
     // Resolve the work item's stale-worker attention before that happens so
-    // the periodic sweep, app-driven paths, and tmux-observed death path
+    // the periodic sweep, the pane-input path, and tmux-observed death path
     // cannot strand an attention item after the slot is gone.
     crate::stale_worker_sweep::resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
 
@@ -635,15 +668,8 @@ async fn reap_dead_execution(
 
     // Append [engine-reconcile] audit line to the task description
     // so a human inspecting the chore can see why it was reset (and
-    // where to find the recovery patch, if one was captured). An
-    // authoritative foreground-driver report is intentionally not labelled
-    // as a PID probe: that would hide the safety boundary that refused pane
-    // input before a shell could receive it.
-    let detection_source = match app_report_reason {
-        Some(WorkerPaneDeathReason::DriverExited) => "the pre-write driver liveness check",
-        Some(_) => "an app pane-death report",
-        None => "a PID probe",
-    };
+    // where to find the recovery patch, if one was captured).
+    let detection_source = evidence.audit_source();
     if let Some(work_item_id) = &state.work_item_id
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
@@ -681,14 +707,14 @@ async fn reap_dead_execution(
     // claim here (as this reap used to) leaves `LiveWorkerStateRegistry`
     // reporting the reaped run as still live on this slot. That desync is
     // exactly what let a slot the engine considers free get re-claimed and
-    // rejected `SlotBusy` by an app that still hosts the old pane — the
-    // stale live-state entry also hides the slot from `husk_pane_sweep`
-    // (which only ever treats a slot as a husk when the engine has NO
-    // live-tracked run there), so the underlying stray pane was never
+    // rejected `SlotBusy` when the app tried to attach a viewer to a slot
+    // it still shows — the stale live-state entry also hides the slot from
+    // `husk_pane_sweep` (which only ever treats a slot as a husk when the
+    // engine has NO live-tracked run there), so the stray pane was never
     // detected and retired either. Clearing it here restores both
     // invariants: `bossctl agents list` stops reporting a dead run as
-    // live, and any real app-hosted pane on this slot becomes visible to
-    // the husk-pane sweep for automatic retirement.
+    // live, and any leftover viewer or tmux session on this slot becomes
+    // visible to the husk-pane sweep for automatic retirement.
     release_reaped_execution(live_states, &coordinator, state).await;
 
     // Structured event for bossctl dispatch tail. Fold in what the
@@ -698,7 +724,7 @@ async fn reap_dead_execution(
     let mut details = serde_json::json!({
         "dead_pid": state.shell_pid,
         "slot_id": state.slot_id,
-        "app_report_reason": app_report_reason.map(WorkerPaneDeathReason::as_str),
+        "detection_source": evidence.as_str(),
         "recovery_patch": recovery_patch
             .as_deref()
             .map(|p| p.display().to_string()),
@@ -1094,22 +1120,22 @@ mod tests {
         );
     }
 
-    // ─── reap_reported_pane_death ───────────────────────────────────────────
+    // ─── reap_driver_exit_at_pane_input ───────────────────────────────────────────
 
-    /// The core invariant: an app-reported pane death reaps the execution
-    /// immediately, even though `started_at` is fresh (well within
-    /// `DEAD_PID_GRACE_SECS`) and the "PID" is still alive — neither guard
-    /// applies here because the app's report is a direct observation, not
-    /// a speculative signal to protect against.
+    /// The core invariant: a driver exit observed at the pane-input boundary
+    /// reaps the execution immediately, even though `started_at` is fresh
+    /// (well within `DEAD_PID_GRACE_SECS`) and the "PID" is still alive —
+    /// neither guard applies here because the observation is direct, not a
+    /// speculative signal to protect against.
     #[tokio::test]
-    async fn reap_reported_pane_death_bypasses_grace_and_pid_checks() {
+    async fn reap_driver_exit_at_pane_input_bypasses_grace_and_pid_checks() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         // Stamp started_at = NOW — within the grace window the periodic
-        // sweep would respect, but reap_reported_pane_death must not.
+        // sweep would respect, but reap_driver_exit_at_pane_input must not.
         let execution_id = create_execution_started_now(&db, &work_item_id);
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
@@ -1120,18 +1146,17 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let reaped = reap_reported_pane_death(
+        let reaped = reap_driver_exit_at_pane_input(
             db.as_ref(),
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
             &NoopCube,
             &execution_id,
-            WorkerPaneDeathReason::SurfaceCreationFailed,
         )
         .await;
 
-        assert!(reaped, "app-reported pane death must reap immediately");
+        assert!(reaped, "a driver exit at the pane-input boundary must reap immediately");
 
         let exec = db.get_execution(&execution_id).unwrap();
         assert_eq!(exec.status, ExecutionStatus::Orphaned);
@@ -1143,8 +1168,8 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "dead_pid_reconcile");
         assert_eq!(
-            events[0].details["app_report_reason"],
-            WorkerPaneDeathReason::SurfaceCreationFailed.as_str(),
+            events[0].details["detection_source"],
+            DeathEvidence::DriverExitAtPaneInput.as_str(),
         );
     }
 
@@ -1153,7 +1178,7 @@ mod tests {
     /// as any other pane death, and its reason must survive in the operator's
     /// dispatch-event record.
     #[tokio::test]
-    async fn reap_reported_driver_exit_records_the_refusal_reason_and_releases_the_slot() {
+    async fn reap_driver_exit_at_pane_input_records_the_refusal_reason_and_releases_the_slot() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -1167,14 +1192,13 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let reaped = reap_reported_pane_death(
+        let reaped = reap_driver_exit_at_pane_input(
             db.as_ref(),
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
             &NoopCube,
             &execution_id,
-            WorkerPaneDeathReason::DriverExited,
         )
         .await;
 
@@ -1200,30 +1224,29 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "dead_pid_reconcile");
         assert_eq!(
-            events[0].details["app_report_reason"],
-            WorkerPaneDeathReason::DriverExited.as_str(),
+            events[0].details["detection_source"],
+            DeathEvidence::DriverExitAtPaneInput.as_str(),
             "the dispatch log must identify the refused shell delivery",
         );
     }
 
-    /// No live slot for the reported `run_id` (already released, or the
-    /// app raced a normal completion) is a no-op, not an error.
+    /// No live slot for the observed `run_id` (already released, or a normal
+    /// completion raced the observation) is a no-op, not an error.
     #[tokio::test]
-    async fn reap_reported_pane_death_returns_false_for_unknown_run_id() {
+    async fn reap_driver_exit_at_pane_input_returns_false_for_unknown_run_id() {
         let (_dir, db) = open_db();
         let db = Arc::new(db);
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let reaped = reap_reported_pane_death(
+        let reaped = reap_driver_exit_at_pane_input(
             db.as_ref(),
             &live_states,
             coordinator,
             sink.as_ref(),
             &NoopCube,
             "run-does-not-exist",
-            WorkerPaneDeathReason::SurfaceCreationFailed,
         )
         .await;
 
@@ -1232,9 +1255,9 @@ mod tests {
     }
 
     /// A slot already `Terminated` was finalized via the normal
-    /// completion path; the app's death report must not double-reap it.
+    /// completion path; the pane-input observation must not double-reap it.
     #[tokio::test]
-    async fn reap_reported_pane_death_skips_terminal_slot() {
+    async fn reap_driver_exit_at_pane_input_skips_terminal_slot() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -1255,14 +1278,13 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let reaped = reap_reported_pane_death(
+        let reaped = reap_driver_exit_at_pane_input(
             db.as_ref(),
             &live_states,
             coordinator,
             sink.as_ref(),
             &NoopCube,
             &execution_id,
-            WorkerPaneDeathReason::SurfaceCreationFailed,
         )
         .await;
 
@@ -1271,9 +1293,9 @@ mod tests {
     }
 
     /// An execution already terminal in the DB (completion raced the
-    /// app's report) is left untouched.
+    /// observation) is left untouched.
     #[tokio::test]
-    async fn reap_reported_pane_death_skips_terminal_execution() {
+    async fn reap_driver_exit_at_pane_input_skips_terminal_execution() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -1287,14 +1309,13 @@ mod tests {
 
         let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let reaped = reap_reported_pane_death(
+        let reaped = reap_driver_exit_at_pane_input(
             db.as_ref(),
             &live_states,
             coordinator,
             sink.as_ref(),
             &NoopCube,
             &execution_id,
-            WorkerPaneDeathReason::SurfaceCreationFailed,
         )
         .await;
 
@@ -1685,7 +1706,7 @@ mod tests {
     /// **The regression this test used to pin, now inverted.** Codex is
     /// `Persistent` (the bare interactive TUI pivot — see
     /// `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`), so a
-    /// reported pane death is no longer read as an expected one-shot exit
+    /// driver exit observed at the pane is no longer read as an expected one-shot exit
     /// even with a delivered turn boundary: the execution is orphaned and
     /// reaped exactly like Claude's pane death, via the same
     /// `dead_pid_reconcile` path.
@@ -1707,14 +1728,13 @@ mod tests {
         // starts a run with lease id "lease"), so the reap's best-effort
         // force-release needs a cube double that actually succeeds rather
         // than `NoopCube` (which panics on any real call).
-        let reaped = reap_reported_pane_death(
+        let reaped = reap_driver_exit_at_pane_input(
             db.as_ref(),
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
             &AlwaysSucceedsCube,
             &execution_id,
-            WorkerPaneDeathReason::ChildProcessExited,
         )
         .await;
 
@@ -1750,14 +1770,13 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let reaped = reap_reported_pane_death(
+        let reaped = reap_driver_exit_at_pane_input(
             db.as_ref(),
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
             &AlwaysSucceedsCube,
             &execution_id,
-            WorkerPaneDeathReason::SurfaceCreationFailed,
         )
         .await;
 
@@ -1770,7 +1789,7 @@ mod tests {
         assert_eq!(events[0].stage, Stage::DeadPidReconcile.as_str());
     }
 
-    /// The periodic sweep reads the same evidence as [`reap_reported_pane_death`]:
+    /// The periodic sweep reads the same evidence as [`reap_driver_exit_at_pane_input`]:
     /// now that Codex is `Persistent`, a dead pid on a Codex run that
     /// delivered its turn boundary is a genuine orphan, not a finished
     /// one-shot worker — no driver in the registry declares
@@ -1805,10 +1824,10 @@ mod tests {
         );
     }
 
-    /// [`reap_reported_pane_death`] never files an attention item — a single
-    /// reported pane death is already surfaced via the dispatch event.
+    /// [`reap_driver_exit_at_pane_input`] never files an attention item — a single
+    /// observed driver exit is already surfaced via the dispatch event.
     #[tokio::test]
-    async fn reap_reported_pane_death_files_no_attention_item() {
+    async fn reap_driver_exit_at_pane_input_files_no_attention_item() {
         let (_dir, db) = open_db();
         let (work_item_id, execution_id) = create_codex_run(&db);
         db.record_run_turn_boundary_for_execution(&execution_id, "2026-07-28T00:16:58Z")
@@ -1820,21 +1839,20 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
-        reap_reported_pane_death(
+        reap_driver_exit_at_pane_input(
             db.as_ref(),
             &live_states,
             coordinator.clone(),
             Arc::new(RecordingDispatchEventSink::new()).as_ref(),
             &AlwaysSucceedsCube,
             &execution_id,
-            WorkerPaneDeathReason::ChildProcessExited,
         )
         .await;
 
         let items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
         assert!(
             items.is_empty(),
-            "reap_reported_pane_death never files an attention item: {items:?}",
+            "reap_driver_exit_at_pane_input never files an attention item: {items:?}",
         );
     }
 
@@ -1860,14 +1878,13 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let reaped = reap_reported_pane_death(
+        let reaped = reap_driver_exit_at_pane_input(
             db.as_ref(),
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
             &AlwaysSucceedsCube,
             &execution_id,
-            WorkerPaneDeathReason::ChildProcessExited,
         )
         .await;
 

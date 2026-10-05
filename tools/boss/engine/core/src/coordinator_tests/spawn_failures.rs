@@ -96,8 +96,8 @@ async fn lease_failure_logs_cube_stderr_at_error_before_recording_failure() {
 }
 
 /// Regression for the silent-release dispatch failure: when the
-/// pane-spawn step inside `run_execution` fails — libghostty IPC
-/// drop, prompt composition error, runner panic, all surface
+/// pane-spawn step inside `run_execution` fails — tmux session creation
+/// failure, prompt composition error, runner panic, all surface
 /// here as `Err(_)` from `ExecutionRunner::run_execution` — the
 /// coordinator MUST raise a `WorkAttentionItem` AND emit a
 /// structured `pane_spawned` error event. Before this fix
@@ -129,6 +129,13 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
     let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+
+    let failed = db.get_execution(&execution_id).unwrap();
+    assert_eq!(
+        failed.last_error.as_deref(),
+        Some("worker prompt failed"),
+        "a local spawn failure must persist its cause on last_error",
+    );
 
     // The execution went all the way through the lease + change creation.
     assert!(!cube.lease_calls.lock().await.is_empty());
@@ -589,21 +596,11 @@ async fn spawn_abort_survives_a_cancel_landing_during_the_cube_release() {
     );
 }
 
-/// Slow-ack provisional-spawn regression (outcome 3): a slow `AttachWorkerPane` ack that
-/// nonetheless spawned the pane must NOT be treated as a spawn
-/// failure. The real `PaneSpawnRunner` now converts the ack timeout
-/// into a PROVISIONAL spawn (waiting_human + slot retained); the fake
-/// returns that same outcome. The coordinator must then:
-///   - keep the execution TRACKED in `waiting_human` (non-terminal),
-///   - NOT release the cube workspace lease (a live pane may occupy it),
-///   - NOT mark the run failed or emit a `pane_spawned: error` event,
-///   - NOT leave a duplicate execution behind (the incident's second
-///     worker came from the failed+demoted work item being re-dispatched).
-///
-/// The Timeout→provisional conversion itself is unit-tested in
-/// `spawn_flow`; this pins the coordinator-side contract.
+/// A successful tmux spawn retains its slot and lease and remains tracked,
+/// even when no app viewer is attached. Viewer failures are covered at the
+/// spawn boundary; the coordinator sees an ordinary live worker outcome.
 #[tokio::test]
-async fn ack_timeout_provisional_spawn_is_tracked_not_failed_or_duplicated() {
+async fn tmux_spawn_is_tracked_not_failed_or_duplicated() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -612,7 +609,7 @@ async fn ack_timeout_provisional_spawn_is_tracked_not_failed_or_duplicated() {
 
     let cube = Arc::new(FakeCubeClient::default());
     let runner = Arc::new(FakeExecutionRunner {
-        ack_timed_out: true,
+        slot_id: Some(1),
         ..FakeExecutionRunner::default()
     });
     let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
@@ -627,21 +624,21 @@ async fn ack_timeout_provisional_spawn_is_tracked_not_failed_or_duplicated() {
     // Tracked, not failed — the pane may be live and doing work.
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(execution.status, ExecutionStatus::Running);
-    // The lease is retained on the tracked row (a provisional pane may
-    // be occupying the workspace) — clearing it would let the workspace
+    // The lease is retained on the tracked row (a tmux worker
+    // occupies the workspace) — clearing it would let the workspace
     // be re-leased out from under a live worker.
     assert_eq!(
         execution.cube_lease_id.as_deref(),
         Some("lease-1"),
-        "the tracked provisional execution must keep its cube lease",
+        "the tracked tmux execution must keep its cube lease",
     );
 
     // No release-while-occupied: the coordinator must not hand the
-    // workspace back to cube for a provisional spawn.
+    // workspace back to cube for a tmux spawn.
     let releases = cube.release_calls.lock().await.clone();
     assert!(
         !releases.iter().any(|id| id == "lease-1"),
-        "cube lease must NOT be released for a provisional (ack-timeout) spawn; releases: {releases:?}",
+        "cube lease must NOT be released for a tmux spawn; releases: {releases:?}",
     );
 
     // No duplicate dispatch: exactly one execution exists for the
@@ -652,7 +649,7 @@ async fn ack_timeout_provisional_spawn_is_tracked_not_failed_or_duplicated() {
     assert_eq!(
         executions.len(),
         1,
-        "a provisional spawn must not leave a duplicate execution behind; got {executions:#?}",
+        "a tmux spawn must not leave a duplicate execution behind; got {executions:#?}",
     );
 
     // The dispatch stream records a normal `pane_spawned: ok`, never a
@@ -660,11 +657,11 @@ async fn ack_timeout_provisional_spawn_is_tracked_not_failed_or_duplicated() {
     let events = recording.events_for(&execution_id).await;
     assert!(
         events.iter().any(|e| e.stage == "pane_spawned" && e.outcome == "ok"),
-        "expected a pane_spawned:ok event for the provisional spawn; got {events:#?}",
+        "expected a pane_spawned:ok event for the tmux spawn; got {events:#?}",
     );
     assert!(
         !events.iter().any(|e| e.stage == "pane_spawned" && e.outcome == "error"),
-        "a provisional spawn must NOT emit a pane_spawned:error event; got {events:#?}",
+        "a tmux spawn must NOT emit a pane_spawned:error event; got {events:#?}",
     );
 }
 
@@ -797,7 +794,7 @@ async fn pane_spawn_failure_for_pr_review_does_not_demote_work_item() {
     }
 
     let cube = Arc::new(FakeCubeClient::default());
-    // fail=true simulates the pane-spawn failure path (libghostty IPC
+    // fail=true simulates the pane-spawn failure path (tmux session creation
     // error, prompt composition failure, etc.) for the pr_review
     // execution. The coordinator must NOT call demote_active_work_item_to_todo.
     let runner = Arc::new(FakeExecutionRunner {

@@ -782,7 +782,7 @@ impl ServerState {
     /// the ownership checks in [`Self::readopt_live_worker`] and
     /// `detach_untracked_worker_viewer`.
     ///
-    /// Host safety: a remote run never occupies a tmux/app-hosted local
+    /// Host safety: a remote run never occupies a tmux-hosted local
     /// slot. [`crate::work::WorkDb::latest_local_agent_id_for_execution`]
     /// already returns `None` when the newest row is remote, so this reads
     /// that same row the slot-to-run occupancy lookup uses rather than the

@@ -543,7 +543,7 @@ async fn unavailable_tmux_preflight_surfaces_typed_errors() {
 async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
     // Regression test, corrected understanding (2026-07-13): the
     // chore-update auto-notice (routed through `send_input_to_worker`)
-    // originally looked like it silently vanished — `SendToPane`
+    // originally looked like it silently vanished — the pane write
     // returned Ok, no WARN was logged, no `UserPromptSubmit` followed.
     // The incident record was later corrected: the worker had in fact
     // acted on the updated text, so the write was delivered but

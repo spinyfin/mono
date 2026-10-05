@@ -393,7 +393,7 @@ pub(super) struct FakeExecutionRunner {
     /// inner cause under this outer context (`anyhow!(msg).context(ctx)`),
     /// so tests can assert `{err:#}` persistence of the cause chain.
     pub(super) fail_context: Option<String>,
-    /// When `true`, `run_execution` fails with a `SlotBusy` app
+    /// When `true`, `run_execution` fails with a `SlotBusy` viewer
     /// rejection (wrapped the same way `spawn_flow` wraps it) instead
     /// of the generic `fail` error, so tests can exercise the
     /// hold-slot / requeue-instead-of-fail path distinctly from a
@@ -419,10 +419,6 @@ pub(super) struct FakeExecutionRunner {
     /// `RunWaitState::CancelledDuringSpawn`. The coordinator must
     /// then release the deferred lease and skip completion recording.
     pub(super) cancelled_during_spawn: bool,
-    /// Simulate a provisional spawn whose process state is not yet verified.
-    /// The coordinator retains the slot and lease while tracking the run in
-    /// waiting_human, avoiding duplicate dispatch while reconciliation runs.
-    pub(super) ack_timed_out: bool,
     /// Handle used by the `cancelled_during_spawn` path to cancel the
     /// row before returning. `None` for the default fake.
     pub(super) work_db: Option<Arc<WorkDb>>,
@@ -446,7 +442,6 @@ impl Default for FakeExecutionRunner {
             slot_id: None,
             spawn_config: None,
             cancelled_during_spawn: false,
-            ack_timed_out: false,
             work_db: None,
             wait_state: None,
         }
@@ -512,22 +507,6 @@ impl ExecutionRunner for FakeExecutionRunner {
                 result_summary: Some("cancelled during spawn".to_owned()),
                 attention: None,
                 slot_id: None,
-                spawn_config: None,
-            });
-        }
-
-        if self.ack_timed_out {
-            // Model a provisional spawn after a worker-start
-            // ack timeout: a PROVISIONAL spawn. The pane may be live,
-            // so the run is tracked live (`running`) with its slot
-            // retained (slot_id = Some ⇒ the coordinator defers the
-            // pool-slot release and does NOT release the workspace
-            // lease). No attention item — this is not a failure.
-            return Ok(RunOutcome {
-                wait_state: RunWaitState::WorkerPaneAlive,
-                result_summary: Some("provisional spawn: worker startup unverified".to_owned()),
-                attention: None,
-                slot_id: Some(1),
                 spawn_config: None,
             });
         }

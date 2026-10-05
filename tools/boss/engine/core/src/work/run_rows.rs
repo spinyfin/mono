@@ -1226,8 +1226,8 @@ impl WorkDb {
 
     /// Whether the newest run for `execution_id` was intended for tmux.
     ///
-    /// This deliberately selects the newest row before reading the mode: a
-    /// resumed app-hosted run must not inherit a prior run's tmux identity.
+    /// This deliberately selects the newest row before reading the stamp: a
+    /// run missing identity must not inherit a prior run's tmux identity.
     /// `None` means no run row exists.
     pub fn latest_run_tmux_hosting_for_execution(&self, execution_id: &str) -> Result<Option<bool>> {
         let conn = self.connect()?;

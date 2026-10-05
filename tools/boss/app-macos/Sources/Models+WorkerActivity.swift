@@ -41,12 +41,11 @@ struct WorkerLiveState {
     /// worker's next hook event proves it resumed, or once the slot is
     /// released.
     let recoveryStatus: String?
-    /// Whether this worker was actually dispatched onto the tmux-hosting
-    /// path (`true`) or not (`false`), mirroring the engine's
-    /// `LiveWorkerState.tmux_hosted`. `nil` when the engine hasn't
+    /// Mirrors the engine's `LiveWorkerState.tmux_hosted`: `true` for a
+    /// local worker hosted in a tmux session. `nil` when the engine hasn't
     /// reported it — remote SSH workers, which remain valid without a
-    /// local tmux identity. `false` is a local invariant failure, not a
-    /// supported hosting mode.
+    /// local tmux identity. `false` is a local invariant failure (the
+    /// durable tmux stamp is missing), not a supported hosting mode.
     let tmuxHosted: Bool?
 
     /// False when two entries share a `runId` or a `slotId`. A snapshot

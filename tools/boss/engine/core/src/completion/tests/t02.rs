@@ -1390,7 +1390,7 @@ async fn blocked_marker_on_first_stop_clears_any_stale_queued_probe() {
     // pending-probe queue on every Stop, independent of this Stop's
     // own completion outcome. A probe minted on an earlier Stop
     // (e.g. queued, then requeued for retry after a failed
-    // `SendToPane`) would therefore still fire on the very Stop
+    // pane write) would therefore still fire on the very Stop
     // where the worker reports `[blocked]`. `on_stop` must clear any
     // such stale probe via the `ProbeQueuer` the moment it finds an
     // unresolved worker signal, on the FIRST Stop that carries the

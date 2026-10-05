@@ -77,15 +77,15 @@
 //! "free + no entry" — never "claimed + no entry" on that path.
 //!
 //! But an UNCONFIRMED teardown deliberately produces "claimed + no live
-//! entry": when the app never confirms the pane is actually gone (no
-//! session registered, a timed-out RPC, an unexpected response),
+//! entry": when tmux process teardown or app viewer detach cannot be
+//! confirmed (a missing session, timed-out request, or unexpected response),
 //! `release_worker_pane` holds the pool claim instead of releasing it
 //! (see the `sweep_owns_handback` branch there) while still dropping the
 //! live-state entry unconditionally just below. This module is exactly
 //! how that state gets resolved. Three producers currently yield this
 //! shape:
 //!
-//! * a rejected `AttachWorkerPane` in `coordinator/run.rs` (`hold_slot_busy`);
+//! * a rejected viewer attachment in `coordinator/run.rs` (`hold_slot_busy`);
 //! * an unconfirmed teardown in `release_worker_pane` (`sweep_owns_handback`);
 //! * `TransientRecoveryReaper::reap_worker` dropping the live-state entry
 //!   for a claim `release_worker_pane` never held or released, when

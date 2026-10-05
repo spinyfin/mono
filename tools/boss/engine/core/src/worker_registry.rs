@@ -99,9 +99,8 @@ impl WorkerRegistry {
             .insert(pid, run_id.into());
     }
 
-    /// Record the libghostty slot id the engine asked the app to host
-    /// `run_id` in. The engine uses this to route follow-up
-    /// `SendToPane` requests by run id.
+    /// Record the viewer slot id the engine claimed for `run_id`'s tmux
+    /// worker. The engine uses this to route follow-up pane writes by run id.
     pub fn register_run_slot(&self, run_id: impl Into<String>, slot_id: u8) {
         {
             let mut inner = self.inner.lock().expect("registry poisoned");
@@ -217,8 +216,8 @@ impl WorkerRegistry {
     }
 
     /// Atomically remove and return the pane registration for `run_id`.
-    /// Cleanup uses the hosting mode to choose detach for tmux-owned workers
-    /// and release for legacy app-owned processes.
+    /// Cleanup detaches the app viewer; the worker itself is torn down by
+    /// token-verified tmux teardown.
     pub fn take_worker_pane_for_run(&self, run_id: &str) -> Option<RegisteredWorkerPane> {
         {
             let mut inner = self.inner.lock().expect("registry poisoned");
@@ -414,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_registration_preserves_hosting_mode_until_cleanup() {
+    fn tmux_registration_preserves_session_identity_until_cleanup() {
         let reg = WorkerRegistry::new();
         reg.register_tmux_run_slot("run-tmux", 4, "boss-4-worker");
 
