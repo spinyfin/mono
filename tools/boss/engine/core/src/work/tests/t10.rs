@@ -4,7 +4,6 @@
 //! - engine PR-merge path (mark_chore_pr_merged → done) sets it
 //! - engine flip_in_review_revisions_to_done sets it
 //! - reconciler_close_work_item sets it
-//! - migrate_tasks_completed_at backfills terminal rows from created_at, leaves others NULL
 
 use super::*;
 
@@ -208,70 +207,6 @@ fn reopen_done_row_clears_completed_at() {
         task_completed_at(&db, &chore_id).is_none(),
         "completed_at must be cleared (NULL) after re-open to todo",
     );
-}
-
-/// migrate_tasks_completed_at must backfill existing terminal rows from
-/// created_at (NOT updated_at — that would reproduce the original bug) and
-/// leave non-terminal rows NULL.
-#[test]
-fn migration_completed_at_backfills_from_created_at_not_updated_at() {
-    let (_dir, path) = disk_db_path("migrate-completed-at-backfill");
-    let conn = rusqlite::Connection::open(&path).unwrap();
-
-    // Build a minimal schema without completed_at (simulates pre-v21 DB).
-    LegacySchema::new(20)
-        .products(NO_EXTRA_COLUMNS)
-        .tasks(TASKS_NO_ACTOR_COLUMNS)
-        .seed(&legacy_product_seed("prod_1", "P", "p"))
-        .seed(
-            "-- done row: created_at=100, updated_at=999 (the buggy re-stamp).
-         INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
-             VALUES ('t_done', 'prod_1', 'chore', 'done-task', 'done', '100', '999');
-         -- archived row
-         INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
-             VALUES ('t_arch', 'prod_1', 'chore', 'arch-task', 'archived', '200', '888');
-         -- active (non-terminal) row — must remain NULL
-         INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
-             VALUES ('t_active', 'prod_1', 'chore', 'active-task', 'active', '300', '300');",
-        )
-        .create(&conn);
-    drop(conn);
-
-    // Open via WorkDb — this runs all migrations including migrate_tasks_completed_at.
-    let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
-
-    // done row: completed_at must equal created_at (100), NOT updated_at (999).
-    let done_completed: Option<String> = conn
-        .query_row("SELECT completed_at FROM tasks WHERE id = 't_done'", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        done_completed.as_deref(),
-        Some("100"),
-        "backfill must use created_at (100) for done rows, not updated_at (999)",
-    );
-
-    // archived row: completed_at must equal created_at (200).
-    let arch_completed: Option<String> = conn
-        .query_row("SELECT completed_at FROM tasks WHERE id = 't_arch'", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        arch_completed.as_deref(),
-        Some("200"),
-        "backfill must use created_at (200) for archived rows",
-    );
-
-    // active row: completed_at must be NULL.
-    let active_completed: Option<String> = conn
-        .query_row("SELECT completed_at FROM tasks WHERE id = 't_active'", [], |r| r.get(0))
-        .unwrap();
-    assert!(
-        active_completed.is_none(),
-        "completed_at must remain NULL for non-terminal rows after migration",
-    );
-
-    drop(conn);
-    let _ = std::fs::remove_file(&path);
 }
 
 /// record_worker_pr_completion with WorkerPrCompletionTarget::Done must set
@@ -699,50 +634,6 @@ fn record_worker_failure_preserves_merge_conflict_parent_for_helper_execution() 
         blocked.contains(&parent_id),
         "merge_conflict parent must remain in list_chores_blocked_on_merge_conflict after helper failure; got {blocked:?}"
     );
-}
-
-/// Idempotency: running migrate_tasks_completed_at a second time must not
-/// overwrite already-set completed_at values (the COALESCE/column-exists guard).
-#[test]
-fn migration_completed_at_is_idempotent() {
-    let (_dir, path) = disk_db_path("migrate-completed-at-idempotent");
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    LegacySchema::new(20)
-        .products(NO_EXTRA_COLUMNS)
-        .tasks(TASKS_NO_ACTOR_COLUMNS)
-        .seed(&legacy_product_seed("prod_1", "P", "p"))
-        .seed(
-            "INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
-             VALUES ('t_done2', 'prod_1', 'chore', 'done2', 'done', '555', '999');",
-        )
-        .create(&conn);
-    drop(conn);
-
-    let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
-    let first: Option<String> = conn
-        .query_row("SELECT completed_at FROM tasks WHERE id = 't_done2'", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        first.as_deref(),
-        Some("555"),
-        "first migration must set completed_at = created_at"
-    );
-    drop(conn);
-
-    // Re-open — migration guard skips because column already exists.
-    let db2 = WorkDb::open(path.clone()).unwrap();
-    let conn2 = db2.connect().unwrap();
-    let second: Option<String> = conn2
-        .query_row("SELECT completed_at FROM tasks WHERE id = 't_done2'", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        first, second,
-        "re-running migration must not overwrite the existing completed_at value",
-    );
-
-    drop(conn2);
-    let _ = std::fs::remove_file(&path);
 }
 
 // ── Deliberate-park admission on automatic mint paths ──────────────────

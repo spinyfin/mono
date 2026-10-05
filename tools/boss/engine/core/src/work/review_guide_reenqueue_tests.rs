@@ -66,27 +66,6 @@ fn published_head_is_excluded_across_base_changes_but_a_new_head_is_eligible() {
     }
 }
 
-#[test]
-fn pre_start_provenance_migration_is_idempotent_and_defaults_existing_rows() {
-    let (_dir, db) = open_db();
-    let (_root, series, comparison) = seeded_open_pr(&db);
-    let attempt = failed_attempt(&db, &series, &comparison, false, OLD_BUILD);
-    let conn = db.connect().unwrap();
-    conn.execute_batch(
-        "ALTER TABLE pr_review_guide_attempts DROP COLUMN failed_pre_start;
-         ALTER TABLE pr_review_guide_attempts DROP COLUMN failed_by_build;",
-    )
-    .unwrap();
-    for _ in 0..2 {
-        migrate_pr_review_guide_job_tables(&conn).unwrap();
-        let migrated = query_pr_review_guide_attempt(&conn, &attempt.id).unwrap().unwrap();
-        assert!(!migrated.failed_pre_start);
-        assert_eq!(migrated.failed_by_build, None);
-        assert_eq!(migrated.status, "failed");
-        assert_eq!(migrated.error, attempt.error);
-    }
-}
-
 /// An `in_review` task on `PR_URL` with a captured source series. Returns
 /// `(root, series_id, comparison_id)`.
 fn seeded_open_pr(db: &WorkDb) -> (String, String, String) {

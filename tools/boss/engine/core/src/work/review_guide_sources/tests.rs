@@ -418,40 +418,6 @@ fn revision_execution_resolves_to_the_canonical_pr_root() {
 }
 
 #[test]
-fn migration_removes_inline_packets_and_unreadable_legacy_rows() {
-    let (_dir, db) = open_db();
-    let packet = packet("base", "head");
-    db.persist_pr_review_guide_source_capture("root", 1, PrSourceCaptureTrigger::Creation, &packet)
-        .unwrap();
-    let conn = db.connect().unwrap();
-    conn.execute_batch(
-        "ALTER TABLE pr_review_guide_source_comparisons ADD COLUMN packet_json TEXT NOT NULL DEFAULT '';
-         UPDATE pr_review_guide_source_comparisons SET packet_path = NULL;",
-    )
-    .unwrap();
-    migrate_pr_review_guide_source_capture_tables(&conn).unwrap();
-    migrate_pr_review_guide_source_capture_tables(&conn).unwrap();
-    assert!(!table_has_column(&conn, "pr_review_guide_source_comparisons", "packet_json").unwrap());
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM pr_review_guide_source_comparisons", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(count, 0);
-    drop(conn);
-    assert!(db.get_latest_pr_review_guide_source_capture("root").unwrap().is_none());
-    db.persist_pr_review_guide_source_capture("root", 2, PrSourceCaptureTrigger::Poller, &packet)
-        .unwrap();
-    assert_eq!(
-        db.get_latest_pr_review_guide_source_capture("root")
-            .unwrap()
-            .unwrap()
-            .packet,
-        packet
-    );
-}
-
-#[test]
 fn stale_invalid_comparison_does_not_replace_current_diagnostics() {
     let (dir, db) = open_db();
     let old = packet("old-base", "old-head");
@@ -570,29 +536,4 @@ fn blocked_artifact_validation_allows_unrelated_claim_and_database_write() {
         assert!(reader.join().unwrap().is_none());
         assert!(claimed.unwrap());
     });
-}
-
-#[test]
-fn migration_replaces_the_legacy_series_index() {
-    let (_dir, db) = open_db();
-    let conn = db.connect().unwrap();
-    conn.execute_batch("DROP INDEX pr_review_guide_source_series_observation_idx;
-        CREATE INDEX pr_review_guide_source_series_root_idx ON pr_review_guide_source_series(root_task_id, updated_at DESC);").unwrap();
-    migrate_pr_review_guide_source_capture_tables(&conn).unwrap();
-    let sql: String = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE name = ?1",
-            ["pr_review_guide_source_series_observation_idx"],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(sql.contains("latest_observation_sequence DESC, id DESC"));
-    let old_count: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name = ?1",
-            ["pr_review_guide_source_series_root_idx"],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(old_count, 0);
 }

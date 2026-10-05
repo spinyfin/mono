@@ -5,7 +5,6 @@ use super::*;
 
 use crate::semantic_progress::SemanticToolCondition;
 use boss_protocol::WorkerEvent;
-use rusqlite::Connection;
 
 fn started_execution(db: &WorkDb) -> String {
     let product = create_test_product(db);
@@ -46,45 +45,6 @@ fn session_start() -> WorkerEvent {
         source: boss_protocol::SessionStartSource::Startup,
         model: None,
     }
-}
-
-#[test]
-fn migrate_work_runs_semantic_progress_adds_nullable_columns_to_existing_rows() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE work_runs (id TEXT PRIMARY KEY, execution_id TEXT NOT NULL);
-         INSERT INTO work_runs (id, execution_id) VALUES ('run_legacy', 'exec_legacy');",
-    )
-    .unwrap();
-
-    crate::work::migrate_work_runs_semantic_progress(&conn).unwrap();
-    crate::work::migrate_work_runs_semantic_progress(&conn).unwrap();
-
-    let columns: Vec<(String, i64)> = conn
-        .prepare("SELECT name, \"notnull\" FROM pragma_table_info('work_runs') WHERE name LIKE 'semantic_%'")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    assert_eq!(
-        columns,
-        vec![
-            ("semantic_progress_at".to_owned(), 0),
-            ("semantic_tool_condition".to_owned(), 0),
-        ],
-        "both columns must be present and nullable",
-    );
-
-    let (progress_at, condition): (Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT semantic_progress_at, semantic_tool_condition FROM work_runs WHERE id = 'run_legacy'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(progress_at, None);
-    assert_eq!(condition, None);
 }
 
 #[test]

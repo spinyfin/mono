@@ -313,43 +313,6 @@ fn complete_pane_parked_execution_is_idempotent() {
     let _ = std::fs::remove_file(path);
 }
 
-// Direct unit coverage of `parse_iso8601_to_epoch` now lives with the
-// consolidated helper in `boss_engine_utils::iso8601`; the end-to-end migration test
-// below exercises it through the real rewrite path.
-
-#[test]
-fn migrate_timestamps_rewrites_iso_rows_to_epoch() {
-    // disk_db_path required: re-opens the DB to trigger migration.
-    let (_dir, path) = disk_db_path("ts-migrate");
-    let db = WorkDb::open(path.clone()).unwrap();
-
-    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
-    let chore = create_test_chore(&db, product.id.clone(), "ISO chore");
-
-    // Hand-roll an ISO 8601 timestamp into the row to mimic the
-    // pre-canonical write path that produced the mixed format.
-    {
-        let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
-            params!["2026-05-07T18:55:45.000Z", chore.id],
-        )
-        .unwrap();
-    }
-
-    // Re-opening runs `init` -> `migrate_timestamps_to_epoch`.
-    let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
-    let updated_at: String = conn
-        .query_row("SELECT updated_at FROM tasks WHERE id = ?1", params![chore.id], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(updated_at, "1778180145");
-
-    let _ = std::fs::remove_file(path);
-}
-
 /// Smoke test for the new dependency CRUD path. Adds an edge,
 /// re-adds it (idempotent), lists in both directions, then drops
 /// it. Cycles and self-loops are rejected at the engine boundary.
@@ -1409,79 +1372,6 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Pre-v3 / pre-v4 databases should pick up the new dependency
-/// table and `last_status_actor` columns transparently on open;
-/// the engine writes the latest `schema_version`.
-#[test]
-fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
-    let (_dir, path) = disk_db_path("deps-migrate");
-    // Stand up a minimal v3 schema: just `tasks`, `projects`,
-    // `metadata`, no dep table, no last_status_actor.
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    LegacySchema::new(3)
-        .products(NO_EXTRA_COLUMNS)
-        .projects(NO_EXTRA_COLUMNS)
-        .tasks(NO_EXTRA_COLUMNS)
-        .create(&conn);
-    drop(conn);
-
-    let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
-    // The new table exists.
-    let exists: i64 = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master
-                 WHERE type='table' AND name='work_item_dependencies')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(exists, 1);
-    assert!(table_has_column(&conn, "tasks", "last_status_actor").unwrap());
-    assert!(table_has_column(&conn, "projects", "last_status_actor").unwrap());
-    let version: String = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(version, "32");
-    let _ = std::fs::remove_file(path);
-}
-
-/// Pre-existing databases (whose `projects` table predates the
-/// design-doc pointer chore) should pick up the three new
-/// nullable columns transparently on open, and `query_project`
-/// should keep working — every existing row reads back with
-/// `None` on each pointer field.
-#[test]
-fn migration_adds_project_design_doc_columns() {
-    let (_dir, path) = disk_db_path("design-doc-migrate");
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    LegacySchema::new(4)
-        .products(NO_EXTRA_COLUMNS)
-        .projects(PROJECTS_V4_COLUMNS)
-        .tasks(TASKS_V4_COLUMNS)
-        .seed(&legacy_product_seed("prod_legacy", "Legacy", "legacy"))
-        .seed(&legacy_project_seed("proj_legacy", "prod_legacy", "Legacy", "legacy"))
-        .create(&conn);
-    drop(conn);
-
-    let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
-    assert!(table_has_column(&conn, "projects", "design_doc_repo_remote_url").unwrap());
-    assert!(table_has_column(&conn, "projects", "design_doc_branch").unwrap());
-    assert!(table_has_column(&conn, "projects", "design_doc_path").unwrap());
-    drop(conn);
-
-    let project = query_project(&db.connect().unwrap(), "proj_legacy")
-        .unwrap()
-        .expect("legacy project should survive migration");
-    assert_eq!(project.design_doc_repo_remote_url, None);
-    assert_eq!(project.design_doc_branch, None);
-    assert_eq!(project.design_doc_path, None);
-    let _ = std::fs::remove_file(path);
-}
-
 /// Round-trip: stamping `created_via` on the input is preserved
 /// across insert + read; omitting it lands `unknown` (the engine-
 /// app handler is responsible for substituting a transport hint
@@ -1529,43 +1419,6 @@ fn create_via_round_trip_per_source() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Pre-existing databases that predate `created_via` should pick
-/// up the new column with `unknown` for every row, and fresh
-/// writes that follow continue to set their own value.
-#[test]
-fn migration_adds_created_via_with_unknown_default() {
-    let (_dir, path) = disk_db_path("created-via-migrate");
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    LegacySchema::new(4)
-        .products(NO_EXTRA_COLUMNS)
-        .projects(PROJECTS_V4_COLUMNS)
-        .tasks(TASKS_V4_COLUMNS)
-        .seed(&legacy_product_seed("prod_legacy", "L", "l"))
-        .seed(
-            "INSERT INTO tasks(id, product_id, project_id, kind, name, description,
-                 status, ordinal, pr_url, deleted_at, created_at, updated_at,
-                 autostart, last_status_actor, priority)
-             VALUES ('task_legacy', 'prod_legacy', NULL, 'chore', 'old', '',
-                 'todo', NULL, NULL, NULL, '1700000000', '1700000000',
-                 1, 'human', 'medium');",
-        )
-        .create(&conn);
-    drop(conn);
-
-    let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
-    assert!(table_has_column(&conn, "tasks", "created_via").unwrap());
-    let legacy = query_task(&conn, "task_legacy").unwrap().unwrap();
-    assert_eq!(legacy.created_via, CREATED_VIA_UNKNOWN);
-    let version: String = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(version, "32");
-    let _ = std::fs::remove_file(path);
-}
-
 /// Fresh init (no pre-existing tables) lands the three pointer
 /// columns via `CREATE TABLE`, not via the migration path. Verify
 /// both routes converge on the same schema shape.
@@ -1601,76 +1454,6 @@ fn fresh_init_includes_tasks_repo_remote_url() {
         .unwrap();
     assert_eq!(index_exists, 1);
 
-    let version: String = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(version, "32");
-
-    let _ = std::fs::remove_file(path);
-}
-
-/// A pre-v5 database (no `repo_remote_url` column on `tasks`,
-/// `schema_version = 4`) should pick up the new column with
-/// existing rows defaulting to `NULL`, get the partial index
-/// created, and have `schema_version` bumped to the current
-/// value.
-#[test]
-fn migration_from_v4_adds_tasks_repo_remote_url() {
-    let (_dir, path) = disk_db_path("tasks-repo-migrate");
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    // Stand up a minimal v4 schema: just enough to round-trip a
-    // single task row that pre-dates the new column.
-    LegacySchema::new(4)
-        .products(NO_EXTRA_COLUMNS)
-        // This one already has the design-doc pointer columns — the
-        // migration under test is the later `tasks.repo_remote_url`.
-        .projects(
-            "last_status_actor TEXT NOT NULL DEFAULT 'human',
-     design_doc_repo_remote_url TEXT,
-     design_doc_branch TEXT,
-     design_doc_path TEXT",
-        )
-        .tasks(TASKS_V4_COLUMNS)
-        .seed(&legacy_product_seed("prod_legacy", "Legacy", "legacy"))
-        .seed(
-            "INSERT INTO tasks(id, product_id, kind, name, status,
-                               created_at, updated_at)
-             VALUES ('task_legacy', 'prod_legacy', 'chore', 'Legacy',
-                     'todo', '1700000000', '1700000000');",
-        )
-        .create(&conn);
-    drop(conn);
-
-    let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
-
-    // New column lands and the legacy row reads back as NULL.
-    assert!(table_has_column(&conn, "tasks", "repo_remote_url").unwrap());
-    let legacy_repo: Option<String> = conn
-        .query_row(
-            "SELECT repo_remote_url FROM tasks WHERE id = 'task_legacy'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(legacy_repo, None);
-
-    // Partial index materializes on the migration path too — the
-    // index DDL only runs once the column exists, so a pre-v5
-    // database that fails to migrate would also fail this check.
-    let index_exists: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master \
-                 WHERE type = 'index' AND name = 'tasks_repo_idx'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(index_exists, 1);
-
-    // schema_version moves from 4 → current.
     let version: String = conn
         .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
             row.get(0)
@@ -2298,5 +2081,42 @@ async fn blocking_a_running_dependent_publishes_execution_terminal() {
         }
     );
 
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn status_check_constraint_rejects_out_of_enum_values_on_both_tables() {
+    let path = temp_db_path("status-check-constraint");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "P".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "C");
+
+    let conn = db.connect().unwrap();
+    let project_err = conn
+        .execute("UPDATE projects SET status = 'todo' WHERE id = ?1", [&project.id])
+        .unwrap_err();
+    assert!(
+        project_err.to_string().to_lowercase().contains("constraint"),
+        "expected a CHECK constraint violation, got: {project_err}"
+    );
+
+    let task_err = conn
+        .execute("UPDATE tasks SET status = 'planned' WHERE id = ?1", [&chore.id])
+        .unwrap_err();
+    assert!(
+        task_err.to_string().to_lowercase().contains("constraint"),
+        "expected a CHECK constraint violation, got: {task_err}"
+    );
     let _ = std::fs::remove_file(path);
 }

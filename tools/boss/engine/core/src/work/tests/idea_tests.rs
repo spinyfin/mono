@@ -230,45 +230,12 @@ fn delete_idea_does_not_touch_graduated_target() {
 }
 
 #[test]
-fn ideas_tables_present_on_fresh_and_migrated_db() {
-    let path = temp_db_path("idea-schema");
-    let db = WorkDb::open(path).unwrap();
-    {
-        let conn = db.connect().unwrap();
-        let exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ideas')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(exists, "fresh db must have ideas");
-        let seq: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'idea_short_id_sequences')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(seq, "fresh db must have idea_short_id_sequences");
-
-        conn.execute_batch(
-            "DROP TABLE ideas;
-             DROP TABLE idea_short_id_sequences;",
-        )
-        .unwrap();
-        migrate_ideas_tables(&conn).unwrap();
-
-        let recreated: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ideas')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(recreated, "migrate_ideas_tables must re-create ideas");
-        assert!(table_has_column(&conn, "tasks", "effort_matched_rule").unwrap());
-    }
+fn ideas_tables_present_on_fresh_db() {
+    let db = WorkDb::open(temp_db_path("idea-schema")).unwrap();
+    let conn = db.connect().unwrap();
+    assert!(table_exists(&conn, "ideas").unwrap());
+    assert!(table_exists(&conn, "idea_short_id_sequences").unwrap());
+    assert!(table_has_column(&conn, "tasks", "effort_matched_rule").unwrap());
 }
 
 #[test]

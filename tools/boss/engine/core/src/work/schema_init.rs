@@ -1,1005 +1,72 @@
 use super::*;
 
-use std::sync::OnceLock;
-use std::time::Instant;
+#[path = "schema_baseline.rs"]
+mod baseline;
 
-use crate::startup_timing::SLOW_STEP_THRESHOLD;
-
-// Schema init must not spawn processes, touch the network, or probe the
-// host. Discovery runs from engine startup after the database is open,
-// with dispatch held until it completes — see
-// `WorkDb::refresh_local_host_auto_capabilities`.
-
-/// Per-step wall-clock ledger for one [`WorkDb::run_full_migration_chain`]
-/// run. The chain replays ~150 idempotent steps on every boot of an
-/// existing database, so a per-step line is logged only above
-/// [`SLOW_STEP_THRESHOLD`]; the total is always logged.
-struct MigrationChainTimer {
-    started: Instant,
-    steps: u32,
-    slow_steps: u32,
-    /// `"database"` for the real connection an engine boot opens, or
-    /// `"scratch_template"` for the in-memory capture
-    /// [`WorkDb::final_schema_ddl`] runs once per process to seed the
-    /// fresh-database fast path — so a reader of the startup ledger never
-    /// attributes the scratch capture's chain to the database that actually
-    /// took the template path.
-    target: &'static str,
-}
-
-/// `true` → debug (scratch capture); `false` → info (the real database).
-/// Field lists live once so a later addition cannot diverge across levels.
-macro_rules! migration_log {
-    ($scratch:expr, $($fields:tt)*) => {
-        if $scratch {
-            tracing::debug!($($fields)*);
-        } else {
-            tracing::info!($($fields)*);
-        }
-    };
-}
-
-impl MigrationChainTimer {
-    fn start(target: &'static str) -> Self {
-        Self {
-            started: Instant::now(),
-            steps: 0,
-            slow_steps: 0,
-            target,
-        }
-    }
-
-    fn is_scratch(&self) -> bool {
-        self.target == "scratch_template"
-    }
-
-    /// Run one chain step under the clock. `name` is the step function's
-    /// path as written at the call site; only its last segment is logged.
-    fn step(&mut self, conn: &Connection, name: &str, step: fn(&Connection) -> Result<()>) -> Result<()> {
-        let started = Instant::now();
-        let result = step(conn);
-        let elapsed = started.elapsed();
-        self.steps += 1;
-        if elapsed >= SLOW_STEP_THRESHOLD {
-            self.slow_steps += 1;
-            migration_log!(
-                self.is_scratch(),
-                target_db = self.target,
-                step = name.rsplit("::").next().unwrap_or(name),
-                elapsed_ms = elapsed.as_millis() as u64,
-                ok = result.is_ok(),
-                "work db: slow migration step",
-            );
-        }
-        result
-    }
-
-    fn finish(&self) {
-        migration_log!(
-            self.is_scratch(),
-            target_db = self.target,
-            steps = self.steps,
-            slow_steps = self.slow_steps,
-            slow_threshold_ms = SLOW_STEP_THRESHOLD.as_millis() as u64,
-            total_ms = self.started.elapsed().as_millis() as u64,
-            "work db: migration chain complete",
-        );
-    }
-}
-
-/// `step!(timer, conn, migrate_x)` runs `migrate_x(conn)` through the chain
-/// timer, naming the step after the function.
-macro_rules! step {
-    ($timer:expr, $conn:expr, $step:path) => {
-        $timer.step($conn, stringify!($step), $step)
-    };
-}
+/// Databases older than the schema shipped by this release are unsupported.
+/// Raise this pair together when squashing the next migration generation.
+/// The historical version marker was coarse; 32 is the value stamped by
+/// boss-v1.0.707 (cc72dac8), including its final last_error migration.
+const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 
 impl WorkDb {
-    /// Bring this database up to the current schema. A brand-new, empty
-    /// database is seeded directly from [`Self::final_schema_ddl`] — the
-    /// fast path, see its docs. Anything else (reopening an on-disk or
-    /// shared-cache in-memory database that already went through `init()`
-    /// once) replays the real incremental chain via
-    /// [`Self::run_full_migration_chain`], so in-place upgrades of existing
-    /// databases keep working exactly as before.
+    /// Install the floor directly on empty databases. Existing databases
+    /// must meet the floor before any data or schema changes are attempted.
+    /// Future migrations must use increasing versions above the floor and
+    /// run here for both paths, advancing the marker only after success.
     pub(crate) fn init(&self) -> Result<()> {
-        let conn = self.connect()?;
-        if Self::has_any_existing_table(&conn)? {
-            return Self::run_full_migration_chain(&conn, "database");
-        }
-        Self::apply_final_schema_template(&conn)
-    }
-
-    /// `true` if this connection's database already has ANY user table —
-    /// not just `metadata`. Gates the fast fresh-schema template path: that
-    /// path replays `CREATE TABLE` statements captured verbatim from
-    /// `sqlite_master.sql`, which (unlike this file's own DDL) does not
-    /// retain `IF NOT EXISTS` and so errors outright if the table already
-    /// exists. A caller can hand `init()` a database that already has some
-    /// (but not all — e.g. a hand-seeded pre-v3 fixture missing `metadata`
-    /// entirely) tables, so checking only for `metadata` is not enough:
-    /// only a database with zero tables is safe to seed from the template.
-    /// Everything else must replay the real incremental chain, whose
-    /// `CREATE TABLE IF NOT EXISTS` / `table_has_column` guards tolerate a
-    /// partially-present schema.
-    fn has_any_existing_table(conn: &Connection) -> Result<bool> {
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table')",
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let has_schema: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')",
             [],
             |row| row.get(0),
-        )
-        .context("checking for existing tables")
-    }
-
-    /// Seed a brand-new, empty database directly from the final schema DDL
-    /// instead of replaying ~80 incremental `migrate_*` calls (most of
-    /// which are column-only `ALTER TABLE`/`table_has_column` probes against
-    /// an empty database that never needed them) against an empty database.
-    /// End state is identical to [`Self::run_full_migration_chain`] — see
-    /// `full_migration_chain_produces_current_schema` in this module's
-    /// tests, which exercises the real chain directly and remains the
-    /// coverage of record for the migration steps themselves.
-    fn apply_final_schema_template(conn: &Connection) -> Result<()> {
-        for statement in Self::final_schema_ddl() {
-            conn.execute_batch(statement)?;
+        )?;
+        if has_schema {
+            Self::check_schema_floor(&tx)?;
+        } else {
+            tx.execute_batch(baseline::SQL)?;
+            tx.execute(
+                "INSERT INTO metadata (key, value) VALUES ('schema_version', ?1)",
+                [SCHEMA_COMPATIBILITY_FLOOR.1.to_string()],
+            )?;
+            tx.execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, CAST(strftime('%s','now') AS INTEGER))",
+                [review_verdicts::PR_REVIEW_VERDICTS_SINCE_METADATA_KEY],
+            )?;
         }
-        // Not schema — this establishes required *data* (the local host row)
-        // that `run_full_migration_chain` also performs unconditionally on
-        // every call, fresh database or not. The local host's capability
-        // *probe* is deliberately not here: schema init must not spawn
-        // processes or touch the network — see the capability-probe note
-        // at the top of this file.
-        crate::host_registry::ensure_local_host(conn)?;
-        Self::stamp_schema_version(conn)?;
-        // Same data stamp `run_full_migration_chain` writes; the template
-        // path never replays those migrate_* calls.
-        migrate_stamp_pr_review_verdicts_since(conn)?;
+        // Required runtime data, not a historical migration. Capability
+        // discovery remains outside DB startup (no processes or network).
+        crate::host_registry::ensure_local_host(&tx)?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// The current schema's full DDL — every `CREATE TABLE`/`CREATE INDEX`
-    /// statement as it stands after every migration has run — captured once
-    /// per process from a scratch in-memory database taken through the real
-    /// [`Self::run_full_migration_chain`]. `sqlite_master.sql` reflects a
-    /// table's *current* column set even after `ALTER TABLE ... ADD COLUMN`,
-    /// so this is a complete final-state snapshot, not just the original
-    /// schema-init batch.
-    fn final_schema_ddl() -> &'static [String] {
-        static DDL: OnceLock<Vec<String>> = OnceLock::new();
-        DDL.get_or_init(|| {
-            let scratch = Connection::open_in_memory().expect("open scratch db for schema template capture");
-            Self::run_full_migration_chain(&scratch, "scratch_template")
-                .expect("run full migration chain against scratch db");
-            let mut stmt = scratch
-                .prepare(
-                    "SELECT sql FROM sqlite_master \
-                     WHERE sql IS NOT NULL \
-                     ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END",
-                )
-                .expect("prepare schema template capture query");
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .expect("query schema template")
-                .collect::<rusqlite::Result<Vec<String>>>()
-                .expect("collect schema template rows")
-        })
-    }
-
-    /// Every migration this database has ever needed, applied in order
-    /// against an existing connection. This is the only path for a database
-    /// that isn't brand-new (reopening an on-disk or shared-cache database
-    /// an earlier `init()` call already migrated) — every step here must
-    /// stay idempotent against its own prior output, since `init()` can run
-    /// it again on an already-current database. For a brand-new database,
-    /// [`Self::apply_final_schema_template`] reaches the same end state far
-    /// faster; that fast path's own template is itself captured by running
-    /// this function once, in [`Self::final_schema_ddl`].
-    pub(crate) fn run_full_migration_chain(conn: &Connection, target: &'static str) -> Result<()> {
-        let mut timer = MigrationChainTimer::start(target);
-        let timer = &mut timer;
-        step!(timer, conn, Self::schema_init_batch)?;
-        step!(timer, conn, migrate_work_executions_v3)?;
-        step!(timer, conn, migrate_tasks_autostart)?;
-        step!(timer, conn, migrate_tasks_deferred)?;
-        step!(timer, conn, migrate_tasks_human_driven)?;
-        step!(timer, conn, migrate_tasks_design_reasoning_effort_xhigh)?;
-        step!(timer, conn, migrate_tasks_completion_summary)?;
-        step!(timer, conn, migrate_last_status_actor)?;
-        step!(timer, conn, migrate_tasks_priority)?;
-        step!(timer, conn, migrate_project_design_doc_columns)?;
-        step!(timer, conn, migrate_tasks_created_via)?;
-        step!(timer, conn, migrate_backfill_project_design_tasks)?;
-        step!(timer, conn, migrate_tasks_repo_remote_url)?;
-        step!(timer, conn, migrate_project_property_audit_table)?;
-        step!(timer, conn, Self::post_v3_indexes)?;
-        step!(timer, conn, migrate_timestamps_to_epoch)?;
-        step!(timer, conn, migrate_tasks_blocked_reason)?;
-        step!(timer, conn, migrate_products_auto_pr_maintenance_enabled)?;
-        step!(timer, conn, migrate_conflict_resolutions_table)?;
-        step!(timer, conn, migrate_backfill_blocked_reason_dependency)?;
-        step!(timer, conn, migrate_work_attention_items_work_item_id)?;
-        step!(timer, conn, migrate_work_attention_items_converted_task_id)?;
-        step!(timer, conn, migrate_work_attention_items_last_raised_at)?;
-        step!(timer, conn, migrate_tasks_effort_and_model_columns)?;
-        step!(timer, conn, migrate_products_default_model)?;
-        step!(timer, conn, migrate_task_blocked_signals_table)?;
-        step!(timer, conn, migrate_ci_remediations_table)?;
-        step!(timer, conn, migrate_ci_remediations_failure_kind_columns)?;
-        step!(timer, conn, migrate_ci_failure_suppressions_table)?;
-        step!(timer, conn, migrate_ci_inflight_observations_table)?;
-        step!(timer, conn, migrate_tasks_ci_attempt_columns)?;
-        step!(timer, conn, migrate_products_ci_attempt_budget)?;
-        step!(timer, conn, migrate_products_dispatch_preamble)?;
-        step!(timer, conn, migrate_products_design_repo)?;
-        step!(timer, conn, migrate_products_docs_repo)?;
-        step!(timer, conn, migrate_products_worker_branch_prefix)?;
-        step!(timer, conn, migrate_work_executions_worker_branch_prefix)?;
-        // The bespoke investigation-doc pointer columns are gone — the card
-        // affordance now derives from `pr_url`, mirroring the design-doc model.
-        // This drop is idempotent (fresh DBs never had the columns).
-        step!(timer, conn, migrate_drop_tasks_investigation_doc_columns)?;
-        // Per-task doc-pointer columns (doc_repo_remote_url / doc_branch /
-        // doc_path) for the project-less doc-link card affordance —
-        // investigations have no project, so they cannot reuse the
-        // per-project `design_doc_*` columns. Detector-populated from the
-        // PR's changed files, mirroring the design-doc model.
-        step!(timer, conn, migrate_tasks_doc_pointer_columns)?;
-        step!(timer, conn, migrate_backfill_task_blocked_signals)?;
-        step!(timer, conn, migrate_effort_escalations_table)?;
-        step!(timer, conn, migrate_null_redundant_task_repo_remote_urls)?;
-        // Runs last so the per-product `(created_at, id)` backfill
-        // sees every task/project row that earlier migrations may
-        // have inserted (notably `migrate_backfill_project_design_tasks`).
-        step!(timer, conn, migrate_short_id_columns)?;
-        // Clears `autostart` on rows that have already been dispatched
-        // so the single-shot semantics (AI #2, Incident 001) apply to
-        // existing data too. Must run after `migrate_tasks_autostart`
-        // so the column exists.
-        step!(timer, conn, migrate_backfill_autostart_consumed)?;
-        // Engine counter-metrics framework (phase 1). Independent of
-        // every other table — runs last because order doesn't matter
-        // for `CREATE TABLE IF NOT EXISTS`.
-        step!(timer, conn, migrate_metrics_tables)?;
-        step!(timer, conn, migrate_work_executions_pre_start_retry)?;
-        step!(timer, conn, migrate_work_executions_pr_url)?;
-        step!(timer, conn, migrate_work_executions_pr_head_before)?;
-        step!(timer, conn, migrate_work_executions_pr_head_after)?;
-        // Positive-evidence columns for the metadata-only CI-fix finalize
-        // gate (issue #1252): the PR body snapshotted at run start plus the
-        // Stop-boundary "metadata delta observed" marker.
-        step!(timer, conn, migrate_work_executions_metadata_fix_columns)?;
-        // PR poll state columns for CI + review indicators on Review-lane cards.
-        step!(timer, conn, migrate_pr_poll_state_columns)?;
-        // External tracker binding columns (products) and per-work-item
-        // upstream-ref columns (tasks) plus partial indices. Design:
-        // tools/boss/docs/designs/external-issue-tracker-sync-github-projects.md
-        step!(timer, conn, migrate_external_tracker_columns)?;
-        // Host registry tables + work_executions host columns for distributed
-        // agent execution (phase 1 — schema + CLI only, no dispatch change).
-        // Design: tools/boss/docs/designs/distributed-agent-execution-register-and-dispatch-to-remote-ssh-hosts.md
-        step!(timer, conn, crate::host_registry::migrate_host_registry_tables)?;
-        step!(timer, conn, crate::host_registry::migrate_work_executions_host_columns)?;
-        // Phase 3: add host_id / cube_workspace_id / remote_pid to work_runs
-        // so the macOS app (and run-failure paths) can see which host
-        // a run executed on.
-        step!(timer, conn, crate::host_registry::migrate_work_runs_host_columns)?;
-        step!(timer, conn, crate::host_registry::migrate_work_runs_shell_pid)?;
-        step!(timer, conn, migrate_work_runs_tmux_hosted)?;
-        // Dispatch-time host health circuit breaker (starves-on-broken-host
-        // fix): consecutive-failure counter used by
-        // `record_host_dispatch_failure` / `_success` to auto-disable a
-        // host that fails every dispatch instead of retrying it forever.
-        step!(timer, conn, crate::host_registry::migrate_hosts_health_columns)?;
-        step!(timer, conn, crate::host_registry::ensure_local_host)?;
-        // No host capability probe belongs in this chain — see the note at
-        // the top of this file.
-
-        // Revision tasks (Phase 1): parent linkage column + index on tasks,
-        // and soft-prefer signal on work_executions. Ships dark — the
-        // `revision` kind is parseable but not yet dispatchable.
-        // Design: tools/boss/docs/designs/revision-tasks.md
-        step!(timer, conn, migrate_tasks_parent_task_id_column)?;
-        step!(timer, conn, migrate_work_executions_prefer_is_soft)?;
-        step!(timer, conn, migrate_work_executions_transient_failure_count)?;
-        step!(timer, conn, migrate_work_executions_allow_dirty)?;
-        // Revision card fix: update existing revision rows whose `name` was
-        // set to the full description text (the original insertion behaviour).
-        // The new insertion code uses only the first line; this backfill
-        // aligns pre-fix rows by truncating to the first newline-terminated
-        // segment using SQLite string functions. Rows whose name already
-        // differs from description (e.g. manually patched via `boss task edit`)
-        // are intentionally skipped.
-        step!(timer, conn, migrate_revision_names_to_first_line)?;
-        // Phase 1 of `unify-pr-remediation-on-revisions.md`: add the
-        // `revision_task_id` reverse link to both attempt side-tables so
-        // Phase 2+ can stamp the FK when a producer creates a revision.
-        // Additive only — bespoke conflict/CI flows are untouched.
-        step!(timer, conn, migrate_conflict_resolutions_revision_task_id)?;
-        step!(timer, conn, migrate_ci_remediations_revision_task_id)?;
-        // Comments in the markdown viewer (Phase 2): engine-backed comment
-        // rows with W3C TextQuoteSelector anchors. Independent of every
-        // other table; `CREATE TABLE IF NOT EXISTS` so order is irrelevant.
-        // Design: tools/boss/docs/designs/comments-in-markdown-viewer.md
-        step!(timer, conn, migrate_work_comments_table)?;
-        // Comments Phase 3: magic-wand dispatch audit trail.
-        step!(timer, conn, migrate_magic_wand_dispatches_table)?;
-        // Comments Phase 4: PR-backed doc → Boss chore worker. Adds `chore_id`
-        // to `magic_wand_dispatches` for audit linkage.
-        step!(timer, conn, migrate_magic_wand_dispatches_add_chore_id)?;
-        // Automations foundation (maintenance-tasks.md): `automations`,
-        // `automation_runs`, `automation_short_id_sequences` tables plus
-        // `tasks.source_automation_id` provenance column. Purely additive —
-        // no existing rows are touched and no behaviour changes ship with
-        // this migration. Everything depends on these tables existing.
-        step!(timer, conn, migrate_automations_tables)?;
-        step!(timer, conn, migrate_tasks_source_automation_id)?;
-        // Attentions — new `attention_groups` and `attentions` tables for
-        // agent-raised, human-actionable notifications (questions +
-        // followups). Design: tools/boss/docs/designs/attentions.md.
-        step!(timer, conn, migrate_attentions)?;
-        // Editorial controls (P576, chore #1): per-product editorial_rules JSON
-        // column, branch_naming snapshot on work_executions, and editorial_actions
-        // audit table. Ships dark — no behaviour change until a product opts in.
-        // Design: tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md
-        step!(timer, conn, migrate_editorial_controls_schema)?;
-        // Normalise any effort_level rows stored as '' to NULL. The mapper
-        // already converts '' → None at read time, but canonical DB storage
-        // should use NULL (consistent with schema intent and SQL IS NULL queries).
-        step!(timer, conn, migrate_tasks_empty_effort_to_null)?;
-        // Behavior 8: upstream title/body drift detection. Adds
-        // `external_ref_upstream_title` and `external_ref_upstream_body` to
-        // `tasks` so the reconciler can tell apart operator edits from upstream
-        // changes without parsing the description prose. Superseded by the
-        // checksum migration below but kept for safe forward compatibility.
-        step!(timer, conn, migrate_external_tracker_upstream_content)?;
-        // Behavior 8 (revision): replace raw-content columns with SHA-256
-        // checksums. Adds `external_ref_upstream_checksum` and
-        // `external_ref_boss_checksum`; the old title/body columns remain in
-        // the schema but are no longer read or written.
-        step!(timer, conn, migrate_external_tracker_content_checksums)?;
-        // P992 task 9: loop termination & bounds — per-PR review cycle
-        // counter and last-reviewed SHA for the no-op skip gate.
-        step!(timer, conn, migrate_tasks_review_cycle_columns)?;
-        // P783 task 2: planner_runs audit ledger + per-project idempotency gate.
-        // The UNIQUE partial index is created here (after the table) so SQLite
-        // can resolve the `outcome` column. `CREATE TABLE IF NOT EXISTS` +
-        // `CREATE INDEX IF NOT EXISTS` make this fully idempotent.
-        // Design: tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md
-        step!(timer, conn, migrate_planner_runs_table)?;
-        // P1422 task B: driver data model (mix-and-match agent-driver
-        // abstraction). Adds `tasks.driver` and `products.default_driver`
-        // TEXT columns. NULL resolves to the engine default (`"claude"`).
-        step!(timer, conn, migrate_tasks_driver_column)?;
-        step!(timer, conn, migrate_products_default_driver)?;
-        // Followup provenance: origin_task_short_id and origin_pr_number
-        // on kind='followup' tasks (PR-review follow-ups created when the
-        // reviewed PR merges before findings are addressed).
-        step!(timer, conn, migrate_tasks_followup_provenance_columns)?;
-        // Done-lane bucketing fix: add completed_at so the kanban can group
-        // done tasks by their actual completion time instead of updated_at.
-        step!(timer, conn, migrate_tasks_completed_at)?;
-        // P783 task 5: tag tasks created by an auto-populate run with the
-        // originating planner_runs.id, so the undo path can delete exactly
-        // that batch. Purely additive nullable column; NULL for every
-        // non-planner task.
-        step!(timer, conn, migrate_tasks_planner_run_id)?;
-        // Comment intent classification (P1a): the four intent-classifier
-        // columns on `work_comments`. Purely additive, `NULL` for every
-        // existing row (classifier never ran on them).
-        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
-        step!(timer, conn, migrate_work_comments_intent_columns)?;
-        // Comment intent handling (P3a): `answer_agent_runs` tracks each
-        // ephemeral read-only answer-agent run against a question-classified
-        // comment. Independent of every other table; `CREATE TABLE IF NOT
-        // EXISTS` so order is irrelevant.
-        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
-        step!(timer, conn, migrate_answer_agent_runs_table)?;
-        step!(timer, conn, migrate_answer_agent_runs_execution_id_column)?;
-        step!(timer, conn, migrate_answer_agent_runs_workspace_positioned_column)?;
-        // Archival provenance: tasks.archived_reason surfaces why the
-        // engine auto-archived a revision (parent PR merged/closed) so
-        // `boss task show` doesn't leave the operator guessing.
-        step!(timer, conn, migrate_tasks_archived_reason)?;
-        step!(timer, conn, migrate_tasks_archival_provenance)?;
-        step!(timer, conn, migrate_products_status_provenance)?;
-        // Buckets 1&3 unification (P2a): `work_comments.revise_task_id`, the
-        // soft FK a `CommentsReviseDoc` batch stamps on every comment it
-        // addresses. Purely additive, `NULL` for every existing row.
-        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
-        step!(timer, conn, migrate_work_comments_revise_task_id_column)?;
-        // Buckets 1&3 unification (P2b) / comment intent handling (P3b):
-        // `comment_thread_entries`, the shared engine-authored
-        // nudge/answer/follow-up table. Purely additive, `CREATE TABLE IF NOT
-        // EXISTS` so order is irrelevant.
-        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
-        step!(timer, conn, migrate_comment_thread_entries_table)?;
-        // Magic-wand removal (P2e): retire any `work_comments` row still
-        // sitting in the now-invalid `dispatched` status. Data-only, no
-        // schema change; the `magic_wand_dispatches` table itself is left
-        // in place, unread, as a historical record.
-        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
-        step!(timer, conn, migrate_retire_magic_wand_dispatched_comments)?;
-        // Dispatch-failure surface: tasks.dispatch_failed_reason /
-        // dispatch_failed_error / dispatch_failed_at, so a task that fails
-        // to start (as opposed to merely waiting on a full worker pool)
-        // renders an error inline on its kanban card.
-        step!(timer, conn, migrate_tasks_dispatch_failure_columns)?;
-        // `schema_version` is a coarse bookkeeping marker, not a per-migration
-        // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
-        // this one and the P1a intent columns above) ride the current marker
-        // rather than bumping it. Left at '22'.
-        // P1203 task 1: add score + merged_into_attention_id + linked_work_item_id
-        // to `attentions` and create the `attention_merges` provenance ledger.
-        // Design: tools/boss/docs/designs/notification-dedup-scoring.md §"Data model".
-        step!(timer, conn, migrate_attentions_score_and_merges)?;
-        // Comment intent classifier terminal-failure surface:
-        // work_comments.intent_classification_failed_at /
-        // intent_classification_error, so a comment whose classifier call
-        // never succeeds shows a failed state instead of an indefinite
-        // "classifying…" spinner. Purely additive.
-        step!(timer, conn, migrate_work_comments_classification_failure_columns)?;
-        // Dispatch-wait surface: work_executions.dispatch_wait_reason /
-        // dispatch_wait_since, so a ready-but-undispatched execution's
-        // kanban card can show the real defer reason (chain_serialized,
-        // pool_exhausted) instead of a generic "Waiting for a slot".
-        step!(timer, conn, migrate_work_executions_dispatch_wait)?;
-        // Widen the conflict_resolutions idempotency key so the
-        // stale-base re-arm path in conflict_watch can dispatch a fresh
-        // attempt once a `succeeded` row's resolution has gone stale,
-        // instead of colliding with that row's UNIQUE slot forever
-        // (T2396 / PR #1874).
-        step!(timer, conn, migrate_conflict_resolutions_widen_unique_key)?;
-        // Regression fix (T1503/T1496): SHA-delta gate in recheck_for_pr must
-        // only fire for revision executions after a Stop event has been
-        // observed, not the moment any commit lands on the parent PR. Without
-        // this guard the gate fires immediately when a *different* worker (e.g.
-        // the parent chore's worker, still active) pushes to the same PR,
-        // transitioning the revision to `in_review` before the revision worker
-        // has done any work. `stop_seen` is set by `on_stop_inner` the first
-        // time a Stop fires; the gate checks it before running the SHA delta
-        // comparison.
-        step!(timer, conn, migrate_work_executions_stop_seen)?;
-        // `revision_stop_contributed_head`: SHA that on_stop_inner's Contributed arm
-        // observed for a revision_implementation execution. recheck_for_pr uses this
-        // as the T848 recovery gate: only finalize when head matches the SHA on_stop
-        // previously attempted to finalize on — not on any head movement from a
-        // concurrently-active parent worker.
-        step!(timer, conn, migrate_work_executions_revision_stop_contributed_head)?;
-        // Merge-queue sub-state: tasks.merge_queue_detail JSON blob (queue
-        // position, GitHub's raw entry state, enqueued-at timestamp) for the
-        // Review card's merging indicator (T2467/mono#1904).
-        step!(timer, conn, migrate_tasks_merge_queue_detail_column)?;
-        // Layer 0 conflict telemetry (T1 of
-        // merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md):
-        // conflict_resolutions.event_source / conflict_class /
-        // resolved_by_rung, so producer-side conflicts (a normal
-        // worker's own `cube workspace rebase` hitting
-        // `REBASED_WITH_CONFLICTS`) and per-rung outcomes are captured,
-        // not just in-review `conflict_watch` detections.
-        step!(timer, conn, migrate_conflict_resolutions_telemetry_columns)?;
-        // Durable in-flight marker for the mechanical escalation-ladder
-        // rungs (0/1), which run inline in the engine with no dispatched
-        // worker: `conflict_resolutions.mechanical_rung_in_flight`. Lets the
-        // startup reconciler recover an attempt killed mid-rung by a restart
-        // (2026-07-18 conflict-ladder restart incident) instead of leaving it
-        // stranded and mistaken for a live "old-style" attempt forever.
-        step!(timer, conn, migrate_conflict_resolutions_mechanical_rung_column)?;
-        // One-time cleanup of orphaned `merge_queue_state = 'queued'` rows on
-        // already-terminal tasks (see `mark_chore_pr_merged` and its sibling
-        // terminal-transition sites, which now clear these columns going
-        // forward) — snaps stale queue positions back to 1..N immediately
-        // after deploy instead of leaving dead rows in `queued` state forever.
-        step!(timer, conn, migrate_clear_merge_queue_state_on_terminal_tasks)?;
-        // Boothby, the autonomous groundskeeper: boothby_passes /
-        // _actions / _findings / _cursors. Independent of every other
-        // table and additive-only (`CREATE TABLE IF NOT EXISTS`), so
-        // ordering against its neighbours is irrelevant. Ships dark —
-        // the tables exist but nothing writes them until the Boothby
-        // agent lands; the actor-boothby capture in the mutation layer
-        // is inert until a caller passes `LAST_STATUS_ACTOR_BOOTHBY`.
-        step!(timer, conn, migrate_boothby_tables)?;
-        // Automation dedup gate: `automation_dedup_suppressions`, the
-        // append-only trace of tasks the gate refused to create because an
-        // open sibling of the same automation already tracks the finding.
-        // Independent of every other table and additive-only.
-        step!(timer, conn, migrate_automation_dedup_suppressions_table)?;
-        // `task_targets`: declared (and, later, actual) files/symbols a task
-        // touches. First consumer is the automation pre-file dedup gate
-        // (`WorkDb::create_automation_task`) — additive, independent of
-        // every other table.
-        // Design: tools/boss/docs/investigations/automation-duplicate-work-2026-07-14.md
-        step!(timer, conn, migrate_task_targets_table)?;
-        // Per-product merge mechanism (`direct` | `trunk_queue`), schema/contract
-        // only — see trunk-merge-queue-integration-queue-backed-merges-merging-ui.md.
-        step!(timer, conn, migrate_products_merge_mechanism)?;
-        // `worker_proposals`: the durable ingress ledger behind the mediated
-        // worker→engine proposal mechanism. Schema-only — no engine
-        // behavior change until the follow-on submission/apply-pipeline
-        // tasks land.
-        // Design: tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md
-        step!(timer, conn, migrate_worker_proposals_table)?;
-        // `trunk_merge_intents`: the standing record of a merge-button click
-        // submitted to Trunk's queue for a `trunk_queue` product. Additive,
-        // independent of every other table.
-        step!(timer, conn, migrate_trunk_merge_intents_table)?;
-        // `github_merge_intents`: the GitHub-native counterpart. It records
-        // a successful `gh pr merge --auto --squash` at a PR head so an empty
-        // first post-submit probe cannot erase the requested merge.
-        step!(timer, conn, migrate_github_merge_intents_table)?;
-        // `tasks.blocked_detail`: verbatim long-form explanation of
-        // `blocked_reason`, rendered as a tooltip on the kanban card's
-        // blocked pill. `blocked_reason` itself stays a short, title-cased
-        // label — this sibling column is where prose goes instead of
-        // being crammed (and truncated) into the label.
-        step!(timer, conn, migrate_tasks_blocked_detail_column)?;
-        // `tasks.effort_matched_rule` / `tasks.effort_reasons`: first-class
-        // effort-classification provenance (matched §Q4 rule + reasons
-        // summary). Replaces free-text `[effort-classification]` tag
-        // stuffing into `description`, which races autostart.
-        step!(timer, conn, migrate_tasks_effort_provenance_columns)?;
-        // `automation_runs.first_attempted_at`: the first-attempt timestamp
-        // the scheduler's retry deadline is measured from, distinct from
-        // `started_at` which the retry upsert rewrites on every attempt.
-        step!(timer, conn, migrate_automation_runs_first_attempted_at_column)?;
-        // `attentions.source_proposal_id`: provenance back to the
-        // `worker_proposals` row a `followup_task` proposal staged a
-        // followup-group member from. Additive, independent of every other
-        // table. Implementation task 6 of the worker-proposal-api design.
-        step!(timer, conn, migrate_attentions_source_proposal_id)?;
-        // Comment intent taxonomy collapse: the classifier's retired
-        // `directive`/`larger_change` split re-homed onto the single
-        // `revision` intent value (nothing downstream ever branched on which
-        // of the two a comment carried). Data-only, no schema change.
-        step!(timer, conn, migrate_collapse_directive_larger_change_intent)?;
-        // `tasks.pr_merge_state_status` / `tasks.pr_head_sha`: two fields the
-        // merge poller's probe already fetches every sweep but previously
-        // discarded. Backs `boss pr status` — see migration doc comment.
-        step!(timer, conn, migrate_tasks_pr_status_columns)?;
-        // `work_executions.pr_title_before`: PR title snapshot alongside the
-        // existing `pr_body_before`. Backs `boss pr body` returning title
-        // and body together.
-        step!(timer, conn, migrate_work_executions_pr_title_before)?;
-        // `product_decisions` + `decision_short_id_sequences`: product-scoped
-        // wontfix/decided records (T-B2-decision). New table only — no
-        // `tasks` column changes, so no collision with effort-provenance /
-        // blocked_detail migrations above.
-        step!(timer, conn, migrate_product_decisions_table)?;
-        // `github_api_calls`: per-call GitHub API usage telemetry (caller
-        // subsystem, API bucket, rateLimit reading). Independent of every
-        // other table and additive-only. Rides the current schema marker.
-        step!(timer, conn, migrate_github_api_calls_table)?;
-        // `tasks.reasoning`: the capability signal (standard | investigation),
-        // independent of `effort_level`'s size signal. Nullable, and NULL is
-        // load-bearing — it means "never classified" and keeps the row on the
-        // dispatcher's pre-existing kind-floor/effort-table path, so landing
-        // this migration re-models nothing already in flight.
-        step!(timer, conn, migrate_tasks_reasoning_column)?;
-        // revision chains must be flat under the original non-revision
-        // work item. New inserts already canonicalize in
-        // `assert_parent_revisable_and_insert`; this rewrites any pre-existing
-        // nested `parent_task_id` links (revision → revision) to the chain root
-        // so the UI rollup and `list_revisions --parent <root>` surface the
-        // full chain. Idempotent; preserves status/executions/deps/history.
-        step!(timer, conn, migrate_flatten_nested_revision_parents)?;
-        // `tasks.tags`: free-form ordered label strings for kanban cards.
-        // JSON array text, default `[]`. Caps enforced at write.
-        step!(timer, conn, migrate_tasks_tags_column)?;
-        // `work_executions.driver_runtime_state`: opaque JSON from
-        // AgentDriver::provision_workspace, handed back to teardown on
-        // every termination path. Survives workspace release so future
-        // Codex retention can operate only on a recorded root.
-        step!(timer, conn, migrate_work_executions_driver_runtime_state)?;
-        // `work_runs.progress_session_id`: the one current provider session
-        // identity, stored in engine-owned SQLite rather than an
-        // agent-writable provider home. Cleared by normal teardown.
-        step!(timer, conn, migrate_work_runs_progress_session_id)?;
-        // Raw provider usage on the run row. Captured on hook delivery rather
-        // than finalization so orphaned executions retain their observed cost.
-        step!(timer, conn, migrate_work_runs_cost_columns)?;
-        // `work_runs.turn_boundary_at`: durable proof that THIS run's process
-        // delivered a terminal result, so a one-turn-per-process worker's exit
-        // can be told apart from a death across an engine restart.
-        step!(timer, conn, migrate_work_runs_turn_boundary_at)?;
-        // `work_runs.progress_ingress_checkpoint`: where a file-tailing
-        // progress ingress had got to, so an engine restart re-attaches a
-        // long-lived agent session's rollout at the right byte rather than
-        // replaying it from zero or skipping to its end.
-        step!(timer, conn, migrate_work_runs_progress_ingress_checkpoint)?;
-        // `work_runs.semantic_progress_at` / `semantic_tool_condition`: last
-        // driver-originated event time and tri-state tool condition, so tmux
-        // re-adoption and later stale recovery can judge semantic health
-        // after an engine restart without treating engine-synthesized
-        // display timestamps as progress. Nullable; legacy NULL is unknown.
-        step!(timer, conn, migrate_work_runs_semantic_progress)?;
-        // Tmux session identity is durable per spawned run so startup
-        // adoption can match a surviving session by its opaque token.
-        // The spawn path does not use these columns until the tmux-hosting
-        // rollout lands.
-        step!(timer, conn, migrate_work_runs_tmux_columns)?;
-        // Token-verified `#{pane_dead}` observation. Survives the identity
-        // column clear on reap so the tmux confidence gate can query it
-        // after teardown.
-        step!(timer, conn, migrate_work_runs_tmux_pane_observation)?;
-        // `work_runs.liveness_anchor_at`: mutable liveness-age for durable
-        // reconcilers, so readoption can reset the pane-attach clock without
-        // stomping the immutable pane-spawn `started_at`.
-        step!(timer, conn, migrate_work_runs_liveness_anchor_at)?;
-        // `execution_driver_decisions`: one row per execution recording the
-        // driver traffic allocation decision (driver + reason + the split it
-        // was decided under). New table plus one additive column, independent
-        // of every migration above.
-        step!(timer, conn, migrate_execution_driver_decisions_table)?;
-        // Resolved driver/model/effort values frozen only after a worker has
-        // actually spawned. NULL on earlier rows means not recorded, never a
-        // guessed default. Must run before the backfill below, which reads
-        // `work_executions.driver` to decide which decision rows it may
-        // safely rewrite.
-        step!(timer, conn, migrate_work_executions_launch_config)?;
-        // Correct the older decision records for execution kinds whose pool
-        // overrides row/product pins. The backfill is self-idempotent.
-        step!(timer, conn, migrate_backfill_pool_driver_decisions)?;
-        // Fold a superseded `codex_dispatch_percentage` value into the
-        // equivalent three-way split and drop the legacy key. Data-only,
-        // self-idempotent — see the function doc comment.
-        step!(timer, conn, migrate_driver_traffic_split_from_codex_percentage)?;
-        // `pr_review_verdicts`: durable per-pass review-verdict ledger, written
-        // atomically with `record_worker_pr_completion` so a `pr_review` pass
-        // can never reach `completed` without a verdict row. Additive,
-        // independent of every other table.
-        step!(timer, conn, migrate_pr_review_verdicts_table)?;
-        step!(timer, conn, migrate_stamp_pr_review_verdicts_since)?;
-        // `pr_review_batches` / `pr_review_batch_members`: immutable review
-        // target/profile snapshots and role-specific attempts. The tables are
-        // persistence-only at this stage; dispatch still uses legacy review
-        // orchestration until the batch reconciler lands.
-        step!(timer, conn, migrate_pr_review_batches_tables)?;
-        step!(timer, conn, migrate_pr_review_batch_generations)?;
-        step!(timer, conn, migrate_pr_review_batch_explicit)?;
-        // `producing_work_item_id`: the task/revision id collapsed into the
-        // cycle root when the batch was created, so a revision's review can
-        // still resolve the revision's own brief instead of only the root's.
-        step!(timer, conn, migrate_pr_review_batch_producing_work_item)?;
-        // Batch-verdict applier: one `pr_review_verdicts` row per batch,
-        // keyed on the review-verdict proposal id so reapply is a no-op.
-        step!(timer, conn, migrate_pr_review_verdicts_batch_columns)?;
-        // One-time backfill: auto-resolve `pr_review_died_without_findings`
-        // attentions already followed by a later completed review pass —
-        // data-only, no schema change; self-idempotent.
-        step!(timer, conn, migrate_backfill_resolve_stale_dead_review_attentions)?;
-        // `work_executions.pr_head_baseline_absorbed`: set when on_stop_inner's
-        // parent-push suppression path rewrites `pr_head_before` mid-run (a
-        // head movement attributed to the concurrently-active parent worker,
-        // not this revision). Once set, the SHA-delta gate's "head unchanged"
-        // finding means "unchanged since the last absorbed baseline", not
-        // "unchanged since the run started" — the ProvenAbsent evidence this
-        // flag gates on must not be trusted the same way a never-absorbed
-        // baseline is (mono#2606 revision).
-        step!(timer, conn, migrate_work_executions_pr_head_baseline_absorbed)?;
-        // Repair any `projects.status` corrupted by the pre-fix untyped
-        // shared engine-status writer (out-of-enum values like `"todo"`),
-        // then close the gap that let it happen: a `CHECK` constraint on
-        // both `projects.status` and `tasks.status`. The repair MUST run
-        // first — the constraint migration's table rebuild would
-        // otherwise reject any still-corrupt row.
-        step!(timer, conn, migrate_repair_invalid_project_status)?;
-        step!(timer, conn, migrate_tasks_cancelled_status_to_archived)?;
-        step!(timer, conn, migrate_projects_tasks_status_check)?;
-        // Project lifecycle provenance: the current row states why its status
-        // was selected, and the existing append-only property audit retains
-        // every status transition (including transitions later superseded).
-        step!(timer, conn, migrate_project_status_provenance)?;
-        // `products.design_guidance`: kind-scoped design-directive guidance,
-        // distinct from `dispatch_preamble` (every kind) and
-        // `editorial_rules.instructions` (GitHub-visible surfaces only) — see
-        // `migrate_products_design_guidance`'s doc comment.
-        step!(timer, conn, migrate_products_design_guidance)?;
-        // `work_attachments`: metadata for screenshot evidence kept for a
-        // worker's own verification and for an operator inspecting a run
-        // locally; bytes live content-addressed under the engine state root.
-        // Independent of execution retention. Existing installations are
-        // upgraded transactionally so evidence rows outlive pruned runs.
-        // Design: tools/boss/docs/designs/worker-screenshot-evidence-attachments.md
-        step!(timer, conn, migrate_work_attachments_table)?;
-        step!(timer, conn, migrate_work_attachments_execution_retention)?;
-        // Data correction: repair any `work_comments` row still reading
-        // 'answered' off a failed, no-reply answer-agent run (the
-        // "comment reads answered when its answer-agent run failed with no
-        // reply" incident) — see the migration's own doc comment for the
-        // exact repair rule. Must run after `migrate_work_comments_table`
-        // and `migrate_answer_agent_runs_table`, both far earlier in this
-        // list. Idempotent; a no-op on every subsequent startup.
-        step!(timer, conn, migrate_correct_falsely_answered_comments_with_failed_runs)?;
-        // Data correction: resolve stale pre-existing `orphan_sweep`
-        // `churn_guard_parked` attention items. The current guarded sweep
-        // will re-park genuinely orphaned work in the
-        // `dispatch_failed_reason` representation — see the migration's own
-        // doc comment and
-        // `docs/designs/dispatch-halt-state-vs-attention-items.md`.
-        // Idempotent; a no-op once no open items of this shape remain.
-        step!(timer, conn, migrate_resolve_open_orphan_sweep_churn_guard_parked)?;
-        // `work_comments.reopened_at`, stamped by reconciliation's
-        // `Reopened` outcome so the sidebar can tell "never claimed" apart
-        // from "claimed, then abandoned". Purely additive.
-        step!(timer, conn, migrate_work_comments_reopened_at_column)?;
-        // `work_executions.run_done_declared_at` / `run_done_outcome` /
-        // `run_undeclared_at`: the durable record of whether a run's worker
-        // declared itself finished (`boss propose done`), and of the
-        // backstop having ended a run that never did. Additive columns on
-        // an existing table; independent of every migration above.
-        // Design: tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md
-        step!(timer, conn, migrate_work_executions_run_done_columns)?;
-        // `ideas` + `idea_short_id_sequences`: markdown drafts authored over
-        // time and later graduated into a chore or project. Own table, own
-        // `I<n>` namespace — deliberately not a `tasks` row. Additive-only
-        // (`CREATE TABLE IF NOT EXISTS`); rides the current schema marker.
-        step!(timer, conn, migrate_ideas_tables)?;
-        // Immutable PR comparison packets used by review-guide generation.
-        // The rollout remains disabled until the source collector and later
-        // guide execution path are enabled, but schema creation is additive
-        // and gives every reconciler one durable capture target.
-        step!(timer, conn, migrate_pr_review_guide_source_capture_tables)?;
-        // Durable attempts/versions for review-guide generation, plus the
-        // series' additive lifecycle/epoch/readable-pointer columns. Depends
-        // on `migrate_pr_review_guide_source_capture_tables` immediately
-        // above (its `pr_review_guide_source_series`/`_comparisons` tables
-        // must exist first). Rollout stays behind the source-capture flag;
-        // schema creation is additive.
-        step!(timer, conn, migrate_pr_review_guide_job_tables)?;
-        step!(timer, conn, guide_comments::migrate_guide_comments)?;
-        step!(timer, conn, guide_feedback::migrate_guide_feedback_outcomes)?;
-        step!(timer, conn, execution_bookmarks::migrate_execution_bookmarks)?;
-        step!(timer, conn, migrate_work_executions_last_error)?;
-        step!(timer, conn, project_postmortem::migrate_project_postmortem_signals)?;
-        // Install task triggers after the historical status-constraint
-        // migration rebuilds tasks; DROP TABLE removes its triggers.
-        step!(timer, conn, pr_flow::migrate_operator_questions)?;
-        step!(timer, conn, Self::stamp_schema_version)?;
-        timer.finish();
-        Ok(())
-    }
-
-    /// `work_executions_ready_idx` / `tasks_repo_idx`. Index creation must
-    /// follow the migrations above: pre-v3 databases don't have `priority`
-    /// until `migrate_work_executions_v3` adds it, and SQLite's `CREATE
-    /// INDEX IF NOT EXISTS` errors on missing columns rather than silently
-    /// skipping. The same rule applies to `tasks_repo_idx` against pre-v5
-    /// databases that haven't yet been migrated.
-    fn post_v3_indexes(conn: &Connection) -> Result<()> {
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS work_executions_ready_idx
-                ON work_executions(status, priority, created_at)",
+    fn check_schema_floor(conn: &Connection) -> Result<()> {
+        let has_metadata: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata')",
             [],
+            |row| row.get(0),
         )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS tasks_repo_idx
-                ON tasks(repo_remote_url, deleted_at)
-                WHERE repo_remote_url IS NOT NULL",
-            [],
-        )?;
-        Ok(())
-    }
-
-    /// Write the coarse `metadata.schema_version` marker both init paths
-    /// leave behind.
-    fn stamp_schema_version(conn: &Connection) -> Result<()> {
-        conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '32')
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [],
-        )?;
-        Ok(())
-    }
-
-    /// The original schema-init batch: every base table and index a
-    /// pre-migration database needs before the incremental `migrate_*`
-    /// steps can run. `IF NOT EXISTS` throughout, so it is idempotent on an
-    /// already-current database. Its own step in the chain timing ledger.
-    fn schema_init_batch(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "
-            PRAGMA foreign_keys = ON;
-
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS products (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                slug TEXT NOT NULL UNIQUE,
-                description TEXT NOT NULL DEFAULT '',
-                repo_remote_url TEXT,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                last_status_actor TEXT,
-                status_basis TEXT,
-                default_model TEXT,
-                default_driver TEXT,
-                ci_attempt_budget INTEGER NOT NULL DEFAULT 3,
-                dispatch_preamble TEXT,
-                design_guidance TEXT,
-                external_tracker_kind TEXT,
-                external_tracker_config TEXT,
-                design_repo TEXT,
-                worker_branch_prefix TEXT,
-                merge_mechanism TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS projects (
-                id TEXT PRIMARY KEY,
-                product_id TEXT NOT NULL REFERENCES products(id),
-                name TEXT NOT NULL,
-                slug TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                goal TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL,
-                priority TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                design_doc_repo_remote_url TEXT,
-                design_doc_branch TEXT,
-                design_doc_path TEXT
-            );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS projects_product_slug_idx
-                ON projects(product_id, slug);
-
-            CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY,
-                product_id TEXT NOT NULL REFERENCES products(id),
-                project_id TEXT REFERENCES projects(id),
-                kind TEXT NOT NULL,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL,
-                ordinal INTEGER,
-                pr_url TEXT,
-                deleted_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                autostart INTEGER NOT NULL DEFAULT 1,
-                deferred INTEGER NOT NULL DEFAULT 0,
-                human_driven INTEGER NOT NULL DEFAULT 0,
-                completion_summary TEXT,
-                priority TEXT NOT NULL DEFAULT 'medium',
-                repo_remote_url TEXT,
-                created_via TEXT NOT NULL DEFAULT 'unknown',
-                effort_level TEXT,
-                model_override TEXT,
-                reasoning TEXT,
-                driver TEXT,
-                ci_attempt_budget INTEGER,
-                ci_attempts_used INTEGER NOT NULL DEFAULT 0,
-                external_ref_kind TEXT,
-                external_ref_canonical_id TEXT,
-                external_ref_raw TEXT,
-                external_ref_synced_at TEXT,
-                external_ref_unbound_at TEXT,
-                archived_by TEXT,
-                archived_at TEXT,
-                archived_reason TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS tasks_product_idx
-                ON tasks(product_id, kind, deleted_at);
-
-            CREATE INDEX IF NOT EXISTS tasks_project_idx
-                ON tasks(project_id, deleted_at, ordinal);
-
-            CREATE TABLE IF NOT EXISTS work_executions (
-                id TEXT PRIMARY KEY,
-                work_item_id TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                status TEXT NOT NULL,
-                repo_remote_url TEXT NOT NULL,
-                cube_repo_id TEXT,
-                cube_lease_id TEXT,
-                cube_workspace_id TEXT,
-                workspace_path TEXT,
-                priority INTEGER NOT NULL DEFAULT 0,
-                preferred_workspace_id TEXT,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                finished_at TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS work_executions_work_item_idx
-                ON work_executions(work_item_id, created_at);
-
-            CREATE TABLE IF NOT EXISTS work_runs (
-                id TEXT PRIMARY KEY,
-                execution_id TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
-                agent_id TEXT NOT NULL,
-                status TEXT NOT NULL,
-                error_text TEXT,
-                result_summary TEXT,
-                transcript_path TEXT,
-                artifacts_path TEXT,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                liveness_anchor_at TEXT,
-                finished_at TEXT,
-                host_id TEXT NOT NULL DEFAULT 'local',
-                cube_workspace_id TEXT,
-                remote_pid INTEGER,
-                shell_pid INTEGER,
-                tmux_server_label TEXT,
-                tmux_session_name TEXT,
-                tmux_spawn_token TEXT,
-                tmux_spawn_state TEXT,
-                tmux_pane_pid INTEGER,
-                tmux_hosted INTEGER NOT NULL DEFAULT 0,
-                tmux_observed_pane_dead INTEGER,
-                tmux_observed_pane_dead_status TEXT,
-                tmux_observed_session_name TEXT,
-                tmux_pane_observation TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS work_runs_execution_idx
-                ON work_runs(execution_id, created_at);
-            CREATE UNIQUE INDEX IF NOT EXISTS work_runs_tmux_spawn_token_idx
-                ON work_runs(tmux_spawn_token)
-                WHERE tmux_spawn_token IS NOT NULL;
-
-            CREATE TABLE IF NOT EXISTS work_attention_items (
-                id TEXT PRIMARY KEY,
-                execution_id TEXT REFERENCES work_executions(id) ON DELETE CASCADE,
-                work_item_id TEXT,
-                kind TEXT NOT NULL,
-                status TEXT NOT NULL,
-                title TEXT NOT NULL,
-                body_markdown TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                resolved_at TEXT,
-                converted_task_id TEXT,
-                last_raised_at TEXT,
-                CHECK (
-                    (execution_id IS NOT NULL AND work_item_id IS NULL)
-                    OR (execution_id IS NULL AND work_item_id IS NOT NULL)
-                )
-            );
-
-            CREATE INDEX IF NOT EXISTS work_attention_items_execution_idx
-                ON work_attention_items(execution_id, created_at);
-
-            CREATE TABLE IF NOT EXISTS pane_summaries (
-                work_item_id TEXT PRIMARY KEY,
-                summary TEXT NOT NULL,
-                basis_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS work_item_dependencies (
-                dependent_id     TEXT NOT NULL,
-                prerequisite_id  TEXT NOT NULL,
-                relation         TEXT NOT NULL DEFAULT 'blocks',
-                created_at       TEXT NOT NULL,
-                PRIMARY KEY (dependent_id, prerequisite_id, relation),
-                CHECK (dependent_id <> prerequisite_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS work_item_dependencies_prereq_idx
-                ON work_item_dependencies(prerequisite_id, relation);
-
-            CREATE INDEX IF NOT EXISTS work_item_dependencies_dependent_idx
-                ON work_item_dependencies(dependent_id, relation);
-
-            CREATE TABLE IF NOT EXISTS project_property_audit (
-                id          TEXT PRIMARY KEY,
-                project_id  TEXT NOT NULL,
-                property    TEXT NOT NULL,
-                old_value   TEXT,
-                new_value   TEXT,
-                actor       TEXT NOT NULL,
-                changed_at  TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS project_property_audit_project_idx
-                ON project_property_audit(project_id, changed_at);
-            ",
-        )?;
+        let version: Option<String> = if has_metadata {
+            conn.query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+                row.get(0)
+            })
+            .optional()?
+        } else {
+            None
+        };
+        let (release, floor) = SCHEMA_COMPATIBILITY_FLOOR;
+        let observed = version.as_deref().unwrap_or("0 (unversioned)");
+        let parsed = version.as_deref().unwrap_or("0").parse::<u32>().with_context(|| {
+            format!(
+                "invalid database schema version {observed:?}; compatibility floor is Boss {release} (schema {floor})"
+            )
+        })?;
+        anyhow::ensure!(
+            parsed >= floor,
+            "database schema version {observed} is below the compatibility floor: Boss {release} (schema {floor}); this database is unsupported"
+        );
         Ok(())
     }
 
@@ -1072,15 +139,10 @@ impl WorkDb {
 mod tests {
     use super::*;
 
-    /// Coverage of record for the real incremental migration chain — the
-    /// fast fresh-database path (`apply_final_schema_template`) reaches an
-    /// end state captured FROM a run of this same chain, so this is the
-    /// only place that actually exercises every `migrate_*` step in order
-    /// against a blank database.
     #[test]
-    fn full_migration_chain_produces_current_schema() {
-        let conn = Connection::open_in_memory().unwrap();
-        WorkDb::run_full_migration_chain(&conn, "database").unwrap();
+    fn fresh_database_produces_current_schema() {
+        let db = WorkDb::open_in_memory().unwrap();
+        let conn = db.connect().unwrap();
 
         let schema_version: String = conn
             .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
@@ -1096,10 +158,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(
-            boothby_passes_exists,
-            "expected boothby_passes table from migrate_boothby_tables, the last migration in the chain"
-        );
+        assert!(boothby_passes_exists, "expected boothby_passes table in the baseline");
 
         let dispatch_failed_reason_columns: i64 = conn
             .query_row(
@@ -1110,7 +169,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             dispatch_failed_reason_columns, 1,
-            "expected tasks.dispatch_failed_reason from migrate_tasks_dispatch_failure_columns"
+            "expected tasks.dispatch_failed_reason in the baseline"
         );
 
         let local_host_exists: bool = conn
@@ -1132,7 +191,7 @@ mod tests {
             .unwrap();
         assert!(
             worker_proposals_exists,
-            "expected worker_proposals table from migrate_worker_proposals_table"
+            "expected worker_proposals table in the baseline"
         );
 
         let work_attachments_exists: bool = conn
@@ -1144,7 +203,7 @@ mod tests {
             .unwrap();
         assert!(
             work_attachments_exists,
-            "expected work_attachments table from migrate_work_attachments_table"
+            "expected work_attachments table in the baseline"
         );
 
         let pr_review_verdicts_exists: bool = conn
@@ -1156,7 +215,7 @@ mod tests {
             .unwrap();
         assert!(
             pr_review_verdicts_exists,
-            "expected pr_review_verdicts table from migrate_pr_review_verdicts_table"
+            "expected pr_review_verdicts table in the baseline"
         );
 
         let pr_review_batches_exist: i64 = conn
@@ -1169,7 +228,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             pr_review_batches_exist, 2,
-            "expected both review-batch tables from migrate_pr_review_batches_tables"
+            "expected both review-batch tables in the baseline"
         );
 
         let verdict_batch_columns: i64 = conn
@@ -1182,7 +241,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             verdict_batch_columns, 2,
-            "expected pr_review_verdicts.batch_id and proposal_id from migrate_pr_review_verdicts_batch_columns"
+            "expected pr_review_verdicts.batch_id and proposal_id in the baseline"
         );
 
         let verdicts_since_exists: bool = conn
@@ -1194,7 +253,7 @@ mod tests {
             .unwrap();
         assert!(
             verdicts_since_exists,
-            "expected pr_review_verdicts_since metadata stamp from migrate_stamp_pr_review_verdicts_since"
+            "expected pr_review_verdicts_since metadata stamp in the baseline"
         );
 
         let run_cost_columns: i64 = conn
@@ -1286,32 +345,405 @@ mod tests {
             .unwrap();
         assert!(tmux_token_index_exists, "expected unique tmux token index");
     }
+}
 
-    /// The fast path a brand-new database actually takes must reach the
-    /// exact same schema shape as the real chain: same tables, same final
-    /// column set per table (post-`ALTER TABLE ... ADD COLUMN`), same
-    /// indexes.
-    #[test]
-    fn fresh_schema_template_matches_full_migration_chain() {
-        let via_chain = Connection::open_in_memory().unwrap();
-        WorkDb::run_full_migration_chain(&via_chain, "database").unwrap();
-
-        let via_template = Connection::open_in_memory().unwrap();
-        WorkDb::apply_final_schema_template(&via_template).unwrap();
-
-        let capture = |conn: &Connection| -> Vec<String> {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT type || ':' || name || ':' || sql FROM sqlite_master \
-                     WHERE sql IS NOT NULL ORDER BY type, name",
-                )
-                .unwrap();
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<String>>>()
-                .unwrap()
-        };
-
-        assert_eq!(capture(&via_chain), capture(&via_template));
+#[cfg(test)]
+pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
     }
+    Ok(false)
+}
+
+pub(crate) fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    type SchemaObject = (String, String, String, Option<String>);
+
+    fn capture(conn: &Connection) -> Vec<SchemaObject> {
+        conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn normalize(objects: Vec<SchemaObject>) -> Vec<SchemaObject> {
+        objects
+            .into_iter()
+            .map(|(kind, name, table, sql)| {
+                (
+                    kind,
+                    name,
+                    table,
+                    sql.map(|sql| sql.split_whitespace().collect::<Vec<_>>().join(" ")),
+                )
+            })
+            .collect()
+    }
+
+    /// This immutable golden was emitted by run_full_migration_chain on
+    /// boss-v1.0.707 (cc72dac8), before deleting that chain. It includes NULL
+    /// SQL autoindexes and complete table DDL (column order, defaults, FKs,
+    /// CHECK/UNIQUE constraints), explicit indexes, and triggers. It must never
+    /// be regenerated from the baseline being tested.
+    #[test]
+    fn baseline_matches_released_chain_golden() {
+        let expected: Vec<SchemaObject> = RELEASED_SCHEMA
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        // Test the floor itself, independently of future post-floor migrations.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(baseline::SQL).unwrap();
+        assert_eq!(normalize(capture(&conn)), normalize(expected));
+    }
+
+    #[test]
+    fn below_floor_and_unversioned_databases_are_rejected_without_changes() {
+        for version in [None, Some("0"), Some("31"), Some("invalid")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("legacy.db");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE sentinel (value TEXT); INSERT INTO sentinel VALUES ('keep me');")
+                .unwrap();
+            if let Some(version) = version {
+                conn.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                    .unwrap();
+                conn.execute("INSERT INTO metadata VALUES ('schema_version', ?1)", [version])
+                    .unwrap();
+            }
+            let before = capture(&conn);
+            let error = WorkDb::open(path).err().expect("unsupported database must fail");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("1.0.707") && message.contains("schema 32"),
+                "{message}"
+            );
+            assert!(message.contains(version.unwrap_or("unversioned")), "{message}");
+            assert_eq!(capture(&conn), before);
+            let value: String = conn
+                .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "keep me");
+        }
+    }
+
+    #[test]
+    fn at_and_above_floor_preserve_schema_data_and_version() {
+        for version in [32, 33] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("supported.db");
+            let conn = Connection::open(&path).unwrap();
+            // Construct an existing DB from the independent released-chain
+            // golden, rather than opening through the implementation under test.
+            let mut objects: Vec<SchemaObject> = RELEASED_SCHEMA
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            objects.sort_by_key(|row| if row.0 == "table" { 0 } else { 1 });
+            for (_, _, _, sql) in objects {
+                if let Some(sql) = sql {
+                    conn.execute_batch(&sql).unwrap();
+                }
+            }
+            conn.execute(
+                "INSERT INTO metadata VALUES ('schema_version', ?1)",
+                [version.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO metadata VALUES (?1, '1700000000')",
+                [review_verdicts::PR_REVIEW_VERDICTS_SINCE_METADATA_KEY],
+            )
+            .unwrap();
+            conn.execute_batch("CREATE TABLE sentinel (value TEXT); INSERT INTO sentinel VALUES ('keep me');")
+                .unwrap();
+            let before = capture(&conn);
+            drop(conn);
+            for _ in 0..2 {
+                let db = WorkDb::open(path.clone()).unwrap();
+                let conn = db.connect().unwrap();
+                assert_eq!(capture(&conn), before);
+                let observed: String = conn
+                    .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(observed, version.to_string());
+                let stamp: String = conn
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key = ?1",
+                        [review_verdicts::PR_REVIEW_VERDICTS_SINCE_METADATA_KEY],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(stamp, "1700000000");
+                let value: String = conn
+                    .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(value, "keep me");
+            }
+        }
+    }
+
+    /// Run alone with --test_filter=database_open_timings --test_sharding_strategy=disabled
+    /// --test_arg=--nocapture to measure DB startup without test concurrency.
+    /// No timing threshold: wall clock results are evidence, not a flaky gate.
+    #[test]
+    fn database_open_timings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fresh = Vec::new();
+        let mut existing = Vec::new();
+        for i in 0..21 {
+            let path = dir.path().join(format!("sample-{i}.db"));
+            let started = std::time::Instant::now();
+            let db = WorkDb::open(path.clone()).unwrap();
+            fresh.push(started.elapsed().as_secs_f64() * 1000.0);
+            drop(db);
+            let started = std::time::Instant::now();
+            let db = WorkDb::open(path).unwrap();
+            existing.push(started.elapsed().as_secs_f64() * 1000.0);
+            drop(db);
+        }
+        println!("FLOOR_TIMINGS fresh_ms={fresh:?} existing_ms={existing:?}");
+    }
+
+    // Captured from the released chain, never from baseline::SQL.
+    const RELEASED_SCHEMA: &str = r###"["index", "answer_agent_runs_by_comment", "answer_agent_runs", "CREATE INDEX answer_agent_runs_by_comment\n             ON answer_agent_runs(comment_id, created_at)"]
+["index", "answer_agent_runs_by_execution", "answer_agent_runs", "CREATE INDEX answer_agent_runs_by_execution ON answer_agent_runs(execution_id)"]
+["index", "attention_groups_grouping_key_idx", "attention_groups", "CREATE UNIQUE INDEX attention_groups_grouping_key_idx\n             ON attention_groups(grouping_key, generation)"]
+["index", "attention_groups_product_short_id_idx", "attention_groups", "CREATE UNIQUE INDEX attention_groups_product_short_id_idx\n             ON attention_groups(product_id, short_id)\n             WHERE short_id IS NOT NULL"]
+["index", "attention_groups_product_state_idx", "attention_groups", "CREATE INDEX attention_groups_product_state_idx\n             ON attention_groups(product_id, state, created_at)"]
+["index", "attention_merges_canonical_idx", "attention_merges", "CREATE INDEX attention_merges_canonical_idx\n             ON attention_merges(canonical_attention_id, created_at)\n             WHERE canonical_attention_id IS NOT NULL"]
+["index", "attention_merges_pair_uq", "attention_merges", "CREATE UNIQUE INDEX attention_merges_pair_uq\n             ON attention_merges(canonical_attention_id, duplicate_attention_id)\n             WHERE duplicate_attention_id IS NOT NULL"]
+["index", "attention_merges_work_item_idx", "attention_merges", "CREATE INDEX attention_merges_work_item_idx\n             ON attention_merges(canonical_work_item_id, created_at)\n             WHERE canonical_work_item_id IS NOT NULL"]
+["index", "attentions_group_idx", "attentions", "CREATE INDEX attentions_group_idx\n             ON attentions(group_id, ordinal)"]
+["index", "automation_dedup_suppressions_by_automation_idx", "automation_dedup_suppressions", "CREATE INDEX automation_dedup_suppressions_by_automation_idx\n             ON automation_dedup_suppressions(automation_id, created_at)"]
+["index", "automation_runs_by_automation_idx", "automation_runs", "CREATE INDEX automation_runs_by_automation_idx\n             ON automation_runs(automation_id, scheduled_for)"]
+["index", "automations_due_idx", "automations", "CREATE INDEX automations_due_idx\n             ON automations(enabled, next_due_at)"]
+["index", "automations_product_short_id_idx", "automations", "CREATE UNIQUE INDEX automations_product_short_id_idx\n             ON automations(product_id, short_id) WHERE short_id IS NOT NULL"]
+["index", "boothby_actions_by_pass", "boothby_actions", "CREATE UNIQUE INDEX boothby_actions_by_pass\n             ON boothby_actions(pass_id, seq)"]
+["index", "boothby_actions_by_target", "boothby_actions", "CREATE INDEX boothby_actions_by_target\n             ON boothby_actions(target_kind, target_id)"]
+["index", "boothby_findings_status_idx", "boothby_findings", "CREATE INDEX boothby_findings_status_idx\n             ON boothby_findings(status, last_seen DESC)"]
+["index", "boothby_passes_single_open_idx", "boothby_passes", "CREATE UNIQUE INDEX boothby_passes_single_open_idx\n             ON boothby_passes((1))\n             WHERE finished_at IS NULL"]
+["index", "boothby_passes_started_idx", "boothby_passes", "CREATE INDEX boothby_passes_started_idx\n             ON boothby_passes(started_at DESC)"]
+["index", "ci_remediations_product_idx", "ci_remediations", "CREATE INDEX ci_remediations_product_idx\n             ON ci_remediations(product_id)"]
+["index", "ci_remediations_status_idx", "ci_remediations", "CREATE INDEX ci_remediations_status_idx\n             ON ci_remediations(status)"]
+["index", "ci_remediations_work_item_idx", "ci_remediations", "CREATE INDEX ci_remediations_work_item_idx\n             ON ci_remediations(work_item_id)"]
+["index", "comment_thread_entries_by_comment", "comment_thread_entries", "CREATE INDEX comment_thread_entries_by_comment\n             ON comment_thread_entries(comment_id, created_at)"]
+["index", "conflict_resolutions_product_idx", "conflict_resolutions", "CREATE INDEX conflict_resolutions_product_idx\n             ON conflict_resolutions(product_id)"]
+["index", "conflict_resolutions_status_idx", "conflict_resolutions", "CREATE INDEX conflict_resolutions_status_idx\n             ON conflict_resolutions(status)"]
+["index", "conflict_resolutions_work_item_idx", "conflict_resolutions", "CREATE INDEX conflict_resolutions_work_item_idx\n             ON conflict_resolutions(work_item_id)"]
+["index", "effort_escalations_product_idx", "effort_escalations", "CREATE INDEX effort_escalations_product_idx\n             ON effort_escalations(product_id, created_at)"]
+["index", "effort_escalations_work_item_idx", "effort_escalations", "CREATE INDEX effort_escalations_work_item_idx\n             ON effort_escalations(work_item_id)"]
+["index", "execution_driver_decisions_work_item_idx", "execution_driver_decisions", "CREATE INDEX execution_driver_decisions_work_item_idx\n             ON execution_driver_decisions(work_item_id)"]
+["index", "github_api_calls_caller_idx", "github_api_calls", "CREATE INDEX github_api_calls_caller_idx\n             ON github_api_calls(caller, started_at_ms)"]
+["index", "github_api_calls_started_idx", "github_api_calls", "CREATE INDEX github_api_calls_started_idx\n             ON github_api_calls(started_at_ms)"]
+["index", "github_merge_intents_active_work_item_idx", "github_merge_intents", "CREATE UNIQUE INDEX github_merge_intents_active_work_item_idx\n             ON github_merge_intents(work_item_id)\n             WHERE status = 'active'"]
+["index", "github_merge_intents_pr_head_idx", "github_merge_intents", "CREATE INDEX github_merge_intents_pr_head_idx\n             ON github_merge_intents(pr_url, head_sha)\n             WHERE status = 'active'"]
+["index", "guide_comment_outcomes_by_task", "guide_comment_outcomes", "CREATE INDEX guide_comment_outcomes_by_task\n             ON guide_comment_outcomes(revise_task_id)"]
+["index", "ideas_product_short_id_idx", "ideas", "CREATE UNIQUE INDEX ideas_product_short_id_idx\n             ON ideas(product_id, short_id) WHERE short_id IS NOT NULL"]
+["index", "ideas_product_status_idx", "ideas", "CREATE INDEX ideas_product_status_idx\n             ON ideas(product_id, status, created_at)"]
+["index", "idx_editorial_actions_product", "editorial_actions", "CREATE INDEX idx_editorial_actions_product\n             ON editorial_actions(product_id, created_at DESC)"]
+["index", "idx_tasks_parent_task_id", "tasks", "CREATE INDEX idx_tasks_parent_task_id\n        ON tasks(parent_task_id)"]
+["index", "magic_wand_dispatches_by_comment", "magic_wand_dispatches", "CREATE INDEX magic_wand_dispatches_by_comment\n             ON magic_wand_dispatches(comment_id, created_at)"]
+["index", "planner_runs_one_per_project", "planner_runs", "CREATE UNIQUE INDEX planner_runs_one_per_project\n             ON planner_runs(project_id)\n             WHERE outcome IN ('running','staged','applied')"]
+["index", "planner_runs_project_idx", "planner_runs", "CREATE INDEX planner_runs_project_idx\n             ON planner_runs(project_id, created_at)"]
+["index", "pr_review_batch_members_batch_idx", "pr_review_batch_members", "CREATE INDEX pr_review_batch_members_batch_idx\n             ON pr_review_batch_members(batch_id, role, attempt)"]
+["index", "pr_review_batches_cycle_root_idx", "pr_review_batches", "CREATE INDEX pr_review_batches_cycle_root_idx\n                 ON pr_review_batches(cycle_root_id, created_at)"]
+["index", "pr_review_guide_attempts_comparison_idx", "pr_review_guide_attempts", "CREATE INDEX pr_review_guide_attempts_comparison_idx\n            ON pr_review_guide_attempts(comparison_id, created_at DESC)"]
+["index", "pr_review_guide_attempts_execution_idx", "pr_review_guide_attempts", "CREATE INDEX pr_review_guide_attempts_execution_idx\n            ON pr_review_guide_attempts(execution_id) WHERE execution_id IS NOT NULL"]
+["index", "pr_review_guide_attempts_idempotency_idx", "pr_review_guide_attempts", "CREATE UNIQUE INDEX pr_review_guide_attempts_idempotency_idx\n            ON pr_review_guide_attempts(series_id, idempotency_token)\n            WHERE idempotency_token IS NOT NULL"]
+["index", "pr_review_guide_attempts_one_live_series", "pr_review_guide_attempts", "CREATE UNIQUE INDEX pr_review_guide_attempts_one_live_series\n           ON pr_review_guide_attempts(series_id) WHERE status IN ('queued', 'running')"]
+["index", "pr_review_guide_attempts_series_idx", "pr_review_guide_attempts", "CREATE INDEX pr_review_guide_attempts_series_idx\n            ON pr_review_guide_attempts(series_id, request_epoch DESC)"]
+["index", "pr_review_guide_source_comparisons_series_sequence_idx", "pr_review_guide_source_comparisons", "CREATE INDEX pr_review_guide_source_comparisons_series_sequence_idx\n            ON pr_review_guide_source_comparisons(series_id, observation_sequence DESC, captured_at DESC)"]
+["index", "pr_review_guide_source_series_observation_idx", "pr_review_guide_source_series", "CREATE INDEX pr_review_guide_source_series_observation_idx\n            ON pr_review_guide_source_series(root_task_id, latest_observation_sequence DESC, id DESC)"]
+["index", "pr_review_guide_versions_series_idx", "pr_review_guide_versions", "CREATE INDEX pr_review_guide_versions_series_idx\n            ON pr_review_guide_versions(series_id, generated_at DESC)"]
+["index", "pr_review_verdicts_batch_id_uidx", "pr_review_verdicts", "CREATE UNIQUE INDEX pr_review_verdicts_batch_id_uidx\n             ON pr_review_verdicts(batch_id) WHERE batch_id IS NOT NULL"]
+["index", "pr_review_verdicts_execution_idx", "pr_review_verdicts", "CREATE INDEX pr_review_verdicts_execution_idx\n             ON pr_review_verdicts(execution_id)"]
+["index", "pr_review_verdicts_proposal_id_uidx", "pr_review_verdicts", "CREATE UNIQUE INDEX pr_review_verdicts_proposal_id_uidx\n             ON pr_review_verdicts(proposal_id) WHERE proposal_id IS NOT NULL"]
+["index", "pr_review_verdicts_work_item_idx", "pr_review_verdicts", "CREATE INDEX pr_review_verdicts_work_item_idx\n             ON pr_review_verdicts(work_item_id, created_at)"]
+["index", "product_decisions_product_short_id_idx", "product_decisions", "CREATE UNIQUE INDEX product_decisions_product_short_id_idx\n             ON product_decisions(product_id, short_id) WHERE short_id IS NOT NULL"]
+["index", "product_decisions_product_status_idx", "product_decisions", "CREATE INDEX product_decisions_product_status_idx\n             ON product_decisions(product_id, status, created_at)"]
+["index", "project_property_audit_project_idx", "project_property_audit", "CREATE INDEX project_property_audit_project_idx\n                ON project_property_audit(project_id, changed_at)"]
+["index", "projects_product_short_id_idx", "projects", "CREATE UNIQUE INDEX projects_product_short_id_idx\n        ON projects(product_id, short_id) WHERE short_id IS NOT NULL"]
+["index", "projects_product_slug_idx", "projects", "CREATE UNIQUE INDEX projects_product_slug_idx\n        ON projects(product_id, slug)"]
+["index", "sqlite_autoindex_answer_agent_runs_1", "answer_agent_runs", null]
+["index", "sqlite_autoindex_attention_group_short_id_sequences_1", "attention_group_short_id_sequences", null]
+["index", "sqlite_autoindex_attention_groups_1", "attention_groups", null]
+["index", "sqlite_autoindex_attention_merges_1", "attention_merges", null]
+["index", "sqlite_autoindex_attentions_1", "attentions", null]
+["index", "sqlite_autoindex_automation_dedup_suppressions_1", "automation_dedup_suppressions", null]
+["index", "sqlite_autoindex_automation_runs_1", "automation_runs", null]
+["index", "sqlite_autoindex_automation_short_id_sequences_1", "automation_short_id_sequences", null]
+["index", "sqlite_autoindex_automations_1", "automations", null]
+["index", "sqlite_autoindex_boothby_actions_1", "boothby_actions", null]
+["index", "sqlite_autoindex_boothby_cursors_1", "boothby_cursors", null]
+["index", "sqlite_autoindex_boothby_findings_1", "boothby_findings", null]
+["index", "sqlite_autoindex_boothby_findings_2", "boothby_findings", null]
+["index", "sqlite_autoindex_boothby_passes_1", "boothby_passes", null]
+["index", "sqlite_autoindex_ci_failure_suppressions_1", "ci_failure_suppressions", null]
+["index", "sqlite_autoindex_ci_inflight_observations_1", "ci_inflight_observations", null]
+["index", "sqlite_autoindex_ci_remediations_1", "ci_remediations", null]
+["index", "sqlite_autoindex_ci_remediations_2", "ci_remediations", null]
+["index", "sqlite_autoindex_comment_thread_entries_1", "comment_thread_entries", null]
+["index", "sqlite_autoindex_conflict_resolutions_1", "conflict_resolutions", null]
+["index", "sqlite_autoindex_conflict_resolutions_2", "conflict_resolutions", null]
+["index", "sqlite_autoindex_decision_short_id_sequences_1", "decision_short_id_sequences", null]
+["index", "sqlite_autoindex_effort_escalations_1", "effort_escalations", null]
+["index", "sqlite_autoindex_execution_bookmarks_1", "execution_bookmarks", null]
+["index", "sqlite_autoindex_execution_driver_decisions_1", "execution_driver_decisions", null]
+["index", "sqlite_autoindex_github_merge_intents_1", "github_merge_intents", null]
+["index", "sqlite_autoindex_guide_comment_outcomes_1", "guide_comment_outcomes", null]
+["index", "sqlite_autoindex_host_capabilities_1", "host_capabilities", null]
+["index", "sqlite_autoindex_hosts_1", "hosts", null]
+["index", "sqlite_autoindex_idea_short_id_sequences_1", "idea_short_id_sequences", null]
+["index", "sqlite_autoindex_ideas_1", "ideas", null]
+["index", "sqlite_autoindex_magic_wand_dispatches_1", "magic_wand_dispatches", null]
+["index", "sqlite_autoindex_metadata_1", "metadata", null]
+["index", "sqlite_autoindex_metrics_counter_1", "metrics_counter", null]
+["index", "sqlite_autoindex_metrics_gauge_1", "metrics_gauge", null]
+["index", "sqlite_autoindex_pane_summaries_1", "pane_summaries", null]
+["index", "sqlite_autoindex_planner_runs_1", "planner_runs", null]
+["index", "sqlite_autoindex_pr_review_batch_members_1", "pr_review_batch_members", null]
+["index", "sqlite_autoindex_pr_review_batch_members_2", "pr_review_batch_members", null]
+["index", "sqlite_autoindex_pr_review_batch_members_3", "pr_review_batch_members", null]
+["index", "sqlite_autoindex_pr_review_batches_1", "pr_review_batches", null]
+["index", "sqlite_autoindex_pr_review_batches_2", "pr_review_batches", null]
+["index", "sqlite_autoindex_pr_review_guide_attempts_1", "pr_review_guide_attempts", null]
+["index", "sqlite_autoindex_pr_review_guide_request_tokens_1", "pr_review_guide_request_tokens", null]
+["index", "sqlite_autoindex_pr_review_guide_source_comparisons_1", "pr_review_guide_source_comparisons", null]
+["index", "sqlite_autoindex_pr_review_guide_source_comparisons_2", "pr_review_guide_source_comparisons", null]
+["index", "sqlite_autoindex_pr_review_guide_source_series_1", "pr_review_guide_source_series", null]
+["index", "sqlite_autoindex_pr_review_guide_source_series_2", "pr_review_guide_source_series", null]
+["index", "sqlite_autoindex_pr_review_guide_versions_1", "pr_review_guide_versions", null]
+["index", "sqlite_autoindex_pr_review_verdicts_1", "pr_review_verdicts", null]
+["index", "sqlite_autoindex_product_decisions_1", "product_decisions", null]
+["index", "sqlite_autoindex_products_1", "products", null]
+["index", "sqlite_autoindex_products_2", "products", null]
+["index", "sqlite_autoindex_project_property_audit_1", "project_property_audit", null]
+["index", "sqlite_autoindex_projects_1", "projects", null]
+["index", "sqlite_autoindex_short_id_sequences_1", "short_id_sequences", null]
+["index", "sqlite_autoindex_task_blocked_signals_1", "task_blocked_signals", null]
+["index", "sqlite_autoindex_task_targets_1", "task_targets", null]
+["index", "sqlite_autoindex_tasks_1", "tasks", null]
+["index", "sqlite_autoindex_trunk_merge_intents_1", "trunk_merge_intents", null]
+["index", "sqlite_autoindex_work_attachments_1", "work_attachments", null]
+["index", "sqlite_autoindex_work_attachments_2", "work_attachments", null]
+["index", "sqlite_autoindex_work_attention_items_1", "work_attention_items", null]
+["index", "sqlite_autoindex_work_capability_requirements_1", "work_capability_requirements", null]
+["index", "sqlite_autoindex_work_comments_1", "work_comments", null]
+["index", "sqlite_autoindex_work_executions_1", "work_executions", null]
+["index", "sqlite_autoindex_work_item_dependencies_1", "work_item_dependencies", null]
+["index", "sqlite_autoindex_work_runs_1", "work_runs", null]
+["index", "sqlite_autoindex_worker_proposals_1", "worker_proposals", null]
+["index", "sqlite_autoindex_worker_proposals_2", "worker_proposals", null]
+["index", "task_blocked_signals_active_idx", "task_blocked_signals", "CREATE INDEX task_blocked_signals_active_idx\n             ON task_blocked_signals(work_item_id, reason)\n             WHERE cleared_at IS NULL"]
+["index", "task_targets_kind_value_idx", "task_targets", "CREATE INDEX task_targets_kind_value_idx\n             ON task_targets(kind, value)"]
+["index", "task_targets_task_id_idx", "task_targets", "CREATE INDEX task_targets_task_id_idx\n             ON task_targets(task_id)"]
+["index", "tasks_external_ref_bound_uniq", "tasks", "CREATE UNIQUE INDEX tasks_external_ref_bound_uniq\n        ON tasks (external_ref_kind, external_ref_canonical_id)\n        WHERE external_ref_canonical_id IS NOT NULL\n          AND external_ref_unbound_at  IS NULL\n          AND deleted_at               IS NULL"]
+["index", "tasks_external_ref_idx", "tasks", "CREATE INDEX tasks_external_ref_idx\n        ON tasks (external_ref_kind, external_ref_canonical_id)\n        WHERE external_ref_canonical_id IS NOT NULL"]
+["index", "tasks_product_idx", "tasks", "CREATE INDEX tasks_product_idx\n        ON tasks(product_id, kind, deleted_at)"]
+["index", "tasks_product_short_id_idx", "tasks", "CREATE UNIQUE INDEX tasks_product_short_id_idx\n        ON tasks(product_id, short_id) WHERE short_id IS NOT NULL"]
+["index", "tasks_project_idx", "tasks", "CREATE INDEX tasks_project_idx\n        ON tasks(project_id, deleted_at, ordinal)"]
+["index", "tasks_repo_idx", "tasks", "CREATE INDEX tasks_repo_idx\n        ON tasks(repo_remote_url, deleted_at) WHERE repo_remote_url IS NOT NULL"]
+["index", "tasks_source_automation_idx", "tasks", "CREATE INDEX tasks_source_automation_idx\n        ON tasks(source_automation_id, status) WHERE source_automation_id IS NOT NULL"]
+["index", "trunk_merge_intents_active_work_item_idx", "trunk_merge_intents", "CREATE UNIQUE INDEX trunk_merge_intents_active_work_item_idx\n             ON trunk_merge_intents(work_item_id)\n             WHERE status = 'active'"]
+["index", "trunk_merge_intents_adopted_episode_idx", "trunk_merge_intents", "CREATE INDEX trunk_merge_intents_adopted_episode_idx\n             ON trunk_merge_intents(work_item_id, adopted_at_head_sha, adopted_at_check_completed_at)"]
+["index", "trunk_merge_intents_status_idx", "trunk_merge_intents", "CREATE INDEX trunk_merge_intents_status_idx\n             ON trunk_merge_intents(status)"]
+["index", "trunk_merge_intents_work_item_idx", "trunk_merge_intents", "CREATE INDEX trunk_merge_intents_work_item_idx\n             ON trunk_merge_intents(work_item_id)"]
+["index", "work_attachments_digest_idx", "work_attachments", "CREATE INDEX work_attachments_digest_idx\n             ON work_attachments(content_digest)"]
+["index", "work_attachments_work_item_idx", "work_attachments", "CREATE INDEX work_attachments_work_item_idx\n             ON work_attachments(work_item_id, created_at)"]
+["index", "work_attention_items_execution_idx", "work_attention_items", "CREATE INDEX work_attention_items_execution_idx\n                ON work_attention_items(execution_id, created_at)"]
+["index", "work_attention_items_work_item_idx", "work_attention_items", "CREATE INDEX work_attention_items_work_item_idx\n            ON work_attention_items(work_item_id, created_at)"]
+["index", "work_comments_by_artifact", "work_comments", "CREATE INDEX work_comments_by_artifact\n             ON work_comments(artifact_kind, artifact_id, status)"]
+["index", "work_comments_by_revise_task", "work_comments", "CREATE INDEX work_comments_by_revise_task ON work_comments(revise_task_id)"]
+["index", "work_comments_guide_version_idx", "work_comments", "CREATE INDEX work_comments_guide_version_idx ON work_comments(guide_version_id)"]
+["index", "work_executions_ready_idx", "work_executions", "CREATE INDEX work_executions_ready_idx\n                ON work_executions(status, priority, created_at)"]
+["index", "work_executions_work_item_idx", "work_executions", "CREATE INDEX work_executions_work_item_idx\n                ON work_executions(work_item_id, created_at)"]
+["index", "work_item_dependencies_dependent_idx", "work_item_dependencies", "CREATE INDEX work_item_dependencies_dependent_idx\n                ON work_item_dependencies(dependent_id, relation)"]
+["index", "work_item_dependencies_prereq_idx", "work_item_dependencies", "CREATE INDEX work_item_dependencies_prereq_idx\n                ON work_item_dependencies(prerequisite_id, relation)"]
+["index", "work_runs_execution_idx", "work_runs", "CREATE INDEX work_runs_execution_idx\n                ON work_runs(execution_id, created_at)"]
+["index", "work_runs_tmux_spawn_token_idx", "work_runs", "CREATE UNIQUE INDEX work_runs_tmux_spawn_token_idx\n                ON work_runs(tmux_spawn_token)\n                WHERE tmux_spawn_token IS NOT NULL"]
+["index", "worker_proposals_work_item_idx", "worker_proposals", "CREATE INDEX worker_proposals_work_item_idx\n             ON worker_proposals(work_item_id, created_at)"]
+["table", "answer_agent_runs", "answer_agent_runs", "CREATE TABLE answer_agent_runs (\n             id                 TEXT PRIMARY KEY,\n             comment_id         TEXT NOT NULL REFERENCES work_comments(id),\n             artifact_kind      TEXT NOT NULL,\n             artifact_id        TEXT NOT NULL,\n             doc_version        TEXT NOT NULL,\n             thread_turn        INTEGER NOT NULL DEFAULT 0,\n             status             TEXT NOT NULL,\n             workspace_lease_id TEXT,\n             reply_body         TEXT,\n             error_kind         TEXT,\n             created_at         TEXT NOT NULL,\n             completed_at       TEXT,\n             execution_id       TEXT REFERENCES work_executions(id) ON DELETE SET NULL\n         , workspace_positioned INTEGER)"]
+["table", "attention_group_short_id_sequences", "attention_group_short_id_sequences", "CREATE TABLE attention_group_short_id_sequences (\n             product_id  TEXT PRIMARY KEY REFERENCES products(id),\n             next_value  INTEGER NOT NULL DEFAULT 1\n         )"]
+["table", "attention_groups", "attention_groups", "CREATE TABLE attention_groups (\n             id                         TEXT PRIMARY KEY,\n             product_id                 TEXT NOT NULL REFERENCES products(id),\n             short_id                   INTEGER,\n             kind                       TEXT NOT NULL,\n             association_project_id     TEXT REFERENCES projects(id),\n             association_task_id        TEXT REFERENCES tasks(id),\n             source_kind                TEXT NOT NULL,\n             source_task_id             TEXT,\n             source_run_id              TEXT,\n             source_doc_path            TEXT,\n             source_doc_repo_remote_url TEXT,\n             source_doc_branch          TEXT,\n             grouping_key               TEXT NOT NULL,\n             generation                 INTEGER NOT NULL DEFAULT 0,\n             state                      TEXT NOT NULL DEFAULT 'open',\n             produced_artifact_kind     TEXT,\n             produced_artifact_ref      TEXT,\n             created_at                 TEXT NOT NULL,\n             actioned_at                TEXT,\n             dismissed_at               TEXT,\n             CHECK (\n                 (association_project_id IS NOT NULL AND association_task_id IS NULL)\n                 OR (association_project_id IS NULL  AND association_task_id IS NOT NULL)\n             )\n         )"]
+["table", "attention_merges", "attention_merges", "CREATE TABLE attention_merges (\n             id                      TEXT PRIMARY KEY,\n             canonical_attention_id  TEXT REFERENCES attentions(id),\n             canonical_work_item_id  TEXT,\n             product_id              TEXT NOT NULL,\n             trigger                 TEXT NOT NULL,\n             duplicate_attention_id  TEXT,\n             candidate_summary       TEXT NOT NULL,\n             candidate_source        TEXT,\n             model                   TEXT NOT NULL,\n             decision_rationale      TEXT,\n             edits_applied           TEXT,\n             created_at              TEXT NOT NULL\n         )"]
+["table", "attentions", "attentions", "CREATE TABLE attentions (\n             id                  TEXT PRIMARY KEY,\n             group_id            TEXT NOT NULL\n                                     REFERENCES attention_groups(id) ON DELETE CASCADE,\n             ordinal             INTEGER NOT NULL,\n             source_anchor       TEXT,\n             answer_state        TEXT NOT NULL DEFAULT 'open',\n             created_at          TEXT NOT NULL,\n             answered_at         TEXT,\n             question_type       TEXT,\n             prompt_text         TEXT,\n             choice_options      TEXT,\n             answer              TEXT,\n             proposed_name       TEXT,\n             proposed_description TEXT,\n             proposed_effort     TEXT,\n             proposed_work_kind  TEXT,\n             rationale           TEXT,\n             confidence_source   TEXT NOT NULL DEFAULT 'structured'\n         , score INTEGER NOT NULL DEFAULT 1, merged_into_attention_id TEXT, linked_work_item_id TEXT, source_proposal_id TEXT)"]
+["table", "automation_dedup_suppressions", "automation_dedup_suppressions", "CREATE TABLE automation_dedup_suppressions (\n             id                 TEXT PRIMARY KEY,\n             automation_id      TEXT NOT NULL REFERENCES automations(id),\n             surviving_task_id  TEXT NOT NULL REFERENCES tasks(id),\n             attempted_name     TEXT NOT NULL,\n             matched_on         TEXT NOT NULL,\n             match_key          TEXT NOT NULL,\n             created_at         TEXT NOT NULL\n         )"]
+["table", "automation_runs", "automation_runs", "CREATE TABLE automation_runs (\n             id                   TEXT PRIMARY KEY,\n             automation_id        TEXT NOT NULL REFERENCES automations(id),\n             scheduled_for        TEXT NOT NULL,\n             started_at           TEXT NOT NULL,\n             finished_at          TEXT,\n             triage_execution_id  TEXT,\n             outcome              TEXT NOT NULL,\n             produced_task_id     TEXT REFERENCES tasks(id),\n             detail               TEXT\n         , first_attempted_at TEXT)"]
+["table", "automation_short_id_sequences", "automation_short_id_sequences", "CREATE TABLE automation_short_id_sequences (\n             product_id  TEXT PRIMARY KEY REFERENCES products(id),\n             next_value  INTEGER NOT NULL DEFAULT 1\n         )"]
+["table", "automations", "automations", "CREATE TABLE automations (\n             id                    TEXT PRIMARY KEY,\n             short_id              INTEGER,\n             product_id            TEXT NOT NULL REFERENCES products(id),\n             name                  TEXT NOT NULL,\n             repo_remote_url       TEXT,\n             trigger_kind          TEXT NOT NULL,\n             trigger_config        TEXT NOT NULL,\n             standing_instruction  TEXT NOT NULL,\n             open_task_limit       INTEGER NOT NULL DEFAULT 1,\n             catch_up_window_secs  INTEGER,\n             enabled               INTEGER NOT NULL DEFAULT 1,\n             created_via           TEXT NOT NULL DEFAULT 'unknown',\n             created_at            TEXT NOT NULL,\n             updated_at            TEXT NOT NULL,\n             last_fired_at         TEXT,\n             last_outcome          TEXT,\n             next_due_at           TEXT\n         )"]
+["table", "boothby_actions", "boothby_actions", "CREATE TABLE boothby_actions (\n             id            TEXT PRIMARY KEY,\n             -- NOT NULL per the design: an action is always part of a pass.\n             -- ON DELETE CASCADE so the retention prune of old passes takes\n             -- their journal detail with them (design \u00a7Retention).\n             pass_id       TEXT NOT NULL REFERENCES boothby_passes(id) ON DELETE CASCADE,\n             -- Ordinal within the pass; `(pass_id, seq)` is the read order.\n             seq           INTEGER NOT NULL,\n             -- Catalogue slug, e.g. 'close_stale_task'. Supplied by the\n             -- executor's verb catalogue (task 2), not inferred here: the\n             -- mutation layer sees a column delta, never the intent behind\n             -- it, and a guessed verb in an audit trail is worse than none.\n             verb          TEXT NOT NULL,\n             -- task | project | attention | attention_item | execution |\n             -- lease | workspace | file | issue. Unconstrained: the\n             -- operational verbs (task 9) target kinds that are not WorkDb\n             -- rows at all, and the catalogue is the authority on the set.\n             target_kind   TEXT NOT NULL,\n             target_id     TEXT NOT NULL,\n             -- JSON: the verb's inputs.\n             params        TEXT,\n             -- Agent-supplied one-liner, required by the design \u2014 an\n             -- unexplained autonomous mutation is exactly what the journal\n             -- exists to prevent.\n             rationale     TEXT NOT NULL,\n             -- JSON of the mutated fields before / after. Restricted to the\n             -- columns the mutation actually touched, so replaying\n             -- `pre_image` reverts exactly what Boothby changed and cannot\n             -- clobber a column another writer has moved since. `pre_image`\n             -- is NULL for I-class (irreversible) actions, which journal\n             -- `params` + evidence instead.\n             pre_image     TEXT,\n             -- Also the undo conflict check: undo compares the row's\n             -- current state against this before restoring `pre_image`.\n             post_image    TEXT,\n             reversibility TEXT NOT NULL\n                               CHECK (reversibility IN ('reversible', 'semi', 'irreversible')),\n             undo_state    TEXT NOT NULL DEFAULT 'none'\n                               CHECK (undo_state IN ('none', 'undoable', 'undone', 'expired', 'conflicted')),\n             undone_at     TEXT,\n             -- Undo is human-only; the Boothby session has no undo verb, so\n             -- it cannot launder its own mistakes.\n             undone_by     TEXT,\n             created_at    TEXT NOT NULL\n         )"]
+["table", "boothby_cursors", "boothby_cursors", "CREATE TABLE boothby_cursors (\n             -- e.g. 'engine-trace', 'dispatch-events', 'transcript:<session>'.\n             source     TEXT PRIMARY KEY,\n             -- JSON: segment/offset or timestamp high-water mark.\n             position   TEXT NOT NULL,\n             updated_at TEXT NOT NULL\n         )"]
+["table", "boothby_findings", "boothby_findings", "CREATE TABLE boothby_findings (\n             id                TEXT PRIMARY KEY,\n             -- Content-derived dedup key, and the memory that makes 'this\n             -- has happened 40 times' legible without a GROUP BY over\n             -- history. Also what a human veto suppresses.\n             fingerprint       TEXT NOT NULL UNIQUE,\n             kind              TEXT NOT NULL\n                                   CHECK (kind IN ('error', 'anomaly', 'perf', 'friction', 'taxonomy')),\n             -- JSON refs: log span / transcript span / row ids.\n             subject           TEXT NOT NULL,\n             first_seen        TEXT NOT NULL,\n             last_seen         TEXT NOT NULL,\n             occurrences       INTEGER NOT NULL DEFAULT 1 CHECK (occurrences >= 1),\n             status            TEXT NOT NULL\n                                   CHECK (status IN ('open', 'filed', 'resolved', 'suppressed')),\n             filed_kind        TEXT CHECK (filed_kind IS NULL OR filed_kind IN ('chore', 'github_issue')),\n             -- Task id or issue URL, per `filed_kind`.\n             filed_ref         TEXT,\n             suppressed_reason TEXT\n         )"]
+["table", "boothby_passes", "boothby_passes", "CREATE TABLE boothby_passes (\n             id              TEXT PRIMARY KEY,\n             -- 'schedule' | 'event:<name>' | 'manual'. Left unconstrained\n             -- past the documented shapes: the event name is open-ended, so\n             -- a CHECK here would reject triggers the design allows.\n             trigger         TEXT NOT NULL,\n             started_at      TEXT NOT NULL,\n             -- NULL while the pass is in flight; set with `outcome`.\n             finished_at     TEXT,\n             outcome         TEXT\n                                 CHECK (outcome IS NULL OR outcome IN\n                                     ('completed', 'nothing_to_do', 'timed_out', 'failed', 'capped')),\n             actions_count   INTEGER NOT NULL DEFAULT 0,\n             proposals_count INTEGER NOT NULL DEFAULT 0,\n             findings_count  INTEGER NOT NULL DEFAULT 0,\n             -- Agent-authored, written by the `pass-summary` verb.\n             summary         TEXT,\n             session_id      TEXT,\n             transcript_path TEXT,\n             -- A pass is finished exactly when it has an outcome. Without\n             -- this a crashed pass could sit in flight forever holding an\n             -- outcome, or report `completed` with no end time.\n             CHECK ((outcome IS NULL) = (finished_at IS NULL))\n         )"]
+["table", "ci_failure_suppressions", "ci_failure_suppressions", "CREATE TABLE ci_failure_suppressions (\n             work_item_id  TEXT NOT NULL,\n             head_sha      TEXT NOT NULL,\n             created_at    TEXT NOT NULL,\n             PRIMARY KEY (work_item_id, head_sha)\n         )"]
+["table", "ci_inflight_observations", "ci_inflight_observations", "CREATE TABLE ci_inflight_observations (\n             work_item_id        TEXT NOT NULL,\n             head_sha            TEXT NOT NULL,\n             first_observed_at   TEXT NOT NULL,\n             alert_level_emitted TEXT NOT NULL DEFAULT 'none',\n             PRIMARY KEY (work_item_id, head_sha)\n         )"]
+["table", "ci_remediations", "ci_remediations", "CREATE TABLE ci_remediations (\n             id                  TEXT PRIMARY KEY,\n             product_id          TEXT NOT NULL,\n             work_item_id        TEXT NOT NULL,\n             pr_url              TEXT NOT NULL,\n             pr_number           INTEGER NOT NULL,\n             head_branch         TEXT NOT NULL,\n             head_sha_at_trigger TEXT NOT NULL,\n             head_sha_after      TEXT,\n             attempt_kind        TEXT NOT NULL,\n             consumes_budget     INTEGER NOT NULL,\n             failed_checks       TEXT NOT NULL,\n             triage_class        TEXT,\n             log_excerpt         TEXT,\n             status              TEXT NOT NULL,\n             failure_reason      TEXT,\n             cube_lease_id       TEXT,\n             cube_workspace_id   TEXT,\n             worker_id           TEXT,\n             created_at          TEXT NOT NULL,\n             started_at          TEXT,\n             finished_at         TEXT, failure_kind TEXT NOT NULL DEFAULT 'pr_branch_ci', before_commit_sha TEXT, revision_task_id TEXT,\n             UNIQUE (work_item_id, head_sha_at_trigger, attempt_kind)\n         )"]
+["table", "comment_thread_entries", "comment_thread_entries", "CREATE TABLE comment_thread_entries (\n             id                   TEXT PRIMARY KEY,\n             comment_id           TEXT NOT NULL REFERENCES work_comments(id),\n             entry_kind           TEXT NOT NULL,\n             author               TEXT NOT NULL,\n             body                 TEXT NOT NULL,\n             revise_task_id       TEXT,\n             answer_agent_run_id  TEXT REFERENCES answer_agent_runs(id),\n             created_at           TEXT NOT NULL\n         )"]
+["table", "conflict_resolutions", "conflict_resolutions", "CREATE TABLE \"conflict_resolutions\" (\n             id                  TEXT PRIMARY KEY,\n             product_id          TEXT NOT NULL,\n             work_item_id        TEXT NOT NULL,\n             pr_url              TEXT NOT NULL,\n             pr_number           INTEGER NOT NULL,\n             head_branch         TEXT NOT NULL,\n             base_branch         TEXT NOT NULL,\n             base_sha_at_trigger TEXT,\n             head_sha_before     TEXT,\n             head_sha_after      TEXT,\n             status              TEXT NOT NULL,\n             failure_reason      TEXT,\n             cube_lease_id       TEXT,\n             cube_workspace_id   TEXT,\n             worker_id           TEXT,\n             conflict_diagnosis  TEXT,\n             created_at          TEXT NOT NULL,\n             started_at          TEXT,\n             finished_at         TEXT,\n             revision_task_id    TEXT, event_source TEXT NOT NULL DEFAULT 'review_watch', conflict_class TEXT, resolved_by_rung INTEGER, mechanical_rung_in_flight INTEGER,\n             UNIQUE (work_item_id, base_sha_at_trigger, head_sha_before)\n         )"]
+["table", "decision_short_id_sequences", "decision_short_id_sequences", "CREATE TABLE decision_short_id_sequences (\n             product_id TEXT PRIMARY KEY,\n             next_value INTEGER NOT NULL\n         )"]
+["table", "editorial_actions", "editorial_actions", "CREATE TABLE editorial_actions (\n             id           INTEGER PRIMARY KEY,\n             product_id   TEXT NOT NULL REFERENCES products(id),\n             execution_id TEXT,\n             pr_url       TEXT,\n             tool_command TEXT NOT NULL,\n             action       TEXT NOT NULL CHECK (action IN ('allow', 'rewrite', 'deny')),\n             reason       TEXT,\n             created_at   TEXT NOT NULL\n         )"]
+["table", "effort_escalations", "effort_escalations", "CREATE TABLE effort_escalations (\n             id             TEXT PRIMARY KEY,\n             product_id     TEXT NOT NULL,\n             work_item_id   TEXT NOT NULL,\n             original_level TEXT NOT NULL,\n             new_level      TEXT NOT NULL,\n             markers        TEXT NOT NULL,\n             rule_id        TEXT,\n             created_at     TEXT NOT NULL\n         )"]
+["table", "execution_bookmarks", "execution_bookmarks", "CREATE TABLE execution_bookmarks (\n        execution_id TEXT PRIMARY KEY REFERENCES work_executions(id),\n        repo_path TEXT NOT NULL,\n        host_id TEXT NOT NULL,\n        recovered_from TEXT,\n        recovered_work INTEGER\n    )"]
+["table", "execution_driver_decisions", "execution_driver_decisions", "CREATE TABLE execution_driver_decisions (\n             execution_id      TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE,\n             work_item_id      TEXT NOT NULL,\n             driver            TEXT,\n             reason            TEXT NOT NULL,\n             split_at_decision TEXT,\n             created_at        TEXT NOT NULL\n         )"]
+["table", "github_api_calls", "github_api_calls", "CREATE TABLE github_api_calls (\n             id               INTEGER PRIMARY KEY,\n             -- Epoch MILLISECONDS (integer), not a string. See the doc\n             -- comment on migrate_github_api_calls_table.\n             started_at_ms    INTEGER NOT NULL,\n             -- Subsystem that made the call ('merge_poller.sweep',\n             -- 'ci_watch', \u2026), or 'unattributed' when no scope was active.\n             caller           TEXT NOT NULL,\n             -- 'graphql' | 'rest' | 'cli'. GraphQL and REST are metered\n             -- against separate hourly buckets and must not be summed.\n             api              TEXT NOT NULL,\n             verb             TEXT NOT NULL,\n             endpoint         TEXT NOT NULL,\n             -- 'ok' | 'error' | 'rate_limited'.\n             outcome          TEXT NOT NULL,\n             duration_ms      INTEGER NOT NULL,\n             -- GraphQL points this call cost (REST: 1 request). NULL when\n             -- the response carried no reading.\n             points_cost      INTEGER,\n             points_remaining INTEGER,\n             points_limit     INTEGER,\n             -- Epoch MILLISECONDS (integer) of the quota-window reset.\n             reset_at_ms      INTEGER\n         )"]
+["table", "github_merge_intents", "github_merge_intents", "CREATE TABLE github_merge_intents (\n             id           TEXT PRIMARY KEY,\n             work_item_id TEXT NOT NULL,\n             pr_url       TEXT NOT NULL,\n             head_sha     TEXT NOT NULL,\n             status       TEXT NOT NULL,\n             created_at   TEXT NOT NULL\n         )"]
+["table", "guide_comment_outcomes", "guide_comment_outcomes", "CREATE TABLE guide_comment_outcomes (\n             comment_id TEXT PRIMARY KEY,\n             revise_task_id TEXT NOT NULL,\n             disposition TEXT NOT NULL,\n             response TEXT NOT NULL,\n             request_regeneration INTEGER NOT NULL DEFAULT 0,\n             created_at TEXT NOT NULL\n         )"]
+["table", "host_capabilities", "host_capabilities", "CREATE TABLE host_capabilities (\n             host_id    TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,\n             capability TEXT NOT NULL,\n             source     TEXT NOT NULL,\n             PRIMARY KEY (host_id, capability)\n         )"]
+["table", "hosts", "hosts", "CREATE TABLE hosts (\n             id             TEXT PRIMARY KEY,\n             ssh_target     TEXT,\n             pool_size      INTEGER NOT NULL DEFAULT 1,\n             enabled        INTEGER NOT NULL DEFAULT 1,\n             last_seen_at   TEXT,\n             last_error_text TEXT,\n             created_at     TEXT NOT NULL\n         , consecutive_failures INTEGER NOT NULL DEFAULT 0)"]
+["table", "idea_short_id_sequences", "idea_short_id_sequences", "CREATE TABLE idea_short_id_sequences (\n             product_id TEXT PRIMARY KEY,\n             next_value INTEGER NOT NULL\n         )"]
+["table", "ideas", "ideas", "CREATE TABLE ideas (\n             id                TEXT PRIMARY KEY,\n             short_id          INTEGER,\n             product_id        TEXT NOT NULL,\n             name              TEXT NOT NULL,\n             body              TEXT NOT NULL DEFAULT '',\n             status            TEXT NOT NULL DEFAULT 'draft',\n             graduated_to_id   TEXT,\n             created_via       TEXT NOT NULL DEFAULT 'unknown',\n             created_at        TEXT NOT NULL,\n             updated_at        TEXT NOT NULL\n         )"]
+["table", "magic_wand_dispatches", "magic_wand_dispatches", "CREATE TABLE magic_wand_dispatches (\n             id            TEXT PRIMARY KEY,\n             comment_id    TEXT NOT NULL REFERENCES work_comments(id),\n             artifact_kind TEXT NOT NULL,\n             artifact_id   TEXT NOT NULL,\n             doc_version   TEXT NOT NULL,\n             status        TEXT NOT NULL,\n             input_tokens  INTEGER,\n             output_tokens INTEGER,\n             result_md     TEXT,\n             error_kind    TEXT,\n             anchor_warning INTEGER NOT NULL DEFAULT 0,\n             created_at    TEXT NOT NULL,\n             resolved_at   TEXT\n         , chore_id TEXT)"]
+["table", "metadata", "metadata", "CREATE TABLE metadata (\n                key TEXT PRIMARY KEY,\n                value TEXT NOT NULL\n            )"]
+["table", "metrics_counter", "metrics_counter", "CREATE TABLE metrics_counter (\n             name           TEXT PRIMARY KEY,\n             value          INTEGER NOT NULL,\n             updated_at_ms  INTEGER NOT NULL,\n             description    TEXT NOT NULL\n         )"]
+["table", "metrics_gauge", "metrics_gauge", "CREATE TABLE metrics_gauge (\n             name             TEXT PRIMARY KEY,\n             value            INTEGER NOT NULL,\n             observed_at_ms   INTEGER NOT NULL,\n             description      TEXT NOT NULL\n         )"]
+["table", "pane_summaries", "pane_summaries", "CREATE TABLE pane_summaries (\n                work_item_id TEXT PRIMARY KEY,\n                summary TEXT NOT NULL,\n                basis_hash TEXT NOT NULL,\n                created_at TEXT NOT NULL\n            )"]
+["table", "planner_runs", "planner_runs", "CREATE TABLE planner_runs (\n             id             TEXT PRIMARY KEY,\n             project_id     TEXT NOT NULL,\n             product_id     TEXT NOT NULL,\n             design_task_id TEXT,\n             caller         TEXT NOT NULL,\n             doc_ref        TEXT,\n             model          TEXT,\n             input_summary  TEXT,\n             raw_output     TEXT,\n             effort_audit   TEXT,\n             notes          TEXT,\n             outcome        TEXT NOT NULL,\n             result_summary TEXT,\n             created_at     TEXT NOT NULL,\n             updated_at     TEXT NOT NULL\n         )"]
+["table", "pr_review_batch_members", "pr_review_batch_members", "CREATE TABLE pr_review_batch_members (\n             id                 TEXT PRIMARY KEY,\n             batch_id           TEXT NOT NULL REFERENCES pr_review_batches(id) ON DELETE CASCADE,\n             attempt            INTEGER NOT NULL CHECK (attempt >= 1),\n             created_at         TEXT NOT NULL,\n             provider_effort    TEXT NOT NULL,\n             requested_driver   TEXT NOT NULL,\n             resolved_model     TEXT NOT NULL,\n             role               TEXT NOT NULL CHECK (role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer', 'supervisor', 'post_merge_reviewer')),\n             status             TEXT NOT NULL CHECK (status IN ('pending', 'running', 'reported', 'failed')),\n             updated_at         TEXT NOT NULL,\n             execution_id       TEXT REFERENCES work_executions(id) ON DELETE SET NULL,\n             report_proposal_id TEXT,\n             terminal_at        TEXT,\n             UNIQUE (batch_id, role, attempt),\n             UNIQUE (execution_id)\n         )"]
+["table", "pr_review_batches", "pr_review_batches", "CREATE TABLE \"pr_review_batches\" (\n                 id TEXT PRIMARY KEY,\n                 cycle_root_id TEXT NOT NULL,\n                 base_sha TEXT NOT NULL,\n                 classification_json TEXT NOT NULL,\n                 created_at TEXT NOT NULL,\n                 phase TEXT NOT NULL CHECK (phase IN ('pre_merge', 'post_merge')),\n                 pr_number INTEGER NOT NULL,\n                 pr_url TEXT NOT NULL,\n                 status TEXT NOT NULL CHECK (status IN ('collecting', 'supervising', 'applying', 'completed', 'failed')),\n                 target_sha TEXT NOT NULL,\n                 updated_at TEXT NOT NULL,\n                 completed_at TEXT,\n                 final_verdict_proposal_id TEXT,\n                 merge_sha TEXT,\n                 generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1), explicit INTEGER NOT NULL DEFAULT 0, producing_work_item_id TEXT,\n                 CHECK (phase = 'pre_merge' OR generation = 1),\n                 UNIQUE (cycle_root_id, phase, target_sha, generation)\n             )"]
+["table", "pr_review_guide_attempts", "pr_review_guide_attempts", "CREATE TABLE pr_review_guide_attempts (\n            id TEXT PRIMARY KEY,\n            series_id TEXT NOT NULL REFERENCES pr_review_guide_source_series(id),\n            comparison_id TEXT NOT NULL REFERENCES pr_review_guide_source_comparisons(id),\n            request_epoch INTEGER NOT NULL,\n            ordinal INTEGER NOT NULL,\n            execution_id TEXT,\n            status TEXT NOT NULL,\n            prompt_version TEXT NOT NULL,\n            driver TEXT,\n            model TEXT,\n            effort_value TEXT,\n            error TEXT,\n            retries INTEGER NOT NULL DEFAULT 0,\n            idempotency_token TEXT,\n            created_at TEXT NOT NULL,\n            started_at TEXT,\n            finished_at TEXT\n        , provider_usage_json TEXT, failed_pre_start INTEGER NOT NULL DEFAULT 0, failed_by_build TEXT)"]
+["table", "pr_review_guide_request_tokens", "pr_review_guide_request_tokens", "CREATE TABLE pr_review_guide_request_tokens (\n            series_id TEXT NOT NULL REFERENCES pr_review_guide_source_series(id) ON DELETE CASCADE,\n            token TEXT NOT NULL,\n            attempt_id TEXT NOT NULL REFERENCES pr_review_guide_attempts(id) ON DELETE CASCADE,\n            PRIMARY KEY (series_id, token)\n        )"]
+["table", "pr_review_guide_source_comparisons", "pr_review_guide_source_comparisons", "CREATE TABLE pr_review_guide_source_comparisons (\n            id TEXT PRIMARY KEY,\n            series_id TEXT NOT NULL REFERENCES pr_review_guide_source_series(id),\n            observation_sequence INTEGER NOT NULL,\n            observed_base_sha TEXT NOT NULL,\n            merge_base_sha TEXT NOT NULL,\n            head_sha TEXT NOT NULL,\n            trigger TEXT NOT NULL,\n            packet_hash TEXT NOT NULL,\n            complete INTEGER NOT NULL CHECK (complete IN (0, 1)),\n            omission_count INTEGER NOT NULL DEFAULT 0,\n            packet_path TEXT,\n            omission_summary_json TEXT,\n            captured_at TEXT NOT NULL, probe_base_sha TEXT, attempt_count INTEGER NOT NULL DEFAULT 1,\n            UNIQUE(series_id, observed_base_sha, head_sha)\n        )"]
+["table", "pr_review_guide_source_observation_sequence", "pr_review_guide_source_observation_sequence", "CREATE TABLE pr_review_guide_source_observation_sequence (\n            id INTEGER PRIMARY KEY CHECK (id = 1),\n            last_sequence INTEGER NOT NULL\n        )"]
+["table", "pr_review_guide_source_series", "pr_review_guide_source_series", "CREATE TABLE pr_review_guide_source_series (\n            id TEXT PRIMARY KEY,\n            root_task_id TEXT NOT NULL,\n            canonical_pr_url TEXT NOT NULL UNIQUE,\n            latest_observation_sequence INTEGER NOT NULL DEFAULT 0,\n            selected_comparison_id TEXT,\n            last_capture_error TEXT,\n            created_at TEXT NOT NULL,\n            updated_at TEXT NOT NULL\n        , guide_lifecycle TEXT NOT NULL DEFAULT 'idle', request_epoch INTEGER NOT NULL DEFAULT 0, readable_version_id TEXT)"]
+["table", "pr_review_guide_versions", "pr_review_guide_versions", "CREATE TABLE pr_review_guide_versions (\n            id TEXT PRIMARY KEY,\n            series_id TEXT NOT NULL REFERENCES pr_review_guide_source_series(id),\n            comparison_id TEXT NOT NULL REFERENCES pr_review_guide_source_comparisons(id),\n            attempt_id TEXT NOT NULL REFERENCES pr_review_guide_attempts(id),\n            markdown TEXT NOT NULL,\n            raw_output TEXT NOT NULL,\n            content_hash TEXT NOT NULL,\n            prompt_version TEXT NOT NULL,\n            generated_at TEXT NOT NULL\n        )"]
+["table", "pr_review_verdicts", "pr_review_verdicts", "CREATE TABLE pr_review_verdicts (\n             id                  TEXT PRIMARY KEY,\n             execution_id        TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,\n             work_item_id        TEXT NOT NULL,\n             head_sha            TEXT,\n             findings_count      INTEGER NOT NULL DEFAULT 0,\n             revision_warranted  INTEGER NOT NULL DEFAULT 0,\n             gate_outcome        TEXT NOT NULL,\n             revision_task_id    TEXT,\n             created_at          TEXT NOT NULL\n         , batch_id TEXT, proposal_id TEXT)"]
+["table", "product_decisions", "product_decisions", "CREATE TABLE product_decisions (\n             id                    TEXT PRIMARY KEY,\n             short_id              INTEGER,\n             product_id            TEXT NOT NULL,\n             kind                  TEXT NOT NULL,\n             status                TEXT NOT NULL DEFAULT 'active',\n             title                 TEXT NOT NULL,\n             body                  TEXT NOT NULL,\n             keywords              TEXT,\n             related_work_item_id  TEXT,\n             superseded_by         TEXT,\n             created_by            TEXT NOT NULL,\n             created_via           TEXT NOT NULL DEFAULT 'unknown',\n             created_at            TEXT NOT NULL,\n             updated_at            TEXT NOT NULL\n         )"]
+["table", "products", "products", "CREATE TABLE products (\n                id TEXT PRIMARY KEY,\n                name TEXT NOT NULL,\n                slug TEXT NOT NULL UNIQUE,\n                description TEXT NOT NULL DEFAULT '',\n                repo_remote_url TEXT,\n                status TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL,\n                last_status_actor TEXT,\n                status_basis TEXT,\n                default_model TEXT,\n                default_driver TEXT,\n                ci_attempt_budget INTEGER NOT NULL DEFAULT 3,\n                dispatch_preamble TEXT,\n                design_guidance TEXT,\n                external_tracker_kind TEXT,\n                external_tracker_config TEXT,\n                design_repo TEXT,\n                worker_branch_prefix TEXT,\n                merge_mechanism TEXT\n            , auto_pr_maintenance_enabled INTEGER NOT NULL DEFAULT 1, docs_repo TEXT, editorial_rules TEXT)"]
+["table", "project_property_audit", "project_property_audit", "CREATE TABLE project_property_audit (\n                id          TEXT PRIMARY KEY,\n                project_id  TEXT NOT NULL,\n                property    TEXT NOT NULL,\n                old_value   TEXT,\n                new_value   TEXT,\n                actor       TEXT NOT NULL,\n                changed_at  TEXT NOT NULL\n            , basis TEXT)"]
+["table", "projects", "projects", "CREATE TABLE \"projects\" (\n    id TEXT PRIMARY KEY,\n    product_id TEXT NOT NULL REFERENCES products(id),\n    name TEXT NOT NULL,\n    slug TEXT NOT NULL,\n    description TEXT NOT NULL DEFAULT '',\n    goal TEXT NOT NULL DEFAULT '',\n    status TEXT NOT NULL CHECK (status IN ('planned', 'active', 'blocked', 'done', 'archived')),\n    priority TEXT NOT NULL,\n    created_at TEXT NOT NULL,\n    updated_at TEXT NOT NULL,\n    design_doc_repo_remote_url TEXT,\n    design_doc_branch TEXT,\n    design_doc_path TEXT,\n    last_status_actor TEXT NOT NULL DEFAULT 'human',\n    short_id INTEGER\n, status_basis TEXT)"]
+["table", "short_id_sequences", "short_id_sequences", "CREATE TABLE short_id_sequences (\n             product_id  TEXT PRIMARY KEY REFERENCES products(id),\n             next_value  INTEGER NOT NULL DEFAULT 1\n         )"]
+["table", "task_blocked_signals", "task_blocked_signals", "CREATE TABLE task_blocked_signals (\n             work_item_id  TEXT NOT NULL,\n             reason        TEXT NOT NULL,\n             attempt_id    TEXT,\n             created_at    TEXT NOT NULL,\n             cleared_at    TEXT,\n             PRIMARY KEY (work_item_id, reason)\n         )"]
+["table", "task_targets", "task_targets", "CREATE TABLE task_targets (\n             id         TEXT PRIMARY KEY,\n             task_id    TEXT NOT NULL REFERENCES tasks(id),\n             kind       TEXT NOT NULL CHECK (kind IN ('file', 'symbol')),\n             value      TEXT NOT NULL,\n             created_at TEXT NOT NULL\n         )"]
+["table", "tasks", "tasks", "CREATE TABLE \"tasks\" (\n    id TEXT PRIMARY KEY,\n    product_id TEXT NOT NULL REFERENCES products(id),\n    project_id TEXT REFERENCES projects(id),\n    kind TEXT NOT NULL,\n    name TEXT NOT NULL,\n    description TEXT NOT NULL DEFAULT '',\n    status TEXT NOT NULL CHECK (status IN ('todo', 'active', 'blocked', 'in_review', 'done', 'archived')),\n    ordinal INTEGER,\n    pr_url TEXT,\n    deleted_at TEXT,\n    created_at TEXT NOT NULL,\n    updated_at TEXT NOT NULL,\n    autostart INTEGER NOT NULL DEFAULT 1,\n    deferred INTEGER NOT NULL DEFAULT 0,\n    human_driven INTEGER NOT NULL DEFAULT 0,\n    design_reasoning_effort_xhigh INTEGER NOT NULL DEFAULT 0,\n    completion_summary TEXT,\n    priority TEXT NOT NULL DEFAULT 'medium',\n    repo_remote_url TEXT,\n    created_via TEXT NOT NULL DEFAULT 'unknown',\n    effort_level TEXT,\n    model_override TEXT,\n    reasoning TEXT,\n    driver TEXT,\n    ci_attempt_budget INTEGER,\n    ci_attempts_used INTEGER NOT NULL DEFAULT 0,\n    external_ref_kind TEXT,\n    external_ref_canonical_id TEXT,\n    external_ref_raw TEXT,\n    external_ref_synced_at TEXT,\n    external_ref_unbound_at TEXT,\n    last_status_actor TEXT NOT NULL DEFAULT 'human',\n    blocked_reason TEXT,\n    blocked_attempt_id TEXT,\n    doc_repo_remote_url TEXT,\n    doc_branch TEXT,\n    doc_path TEXT,\n    short_id INTEGER,\n    ci_required_state TEXT,\n    review_required_state TEXT,\n    ci_required_detail TEXT,\n    review_required_detail TEXT,\n    pr_state_polled_at TEXT,\n    merge_queue_state TEXT,\n    pr_mergeable_state TEXT,\n    parent_task_id TEXT,\n    source_automation_id TEXT REFERENCES automations(id),\n    external_ref_upstream_title TEXT,\n    external_ref_upstream_body TEXT,\n    external_ref_upstream_checksum TEXT,\n    external_ref_boss_checksum TEXT,\n    review_cycle INTEGER NOT NULL DEFAULT 0,\n    last_reviewed_sha TEXT,\n    origin_task_short_id INTEGER,\n    origin_pr_number INTEGER,\n    completed_at TEXT,\n    planner_run_id TEXT,\n    archived_by TEXT,\n    archived_at TEXT,\n    archived_reason TEXT,\n    dispatch_failed_reason TEXT,\n    dispatch_failed_error TEXT,\n    dispatch_failed_at TEXT,\n    merge_queue_detail TEXT,\n    blocked_detail TEXT,\n    effort_matched_rule TEXT,\n    effort_reasons TEXT,\n    pr_merge_state_status TEXT,\n    pr_head_sha TEXT,\n    pr_status_observed_at TEXT,\n    tags TEXT NOT NULL DEFAULT '[]'\n)"]
+["table", "trunk_merge_intents", "trunk_merge_intents", "CREATE TABLE trunk_merge_intents (\n             id                   TEXT PRIMARY KEY,\n             work_item_id         TEXT NOT NULL,\n             pr_url               TEXT NOT NULL,\n             pr_number            INTEGER NOT NULL,\n             repo                 TEXT NOT NULL,\n             target_branch        TEXT NOT NULL,\n             status               TEXT NOT NULL,\n             last_trunk_state     TEXT,\n             last_trunk_state_at  TEXT,\n             submit_count         INTEGER NOT NULL DEFAULT 1,\n             created_at           TEXT NOT NULL\n         , adopted_at_head_sha TEXT, adopted_at_check_completed_at TEXT)"]
+["table", "work_attachments", "work_attachments", "CREATE TABLE work_attachments (\n             id             TEXT PRIMARY KEY,\n             execution_id   TEXT NOT NULL,\n             work_item_id   TEXT NOT NULL,\n             caption        TEXT NOT NULL DEFAULT '',\n             content_digest TEXT NOT NULL,\n             media_type     TEXT NOT NULL,\n             pixel_width    INTEGER NOT NULL,\n             pixel_height   INTEGER NOT NULL,\n             size_bytes     INTEGER NOT NULL,\n             source_name    TEXT NOT NULL,\n             created_at     TEXT NOT NULL,\n             reclaimed_at   TEXT,\n             UNIQUE (execution_id, content_digest)\n         )"]
+["table", "work_attention_items", "work_attention_items", "CREATE TABLE work_attention_items (\n                id TEXT PRIMARY KEY,\n                execution_id TEXT REFERENCES work_executions(id) ON DELETE CASCADE,\n                work_item_id TEXT,\n                kind TEXT NOT NULL,\n                status TEXT NOT NULL,\n                title TEXT NOT NULL,\n                body_markdown TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                resolved_at TEXT,\n                converted_task_id TEXT,\n                last_raised_at TEXT,\n                CHECK (\n                    (execution_id IS NOT NULL AND work_item_id IS NULL)\n                    OR (execution_id IS NULL AND work_item_id IS NOT NULL)\n                )\n            )"]
+["table", "work_capability_requirements", "work_capability_requirements", "CREATE TABLE work_capability_requirements (\n             subject_kind TEXT NOT NULL,\n             subject_id   TEXT NOT NULL,\n             capability   TEXT NOT NULL,\n             PRIMARY KEY (subject_kind, subject_id, capability)\n         )"]
+["table", "work_comments", "work_comments", "CREATE TABLE work_comments (\n             id                            TEXT PRIMARY KEY,\n             artifact_kind                 TEXT NOT NULL,\n             artifact_id                   TEXT NOT NULL,\n             doc_version                   TEXT NOT NULL,\n             anchor_json                   TEXT NOT NULL,\n             body                          TEXT NOT NULL,\n             author                        TEXT NOT NULL,\n             status                        TEXT NOT NULL,\n             status_actor                  TEXT,\n             last_resolved_with            TEXT,\n             plain_text_projection_version INTEGER NOT NULL DEFAULT 0,\n             created_at                    TEXT NOT NULL,\n             updated_at                    TEXT NOT NULL,\n             dismissed_at                  TEXT\n         , intent TEXT, intent_confidence REAL, intent_classified_at TEXT, intent_overridden_by TEXT, revise_task_id TEXT, intent_classification_failed_at TEXT, intent_classification_error TEXT, reopened_at TEXT, guide_version_id TEXT REFERENCES pr_review_guide_versions(id), guide_context_json TEXT)"]
+["table", "work_executions", "work_executions", "CREATE TABLE work_executions (\n                id TEXT PRIMARY KEY,\n                work_item_id TEXT NOT NULL,\n                kind TEXT NOT NULL,\n                status TEXT NOT NULL,\n                repo_remote_url TEXT NOT NULL,\n                cube_repo_id TEXT,\n                cube_lease_id TEXT,\n                cube_workspace_id TEXT,\n                workspace_path TEXT,\n                priority INTEGER NOT NULL DEFAULT 0,\n                preferred_workspace_id TEXT,\n                created_at TEXT NOT NULL,\n                started_at TEXT,\n                finished_at TEXT\n            , worker_branch_prefix TEXT, pre_start_failure_count INTEGER NOT NULL DEFAULT 0, dispatch_not_before TEXT, pr_url TEXT, pr_head_before TEXT, pr_head_after TEXT, pr_body_before TEXT, metadata_fix_confirmed_at TEXT, pinned_host_id TEXT, host_id TEXT, prefer_is_soft INTEGER NOT NULL DEFAULT 0, transient_failure_count INTEGER NOT NULL DEFAULT 0, allow_dirty INTEGER NOT NULL DEFAULT 0, branch_naming TEXT, dispatch_wait_reason TEXT, dispatch_wait_since TEXT, stop_seen INTEGER NOT NULL DEFAULT 0, revision_stop_contributed_head TEXT, pr_title_before TEXT, driver_runtime_state TEXT, driver TEXT, model TEXT, effort_level TEXT, pr_head_baseline_absorbed INTEGER NOT NULL DEFAULT 0, run_done_declared_at TEXT, run_done_outcome TEXT, run_undeclared_at TEXT, last_error TEXT)"]
+["table", "work_item_dependencies", "work_item_dependencies", "CREATE TABLE work_item_dependencies (\n                dependent_id     TEXT NOT NULL,\n                prerequisite_id  TEXT NOT NULL,\n                relation         TEXT NOT NULL DEFAULT 'blocks',\n                created_at       TEXT NOT NULL,\n                PRIMARY KEY (dependent_id, prerequisite_id, relation),\n                CHECK (dependent_id <> prerequisite_id)\n            )"]
+["table", "work_runs", "work_runs", "CREATE TABLE work_runs (\n                id TEXT PRIMARY KEY,\n                execution_id TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,\n                agent_id TEXT NOT NULL,\n                status TEXT NOT NULL,\n                error_text TEXT,\n                result_summary TEXT,\n                transcript_path TEXT,\n                artifacts_path TEXT,\n                created_at TEXT NOT NULL,\n                started_at TEXT,\n                liveness_anchor_at TEXT,\n                finished_at TEXT,\n                host_id TEXT NOT NULL DEFAULT 'local',\n                cube_workspace_id TEXT,\n                remote_pid INTEGER,\n                shell_pid INTEGER,\n                tmux_server_label TEXT,\n                tmux_session_name TEXT,\n                tmux_spawn_token TEXT,\n                tmux_spawn_state TEXT,\n                tmux_pane_pid INTEGER,\n                tmux_hosted INTEGER NOT NULL DEFAULT 0,\n                tmux_observed_pane_dead INTEGER,\n                tmux_observed_pane_dead_status TEXT,\n                tmux_observed_session_name TEXT,\n                tmux_pane_observation TEXT\n            , progress_session_id TEXT, model TEXT, output_tokens INTEGER, input_tokens INTEGER, cache_creation_tokens INTEGER, cache_read_tokens INTEGER, cache_creation_5m_tokens INTEGER, cache_creation_1h_tokens INTEGER, rounds INTEGER, agent_active_ms INTEGER, turn_boundary_at TEXT, progress_ingress_checkpoint TEXT, semantic_progress_at TEXT, semantic_tool_condition TEXT, tmux_pane_observation_at TEXT)"]
+["table", "worker_proposals", "worker_proposals", "CREATE TABLE worker_proposals (\n             id              TEXT PRIMARY KEY,\n             execution_id    TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,\n             work_item_id    TEXT,\n             kind            TEXT NOT NULL,\n             payload_json    TEXT NOT NULL,\n             idempotency_key TEXT NOT NULL,\n             state           TEXT NOT NULL DEFAULT 'proposed',\n             decided_by      TEXT,\n             decision_reason TEXT,\n             applied_ref     TEXT,\n             created_at      TEXT NOT NULL,\n             decided_at      TEXT,\n             UNIQUE (execution_id, idempotency_key)\n         )"]
+["trigger", "immutable_guide_comment_context", "work_comments", "CREATE TRIGGER immutable_guide_comment_context\n         BEFORE UPDATE OF artifact_kind, artifact_id, guide_version_id, guide_context_json,\n                          anchor_json, doc_version, plain_text_projection_version ON work_comments\n         WHEN OLD.guide_version_id IS NOT NULL\n         BEGIN SELECT RAISE(ABORT, 'guide comment authored context is immutable'); END"]
+"###;
 }
