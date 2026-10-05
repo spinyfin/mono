@@ -119,6 +119,7 @@ final class TerminalInputMonitor: NSObject {
             name: NSWindow.willCloseNotification, object: nil
         )
 
+        Self.probeMonitor = self
         Self.installWindowNoResponderProbe()
         startHeartbeat()
         libghosttyMirror.start()
@@ -140,6 +141,7 @@ final class TerminalInputMonitor: NSObject {
     func stop() {
         guard started else { return }
         started = false
+        if Self.probeMonitor === self { Self.probeMonitor = nil }
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
             self.keyMonitor = nil
@@ -300,6 +302,7 @@ final class TerminalInputMonitor: NSObject {
     // MARK: - Window-level beep site
 
     private static var probeInstalled = false
+    private static weak var probeMonitor: TerminalInputMonitor?
 
     /// Observe the base implementation so window controllers after a window
     /// are covered too. Always preserve AppKit's implementation for all selectors.
@@ -312,7 +315,7 @@ final class TerminalInputMonitor: NSObject {
         let original = unsafeBitCast(method_getImplementation(method), to: Original.self)
         let block: @convention(block) (NSResponder, Selector) -> Void = { responder, eventSelector in
             MainActor.assumeIsolated {
-                TerminalInputMonitor.shared.windowNoResponder(responder: responder, selector: eventSelector)
+                TerminalInputMonitor.probeMonitor?.windowNoResponder(responder: responder, selector: eventSelector)
             }
             original(responder, selector, eventSelector)
         }

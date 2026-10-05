@@ -26,8 +26,9 @@ import os
 ///   first responder. Logged before dispatch, so it does not say whether
 ///   that responder handled the key or whether AppKit beeped.
 /// - `no_responder_window` — a terminal-hosting window's responder chain
-///   ended in `noResponder(for:)` (the AppKit beep site), with the redacted
-///   most recent key and the first responder at that moment.
+///   reached `noResponder(for:)` on a window, controller, or view. Only
+///   `keyDown:` is a beep candidate; redacted key fields are attached only
+///   when the current event matches that window's recorded key event.
 /// - `key_to_text_input` — same, but the responder was a legitimate text
 ///   field; coalesced per focus episode and without key codes.
 /// - `terminal_focus` — a pane itself became / resigned first responder.

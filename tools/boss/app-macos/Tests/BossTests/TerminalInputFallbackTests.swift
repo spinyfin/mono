@@ -30,6 +30,43 @@ final class TerminalInputFallbackTests: XCTestCase {
         XCTAssertNil(TerminalInputFallback.window(for: NSResponder()))
     }
 
+    func testInstalledProbeRecordsWindowAndControllerFallbacks() throws {
+        let directory = URL(
+            fileURLWithPath: ProcessInfo.processInfo.environment["TEST_TMPDIR"] ?? NSTemporaryDirectory(),
+            isDirectory: true
+        ).appendingPathComponent("terminal-probe-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = TerminalInputLog(directory: directory.path)
+        let monitor = TerminalInputMonitor(log: log)
+        monitor.start()
+        defer { monitor.stop() }
+        let window = window()
+        let controller = NSWindowController(window: window)
+        window.nextResponder = controller
+        monitor.registerTerminalWindow(window)
+
+        window.noResponder(for: keyUp)
+        controller.noResponder(for: keyUp)
+        log.flushForTesting()
+
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let records = try files.flatMap { file in
+            try String(contentsOf: file, encoding: .utf8).split(separator: "\n").map { line in
+                try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+            }
+        }.filter { $0["event"] as? String == "no_responder_window" }
+        XCTAssertEqual(records.count, 2)
+        XCTAssertEqual(records.compactMap { $0["receiver"] as? String }, [
+            TerminalInputMonitor.describe(window), TerminalInputMonitor.describe(controller),
+        ])
+        for record in records {
+            XCTAssertEqual(record["window"] as? Int, window.windowNumber)
+            XCTAssertEqual(record["selector"] as? String, "keyUp:")
+            XCTAssertEqual(record["beep_candidate"] as? Bool, false)
+            XCTAssertNil(record["key"])
+        }
+    }
+
     func testOnlyKeyDownIsBeepCandidateAndCarriesKeyFields() {
         let window = window()
         let event = key(window, code: 36, characters: "\r")
