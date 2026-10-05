@@ -97,14 +97,8 @@ final class WorkDependencyKanbanTests: XCTestCase {
         XCTAssertEqual(model.dependencyPrereqs(for: phase4.id).map(\.status), ["archived"])
     }
 
-    /// Dragging a gated row to Doing is NOT refused client-side. The
-    /// engine owns the dependency rule (and it is kind-aware in a way a
-    /// client mirror drifted from — see
-    /// `testRevisionIsNotLabelledGatedByInReviewPrerequisite`), so the
-    /// drop is forwarded and the card is placed optimistically. When the
-    /// engine does refuse, its `work_error` bounces the card back and the
-    /// inline notice carries the engine's own reason — never a silent
-    /// snap-back.
+    /// Drops are forwarded to the engine; a refusal bounces the card back
+    /// and surfaces the engine's reason verbatim in the inline notice.
     func testAttemptDropForwardsGatedDragAndSurfacesEngineRefusal() {
         let model = makeFixture()
         guard let dependent = model.taskByName("Phase 4") else {
@@ -127,7 +121,7 @@ final class WorkDependencyKanbanTests: XCTestCase {
 
         XCTAssertEqual(model.effectiveBoardColumn(for: dependent), origin, "a refused drop bounces back")
         XCTAssertEqual(model.dragRefusalNotice?.taskID, dependent.id)
-        XCTAssertEqual(model.dragRefusalNotice?.message, reason, "the operator sees the engine's reason verbatim")
+        XCTAssertEqual(model.dragRefusalNotice?.message, reason, "the engine's reason is surfaced verbatim")
         XCTAssertNil(model.workErrorMessage, "a kanban refusal is inline, not modal")
     }
 
@@ -149,12 +143,29 @@ final class WorkDependencyKanbanTests: XCTestCase {
         XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: nil))
     }
 
-    /// The operator's row: a CI-fix revision parked `blocked /
-    /// worker_failed` behind a sibling revision that is `in_review`. The
-    /// kanban must not label it as gated (no chain badge, no "Blocked by"
-    /// text, empty gating list) — the engine would dispatch it, and
-    /// `bossctl work start` did. A chore behind the same `in_review` row
-    /// stays labelled gated, matching the engine's kind-specific rule.
+    func testMixedKindDiamondFrontierIsIndependentOfEdgeOrder() {
+        let model = makeFixture()
+        for (id, status, kind) in [
+            ("revision", "blocked", "revision"),
+            ("chore", "blocked", "chore"),
+            ("shared", "in_review", "revision")
+        ] {
+            model.upsertTaskForTest(id: id, name: id, status: status, lastStatusActor: "engine", kind: kind)
+        }
+        let edges = [
+            WorkItemDependency(dependentID: "revision", prerequisiteID: "shared", relation: "blocks"),
+            WorkItemDependency(dependentID: "revision", prerequisiteID: "chore", relation: "blocks"),
+            WorkItemDependency(dependentID: "chore", prerequisiteID: "shared", relation: "blocks")
+        ]
+        for orderedEdges in [edges, Array(edges.reversed())] {
+            model.dependenciesByProductID["prod_test"] = orderedEdges
+            model.invalidateWorkCache(.dependencies)
+            XCTAssertEqual(model.actionablePrereqFrontier(for: "revision"), ["shared"])
+        }
+    }
+
+    /// A CI-fix revision behind an in_review sibling has no gating label;
+    /// a chore behind the same prerequisite remains gated.
     func testRevisionIsNotLabelledGatedByInReviewPrerequisite() {
         let model = makeFixture()
         guard let root = model.taskByName("Phase 2") else {

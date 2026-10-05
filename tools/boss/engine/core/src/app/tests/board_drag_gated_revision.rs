@@ -1,18 +1,6 @@
-//! Regression: dragging a `blocked / worker_failed` revision card to Doing
-//! must take the same engine path as `bossctl work start`, and must apply
-//! the same dependency rule.
-//!
-//! The operator-reported shape: a CI-fix revision on a PR whose preceding
-//! review-findings revision sits in `in_review` (its commits are pushed,
-//! the PR is open and quiescent). `gating_prereqs_for` is kind-aware —
-//! `in_review` satisfies a `revision` dependent, because waiting for `done`
-//! would deadlock the CI fix behind a PR that cannot merge until that very
-//! fix lands. `bossctl work start` honoured that and dispatched; the kanban
-//! drop refused with a client-side `done`/`archived`-only mirror of the
-//! rule before the engine ever saw the gesture. The app no longer
-//! pre-checks; these tests pin the engine contract the board drop now
-//! relies on: a startable row dispatches, a genuinely gated one is refused
-//! with a `work_error` that names the gate.
+//! Board drops use the same dependency admission as explicit starts.
+//! A CI-fix revision behind an `in_review` sibling can dispatch; a gated
+//! row receives a `work_error` naming the prerequisite.
 
 use super::*;
 use crate::app::work_items::handle_move_work_item_on_board;
@@ -90,7 +78,7 @@ fn create_manual_revision(state: &ServerState, parent_id: &str, description: &st
         .unwrap_or_else(|err| panic!("create revision {description:?}: {err:#}"))
 }
 
-/// Seed the operator's chain and return `(root, review_findings, ci_fix)`:
+/// Seed a revision chain and return `(root, review_findings, ci_fix)`:
 ///
 /// - `root`: an `in_review` chore with an open PR.
 /// - `review_findings`: the first revision on that PR, now `in_review`
@@ -147,7 +135,7 @@ fn seed_ci_fix_behind_in_review_revision(state: &Arc<ServerState>) -> (Task, Tas
     );
 
     // The CI-fix worker runs and fails: `blocked / worker_failed`,
-    // `autostart = false` — exactly the operator's row.
+    // `autostart = false`.
     let failed_execution = create_spawned_execution(&state.work_db, &ci_fix.id, 999_999);
     state
         .work_db
@@ -161,12 +149,8 @@ fn seed_ci_fix_behind_in_review_revision(state: &Arc<ServerState>) -> (Task, Tas
     (root, task_row(state, &review_findings.id), ci_fix)
 }
 
-/// The operator's gesture: drag the `blocked / worker_failed` CI-fix
-/// revision from Backlog to Doing. The engine must accept it — the only
-/// prerequisite is an `in_review` sibling, which satisfies a revision —
-/// reset the failure block, land the card in Doing, and dispatch a fresh
-/// `revision_implementation` execution, exactly as `bossctl work start`
-/// did for the same row.
+/// Dragging a blocked worker_failed revision to Doing dispatches a fresh
+/// execution when its sibling prerequisite is in_review.
 #[tokio::test]
 async fn blocked_worker_failed_revision_dropped_on_doing_dispatches() {
     let (server_state, _dir) = test_server_state_with_fakes();
@@ -224,7 +208,7 @@ async fn blocked_worker_failed_revision_dropped_on_doing_dispatches() {
 /// The refusal half of the contract: a revision whose prerequisite is
 /// genuinely unsatisfied (here, a sibling still `blocked`) must be refused
 /// by the engine with a `work_error` that names the gate — so the app can
-/// show the operator why the card bounced — and must not move or dispatch.
+/// surface the refusal reason — and must not move or dispatch.
 /// Same handler, same rule, same message family as an explicit start.
 #[tokio::test]
 async fn gated_revision_dropped_on_doing_is_refused_with_the_gate_named() {
@@ -328,4 +312,118 @@ async fn chore_gated_on_in_review_prerequisite_dropped_on_doing_is_refused() {
         other => panic!("expected a WorkError naming the gate, got: {other:?}"),
     }
     assert_eq!(task_row(&server_state, &dependent.id).status, TaskStatus::Blocked);
+}
+
+#[tokio::test]
+async fn quarantined_drop_restores_block_and_surfaces_explicit_start_error() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let (_, _, task) = seed_ci_fix_behind_in_review_revision(&state);
+    state
+        .work_db
+        .update_work_item(
+            &task.id,
+            WorkItemPatch::builder()
+                .blocked_detail("worker exited before producing a PR")
+                .build(),
+        )
+        .unwrap();
+    let before = task_row(&state, &task.id);
+    let executions_before = state.work_db.list_executions(Some(&task.id)).unwrap();
+    state
+        .work_db
+        .set_metadata(
+            "local_worker_startup_quarantine",
+            &serde_json::json!({"executions": {"historical": task.id}, "scan_error": null}).to_string(),
+        )
+        .unwrap();
+    state.work_db.precheck_dispatch_repo(&task.id).unwrap();
+    let expected = state
+        .work_db
+        .request_execution_with_live_check(
+            boss_protocol::RequestExecutionInput::builder()
+                .work_item_id(&task.id)
+                .build(),
+            |_| false,
+        )
+        .unwrap_err();
+    assert!(format!("{expected:#}").contains("quarantined historical local worker"));
+
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(dispatch(&state, &sink, "quarantined-drop"), drop_on_doing(&task.id)).await;
+    match sole_response(&sink).await {
+        FrontendEvent::WorkError { message } => assert_eq!(message, format!("{expected:#}")),
+        other => panic!("expected quarantine refusal, got {other:?}"),
+    }
+    let after = task_row(&state, &task.id);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.blocked_reason, before.blocked_reason);
+    assert_eq!(after.blocked_detail, before.blocked_detail);
+    let executions_after = state.work_db.list_executions(Some(&task.id)).unwrap();
+    assert_eq!(executions_after.len(), executions_before.len());
+    assert!(executions_after.iter().all(|execution| execution.status.is_terminal()));
+}
+
+#[tokio::test]
+async fn blocked_chore_and_project_task_with_satisfied_prerequisite_dispatch() {
+    for (kind, reason) in [("chore", "ci_failure"), ("project_task", "conflict")] {
+        let (state, _dir) = test_server_state_with_fakes();
+        let db = &state.work_db;
+        let product = create_test_product_with_repo(db, "BlockedDrop", Some("git@example.com:board/drop.git"));
+        let prerequisite = create_test_chore_manual(db, &product.id, "Satisfied prerequisite");
+        set_status(&state, &prerequisite.id, "done");
+        let task = if kind == "project_task" {
+            let project = db
+                .create_project(boss_protocol::CreateProjectInput {
+                    product_id: product.id.clone(),
+                    name: "Project".to_owned(),
+                    description: None,
+                    goal: None,
+                    autostart: false,
+                    no_design_task: true,
+                    design_reasoning_effort_xhigh: false,
+                })
+                .unwrap();
+            db.create_task(
+                boss_protocol::CreateTaskInput::builder()
+                    .product_id(&product.id)
+                    .project_id(project.id)
+                    .name("Project task")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap()
+        } else {
+            create_test_chore_manual(db, &product.id, "Chore")
+        };
+        assert_eq!(task.kind.as_str(), kind);
+        db.add_dependency(boss_protocol::AddDependencyInput {
+            dependent: task.id.clone(),
+            prerequisite: prerequisite.id,
+            relation: None,
+        })
+        .unwrap();
+        db.update_work_item(
+            &task.id,
+            WorkItemPatch::builder()
+                .status("blocked")
+                .blocked_reason(reason)
+                .blocked_detail("Blocked attempt details")
+                .build(),
+        )
+        .unwrap();
+        assert!(db.gating_prereqs_for(&task.id).unwrap().is_empty());
+        let sink = make_session_sink();
+        handle_move_work_item_on_board(dispatch(&state, &sink, "blocked-drop"), drop_on_doing(&task.id)).await;
+        assert!(matches!(
+            sole_response(&sink).await,
+            FrontendEvent::WorkItemUpdated { .. }
+        ));
+        let after = task_row(&state, &task.id);
+        assert_eq!(after.status, TaskStatus::Active, "{kind} / {reason}");
+        assert_eq!(after.blocked_reason, None);
+        assert_eq!(after.blocked_detail, None);
+        let executions = db.list_executions(Some(&task.id)).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert!(!executions[0].status.is_terminal());
+    }
 }

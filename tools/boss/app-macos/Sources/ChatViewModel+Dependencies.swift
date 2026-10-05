@@ -255,13 +255,14 @@ extension ChatViewModel {
 
             for prereqID in prereqIDs {
                 guard !visited.contains(prereqID) else { continue }
-                visited.insert(prereqID)
 
                 // Skip prereqs that already satisfy `current`'s gate — they
                 // aren't holding anything up (for a revision dependent that
                 // includes an `in_review` prereq, same as the engine).
                 guard !isWorkItemSatisfied(prereqID, forDependentKind: task(withID: current)?.kind)
                 else { continue }
+
+                visited.insert(prereqID)
 
                 // An unblocked, open item is exactly what "actionable" means.
                 if gatingPrereqs(for: prereqID).isEmpty {

@@ -583,6 +583,10 @@ pub(super) async fn apply_work_item_patch(
         // applies. We only care about task/chore — products and
         // projects have no execution lifecycle.
         let previous_task_status = task_status_for_id(&work_db, &id);
+        let previous_block = work_db.get_work_item(&id).ok().and_then(|item| match item {
+            WorkItem::Task(t) | WorkItem::Chore(t) => Some((t.blocked_reason, t.blocked_detail)),
+            _ => None,
+        });
         // Capture name+description before the update so the
         // chore-update worker notification can report old → new.
         // Only read when the patch touches these fields to avoid
@@ -657,13 +661,7 @@ pub(super) async fn apply_work_item_patch(
         let actor = resolve_status_actor(&server_state, peer_pid);
         match work_db.update_work_item_as_actor(&id, patch, actor) {
             Ok(mut item) => {
-                // Set only by the pause-bypass dispatch arm below when the
-                // authoritative re-check refuses: the status patch already
-                // landed, so we revert it and answer this request with a
-                // `work_error` (which `ChatViewModel`'s existing
-                // `.workError` handler bounces the optimistic move on)
-                // instead of a success response that would otherwise leave
-                // the card in Doing with no execution and no visible error.
+                // Dispatch refusals roll back the move and return the engine reason.
                 let mut dispatch_failure_response: Option<String> = None;
                 // Set only inside the pause-bypass arm's genuine claim branch
                 // (`dispatch_with_pause_bypass` actually claimed a `ready` row
@@ -830,45 +828,7 @@ pub(super) async fn apply_work_item_patch(
                                 (Some(outcome.execution.id), false, Some(reason))
                             }
                             Err(err) => {
-                                // The pre-check in `handle_move_work_item_on_board`
-                                // already cleared this drag before the status
-                                // patch above ever applied — reaching a refusal
-                                // here means the pause was re-raised (or the
-                                // interactive cap filled) in the window between
-                                // that confirmation and this authoritative
-                                // re-check. The status patch already landed, so
-                                // revert it rather than leaving the card
-                                // stranded in Doing with no execution and no
-                                // visible error.
                                 let reason = format!("{err:#}");
-                                tracing::warn!(
-                                    work_item_id = %work_item_id_for_event,
-                                    ?err,
-                                    "UpdateWorkItem → active: pause-bypass dispatch refused at the \
-                                     authoritative re-check; reverting status, no worker spawned",
-                                );
-                                if let Some(prev_status) = &previous_task_status {
-                                    let revert_patch = WorkItemPatch::builder().status(prev_status.as_str()).build();
-                                    // Engine-initiated rollback, not a human
-                                    // edit — stamp `last_status_actor` as
-                                    // engine so dependency-cascade heuristics
-                                    // that key off the actor stay honest.
-                                    match work_db.update_work_item_as_actor(
-                                        &work_item_id_for_event,
-                                        revert_patch,
-                                        boss_protocol::LAST_STATUS_ACTOR_ENGINE,
-                                    ) {
-                                        Ok(reverted) => item = reverted,
-                                        Err(revert_err) => {
-                                            tracing::warn!(
-                                                work_item_id = %work_item_id_for_event,
-                                                ?revert_err,
-                                                "UpdateWorkItem → active: failed to revert status after \
-                                                 pause-bypass dispatch refusal",
-                                            );
-                                        }
-                                    }
-                                }
                                 dispatch_failure_response = Some(reason.clone());
                                 (None, false, Some(reason))
                             }
@@ -886,24 +846,9 @@ pub(super) async fn apply_work_item_patch(
                                 (Some(execution.id), true, None)
                             }
                             Err(err) => {
-                                // Deterministic preconditions (no
-                                // resolvable repo, bug #679) are
-                                // caught by the pre-update
-                                // `precheck_dispatch_repo` gate above
-                                // and reject the patch outright. This
-                                // arm now only fires for non-
-                                // deterministic races (e.g., a
-                                // concurrent execution insert lost
-                                // the unique-row gate). Keep the WARN
-                                // so a residual silent skip is still
-                                // observable in engine-trace.jsonl.
-                                tracing::warn!(
-                                    work_item_id = %work_item_id_for_event,
-                                    ?err,
-                                    "UpdateWorkItem → active: auto-dispatch \
-                                     failed; status update kept, no worker spawned",
-                                );
-                                (None, false, Some(format!("{err:#}")))
+                                let reason = format!("{err:#}");
+                                dispatch_failure_response = Some(reason.clone());
+                                (None, false, Some(reason))
                             }
                         }
                     } else {
@@ -926,6 +871,27 @@ pub(super) async fn apply_work_item_patch(
                             ),
                         )
                     };
+                    if let Some(reason) = &dispatch_failure_response {
+                        tracing::warn!(work_item_id = %work_item_id_for_event, %reason,
+                            "UpdateWorkItem → active: dispatch refused; reverting status");
+                        if let Some(prev_status) = &previous_task_status {
+                            let (blocked_reason, blocked_detail) = previous_block.clone().unwrap_or_default();
+                            let revert_patch = WorkItemPatch::builder()
+                                .status(prev_status.as_str())
+                                .maybe_blocked_reason(blocked_reason)
+                                .maybe_blocked_detail(blocked_detail)
+                                .build();
+                            match work_db.update_work_item_as_actor(
+                                &work_item_id_for_event,
+                                revert_patch,
+                                boss_protocol::LAST_STATUS_ACTOR_ENGINE,
+                            ) {
+                                Ok(reverted) => item = reverted,
+                                Err(err) => tracing::warn!(work_item_id = %work_item_id_for_event, ?err,
+                                    "failed to revert status after dispatch refusal"),
+                            }
+                        }
+                    }
                     // Pin the event's execution_id to the resolved exec id
                     // when dispatch landed, falling back to the work item
                     // id otherwise so the line stays correlatable with
