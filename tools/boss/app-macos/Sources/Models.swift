@@ -182,12 +182,10 @@ struct WorkTask: Identifiable, Hashable {
     /// intentional. Mirrors `Task.ai_reviewing` on the wire; `false` when
     /// absent (older engines / tasks not undergoing an AI review pass).
     var aiReviewing: Bool = false
-    /// Resolved AI-review badge state: one of `"reviewing"`, `"review_queued"`,
-    /// `"reviewed_with_findings"`, `"reviewed_all_clear"`, or
-    /// `"review_not_required"`. `nil` means "not reviewed yet" — render no
-    /// badge — and must never be treated as a clean result. Mirrors
-    /// `Task.ai_review_state` on the wire; engine-computed from the durable
-    /// `pr_review_verdicts` ledger, never from execution status.
+    /// Engine-resolved review for the current PR head. `not_reviewed`
+    /// explicitly marks missing review evidence; `reviewed_clean_pending`
+    /// means AI passed but CI, mergeability, or revisions prevent readiness.
+    /// Mirrors `Task.ai_review_state`; the app does not reconcile history.
     var aiReviewState: String? = nil
     /// The revision task that carries the review comments for
     /// `aiReviewState == "reviewed_with_findings"`, when one was

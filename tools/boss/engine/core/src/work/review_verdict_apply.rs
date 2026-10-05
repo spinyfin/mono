@@ -481,6 +481,18 @@ impl WorkDb {
             require_gate_passing_verdict,
         )?;
 
+        // A clean pass can leave every row in the same status. Publish the
+        // changed projection after commit rather than relying on a later
+        // worker-stop or PR-poll event to happen to refresh the card.
+        let product_id = tx.query_row(
+            "SELECT product_id FROM tasks WHERE id = ?1",
+            [&batch.cycle_root_id],
+            |row| row.get(0),
+        )?;
+        pending.push(boss_event_bus::Event::ReviewVerdictApplied {
+            product_id,
+            task_id: batch.cycle_root_id.clone(),
+        });
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(Some(applied_ref).filter(|_| remediating_task_id.is_some()))
     }

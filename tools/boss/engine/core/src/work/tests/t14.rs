@@ -169,6 +169,11 @@ async fn stalled_reviewer_fallback_refires_and_restores_reviewing_state() {
     assert!(card.ai_reviewing);
     assert_eq!(card.ai_review_state.as_deref(), Some("reviewing"));
 
+    // A clean verdict must cover the head currently observed on the PR.
+    db.connect().unwrap().execute(
+        "UPDATE tasks SET pr_head_sha = 'reviewed-head', ci_required_state = 'success', pr_mergeable_state = 'mergeable' WHERE id = ?1",
+        [&chore.id],
+    ).unwrap();
     db.record_worker_pr_completion(
         &refired.id,
         pr,

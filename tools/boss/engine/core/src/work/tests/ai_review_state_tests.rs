@@ -1,18 +1,10 @@
-//! `attach_ai_review_state` — the resolver behind `Task.ai_review_state` /
-//! `ai_review_findings_revision_id`. Covers the traps called out in the
-//! design: the chain-root rollup to the last completed revision's OWN
-//! verdict, kind exclusion, ignoring stale attentions, and "no informative
-//! verdict" rendering as no badge rather than being inferred as clean.
+//! Current-head review projection, including legacy revision-owned verdicts,
+//! kind exclusions, failed attempts, and running/queued review precedence.
 
 use super::*;
 
-/// A chain root's card must reflect the last completed (`in_review`/`done`)
-/// revision's own verdict — never the root's own (nonexistent) row.
-/// `pr_review_verdicts.work_item_id` is recorded against whichever row
-/// actually produced the reviewed push (`finalize_pr_review_pass`'s
-/// `producing_task_id`), which is the revision's own id for a
-/// revision-triggered review, so a resolver that only ever looked at the
-/// root's id would find nothing and wrongly blank the badge.
+/// Legacy review verdicts belong to the producing revision. The root and
+/// revision must both display that verdict when it covers the current head.
 #[test]
 fn ai_review_state_rolls_up_from_last_completed_revision_on_chain_root() {
     let db = WorkDb::open(temp_db_path("ai-review-state-rollup")).unwrap();
@@ -75,6 +67,7 @@ fn ai_review_state_rolls_up_from_last_completed_revision_on_chain_root() {
     db.set_review_verdict_revision_task_id(&execution.id, followup_id)
         .unwrap();
 
+    observe_badge_head(&db, &root_id, "sha-findings");
     let tree = db.get_work_tree(&product_id).unwrap();
     let root_card = tree
         .chores
@@ -102,14 +95,10 @@ fn ai_review_state_rolls_up_from_last_completed_revision_on_chain_root() {
     assert_eq!(revision_card.ai_review_state.as_deref(), Some("reviewed_with_findings"));
 }
 
-/// The rollup to the last completed revision's verdict is a preference, not
-/// a hard redirect: when that revision has no informative verdict of its
-/// own, the root must fall back to its OWN verdict rather than rendering no
-/// badge. This is the exact defect that left Done chain roots with a
-/// perfectly good verdict on record blanking out once their terminal
-/// revision (itself unreviewed) became the rollup target.
+/// A completed revision without its own verdict does not hide a root-owned
+/// verdict covering the same current head.
 #[test]
-fn ai_review_state_falls_back_to_root_verdict_when_terminal_revision_has_none() {
+fn ai_review_state_uses_current_head_root_verdict_when_terminal_revision_has_none() {
     let db = WorkDb::open(temp_db_path("ai-review-state-fallback")).unwrap();
     let product_id = make_revision_product(&db, "fallback");
     let pr_url = "https://github.com/spinyfin/mono/pull/5101";
@@ -162,6 +151,7 @@ fn ai_review_state_falls_back_to_root_verdict_when_terminal_revision_has_none() 
         .unwrap();
     }
 
+    observe_badge_head(&db, &root_id, "sha-root-findings");
     let tree = db.get_work_tree(&product_id).unwrap();
     let root_card = tree
         .chores
@@ -280,6 +270,7 @@ fn ai_review_state_ignores_a_stale_open_pr_review_died_attention() {
         .unwrap();
     }
 
+    observe_badge_head(&db, &chore_id, "sha-clean");
     let tree = db.get_work_tree(&product_id).unwrap();
     let card = tree.chores.iter().find(|c| c.id == chore_id).expect("chore present");
     assert_eq!(
@@ -290,10 +281,10 @@ fn ai_review_state_ignores_a_stale_open_pr_review_died_attention() {
 }
 
 /// A card with no `pr_review_verdicts` row at all for its id — the pass
-/// simply has not completed yet — must render no badge. Absence of evidence
+/// simply has not completed yet — must render not reviewed. Absence of evidence
 /// must never be promoted to "reviewed all clear."
 #[test]
-fn ai_review_state_is_none_when_no_verdict_exists_for_the_current_head() {
+fn ai_review_state_is_not_reviewed_when_no_verdict_exists_for_the_current_head() {
     let db = WorkDb::open(temp_db_path("ai-review-state-no-verdict")).unwrap();
     let product_id = make_revision_product(&db, "no-verdict");
     let pr_url = "https://github.com/spinyfin/mono/pull/8001";
@@ -302,8 +293,8 @@ fn ai_review_state_is_none_when_no_verdict_exists_for_the_current_head() {
     let tree = db.get_work_tree(&product_id).unwrap();
     let card = tree.chores.iter().find(|c| c.id == chore_id).expect("chore present");
     assert!(
-        card.ai_review_state.is_none(),
-        "no informative verdict must render as no badge, never inferred as clean or reviewing"
+        card.ai_review_state.as_deref() == Some("not_reviewed"),
+        "no informative verdict must render as not reviewed, never inferred as clean or reviewing"
     );
 }
 
@@ -362,6 +353,7 @@ fn ai_review_state_shows_completed_review_after_an_earlier_failed_attempt() {
         .unwrap();
     }
 
+    observe_badge_head(&db, &chore_id, "sha-completed-after-retry");
     let tree = db.get_work_tree(&product_id).unwrap();
     let card = tree.chores.iter().find(|c| c.id == chore_id).expect("chore present");
     assert_eq!(
@@ -372,9 +364,9 @@ fn ai_review_state_shows_completed_review_after_an_earlier_failed_attempt() {
 }
 
 /// A terminal failure does not itself establish that a review occurred. The
-/// card remains unbadged until a reviewer produces an informative verdict.
+/// card remains not reviewed until a reviewer produces an informative verdict.
 #[test]
-fn ai_review_state_hides_badge_when_every_review_attempt_failed() {
+fn ai_review_state_is_not_reviewed_when_every_review_attempt_failed() {
     let db = WorkDb::open(temp_db_path("ai-review-state-only-failed")).unwrap();
     let product_id = make_revision_product(&db, "only-failed");
     let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/8102");
@@ -400,7 +392,7 @@ fn ai_review_state_hides_badge_when_every_review_attempt_failed() {
     let tree = db.get_work_tree(&product_id).unwrap();
     let card = tree.chores.iter().find(|c| c.id == chore_id).expect("chore present");
     assert!(
-        card.ai_review_state.is_none(),
+        card.ai_review_state.as_deref() == Some("not_reviewed"),
         "failed pr_review executions must not be inferred as completed reviews"
     );
 }
@@ -477,12 +469,10 @@ fn ai_review_state_marks_a_queued_reviewer_distinctly() {
     assert_eq!(card.ai_review_state.as_deref(), Some("review_queued"));
 }
 
-/// There is deliberately no "review failed" badge state (design decision:
-/// absence is the signal). A `gave_up` verdict — the reviewer never
-/// produced a result even after re-prompting — must render exactly like no
-/// verdict at all, not a distinguishable failure indicator.
+/// A give-up supplies no review evidence, so a bound PR must explicitly
+/// remain not reviewed rather than being treated as clean.
 #[test]
-fn ai_review_state_treats_gave_up_verdict_as_no_badge() {
+fn ai_review_state_treats_gave_up_verdict_as_not_reviewed() {
     let db = WorkDb::open(temp_db_path("ai-review-state-gave-up")).unwrap();
     let product_id = make_revision_product(&db, "gave-up");
     let pr_url = "https://github.com/spinyfin/mono/pull/9201";
@@ -524,8 +514,8 @@ fn ai_review_state_treats_gave_up_verdict_as_no_badge() {
     let tree = db.get_work_tree(&product_id).unwrap();
     let card = tree.chores.iter().find(|c| c.id == chore_id).expect("chore present");
     assert!(
-        card.ai_review_state.is_none(),
-        "gave_up must render exactly like no verdict at all — never a failure badge"
+        card.ai_review_state.as_deref() == Some("not_reviewed"),
+        "gave_up must render as not reviewed, never as a clean pass"
     );
 }
 
@@ -771,4 +761,11 @@ fn ai_review_state_prefers_live_reviewing_over_stale_verdict_when_in_review() {
         Some("reviewing"),
         "a live running pass must win over an older completed verdict"
     );
+}
+
+fn observe_badge_head(db: &WorkDb, root: &str, sha: &str) {
+    db.connect().unwrap().execute(
+        "UPDATE tasks SET pr_head_sha = ?2, ci_required_state = 'success', pr_mergeable_state = 'mergeable' WHERE id = ?1",
+        rusqlite::params![root, sha],
+    ).unwrap();
 }
