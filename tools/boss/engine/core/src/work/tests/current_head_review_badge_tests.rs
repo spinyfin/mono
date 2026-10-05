@@ -175,3 +175,51 @@ fn current_head_review_badge_clean_does_not_imply_ready_with_ci_conflicts_or_pen
         );
     }
 }
+
+fn poll(db: &WorkDb, root: &str, sha: &str, ci: &str) {
+    db.update_task_pr_poll_state(
+        root,
+        PrPollStateInput {
+            ci_required_state: ci,
+            review_required_state: "approved",
+            pr_mergeable_state: "mergeable",
+            pr_head_sha: Some(sha),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn current_head_review_badge_ci_success_for_old_head_is_not_all_clear() {
+    let db = WorkDb::open(temp_db_path("current-head-review-ci-head")).unwrap();
+    let product = make_revision_product(&db, "current-head-ci-head");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8004");
+    poll(&db, &root, "a", "success");
+    // A partial `boss pr status --refresh` observation moves the head only.
+    db.set_pr_status_observation(&root, "mergeable", Some("CLEAN"), Some("b"), "2026-01-01T00:00:00Z")
+        .unwrap();
+    verdict(&db, &root, "b", "completed_clean");
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("reviewed_clean_pending")
+    );
+    poll(&db, &root, "b", "success");
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("reviewed_all_clear")
+    );
+}
+
+#[test]
+fn current_head_review_badge_done_card_without_matching_verdict_shows_no_badge() {
+    let db = WorkDb::open(temp_db_path("current-head-review-done")).unwrap();
+    let product = make_revision_product(&db, "current-head-done");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8005");
+    observe(&db, &root, None, "success", "mergeable");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&root])
+        .unwrap();
+    assert_eq!(card(&db, &product, &root).ai_review_state, None);
+}

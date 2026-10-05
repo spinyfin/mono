@@ -734,7 +734,18 @@ pub(crate) const AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING: &str = "reviewed_clean_
 /// that a head was reviewed. Live review executions take precedence.
 pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
     let review_targets = review_execution_target_ids(conn, tasks, chores);
-    let lookup_ids: Vec<String> = tasks.iter().chain(chores.iter()).map(|row| row.id.clone()).collect();
+    // Only rows that can display a verdict badge need the batched lookup;
+    // a revision carries no `pr_url` of its own (its chain root does).
+    let lookup_ids: Vec<String> = tasks
+        .iter()
+        .chain(chores.iter())
+        .filter(|row| {
+            !task_kind_excluded_from_ai_review(&row.kind)
+                && matches!(row.status, TaskStatus::Active | TaskStatus::InReview | TaskStatus::Done)
+                && (row.kind == TaskKind::Revision || row.pr_url.as_deref().is_some_and(|u| !u.is_empty()))
+        })
+        .map(|row| row.id.clone())
+        .collect();
     let verdicts = super::review_badge::current_head_review_states(conn, &lookup_ids)?;
     // Queue lookup is for Active/InReview cards (`review_queued`), not the
     // verdict `lookup_ids` slice above. Scope to the tree being rendered
@@ -790,8 +801,16 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
         match row.status {
             TaskStatus::Active | TaskStatus::InReview if row.ai_reviewing => (Some(AI_REVIEW_STATE_REVIEWING), None),
             TaskStatus::Active | TaskStatus::InReview if is_queued() => (Some(AI_REVIEW_STATE_REVIEW_QUEUED), None),
-            TaskStatus::Active | TaskStatus::InReview | TaskStatus::Done => verdicts
+            TaskStatus::Active | TaskStatus::InReview => verdicts
                 .get(&row.id)
+                .map(|(state, revision)| (Some(*state), revision.clone()))
+                .unwrap_or((None, None)),
+            // Closed work shows no badge unless a verdict matches the last
+            // observed head; "not reviewed" is only meaningful while the PR
+            // is still open (`pr_head_sha` is NULL for legacy merged cards).
+            TaskStatus::Done => verdicts
+                .get(&row.id)
+                .filter(|(state, _)| *state != AI_REVIEW_STATE_NOT_REVIEWED)
                 .map(|(state, revision)| (Some(*state), revision.clone()))
                 .unwrap_or((None, None)),
             _ => (None, None),
