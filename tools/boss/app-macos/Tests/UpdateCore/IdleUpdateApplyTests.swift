@@ -33,7 +33,7 @@ final class IdleUpdateApplyTests: XCTestCase {
         IdleUpdateApplier(
             policy: .init(workerQuietSeconds: 60, userIdleSeconds: 120, retryCooldownSeconds: 600),
             snapshot: { world.snapshot },
-            perform: { world.performed.append($0) },
+            perform: { action, completion in world.performed.append(action); completion(.performed) },
             now: { world.now }
         )
     }
@@ -263,6 +263,58 @@ final class IdleUpdateApplyTests: XCTestCase {
         XCTAssertEqual(applier.tick(), .apply(.restartEngine))
         world.now.addTimeInterval(3600)
         world.snapshot.userRequested = true
+        XCTAssertEqual(applier.tick(), .apply(.restartEngine))
+    }
+
+    func testDeferredRestartRemainsEligibleAndPreservesRequestedModes() {
+        for mode in [UpdateMode.automatic, .notify, .manual] {
+            for requested in [false, true] where mode == .automatic || requested {
+                let world = World(automaticSnapshot(liveWorkers: 0))
+                world.snapshot.mode = mode
+                world.snapshot.userRequested = requested
+                world.snapshot.stagedVersion = nil
+                world.snapshot.engineBehindBundle = true
+                world.snapshot.engineRestartKey = "old->bundled"
+                let applier = IdleUpdateApplier(
+                    policy: .init(workerQuietSeconds: 0), snapshot: { world.snapshot },
+                    perform: { action, completion in
+                        world.performed.append(action)
+                        completion(.deferred("Waiting for live workers."))
+                    }, now: { world.now }
+                )
+                XCTAssertEqual(applier.tick(), .apply(.restartEngine))
+                XCTAssertEqual(applier.tick(), .apply(.restartEngine))
+                XCTAssertEqual(world.performed.count, 2)
+                XCTAssertEqual(world.snapshot.userRequested, requested)
+                world.snapshot.engineBehindBundle = false
+                XCTAssertEqual(applier.tick(), .nothingToApply)
+                XCTAssertNil(applier.outcome, "A completed external restart must clear the old waiting status")
+            }
+        }
+    }
+
+    func testFingerprintMismatchRecoversDevBundleEvenInManualMode() {
+        let world = World(automaticSnapshot(liveWorkers: 2))
+        world.snapshot.mode = .manual
+        world.snapshot.isDevBuild = true
+        world.snapshot.stagedVersion = nil
+        world.snapshot.engineBehindBundle = false // equal version, different binary
+        world.snapshot.engineFingerprintMismatch = true
+        let applier = makeApplier(world)
+        XCTAssertEqual(applier.tick(), .wait(.liveWorkers(2)))
+        world.snapshot.liveWorkerCount = 0
+        XCTAssertEqual(applier.tick(), .wait(.workersRecentlyActive))
+        world.now.addTimeInterval(60)
+        XCTAssertEqual(applier.tick(), .apply(.restartEngine))
+    }
+
+    func testFingerprintRecoveryDoesNotInstallStagedReleaseInNotifyMode() {
+        let world = World(automaticSnapshot(liveWorkers: 0))
+        world.snapshot.mode = .notify
+        world.snapshot.engineFingerprintMismatch = true
+        let applier = makeApplier(world)
+        _ = applier.tick()
+        world.now.addTimeInterval(60)
         XCTAssertEqual(applier.tick(), .apply(.restartEngine))
     }
 

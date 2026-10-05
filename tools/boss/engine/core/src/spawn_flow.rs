@@ -671,6 +671,15 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     input: StartWorkerInput,
     spawn_timeout: StdDuration,
 ) -> Result<StartedWorker, StartWorkerError> {
+    let _admission = if let Some(states) = spawner.live_worker_state_registry() {
+        let admission = states.shutdown_admission.read().await;
+        if *admission {
+            return Err(StartWorkerError::Tmux(anyhow!("engine is shutting down")));
+        }
+        Some(admission)
+    } else {
+        None
+    };
     // Local dispatch is only recoverable when the driver supplies Rich
     // per-tool progress boundaries. A Coarse/Minimal driver would silently
     // lose automatic wedge recovery, so refuse before writing files or
@@ -1850,6 +1859,21 @@ mod tests {
         slot_id: u8,
         spawn_calls: Arc<AtomicUsize>,
         steps: std::sync::Mutex<Vec<SpawnStep>>,
+    }
+
+    #[tokio::test]
+    async fn accepted_idle_shutdown_blocks_new_worker_before_side_effects() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = LiveStateSpawner::new(4);
+        *spawner.live_states.shutdown_admission.write().await = true;
+        let input = sample_input(&workspace, spawner.tmux_runner.clone());
+        let error = start_worker(&spawner, input, StdDuration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("engine is shutting down"));
+        assert_eq!(spawner.spawn_calls.load(Ordering::SeqCst), 0);
+        assert!(spawner.steps().is_empty());
+        assert!(spawner.live_states.snapshot().is_empty());
     }
 
     impl LiveStateSpawner {

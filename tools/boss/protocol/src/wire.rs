@@ -2538,6 +2538,10 @@ pub enum FrontendRequest {
     Shutdown {
         token: String,
     },
+    /// Atomically refuse shutdown while workers are live or being spawned.
+    ShutdownWhenIdle {
+        token: String,
+    },
 
     /// App reports that it can once again host worker panes — sent after
     /// `GhosttyRuntime` observes `NSWorkspace.didWakeNotification` /

@@ -733,8 +733,10 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
         peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::Shutdown { token } = req else {
-        unreachable!()
+    let (token, only_if_idle) = match req {
+        FrontendRequest::Shutdown { token } => (token, false),
+        FrontendRequest::ShutdownWhenIdle { token } => (token, true),
+        _ => unreachable!(),
     };
     {
         // The token written to disk at startup is the auth
@@ -748,7 +750,7 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
         // Support/`, so a test that lands here without the
         // file in scope will fail with `token_missing` rather
         // than killing a 9-hour-old engine.
-        let outcome = match server_state.control_token.as_deref() {
+        let mut outcome = match server_state.control_token.as_deref() {
             None => {
                 // In-process serve() without a control token —
                 // shouldn't happen for any process that has a
@@ -765,6 +767,19 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
                 }
             }
         };
+        if outcome == "accepted" && only_if_idle {
+            // Do not wait on a spawn: refuse and let the app retry once it is idle.
+            match server_state.live_worker_states.shutdown_admission.try_write() {
+                Ok(mut admission) => {
+                    if super::engine_meta::count_live_workers(&server_state.live_worker_states.snapshot()) > 0 {
+                        outcome = "workers_live";
+                    } else {
+                        *admission = true;
+                    }
+                }
+                Err(_) => outcome = "workers_spawning",
+            }
+        }
         crate::audit::record_shutdown_rpc(outcome, peer_pid);
         if outcome == "accepted" {
             tracing::info!(
@@ -804,6 +819,48 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
 mod tests {
     use super::super::tests::{make_session_sink, test_server_state};
     use super::*;
+
+    #[tokio::test]
+    async fn guarded_shutdown_refuses_live_and_spawning_then_closes_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig::builder()
+                .cwd(temp.path().to_path_buf())
+                .db_path(temp.path().join("state.db"))
+                .build(),
+            None,
+        ));
+        let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+            cfg,
+            None,
+            Some(Arc::new("test-token".to_owned())),
+            super::super::ServerStateOverrides::default(),
+        )
+        .unwrap();
+        let sink = make_session_sink();
+        let request = || FrontendRequest::ShutdownWhenIdle {
+            token: "test-token".to_owned(),
+        };
+        let spawn = state.live_worker_states.shutdown_admission.read().await;
+        handle_shutdown(dispatch_ctx(&state, &sink), request()).await;
+        assert!(matches!(sink.next().await.unwrap().payload,
+            FrontendEvent::ShutdownRejected { reason } if reason == "workers_spawning"));
+        assert!(!*spawn);
+        drop(spawn);
+        state.live_worker_states.register_spawn(1, "run", "model", 123, None);
+        handle_shutdown(dispatch_ctx(&state, &sink), request()).await;
+        assert!(matches!(sink.next().await.unwrap().payload,
+            FrontendEvent::ShutdownRejected { reason } if reason == "workers_live"));
+        assert!(!*state.live_worker_states.shutdown_admission.read().await);
+        state.live_worker_states.release_slot_for_run("run");
+        handle_shutdown(dispatch_ctx(&state, &sink), request()).await;
+        assert!(matches!(
+            sink.next().await.unwrap().payload,
+            FrontendEvent::ShutdownAccepted
+        ));
+        // A new spawn cannot pass its admission check after acceptance.
+        assert!(*state.live_worker_states.shutdown_admission.read().await);
+    }
 
     /// `ServerState::coordinator_model` — sourced from
     /// `WorkConfig::coordinator_model` (`BOSS_COORDINATOR_MODEL`, default

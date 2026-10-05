@@ -2642,7 +2642,9 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::SetSetting { .. } => Box::pin(engine_meta::handle_set_setting(ctx, r)),
             r @ FrontendRequest::SetTaskDocPointer { .. } => Box::pin(work_items::handle_set_task_doc_pointer(ctx, r)),
-            r @ FrontendRequest::Shutdown { .. } => Box::pin(sessions::handle_shutdown(ctx, r)),
+            r @ (FrontendRequest::Shutdown { .. } | FrontendRequest::ShutdownWhenIdle { .. }) => {
+                Box::pin(sessions::handle_shutdown(ctx, r))
+            }
             r @ FrontendRequest::SpawnCapabilityRestored => {
                 Box::pin(sessions::handle_spawn_capability_restored(ctx, r))
             }

@@ -27,13 +27,24 @@ final class EngineFreshnessDriver {
     private let updateModel: UpdateModel
     private let liveWorkerStates: LiveWorkerStateStore
     private weak var chatModel: ChatViewModel?
+    private let snapshotOverride: (() -> IdleApplySnapshot)?
+    private let install: (Bool) -> InstallOutcome
+    private let restartOverride: ((@escaping @MainActor @Sendable (IdleApplyOutcome) -> Void) -> Void)?
     private var applier: IdleUpdateApplier?
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
     /// The "nothing to apply" note is on screen; keep it until the next request.
     private var showingUnfulfillableRequest = false
 
-    init(updateModel: UpdateModel, chatModel: ChatViewModel, liveWorkerStates: LiveWorkerStateStore) {
+    init(
+        updateModel: UpdateModel, chatModel: ChatViewModel?, liveWorkerStates: LiveWorkerStateStore,
+        snapshot: (() -> IdleApplySnapshot)? = nil,
+        install: @escaping (Bool) -> InstallOutcome = { UpdateLifecycle.installStagedAndRelaunch(userInitiated: $0) },
+        restart: ((@escaping @MainActor @Sendable (IdleApplyOutcome) -> Void) -> Void)? = nil
+    ) {
+        self.snapshotOverride = snapshot
+        self.install = install
+        self.restartOverride = restart
         self.updateModel = updateModel
         self.chatModel = chatModel
         self.liveWorkerStates = liveWorkerStates
@@ -41,10 +52,7 @@ final class EngineFreshnessDriver {
 
     func start() {
         guard applier == nil, let chatModel else { return }
-        applier = IdleUpdateApplier(
-            snapshot: { [weak self] in self?.snapshot() ?? Self.inertSnapshot },
-            perform: { [weak self] action in self?.perform(action) }
-        )
+        startApplying()
 
         // Report the newest published release once connected, and again whenever
         // either side changes (a reconnect means a possibly different engine).
@@ -87,9 +95,30 @@ final class EngineFreshnessDriver {
         }
     }
 
-    private func tick() {
+    func startApplying(policy: IdleUpdateApplier.Policy = .init()) {
+        applier = IdleUpdateApplier(
+            policy: policy,
+            snapshot: { [weak self] in self?.snapshot() ?? Self.inertSnapshot },
+            perform: { [weak self] action, completion in self?.perform(action, completion: completion) }
+        )
+    }
+
+    func tick() {
         guard let applier else { return }
         let decision = applier.tick()
+        if case .installFailed = updateModel.downloadState {
+            updateModel.setIdleApplyStatus(unfulfillableRequestMessage(downloadState: updateModel.downloadState))
+            showingUnfulfillableRequest = true
+            return
+        }
+        if let outcome = applier.outcome {
+            switch outcome {
+            case .deferred(let message), .failed(let message):
+                updateModel.setIdleApplyStatus(message)
+                return
+            case .performed: break
+            }
+        }
         switch decision {
         case .nothingToApply where updateModel.applyWhenIdleRequested:
             // Requested, but nothing could be applied: no installable newer build, or a
@@ -101,6 +130,8 @@ final class EngineFreshnessDriver {
             if !showingUnfulfillableRequest {
                 updateModel.setIdleApplyStatus(nil)
             }
+        case .wait(.liveWorkers(let count)) where chatModel?.bundledEngineMismatchKey != nil:
+            updateModel.setIdleApplyStatus("Bundled engine differs; restart deferred: \(count) live workers.")
         case .wait, .apply:
             showingUnfulfillableRequest = false
             updateModel.setIdleApplyStatus(decision.statusText)
@@ -117,14 +148,16 @@ final class EngineFreshnessDriver {
     )
 
     private func snapshot() -> IdleApplySnapshot {
-        IdleApplySnapshot(
+        if let snapshotOverride { return snapshotOverride() }
+        return IdleApplySnapshot(
             mode: updateModel.mode,
             isDevBuild: updateModel.isDevBuild,
             userRequested: updateModel.applyWhenIdleRequested,
             isPreparingUpdate: updateModel.isPreparingUpdate,
             stagedVersion: updateModel.versionReadyToApply,
             engineBehindBundle: engineBehindBundle,
-            engineRestartKey: engineBehindBundle ? chatModel?.engineRelease.map { "\($0.engineVersion)->\(UpdateLifecycle.runningVersion?.description ?? "?")" } : nil,
+            engineFingerprintMismatch: chatModel?.bundledEngineMismatchKey != nil,
+            engineRestartKey: chatModel?.bundledEngineMismatchKey ?? (engineBehindBundle ? chatModel?.engineRelease.map { "\($0.engineVersion)->\(UpdateLifecycle.runningVersion?.description ?? "?")" } : nil),
             engineReachable: chatModel?.isConnected ?? false,
             liveWorkerCount: liveWorkerStates.activeAgentCount,
             hasModalUI: NSApp.modalWindow != nil || NSApp.windows.contains { $0.attachedSheet != nil },
@@ -141,9 +174,10 @@ final class EngineFreshnessDriver {
     /// developer's custom engine, which has no bundled counterpart to restart onto.
     private var engineBehindBundle: Bool {
         guard ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] == nil,
-              let chatModel, !chatModel.isRestartingEngine,
+              let chatModel,
               let release = chatModel.engineRelease
         else { return false }
+        if chatModel.bundledEngineMismatchKey != nil { return true }
         return engineIsBehindBundle(
             engineVersion: release.engineVersion,
             bundleVersion: UpdateLifecycle.runningVersion
@@ -152,26 +186,38 @@ final class EngineFreshnessDriver {
 
     // MARK: - Side effects
 
-    private func perform(_ action: IdleApplyAction) {
+    private func perform(_ action: IdleApplyAction, completion: @escaping @MainActor @Sendable (IdleApplyOutcome) -> Void) {
         let userRequested = updateModel.applyWhenIdleRequested
-        updateModel.clearApplyWhenIdleRequest()
         switch action {
         case .restartEngine:
             freshnessLog.info("update apply-at-idle: restarting engine onto the bundled build (no live workers)")
-            chatModel?.restartEngine(onlyIfNoLiveWorkers: true)
+            let finished: @MainActor @Sendable (IdleApplyOutcome) -> Void = { [weak self] outcome in
+                completion(outcome)
+                if outcome == .performed, userRequested { self?.updateModel.clearApplyWhenIdleRequest() }
+                switch outcome {
+                case .deferred(let message), .failed(let message): self?.updateModel.setIdleApplyStatus(message)
+                case .performed: break
+                }
+            }
+            if let restartOverride { restartOverride(finished) }
+            else if let chatModel { chatModel.restartEngine(onlyIfNoLiveWorkers: true, completion: finished) }
+            else { finished(.deferred("Waiting for the engine connection.")) }
 
         case .relaunchIntoStagedUpdate(let version):
+            updateModel.clearApplyWhenIdleRequest()
             // A swap already applied by an earlier Install & Relaunch whose quit was
             // vetoed only needs the quit; do not swap twice.
             if UpdateLifecycle.pendingRelaunch == nil {
-                switch UpdateLifecycle.installStagedAndRelaunch(userInitiated: userRequested) {
+                switch install(userRequested) {
                 case .relaunchPending:
                     updateModel.markInstalledPendingRelaunch(version: version, willRelaunch: true)
                 case .installedNoRelaunch:
                     updateModel.markInstalledPendingRelaunch(version: version, willRelaunch: false)
+                    completion(.performed)
                     return
                 case .notInstalled:
                     updateModel.markInstallFailed(version: version, reason: UpdateInstallAction.notInstalledReason)
+                    completion(.failed(unfulfillableRequestMessage(downloadState: updateModel.downloadState)))
                     return
                 }
             }
@@ -184,6 +230,7 @@ final class EngineFreshnessDriver {
             // upgrade attaches to an engine that reports live workers instead of
             // replacing it, and this applier restarts it later once it is idle.
             // `applicationWillTerminate` arms the relaunch helper.
+            completion(.performed)
             NSApp.terminate(nil)
         }
     }

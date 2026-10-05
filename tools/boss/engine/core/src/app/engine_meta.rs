@@ -206,7 +206,7 @@ pub(super) async fn handle_worker_pool_summary(ctx: Dispatch, req: FrontendReque
 
 /// Workers that hold a slot and a conversation: everything except errored
 /// and terminated, matching the app's own "live" definition.
-fn count_live_workers(states: &[boss_protocol::LiveWorkerState]) -> u32 {
+pub(super) fn count_live_workers(states: &[boss_protocol::LiveWorkerState]) -> u32 {
     use boss_protocol::WorkerActivity::{Idle, Spawning, WaitingForInput, Working};
     let live = states
         .iter()

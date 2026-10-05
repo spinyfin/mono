@@ -287,6 +287,73 @@ final class EngineProcessControllerTests: XCTestCase {
 
         XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
         XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
+        XCTAssertNotNil(controller.bundledEngineMismatchKey)
+    }
+
+    func testGuardedRestartDoesNotSignalAnUnreachableEngine() throws {
+        let fixture = try Fixture(reachableSocket: .none)
+        try "\(fixture.runningPid)\n".write(toFile: fixture.paths.pidPath, atomically: true, encoding: .utf8)
+        fixture.processObserver.markRunning(fixture.runningPid)
+        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, _ in
+            XCTFail("An unreachable engine must not be replaced by an idle update")
+            return 4242
+        }
+        defer { controller.stop() }
+        XCTAssertNotEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
+        XCTAssertTrue(fixture.processObserver.signals.isEmpty)
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+    }
+
+    func testGuardedRestartDoesNotTreatLegacyMissingCountAsIdle() throws {
+        let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "legacy-engine")
+        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, _ in 4242 }
+        defer { controller.stop() }
+        XCTAssertNotEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+    }
+
+    func testFailedVersionQueryNeverStopsReachableEngine() throws {
+        for restarting in [false, true] {
+            let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
+            fixture.socketControl.queryFailed = true
+            let recorder = LaunchRecorder()
+            let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, path in
+                recorder.record(path)
+                return 4242
+            }
+            defer { controller.stop() }
+            if restarting {
+                XCTAssertNotEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
+            } else {
+                try controller.start()
+            }
+            XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+            XCTAssertTrue(fixture.processObserver.signals.isEmpty)
+            XCTAssertTrue(recorder.socketPaths.isEmpty)
+        }
+    }
+
+    func testRefusedGuardedShutdownDoesNotEscalateToSignals() throws {
+        for restarting in [false, true] {
+            let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
+            fixture.socketControl.liveWorkers = 0
+            fixture.socketControl.refuseShutdown = true
+            fixture.processObserver.markRunning(fixture.runningPid)
+            let recorder = LaunchRecorder()
+            let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, path in
+                recorder.record(path)
+                return 4242
+            }
+            defer { controller.stop() }
+            if restarting {
+                XCTAssertNotEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
+            } else {
+                try controller.start()
+            }
+            XCTAssertEqual(fixture.socketControl.shutdownRequests.count, 1)
+            XCTAssertTrue(fixture.processObserver.signals.isEmpty)
+            XCTAssertTrue(recorder.socketPaths.isEmpty)
+        }
     }
 
     func testGuardedRestartLeavesAnEngineWithLiveWorkersRunning() throws {
@@ -295,7 +362,7 @@ final class EngineProcessControllerTests: XCTestCase {
         let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, _ in 4242 }
         defer { controller.stop() }
 
-        XCTAssertFalse(try controller.restart(onlyIfNoLiveWorkers: true))
+        XCTAssertNotEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
         XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
     }
 
@@ -511,6 +578,8 @@ private extension EngineProcessControllerTests {
         private let runningPid: pid_t?
         private var requests: [String] = []
         private var shutdowns: [String] = []
+        var refuseShutdown = false
+        var queryFailed = false
         /// What the engine reports as live; `nil` models an engine that predates the field.
         var liveWorkers: Int?
 
@@ -536,17 +605,15 @@ private extension EngineProcessControllerTests {
             socketPath == reachableSocket ? runningPid : nil
         }
 
-        func fingerprint(socketPath: String, timeoutSeconds _: Double) -> String? {
+        func version(socketPath: String, timeoutSeconds _: Double) -> EngineVersionSnapshot? {
             lock.withLock { requests.append(socketPath) }
-            return expectedFingerprint
+            guard !queryFailed, let expectedFingerprint else { return nil }
+            return EngineVersionSnapshot(fingerprint: expectedFingerprint, liveWorkers: liveWorkers)
         }
 
-        func liveWorkerCount(socketPath _: String, timeoutSeconds _: Double) -> Int? {
-            liveWorkers
-        }
-
-        func shutdown(socketPath: String, tokenPath _: String, timeoutSeconds _: Double) throws -> pid_t? {
+        func shutdown(socketPath: String, tokenPath _: String, timeoutSeconds _: Double, onlyIfIdle: Bool) throws -> pid_t? {
             lock.withLock { shutdowns.append(socketPath) }
+            if refuseShutdown { throw NSError(domain: "test guarded refusal", code: 1) }
             return runningPid
         }
 

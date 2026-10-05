@@ -14,7 +14,7 @@ private let idleApplyLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category
 // - Never while any worker is live. A live worker is one the engine reports as
 //   spawning, working, waiting for input, or idle at its prompt.
 // - Never when the engine is unreachable, because then the worker count is stale.
-// - Never over a dev build.
+// - Never install over a dev build; engine-only bundle matching is allowed.
 // - Unattended (automatic mode) applies also wait for a quiet period with no live
 //   workers and for the user to be away from the keyboard.
 
@@ -28,9 +28,11 @@ public struct IdleApplySnapshot: Equatable, Sendable {
     public var isPreparingUpdate: Bool
     /// A verified update staged on disk (or already swapped in, awaiting relaunch).
     public var stagedVersion: VersionTuple?
+    /// A launch-time binary mismatch still needs an engine-only restart, even in dev builds.
+    public var engineFingerprintMismatch: Bool
     /// The running engine is older than the engine inside this app bundle.
     public var engineBehindBundle: Bool
-    /// Identifies the (engine version, bundle version) pair behind `engineBehindBundle`,
+    /// Identifies the engine/bundle fingerprint pair (versions when fingerprints are unavailable),
     /// so an unattended engine-only restart that did not change the engine version is
     /// not repeated for the same pair.
     public var engineRestartKey: String?
@@ -48,6 +50,7 @@ public struct IdleApplySnapshot: Equatable, Sendable {
         isPreparingUpdate: Bool = false,
         stagedVersion: VersionTuple?,
         engineBehindBundle: Bool,
+        engineFingerprintMismatch: Bool = false,
         engineRestartKey: String? = nil,
         engineReachable: Bool,
         liveWorkerCount: Int,
@@ -60,12 +63,19 @@ public struct IdleApplySnapshot: Equatable, Sendable {
         self.isPreparingUpdate = isPreparingUpdate
         self.stagedVersion = stagedVersion
         self.engineBehindBundle = engineBehindBundle
+        self.engineFingerprintMismatch = engineFingerprintMismatch
         self.engineRestartKey = engineRestartKey
         self.engineReachable = engineReachable
         self.liveWorkerCount = liveWorkerCount
         self.hasModalUI = hasModalUI
         self.secondsSinceUserInput = secondsSinceUserInput
     }
+}
+
+public enum IdleApplyOutcome: Equatable, Sendable {
+    case performed
+    case deferred(String)
+    case failed(String)
 }
 
 public enum IdleApplyAction: Equatable, Sendable {
@@ -153,10 +163,12 @@ public final class IdleUpdateApplier {
 
     private let policy: Policy
     private let snapshot: () -> IdleApplySnapshot
-    private let perform: (IdleApplyAction) -> Void
+    private let perform: (IdleApplyAction, @escaping @MainActor @Sendable (IdleApplyOutcome) -> Void) -> Void
     private let now: () -> Date
 
     private var workersIdleSince: Date?
+    private var inFlight = false
+    public private(set) var outcome: IdleApplyOutcome?
     private var lastAttemptAt: Date?
     /// The engine/bundle pair of the last unattended engine-only restart.
     private var lastUnattendedEngineRestartKey: String?
@@ -165,7 +177,7 @@ public final class IdleUpdateApplier {
     public init(
         policy: Policy = Policy(),
         snapshot: @escaping () -> IdleApplySnapshot,
-        perform: @escaping (IdleApplyAction) -> Void,
+        perform: @escaping (IdleApplyAction, @escaping @MainActor @Sendable (IdleApplyOutcome) -> Void) -> Void,
         now: @escaping () -> Date = { Date() }
     ) {
         self.policy = policy
@@ -176,6 +188,7 @@ public final class IdleUpdateApplier {
 
     /// An explicit request overrides the retry cooldown and the non-convergence guard.
     public func noteUserRequest() {
+        outcome = nil
         lastAttemptAt = nil
         lastUnattendedEngineRestartKey = nil
     }
@@ -183,6 +196,9 @@ public final class IdleUpdateApplier {
     /// Evaluate once and, if the decision is `.apply`, perform it.
     @discardableResult
     public func tick() -> IdleApplyDecision {
+        if inFlight { return lastDecision }
+        // Deferrals are re-evaluated each tick; only terminal failures stay visible.
+        if case .deferred = outcome { outcome = nil }
         let current = snapshot()
         let decision = decide(current, at: now())
         if decision != lastDecision {
@@ -190,11 +206,24 @@ public final class IdleUpdateApplier {
             lastDecision = decision
         }
         if case .apply(let action) = decision {
-            lastAttemptAt = now()
-            if action == .restartEngine, !current.userRequested {
-                lastUnattendedEngineRestartKey = current.engineRestartKey
+            inFlight = true
+            outcome = nil
+            perform(action) { [weak self] result in
+                guard let self else { return }
+                self.inFlight = false
+                self.outcome = result
+                switch result {
+                case .performed:
+                    self.lastAttemptAt = self.now()
+                    if action == .restartEngine, !current.userRequested {
+                        self.lastUnattendedEngineRestartKey = current.engineRestartKey
+                    }
+                case .deferred:
+                    break
+                case .failed:
+                    self.lastAttemptAt = self.now()
+                }
             }
-            perform(action)
         }
         return decision
     }
@@ -209,21 +238,20 @@ public final class IdleUpdateApplier {
             workersIdleSince = nil
         }
 
-        guard snapshot.userRequested || snapshot.mode == .automatic else { return .notEligible }
-        // Dev builds are reported as behind elsewhere; they are never installed over.
-        guard !snapshot.isDevBuild else { return .notEligible }
+        let mayInstall = !snapshot.isDevBuild && (snapshot.userRequested || snapshot.mode == .automatic)
+        guard mayInstall || snapshot.engineFingerprintMismatch else { return .notEligible }
 
         // Order matters: a staged release wins; then anything still being found or
         // downloaded (an engine-only restart now would consume the request and strand
         // the newer release); then the engine-only restart.
         let action: IdleApplyAction
-        if let version = snapshot.stagedVersion {
+        if let version = snapshot.stagedVersion, mayInstall {
             action = .relaunchIntoStagedUpdate(version)
-        } else if snapshot.isPreparingUpdate {
+        } else if snapshot.isPreparingUpdate && mayInstall {
             // A requested download is still in flight; restarting only the engine now
             // would consume the request and strand the newer release.
             return .wait(.preparingUpdate)
-        } else if snapshot.engineBehindBundle {
+        } else if snapshot.engineBehindBundle || snapshot.engineFingerprintMismatch {
             // An unattended restart that left the engine version unchanged would
             // repeat forever; only an explicit request retries that pair.
             if !snapshot.userRequested,

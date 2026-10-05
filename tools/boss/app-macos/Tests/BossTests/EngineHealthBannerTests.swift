@@ -10,6 +10,15 @@ import XCTest
 /// affordance, so its source of truth must be tested.
 @MainActor
 final class EngineHealthBannerTests: XCTestCase {
+    func testBundleMismatchAndInstallFailureShowWithoutReleaseWarning() {
+        for message in ["Bundled engine differs; restart deferred: 2 live workers.", "Install failed: swap failed"] {
+            let issues = EngineHealthBanner.includingUpdateStatus([], status: message)
+            XCTAssertEqual(issues.count, 1)
+            XCTAssertEqual(issues.first?.body, message)
+        }
+        XCTAssertTrue(EngineHealthBanner.includingUpdateStatus([], status: nil).isEmpty)
+    }
+
 
     /// The healthy case: engine reports the key is present with no
     /// issues. The banner-driving array must end up empty and the

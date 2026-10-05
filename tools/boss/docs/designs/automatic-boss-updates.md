@@ -245,7 +245,7 @@ Added after incident 008 (postmortem in mono#3048): a fix was published as a rel
 - A dev build that is behind is reported like any other. It is only excluded from installing.
 - `unknown` (unstamped engine, or nothing reported yet) is a status, not a warning.
 
-**Applying it.** `IdleUpdateApplier` (`UpdateCore`) decides when a staged update may be applied while Boss keeps running; `EngineFreshnessDriver` (app target) feeds it and performs the result. Applying means the existing swap plus an app relaunch through the existing relaunch helper, so the watchdog and rollback still cover it; the relaunch's launch-time fingerprint check is what replaces the engine. If the bundle is already current and only the engine is older, it restarts just the engine onto the bundled binary.
+**Applying it.** `IdleUpdateApplier` (`UpdateCore`) decides when a staged update may be applied while Boss keeps running; `EngineFreshnessDriver` (app target) feeds it and performs the result. Applying means the existing swap plus an app relaunch through the existing relaunch helper, so the watchdog and rollback still cover it; the relaunch's launch-time fingerprint check is what replaces the engine. If the bundle is already current and only the engine is older, it restarts just the engine onto the bundled binary. A launch-time fingerprint mismatch also queues this engine-only recovery when versions are equal or the bundle is a dev build. Completing that deferred launch is independent of release-update mode; it does not install a release over a dev build.
 
 | Mode                 | Behaviour                                                                                                                                                                                      |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -256,13 +256,15 @@ Added after incident 008 (postmortem in mono#3048): a fix was published as a rel
 
 Safety rules, all enforced in `IdleUpdateApplier.decide`:
 
-- **No restart loop.** After an attempt, another waits out a 10-minute cooldown. An unattended engine-only restart is also remembered by its (engine version, bundle version) pair and not repeated for the same pair if the engine version did not change; an explicit request overrides this.
+- **No restart loop.** Completed attempts and failures start a 10-minute cooldown. An unattended engine-only restart is remembered by its engine/bundle fingerprint pair (version pair when fingerprints are unavailable) only after it actually ran; an explicit request overrides this. A deferred restart keeps the explicit request queued and remains eligible on the next idle tick.
 - **No live workers.** A live worker is any worker the engine reports as spawning, working, waiting for input, or idle at its prompt — the same count the quit confirmation uses. Any live worker blocks the apply; nothing is drained, interrupted, or restarted underneath.
 - **Engine reachable.** With no engine connection the worker count is stale, so that is treated as not idle.
 - **No sheet or modal dialog open.**
 - **Unattended applies only:** no live workers for 60 seconds continuously (so the gap between two back-to-back dispatches is not mistaken for idle), and no keyboard or mouse input for 120 seconds. An explicit **Update & Restart** skips both waits but not the rules above.
 
-A host that always has live workers is never auto-restarted; it keeps the indicator until an idle moment or a quit.
+A host that always has live workers is never auto-restarted; it keeps the indicator until an idle moment or a quit. Launch reads the fingerprint and live-worker count from one version reply; a failed query keeps the reachable engine running. Guarded restarts require a known zero count, then use an engine-side conditional shutdown that refuses live workers or an in-flight spawn and closes new spawn admission before accepting. Refused or unanswered guarded shutdowns never escalate to signals. For compatibility, a successful launch-time reply from a legacy engine with no worker-count field retains the historical replacement behavior.
+
+Bundle-mismatch deferrals and install failures remain visible in the banner even without a release-version warning. An install failure remains visible after its request has been cleared and on later idle ticks.
 
 ### Component summary (as built)
 

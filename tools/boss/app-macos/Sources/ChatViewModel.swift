@@ -1,4 +1,5 @@
 import Foundation
+import UpdateCore
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -984,15 +985,21 @@ final class ChatViewModel: ObservableObject {
     /// With `onlyIfNoLiveWorkers` the controller re-checks the engine's own
     /// live-worker count at the moment it would stop the engine, and leaves
     /// the engine running if any worker is live (used by update applies).
-    func restartEngine(onlyIfNoLiveWorkers: Bool = false) {
-        guard !isRestartingEngine else { return }
+    var bundledEngineMismatchKey: String? { processController.bundledEngineMismatchKey }
+
+    func restartEngine(onlyIfNoLiveWorkers: Bool = false, completion: (@MainActor @Sendable (IdleApplyOutcome) -> Void)? = nil) {
+        guard !isRestartingEngine else {
+            completion?(.deferred("Waiting for the current engine restart."))
+            return
+        }
         isRestartingEngine = true
 
         let processController = self.processController
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var restartError: Error?
+            var outcome: IdleApplyOutcome = .performed
             do {
-                try processController.restart(onlyIfNoLiveWorkers: onlyIfNoLiveWorkers)
+                outcome = try processController.restart(onlyIfNoLiveWorkers: onlyIfNoLiveWorkers)
             } catch {
                 restartError = error
             }
@@ -1004,6 +1011,11 @@ final class ChatViewModel: ObservableObject {
                         "Failed to restart engine: \(restartError.localizedDescription)",
                         alwaysShow: true
                     )
+                }
+                if let restartError {
+                    completion?(.failed(restartError.localizedDescription))
+                } else {
+                    completion?(outcome)
                 }
                 // Make sure the EngineClient is started even if the
                 // very first `startIfNeeded()` failed before launching

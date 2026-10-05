@@ -153,6 +153,9 @@ pub const STALE_ACTIVITY_DOWNGRADE_SECS: i64 = 30;
 /// Thread-safe registry of LiveWorkerState entries, keyed by slot id.
 #[derive(Default)]
 pub struct LiveWorkerStateRegistry {
+    /// Readers cover spawn through live-state registration; a successful idle shutdown
+    /// permanently closes admission before releasing the writer.
+    pub(crate) shutdown_admission: tokio::sync::RwLock<bool>,
     /// Every live slot's complete record. One map, not several parallel
     /// ones keyed by the same `u8`: a slot's whole footprint is
     /// established by a single `insert` and torn down by a single

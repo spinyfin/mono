@@ -254,6 +254,13 @@ struct EngineHealthBanner: View {
         issues.contains { $0.kind == EngineHealthIssue.engineBehindPublishedReleaseKind }
     }
 
+    /// Engine-only recovery and install failures remain visible even when the
+    /// release versions match and the engine reports no health warning.
+    static func includingUpdateStatus(_ issues: [EngineHealthIssue], status: String?) -> [EngineHealthIssue] {
+        guard issues.isEmpty, let status else { return issues }
+        return [EngineHealthIssue(kind: "engine_update_status", severity: "warning", title: "Boss update", body: status)]
+    }
+
     static func updateAndRestartTitle(queued: Bool) -> String {
         queued ? "Queued for Idle" : "Update & Restart"
     }
@@ -340,7 +347,7 @@ struct EngineHealthBanner: View {
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if isEngineBehindRelease, let updateAndRestartStatus {
+            if let updateAndRestartStatus {
                 Text(updateAndRestartStatus)
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.92))
