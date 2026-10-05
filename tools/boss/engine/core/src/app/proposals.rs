@@ -353,8 +353,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
     // budget check, DB acceptance, grant commit) so concurrent declarations
     // cannot both pass the budget check and leave an accepted row with no
     // grant. Held until the end of the handler's wait handling.
-    let wait_lock = (kind == ProposalKind::Wait)
-        .then(|| server_state.wait_registry.submit_lock(&caller.execution_id));
+    let wait_lock = (kind == ProposalKind::Wait).then(|| server_state.wait_registry.submit_lock(&caller.execution_id));
     let _wait_guard = match &wait_lock {
         Some(lock) => Some(lock.lock().await),
         None => None,

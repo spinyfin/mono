@@ -186,6 +186,16 @@ impl NudgeBreaker {
         }
     }
 
+    /// `(count, total_count)` currently charged to `execution_id`, or `None`
+    /// when nothing is tracked. Read-only; for tests and diagnostics.
+    pub fn counts(&self, execution_id: &str) -> Option<(u32, u32)> {
+        self.inner
+            .lock()
+            .expect("NudgeBreaker mutex poisoned")
+            .get(execution_id)
+            .map(|r| (r.count, r.total_count))
+    }
+
     /// Drop any tracked state for `execution_id`. Called when the worker
     /// makes real progress (a PR is finalized) so a later, unrelated
     /// nudge cycle starts clean. Idempotent.

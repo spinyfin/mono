@@ -717,7 +717,10 @@ struct WorkerFixture {
 
 impl WorkerFixture {
     fn new() -> Self {
-        let (server_state, dir) = test_server_state();
+        Self::with_state(test_server_state())
+    }
+
+    fn with_state((server_state, dir): (Arc<ServerState>, tempfile::TempDir)) -> Self {
         let (execution_id, work_item_id) = new_execution(&server_state, "Cleanup");
         let peer_pid = std::process::id() as libc::pid_t;
         server_state.worker_registry.register(peer_pid, execution_id.clone());
@@ -2269,6 +2272,46 @@ async fn a_replay_at_the_cap_still_succeeds() {
     assert_eq!(Some(replay.id), first_id);
 }
 
+/// A [`crate::completion::PrDetector`] that always reports "no PR", so a test
+/// can drive `on_stop` on a live execution without shelling out to `gh`.
+struct NoPrDetector;
+
+#[async_trait::async_trait]
+impl crate::completion::PrDetector for NoPrDetector {
+    async fn detect_pr(
+        &self,
+        _repo_remote_url: &str,
+        _expected_branch: &str,
+    ) -> anyhow::Result<crate::completion::PrStatus> {
+        Ok(crate::completion::PrStatus::None)
+    }
+}
+
+/// Like [`test_server_state_with_fakes`], but with a PR detector that finds no PR.
+fn test_server_state_with_no_pr() -> (Arc<ServerState>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        super::super::ServerStateOverrides {
+            cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
+            pr_detector: Some(Arc::new(NoPrDetector)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (state, temp)
+}
+
 // ── Worker wait ──────────────────────────────────────────────────────────────
 
 fn wait_payload(reason: &str) -> Value {
@@ -2276,20 +2319,159 @@ fn wait_payload(reason: &str) -> Value {
 }
 
 /// The proposal handler and the completion handler must consult the same
-/// registry: a wait declared over the proposal channel has to be visible to
-/// the Stop-time nudge (which holds on `active`).
+/// registry: a wait declared over the proposal channel has to hold the
+/// Stop-time nudge on a live, no-PR execution.
 #[tokio::test]
-async fn a_submitted_wait_is_visible_to_the_completion_handlers_registry() {
-    let fx = WorkerFixture::new();
+async fn a_submitted_wait_holds_the_completion_handlers_stop_nudge() {
+    let fx = WorkerFixture::with_state(test_server_state_with_no_pr());
+    // A live execution with no PR: `start_execution_run` flips it to running.
+    fx.server_state
+        .work_db
+        .start_execution_run(
+            &fx.execution_id,
+            "worker-1",
+            "repo",
+            "lease-1",
+            "workspace-1",
+            fx._dir.path().to_str().unwrap(),
+        )
+        .unwrap();
     submitted(submit(&fx, ProposalKind::Wait, wait_payload("bazel test")).await);
 
-    let handler_registry = fx.server_state.completion_handler.wait_registry();
-    assert!(Arc::ptr_eq(handler_registry, &fx.server_state.wait_registry));
+    for _ in 0..3 {
+        let outcome = fx.server_state.completion_handler.on_stop(&fx.execution_id).await;
+        assert!(
+            matches!(outcome, crate::completion::StopOutcome::WorkerWaitPending { .. }),
+            "a wait declared over the proposal channel must hold Stop; got {outcome:?}",
+        );
+    }
+}
+
+/// A failed submit (the ledger insert errors) must answer with a failure and
+/// leave no grant and no charged budget behind.
+#[tokio::test]
+async fn a_failed_wait_submit_grants_and_charges_nothing() {
+    let fx = WorkerFixture::new();
+    fx.server_state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute("DROP TABLE worker_proposals", [])
+        .unwrap();
+
+    let event = submit(&fx, ProposalKind::Wait, wait_payload("bazel test")).await;
+    assert!(
+        matches!(event, FrontendEvent::ProposalRejected { .. }),
+        "a failed submit must not acknowledge the wait; got {event:?}",
+    );
+
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
-    let active = handler_registry
-        .active(&fx.execution_id, now)
-        .expect("the completion handler must see the declared wait");
-    assert_eq!(active.reason, "bazel test");
+    assert!(fx.server_state.wait_registry.active(&fx.execution_id, now).is_none());
+    assert_eq!(fx.server_state.wait_registry.total_granted_secs(&fx.execution_id), 0);
+}
+
+/// A keyed replay of an accepted wait resolves to the original row even once
+/// the cumulative budget is spent, without renewing or recharging.
+#[tokio::test]
+async fn replaying_an_accepted_wait_succeeds_after_the_budget_is_spent() {
+    let fx = WorkerFixture::new();
+    let long = |reason: &str| json!({"duration_secs": boss_protocol::WAIT_MAX_DURATION_SECS, "reason": reason});
+    let keyed = |reason: &str, key: &str| submit_request_keyed(&fx.execution_id, ProposalKind::Wait, long(reason), key);
+    let (first, _) = submitted(call_with_peer(&fx.server_state, Some(fx.peer_pid), keyed("a", "k1")).await);
+    submitted(call_with_peer(&fx.server_state, Some(fx.peer_pid), keyed("b", "k2")).await);
+    let total = fx.server_state.wait_registry.total_granted_secs(&fx.execution_id);
+    assert_eq!(total, boss_protocol::WAIT_MAX_TOTAL_SECS_PER_EXECUTION);
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let before = fx.server_state.wait_registry.active(&fx.execution_id, now).unwrap();
+
+    // A fresh declaration is refused: the budget is spent.
+    let error = rejected(call_with_peer(&fx.server_state, Some(fx.peer_pid), keyed("c", "k3")).await);
+    assert_eq!(error.code, ProposalErrorCode::ValidationFailed);
+
+    // Replaying either accepted key still returns the original row.
+    let (replay, already) = submitted(call_with_peer(&fx.server_state, Some(fx.peer_pid), keyed("a", "k1")).await);
+    assert!(already);
+    assert_eq!(replay.id, first.id);
+
+    let after = fx.server_state.wait_registry.active(&fx.execution_id, now).unwrap();
+    assert_eq!(after.expires_at_epoch, before.expires_at_epoch);
+    assert_eq!(
+        fx.server_state.wait_registry.total_granted_secs(&fx.execution_id),
+        total
+    );
+}
+
+/// Two concurrent distinct declarations against a budget that covers only one:
+/// exactly one is granted and recorded, the other gets a typed refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_waits_over_a_budget_for_one_grant_exactly_one() {
+    let fx = WorkerFixture::new();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let used = boss_protocol::WAIT_MAX_TOTAL_SECS_PER_EXECUTION - boss_protocol::WAIT_MAX_DURATION_SECS;
+    fx.server_state
+        .wait_registry
+        .declare(
+            &fx.execution_id,
+            "earlier".to_owned(),
+            None,
+            used.min(boss_protocol::WAIT_MAX_DURATION_SECS),
+            now,
+        )
+        .unwrap();
+    if used > boss_protocol::WAIT_MAX_DURATION_SECS {
+        fx.server_state
+            .wait_registry
+            .declare(
+                &fx.execution_id,
+                "earlier2".to_owned(),
+                None,
+                used - boss_protocol::WAIT_MAX_DURATION_SECS,
+                now,
+            )
+            .unwrap();
+    }
+    let long = |reason: &str, key: &str| {
+        submit_request_keyed(
+            &fx.execution_id,
+            ProposalKind::Wait,
+            json!({"duration_secs": boss_protocol::WAIT_MAX_DURATION_SECS, "reason": reason}),
+            key,
+        )
+    };
+    let (a, b) = tokio::join!(
+        call_with_peer(&fx.server_state, Some(fx.peer_pid), long("a", "ka")),
+        call_with_peer(&fx.server_state, Some(fx.peer_pid), long("b", "kb")),
+    );
+
+    let accepted = [&a, &b]
+        .iter()
+        .filter(|e| matches!(e, FrontendEvent::ProposalSubmitted { .. }))
+        .count();
+    let refused: Vec<_> = [&a, &b]
+        .iter()
+        .filter_map(|e| match e {
+            FrontendEvent::ProposalRejected { error } => Some(error.code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(accepted, 1, "exactly one declaration may be granted: {a:?} / {b:?}");
+    assert_eq!(refused, [ProposalErrorCode::ValidationFailed]);
+    assert_eq!(
+        fx.server_state.wait_registry.total_granted_secs(&fx.execution_id),
+        boss_protocol::WAIT_MAX_TOTAL_SECS_PER_EXECUTION
+    );
+    let rows: i64 = fx
+        .server_state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM worker_proposals WHERE execution_id = ?1 AND kind = 'wait'",
+            rusqlite::params![fx.execution_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "the refused declaration must leave no ledger row");
 }
 
 /// Replaying an explicit idempotency key returns the recorded row; it must not

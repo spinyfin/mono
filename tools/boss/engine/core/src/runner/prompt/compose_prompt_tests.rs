@@ -1277,6 +1277,16 @@ fn conflict_revision_gate_points_at_boss_propose_blocked_when_seam_is_on() {
         !prompt.contains("[blocked] reason=\"...\""),
         "seam on: conflict-resolution gate must not also teach the legacy marker:\n{prompt}",
     );
+    assert!(
+        prompt.contains(
+            "If you background it instead, declare the wait with `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` before ending your turn"
+        ),
+        "conflict-resolution gate must require a declared wait when the build is backgrounded:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("Do NOT background it and idle in a wait-loop"),
+        "conflict-resolution gate must not carry the old blanket background ban:\n{prompt}",
+    );
 }
 
 #[test]

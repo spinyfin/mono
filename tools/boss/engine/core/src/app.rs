@@ -549,6 +549,8 @@ struct ServerStateOverrides {
     /// Test-injected source-packet collector. `None` uses the GitHub-backed
     /// default on the completion handler.
     source_packet_collector: Option<crate::review_guide_capture::SourcePacketCollector>,
+    /// Fake PR detector. `None` uses `CommandPrDetector` (shells out to `gh`).
+    pr_detector: Option<Arc<dyn PrDetector>>,
 }
 
 #[derive(bon::Builder)]
@@ -1144,6 +1146,7 @@ impl ServerState {
             worker_registry: worker_registry_override,
             branch_verifier: branch_verifier_override,
             source_packet_collector: source_packet_collector_override,
+            pr_detector: pr_detector_override,
         } = overrides;
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
@@ -1267,7 +1270,8 @@ impl ServerState {
         let publisher: Arc<dyn ExecutionPublisher> = publisher_impl.clone();
         let cube_client: Arc<dyn CubeClient> =
             cube_client_override.unwrap_or_else(|| Arc::new(CommandCubeClient::new(cfg.clone())));
-        let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
+        let pr_detector: Arc<dyn PrDetector> =
+            pr_detector_override.unwrap_or_else(|| Arc::new(CommandPrDetector::new()));
         // The pane releaser and probe queuer both need a Weak<ServerState>
         // to call back into ServerState methods, so they're late-bound
         // after the Arc<ServerState> exists. Same pattern as

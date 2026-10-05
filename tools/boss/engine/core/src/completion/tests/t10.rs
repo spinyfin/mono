@@ -571,6 +571,7 @@ async fn worker_wait_hold_is_held_by_the_sweep_then_resumes_ladder_to_the_termin
     } = TestHarness::new(db.clone(), detector);
     let probe = ToggleWatermarkProbe::new(0, Some("wm-frozen"));
     let clock = ManualClock::new();
+    let breaker = Arc::new(crate::nudge_breaker::NudgeBreaker::new());
     let wait_registry = Arc::new(crate::wait_registry::WaitRegistry::new());
     wait_registry
         .declare(
@@ -584,6 +585,7 @@ async fn worker_wait_hold_is_held_by_the_sweep_then_resumes_ladder_to_the_termin
     let handler = handler
         .with_background_activity_probe(probe)
         .with_now_fn(clock.now_fn())
+        .with_nudge_breaker(breaker.clone())
         .with_wait_registry(wait_registry);
 
     assert!(matches!(
@@ -600,6 +602,11 @@ async fn worker_wait_hold_is_held_by_the_sweep_then_resumes_ladder_to_the_termin
         "an unexpired wait must hold the sweep too; got {held:?}",
     );
     assert!(probes.snapshot().is_empty(), "no probe while the wait is active");
+    assert_eq!(
+        breaker.counts(&execution_id),
+        None,
+        "a held wait must not consume a breaker count",
+    );
 
     // Let the wait lapse, then drive sweeps to the breaker terminal.
     tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
@@ -613,6 +620,11 @@ async fn worker_wait_hold_is_held_by_the_sweep_then_resumes_ladder_to_the_termin
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].1, PROBE_NO_PR);
     assert_eq!(probes.deliver_snapshot(), [execution_id.as_str()]);
+    assert_eq!(
+        breaker.counts(&execution_id),
+        Some((1, 1)),
+        "exactly one breaker count after the first post-expiry probe",
+    );
     assert!(
         handler.pending_background_nudge_execution_ids().contains(&execution_id),
         "the intent must be retained after the post-expiry probe so later sweeps advance the ladder",
