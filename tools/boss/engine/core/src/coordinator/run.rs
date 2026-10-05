@@ -876,10 +876,9 @@ impl ExecutionCoordinator {
     /// Release `worker_id` back to the pool, then rescan + kick to
     /// pick up newly-eligible work. Used at the tail of non-pane
     /// `run_execution` calls and from [`ServerState::release_worker_pane`]
-    /// for the deferred pane-spawn case — the engine and the app must
-    /// agree on which slots are busy, so the WorkerPool free signal is
-    /// paired with the libghostty pane teardown rather than firing as
-    /// soon as the spawn RPC returns.
+    /// for the deferred pane-spawn case. The WorkerPool free signal
+    /// follows token-verified tmux teardown and viewer detach, keeping
+    /// the slot occupied until the worker has been released.
     pub async fn release_worker_and_kick(self: &Arc<Self>, worker_id: &str, last_workspace_id: Option<&str>) {
         self.pool_for_worker_id(worker_id)
             .release_worker(worker_id, last_workspace_id)

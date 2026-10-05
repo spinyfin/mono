@@ -7,7 +7,7 @@ use super::*;
 
 impl WorkerCompletionHandler {
     /// Force-release the resources backing `execution_id`: tear down
-    /// the libghostty pane and release the cube workspace. Idempotent —
+    /// the tmux pane and release the cube workspace. Idempotent —
     /// duplicate calls (e.g. completion-detection followed by a manual
     /// stop, or two clients racing to mark a chore done) become no-ops
     /// on the second pass via the registry's `take_slot_for_run`

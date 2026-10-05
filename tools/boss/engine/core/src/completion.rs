@@ -372,8 +372,8 @@ pub enum PaneReleaseOutcome {
     NoLiveWorker,
 }
 
-/// Asks the registered app session to tear down the libghostty pane
-/// hosting `run_id`. Implementations must be idempotent: a duplicate
+/// Tears down the tmux session hosting `run_id` after verifying its token
+/// and detaches its app viewer. Implementations must be idempotent: a duplicate
 /// call after the slot has been released is a no-op, not an error.
 /// The completion handler calls this after a successful cube lease
 /// release on PR detection so the Workers grid pane disappears.

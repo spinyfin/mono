@@ -3,6 +3,10 @@
 In-file tests are scanned too. Historical design documents are not production
 surfaces. Remote detached SSH workers, the frontend InterruptWorkerPane RPC,
 and viewer-only attach/detach/focus requests are deliberately allowed.
+
+The spawn ordering scan is a coarse textual tripwire, not a control-flow proof.
+The spawn_flow behavioral test local_spawn_requires_successfully_persisted_identity
+is the primary enforcement of intent persistence before any tmux command.
 """
 
 import os
@@ -64,14 +68,26 @@ def violations(sources):
     for path, content in sources.items():
         for match in REMOVED_PATTERN.finditer(content):
             identifier = match.group()
-            # This exact file rejects the removed key with remediation text;
-            # it does not expose a supported setting or hosting-mode branch.
+            # Permit only stale-key diagnostics and TOML rejection fixtures.
+            # Registry references through the constant are checked below too.
+            line_text = content[content.rfind("\n", 0, match.start()) + 1:
+                                content.find("\n", match.end())].strip()
             if identifier == "workers.tmux_hosting" and path == "engine/core/src/settings.rs":
-                continue
+                if (line_text.startswith("///")
+                        or line_text == 'const TMUX_HOSTING_SETTING: &str = "workers.tmux_hosting";'
+                        or line_text == 'const TMUX_HOSTING_REMOVED_MESSAGE: &str = "remove `workers.tmux_hosting`; local workers are always tmux-hosted";'
+                        or (content[match.start() - 2:match.start()] == '\\"'
+                            and content[match.end():match.end() + 5] == '\\" = ')):
+                    continue
             line = content.count("\n", 0, match.start()) + 1
             errors.append(f"{path}:{line}: removed identifier {identifier}")
         if path.startswith("engine/core/src/") and OPTIONAL_HOST.search(content):
             errors.append(f"{path}: an optional TmuxWorkerHost permits a local spawn without identity")
+
+    settings = sources["engine/core/src/settings.rs"]
+    registry = re.search(r"pub const REGISTRY\s*:[^=]*=\s*&\[(.*?)^\];", settings, re.M | re.S)
+    if not registry or re.search(r"workers\.tmux_hosting|\bTMUX_HOSTING_SETTING\b", registry[1]):
+        errors.append("settings REGISTRY must not expose the removed tmux hosting key")
 
     spawn = sources["engine/core/src/spawn_flow.rs"]
     declaration = re.search(r"pub struct StartWorkerInput\b[^\{]*\{(.*?)^\}", spawn, re.M | re.S)
@@ -104,6 +120,7 @@ def verify_guard(sources):
     # them so every spelling need not rescan the entire production tree.
     sources = {path: sources[path] for path in (
         spawn_path,
+        "engine/core/src/settings.rs",
         "engine/core/src/app/tmux_teardown.rs",
         "engine/core/src/worker_registry.rs",
         "protocol/src/engine_app.rs",
@@ -117,6 +134,13 @@ def verify_guard(sources):
         ("engine/core/src/worker_registry.rs", "tmux_hosted: bool"),
         ("protocol/src/engine_app.rs", "pub enum EngineToAppRequest {\n    SpawnWorkerPane,\n}"),
     ]
+    settings_path = "engine/core/src/settings.rs"
+    for key in ('"workers.tmux_hosting"', "TMUX_HOSTING_SETTING"):
+        entry = f'\n    SettingSpec {{ key: {key}, description: "regression", default_enabled: false }},'
+        mutations.append((settings_path, sources[settings_path].replace(
+            "pub const REGISTRY: &[SettingSpec] = &[",
+            "pub const REGISTRY: &[SettingSpec] = &[" + entry, 1)))
+    mutations.append((settings_path, sources[settings_path] + '\nconst REINTRODUCED: &str = "workers.tmux_hosting";\n'))
     # Exercise each removed spelling in each scanned production language.
     for identifier in REMOVED:
         for path in ("protocol/src/regression.rs", "app-macos/Sources/Regression.swift"):

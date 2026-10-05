@@ -408,7 +408,8 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
 impl crate::stale_worker_sweep::StaleWorkerReaper for ServerState {
     /// Route the stale-worker reconcile through the exact teardown
     /// `bossctl agents stop` performs: `release_worker_pane` tears down
-    /// the libghostty pane, fires the `reap_worker_process_tree`
+    /// the token-verified tmux session, detaches the app viewer, and fires
+    /// the `reap_worker_process_tree`
     /// SIGTERM/SIGKILL ladder at the worker's process group, releases the
     /// pool slot, and drops the live-state entry. This is what was
     /// missing — the sweep used to free the pool slot without ever

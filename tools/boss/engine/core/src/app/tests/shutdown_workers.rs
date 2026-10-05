@@ -204,8 +204,8 @@ async fn shutdown_workers_preserves_tmux_and_historical_workers() {
 }
 
 /// Durable `tmux_hosted = 1` is enough even when the in-memory live-state
-/// stamp is missing — the fallback if a registry entry was recorded on the
-/// legacy app-hosted path.
+/// stamp is missing — the fallback for a run registered without a tmux
+/// session name.
 #[tokio::test]
 async fn shutdown_workers_survives_when_only_the_durable_tmux_hosted_bit_is_set() {
     let (server_state, _dir) = test_server_state();
@@ -216,7 +216,7 @@ async fn shutdown_workers_survives_when_only_the_durable_tmux_hosted_bit_is_set(
     let mut child = spawn_group_leader_sleeper();
     let pid = child.id() as i32;
     let execution_id = seed_tmux_hosted_execution(db, &work_item_id, i64::from(pid));
-    // Deliberately the legacy app-hosted registry + unstamped live state.
+    // Deliberately register without a tmux session name or live-state stamp.
     server_state.worker_registry.register_run_slot(&execution_id, 2);
     server_state
         .live_worker_states

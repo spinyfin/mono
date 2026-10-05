@@ -110,7 +110,8 @@ pub enum PreemptOutcome {
 /// Production wiring routes this into
 /// [`crate::completion::WorkerCompletionHandler::force_release`], which
 /// is the same incident-hardened teardown `bossctl agents stop` and the
-/// stale-worker sweep use: it tears down the libghostty pane, fires the
+/// stale-worker sweep use: it verifies the tmux token, tears down the
+/// session, detaches the app viewer, and fires the
 /// `reap_worker_process_tree` SIGTERM/SIGKILL ladder at the worker's
 /// whole process group (so no orphaned `claude` survives holding build
 /// locks — the #975/#1006 leak class), releases the pool slot, and

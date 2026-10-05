@@ -46,7 +46,7 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
                 // actively-running dependent into `blocked`. The DB
                 // transition already cancelled its execution row
                 // atomically; here we release the physical worker —
-                // tear down its libghostty pane and free its cube
+                // tear down its tmux pane and free its cube
                 // workspace lease — so a `blocked` task never leaves a
                 // live worker behind ("in backlog but executing").
                 // Mirrors the cancel-execution reaping path: pane slots

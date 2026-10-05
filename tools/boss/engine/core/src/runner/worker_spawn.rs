@@ -502,7 +502,7 @@ fn prompt_addendum_to_prepend(kind: &ExecutionKind, addendum: Option<&'static st
 /// Per-execution prompt + spawn-config composition shared by every
 /// worker transport.
 ///
-/// [`PaneSpawnRunner`] (local libghostty panes) and
+/// [`PaneSpawnRunner`] (local tmux panes) and
 /// [`crate::host_adapter::SshHostAdapter`] (remote SSH workers) both call
 /// this so the two launch paths hand the worker a byte-identical prompt
 /// and resolve the same effort/model knobs (design §Q3). It gathers the

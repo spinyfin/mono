@@ -159,8 +159,8 @@ pub struct LiveWorkerState {
     /// this with that authoritative value. Absent model on the hook
     /// (Codex stdout `thread.started`) leaves the launch default in place.
     pub model: String,
-    /// Best-effort shell pid the app returned at spawn. `0` if the
-    /// app did not yet plumb pid back through `proc_listpids`.
+    /// Tmux pane pid (`#{pane_pid}`). `0` for remote workers or before
+    /// the local pane pid has been registered.
     pub shell_pid: i32,
     /// ISO-8601 timestamp of the most recent hook event observed for
     /// this slot. Useful for staleness detection — a worker that has

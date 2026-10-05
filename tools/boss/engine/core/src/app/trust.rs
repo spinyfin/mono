@@ -159,7 +159,7 @@ impl ServerState {
     /// pid is missing (the engine has not yet created the coordinator,
     /// or runs that don't set up a Boss pane at all), we fall back to
     /// "descendant of the app, not a descendant of any registered
-    /// worker shell". Workers each run in their own libghostty pane
+    /// worker shell". Workers each run in their own tmux pane
     /// whose shell pid is recorded in `WorkerRegistry`; a `bossctl`
     /// invoked from inside a worker pane therefore descends from a
     /// registered worker pid, while the same call from the Boss pane

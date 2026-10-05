@@ -137,7 +137,7 @@ pub struct RunOutcome {
     pub result_summary: Option<String>,
     pub attention: Option<RunAttention>,
     /// Pane slot the worker was actually allocated into, if this run
-    /// hosts a libghostty pane. The coordinator stamps this onto the
+    /// hosts a tmux pane. The coordinator stamps this onto the
     /// run record's `agent_id` (as `worker-{slot_id}`) so `bossctl
     /// agents list` shows one entry per active pane instead of
     /// collapsing every run into the worker-pool placeholder. `None`

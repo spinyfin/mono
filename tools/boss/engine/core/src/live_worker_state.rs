@@ -260,10 +260,9 @@ struct SlotMeta {
     /// this driver started?" still has a single, unforgeable answer.
     ///
     /// Note what is deliberately absent: `shell_pid`. A reported
-    /// foreground pid is the *shell hosting the pane*, not the driver
-    /// (`GhosttyTerminalView.swift`'s `onSurfaceAttached` reads
-    /// `ghostty_surface_foreground_pid`, which is the login shell when
-    /// the driver was never exec'd). Every check that treated a positive
+    /// tmux pane pid (`#{pane_pid}`) identifies the pane process, which
+    /// may still be the shell if the driver was never exec'd. It is zero
+    /// for remote workers or before registration. Every check that treated a positive
     /// pid as evidence of a working worker is what the 2026-07-30
     /// incident walked through untouched.
     driver_signal_at: Option<i64>,

@@ -7,7 +7,7 @@
 //! (`drain_ready_queue` / `force_dispatch` → `claim_worker`) and, for a
 //! pane-spawned run, its release is DEFERRED to
 //! [`crate::app::ServerState::release_worker_pane`], which frees the
-//! slot only when the macOS app tears the libghostty pane down. Every
+//! slot after token-verified tmux teardown and viewer detach. Every
 //! other release path keys off a *live* worker:
 //!
 //! * completion (`force_release` / `force_stop_execution` /

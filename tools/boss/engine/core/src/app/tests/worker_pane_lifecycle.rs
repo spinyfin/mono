@@ -97,7 +97,7 @@ async fn release_worker_pane_drops_live_worker_state() {
     // rendering the worker as attached to its work item. Without
     // this, the kanban Doing dot and the pane titlebar pill stayed
     // pinned at the worker's last activity (e.g. WaitingForInput)
-    // even after the libghostty pane was torn down.
+    // even after the tmux session was torn down.
     let (server_state, _dir) = test_server_state();
     let run_id = super::tmux_stub::seed_teardown(&server_state);
     server_state.worker_registry.register_run_slot(&run_id, 1);
@@ -116,7 +116,7 @@ async fn release_worker_pane_drops_live_worker_state() {
 
     assert!(
         server_state.live_worker_states.get(1).is_none(),
-        "release_worker_pane must drop the live-state entry alongside the libghostty pane",
+        "release_worker_pane must drop the live-state entry alongside the tmux session",
     );
     assert_eq!(
         server_state.worker_registry.slot_for_run(&run_id),
@@ -180,8 +180,8 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
     // (`release_worker_pane`'s primary body, as opposed to the
     // no-slot-mapping fallback covered in `worker_process_reaping.rs`):
     // a tmux-hosted worker's session must be torn down and its identity
-    // columns cleared alongside the libghostty pane release, even when no
-    // app session is registered to answer the pane-release request.
+    // columns cleared alongside the tmux session release, even when no
+    // app session is registered to receive the viewer-detach request.
     use super::tmux_stub::{fake_tmux, ok};
 
     let (server_state, _dir) = test_server_state();
@@ -291,7 +291,7 @@ async fn release_worker_pane_releases_matching_worker_pool_slot() {
     assert_eq!(
         pool.idle_count().await,
         1,
-        "WorkerPool slot must be freed once the libghostty pane is released",
+        "WorkerPool slot must be freed once the tmux session is released",
     );
     // And the next claim lands on the same slot.
     let re_claimed = pool.claim_worker("exec-2", None).await.expect("slot 1 is free");
