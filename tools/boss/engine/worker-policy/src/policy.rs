@@ -525,6 +525,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::PlanProject { .. }
         | FrontendRequest::ReleaseHoldRun { .. }
         | FrontendRequest::ReleaseProject { .. }
+        | FrontendRequest::StartProjectPostmortem { .. }
         | FrontendRequest::RetryCiRemediation { .. }
         | FrontendRequest::RetryConflictResolution { .. }
         | FrontendRequest::RunAutomation { .. }

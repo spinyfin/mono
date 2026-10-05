@@ -2541,6 +2541,12 @@ pub enum FrontendRequest {
     /// can host it again. Fire-and-forget; no response expected.
     SpawnCapabilityRestored,
 
+    /// Start a complete project's postmortem, or return the existing one.
+    /// Refuses while open tasks or planning remain.
+    StartProjectPostmortem {
+        project_id: String,
+    },
+
     /// Boss-tier RPC: tear down the libghostty pane hosting `run_id`
     /// and release the cube workspace its execution still holds.
     /// Used by `bossctl agents stop`. Idempotent — duplicate requests

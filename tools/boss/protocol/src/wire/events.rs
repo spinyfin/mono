@@ -961,6 +961,11 @@ pub enum FrontendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proposal: Option<crate::PlannerOutput>,
     },
+    /// Response to [`FrontendRequest::StartProjectPostmortem`].
+    ProjectPostmortemResult {
+        task: Task,
+        created: bool,
+    },
     /// Response to [`FrontendRequest::ReleaseProject`].
     ReleaseProjectResult {
         project_id: String,

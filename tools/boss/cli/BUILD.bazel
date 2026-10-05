@@ -581,3 +581,29 @@ rust_test(
         normal_dev = True,
     ),
 )
+
+rust_test(
+    name = "project_postmortem_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = [
+        "tests/project_postmortem.rs",
+    ],
+    crate_root = "tests/project_postmortem.rs",
+    data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":common",
+        ":harness",
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

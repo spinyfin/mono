@@ -103,6 +103,7 @@ mod panes;
 mod pid_file;
 mod planner_ops;
 mod pr_status;
+mod project_postmortem_ops;
 // `pub(crate)` so `crate::attention_lifecycle` can bind
 // `PROBE_UNDELIVERED_ATTENTION_KIND` rather than re-spelling the string.
 // Individual items stay `pub(super)`; only the module path is widened.
@@ -2587,6 +2588,9 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::ReleaseHoldRun { .. } => Box::pin(executions::handle_release_hold_run(ctx, r)),
             r @ FrontendRequest::ReleaseProject { .. } => Box::pin(planner_ops::handle_release_project(ctx, r)),
+            r @ FrontendRequest::StartProjectPostmortem { .. } => {
+                Box::pin(project_postmortem_ops::handle_start(ctx, r))
+            }
             r @ FrontendRequest::ReleaseReviewTerminal { .. } => {
                 Box::pin(review::handle_release_review_terminal(ctx, r))
             }

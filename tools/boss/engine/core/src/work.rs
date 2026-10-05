@@ -649,6 +649,9 @@ mod executions_runs;
 mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
+mod project_postmortem;
+#[cfg(test)]
+mod project_postmortem_tests;
 pub(crate) use feedback_target::FeedbackTarget;
 mod description_guard;
 mod guide_comments;
@@ -711,7 +714,6 @@ pub(crate) use audit_misc::*;
 pub(crate) use chain_helpers::*;
 use create_entities::create_project_in_tx;
 pub(crate) use dep_helpers::*;
-pub(crate) use design_postmortem::TriggerTaskSnapshot;
 pub(crate) use dispatch_class::DispatchClass;
 pub(crate) use dispatch_helpers::*;
 pub(crate) use driver_allocation::*;

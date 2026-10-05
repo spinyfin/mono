@@ -379,6 +379,8 @@ pub(crate) enum ProjectCommand {
     /// Move a project into a different lifecycle status
     /// (planned/active/blocked/done/archived).
     Move(ProjectMoveArgs),
+    /// Start a completed project's postmortem; an existing one is a no-op.
+    Postmortem(ProjectSelectorArgs),
     /// Set or clear a project's design-doc pointer. `--path` sets the
     /// repo-relative doc path; `--repo` and `--branch` are optional
     /// overrides that fall back to the product's defaults. `--unset`

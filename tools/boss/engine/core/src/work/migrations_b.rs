@@ -167,7 +167,7 @@ pub(crate) fn migrate_project_property_audit_table(conn: &Connection) -> Result<
     Ok(())
 }
 
-/// Backfill a `kind = 'design'` task for every project that doesn't
+/// Backfill a `kind = 'design'` task for every non-terminal project that doesn't
 /// have one yet. Brings databases that predate
 /// design-as-task up to the new shape so the kanban renders them
 /// like new projects: a "Design" card sits at the head of the
@@ -186,7 +186,8 @@ pub(crate) fn migrate_backfill_project_design_tasks(conn: &Connection) -> Result
     let mut stmt = conn.prepare(
         "SELECT p.id, p.product_id
          FROM projects p
-         WHERE NOT EXISTS (
+         WHERE p.status NOT IN ('done', 'archived')
+           AND NOT EXISTS (
              SELECT 1 FROM tasks t
              WHERE t.project_id = p.id
                AND t.kind = 'design'
