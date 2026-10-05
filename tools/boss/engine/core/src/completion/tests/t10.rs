@@ -460,6 +460,27 @@ async fn a_resumed_background_children_hold_is_still_retired_without_a_probe() {
 }
 
 #[tokio::test]
+async fn worker_teardown_clears_active_wait_and_granted_duration() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let TestHarness { handler, .. } = TestHarness::new(db, StubPrDetector::ok(None));
+    let wait_registry = Arc::new(crate::wait_registry::WaitRegistry::new());
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    wait_registry
+        .declare(&execution_id, "build".to_owned(), None, 60, now)
+        .unwrap();
+    let handler = handler.with_wait_registry(wait_registry.clone());
+    let guard = handler.begin_teardown(&execution_id);
+
+    handler
+        .finish_worker_teardown(&execution_id, &chore_id, None, Some(workspace.path()), "test", guard)
+        .await;
+
+    assert!(wait_registry.active(&execution_id, now).is_none());
+    assert_eq!(wait_registry.total_granted_secs(&execution_id), 0);
+}
+
+#[tokio::test]
 async fn active_worker_wait_suppresses_nudge_and_never_touches_breaker() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());

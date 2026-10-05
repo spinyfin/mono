@@ -121,6 +121,8 @@ impl WorkerCompletionHandler {
         path: &'static str,
         guard: TeardownGuard,
     ) {
+        // Every terminal completion path clears its worker-declared wait here.
+        self.wait_registry.forget(execution_id);
         let started = Instant::now();
 
         let pane_started = Instant::now();
