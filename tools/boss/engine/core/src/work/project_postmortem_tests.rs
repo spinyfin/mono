@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{create_test_product_named, open_db};
 
-fn project(db: &WorkDb) -> Project {
+fn empty_project(db: &WorkDb) -> Project {
     let product = create_test_product_named(db, "Postmortems");
     let project = db
         .create_project(
@@ -19,6 +19,36 @@ fn project(db: &WorkDb) -> Project {
     })
     .unwrap();
     query_project(&db.connect().unwrap(), &project.id).unwrap().unwrap()
+}
+
+/// A project with one completed implementation task. The completion signal
+/// that task recorded is cleared so each test exercises its own trigger.
+fn project(db: &WorkDb) -> Project {
+    let p = empty_project(db);
+    let done = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(&p.product_id)
+                .project_id(&p.id)
+                .name("Completed implementation")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    db.update_work_item(
+        &done.id,
+        WorkItemPatch {
+            status: Some("done".into()),
+            pr_url: Some("https://github.com/o/r/pull/1".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("DELETE FROM project_postmortem_signals", [])
+        .unwrap();
+    p
 }
 
 fn task(db: &WorkDb, project: &Project) -> Task {
@@ -245,4 +275,43 @@ fn racing_requests_create_one_postmortem() {
     });
     assert_eq!(results.iter().filter(|(_, created)| *created).count(), 1);
     assert_eq!(results[0].0.id, results[1].0.id);
+}
+
+#[tokio::test]
+async fn project_done_without_completed_work_schedules_nothing() {
+    let (_dir, db) = open_db();
+    let p = empty_project(&db);
+    db.update_work_item(
+        &p.id,
+        WorkItemPatch {
+            status: Some("done".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(db.has_project_postmortem_signal(&p.id).unwrap());
+    assert_eq!(
+        crate::project_postmortem_sweep::run_one_pass(&db)
+            .await
+            .postmortems_created,
+        0
+    );
+    assert!(
+        db.start_project_postmortem(&p.id)
+            .unwrap_err()
+            .to_string()
+            .contains("no implementation work completed")
+    );
+}
+
+#[test]
+fn command_recreates_after_postmortem_was_deleted() {
+    let (_dir, db) = open_db();
+    let p = project(&db);
+    let (first, created) = db.start_project_postmortem(&p.id).unwrap();
+    assert!(created);
+    db.delete_work_item(&first.id).unwrap();
+    let (second, created) = db.start_project_postmortem(&p.id).unwrap();
+    assert!(created, "a deleted postmortem must not disable the command");
+    assert_ne!(second.id, first.id);
 }

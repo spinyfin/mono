@@ -2300,9 +2300,10 @@ pub async fn serve_with_overrides(
 
     // Project-postmortem sweeper: when a project's implementation work
     // (project_task/design/investigation, excluding the postmortem kind
-    // itself) drains to zero, auto-schedule a `design_postmortem` task that
-    // reviews the wave's merged PRs against the design doc. Edge-triggered
-    // and idempotent — see project_postmortem_sweep.rs for the full design.
+    // itself) completes, auto-schedule a `design_postmortem` task that
+    // reviews the PRs merged since the last postmortem against the design
+    // doc. Signal-driven and idempotent per completed wave — see
+    // project_postmortem_sweep.rs for the full design.
     // Gated by the `project_postmortem_sweep` flag (default ON, re-checked
     // every pass) so the sweep — which autonomously creates dispatchable
     // work — can be killed without a rebuild or restart; see incident

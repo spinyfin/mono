@@ -42,24 +42,55 @@ impl WorkDb {
         )?)
     }
 
-    /// Return (postmortem, created). The immediate transaction serializes
-    /// automatic and operator requests across connections, and rechecks open
-    /// work at the insertion boundary. Tombstones also count as existing.
+    /// Start a postmortem for `boss project postmortem` / the
+    /// `StartProjectPostmortem` RPC. Deleted postmortems are ignored, so the
+    /// command can recover a project whose postmortem was removed.
     pub fn start_project_postmortem(&self, project_id: &str) -> Result<(Task, bool)> {
+        self.start_postmortem(project_id, false)
+    }
+
+    /// Start a postmortem for the sweep. A deleted postmortem still anchors
+    /// the "work completed since" cutoff, so deleting one dismisses the work
+    /// it covered without blocking a later wave.
+    pub(crate) fn schedule_project_postmortem(&self, project_id: &str) -> Result<(Task, bool)> {
+        self.start_postmortem(project_id, true)
+    }
+
+    /// Return (postmortem, created). The immediate transaction serializes
+    /// the sweep and the `StartProjectPostmortem` RPC across connections, and
+    /// rechecks open work at the insertion boundary. A live, non-terminal
+    /// postmortem is returned as-is; otherwise a new one needs a done
+    /// `project_task`/`investigation` completed after the latest
+    /// postmortem's cutoff (or any, if there has been none).
+    fn start_postmortem(&self, project_id: &str, tombstones_anchor: bool) -> Result<(Task, bool)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let project = query_project(&tx, project_id).require("project", project_id)?;
-        let existing: Option<String> = tx
+        let latest: Option<(String, String, i64, bool)> = tx
+            .query_row(
+                "SELECT id, status,
+                        COALESCE(CAST(NULLIF(completed_at, '') AS INTEGER), CAST(created_at AS INTEGER), 0),
+                        deleted_at IS NOT NULL
+                 FROM tasks WHERE project_id = ?1 AND kind = 'design_postmortem'
+                   AND (?2 OR deleted_at IS NULL)
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                rusqlite::params![project_id, tombstones_anchor],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let live_open: Option<String> = tx
             .query_row(
                 "SELECT id FROM tasks WHERE project_id = ?1 AND kind = 'design_postmortem'
-             ORDER BY created_at, id LIMIT 1",
+                   AND deleted_at IS NULL AND status NOT IN ('done', 'archived')
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
                 [project_id],
                 |row| row.get(0),
             )
             .optional()?;
-        if let Some(id) = existing {
+        if let Some(id) = live_open {
             return Ok((query_task(&tx, &id).require("task", &id)?, false));
         }
+        let cutoff = latest.as_ref().map(|(_, _, cutoff, _)| *cutoff);
         let open: i64 = tx.query_row(
             "SELECT COUNT(*) FROM tasks WHERE project_id = ?1 AND deleted_at IS NULL
              AND kind != 'design_postmortem' AND status NOT IN ('done', 'archived')",
@@ -87,15 +118,28 @@ impl WorkDb {
         );
         let mut stmt = tx.prepare(
             "SELECT name, pr_url FROM tasks WHERE project_id = ?1 AND deleted_at IS NULL
-             AND kind != 'design_postmortem' AND status = 'done' AND pr_url IS NOT NULL
+             AND kind IN ('project_task', 'investigation') AND status = 'done'
+             AND CAST(NULLIF(completed_at, '') AS INTEGER) > ?2
              ORDER BY created_at, id",
         )?;
-        let prs = stmt
-            .query_map([project_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        let done = stmt
+            .query_map(rusqlite::params![project_id, cutoff.unwrap_or(-1)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
+        if done.is_empty() {
+            if let Some((id, _, _, false)) = &latest {
+                return Ok((query_task(&tx, id).require("task", id)?, false));
+            }
+            anyhow::bail!(
+                "cannot start project postmortem: no implementation work completed since the last postmortem"
+            );
+        }
+        let prs = done
+            .into_iter()
+            .filter_map(|(name, url)| url.filter(|u| !u.is_empty()).map(|u| (name, u)))
+            .collect::<Vec<_>>();
         let refs = prs
             .iter()
             .map(|(name, url)| (name.as_str(), url.as_str()))

@@ -8,8 +8,11 @@
 //! installation never backfills historical projects.
 //!
 //! Scheduling rechecks all live task kinds and active planning in an immediate
-//! transaction shared with the operator command. Any prior postmortem, including
-//! a completed or deleted one, makes scheduling a no-op.
+//! transaction shared with `boss project postmortem`. A live, open postmortem
+//! blocks a duplicate. Otherwise a new one needs a `project_task` or
+//! `investigation` completed after the latest postmortem's cutoff (its
+//! completion time, falling back to creation; a deleted postmortem still
+//! anchors the cutoff for the sweep), so a later wave of work re-arms it.
 //!
 //! Archived projects and projects without design docs remain ineligible.
 //! The project_postmortem_sweep feature flag gates automatic scheduling only.
@@ -210,9 +213,6 @@ async fn evaluate_project(
         // so skip rather than create work nobody can act on.
         return Ok(EvalOutcome::Skipped);
     }
-    if work_db.last_design_postmortem_for_project(&project.id)?.is_some() {
-        return Ok(EvalOutcome::Evaluated);
-    }
     let signaled = work_db.has_project_postmortem_signal(&project.id)?;
     let tasks = work_db.list_project_trigger_tasks(&product.id, &project.id)?;
     let recent_completion = tasks.iter().any(|task| {
@@ -224,7 +224,7 @@ async fn evaluate_project(
         return Ok(EvalOutcome::Skipped);
     }
     // Recheck every task kind and planning, serializing with insertion.
-    let (created, inserted) = match work_db.start_project_postmortem(&project.id) {
+    let (created, inserted) = match work_db.schedule_project_postmortem(&project.id) {
         Ok(result) => result,
         Err(err) => {
             tracing::debug!(project_id = %project.id, %err, "project postmortem not ready");
@@ -263,7 +263,7 @@ fn epoch_secs(value: Option<&str>) -> Option<i64> {
 pub(crate) fn compose_postmortem_brief(project: &Project, merged_prs: &[(&str, &str)]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "Design postmortem for project \"{}\": review the project's merged PRs and update the project's design doc to reflect what actually shipped — decisions that diverged, scope added or dropped, and contracts that evolved during implementation. Also flag any uncompleted work the review surfaces (see the required structured-output section in your instructions below) so the engine can schedule it.\n\n",
+        "Design postmortem for project \"{}\": review the PRs merged since the last postmortem (or since the project began, if this is the first) and update the project's design doc to reflect what actually shipped — decisions that diverged, scope added or dropped, and contracts that evolved during implementation. Also flag any uncompleted work the review surfaces (see the required structured-output section in your instructions below) so the engine can schedule it.\n\n",
         project.name
     ));
     if let Some(path) = project.design_doc_path.as_deref().filter(|p| !p.is_empty()) {
@@ -523,9 +523,11 @@ mod tests {
         );
     }
 
-    /// The project has one postmortem even if more work is completed later.
+    /// Re-armable: once the existing postmortem completes AND a fresh wave
+    /// of implementation work lands and drains, a second postmortem is
+    /// scheduled.
     #[tokio::test]
-    async fn completed_postmortem_is_not_recreated_after_new_work() {
+    async fn reschedules_after_new_wave_following_completed_postmortem() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let project = create_project_no_seed(&db, &product_id, "Alpha");
@@ -570,11 +572,17 @@ mod tests {
         db.force_completed_at_for_test(&task2.id, 3_000).unwrap();
         let outcome = run_one_pass(db.as_ref()).await;
         assert_eq!(
-            outcome.postmortems_created, 0,
-            "a completed postmortem must still prevent a duplicate"
+            outcome.postmortems_created, 1,
+            "a fresh completed wave must re-arm the trigger"
         );
-        let existing = db.last_design_postmortem_for_project(&project.id).unwrap().unwrap();
-        assert_eq!(existing.id, first_pm.id);
+
+        let second_pm = db.last_design_postmortem_for_project(&project.id).unwrap().unwrap();
+        assert_ne!(second_pm.id, first_pm.id);
+        assert!(second_pm.description.contains("pull/3"));
+        assert!(
+            !second_pm.description.contains("pull/1"),
+            "the already-reviewed PR must not be re-listed in the new postmortem's brief"
+        );
     }
 
     /// The postmortem task's own completion must never count as
@@ -756,9 +764,12 @@ mod tests {
         );
     }
 
-    /// Deletion is a durable dismissal, including after new work completes.
+    /// Boundary companion to the deleted-postmortem test above: the deleted
+    /// postmortem's cutoff anchor must still gate genuinely *new* work — a
+    /// trigger-task completion that postdates the deleted row's `created_at`
+    /// must fire normally.
     #[tokio::test]
-    async fn deleted_postmortem_is_not_recreated_after_new_work() {
+    async fn new_work_after_deleted_postmortem_still_triggers() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let project = create_project_no_seed(&db, &product_id, "Alpha");
@@ -779,11 +790,13 @@ mod tests {
 
         let outcome = run_one_pass(db.as_ref()).await;
         assert_eq!(
-            outcome.postmortems_created, 0,
-            "a deleted postmortem must still prevent a duplicate"
+            outcome.postmortems_created, 1,
+            "work completing after the deleted postmortem's cutoff anchor must still trigger"
         );
-        let existing = db.last_design_postmortem_for_project(&project.id).unwrap().unwrap();
-        assert_eq!(existing.id, first_pm.id);
+        let second_pm = db.last_design_postmortem_for_project(&project.id).unwrap().unwrap();
+        assert_ne!(second_pm.id, first_pm.id);
+        assert!(second_pm.description.contains("pull/2"));
+        assert!(!second_pm.description.contains("pull/1"));
     }
 
     /// Defect 3 (kill switch): with `project_postmortem_sweep` disabled via

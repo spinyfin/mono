@@ -72,8 +72,8 @@ impl WorkDb {
     /// Most recently created `design_postmortem` task for `project_id`
     /// (deleted or not), or `None` if the project has never had one.
     ///
-    /// Includes tombstones so deleting a postmortem cannot re-arm automatic
-    /// scheduling or the operator command.
+    /// Includes tombstones; they remain the cutoff anchor for automatic
+    /// scheduling.
     pub fn last_design_postmortem_for_project(&self, project_id: &str) -> Result<Option<Task>> {
         let conn = self.connect()?;
         let id: Option<String> = conn
@@ -95,8 +95,7 @@ impl WorkDb {
     /// Most recently created *live* (non-deleted) `design_postmortem` task
     /// for `project_id`, or `None` if there isn't one.
     ///
-    /// For callers displaying live history. Scheduling must use the query
-    /// including tombstones instead, since a deleted postmortem still counts.
+    /// For callers displaying live history.
     pub fn last_live_design_postmortem_for_project(&self, project_id: &str) -> Result<Option<Task>> {
         let conn = self.connect()?;
         let id: Option<String> = conn

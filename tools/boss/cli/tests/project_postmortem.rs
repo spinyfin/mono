@@ -1,13 +1,13 @@
 use anyhow::Result;
 use boss_client::BossClient;
-use boss_protocol::{CreateProductInput, CreateProjectInput, CreateTaskInput, SetProjectDesignDocInput};
+use boss_protocol::{CreateProductInput, CreateProjectInput, CreateTaskInput, SetProjectDesignDocInput, WorkItemPatch};
 use common::{run_boss, run_boss_expect_failure, run_boss_human};
 use harness::TestEngine;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postmortem_command_refuses_open_work_then_starts_once() -> Result<()> {
     let engine = TestEngine::spawn().await?;
-    // The operator command remains available with automatic scheduling off.
+    // `boss project postmortem` works with the sweep flag disabled.
     // This also keeps the background sweep from racing the explicit start.
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let response = client
@@ -52,6 +52,24 @@ async fn postmortem_command_refuses_open_work_then_starts_once() -> Result<()> {
     assert!(error.contains("1 open task(s) remain"), "{error}");
     assert!(db.last_design_postmortem_for_project(&project.id)?.is_none());
     db.delete_work_item(&task.id)?;
+    // A project with no completed implementation work has nothing to review.
+    let error = run_boss_expect_failure(engine.socket_str(), &args)?;
+    assert!(error.contains("no implementation work completed"), "{error}");
+    let done = db.create_task(
+        CreateTaskInput::builder()
+            .product_id(&product.id)
+            .project_id(&project.id)
+            .name("Done work")
+            .autostart(false)
+            .build(),
+    )?;
+    db.update_work_item(
+        &done.id,
+        WorkItemPatch {
+            status: Some("done".into()),
+            ..WorkItemPatch::default()
+        },
+    )?;
     let created = run_boss(engine.socket_str(), &args)?;
     assert_eq!(created["created"], true);
     assert_eq!(created["task"]["kind"], "design_postmortem");
@@ -61,5 +79,10 @@ async fn postmortem_command_refuses_open_work_then_starts_once() -> Result<()> {
     let message = run_boss_human(engine.socket_str(), &args)?;
     assert!(message.contains("already exists"), "{message}");
     assert!(message.contains("no-op"), "{message}");
+    // Deleting the postmortem must not disable the command.
+    db.delete_work_item(created["task"]["id"].as_str().unwrap())?;
+    let recreated = run_boss(engine.socket_str(), &args)?;
+    assert_eq!(recreated["created"], true);
+    assert_ne!(recreated["task"]["id"], created["task"]["id"]);
     Ok(())
 }
