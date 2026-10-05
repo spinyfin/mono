@@ -9,6 +9,28 @@ mod baseline;
 /// boss-v1.0.707 (cc72dac8), including its final last_error migration.
 const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 
+// Derive requirements once from the fresh-database SQL, but check every DB.
+static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
+    std::sync::LazyLock::new(|| {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(baseline::SQL)?;
+        schema_objects(&conn)
+    });
+
+fn schema_objects(conn: &Connection) -> Result<std::collections::BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT type || ' ' || name FROM sqlite_master
+         WHERE type IN ('table', 'index', 'trigger') AND name NOT LIKE 'sqlite_%'
+         UNION ALL
+         SELECT 'column ' || m.name || '.' || p.name
+         FROM sqlite_master m JOIN pragma_table_info(m.name) p
+         WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'",
+    )?;
+    Ok(stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 impl WorkDb {
     /// Install the floor directly on empty databases. Existing databases
     /// must meet the floor before any data or schema changes are attempted.
@@ -67,6 +89,16 @@ impl WorkDb {
             parsed >= floor,
             "database schema version {observed} is below the compatibility floor: Boss {release} (schema {floor}); this database is unsupported"
         );
+        if parsed == floor {
+            let required = BASELINE_OBJECTS.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
+            let actual = schema_objects(conn)?;
+            let missing: Vec<_> = required.difference(&actual).cloned().collect();
+            anyhow::ensure!(
+                missing.is_empty(),
+                "database schema version {observed} is below the compatibility floor: Boss {release} (schema {floor}); missing baseline objects: {}; this database is unsupported",
+                missing.join(", ")
+            );
+        }
         Ok(())
     }
 
@@ -452,16 +484,7 @@ mod floor_tests {
             let conn = Connection::open(&path).unwrap();
             // Construct an existing DB from the independent released-chain
             // golden, rather than opening through the implementation under test.
-            let mut objects: Vec<SchemaObject> = RELEASED_SCHEMA
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-            objects.sort_by_key(|row| if row.0 == "table" { 0 } else { 1 });
-            for (_, _, _, sql) in objects {
-                if let Some(sql) = sql {
-                    conn.execute_batch(&sql).unwrap();
-                }
-            }
+            seed_released_schema(&conn);
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -502,26 +525,75 @@ mod floor_tests {
         }
     }
 
-    /// Run alone with --test_filter=database_open_timings --test_sharding_strategy=disabled
-    /// --test_arg=--nocapture to measure DB startup without test concurrency.
-    /// No timing threshold: wall clock results are evidence, not a flaky gate.
     #[test]
-    fn database_open_timings() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut fresh = Vec::new();
-        let mut existing = Vec::new();
-        for i in 0..21 {
-            let path = dir.path().join(format!("sample-{i}.db"));
-            let started = std::time::Instant::now();
-            let db = WorkDb::open(path.clone()).unwrap();
-            fresh.push(started.elapsed().as_secs_f64() * 1000.0);
-            drop(db);
-            let started = std::time::Instant::now();
-            let db = WorkDb::open(path).unwrap();
-            existing.push(started.elapsed().as_secs_f64() * 1000.0);
-            drop(db);
+    fn incomplete_version_32_is_rejected_without_changes() {
+        for (remove, missing) in [
+            (
+                "ALTER TABLE work_executions DROP COLUMN last_error",
+                "column work_executions.last_error",
+            ),
+            ("DROP TABLE execution_bookmarks", "table execution_bookmarks"),
+            (
+                "DROP INDEX answer_agent_runs_by_comment",
+                "index answer_agent_runs_by_comment",
+            ),
+            (
+                "DROP TRIGGER immutable_guide_comment_context",
+                "trigger immutable_guide_comment_context",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("incomplete.db");
+            let conn = Connection::open(&path).unwrap();
+            seed_released_schema(&conn);
+            conn.execute_batch(
+                "INSERT INTO metadata VALUES ('schema_version', '32');
+                 CREATE TABLE sentinel (value TEXT);
+                 INSERT INTO sentinel VALUES ('keep me');",
+            )
+            .unwrap();
+            conn.execute_batch(remove).unwrap();
+            let before = capture(&conn);
+            let error = WorkDb::open(path).err().expect("incomplete floor must fail");
+            let message = format!("{error:#}");
+            for expected in [
+                "database schema version 32",
+                "compatibility floor",
+                "Boss 1.0.707",
+                "schema 32",
+                missing,
+            ] {
+                assert!(message.contains(expected), "{message}");
+            }
+            assert_eq!(capture(&conn), before);
+            let value: String = conn
+                .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "keep me");
+            let version: String = conn
+                .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(version, "32");
+            let hosts: i64 = conn
+                .query_row("SELECT COUNT(*) FROM hosts", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(hosts, 0, "rejection must precede local-host initialization");
         }
-        println!("FLOOR_TIMINGS fresh_ms={fresh:?} existing_ms={existing:?}");
+    }
+
+    fn seed_released_schema(conn: &Connection) {
+        let mut objects: Vec<SchemaObject> = RELEASED_SCHEMA
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        objects.sort_by_key(|row| if row.0 == "table" { 0 } else { 1 });
+        for (_, _, _, sql) in objects {
+            if let Some(sql) = sql {
+                conn.execute_batch(&sql).unwrap();
+            }
+        }
     }
 
     // Captured from the released chain, never from baseline::SQL.

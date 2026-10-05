@@ -441,9 +441,9 @@ async fn run_one_pass_filtered(
         //
         // The discriminator is NOT the row's `autostart` flag.
         // `autostart` is single-shot: `start_execution_run` clears it the
-        // first time a row enters `active` (`work/executions_runs.rs`, and
-        // `migrate_backfill_autostart_consumed` backfilled the same for
-        // older rows), so EVERY row this sweep can legitimately recover —
+        // first time a row enters `active` (`work/executions_runs.rs`).
+        // Every supported database has it cleared on rows that ran, so
+        // EVERY row this sweep can legitimately recover —
         // every row whose worker actually ran — has `autostart = 0`.
         // Gating this sweep on `autostart` would not honour the park; it
         // would switch the sweep off, post-crash orphan recovery included.

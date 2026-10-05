@@ -11,18 +11,8 @@
 //! duration plus the running total since the phase began. A step is logged
 //! unconditionally: the point is a complete ledger, not an alarm, and the
 //! phases are short lists of coarse steps.
-//!
-//! [`SLOW_STEP_THRESHOLD`] is for the long, fine-grained lists (the ~150
-//! schema migration steps) where an unconditional line per step would
-//! bury the ledger — those log only the steps over the threshold plus a
-//! total.
 
 use std::time::{Duration, Instant};
-
-/// A fine-grained step (one schema migration, one probe) is logged on its
-/// own line only when it takes at least this long. Coarse startup phases
-/// ignore it and log every step.
-pub const SLOW_STEP_THRESHOLD: Duration = Duration::from_millis(50);
 
 /// Running ledger for one startup phase. Create with [`Self::begin`], call
 /// [`Self::mark`] after each step completes, and [`Self::finish`] when the
