@@ -402,7 +402,10 @@ async fn auto_run(kind: &str, via_revision: bool) -> (bool, usize) {
     let url = "https://github.com/acme/widget/pull/91";
     let packet = crate::test_support::source_capture_packet(url, "base", "head");
     let output = packet.clone();
+    let collections = Arc::new(AtomicUsize::new(0));
+    let counted = collections.clone();
     let collect: PacketCollectFn = Arc::new(move |_, _, _, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
         let packet = output.clone();
         Box::pin(async move { Ok(packet) })
     });
@@ -411,7 +414,7 @@ async fn auto_run(kind: &str, via_revision: bool) -> (bool, usize) {
     flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
     flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
     let request = SourceCaptureRequest::builder()
-        .root_task_id(requested)
+        .root_task_id(requested.clone())
         .pr_url(url)
         .trigger(PrSourceCaptureTrigger::Creation)
         .build();
@@ -419,7 +422,20 @@ async fn auto_run(kind: &str, via_revision: bool) -> (bool, usize) {
     if let Some(handle) = handle {
         handle.await.unwrap();
     }
+    // A regressed gate that judged the supplied id directly would store the
+    // capture under the revision id (or at least run the collector), which a
+    // lookup by chain root alone cannot see.
+    let under_requested = db.get_latest_pr_review_guide_source_capture(&requested).unwrap();
     let Some(capture) = db.get_latest_pr_review_guide_source_capture(&root).unwrap() else {
+        assert!(
+            under_requested.is_none(),
+            "capture must not be stored under the requested id"
+        );
+        assert_eq!(
+            collections.load(Ordering::SeqCst),
+            0,
+            "skipped roots must not spawn source collection"
+        );
         return (false, 0);
     };
     let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
