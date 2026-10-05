@@ -110,7 +110,7 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
     }
 
     func testAttachWorkerPanePathRecordsTmuxIdentityNotHomeDirectory() {
-        // Production attachWorkerPane builds EngineSpawnRequest via
+        // Production attachWorkerPane builds WorkerViewerLaunch via
         // `init(attaching:)` and hostAttachedPane logs spawnRequested
         // from those fields. Pin that path so a synthesized home
         // directory cannot silently return as workspace_path.
@@ -122,10 +122,9 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
             summary: nil,
             taskTitle: nil
         )
-        let launch = EngineSpawnRequest(attaching: request)
+        let launch = WorkerViewerLaunch(attaching: request)
         XCTAssertEqual(launch.sessionName, request.sessionName)
         XCTAssertEqual(launch.tmuxSocketPath, request.tmuxSocketPath)
-        XCTAssertEqual(launch.workspacePath, FileManager.default.homeDirectoryForCurrentUser.path)
 
         let extra = SpawnDiagnosticsLog.spawnRequestedExtra(
             slotId: Int(launch.slotId),
@@ -137,7 +136,7 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         XCTAssertEqual(extra["tmux_socket_path"] as? String, "/state/boss/tmux.sock")
         XCTAssertNil(extra["workspace_path"])
         XCTAssertFalse(
-            extra.values.contains { ($0 as? String) == launch.workspacePath },
+            extra.values.contains { ($0 as? String) == FileManager.default.homeDirectoryForCurrentUser.path },
             "tmux client cwd must not appear in spawn_requested extras"
         )
     }

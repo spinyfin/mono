@@ -2,13 +2,8 @@ import Foundation
 
 /// Internal launch parameters for a worker-viewer libghostty surface.
 /// `attachWorkerPane` builds this from an `EngineAttachRequest`.
-struct EngineSpawnRequest: Sendable {
+struct WorkerViewerLaunch: Sendable {
     let runId: String
-    /// Working directory of the local tmux *client* process (typically
-    /// the user's home). This is not the worker workspace — AttachWorkerPane
-    /// does not carry that path, and spawn diagnostics must not report it
-    /// as `workspace_path`.
-    let workspacePath: String
     /// 1-indexed slot the engine has claimed for this worker. The
     /// app must host the pane in this exact slot or fail with
     /// `.slotBusy`. The engine is the source of truth for slot
@@ -16,8 +11,6 @@ struct EngineSpawnRequest: Sendable {
     /// the app has been removed.
     let slotId: Int
     let initialInput: String
-    /// Always empty for tmux attachment; the engine configured the worker environment.
-    let env: [(String, String)]
     /// Engine-supplied 2–4 word present-continuous gerund phrase
     /// describing what the worker is doing (e.g. "fixing the fencer
     /// scraper"). Present only when the engine successfully called
@@ -28,9 +21,6 @@ struct EngineSpawnRequest: Sendable {
     /// fallback display label when `summary` is nil — rendered as
     /// `"<AgentName>: <taskTitle>"` rather than with a gerund "is".
     let taskTitle: String?
-    /// Viewer screen-scrape markers. The attach path always supplies
-    /// .claudeDefault; these markers are not supplied over the attach RPC.
-    let paneMonitor: PaneMonitorSpec?
     /// Detached tmux session the viewer attaches to. Recorded on
     /// `spawn_requested` so the JSONL identifies the worker without a
     /// workspace path.
