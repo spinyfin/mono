@@ -128,8 +128,8 @@ impl WorkDb {
     /// `blocked_reason`, which is NULL here. So a PR that is still
     /// dirty/red is never re-probed, no `task_blocked_signals` row is
     /// re-armed, and no remediation revision ever (re)spawns — the parent
-    /// rests `blocked` forever with no affordance to recover (the T795 /
-    /// PR #1077 strand). The merge poller's stranded-blocked reconciliation
+    /// rests `blocked` forever with no affordance to recover (the PR #1077
+    /// strand). The merge poller's stranded-blocked reconciliation
     /// pass re-probes these and re-canonicalises a still-dirty row back
     /// into the standard `blocked: merge_conflict` / `blocked: ci_failure`
     /// loop via [`Self::recanonicalize_blocked_merge_conflict`] /

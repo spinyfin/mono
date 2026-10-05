@@ -372,3 +372,121 @@ fn enqueue_resolves_product_repository_and_task_override() {
         assert_eq!(execution.status, ExecutionStatus::Ready);
     }
 }
+
+/// Run automatic capture with both flags on for a root of `kind`, optionally
+/// requested through a revision of that root (as the merge poller does).
+/// Returns whether a capture row exists and how many live generation
+/// attempts were enqueued for its series.
+async fn auto_run(kind: &str, via_revision: bool) -> (bool, usize) {
+    let (dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "kind gate");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET kind = ?1 WHERE id = ?2", [kind, root.as_str()])
+        .unwrap();
+    let requested = if via_revision {
+        let revision = create_active_chore(&db, &product, "kind gate revision");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET kind = 'revision', parent_task_id = ?1 WHERE id = ?2",
+                rusqlite::params![root, revision],
+            )
+            .unwrap();
+        revision
+    } else {
+        root.clone()
+    };
+    let url = "https://github.com/acme/widget/pull/91";
+    let packet = crate::test_support::source_capture_packet(url, "base", "head");
+    let output = packet.clone();
+    let collections = Arc::new(AtomicUsize::new(0));
+    let counted = collections.clone();
+    let collect: PacketCollectFn = Arc::new(move |_, _, _, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let packet = output.clone();
+        Box::pin(async move { Ok(packet) })
+    });
+    let collector = SourcePacketCollector::fixture(collect, packet);
+    let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("flags.toml")));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
+    let request = SourceCaptureRequest::builder()
+        .root_task_id(requested.clone())
+        .pr_url(url)
+        .trigger(PrSourceCaptureTrigger::Creation)
+        .build();
+    let handle = reconcile_review_guide_source_with_collector(db.clone(), flags, request, collector);
+    if let Some(handle) = handle {
+        handle.await.unwrap();
+    }
+    // A regressed gate that judged the supplied id directly would store the
+    // capture under the revision id (or at least run the collector), which a
+    // lookup by chain root alone cannot see.
+    let under_requested = db.get_latest_pr_review_guide_source_capture(&requested).unwrap();
+    let Some(capture) = db.get_latest_pr_review_guide_source_capture(&root).unwrap() else {
+        assert!(
+            under_requested.is_none(),
+            "capture must not be stored under the requested id"
+        );
+        assert_eq!(
+            collections.load(Ordering::SeqCst),
+            0,
+            "skipped roots must not spawn source collection"
+        );
+        return (false, 0);
+    };
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    for attempt in &live {
+        let execution = db
+            .get_execution(attempt.execution_id.as_deref().expect("must dispatch"))
+            .unwrap();
+        assert_eq!(execution.kind, ExecutionKind::PrReviewGuide);
+    }
+    (true, live.len())
+}
+
+#[tokio::test]
+async fn design_task_pr_is_not_auto_captured_or_generated() {
+    assert_eq!(auto_run("design", false).await, (false, 0));
+}
+
+#[tokio::test]
+async fn revision_of_design_task_is_not_auto_captured_or_generated() {
+    assert_eq!(auto_run("design", true).await, (false, 0));
+}
+
+#[tokio::test]
+async fn chore_pr_is_still_auto_captured_and_generated() {
+    assert_eq!(auto_run("chore", false).await, (true, 1));
+}
+
+#[tokio::test]
+async fn project_task_pr_is_still_auto_captured_and_generated() {
+    assert_eq!(auto_run("project_task", false).await, (true, 1));
+}
+
+#[tokio::test]
+async fn manual_capture_still_works_for_design_task() {
+    let (_dir, db) = open_db();
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "manual design");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET kind = 'design' WHERE id = ?1", [root.as_str()])
+        .unwrap();
+    let url = "https://github.com/acme/widget/pull/92";
+    let packet = crate::test_support::source_capture_packet(url, "base", "head");
+    let output = packet.clone();
+    let collect: PacketCollectFn = Arc::new(move |_, _, _, _| {
+        let packet = output.clone();
+        Box::pin(async move { Ok(packet) })
+    });
+    let collector = SourcePacketCollector::fixture(collect, packet);
+    capture_review_guide_source_manually(&db, &root, url, &collector)
+        .await
+        .unwrap();
+    assert!(db.get_latest_pr_review_guide_source_capture(&root).unwrap().is_some());
+}

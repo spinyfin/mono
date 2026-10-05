@@ -164,6 +164,24 @@ async fn manual_generation_captures_and_dispatches_with_both_flags_off() {
 }
 
 #[tokio::test]
+async fn manual_generation_still_dispatches_for_design_root() {
+    let f = Fixture::new(false);
+    let db = &f.state.work_db;
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET kind = 'design' WHERE id = ?1", [f.root.as_str()])
+        .unwrap();
+    let attempt = f.generate("design", false).await;
+    assert_eq!(attempt.status, "running");
+    let capture = db.get_latest_pr_review_guide_source_capture(&f.root).unwrap().unwrap();
+    assert_eq!(capture.trigger, "manual");
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].id, attempt.id);
+    assert!(live[0].execution_id.is_some());
+}
+
+#[tokio::test]
 async fn manual_generation_uses_product_repository_without_task_override() {
     let f = Fixture::new(false);
     let db = &f.state.work_db;
