@@ -519,7 +519,12 @@ pub(crate) fn reconcile_work_item_execution(
     // This keeps gated dependents out of `ready` and therefore out
     // of the dispatcher's pickup pool.
     // Dependency cascades can enter here without task_accepts_execution.
-    if query_task(conn, work_item_id)?.is_some_and(|task| task.blocked_reason.as_deref() == Some("worker_failed")) {
+    if query_task(conn, work_item_id)?.is_some_and(|task| {
+        matches!(
+            task.blocked_reason.as_deref(),
+            Some("worker_failed" | "awaiting_operator_answer")
+        )
+    }) {
         return Ok(());
     }
     let gated = !deps::gating_prereqs_for(conn, work_item_id)?.is_empty();
@@ -1276,10 +1281,11 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // An explicit retry acknowledges the failed attempt. Its run history
         // retains the explanation, while the new attempt starts without a stale
         // failure blocker. Automatic reconciliation cannot reach this clear.
+        super::pr_flow::withdraw_questions(conn, &work_item_id, "restarted_without_answer")?;
         conn.execute(
             "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
                  last_status_actor = 'engine', updated_at = ?2
-             WHERE id = ?1 AND status = 'blocked' AND blocked_reason = 'worker_failed'",
+             WHERE id = ?1 AND status = 'blocked' AND blocked_reason IN ('worker_failed', 'awaiting_operator_answer')",
             params![work_item_id, now],
         )?;
 

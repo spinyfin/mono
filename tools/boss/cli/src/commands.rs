@@ -430,6 +430,17 @@ pub(crate) enum ProjectCommand {
     },
 }
 
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("answer").required(true).args(["yes", "no"])))]
+pub(crate) struct TaskAnswerArgs {
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    pub id: String,
+    #[arg(long)]
+    pub yes: bool,
+    #[arg(long)]
+    pub no: bool,
+}
+
 /// Subcommands under `boss task ...`.
 ///
 /// The kind-agnostic verbs (`show`, `update`, `move`, `delete`,
@@ -445,6 +456,8 @@ pub(crate) enum ProjectCommand {
 /// meaningful for project tasks).
 #[derive(Debug, Subcommand)]
 pub(crate) enum TaskCommand {
+    /// Answer the open question on a task, or a specific question id.
+    Answer(TaskAnswerArgs),
     Create(TaskCreateArgs),
     /// Bulk-create N tasks from a JSON array. Sidesteps the per-call
     /// CLI startup overhead of running `task create` N times — one

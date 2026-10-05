@@ -173,6 +173,15 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
         "worker_signal seam off: blocked outcome must preserve the reason on propose done --summary:\n{prompt}",
     );
     assert!(
+        prompt.contains(
+            "--question \"Approve raising the 30-file limit to 48 files?\" --answer-type yes-no --explanation"
+        )
+    );
+    assert!(prompt.contains("Before asking, check the brief for a `## Operator authorization` section."));
+    assert!(prompt.contains("Use the typed question flags on a blocked declaration"));
+    assert!(prompt.contains("Yes appends authorization and restarts in the preserved workspace"));
+    assert!(prompt.contains("No leaves the task blocked in Backlog"));
+    assert!(
         prompt.contains("the marker is Stop-boundary-only"),
         "worker_signal seam off: must describe the marker as Stop-boundary-only:\n{prompt}",
     );

@@ -272,10 +272,12 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
         ProposalKind::RunDone => {
             let outcome = reader.required_enum::<RunDoneOutcome>("outcome");
             let summary = reader.required_text("summary", MAX_SHORT_FIELD_CHARS);
+            let question = reader.operator_question(outcome);
             reader.finish()?;
             to_json(&RunDoneProposalPayload {
                 outcome: outcome.unwrap_or(RunDoneOutcome::Blocked),
                 summary: summary.unwrap_or_default(),
+                question,
             })
         }
     };
@@ -534,6 +536,36 @@ impl<'a> PayloadReader<'a> {
         self.text_from(field, value, max_chars)
     }
 
+    fn operator_question(&mut self, outcome: Option<RunDoneOutcome>) -> Option<boss_protocol::OperatorQuestion> {
+        let value = self.raw("question")?;
+        if outcome != Some(RunDoneOutcome::Blocked) {
+            self.error("question", "a question is only meaningful on a blocked declaration");
+        }
+        if let Some(kind) = value.pointer("/answer_type/kind").and_then(Value::as_str)
+            && kind != "yes_no"
+        {
+            self.error("question.answer_type.kind", format!("unsupported answer type: {kind}"));
+            return None;
+        }
+        let mut question = match serde_json::from_value::<boss_protocol::OperatorQuestion>(value.clone()) {
+            Ok(question) => question,
+            Err(err) => {
+                self.error("question", format!("unsupported or invalid question: {err}"));
+                return None;
+            }
+        };
+        question.text = self.text_from("question.text", &Value::String(question.text), 500)?;
+        if question.text.contains(['\n', '\r']) {
+            self.error("question.text", "must be a single line");
+        }
+        question.explanation = self.text_from(
+            "question.explanation",
+            &Value::String(question.explanation),
+            MAX_LONG_FIELD_CHARS,
+        )?;
+        Some(question)
+    }
+
     /// Read `field` as an optional non-empty, length-bounded string. An
     /// absent (or null) key is fine; a present-but-blank one is not — a
     /// worker that passes `--branch ""` meant to pass nothing, and silently
@@ -687,3 +719,52 @@ impl<'a> PayloadReader<'a> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod operator_question_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn blocked_question_validation_and_canonicalization() {
+        let valid = json!({"outcome":"blocked", "summary":"Needs approval", "question":{
+            "text":"  Approve 48 files against the limit of 30?  ",
+            "answer_type":{"kind":"yes_no"}, "explanation":"  All files are required.  "
+        }});
+        let canonical = validate_payload(ProposalKind::RunDone, &valid).unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        let question = parsed.question.unwrap();
+        assert_eq!(question.text, "Approve 48 files against the limit of 30?");
+        assert_eq!(question.explanation, "All files are required.");
+        for outcome in ["delivered", "no_changes_needed"] {
+            let mut invalid = valid.clone();
+            invalid["outcome"] = json!(outcome);
+            assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err());
+        }
+        for kind in ["multiple_choice", "prompt", "unknown"] {
+            let mut invalid = valid.clone();
+            invalid["question"]["answer_type"]["kind"] = json!(kind);
+            assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err());
+        }
+        for text in [
+            String::new(),
+            " ".into(),
+            "first\nsecond".into(),
+            "first\rsecond".into(),
+            "é".repeat(501),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["question"]["text"] = json!(text);
+            assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err());
+        }
+        for explanation in [String::new(), "x".repeat(MAX_LONG_FIELD_CHARS + 1)] {
+            let mut invalid = valid.clone();
+            invalid["question"]["explanation"] = json!(explanation);
+            assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err());
+        }
+        let mut boundary = valid;
+        boundary["question"]["text"] = json!("é".repeat(500));
+        boundary["question"]["explanation"] = json!("x".repeat(MAX_LONG_FIELD_CHARS));
+        assert!(validate_payload(ProposalKind::RunDone, &boundary).is_ok());
+    }
+}

@@ -281,6 +281,12 @@ pub enum FrontendRequest {
         dismiss: bool,
     },
 
+    /// Answer a blocked worker's question by question id or task selector.
+    AnswerOperatorQuestion {
+        id: String,
+        answer: crate::OperatorAnswer,
+    },
+
     /// Heuristic feedback-loop audit (design §Q4 follow-up, PR #370).
     /// Aggregates recorded escalation events for `product_id`
     /// against the §Q4 marker corpus and returns a snapshot report
@@ -1499,6 +1505,11 @@ pub enum FrontendRequest {
     /// summarizer disabled. The UI uses this to render the toggle
     /// state on the Agents-tab worker row.
     ListLiveStatusDisabledSlots,
+
+    /// Open and historical operator questions for a task.
+    ListOperatorQuestions {
+        id: String,
+    },
 
     /// All `planner_runs` audit rows for a project, newest first. Backs
     /// `boss project plan-runs <project>` — the operator's after-the-fact

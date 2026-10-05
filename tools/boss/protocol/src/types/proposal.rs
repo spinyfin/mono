@@ -462,6 +462,8 @@ impl std::str::FromStr for RunDoneOutcome {
 pub struct RunDoneProposalPayload {
     pub outcome: RunDoneOutcome,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<super::OperatorQuestion>,
 }
 
 // ---------------------------------------------------------------------------
@@ -631,4 +633,119 @@ pub const PROPOSAL_CAP_PER_KIND_PER_EXECUTION: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewGuideProposalPayload {
     pub body_markdown: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorQuestion {
+    pub text: String,
+    pub answer_type: OperatorAnswerType,
+    pub explanation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorAnswerType {
+    YesNo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorAnswer {
+    YesNo { value: bool },
+}
+
+/// The open question projected onto a task for board and detail readers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct OperatorQuestionView {
+    pub id: String,
+    pub text: String,
+    pub answer_type: OperatorAnswerType,
+    pub explanation: String,
+    pub asked_at: String,
+    pub execution_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorQuestionStatus {
+    Open,
+    Answered,
+    Withdrawn,
+}
+
+/// Immutable question and durable answer/withdrawal history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct OperatorQuestionRecord {
+    #[serde(flatten)]
+    pub question: OperatorQuestionView,
+    pub work_item_id: String,
+    pub status: OperatorQuestionStatus,
+    pub answer: Option<OperatorAnswer>,
+    pub answered_by: Option<String>,
+    pub answered_at: Option<String>,
+    pub withdrawn_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum OperatorQuestionError {
+    NotFound,
+    Conflict {
+        state: String,
+        answer: Option<OperatorAnswer>,
+    },
+    ValidationFailed {
+        message: String,
+    },
+}
+
+impl std::fmt::Display for OperatorQuestionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for OperatorQuestionError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn question_and_answer_round_trip_and_reserved_tags_are_rejected() {
+        let question = OperatorQuestion {
+            text: "Approve the larger limit?".into(),
+            answer_type: OperatorAnswerType::YesNo,
+            explanation: "The requested change exceeds the current limit.".into(),
+        };
+        let payload = super::RunDoneProposalPayload {
+            outcome: super::RunDoneOutcome::Blocked,
+            summary: "A decision is required.".into(),
+            question: Some(question),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["question"]["answer_type"]["kind"], "yes_no");
+        assert_eq!(
+            serde_json::from_value::<super::RunDoneProposalPayload>(json).unwrap(),
+            payload
+        );
+        for value in [true, false] {
+            let answer = OperatorAnswer::YesNo { value };
+            assert_eq!(
+                serde_json::from_str::<OperatorAnswer>(&serde_json::to_string(&answer).unwrap()).unwrap(),
+                answer
+            );
+        }
+        for kind in ["multiple_choice", "prompt", "unknown"] {
+            let json = serde_json::json!({"kind": kind});
+            assert!(serde_json::from_value::<OperatorAnswerType>(json.clone()).is_err());
+            assert!(serde_json::from_value::<OperatorAnswer>(json).is_err());
+        }
+        let old: super::RunDoneProposalPayload =
+            serde_json::from_str(r#"{"outcome":"blocked","summary":"Waiting"}"#).unwrap();
+        assert!(old.question.is_none());
+        assert!(serde_json::to_value(old).unwrap().get("question").is_none());
+    }
 }

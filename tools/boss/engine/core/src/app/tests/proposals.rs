@@ -24,6 +24,406 @@ use boss_protocol::{
 };
 use serde_json::{Value, json};
 
+fn operator_question_payload() -> Value {
+    json!({"outcome":"blocked", "summary":"The scope needs authorization", "question":{
+        "text":"Approve raising the file limit from 30 to 48?",
+        "answer_type":{"kind":"yes_no"},
+        "explanation":"All 48 files are needed for the requested migration."
+    }})
+}
+
+async fn parked_question_task() -> (Arc<ServerState>, tempfile::TempDir, String, String) {
+    let (state, dir, execution, task) = live_chore_execution();
+    {
+        let conn = state.work_db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET kind = 'project_task', description = 'Original brief' WHERE id = ?1",
+            [&task],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET kind = 'task_implementation' WHERE id = ?1",
+            [&execution],
+        )
+        .unwrap();
+    }
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(&execution, ProposalKind::RunDone, operator_question_payload()),
+        )
+        .await,
+    );
+    (state, dir, execution, task)
+}
+
+fn question_task(state: &ServerState, id: &str) -> boss_protocol::Task {
+    let crate::work::WorkItem::Task(task) = state.work_db.get_work_item(id).unwrap() else {
+        panic!("expected task");
+    };
+    task
+}
+
+async fn answer_question(state: &Arc<ServerState>, id: &str, value: bool) -> FrontendEvent {
+    call_with_peer(
+        state,
+        None,
+        FrontendRequest::AnswerOperatorQuestion {
+            id: id.into(),
+            answer: boss_protocol::OperatorAnswer::YesNo { value },
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn question_finalize_preserves_workspace_and_never_auto_dispatches() {
+    let (state, _dir, execution_id, task_id) = parked_question_task().await;
+    let db = &state.work_db;
+    let task = question_task(&state, &task_id);
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("awaiting_operator_answer"));
+    assert_eq!(
+        task.blocked_detail.as_deref(),
+        Some("Approve raising the file limit from 30 to 48?")
+    );
+    assert!(!task.autostart);
+    let question = task.operator_question.as_ref().unwrap();
+    assert_eq!(question.execution_id, execution_id);
+    assert_eq!(question.text, task.blocked_detail.as_deref().unwrap());
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert_eq!(execution.status, boss_protocol::ExecutionStatus::Failed);
+    assert!(execution.cube_lease_id.is_none());
+    assert!(execution.cube_workspace_id.is_none());
+    assert!(execution.workspace_path.is_none());
+    assert_eq!(execution.preferred_workspace_id.as_deref(), Some("workspace-run-done"));
+    assert!(db.list_attention_items_for_work_item(&task_id).unwrap().is_empty());
+    assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&task_id])
+        .unwrap();
+    db.reconcile_product_executions(&task.product_id).unwrap();
+    db.reconcile_active_dispatch(|_| false).unwrap();
+    assert_eq!(db.list_executions(Some(&task_id)).unwrap().len(), 1);
+    let listed = db.list_tasks(&task.product_id, None, None, false).unwrap();
+    assert_eq!(
+        listed.iter().find(|item| item.id == task_id).unwrap().operator_question,
+        task.operator_question
+    );
+    let tree = db.get_work_tree(&task.product_id).unwrap();
+    assert_eq!(
+        tree.tasks
+            .iter()
+            .find(|item| item.id == task_id)
+            .unwrap()
+            .operator_question,
+        task.operator_question
+    );
+}
+
+#[tokio::test]
+async fn question_yes_appends_exact_authorization_and_mints_one_preserved_execution() {
+    let (state, _dir, old_execution, task_id) = parked_question_task().await;
+    let original = question_task(&state, &task_id);
+    let question = original.operator_question.unwrap();
+    let answer = answer_question(&state, &original.short_id.unwrap().to_string(), true).await;
+    let FrontendEvent::WorkItemUpdated {
+        item: crate::work::WorkItem::Task(task),
+    } = answer
+    else {
+        panic!("expected updated task: {answer:?}");
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
+    assert!(task.autostart);
+    assert_eq!(task.last_status_actor, "human");
+    assert!(task.blocked_reason.is_none());
+    assert!(task.blocked_detail.is_none());
+    assert!(task.operator_question.is_none());
+    let history = state.work_db.list_operator_questions(&task_id).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].status, boss_protocol::OperatorQuestionStatus::Answered);
+    assert_eq!(history[0].answered_by.as_deref(), Some("human"));
+    let timestamp = chrono::DateTime::from_timestamp(history[0].answered_at.as_ref().unwrap().parse().unwrap(), 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M UTC")
+        .to_string();
+    assert_eq!(
+        task.description,
+        format!(
+            "Original brief\n\n---\n\n## Operator authorization ({timestamp})\n\n\
+- **Question the previous worker asked:** Approve raising the file limit from 30 to 48?\n\
+- **Answer:** Yes\n\
+- **The worker's explanation:** All 48 files are needed for the requested migration.\n\
+- **Asked by run:** `{old_execution}`\n\n\
+The operator recorded this answer on the kanban. It is explicit, human-granted approval for exactly what the question asks and nothing broader. Treat it as the authorization the worker rules require before relaxing a check or exceeding a limit for this task; state in the PR body that the operator authorized it on the date above. It does not authorize bypassing any other check, and it does not change what the repository's checks enforce.\n"
+        )
+    );
+    let executions = state.work_db.list_executions(Some(&task_id)).unwrap();
+    assert_eq!(executions.len(), 2);
+    let next = executions
+        .iter()
+        .find(|execution| execution.id != old_execution)
+        .unwrap();
+    assert_eq!(next.status, boss_protocol::ExecutionStatus::Ready);
+    assert_eq!(next.preferred_workspace_id.as_deref(), Some("workspace-run-done"));
+    assert!(next.allow_dirty && next.prefer_is_soft);
+    for selector in [&question.id, &task_id] {
+        assert!(matches!(
+            answer_question(&state, selector, true).await,
+            FrontendEvent::WorkItemUpdated { .. }
+        ));
+    }
+    assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 2);
+    assert_eq!(question_task(&state, &task_id).description, task.description);
+    assert!(matches!(answer_question(&state, &question.id, false).await,
+        FrontendEvent::OperatorQuestionError { error: boss_protocol::OperatorQuestionError::Conflict {
+            state, answer: Some(boss_protocol::OperatorAnswer::YesNo { value: true })
+        }} if state == "answered"));
+}
+
+#[tokio::test]
+async fn question_no_records_decline_and_remains_in_backlog() {
+    let (state, _dir, _, task_id) = parked_question_task().await;
+    assert!(matches!(
+        answer_question(&state, &task_id, false).await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    let task = question_task(&state, &task_id);
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert!(!task.autostart);
+    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+    assert_eq!(task.description, "Original brief");
+    assert!(task.operator_question.is_none());
+    let record = state.work_db.list_operator_questions(&task_id).unwrap().remove(0);
+    let date = chrono::DateTime::from_timestamp(record.answered_at.unwrap().parse().unwrap(), 0)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        task.blocked_detail.unwrap(),
+        format!(
+            "Operator declined on {date}: \"Approve raising the file limit from 30 to 48?\"\n\nWorker's explanation: All 48 files are needed for the requested migration.\n\nRun summary: The scope needs authorization"
+        )
+    );
+    assert!(matches!(
+        answer_question(&state, &task_id, false).await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn question_restart_delete_and_edits_withdraw_atomically() {
+    for action in ["restart", "delete", "status", "reason"] {
+        let (state, _dir, _, task_id) = parked_question_task().await;
+        let question_id = question_task(&state, &task_id).operator_question.unwrap().id;
+        let reason = match action {
+            "restart" => {
+                state
+                    .work_db
+                    .request_execution(
+                        boss_protocol::RequestExecutionInput::builder()
+                            .work_item_id(&task_id)
+                            .build(),
+                    )
+                    .unwrap();
+                "restarted_without_answer"
+            }
+            "delete" => {
+                state.work_db.delete_work_item(&task_id).unwrap();
+                "task_deleted"
+            }
+            "status" => {
+                state
+                    .work_db
+                    .update_work_item(
+                        &task_id,
+                        boss_protocol::WorkItemPatch {
+                            status: Some("todo".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                "status_edited"
+            }
+            _ => {
+                state
+                    .work_db
+                    .update_work_item(
+                        &task_id,
+                        boss_protocol::WorkItemPatch {
+                            blocked_reason: Some("operator_override".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                "reason_edited"
+            }
+        };
+        let record = state.work_db.list_operator_questions(&task_id).unwrap().remove(0);
+        assert_eq!(
+            record.status,
+            boss_protocol::OperatorQuestionStatus::Withdrawn,
+            "{action}"
+        );
+        assert_eq!(record.withdrawn_reason.as_deref(), Some(reason));
+        let response = answer_question(&state, &question_id, true).await;
+        if action == "delete" {
+            assert!(matches!(
+                response,
+                FrontendEvent::OperatorQuestionError {
+                    error: boss_protocol::OperatorQuestionError::NotFound
+                }
+            ));
+        } else {
+            assert!(matches!(response, FrontendEvent::OperatorQuestionError {
+                error: boss_protocol::OperatorQuestionError::Conflict { state, .. }
+            } if state == "withdrawn"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn question_on_chore_folds_into_failure_and_unparkable_task_withdraws() {
+    for kind in ["chore", "followup", "project_task"] {
+        let (state, _dir, execution_id, task_id) = live_chore_execution();
+        if kind == "followup" {
+            state
+                .work_db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET kind = ?2 WHERE id = ?1",
+                    rusqlite::params![task_id, kind],
+                )
+                .unwrap();
+        }
+        if kind == "project_task" {
+            state
+                .work_db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET kind = 'project_task', status = 'in_review' WHERE id = ?1",
+                    [&task_id],
+                )
+                .unwrap();
+        }
+        submitted(
+            call_with_peer(
+                &state,
+                Some(std::process::id() as libc::pid_t),
+                submit_request(&execution_id, ProposalKind::RunDone, operator_question_payload()),
+            )
+            .await,
+        );
+        let item = state.work_db.get_work_item(&task_id).unwrap();
+        match item {
+            crate::work::WorkItem::Chore(task) => {
+                assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+                let detail = task.blocked_detail.unwrap();
+                assert!(detail.contains("Approve raising the file limit from 30 to 48?"));
+                assert!(detail.contains("All 48 files are needed"));
+                assert!(state.work_db.list_operator_questions(&task_id).unwrap().is_empty());
+            }
+            crate::work::WorkItem::Task(task) => {
+                assert_eq!(task.status, boss_protocol::TaskStatus::InReview);
+                assert!(task.operator_question.is_none());
+                let record = state.work_db.list_operator_questions(&task_id).unwrap().remove(0);
+                assert_eq!(record.withdrawn_reason.as_deref(), Some("task_not_parkable"));
+            }
+            _ => panic!("expected task or chore"),
+        }
+        assert_eq!(
+            state.work_db.get_execution(&execution_id).unwrap().status,
+            boss_protocol::ExecutionStatus::Failed
+        );
+    }
+}
+
+#[tokio::test]
+async fn question_answer_rolls_back_when_dispatch_cannot_create_an_execution() {
+    let (state, _dir, _, task_id) = parked_question_task().await;
+    let before = question_task(&state, &task_id);
+    // Repository resolution is part of the dispatch transaction. A failure
+    // must leave both the unanswered question and original brief intact.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE products SET repo_remote_url = NULL WHERE id = ?1",
+            [&before.product_id],
+        )
+        .unwrap();
+    assert!(matches!(
+        answer_question(&state, &task_id, true).await,
+        FrontendEvent::WorkError { .. }
+    ));
+    let after = question_task(&state, &task_id);
+    assert_eq!(after.description, before.description);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.blocked_reason, before.blocked_reason);
+    assert_eq!(after.operator_question, before.operator_question);
+    let records = state.work_db.list_operator_questions(&task_id).unwrap();
+    assert_eq!(records[0].status, boss_protocol::OperatorQuestionStatus::Open);
+    assert!(records[0].answer.is_none());
+    assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn question_edit_between_acceptance_and_finalize_is_not_overwritten() {
+    let (state, _dir, execution_id, task_id) = live_chore_execution();
+    state.feature_flags.set("run_done_proposals_seam", false).unwrap();
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute("UPDATE tasks SET kind = 'project_task' WHERE id = ?1", [&task_id])
+        .unwrap();
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(&execution_id, ProposalKind::RunDone, operator_question_payload()),
+        )
+        .await,
+    );
+    state
+        .work_db
+        .update_work_item(
+            &task_id,
+            boss_protocol::WorkItemPatch {
+                status: Some("todo".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let question = state
+        .work_db
+        .execution_operator_question(&execution_id)
+        .unwrap()
+        .unwrap();
+    state
+        .work_db
+        .record_worker_awaiting_operator_answer(&execution_id, "late finalization", &question)
+        .unwrap();
+    let task = question_task(&state, &task_id);
+    assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
+    assert!(task.operator_question.is_none());
+    let record = state.work_db.list_operator_questions(&task_id).unwrap().remove(0);
+    assert_eq!(record.status, boss_protocol::OperatorQuestionStatus::Withdrawn);
+    assert_eq!(record.withdrawn_reason.as_deref(), Some("status_edited"));
+    assert!(matches!(
+        answer_question(&state, &record.question.id, true).await,
+        FrontendEvent::OperatorQuestionError {
+            error: boss_protocol::OperatorQuestionError::Conflict { .. }
+        }
+    ));
+}
+
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
 /// A product, chore, and `ready` execution, with this process registered as
@@ -92,6 +492,9 @@ async fn call_with_peer(
             r @ FrontendRequest::SubmitProposal { .. } => proposals::handle_submit_proposal(ctx, r).await,
             r @ FrontendRequest::ListProposals { .. } => proposals::handle_list_proposals(ctx, r).await,
             r @ FrontendRequest::GetWorkItem { .. } => super::super::work_items::handle_get_work_item(ctx, r).await,
+            r @ FrontendRequest::AnswerOperatorQuestion { .. } | r @ FrontendRequest::ListOperatorQuestions { .. } => {
+                super::super::work_items::handle_operator_question(ctx, r).await
+            }
             other => panic!("not a supported test verb: {other:?}"),
         }
     };

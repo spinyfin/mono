@@ -209,6 +209,17 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let status = parse_text_column::<TaskStatus>(6, &status_raw)?;
     Ok(Task {
         id: row.get(0)?,
+        operator_question: match row.as_ref().column_index("operator_question") {
+            Ok(index) => row
+                .get::<_, Option<String>>(index)?
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
+                    })
+                })
+                .transpose()?,
+            Err(_) => None,
+        },
         product_id: row.get(1)?,
         project_id: row.get(2)?,
         kind,

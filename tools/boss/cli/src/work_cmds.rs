@@ -816,6 +816,20 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         TaskCommand::ByPr(args) => run_by_pr(&mut client, ctx, args).await,
         TaskCommand::ByExec(args) => run_by_exec(&mut client, ctx, args).await,
         TaskCommand::Executions(args) => run_task_executions(&mut client, ctx, args).await,
+        TaskCommand::Answer(args) => {
+            let response = client
+                .send_request(&FrontendRequest::AnswerOperatorQuestion {
+                    id: args.id,
+                    answer: boss_protocol::OperatorAnswer::YesNo { value: args.yes },
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::WorkItemUpdated { item } => print_entity(ctx, &item, || println!("Answer recorded.")),
+                FrontendEvent::OperatorQuestionError { error } => Err(CliError::usage(error.to_string())),
+                other => Err(unexpected_event("task answer", &other)),
+            }
+        }
         TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args, false).await,
         TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, *args).await,
         TaskCommand::Complete(args) => run_complete_human_driven(&mut client, ctx, args).await,
@@ -1468,12 +1482,24 @@ pub(crate) async fn run_show_leaf(
     let execution_runs = list_execution_runs(client, &executions).await?;
     let runtime = get_task_runtime(client, &item.id).await?;
     let attention_items = list_attention_items_for_work_item(client, &item.id).await?;
+    let questions = match client
+        .send_request(&FrontendRequest::ListOperatorQuestions { id: item.id.clone() })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::OperatorQuestionsList { questions } => questions,
+        other => return Err(unexpected_event("operator question history", &other)),
+    };
     let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
     let mut task_json = task_json_with_runtime(&item, &runtime)?;
     // These keys share a namespace with `Task`'s own serialized fields, so a
     // future `Task` field named `dependencies`/`executions`/`attention_items`/
     // `attention_groups` would be silently overwritten by the insert below.
     if let serde_json::Value::Object(map) = &mut task_json {
+        map.insert(
+            "operator_questions".into(),
+            serde_json::to_value(&questions).map_err(CliError::internal)?,
+        );
         map.insert(
             "dependencies".to_owned(),
             serde_json::to_value(&detail).map_err(CliError::internal)?,
@@ -1495,6 +1521,26 @@ pub(crate) async fn run_show_leaf(
     }
     print_entity(ctx, &task_json, || {
         print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
+        for record in &questions {
+            let q = &record.question;
+            println!("\nOperator question {} ({:?}): {}", q.id, record.status, q.text);
+            println!(
+                "  Answer type: yes_no; asked: {}; execution: {}",
+                q.asked_at, q.execution_id
+            );
+            println!("  Explanation: {}", q.explanation);
+            if let Some(boss_protocol::OperatorAnswer::YesNo { value }) = &record.answer {
+                println!(
+                    "  Answer: {}; by: {}; at: {}",
+                    if *value { "Yes" } else { "No" },
+                    record.answered_by.as_deref().unwrap_or(""),
+                    record.answered_at.as_deref().unwrap_or("")
+                );
+            }
+            if let Some(reason) = &record.withdrawn_reason {
+                println!("  Withdrawn: {reason}");
+            }
+        }
         print_attention_items_section(&attention_items);
         print_attention_groups_section(&attention_groups);
         print_runtime_section(&runtime);

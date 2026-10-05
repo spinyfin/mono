@@ -415,6 +415,18 @@ fn top_cost_report() -> crate::TopCostReport {
 /// forces a new variant to be represented here.
 fn tag_cases() -> Vec<TagCase> {
     vec![
+        TagCase {
+            label: "operator_questions",
+            event: FrontendEvent::OperatorQuestionsList { questions: vec![] },
+            expected_tag: "operator_questions_list",
+        },
+        TagCase {
+            label: "operator_question_error",
+            event: FrontendEvent::OperatorQuestionError {
+                error: crate::OperatorQuestionError::NotFound,
+            },
+            expected_tag: "operator_question_error",
+        },
         // --- Connection lifecycle ---
         TagCase {
             label: "Hello",
@@ -2294,7 +2306,9 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::SelectedProductResult { .. }
         | FrontendEvent::SelectedProductReported { .. }
         | FrontendEvent::AttachmentStored { .. }
-        | FrontendEvent::AttachmentsList { .. } => {}
+        | FrontendEvent::AttachmentsList { .. }
+        | FrontendEvent::OperatorQuestionsList { .. }
+        | FrontendEvent::OperatorQuestionError { .. } => {}
     }
 }
 

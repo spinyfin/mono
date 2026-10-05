@@ -2011,6 +2011,7 @@ fn run_done_payload_roundtrips() {
     let payload = RunDoneProposalPayload {
         outcome: RunDoneOutcome::Delivered,
         summary: "opened https://github.com/foo/bar/pull/1 with the md5 crate swap".into(),
+        question: None,
     };
     let raw = serde_json::to_value(&payload).unwrap();
     assert_eq!(raw.get("outcome").and_then(|v| v.as_str()), Some("delivered"));

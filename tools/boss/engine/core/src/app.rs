@@ -2407,6 +2407,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::DeleteAutomation { .. } => Box::pin(automations::handle_delete_automation(ctx, r)),
             r @ FrontendRequest::DeleteIdea { .. } => Box::pin(ideas::handle_delete_idea(ctx, r)),
             r @ FrontendRequest::DeleteWorkItem { .. } => Box::pin(work_items::handle_delete_work_item(ctx, r)),
+            r @ FrontendRequest::AnswerOperatorQuestion { .. } | r @ FrontendRequest::ListOperatorQuestions { .. } => {
+                Box::pin(work_items::handle_operator_question(ctx, r))
+            }
             r @ FrontendRequest::DisableAutomation { .. } => Box::pin(automations::handle_disable_automation(ctx, r)),
             r @ FrontendRequest::DismissAttention { .. } => Box::pin(attentions::handle_dismiss_attention(ctx, r)),
             r @ FrontendRequest::EnableAutomation { .. } => Box::pin(automations::handle_enable_automation(ctx, r)),
