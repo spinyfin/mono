@@ -184,6 +184,25 @@ The operator recorded this answer on the kanban. It is explicit, human-granted a
 }
 
 #[tokio::test]
+async fn question_answer_reports_a_minted_execution_only_for_the_first_yes() {
+    let yes = boss_protocol::OperatorAnswer::YesNo { value: true };
+    let no = boss_protocol::OperatorAnswer::YesNo { value: false };
+
+    let (state, _dir, _, task_id) = parked_question_task().await;
+    let (_, minted) = state.work_db.answer_operator_question(&task_id, yes.clone()).unwrap();
+    assert!(
+        minted,
+        "a first Yes mints a ready execution the scheduler must be kicked for"
+    );
+    let (_, minted) = state.work_db.answer_operator_question(&task_id, yes).unwrap();
+    assert!(!minted, "an idempotent repeat mints nothing");
+
+    let (state, _dir, _, task_id) = parked_question_task().await;
+    let (_, minted) = state.work_db.answer_operator_question(&task_id, no).unwrap();
+    assert!(!minted, "a No mints nothing");
+}
+
+#[tokio::test]
 async fn question_no_records_decline_and_remains_in_backlog() {
     let (state, _dir, _, task_id) = parked_question_task().await;
     assert!(matches!(

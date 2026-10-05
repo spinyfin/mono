@@ -1013,7 +1013,10 @@ pub(crate) fn run_done_directive(
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let (blocked_file, blocked_while_continuing) = if worker_signal_seam_enabled {
         (
-            format!("File `{boss} propose blocked --reason \"...\"` alongside it (before this call)"),
+            format!(
+                "File `{boss} propose blocked --reason \"...\"` alongside it (before this call), \
+                 unless the declaration carries a question as described below"
+            ),
             format!("`{boss} propose blocked --reason \"...\"` alone records"),
         )
     } else {
@@ -1025,6 +1028,14 @@ pub(crate) fn run_done_directive(
              ends without a terminal `propose done`) and records"
                 .to_string(),
         )
+    };
+    let question_companion = if worker_signal_seam_enabled {
+        format!(
+            " A declaration that carries a question is its own blocker record: do NOT also file \
+             `{boss} propose blocked`, because that raises a separate attention item the answer never clears."
+        )
+    } else {
+        String::new()
     };
     let gate_exception = if conflict_resolution {
         "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
@@ -1080,7 +1091,7 @@ pub(crate) fn run_done_directive(
      ```\n\
      {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Approve raising the 30-file limit to 48 files?\" --answer-type yes-no --explanation \"<why this is needed and what Yes authorizes>\"\n\
      ```\n\n\
-     Name the check or limit, the amount needed versus allowed, and what you will do on Yes. \"Can I proceed?\" is not specific enough. Put the justification in --explanation, not the question. One question per run: ask the most blocking decision and disclose any further decisions in the explanation. Tasks wait durably for the answer; Yes appends authorization and restarts in the preserved workspace, No leaves the task blocked in Backlog. Chores retain the question in their failure detail.\n\n\
+     Name the check or limit, the amount needed versus allowed, and what you will do on Yes. \"Can I proceed?\" is not specific enough. Put the justification in --explanation, not the question.{question_companion} One question per run: ask the most blocking decision and disclose any further decisions in the explanation. Tasks wait durably for the answer; Yes appends authorization and restarts in the preserved workspace, No leaves the task blocked in Backlog. Chores retain the question in their failure detail.\n\n\
      Before asking, check the brief for a `## Operator authorization` section. If it already grants the authorization needed, proceed and cite it in the PR body. Do not ask for decisions you are allowed to make, or use questions to hand back work that is merely hard. The answer authorizes exactly the question; it does not disable or bypass repository checks.\n\n\
      {gate_exception}\n\n\
      To flag a concern while continuing, {blocked_while_continuing} the blocker and pauses the \

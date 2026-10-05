@@ -216,6 +216,31 @@ fn run_done_seam_on_worker_signal_seam_on_teaches_propose_blocked() {
     );
 }
 
+#[test]
+fn both_seams_on_forbid_companion_propose_blocked_for_typed_questions() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .worker_signal_proposals_seam_enabled(true)
+            .run_done_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("unless the declaration carries a question as described below"),
+        "the companion propose blocked instruction must exempt question-bearing declarations:\n{prompt}",
+    );
+    assert!(
+        prompt.contains(
+            "A declaration that carries a question is its own blocker record: do NOT also file \
+             `\"$BOSS_BIN\" propose blocked`"
+        ),
+        "the question paragraph must forbid a companion propose blocked:\n{prompt}",
+    );
+}
+
 /// When `run_done_proposals_seam` is on, the Bazel pre-push gate itself must
 /// override its absolute "do not push red code" stop with the evidence-gated
 /// unattributable-failure exception — not leave that exception only in the

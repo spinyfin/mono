@@ -826,7 +826,13 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                 .map_err(CliError::internal)?;
             match response {
                 FrontendEvent::WorkItemUpdated { item } => print_entity(ctx, &item, || println!("Answer recorded.")),
-                FrontendEvent::OperatorQuestionError { error } => Err(CliError::usage(error.to_string())),
+                FrontendEvent::OperatorQuestionError {
+                    error: error @ boss_protocol::OperatorQuestionError::ValidationFailed { .. },
+                } => Err(CliError::usage(error.to_string())),
+                FrontendEvent::OperatorQuestionError { error } => Err(CliError::application(error.to_string())),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
                 other => Err(unexpected_event("task answer", &other)),
             }
         }

@@ -704,7 +704,17 @@ pub enum OperatorQuestionError {
 
 impl std::fmt::Display for OperatorQuestionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::NotFound => write!(f, "no operator question found for that id"),
+            Self::Conflict { state, answer } => {
+                write!(f, "the question can no longer be answered (state: {state}")?;
+                if let Some(OperatorAnswer::YesNo { value }) = answer {
+                    write!(f, ", recorded answer: {}", if *value { "yes" } else { "no" })?;
+                }
+                write!(f, ")")
+            }
+            Self::ValidationFailed { message } => write!(f, "invalid answer: {message}"),
+        }
     }
 }
 impl std::error::Error for OperatorQuestionError {}

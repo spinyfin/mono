@@ -2002,7 +2002,12 @@ impl WorkDb {
     }
 
     /// The selector is a question id or a canonical task id (RPC resolves short ids).
-    pub fn answer_operator_question(&self, id: &str, answer: OperatorAnswer) -> Result<WorkItem> {
+    ///
+    /// The returned flag is true only when this call minted a ready execution
+    /// (a first Yes answer); the caller must then kick the scheduler, since the
+    /// transaction stages no dispatch wakeup of its own. It is false for No
+    /// answers and for idempotent repeats.
+    pub fn answer_operator_question(&self, id: &str, answer: OperatorAnswer) -> Result<(WorkItem, bool)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let question = tx
@@ -2019,7 +2024,7 @@ impl WorkDb {
             .ok_or(OperatorQuestionError::NotFound)?;
         if question.status != OperatorQuestionStatus::Open {
             if question.status == OperatorQuestionStatus::Answered && question.answer.as_ref() == Some(&answer) {
-                return Ok(task_to_item(task));
+                return Ok((task_to_item(task), false));
             }
             return Err(OperatorQuestionError::Conflict {
                 state: match question.status {
@@ -2048,6 +2053,7 @@ impl WorkDb {
         )?;
         anyhow::ensure!(changed == 1, "question transition lost inside its transaction");
         let mut pending = PendingEvents::new();
+        let mut minted_execution = false;
         match answer {
             OperatorAnswer::YesNo { value: true } => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
@@ -2076,6 +2082,7 @@ impl WorkDb {
                     // no live-worker oracle is supplied.
                     |_| true,
                 )?;
+                minted_execution = true;
             }
             OperatorAnswer::YesNo { value: false } => {
                 let summary: String = tx.query_row(
@@ -2100,7 +2107,7 @@ impl WorkDb {
         }
         let updated = query_task(&tx, &task.id).require("task", &task.id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
-        Ok(task_to_item(updated))
+        Ok((task_to_item(updated), minted_execution))
     }
 }
 
