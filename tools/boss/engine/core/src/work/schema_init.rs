@@ -44,8 +44,8 @@ impl WorkDb {
             [],
             |row| row.get(0),
         )?;
-        if has_schema {
-            Self::check_schema_floor(&tx)?;
+        let version = if has_schema {
+            Self::check_schema_floor(&tx)?
         } else {
             tx.execute_batch(baseline::SQL)?;
             tx.execute(
@@ -56,6 +56,11 @@ impl WorkDb {
                 "INSERT INTO metadata (key, value) VALUES (?1, CAST(strftime('%s','now') AS INTEGER))",
                 [review_verdicts::PR_REVIEW_VERDICTS_SINCE_METADATA_KEY],
             )?;
+            SCHEMA_COMPATIBILITY_FLOOR.1
+        };
+        if version < 33 {
+            project_postmortem::migrate_project_postmortem_signals(&tx)?;
+            tx.execute("UPDATE metadata SET value = '33' WHERE key = 'schema_version'", [])?;
         }
         // Required runtime data, not a historical migration. Capability
         // discovery remains outside DB startup (no processes or network).
@@ -64,7 +69,7 @@ impl WorkDb {
         Ok(())
     }
 
-    fn check_schema_floor(conn: &Connection) -> Result<()> {
+    fn check_schema_floor(conn: &Connection) -> Result<u32> {
         let has_metadata: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata')",
             [],
@@ -99,7 +104,7 @@ impl WorkDb {
                 missing.join(", ")
             );
         }
-        Ok(())
+        Ok(parsed)
     }
 
     /// Open the one raw connection a `WorkDb` (and every clone of it) will
@@ -181,7 +186,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, "32");
+        assert_eq!(schema_version, "33");
 
         let boothby_passes_exists: bool = conn
             .query_row(
@@ -477,14 +482,17 @@ mod floor_tests {
     }
 
     #[test]
-    fn at_and_above_floor_preserve_schema_data_and_version() {
-        for version in [32, 33] {
+    fn supported_databases_apply_post_floor_migrations_without_losing_data() {
+        for version in [32, 33, 34] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
             let conn = Connection::open(&path).unwrap();
             // Construct an existing DB from the independent released-chain
             // golden, rather than opening through the implementation under test.
             seed_released_schema(&conn);
+            if version >= 33 {
+                project_postmortem::migrate_project_postmortem_signals(&conn).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -497,7 +505,11 @@ mod floor_tests {
             .unwrap();
             conn.execute_batch("CREATE TABLE sentinel (value TEXT); INSERT INTO sentinel VALUES ('keep me');")
                 .unwrap();
-            let before = capture(&conn);
+            let expected = Connection::open_in_memory().unwrap();
+            seed_released_schema(&expected);
+            project_postmortem::migrate_project_postmortem_signals(&expected).unwrap();
+            expected.execute_batch("CREATE TABLE sentinel (value TEXT)").unwrap();
+            let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {
                 let db = WorkDb::open(path.clone()).unwrap();
@@ -508,7 +520,7 @@ mod floor_tests {
                         row.get(0)
                     })
                     .unwrap();
-                assert_eq!(observed, version.to_string());
+                assert_eq!(observed, version.max(33).to_string());
                 let stamp: String = conn
                     .query_row(
                         "SELECT value FROM metadata WHERE key = ?1",

@@ -1459,7 +1459,7 @@ fn fresh_init_includes_tasks_repo_remote_url() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "32");
+    assert_eq!(version, "33");
 
     let _ = std::fs::remove_file(path);
 }
