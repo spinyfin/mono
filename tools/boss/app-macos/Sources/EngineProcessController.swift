@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import UpdateCore
 
 /// Bounded restart policy for an app-managed engine. The schedule is indexed
 /// from one, and stays at its final value when callers allow more attempts
@@ -180,6 +181,10 @@ final class EngineProcessController: @unchecked Sendable {
     private let supervisionStopLock = NSLock()
     private var supervisionStopped = false
 
+    private let mismatchLock = NSLock()
+    private var mismatchKey: String?
+    var bundledEngineMismatchKey: String? { mismatchLock.withLock { mismatchKey } }
+
     var onOutputLine: (@MainActor @Sendable (String) -> Void)?
     var onSupervisionStateChange: (@MainActor @Sendable (EngineSupervisionState) -> Void)?
 
@@ -247,8 +252,8 @@ final class EngineProcessController: @unchecked Sendable {
 
             if let running = discoverRunningEngine() {
                 // An engine is already running. Check if its binary matches
-                // the app's bundled engine. If not, replace it so the user
-                // always gets the version that shipped with this app launch.
+                // the app's bundled engine. Replace it only when safe; otherwise
+                // attach and let the idle applier finish the upgrade.
                 //
                 // Each branch emits a distinct log line so a user reporting
                 // "engine wasn't restarted after I updated Boss" can grep
@@ -280,25 +285,36 @@ final class EngineProcessController: @unchecked Sendable {
                 // engine isn't torn down and replaced (and doesn't then hit
                 // the SIGTERM/SIGKILL fallback if the follow-on shutdown RPC
                 // also times out).
-                var runningFP: String?
+                var runningVersion: EngineVersionSnapshot?
                 var fingerprintAttempts = 0
                 let maxFingerprintAttempts = 3
                 while fingerprintAttempts < maxFingerprintAttempts {
                     fingerprintAttempts += 1
-                    runningFP = socketControl.fingerprint(socketPath: running.socketPath, timeoutSeconds: 3.0)
-                    if runningFP != nil { break }
+                    runningVersion = socketControl.version(socketPath: running.socketPath, timeoutSeconds: 3.0)
+                    if runningVersion != nil { break }
                 }
 
-                guard let runningFP else {
+                guard let runningVersion else {
                     emit("[engine version-check inconclusive] running fingerprint unavailable after \(fingerprintAttempts) attempts bundled=\(bundledFP) — keeping reachable \(describe(running))")
                     return
                 }
+                let runningFP = runningVersion.fingerprint
+                mismatchLock.withLock { mismatchKey = bundledFP == runningFP ? nil : "\(runningFP)->\(bundledFP)" }
                 if bundledFP == runningFP {
                     emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to \(describe(running))")
                     return
                 }
+                // Never stop an engine that has live workers: the upgrade would kill
+                // them. Attach instead; the app's idle applier restarts the engine
+                // later, once nothing is live. An engine too old to report a count
+                // (nil) is replaced as before, since that is the only way it can
+                // ever pick up the field.
+                if let live = runningVersion.liveWorkers, live > 0 {
+                    emit("[engine upgrade deferred] running=\(runningFP) bundled=\(bundledFP) — \(live) live worker(s); attaching to \(describe(running))")
+                    return
+                }
                 emit("[engine upgrade] running=\(runningFP) bundled=\(bundledFP) — replacing \(describe(running))")
-                try stopRunningEngine(running)
+                guard try stopRunningEngine(running, onlyIfIdle: runningVersion.liveWorkers != nil) else { return }
                 emit("[engine upgrade] old engine stopped — launching new engine from bundle")
             }
 
@@ -306,6 +322,7 @@ final class EngineProcessController: @unchecked Sendable {
             let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
 
             let pid = try launchEngine(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+            mismatchLock.withLock { mismatchKey = nil }
             lastLaunchError = nil
             emit("[engine launch] detached pid=\(pid) socket=\(socketPath) \(command)")
         }
@@ -423,23 +440,48 @@ final class EngineProcessController: @unchecked Sendable {
     /// so a concurrent `start()` can't race and end up with two
     /// engines fighting over the same socket. Safe to call when no
     /// engine is running — falls through to the launch step.
-    func restart() throws {
+    ///
+    /// With `onlyIfNoLiveWorkers`, the check happens here, under the start lock
+    /// then the engine atomically closes spawn admission before accepting shutdown.
+    /// Failed queries and refused shutdowns leave the engine running and return
+    /// a deferred outcome.
+    @discardableResult
+    func restart(onlyIfNoLiveWorkers: Bool = false) throws -> IdleApplyOutcome {
         disableSupervision()
+        var outcome: IdleApplyOutcome = .performed
         do {
             try withStartLock {
                 if let running = discoverRunningEngine() {
+                    if onlyIfNoLiveWorkers {
+                        let count = socketControl.version(socketPath: running.socketPath, timeoutSeconds: 3.0)?.liveWorkers
+                        if count != 0 {
+                            let message = count.map { "Waiting for \($0) live workers." }
+                                ?? "Waiting for a confirmed engine worker count."
+                            emit("[engine restart deferred] \(message)")
+                            outcome = .deferred(message)
+                            return
+                        }
+                    }
                     emit("[engine restart] terminating existing engine \(describe(running))")
-                    try stopRunningEngine(running)
+                    if try !stopRunningEngine(running, onlyIfIdle: onlyIfNoLiveWorkers) {
+                        outcome = .deferred("Waiting for the engine to accept an idle shutdown.")
+                        return
+                    }
+                } else if onlyIfNoLiveWorkers {
+                    outcome = .deferred("Waiting for the engine connection before restarting.")
+                    return
                 }
 
                 try ensureNoLiveEngineProcess()
                 let socketPath = paths.socketPath
                 let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
                 let pid = try launchEngine(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+                mismatchLock.withLock { mismatchKey = nil }
                 lastLaunchError = nil
                 emit("[engine restart] detached pid=\(pid) socket=\(socketPath) \(command)")
             }
             enableSupervision(resetRestartBudget: true)
+            return outcome
         } catch {
             reportLaunchFailure(error, attempt: nil)
             throw error
@@ -782,7 +824,8 @@ final class EngineProcessController: @unchecked Sendable {
         try? FileManager.default.removeItem(atPath: pidPath)
     }
 
-    private func stopRunningEngine(_ running: RunningEngine) throws {
+    @discardableResult
+    private func stopRunningEngine(_ running: RunningEngine, onlyIfIdle: Bool = false) throws -> Bool {
         var fallbackPID = running.pid
         var rpcFailure: Error?
         var socketClosed = false
@@ -790,7 +833,8 @@ final class EngineProcessController: @unchecked Sendable {
             fallbackPID = try socketControl.shutdown(
                 socketPath: running.socketPath,
                 tokenPath: paths.controlTokenPath,
-                timeoutSeconds: 5
+                timeoutSeconds: 5,
+                onlyIfIdle: onlyIfIdle
             ) ?? fallbackPID
             socketClosed = socketControl.waitForClose(
                 socketPath: running.socketPath,
@@ -802,8 +846,14 @@ final class EngineProcessController: @unchecked Sendable {
                 )
             }
         } catch {
+            if onlyIfIdle {
+                emit("[engine restart deferred] guarded shutdown did not authorize a stop: \(error.localizedDescription)")
+                return false
+            }
             rpcFailure = error
         }
+        // A guarded stop never escalates an unconfirmed shutdown to signals.
+        if onlyIfIdle, !socketClosed { return false }
 
         guard let pid = fallbackPID else {
             throw controllerError(
@@ -811,7 +861,13 @@ final class EngineProcessController: @unchecked Sendable {
             )
         }
 
-        try confirmProcessGone(pid: pid, pidPath: running.pidPath, failureContext: rpcFailure?.localizedDescription ?? "unknown error")
+        if onlyIfIdle {
+            guard waitForProcessExit(pid: pid, timeout: stopPolicy.pidExitTimeout) else { return false }
+            clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+        } else {
+            try confirmProcessGone(pid: pid, pidPath: running.pidPath, failureContext: rpcFailure?.localizedDescription ?? "unknown error")
+        }
+        return true
     }
 
     /// Wait for `pid` to exit, escalating SIGTERM then SIGKILL, and throw if

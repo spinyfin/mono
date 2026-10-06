@@ -1526,6 +1526,7 @@ fn tag_cases() -> Vec<TagCase> {
                 git_sha: "abc123".into(),
                 build_time: "2026-01-01T00:00:00Z".into(),
                 binary_fingerprint: "def456".into(),
+                live_worker_count: Some(0),
             },
             expected_tag: "engine_version_result",
         },
@@ -1535,6 +1536,9 @@ fn tag_cases() -> Vec<TagCase> {
                 report: EngineHealthReport {
                     engine_version: "1.0.4-dev-abc123".into(),
                     engine_git_sha: "abc123".into(),
+                    newest_published_release: None,
+                    engine_release_status: Default::default(),
+                    engine_is_dev_build: false,
                     anthropic_api_key_present: true,
                     dispatch_paused: false,
                     automation_paused: false,

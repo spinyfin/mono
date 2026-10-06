@@ -494,6 +494,32 @@ impl ExecutionCoordinator {
             }
             return Err(anyhow!("{hold}"));
         }
+        // Shutdown admission, taken where dispatch commits to a run — before the cube
+        // lease, provisioning or any other side effect — and moved into the spawned run
+        // task below, so an idle-guarded shutdown cannot be accepted between run start
+        // and the worker becoming visible (local live-state entry / remote pending
+        // marker). Refusal is a deferral, not a start failure: revert the claim so the
+        // next kick (on the next engine) picks the row up.
+        let admission_guard = match self.live_worker_states.as_ref().map(|states| states.try_admit_spawn()) {
+            Some(Err(refusal)) => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    worker_id = %worker_id,
+                    %refusal,
+                    "spawn_attempt deferred: engine shutdown in progress",
+                );
+                if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "failed to release dispatch claim after shutdown deferral"
+                    );
+                }
+                return Err(anyhow!(refusal));
+            }
+            Some(Ok(guard)) => Some(guard),
+            None => None,
+        };
         // Durable spawn-window claim. The drain loop usually already won
         // this CAS; `AlreadyHeld` is that case. `force_dispatch` and any
         // path that skipped the drain pickup claim it here. Rejected means
@@ -1901,6 +1927,9 @@ impl ExecutionCoordinator {
                 self.execution_started_hook.on_execution_started(&execution.id).await;
                 let coordinator = self.clone();
                 tokio::spawn(async move {
+                    // Held until run_execution returns: for pane/SSH spawns that is past
+                    // live-state registration / the remote pending marker.
+                    let _admission = admission_guard;
                     coordinator
                         .run_execution(execution, run, work_item, worker_id_owned, lease, change, adapter)
                         .await;

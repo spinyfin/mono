@@ -232,11 +232,17 @@ struct BossEnginePaths {
         }
     }
 }
+/// No snapshot means query failure; no count in a successful reply means a legacy engine.
+struct EngineVersionSnapshot: Sendable {
+    let fingerprint: String
+    let liveWorkers: Int?
+}
+
 protocol EngineSocketControlling: Sendable {
     func isReachable(socketPath: String, timeoutSeconds: Double) -> Bool
     func peerPID(socketPath: String, timeoutSeconds: Double) -> pid_t?
-    func fingerprint(socketPath: String, timeoutSeconds: Double) -> String?
-    func shutdown(socketPath: String, tokenPath: String, timeoutSeconds: Double) throws -> pid_t?
+    func version(socketPath: String, timeoutSeconds: Double) -> EngineVersionSnapshot?
+    func shutdown(socketPath: String, tokenPath: String, timeoutSeconds: Double, onlyIfIdle: Bool) throws -> pid_t?
     func waitForClose(socketPath: String, timeoutSeconds: Double) -> Bool
 }
 
@@ -277,17 +283,25 @@ struct EngineSocketControl: EngineSocketControlling {
         return pid
     }
 
-    func fingerprint(socketPath: String, timeoutSeconds: Double) -> String? {
+    func version(socketPath: String, timeoutSeconds: Double) -> EngineVersionSnapshot? {
         guard let payload = request(
             socketPath: socketPath,
             requestID: "version-check",
             payload: ["type": "get_engine_version"],
             timeoutSeconds: timeoutSeconds
-        ), payload["type"] as? String == "engine_version_result"
+        ), payload["type"] as? String == "engine_version_result",
+           let fingerprint = payload["binary_fingerprint"] as? String
         else {
             return nil
         }
-        return payload["binary_fingerprint"] as? String
+        let liveWorkers: Int?
+        if let value = payload["live_worker_count"], !(value is NSNull) {
+            guard let count = value as? Int, count >= 0 else { return nil }
+            liveWorkers = count
+        } else {
+            liveWorkers = nil
+        }
+        return EngineVersionSnapshot(fingerprint: fingerprint, liveWorkers: liveWorkers)
     }
 
     func readShutdownCredential(tokenPath: String) throws -> ShutdownCredential {
@@ -302,7 +316,7 @@ struct EngineSocketControl: EngineSocketControlling {
         return ShutdownCredential(token: token, socketPath: socketPath, pid: pid)
     }
 
-    func shutdown(socketPath: String, tokenPath: String, timeoutSeconds: Double) throws -> pid_t? {
+    func shutdown(socketPath: String, tokenPath: String, timeoutSeconds: Double, onlyIfIdle: Bool) throws -> pid_t? {
         let credential = try readShutdownCredential(tokenPath: tokenPath)
         guard standardized(credential.socketPath) == standardized(socketPath) else {
             throw failure(
@@ -312,7 +326,7 @@ struct EngineSocketControl: EngineSocketControlling {
         guard let payload = request(
             socketPath: socketPath,
             requestID: "engine-stop",
-            payload: ["type": "shutdown", "token": credential.token],
+            payload: ["type": onlyIfIdle ? "shutdown_when_idle" : "shutdown", "token": credential.token],
             timeoutSeconds: timeoutSeconds
         ) else {
             throw failure("shutdown RPC did not return a response from \(socketPath)")

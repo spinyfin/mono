@@ -321,9 +321,12 @@ extension ChatViewModel {
                     capabilityPresent: prior.capabilityPresent
                 )
             }
-        case .engineHealthResult(let apiKeyPresent, let issues):
+        case .engineHealthResult(let apiKeyPresent, let issues, let release):
             engineAnthropicApiKeyPresent = apiKeyPresent
             engineHealthIssues = issues
+            if engineRelease != release {
+                engineRelease = release
+            }
         case .driverTrafficSplitResult(let split):
             driverTrafficSplit = split
         case .driverQuotaUsageResult(let snapshot):

@@ -939,6 +939,14 @@ impl HostAdapter for SshHostAdapter {
     ) -> Result<RunOutcome> {
         let host = self.transport.host_id.clone();
 
+        // Same admission boundary as local dispatch, taken before any launch side
+        // effect and held until the launched run is marked pending below (and so
+        // visible to the idle-shutdown check). Refusal is a clean, retriable refusal.
+        let _admission = match self.live_worker_states.as_ref() {
+            Some(states) => Some(states.try_admit_spawn()?),
+            None => None,
+        };
+
         // 1. Verify the wrapper before any other work — drifted versions
         //    turn into `host_wrapper_push_failed` early so we don't try
         //    to invoke a stale wrapper contract.
@@ -1206,6 +1214,12 @@ impl HostAdapter for SshHostAdapter {
             let reason = outcome.failure_reason.unwrap_or(REASON_WORKER_LAUNCH_FAILED);
             let detail = outcome.detail.unwrap_or_default();
             bail!("{reason} on host {host}: {detail}");
+        }
+
+        // The worker is running but registers a live-state slot only on its first
+        // forwarded hook; mark it pending so an idle-guarded shutdown still sees it.
+        if let Some(states) = self.live_worker_states.as_ref() {
+            states.note_remote_launch(&run_id);
         }
 
         // Persist the remote worker pid onto the run row so it is the
@@ -1980,6 +1994,42 @@ mod tests {
         let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
         let transport = SshTransport::new(host_id, ssh_target, &base);
         SshHostAdapter::new(transport, Arc::new(db), cfg, false, base.join("events.sock"), None)
+    }
+
+    #[tokio::test]
+    async fn ssh_spawn_is_refused_once_idle_shutdown_closed_admission() {
+        let base = std::env::temp_dir();
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let chore = crate::test_support::create_test_chore(&db, product.id.clone(), "c");
+        let execution = crate::test_support::create_ready_chore_execution(&db, chore.id.clone());
+        let work = crate::config::WorkConfig::builder()
+            .cwd(base.clone())
+            .db_path(base.join("unused-ssh-admission.db"))
+            .build();
+        let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
+        let registry = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+        let adapter = SshHostAdapter::new(
+            SshTransport::new("zakalwe", "deploy@zakalwe.example", &base),
+            Arc::new(db),
+            cfg,
+            false,
+            base.join("events.sock"),
+            Some(Arc::clone(&registry)),
+        );
+        // An accepted idle-guarded shutdown closes admission for good.
+        *registry.shutdown_admission.write().await = true;
+        let item = adapter_work_item(&adapter, &chore.id);
+        let err = adapter
+            .spawn_worker("w", &execution, &item, Path::new("/remote/ws"), None)
+            .await
+            .expect_err("closed admission must refuse the remote launch");
+        assert!(err.to_string().contains("engine is shutting down"), "{err:#}");
+        assert!(registry.pending_remote_launches().is_empty());
+    }
+
+    fn adapter_work_item(adapter: &SshHostAdapter, id: &str) -> WorkItem {
+        adapter.work_db.get_work_item(id).unwrap()
     }
 
     #[test]

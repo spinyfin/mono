@@ -132,6 +132,43 @@ struct EngineHealthIssue: Identifiable, Hashable {
     /// Engine-emitted kind for a global automation pause. Kept on the
     /// health report; the toolbar toggle is the presentation surface.
     static let automationPausedKind = "automation_paused"
+    /// Engine-emitted kind for "the running engine is older than the
+    /// newest published release". Carries the Update & Restart action.
+    static let engineBehindPublishedReleaseKind = "engine_behind_published_release"
+}
+
+/// The engine's report of its own version against the newest published
+/// release, decoded from `engine_health_result`. The engine owns the
+/// comparison; the app only renders it and reads `engineVersion`.
+struct EngineReleaseInfo: Hashable {
+    /// `1.0.N`, `1.0.N-dev-<sha>`, or `unknown`.
+    let engineVersion: String
+    /// Newest published release the updater reported, if any.
+    let newestPublishedRelease: String?
+    /// `current`, `behind`, or `unknown`.
+    let status: String
+    let isDevBuild: Bool
+
+    var isBehind: Bool { status == "behind" }
+
+    init(engineVersion: String, newestPublishedRelease: String?, status: String, isDevBuild: Bool) {
+        self.engineVersion = engineVersion
+        self.newestPublishedRelease = newestPublishedRelease
+        self.status = status
+        self.isDevBuild = isDevBuild
+    }
+
+    /// Decode from an `engine_health_result` report. `nil` when the report
+    /// carries no `engine_version` — an engine that predates the stamp.
+    init?(report: [String: Any]) {
+        guard let version = report["engine_version"] as? String, !version.isEmpty else { return nil }
+        self.init(
+            engineVersion: version,
+            newestPublishedRelease: report["newest_published_release"] as? String,
+            status: report["engine_release_status"] as? String ?? "unknown",
+            isDevBuild: (report["engine_is_dev_build"] as? NSNumber)?.boolValue ?? false
+        )
+    }
 }
 
 /// Live `getQueue` smoke-check outcome against a `trunk_queue`-mechanism

@@ -544,10 +544,16 @@ struct ContentView: View {
             // condition (missing ANTHROPIC_API_KEY, dispatch paused,
             // syspolicyd wedged, etc.). Surface as a first-class
             // affordance so operators can't miss it (#699).
-            if model.isConnected, !model.bannerHealthIssues.isEmpty {
+            let healthIssues = EngineHealthBanner.includingUpdateStatus(model.bannerHealthIssues, status: updateModel.idleApplyStatus)
+            if model.isConnected, !healthIssues.isEmpty {
                 EngineHealthBanner(
-                    issues: model.bannerHealthIssues,
-                    onUnpauseDispatch: { model.resumeDispatch() }
+                    issues: healthIssues,
+                    onUnpauseDispatch: { model.resumeDispatch() },
+                    onUpdateAndRestart: updateModel.isDevBuild
+                        ? nil
+                        : { updateModel.requestUpdateAndRestart() },
+                    updateAndRestartQueued: updateModel.applyWhenIdleRequested,
+                    updateAndRestartStatus: updateModel.idleApplyStatus
                 )
                 .transition(bannerTransition)
             }

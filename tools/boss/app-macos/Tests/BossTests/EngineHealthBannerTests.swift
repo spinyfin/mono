@@ -10,6 +10,15 @@ import XCTest
 /// affordance, so its source of truth must be tested.
 @MainActor
 final class EngineHealthBannerTests: XCTestCase {
+    func testBundleMismatchAndInstallFailureShowWithoutReleaseWarning() {
+        for message in ["Bundled engine differs; restart deferred: 2 live workers.", "Install failed: swap failed"] {
+            let issues = EngineHealthBanner.includingUpdateStatus([], status: message)
+            XCTAssertEqual(issues.count, 1)
+            XCTAssertEqual(issues.first?.body, message)
+        }
+        XCTAssertTrue(EngineHealthBanner.includingUpdateStatus([], status: nil).isEmpty)
+    }
+
 
     /// The healthy case: engine reports the key is present with no
     /// issues. The banner-driving array must end up empty and the
@@ -231,6 +240,65 @@ final class EngineHealthBannerTests: XCTestCase {
         )
         XCTAssertTrue(AutomationPauseControl.usesEngagedTreatment(isPaused: true))
         XCTAssertFalse(AutomationPauseControl.usesEngagedTreatment(isPaused: false))
+    }
+
+    /// The engine owns the running-vs-published comparison; the app must
+    /// carry it through so the idle applier can read the engine version.
+    func testReleaseInfoIsStoredAndClearedByAnOlderEngine() {
+        let model = makeModel()
+        let release = EngineReleaseInfo(
+            engineVersion: "1.0.685",
+            newestPublishedRelease: "1.0.686",
+            status: "behind",
+            isDevBuild: false
+        )
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: [], release: release))
+        XCTAssertEqual(model.engineRelease, release)
+        XCTAssertEqual(model.engineRelease?.isBehind, true)
+
+        // A report with no version (an engine that predates it) is unknown,
+        // not a stale "behind" carried over from the previous engine.
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: []))
+        XCTAssertNil(model.engineRelease)
+    }
+
+    func testReleaseInfoDecodesFromHealthReport() {
+        let info = EngineReleaseInfo(report: [
+            "engine_version": "1.0.685-dev-abc1234",
+            "newest_published_release": "1.0.686",
+            "engine_release_status": "behind",
+            "engine_is_dev_build": true,
+        ])
+        XCTAssertEqual(info?.engineVersion, "1.0.685-dev-abc1234")
+        XCTAssertEqual(info?.newestPublishedRelease, "1.0.686")
+        XCTAssertEqual(info?.isBehind, true)
+        XCTAssertEqual(info?.isDevBuild, true)
+
+        // Version present but nothing reported yet: unknown, not behind.
+        let unknown = EngineReleaseInfo(report: ["engine_version": "1.0.686"])
+        XCTAssertEqual(unknown?.status, "unknown")
+        XCTAssertNil(unknown?.newestPublishedRelease)
+        // An engine that predates the stamped version.
+        XCTAssertNil(EngineReleaseInfo(report: ["anthropic_api_key_present": true]))
+    }
+
+    func testReportNewestPublishedReleaseSendsRPC() {
+        let model = makeModel()
+        let recorder = PayloadRecorder()
+        model.outboundRecorder = { payload in recorder.value.append(payload) }
+
+        model.reportNewestPublishedRelease("1.0.686")
+
+        let sent = recorder.value.first { $0["type"] as? String == "report_newest_published_release" }
+        XCTAssertEqual(sent?["version"] as? String, "1.0.686")
+    }
+
+    func testUpdateAndRestartButtonTitleReflectsQueuedState() {
+        XCTAssertEqual(EngineHealthBanner.updateAndRestartTitle(queued: false), "Update & Restart")
+        XCTAssertNotEqual(
+            EngineHealthBanner.updateAndRestartTitle(queued: true),
+            EngineHealthBanner.updateAndRestartTitle(queued: false)
+        )
     }
 
     /// A subsequent healthy report must clear a previously-surfaced

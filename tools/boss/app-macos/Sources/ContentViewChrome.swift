@@ -237,7 +237,33 @@ struct EngineHealthBanner: View {
     /// resume` uses — the engine owns the actual state change, this
     /// button is a thin trigger.
     let onUnpauseDispatch: () -> Void
+    /// One-click remedy for the `engine_behind_published_release` issue:
+    /// stage the newest release and apply it once no workers are live.
+    /// `nil` hides the button — dev builds are shown the warning but are
+    /// never installed over.
+    var onUpdateAndRestart: (() -> Void)? = nil
+    /// It was already pressed and the apply is waiting for idle.
+    var updateAndRestartQueued: Bool = false
+    /// What the apply is waiting on, when there is something to say.
+    var updateAndRestartStatus: String? = nil
     @State private var isExpanded: Bool = false
+
+    /// `true` when the stale-engine issue is present, driving the
+    /// banner's "Update & Restart" button.
+    private var isEngineBehindRelease: Bool {
+        issues.contains { $0.kind == EngineHealthIssue.engineBehindPublishedReleaseKind }
+    }
+
+    /// Engine-only recovery and install failures remain visible even when the
+    /// release versions match and the engine reports no health warning.
+    static func includingUpdateStatus(_ issues: [EngineHealthIssue], status: String?) -> [EngineHealthIssue] {
+        guard issues.isEmpty, let status else { return issues }
+        return [EngineHealthIssue(kind: "engine_update_status", severity: "warning", title: "Boss update", body: status)]
+    }
+
+    static func updateAndRestartTitle(queued: Bool) -> String {
+        queued ? "Queued for Idle" : "Update & Restart"
+    }
 
     /// `true` when the paused-dispatch issue is present, driving the
     /// banner's "Unpause" button.
@@ -302,10 +328,34 @@ struct EngineHealthBanner: View {
                     .help("Resume global dispatch (same as `bossctl dispatch resume`).")
                     .accessibilityHint("Resumes global dispatch.")
                 }
+
+                if isEngineBehindRelease, let onUpdateAndRestart {
+                    Button(action: onUpdateAndRestart) {
+                        Text(Self.updateAndRestartTitle(queued: updateAndRestartQueued))
+                            .font(.callout.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(.white)
+                    .disabled(updateAndRestartQueued)
+                    .help(updateAndRestartStatus
+                        ?? "Download the newest release and restart onto it once no workers are live.")
+                    .accessibilityHint("Applies the newest Boss release once no workers are live.")
+                }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let updateAndRestartStatus {
+                Text(updateAndRestartStatus)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.92))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 8)
+            }
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 6) {

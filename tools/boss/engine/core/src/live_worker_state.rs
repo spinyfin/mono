@@ -10,8 +10,8 @@
 //! quickly after spawn (they model the spawn act, not the worker's
 //! life). Two consecutive runs in the same slot reuse the slot key.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use boss_protocol::{ExecutionKind, LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity, WorkerEvent};
 
@@ -153,6 +153,18 @@ pub const STALE_ACTIVITY_DOWNGRADE_SECS: i64 = 30;
 /// Thread-safe registry of LiveWorkerState entries, keyed by slot id.
 #[derive(Default)]
 pub struct LiveWorkerStateRegistry {
+    /// Readers cover a spawn from the moment dispatch commits to a run until the worker is
+    /// visible to the idle-shutdown check (a local worker's live-state entry, or a remote
+    /// worker's [`Self::note_remote_launch`] marker). A successful idle shutdown permanently
+    /// closes admission before releasing the writer. `Arc` so a guard can move into the
+    /// spawned run task ([`SpawnAdmission`]).
+    pub(crate) shutdown_admission: Arc<tokio::sync::RwLock<bool>>,
+    /// Remote runs whose launch succeeded but whose first forwarded hook has not yet
+    /// allocated a live-state slot. Counted as live by the idle-shutdown check so a remote
+    /// worker that has not spoken yet is not invisible. Cleared when the slot registers,
+    /// when the run's slot is released, or (pruned by the shutdown check) once the
+    /// execution is terminal.
+    pending_remote_launches: Mutex<HashSet<String>>,
     /// Every live slot's complete record. One map, not several parallel
     /// ones keyed by the same `u8`: a slot's whole footprint is
     /// established by a single `insert` and torn down by a single
@@ -414,7 +426,45 @@ pub struct UnverifiedDriverStart {
     pub activity: WorkerActivity,
 }
 
+pub use crate::spawn_admission::{AdmissionRefusal, SpawnAdmission};
+
 impl LiveWorkerStateRegistry {
+    /// Take a spawn admission without waiting. Every spawn path (local dispatch, SSH
+    /// launch, `start_worker`) goes through this boundary before any side effect.
+    pub fn try_admit_spawn(&self) -> Result<SpawnAdmission, AdmissionRefusal> {
+        let guard = Arc::clone(&self.shutdown_admission)
+            .try_read_owned()
+            .map_err(|_| AdmissionRefusal::ShutdownDeciding)?;
+        if *guard {
+            return Err(AdmissionRefusal::ShuttingDown);
+        }
+        Ok(guard)
+    }
+
+    /// Record a successfully launched remote run that has not yet registered a slot.
+    pub fn note_remote_launch(&self, run_id: &str) {
+        self.pending_remote_launches
+            .lock()
+            .expect("registry mutex poisoned")
+            .insert(run_id.to_owned());
+    }
+
+    /// Forget a remote launch marker (slot registered, or run released).
+    pub fn clear_remote_launch(&self, run_id: &str) {
+        self.pending_remote_launches
+            .lock()
+            .expect("registry mutex poisoned")
+            .remove(run_id);
+    }
+
+    /// Run ids of remote launches still waiting for their first hook.
+    pub fn pending_remote_launches(&self) -> Vec<String> {
+        let guard = self.pending_remote_launches.lock().expect("registry mutex poisoned");
+        let mut out: Vec<String> = guard.iter().cloned().collect();
+        out.sort();
+        out
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -877,6 +927,7 @@ impl LiveWorkerStateRegistry {
     /// that gate.
     #[track_caller]
     pub fn release_slot_for_run(&self, run_id: &str) -> Option<u8> {
+        self.clear_remote_launch(run_id);
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let slot_id = guard.values().find(|entry| entry.state.run_id == run_id)?.state.slot_id;
         guard.remove(&slot_id);

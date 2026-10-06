@@ -944,6 +944,12 @@ struct ServerState {
     /// per-call `Send(Timeout)` WARNs. See [`AppChannelHealth`].
     #[builder(default)]
     app_channel_health: Arc<AppChannelHealth>,
+    /// Newest published `boss-v` release, as last reported by the app's
+    /// updater via `ReportNewestPublishedRelease`. In memory only: the
+    /// engine has no release poller of its own, and the app re-reports
+    /// on every connect. `None` until the first report.
+    #[builder(default)]
+    newest_published_release: StdMutex<Option<String>>,
     /// Serialize app viewer allocation independently of tmux worker creation.
     attach_pane_lock: Arc<Mutex<()>>,
     /// Bumped when the registered app session is replaced so an in-flight
@@ -2663,7 +2669,9 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::SetSetting { .. } => Box::pin(engine_meta::handle_set_setting(ctx, r)),
             r @ FrontendRequest::SetTaskDocPointer { .. } => Box::pin(work_items::handle_set_task_doc_pointer(ctx, r)),
-            r @ FrontendRequest::Shutdown { .. } => Box::pin(sessions::handle_shutdown(ctx, r)),
+            r @ (FrontendRequest::Shutdown { .. } | FrontendRequest::ShutdownWhenIdle { .. }) => {
+                Box::pin(sessions::handle_shutdown(ctx, r))
+            }
             r @ FrontendRequest::SpawnCapabilityRestored => {
                 Box::pin(sessions::handle_spawn_capability_restored(ctx, r))
             }
@@ -2690,6 +2698,9 @@ async fn handle_frontend_connection(
                 Box::pin(work_items::handle_move_work_item_on_board(ctx, r))
             }
             r @ FrontendRequest::UpdateWorkItem { .. } => Box::pin(work_items::handle_update_work_item(ctx, r)),
+            r @ FrontendRequest::ReportNewestPublishedRelease { .. } => {
+                Box::pin(engine_meta::handle_report_newest_published_release(ctx, r))
+            }
             r @ FrontendRequest::ReportSelectedProduct { .. } => {
                 Box::pin(selected_product::handle_report_selected_product(ctx, r))
             }

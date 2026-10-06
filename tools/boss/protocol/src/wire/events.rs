@@ -1130,11 +1130,18 @@ pub enum FrontendEvent {
     /// or `"unknown"` if unstamped). `git_sha` and `build_time` are
     /// included for human-readable logging; they may be "unknown"
     /// in Cargo (non-Bazel) builds.
+    ///
+    /// `live_worker_count` is the number of workers that are spawning,
+    /// working, waiting for input or idle at a prompt. The app refuses to
+    /// stop an engine that reports a non-zero count when replacing it for
+    /// an update. Absent from engines that predate the field.
     EngineVersionResult {
         version: String,
         git_sha: String,
         build_time: String,
         binary_fingerprint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_worker_count: Option<u32>,
     },
     /// Response to [`FrontendRequest::GetEngineHealth`]: the engine's
     /// current user-visible configuration health. Empty `issues` means

@@ -37,7 +37,7 @@ enum InstallOutcome {
     case installedNoRelaunch
 }
 
-/// App-lifecycle glue for the self-updater's install/swap step (design doc §4, T7).
+/// App-lifecycle glue for the self-updater's install/swap step (automatic-boss-updates.md §4).
 ///
 /// All of the *mechanics* — the bundle rename, `.bak` rollback, first-launch-OK
 /// flag, blocklist, reconciliation — live in `UpdateCore.UpdateInstaller`, which is
@@ -191,8 +191,12 @@ enum UpdateLifecycle {
     /// after a vetoed quit is idempotent: the already-applied swap is recognised and
     /// reported as `.relaunchPending` again instead of failing on the consumed staged
     /// bundle.
-    static func installStagedAndRelaunch() -> InstallOutcome {
-        switch performSwap(relaunch: true, userInitiated: true) {
+    ///
+    /// `userInitiated: false` is the unattended apply-at-idle path. It keeps the
+    /// automatic-mode gate and never retries a blocklisted version, exactly like the
+    /// quit/startup swaps; everything else is the same.
+    static func installStagedAndRelaunch(userInitiated: Bool = true) -> InstallOutcome {
+        switch performSwap(relaunch: true, userInitiated: userInitiated) {
         case .notApplied:
             return .notInstalled
         case .applied(let plan):
@@ -291,7 +295,7 @@ enum UpdateLifecycle {
 
         case .notWritable(let installURL, let stagedURL):
             // /Applications-without-write: degrade gracefully (design §4). The UI
-            // surfaces (T3/T4) reveal the staged bundle in Finder; here we only log.
+            // surfaces (the update sheet and chrome popover) reveal the staged bundle in Finder; here we only log.
             lifecycleLog.warning(
                 "update swap skipped: \(ready.version, privacy: .public) is staged but \(installURL.path, privacy: .sensitive) is not writable; staged at \(stagedURL.path, privacy: .sensitive)")
             return .notApplied

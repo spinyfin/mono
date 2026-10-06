@@ -227,6 +227,7 @@ impl BossClient {
                 git_sha,
                 build_time,
                 binary_fingerprint,
+                ..
             } => Ok((version, git_sha, build_time, binary_fingerprint)),
             other => anyhow::bail!("unexpected response to GetEngineVersion: {:?}", other),
         }
