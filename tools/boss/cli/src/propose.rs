@@ -1390,6 +1390,17 @@ mod tests {
             flag_hint_for_field(ProposalKind::EffortEscalation, "requested_level"),
             Some("--level")
         );
+        for (kind, field, flag) in [
+            (ProposalKind::RunDone, "question", "--question"),
+            (ProposalKind::RunDone, "question.text", "--question"),
+            (ProposalKind::RunDone, "question.answer_type.kind", "--answer-type"),
+            (ProposalKind::RunDone, "question.explanation", "--explanation"),
+            (ProposalKind::Wait, "reason", "--reason"),
+            (ProposalKind::Wait, "duration_secs", "--duration"),
+            (ProposalKind::Wait, "waiting_on", "--waiting-on"),
+        ] {
+            assert_eq!(flag_hint_for_field(kind, field), Some(flag));
+        }
         assert_eq!(flag_hint_for_field(ProposalKind::PrCreated, "unknown_field"), None);
     }
 
