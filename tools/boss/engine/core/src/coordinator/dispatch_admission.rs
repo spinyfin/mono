@@ -68,6 +68,7 @@ fn entry_point_label(entry_point: DispatchAdmissionEntryPoint) -> &'static str {
     match entry_point {
         DispatchAdmissionEntryPoint::Cli => "cli",
         DispatchAdmissionEntryPoint::AppDrag => "app_drag",
+        DispatchAdmissionEntryPoint::OperatorAnswer => "operator_answer",
     }
 }
 

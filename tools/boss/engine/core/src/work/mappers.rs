@@ -183,6 +183,8 @@ pub(crate) fn map_comment_thread_entry(row: &Row<'_>) -> rusqlite::Result<Commen
     })
 }
 
+/// Maps a task row whose SELECT includes the `operator_question` column; a
+/// SELECT that omits it is an error rather than a silent `None`.
 pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let effort_raw: Option<String> = row.get(19)?;
     let effort_level = match effort_raw.as_deref() {
@@ -209,6 +211,17 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let status = parse_text_column::<TaskStatus>(6, &status_raw)?;
     Ok(Task {
         id: row.get(0)?,
+        operator_question: match row.as_ref().column_index("operator_question") {
+            Ok(index) => row
+                .get::<_, Option<String>>(index)?
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
+                    })
+                })
+                .transpose()?,
+            Err(err) => return Err(err),
+        },
         product_id: row.get(1)?,
         project_id: row.get(2)?,
         kind,
@@ -267,13 +280,11 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         merge_queue_detail: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
         driver: row.get::<_, Option<String>>(31)?.filter(|s| !s.is_empty()),
         pr_mergeable_state: row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty()),
-        // Standard queries omit the external_ref columns; the T8 methods
-        // use map_task_with_external_ref which adds columns 33-37.
-        // T1 schema columns; populated by T8 WorkDb methods when the migration
-        // has run. Until then the protocol field carries None.
+        // Base task mapping leaves external_ref unset; map_task_with_external_ref
+        // populates it from columns 36-40.
         external_ref: None,
         parent_task_id: None,
-        // completed_at is not in the base 33-column SELECT; extended
+        // completed_at is not in the base task SELECT; extended
         // mappers (map_task_with_parent_and_provenance and
         // map_task_with_external_ref_parent_source_and_provenance) read it
         // from the appended column in their respective SELECTs.

@@ -301,7 +301,8 @@ impl WorkDb {
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
-                    source_automation_id
+                    source_automation_id,
+                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                FROM tasks
               WHERE source_automation_id = ?1
                 AND status IN ({OPEN_SIBLING_STATUSES})
@@ -451,7 +452,8 @@ impl WorkDb {
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
-                    source_automation_id
+                    source_automation_id,
+                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                FROM tasks
               WHERE source_automation_id = ?1
                 AND deleted_at IS NULL
@@ -480,7 +482,8 @@ impl WorkDb {
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
-                    source_automation_id
+                    source_automation_id,
+                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                FROM tasks
               WHERE product_id = ?1
                 AND source_automation_id IS NOT NULL
@@ -517,7 +520,8 @@ impl WorkDb {
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
-                    source_automation_id
+                    source_automation_id,
+                      (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                FROM tasks
               WHERE product_id = ?1
                 AND source_automation_id IS NOT NULL

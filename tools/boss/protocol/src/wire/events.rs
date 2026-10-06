@@ -87,6 +87,12 @@ pub enum FrontendEvent {
     WorkItemUpdated {
         item: WorkItem,
     },
+    OperatorQuestionsList {
+        questions: Vec<crate::OperatorQuestionRecord>,
+    },
+    OperatorQuestionError {
+        error: crate::OperatorQuestionError,
+    },
     ProjectTasksReordered {
         project_id: String,
         task_ids: Vec<String>,

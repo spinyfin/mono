@@ -750,6 +750,9 @@ impl WorkDb {
         step!(timer, conn, execution_bookmarks::migrate_execution_bookmarks)?;
         step!(timer, conn, migrate_work_executions_last_error)?;
         step!(timer, conn, project_postmortem::migrate_project_postmortem_signals)?;
+        // Install task triggers after the historical status-constraint
+        // migration rebuilds tasks; DROP TABLE removes its triggers.
+        step!(timer, conn, pr_flow::migrate_operator_questions)?;
         step!(timer, conn, Self::stamp_schema_version)?;
         timer.finish();
         Ok(())

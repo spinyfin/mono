@@ -524,6 +524,7 @@ pub struct ExecutionReconcileResult {
 pub enum DispatchAdmissionEntryPoint {
     Cli,
     AppDrag,
+    OperatorAnswer,
 }
 
 /// Stable reason code naming one constraint [`DispatchAdmission`] (or a

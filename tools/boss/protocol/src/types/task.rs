@@ -531,6 +531,9 @@ impl ReasoningMode {
 #[builder(on(String, into))]
 pub struct Task {
     pub id: String,
+    /// Derived from the task's single open question; absent after answer or withdrawal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_question: Option<super::OperatorQuestionView>,
     /// Per-product short id allocated at insert time. Always `Some` after the
     /// schema migration runs; `None` only on rows predating it (which the
     /// migration backfills, so in practice this is never `None` at runtime).

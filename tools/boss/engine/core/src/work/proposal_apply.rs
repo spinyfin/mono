@@ -972,7 +972,15 @@ fn apply_run_done(
         )));
     }
 
+    tx.execute(
+        "UPDATE operator_questions SET status = 'withdrawn', withdrawn_reason = 'declaration_superseded'
+         WHERE execution_id = ?1 AND status = 'open'",
+        [execution_id],
+    )?;
     supersede_prior_run_done_declarations(tx, execution_id, proposal_id)?;
+    if let Some(question) = &payload.question {
+        super::pr_flow::insert_question(tx, execution_id, proposal_id, question)?;
+    }
 
     Ok(ApplyDecision::Applied(ApplyOutcome {
         // The execution row is what the apply produced, and it is the row

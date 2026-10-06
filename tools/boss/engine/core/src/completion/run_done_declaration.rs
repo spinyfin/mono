@@ -290,12 +290,22 @@ impl WorkerCompletionHandler {
     /// A genuine blocker fails the attempt. The failure transaction records the
     /// submitted summary/reason on the task before releasing resources or events.
     async fn finalize_declared_blocked(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        let question = match self.work_db.execution_operator_question(&execution.id) {
+            Ok(question) => question,
+            Err(err) => {
+                tracing::error!(execution_id = %execution.id, ?err, "failed to read declared question");
+                return StopOutcome::DbError;
+            }
+        };
         let detail = format!(
             "Execution `{}` failed: worker declared it could not complete. The submitted \
              explanation is recorded on the task. This attempt will not be retried automatically.",
             execution.id
         );
-        if !self.finalize_worker_failure(execution, &detail).await {
+        if !self
+            .finalize_worker_failure_or_question(execution, &detail, question.as_ref())
+            .await
+        {
             return StopOutcome::DbError;
         }
         StopOutcome::RunDoneDeclaredWithoutDelivery { detail }

@@ -614,6 +614,15 @@ impl WorkerCompletionHandler {
     /// Commit the durable failure before resource teardown and publication.
     /// A database error must not be reported to the caller as successful completion.
     pub(super) async fn finalize_worker_failure(&self, execution: &crate::work::WorkExecution, detail: &str) -> bool {
+        self.finalize_worker_failure_or_question(execution, detail, None).await
+    }
+
+    pub(super) async fn finalize_worker_failure_or_question(
+        &self,
+        execution: &crate::work::WorkExecution,
+        detail: &str,
+        question: Option<&boss_protocol::OperatorQuestion>,
+    ) -> bool {
         // Captured before `record_worker_failure` below nulls
         // `workspace_path` in the same transaction that terminalizes the
         // execution — this path terminalizes a live execution, so it
@@ -621,7 +630,13 @@ impl WorkerCompletionHandler {
         let workspace_path = execution.workspace_path.clone();
         // Marked before the terminalizing write — see `super::teardown`.
         let teardown = self.begin_teardown(&execution.id);
-        let completion = match self.work_db.record_worker_failure(&execution.id, detail) {
+        let recorded = match question {
+            Some(question) => self
+                .work_db
+                .record_worker_awaiting_operator_answer(&execution.id, detail, question),
+            None => self.work_db.record_worker_failure(&execution.id, detail),
+        };
+        let completion = match recorded {
             Ok(Some(completion)) => completion,
             Ok(None) => return true,
             Err(err) => {

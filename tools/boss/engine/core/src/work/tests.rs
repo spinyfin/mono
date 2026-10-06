@@ -569,6 +569,7 @@ fn task_status(db: &WorkDb, task_id: &str) -> String {
 /// Build a minimal Task with enough fields for `attach_revision_projections`.
 fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, ts: &str) -> Task {
     Task {
+        operator_question: None,
         id: id.to_owned(),
         short_id: None,
         product_id: "p".to_owned(),

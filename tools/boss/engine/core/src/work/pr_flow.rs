@@ -1,4 +1,8 @@
 use super::*;
+use boss_protocol::{
+    DispatchAdmissionEntryPoint, OperatorAnswer, OperatorQuestion, OperatorQuestionError, OperatorQuestionRecord,
+    OperatorQuestionStatus, OperatorQuestionView,
+};
 
 /// The `blocked_reason` value the incident-002 postmortem tripwire stamps on
 /// a cycle root it halts pending explicit operator sign-off (see
@@ -395,6 +399,24 @@ impl WorkDb {
     /// already exists. Resources are released even for a deleted task. A
     /// repeated call is a no-op. Explicit retries retain workspace recovery.
     pub fn record_worker_failure(&self, execution_id: &str, detail: &str) -> Result<Option<WorkerFailureCompletion>> {
+        self.record_worker_failure_or_question(execution_id, detail, None)
+    }
+
+    pub fn record_worker_awaiting_operator_answer(
+        &self,
+        execution_id: &str,
+        detail: &str,
+        question: &boss_protocol::OperatorQuestion,
+    ) -> Result<Option<WorkerFailureCompletion>> {
+        self.record_worker_failure_or_question(execution_id, detail, Some(question))
+    }
+
+    fn record_worker_failure_or_question(
+        &self,
+        execution_id: &str,
+        detail: &str,
+        question: Option<&boss_protocol::OperatorQuestion>,
+    ) -> Result<Option<WorkerFailureCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -440,6 +462,9 @@ impl WorkDb {
             }
         }
         drop(stmt);
+        if let Some(question) = question {
+            diagnostic.push_str(&format!("\n\n{}\n\n{}", question.text, question.explanation));
+        }
         let trimmed = diagnostic.trim();
         tx.execute(
             "UPDATE work_executions
@@ -460,13 +485,31 @@ impl WorkDb {
         // the diagnostic is folded into `blocked_detail` when a reason
         // already exists (blocked_detail cannot outlive blocked_reason).
         match query_task(&tx, &work_item_id)? {
+            Some(task)
+                if question.is_some()
+                    && !matches!(task.kind, TaskKind::Chore | TaskKind::Followup)
+                    && !tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM operator_questions WHERE execution_id = ?1 AND status = 'open')",
+                        [execution_id],
+                        |row| row.get::<_, bool>(0),
+                    )? => {}
             Some(task) if matches!(task.status, TaskStatus::Active | TaskStatus::Todo) => {
+                let question = question.filter(|_| !matches!(task.kind, TaskKind::Chore | TaskKind::Followup));
                 tx.execute(
                     "UPDATE tasks
-                     SET status = 'blocked', blocked_reason = 'worker_failed', blocked_detail = ?2,
+                     SET status = 'blocked', blocked_reason = ?4, blocked_detail = ?2,
                          autostart = 0, last_status_actor = 'engine', updated_at = ?3
                      WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'todo')",
-                    params![work_item_id, trimmed, now],
+                    params![
+                        work_item_id,
+                        question.map_or(trimmed, |q| q.text.as_str()),
+                        now,
+                        if question.is_some() {
+                            "awaiting_operator_answer"
+                        } else {
+                            "worker_failed"
+                        }
+                    ],
                 )?;
             }
             Some(task)
@@ -484,6 +527,14 @@ impl WorkDb {
                 )?;
             }
             _ => {}
+        }
+
+        if question.is_some()
+            && !query_task(&tx, &work_item_id)?.is_some_and(|task| {
+                task.deleted_at.is_none() && task.blocked_reason.as_deref() == Some("awaiting_operator_answer")
+            })
+        {
+            super::pr_flow::withdraw_questions(&tx, &work_item_id, "task_not_parkable")?;
         }
 
         // Preserve the attributable failure in the latest run history.
@@ -1801,6 +1852,277 @@ impl WorkDb {
     }
 }
 
+// Durable questions attached to blocked completion declarations.
+pub(super) fn migrate_operator_questions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS operator_questions (
+            id TEXT PRIMARY KEY,
+            work_item_id TEXT NOT NULL,
+            execution_id TEXT NOT NULL,
+            proposal_id TEXT NOT NULL,
+            question_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('open', 'answered', 'withdrawn')),
+            answer_json TEXT,
+            answered_by TEXT,
+            answered_at TEXT,
+            withdrawn_reason TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS operator_questions_one_open_per_item
+            ON operator_questions(work_item_id) WHERE status = 'open';
+        CREATE INDEX IF NOT EXISTS operator_questions_by_item
+            ON operator_questions(work_item_id, created_at);
+        CREATE VIEW IF NOT EXISTS open_operator_questions AS
+            SELECT work_item_id, json_patch(question_json,
+                json_object('id', id, 'asked_at', created_at, 'execution_id', execution_id)) AS view_json
+            FROM operator_questions WHERE status = 'open';
+        CREATE TRIGGER IF NOT EXISTS operator_questions_task_override
+        AFTER UPDATE OF status, blocked_reason, deleted_at ON tasks
+        WHEN NEW.deleted_at IS NOT OLD.deleted_at
+          OR NEW.status IS NOT OLD.status
+          OR NEW.blocked_reason IS NOT OLD.blocked_reason
+        BEGIN
+            UPDATE operator_questions
+            SET status = 'withdrawn', withdrawn_reason = CASE
+                WHEN NEW.deleted_at IS NOT NULL THEN 'task_deleted'
+                WHEN NEW.status != 'blocked' THEN 'status_edited'
+                ELSE 'reason_edited' END
+            WHERE work_item_id = NEW.id AND status = 'open'
+              AND (NEW.deleted_at IS NOT NULL
+                OR (NEW.status IS NOT OLD.status AND NEW.status != 'blocked')
+                OR (NEW.blocked_reason IS NOT OLD.blocked_reason
+                    AND NEW.blocked_reason IS NOT 'awaiting_operator_answer'));
+        END;",
+    )?;
+    Ok(())
+}
+
+pub(super) fn withdraw_questions(conn: &Connection, work_item_id: &str, reason: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE operator_questions SET status = 'withdrawn', withdrawn_reason = ?2
+         WHERE work_item_id = ?1 AND status = 'open'",
+        params![work_item_id, reason],
+    )?;
+    Ok(())
+}
+
+pub(super) fn insert_question(
+    conn: &Connection,
+    execution_id: &str,
+    proposal_id: &str,
+    question: &OperatorQuestion,
+) -> Result<()> {
+    let execution = query_execution(conn, execution_id).require("execution", execution_id)?;
+    // Chores retain the question in their proposal and failure diagnostic.
+    let Some(task) = query_task(conn, &execution.work_item_id)? else {
+        return Ok(());
+    };
+    if matches!(task.kind, TaskKind::Chore | TaskKind::Followup) {
+        return Ok(());
+    }
+    let parkable = task.deleted_at.is_none() && matches!(task.status, TaskStatus::Active | TaskStatus::Todo);
+    conn.execute(
+        "INSERT INTO operator_questions
+         (id, work_item_id, execution_id, proposal_id, question_json, status, withdrawn_reason, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            next_id("oq"),
+            task.id,
+            execution_id,
+            proposal_id,
+            serde_json::to_string(question)?,
+            if parkable { "open" } else { "withdrawn" },
+            if parkable { None } else { Some("task_not_parkable") },
+            now_string()
+        ],
+    )?;
+    Ok(())
+}
+
+fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRecord> {
+    let json: String = row.get("question_json")?;
+    let question: OperatorQuestion = serde_json::from_str(&json)
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err)))?;
+    let answer: Option<String> = row.get("answer_json")?;
+    let answer = answer
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err)))?;
+    let status: String = row.get("status")?;
+    Ok(OperatorQuestionRecord::builder()
+        .question(
+            OperatorQuestionView::builder()
+                .id(row.get::<_, String>("id")?)
+                .text(question.text)
+                .answer_type(question.answer_type)
+                .explanation(question.explanation)
+                .asked_at(row.get::<_, String>("created_at")?)
+                .execution_id(row.get::<_, String>("execution_id")?)
+                .build(),
+        )
+        .work_item_id(row.get::<_, String>("work_item_id")?)
+        .status(match status.as_str() {
+            "open" => OperatorQuestionStatus::Open,
+            "answered" => OperatorQuestionStatus::Answered,
+            _ => OperatorQuestionStatus::Withdrawn,
+        })
+        .maybe_answer(answer)
+        .maybe_answered_by(row.get::<_, Option<String>>("answered_by")?)
+        .maybe_answered_at(row.get::<_, Option<String>>("answered_at")?)
+        .maybe_withdrawn_reason(row.get::<_, Option<String>>("withdrawn_reason")?)
+        .build())
+}
+
+impl WorkDb {
+    pub fn list_operator_questions(&self, work_item_id: &str) -> Result<Vec<OperatorQuestionRecord>> {
+        let conn = self.connect()?;
+        let mut stmt =
+            conn.prepare("SELECT * FROM operator_questions WHERE work_item_id = ?1 ORDER BY created_at, id")?;
+        collect_rows(stmt.query_map([work_item_id], map_question)?)
+    }
+
+    pub(crate) fn execution_operator_question(&self, execution_id: &str) -> Result<Option<OperatorQuestion>> {
+        let conn = self.connect()?;
+        let payload: Option<String> = conn
+            .query_row(
+                "SELECT payload_json FROM worker_proposals
+             WHERE execution_id = ?1 AND kind = 'run_done' AND state = 'applied'
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+                [execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|json| {
+                serde_json::from_str::<boss_protocol::RunDoneProposalPayload>(&json).map(|payload| payload.question)
+            })
+            .transpose()
+            .map(Option::flatten)
+            .map_err(Into::into)
+    }
+
+    /// The selector is a question id or a canonical task id (RPC resolves short ids).
+    ///
+    /// The returned flag is true only when this call minted a ready execution
+    /// (a first Yes answer); the caller must then kick the scheduler, since the
+    /// transaction stages no dispatch wakeup of its own. It is false for No
+    /// answers and for idempotent repeats.
+    pub fn answer_operator_question(&self, id: &str, answer: OperatorAnswer) -> Result<(WorkItem, bool)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let question = tx
+            .query_row(
+                "SELECT * FROM operator_questions WHERE id = ?1 OR work_item_id = ?1
+             ORDER BY (status = 'open') DESC, created_at DESC, id DESC LIMIT 1",
+                [id],
+                map_question,
+            )
+            .optional()?
+            .ok_or(OperatorQuestionError::NotFound)?;
+        let task = query_task(&tx, &question.work_item_id)?
+            .filter(|task| task.deleted_at.is_none())
+            .ok_or(OperatorQuestionError::NotFound)?;
+        if question.status != OperatorQuestionStatus::Open {
+            if question.status == OperatorQuestionStatus::Answered && question.answer.as_ref() == Some(&answer) {
+                return Ok((task_to_item(task), false));
+            }
+            return Err(OperatorQuestionError::Conflict {
+                state: match question.status {
+                    OperatorQuestionStatus::Answered => "answered",
+                    _ => "withdrawn",
+                }
+                .into(),
+                answer: question.answer,
+            }
+            .into());
+        }
+        if task.status != TaskStatus::Blocked || task.blocked_reason.as_deref() != Some("awaiting_operator_answer") {
+            return Err(OperatorQuestionError::Conflict {
+                state: task.status.to_string(),
+                answer: None,
+            }
+            .into());
+        }
+        let now = now_string();
+        let answered_at = chrono::DateTime::from_timestamp(now.parse::<i64>()?, 0)
+            .context("answer timestamp is outside the supported range")?;
+        let changed = tx.execute(
+            "UPDATE operator_questions SET status = 'answered', answer_json = ?2,
+             answered_by = 'human', answered_at = ?3 WHERE id = ?1 AND status = 'open'",
+            params![question.question.id, serde_json::to_string(&answer)?, now],
+        )?;
+        anyhow::ensure!(changed == 1, "question transition lost inside its transaction");
+        let mut pending = PendingEvents::new();
+        let mut minted_execution = false;
+        match answer {
+            OperatorAnswer::YesNo { value: true } => {
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let description = format!(
+                    "{}{}",
+                    task.description,
+                    authorization_block(&question.question, &timestamp)
+                );
+                super::description_guard::validate_description_update(&task.description, &description, false)?;
+                tx.execute(
+                    "UPDATE tasks SET description = ?2, status = 'todo', blocked_reason = NULL,
+                     blocked_detail = NULL, autostart = 1, last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
+                    params![task.id, description, now],
+                )?;
+                let asking = query_execution(&tx, &question.question.execution_id)
+                    .require("execution", &question.question.execution_id)?;
+                request_execution_in_tx_with_live_check(
+                    &mut pending,
+                    &tx,
+                    RequestExecutionInput::builder()
+                        .work_item_id(&task.id)
+                        .maybe_preferred_workspace_id(asking.preferred_workspace_id)
+                        .entry_point(DispatchAdmissionEntryPoint::OperatorAnswer)
+                        .build(),
+                    // Match request_execution's conservative behavior when
+                    // no live-worker oracle is supplied.
+                    |_| true,
+                )?;
+                minted_execution = true;
+            }
+            OperatorAnswer::YesNo { value: false } => {
+                let summary: String = tx.query_row(
+                    "SELECT json_extract(payload_json, '$.summary') FROM worker_proposals
+                     WHERE id = (SELECT proposal_id FROM operator_questions WHERE id = ?1)",
+                    [&question.question.id],
+                    |row| row.get(0),
+                )?;
+                let detail = format!(
+                    "Operator declined on {}: \"{}\"\n\nWorker's explanation: {}\n\nRun summary: {}",
+                    answered_at.format("%Y-%m-%d"),
+                    question.question.text,
+                    question.question.explanation,
+                    summary
+                );
+                tx.execute(
+                    "UPDATE tasks SET blocked_reason = 'worker_failed', blocked_detail = ?2,
+                     last_status_actor = 'human', updated_at = ?3 WHERE id = ?1",
+                    params![task.id, detail, now],
+                )?;
+            }
+        }
+        let updated = query_task(&tx, &task.id).require("task", &task.id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok((task_to_item(updated), minted_execution))
+    }
+}
+
+fn authorization_block(question: &OperatorQuestionView, timestamp: &str) -> String {
+    format!(
+        "\n\n---\n\n## Operator authorization ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Answer:** Yes\n\
+- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The operator recorded this answer on the kanban. It is explicit, human-granted approval for exactly what the question asks and nothing broader. Treat it as the authorization the worker rules require before relaxing a check or exceeding a limit for this task; state in the PR body that the operator authorized it on the date above. It does not authorize bypassing any other check, and it does not change what the repository's checks enforce.\n",
+        question.text, question.explanation, question.execution_id
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
@@ -1832,5 +2154,68 @@ mod tests {
         let listed_task = listed.iter().find(|t| t.id == task.id).unwrap();
         assert_eq!(listed_task.review_cycle, 2);
         assert_eq!(listed_task.last_reviewed_sha.as_deref(), Some("cafef00d"));
+    }
+}
+
+#[cfg(test)]
+mod operator_question_tests {
+    use super::*;
+
+    #[test]
+    fn migration_survives_reopen_and_enforces_one_open_question() {
+        let (dir, db) = crate::test_support::open_db();
+        let conn = db.connect().unwrap();
+        let trigger_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type = 'trigger' AND name = 'operator_questions_task_override')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(trigger_exists, "fresh schema must retain the task override trigger");
+        for id in ["oq_first", "oq_second"] {
+            let result = conn.execute(
+                "INSERT INTO operator_questions
+                 (id, work_item_id, execution_id, proposal_id, question_json, status, created_at)
+                 VALUES (?1, 'task_example', 'exec_example', 'prop_example', '{}', 'open', '1')",
+                [id],
+            );
+            if id == "oq_first" {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("operator_questions.work_item_id")
+                );
+            }
+        }
+        withdraw_questions(&conn, "task_example", "status_edited").unwrap();
+        conn.execute(
+            "INSERT INTO operator_questions
+             (id, work_item_id, execution_id, proposal_id, question_json, status, created_at)
+             VALUES ('oq_second', 'task_example', 'exec_example', 'prop_example', '{}', 'open', '2')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        drop(db);
+        let reopened = WorkDb::open(dir.path().join("state.db")).unwrap();
+        let conn = reopened.connect().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM operator_questions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN
+             ('operator_questions_one_open_per_item', 'operator_questions_by_item')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2);
     }
 }

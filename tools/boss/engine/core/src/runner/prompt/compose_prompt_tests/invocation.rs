@@ -173,6 +173,15 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
         "worker_signal seam off: blocked outcome must preserve the reason on propose done --summary:\n{prompt}",
     );
     assert!(
+        prompt.contains(
+            "--question \"Approve raising the 30-file limit to 48 files?\" --answer-type yes-no --explanation"
+        )
+    );
+    assert!(prompt.contains("Before asking, check the brief for a `## Operator authorization` section."));
+    assert!(prompt.contains("Use the typed question flags on a blocked declaration"));
+    assert!(prompt.contains("Yes appends authorization and restarts in the preserved workspace"));
+    assert!(prompt.contains("No leaves the task blocked in Backlog"));
+    assert!(
         prompt.contains("the marker is Stop-boundary-only"),
         "worker_signal seam off: must describe the marker as Stop-boundary-only:\n{prompt}",
     );
@@ -204,6 +213,31 @@ fn run_done_seam_on_worker_signal_seam_on_teaches_propose_blocked() {
     assert!(
         !prompt.contains("a `[blocked] reason=\"...\"` marker alone records"),
         "both seams on: run_done directive must not fall back to the marker as the primary channel:\n{prompt}",
+    );
+}
+
+#[test]
+fn both_seams_on_forbid_companion_propose_blocked_for_typed_questions() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .worker_signal_proposals_seam_enabled(true)
+            .run_done_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("unless the declaration carries a question as described below"),
+        "the companion propose blocked instruction must exempt question-bearing declarations:\n{prompt}",
+    );
+    assert!(
+        prompt.contains(
+            "A declaration that carries a question is its own blocker record: do NOT also file \
+             `\"$BOSS_BIN\" propose blocked`"
+        ),
+        "the question paragraph must forbid a companion propose blocked:\n{prompt}",
     );
 }
 

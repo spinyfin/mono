@@ -347,9 +347,8 @@ pub(crate) struct ReviewVerdictArgs {
 pub(crate) struct RunDoneArgs {
     /// How the run ended. `delivered` = the deliverable exists;
     /// `no-changes-needed` = you verified there was nothing to produce;
-    /// `blocked` = you are stopping without delivering (file a
-    /// `boss propose blocked` alongside it so the blocker itself is
-    /// recorded).
+    /// `blocked` = you are stopping without delivering. Explain the
+    /// blocker in --summary and attach --question when a human decision is needed.
     #[arg(long, value_enum)]
     outcome: RunDoneOutcomeArg,
 
@@ -358,6 +357,17 @@ pub(crate) struct RunDoneArgs {
     /// declaration exists to fill.
     #[arg(long)]
     summary: String,
+
+    /// One specific Yes/No decision preventing delivery.
+    #[arg(long, requires_all = ["answer_type", "explanation"])]
+    question: Option<String>,
+
+    #[arg(long, value_parser = ["yes-no"], requires = "question")]
+    answer_type: Option<String>,
+
+    /// Why the decision is needed and what Yes authorizes.
+    #[arg(long, requires = "question")]
+    explanation: Option<String>,
 
     #[command(flatten)]
     common: IdempotencyArgs,
@@ -651,6 +661,11 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             serde_json::to_value(RunDoneProposalPayload {
                 outcome: RunDoneOutcome::from(args.outcome),
                 summary: args.summary,
+                question: args.question.map(|text| boss_protocol::OperatorQuestion {
+                    text,
+                    answer_type: boss_protocol::OperatorAnswerType::YesNo,
+                    explanation: args.explanation.unwrap_or_default(),
+                }),
             })
             .map_err(CliError::internal)?,
             args.common.idempotency_key,
@@ -802,6 +817,9 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::ReviewVerdict, "verdict") => Some("--verdict-file"),
         (ProposalKind::RunDone, "outcome") => Some("--outcome"),
         (ProposalKind::RunDone, "summary") => Some("--summary"),
+        (ProposalKind::RunDone, "question" | "question.text") => Some("--question"),
+        (ProposalKind::RunDone, "question.answer_type.kind") => Some("--answer-type"),
+        (ProposalKind::RunDone, "question.explanation") => Some("--explanation"),
 
         _ => None,
     }
@@ -840,6 +858,56 @@ mod tests {
 
     use super::*;
     use crate::{Cli, Commands};
+
+    #[test]
+    fn operator_question_flags_require_a_complete_question_and_typed_answer() {
+        let base = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need approval",
+        ];
+        for flags in [
+            vec!["--question", "Approve?"],
+            vec!["--answer-type", "yes-no"],
+            vec!["--explanation", "Why"],
+            vec![
+                "--question",
+                "Approve?",
+                "--answer-type",
+                "prompt",
+                "--explanation",
+                "Why",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(base.iter().copied().chain(flags)).is_err());
+        }
+        let flags = [
+            "--question",
+            "Approve?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+            "Why",
+        ];
+        let cli = Cli::try_parse_from(base.iter().copied().chain(flags)).unwrap();
+        let Commands::Propose(args) = cli.command else {
+            panic!("expected propose")
+        };
+        let (_, payload, _) = payload_for(args.command.unwrap()).unwrap();
+        assert_eq!(payload["question"]["answer_type"]["kind"], "yes_no");
+        assert_eq!(payload["question"]["text"], "Approve?");
+        assert_eq!(payload["question"]["explanation"], "Why");
+        for flags in [vec![], vec!["--yes", "--no"]] {
+            assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example"].into_iter().chain(flags)).is_err());
+        }
+        for flag in ["--yes", "--no"] {
+            assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example", flag]).is_ok());
+        }
+    }
 
     fn parse_propose(args: &[&str]) -> ProposeArgs {
         let mut full = vec!["boss", "propose"];

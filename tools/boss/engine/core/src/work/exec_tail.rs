@@ -383,7 +383,8 @@ impl WorkDb {
                     ci_required_state, review_required_state, ci_required_detail,
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
                     external_ref_kind, external_ref_canonical_id, external_ref_raw,
-                    external_ref_synced_at, external_ref_unbound_at
+                    external_ref_synced_at, external_ref_unbound_at,
+                    (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
              FROM tasks
              WHERE id = ?1 AND deleted_at IS NULL",
             [id],
@@ -414,7 +415,8 @@ impl WorkDb {
                     ci_required_state, review_required_state, ci_required_detail,
                     review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha,
                     external_ref_kind, external_ref_canonical_id, external_ref_raw,
-                    external_ref_synced_at, external_ref_unbound_at
+                    external_ref_synced_at, external_ref_unbound_at,
+                    (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
              FROM tasks
              WHERE external_ref_kind          = ?1
                AND external_ref_canonical_id  = ?2

@@ -130,6 +130,9 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
     use WorkerVerbDecision::Allow;
 
     match request {
+        // An answer is operator authorization; a worker cannot grant its own.
+        FrontendRequest::AnswerOperatorQuestion { .. } => coordinator(variant_name(request)),
+        FrontendRequest::ListOperatorQuestions { .. } => Allow,
         // ── Allowed: taxonomy reads ──────────────────────────────────────
         //
         // The model half of the isolation boundary. Nothing here mutates,
@@ -583,4 +586,26 @@ fn snake_to_upper_camel(tag: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod operator_question_tests {
+    use super::*;
+
+    #[test]
+    fn workers_can_read_questions_but_cannot_authorize_themselves() {
+        assert!(
+            worker_verb_decision(&FrontendRequest::ListOperatorQuestions {
+                id: "task_example".into()
+            })
+            .is_allowed()
+        );
+        assert!(
+            !worker_verb_decision(&FrontendRequest::AnswerOperatorQuestion {
+                id: "oq_example".into(),
+                answer: boss_protocol::OperatorAnswer::YesNo { value: true },
+            })
+            .is_allowed()
+        );
+    }
 }

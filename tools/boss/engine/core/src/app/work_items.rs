@@ -11,6 +11,71 @@ use boss_engine_board_gesture::{BoardRow, DropResolution, resolve_drop};
 use super::*;
 use crate::protocol::WorkItemPatch;
 
+pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        ..
+    } = ctx;
+    let (id, answer) = match req {
+        FrontendRequest::AnswerOperatorQuestion { id, answer } => (id, Some(answer)),
+        FrontendRequest::ListOperatorQuestions { id } => (id, None),
+        _ => unreachable!(),
+    };
+    let resolved = if id.starts_with("oq_") {
+        Ok(id)
+    } else {
+        server_state.resolve_work_item_id(&id).await
+    };
+    let id = match resolved {
+        Ok(id) => id,
+        Err(_) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::OperatorQuestionError {
+                    error: boss_protocol::OperatorQuestionError::NotFound,
+                },
+            );
+            return;
+        }
+    };
+    let Some(answer) = answer else {
+        match work_db.list_operator_questions(&id) {
+            Ok(questions) => send_response(&sink, &request_id, FrontendEvent::OperatorQuestionsList { questions }),
+            Err(err) => send_work_error(&sink, &request_id, &err),
+        }
+        return;
+    };
+    match work_db.answer_operator_question(&id, answer) {
+        Ok((item, _)) => {
+            let product_id = item.product_id().to_string();
+            let revision = publish_work_invalidation(
+                &server_state,
+                &session_id,
+                &request_id,
+                vec![work_product_topic(&product_id)],
+                "operator_question_answered",
+                Some(product_id),
+                vec![work_item_id(&item)],
+            )
+            .await;
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+        }
+        Err(err) => match err.downcast_ref::<boss_protocol::OperatorQuestionError>() {
+            Some(error) => send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::OperatorQuestionError { error: error.clone() },
+            ),
+            None => send_work_error(&sink, &request_id, &err),
+        },
+    }
+}
+
 pub(super) async fn handle_list_tasks(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
