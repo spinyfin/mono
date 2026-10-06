@@ -2333,5 +2333,9 @@ async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
         "a cancel that lands during confirmation must yield CancelledDuringSpawn",
     );
     assert!(outcome.slot_id.is_none());
+    assert!(
+        spawner.cancel_on_capture.lock().unwrap().is_none(),
+        "confirmation must observe the pane and trigger cancellation",
+    );
     assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
 }
