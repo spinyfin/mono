@@ -1,21 +1,41 @@
-# Multi-agent code review: independent reports, one non-verifying supervisor
+# Multi-agent code review: independent reports, a source-reading supervisor
 
-- Date: 2026-09-01
-- Status: proposed — design only, no implementation
+- Date: 2026-10-05 (as-built review; original design 2026-09-01)
+- Status: implemented behind a default-off flag; acceptance, cutover, and legacy removal incomplete
 - Provenance: project design for Multi-agent code review
 - Related designs: [automated reviewer pass](../../tools/boss/docs/designs/automated-reviewer-pass-on-every-agent-authored-pr.md), [worker proposal API](../../tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md), [revision tasks](../../tools/boss/docs/designs/revision-tasks.md), [unified PR remediation](../../tools/boss/docs/designs/unify-pr-remediation-on-revisions.md)
 
-The contested property is explicit: two reviewers remain independent until a third agent collates their structured reports, and that supervisor does not inspect source or re-run the review. This design accepts a small sequential collation step in exchange for provider diversity, per-reviewer failure isolation, and one durable outcome.
+The contested property is supervisor authority: the shipped supervisor can inspect source and adjudicate disagreements, contrary to the original non-verifying collation boundary. Independent leaf reports, per-role recovery, and one durable verdict shipped; the original evidence-preservation and cost claims do not automatically carry over to that broader role.
 
 ## Verdict
 
-Replace each pre-merge reviewer pass with a persisted review batch containing two parallel, read-only executions pinned to Claude and Codex, followed by a cheap Claude Sonnet supervisor. Select each leaf model from the PR's own recorded size-and-complexity profile, submit both reports and the consolidated verdict through `boss propose`, and create either an ordinary revision on an open PR or a follow-up against `main` after merge.
+When enabled, batch review uses parallel Claude and Codex leaves followed by a Claude supervisor. Frozen PR profiles select models, reports and verdicts travel through `boss propose`, and qualifying consolidated findings create an open-PR revision or a closed-origin follow-up. A solo Opus reviewer checks eligible landed commits.
 
-Use a static 16-slot review pool with batch-aware admission. A pre-merge batch conservatively retains its four-slot reservation across the membership transition, so four PRs can progress concurrently without leaf reviews starving supervisors; post-merge reviews consume one slot and remain lower priority than pre-merge work.
+The static pool has 16 review slots and four-unit pre-merge reservations. The code default remains off, the legacy finalizer remains reachable, and post-merge eligibility, admission recovery, and reservation accounting have the limitations below. Pipeline availability does not establish that rollout acceptance passed.
+
+## Evidence and scope
+
+This review compared PR bodies, commit history, and diffs with repository state at `74dedeaa`:
+
+| Delivery                                          | Merged evidence                                                                                          |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Profiles, model tiers, persistence                | [#2851](https://github.com/spinyfin/mono/pull/2851)                                                      |
+| Proposal ingress and reviewer restrictions        | [#2854](https://github.com/spinyfin/mono/pull/2854), [#2855](https://github.com/spinyfin/mono/pull/2855) |
+| Fan-out, quorum, supervisor                       | [#2861](https://github.com/spinyfin/mono/pull/2861), [#2881](https://github.com/spinyfin/mono/pull/2881) |
+| Verdict application and remediation               | [#2897](https://github.com/spinyfin/mono/pull/2897)                                                      |
+| Landed-code trigger and pool expansion            | [#2909](https://github.com/spinyfin/mono/pull/2909), [#2896](https://github.com/spinyfin/mono/pull/2896) |
+| Diagnostics and component acceptance tests        | [#2917](https://github.com/spinyfin/mono/pull/2917)                                                      |
+| Supervisor recovery and post-merge cleanup repair | [#2895](https://github.com/spinyfin/mono/pull/2895), [#2938](https://github.com/spinyfin/mono/pull/2938) |
+
+Code inspection establishes implementation, not a repeated production acceptance run. The original three-leaf delivery was subsequently extended with explicit generations ([#2979](https://github.com/spinyfin/mono/pull/2979)) and changed to two leaves ([#3073](https://github.com/spinyfin/mono/pull/3073)); those contracts already present in this document remain below. No production database or live flag override was inspected, so default-off does not mean no deployment enabled batches.
 
 ## Two-leaf decision (2026-10-03)
 
-Across 389 pre-merge batches from 2026-09-09 to 2026-10-03, Claude/Codex/Grok produced 2.8/1.7/1.2 findings per batch, no findings in 20%/28%/43% of batches, 693/260/140 unique findings, unique critical/high findings in 8%/15%/7% of batches, contradiction wins of 50%/38%/22%, and median runtimes of 3.3/2.9/8.4 min. Grok finished last in 97% of rounds, adding about 5 minutes to every review without increasing its unique high-severity yield with runtime. The supervisor kept 97%/83%/90% of Claude/Codex/Grok findings; Grok alone supplied 4 of the 10 retained critical findings (including mono#2927). This trades those few unique serious catches for removing the delay, with Codex catching more unique critical/high issues, faster. These figures come from every report and verdict in an engine-database snapshot taken 2026-10-03 00:21 CDT; automatic finding matches were about 95% correct on a spot check. The always-Claude supervisor uses the Claude reviewer's model, potentially flattering Claude, and there is no record of which findings were real or fixed. Grok remains available as an implementation-worker driver.
+Across 389 pre-merge batches from 2026-09-09 to 2026-10-03, Claude/Codex/Grok produced 2.8/1.7/1.2 findings per batch, no findings in 20%/28%/43% of batches, 693/260/140 unique findings, unique critical/high findings in 8%/15%/7% of batches, contradiction wins of 50%/38%/22%, and median runtimes of 3.3/2.9/8.4 min. Grok finished last in 97% of rounds, adding about 5 minutes to every review without increasing its unique high-severity yield with runtime.
+
+The supervisor kept 97%/83%/90% of Claude/Codex/Grok findings; Grok alone supplied 4 of the 10 retained critical findings (including mono#2927). This trades those few unique serious catches for removing the delay, with Codex catching more unique critical/high issues, faster.
+
+These figures come from every report and verdict in an engine-database snapshot taken 2026-10-03 00:21 CDT; automatic finding matches were about 95% correct on a spot check. The always-Claude supervisor uses the Claude reviewer's model, potentially flattering Claude, and there is no record of which findings were real or fixed. Grok remains available as an implementation-worker driver.
 
 ## Goals
 
@@ -34,46 +54,18 @@ Across 389 pre-merge batches from 2026-09-09 to 2026-10-03, Claude/Codex/Grok pr
 - Fixing host sleep. The separate wake-assertion work is a prerequisite for realizing the latency benefit, not part of this project.
 - Changing the work-item `--effort` classifier or using work-item effort as a review-size proxy.
 - Posting leaf reports, supervisor discussion, or findings to GitHub.
-- Letting the supervisor become a third source reviewer.
+- An unrestricted third source review. The shipped supervisor may inspect source to resolve leaf disagreements, broader than the original non-verifying boundary.
 - Giving review agents permission to build or run tests in exceptional cases.
 - Replacing human PR review or making a clean automated verdict sufficient to merge.
 - Running the two-leaf pre-merge topology again after merge. Post-merge review is a distinct, single-agent integration safety net.
 
-## Current state and constraints
+## Constraints and baseline
 
-### One reviewer, one driver, one strong model
+The legacy path routes review to Claude/strong and finalizes a `ReviewResult` artifact or transcript through [`finalize_pr_review_pass`](../../tools/boss/engine/core/src/completion/finalize_passes.rs). It remains reachable when batch mode is disabled; batch-member completion bypasses it. Automation keeps its separate pool policy.
 
-Every current `pr_review` execution is routed by the review-pool policy to Claude at the strong tier, which resolves to Opus. The reviewed row's own driver is intentionally ignored, and the owning work item's effort is passed through to the reviewer. This means there is neither driver diversity nor a PR-derived model signal today; the apparent effort relationship is confounded by larger work items tending to produce larger PRs.
+The batch path reuses peer-derived proposal attribution, canonical validation, the durable proposal ledger, and the existing remediation lifecycle. An open-origin finding becomes a revision; a merged or closed-unmerged origin becomes a follow-up with origin provenance, matching established parent-close conversion.
 
-The current dispatch and model resolution are centralized in [`coordinator.rs`](../../tools/boss/engine/core/src/coordinator.rs) and [`worker_spawn.rs`](../../tools/boss/engine/core/src/runner/worker_spawn.rs). That centralization is reusable, but review and automation currently share the same fixed pool policy, so this project must specialize review policy without changing automation.
-
-### Output bypasses `boss propose`
-
-The reviewer writes a `ReviewResult` JSON artifact and repeats it in its transcript as a fallback. [`finalize_pr_review_pass`](../../tools/boss/engine/core/src/completion/finalize_passes.rs) parses that output, records one `pr_review_verdicts` row, applies the severity gate, and directly calls `create_revision`.
-
-`boss propose` is already a synchronous worker-to-engine RPC with peer-derived execution attribution, typed per-kind validation, idempotency keys, rate caps, a durable `worker_proposals` ledger, and auto-applied versus gated policies. Workers currently use its closed vocabulary for attention, effort escalation, blocked state, deferred scope, follow-up suggestions, automation outcomes, and PR-created declarations; the engine either applies the declaration immediately or leaves a durable proposal for the owning workflow. There is no review kind today. The earlier proposal design deliberately deferred reviewer migration because the artifact was healthier than transcript-only seams; this project now takes on that explicit deferred seam.
-
-### Read-only is enforced, but “do not build” is not
-
-The request's uncertainty is partly resolved in the existing implementation:
-
-- `ExecutionKind::PrReview` maps exhaustively to `WorkerKind::Reviewer` in [`worker_setup.rs`](../../tools/boss/engine/core/src/worker_setup.rs).
-- Reviewer prompts and Claude deny rules block workspace edits, pushes, PR/issue writes, and Boss PR helpers.
-- Codex reviewer executions always use the OS-enforced `read-only` sandbox in [`codex.rs`](../../tools/boss/engine/driver/src/codex.rs).
-- Grok uses a read-only sandbox off-host, plus workspace edit denies; local macOS Grok deliberately runs its sandbox off so repository test sandboxes can work.
-- The Codex tool-surface guard closes unobservable stdin-driven command channels and app/MCP calls, but it is not a build-tool guard.
-
-These controls establish “cannot change or publish the PR.” They do not establish “cannot invoke a build or test”: Claude may run one through Bash, Codex may attempt one against external caches, and local Grok explicitly retains the capability needed by Bazel. The design therefore adds a reviewer-only build/execution command guard across supported reviewer drivers, including legacy Grok batches, rather than claiming the existing write fence already meets the requirement.
-
-### Current orchestration assumes one live reviewer
-
-The enqueue dedup, dead-review recovery, and chain single-writer guard all assume at most one non-terminal `pr_review` execution for a work item. In particular, the chain guard treats review-versus-review as a hold. Three rows cannot simply be inserted and expected to run in parallel; batch membership must become the key for dedup, recovery, and the read-only concurrency exception.
-
-### Existing remediation behavior is reusable but incomplete at the merge race
-
-For findings produced while the origin PR is open, the engine already creates an autostart revision that commits to the existing branch. If that revision is still pending when the origin PR merges, the shared parent-close resolver converts review-findings work in place to a `followup` row with origin PR provenance, and its implementation opens a new PR against `main`.
-
-However, if the PR merges before `finalize_pr_review_pass` calls `create_revision`, the create-time open-PR gate rejects the revision and the current finalizer records `revision_creation_failed`; no follow-up is materialized. The consolidated-verdict applier must unify these paths so a merged origin makes a finding a follow-up, never moot and never discarded.
+Read-only checkout access and permission to execute code are separate properties. #2855 added a shared reviewer static-analysis command guard across Claude, Codex, and Grok, including legacy reviewers. Codex uses an output-only `workspace-write` sandbox configuration, with the checkout outside writable roots, so it can write the proposal body. Reviewer prompts and guards prohibit builds, tests, formatters, generators, changed-code execution, repository edits, pushes, and GitHub writes. Findings needing execution carry `needs_runtime_verification`; implementation workers perform that verification.
 
 ### Measured performance baseline
 
@@ -86,17 +78,17 @@ The supplied baseline covers 434 executions, including 52 deeply parsed transcri
 | high            |         5.9 min |    21 |        26,382 |         107k |
 | xhigh           |         7.6 min |    25 |        34,380 |         137k |
 
-The original three-leaf planning envelope budgeted 24,678 output tokens and about 2.6 minutes of parallel awake time. The supervisor contract below targets no more than 4,000 output tokens, adding about 1.1 minutes at the measured throughput: approximately 28,678 output tokens and 3.7 minutes end to end, versus 34,380 tokens and 7.6 minutes for one xhigh reviewer.
+The original three-leaf planning envelope budgeted 24,678 output tokens and about 2.6 minutes of parallel awake time. Its non-verifying supervisor target was no more than 4,000 output tokens, adding about 1.1 minutes at the measured throughput: approximately 28,678 output tokens and 3.7 minutes end to end, versus 34,380 tokens and 7.6 minutes for one xhigh reviewer. Source-reading supervision changes that premise; these projections are retained as historical hypotheses.
 
 The output-token advantage holds while the supervisor stays below 9,702 tokens; the awake-wall advantage holds while it stays below about five minutes. The 4,000-token target leaves meaningful margin on both. This is a planning envelope, not a measured supervisor result, and it excludes provider price differences and input-token cost; rollout telemetry must validate it.
 
-Host sleep currently consumed 38% of measured review wall time, and 95% of gaps longer than 120 seconds were attributable to sleep. Concurrent reviewers suspend together, so concurrency does not recover that lost wall time. The separate wake assertion must land before this project evaluates its latency claim; this design neither duplicates nor works around that prerequisite.
+Host sleep in the supplied baseline consumed 38% of measured review wall time, and 95% of gaps longer than 120 seconds were attributable to sleep. Concurrent reviewers suspend together, so concurrency does not recover that lost wall time. Wake-assertion deployment must be verified before assessing latency; this repository review does not establish deployment status.
 
-## Chosen approach
+## Shipped architecture
 
 ### Persist immutable review batches with explicit generations
 
-Introduce a review-batch model rather than encoding roles in `created_via` or inferring siblings from timestamps.
+The persisted `pr_review_batches` and `pr_review_batch_members` tables have shared protocol types, migrations, and transactional query/create APIs. Roles are explicit membership data.
 
 A batch records:
 
@@ -113,7 +105,7 @@ Immutability is a property of a batch, not of a target SHA. With `review_batch_f
 
 Only explicit `bossctl review start` invocations advance generations. Automatic post-push admission reuses the latest existing batch at a head, including a completed batch, and never creates an automatic re-review generation. Explicit starts override pure-rebase, no-op, already-reviewed-head, and maximum-cycle redundancy skips, but still require the four-unit reservation. Capacity exhaustion, unavailable PR metadata, or an unavailable reviewer driver returns an error without a single-reviewer fallback. An active legacy reviewer also returns an error, keeping the two finalizers from competing. With the flag off, `bossctl review start` retains its legacy single-reviewer behavior; the feature flag is the only mode switch.
 
-Each batch also persists whether it was minted by an explicit `bossctl review start` admission. Verdict application's same-head duplicate-suppression guard is scoped to automatic and legacy batches only: an explicit admission is a deliberate request to re-review one exact head, so its verdict always materialises when the severity gate warrants it, even at a head an earlier pass already reviewed.
+Each batch also persists whether it was minted by an explicit `bossctl review start` admission. Verdict application's same-head duplicate-suppression guard is scoped to automatic and legacy batches only: an explicit admission is a deliberate request to re-review one exact head, so a prior pass at the same head does not suppress its qualifying verdict; the other remediation holds still apply.
 
 Resolved model and effort belong to the member, not the task. The scheduler reads the member policy at spawn, so review configuration cannot inherit `tasks.driver`, `tasks.model_override`, `tasks.reasoning`, or `tasks.effort_level`. The batch preserves both classifier inputs and the resolved model names, making a later menu or threshold change unable to rewrite history.
 
@@ -140,11 +132,11 @@ The initial policy is deterministic:
 
 Missing or incomplete GitHub metadata fails conservatively to Standard and records the missing fields. It does not inherit work-item effort and does not silently classify as Light.
 
-Only a Deep batch that contains production code is eligible for post-merge review. Large docs-only and test-only PRs still receive an appropriately profiled pre-merge review, but do not trigger a landed-code integration pass.
+The intended post-merge boundary is Deep **and** production code. Classification persists both facts, but the shipped trigger checks only Deep; the missing consumer is recorded below.
 
 ### Map profiles through each driver's real model menu
 
-Extend the driver model menu with a review-specific `fast`, `balanced`, and `strong` mapping. The policy is concrete at current HEAD:
+Driver model menus expose review-specific `fast`, `balanced`, and `strong` mappings. Current mappings are:
 
 | Review profile | Claude   | Codex         | Provider effort |
 | -------------- | -------- | ------------- | --------------- |
@@ -154,26 +146,26 @@ Extend the driver model menu with a review-specific `fast`, `balanced`, and `str
 
 The Claude mapping follows the requested example: small/simple work uses Sonnet, while large/complex work earns Opus. Codex selects `gpt-6-astra` for Light, Standard, and Deep.
 
-Every leaf receives provider effort `medium`. Model capability varies with the PR; effort does not vary with the parent task, which removes the current confound and keeps the measured comparison interpretable.
+Every pre-merge leaf and supervisor receives provider effort `medium`, independent of the parent task. The supervisor uses the same Claude profile mapping: Sonnet for Light/Standard and Opus for Deep, instead of fixed Sonnet. #2881 records a preference for a consistent Claude judge, but no economic justification for dropping the fixed cheap model. Post-merge stores effort `large`, which resolves to Claude provider effort `high`; the names are equivalent only on that resolved-effort dimension.
 
 ### Dispatch two executions, not one execution with subagents
 
 The batch reconciler atomically inserts one member and one `pr_review` execution per driver, then kicks the scheduler. Each execution gets its own provider process, lease, transcript, proposal attribution, retry state, and review-pool slot.
 
-The per-PR chain guard gains one narrow exception: read-only leaf members in the same batch may run concurrently with one another. They still block every writer and reviewers from other batches. Explicit generations at the same target follow terminal batches, while the existing conflict-resolution preemption remains unchanged. The exception is keyed on persisted batch membership and leaf role, never merely on `kind = pr_review`.
+The per-PR chain guard permits compatible read-only members of the same pre-merge batch: leaf/leaf and leaf/supervisor pairs, never supervisor/supervisor pairs. This lets consolidation proceed while a reporting leaf finishes teardown. They still block every writer and reviewers from other batches. Explicit generations at the same target follow terminal batches, while the existing conflict-resolution preemption remains unchanged. The exception is keyed on persisted batch membership and compatible roles, never merely on `kind = pr_review`.
 
-The current review-pool fixed-Claude policy becomes review-member-aware. Automation keeps its existing Claude/strong policy. Review executions without valid member metadata fail before spawn rather than falling back to Claude and accidentally collapsing diversity.
+Spawn policy reads persisted member policy and fails invalid batch metadata rather than collapsing diversity to Claude. Genuine legacy executions retain their path; the current spawn guard prevents a memberless legacy reviewer from competing with a live pre-merge batch. Automation retains its Claude/strong policy.
 
 ### Submit structured reports through `boss propose`
 
-Add two proposal kinds:
+Two proposal kinds ship:
 
 - `review_report`: one leaf observation, auto-accepted after batch/role/target validation;
 - `review_verdict`: the supervisor's consolidated outcome, asynchronously applied because its application may probe PR state and create a remediation work item.
 
-The leaf writes JSON to the engine-owned structured-output path only as a shell-safe `--body-file`, then calls `boss propose review-report --body-file "$BOSS_STRUCTURED_OUTPUT"`. The CLI returns validation errors while the session is still alive, so the reviewer can correct and retry. Completion no longer discovers the report by scraping a transcript.
+The leaf writes JSON to the engine-owned structured-output path only as a shell-safe `--body-file`, then calls `boss propose review-report --batch-id <batch> --target-sha <sha> --body-file "$BOSS_STRUCTURED_OUTPUT"`. The CLI returns validation errors while the session is still alive, so the reviewer can correct and retry. Completion no longer discovers the report by scraping a transcript.
 
-Attribution is engine-owned. The payload names the batch and target SHA, but the engine derives execution, member role, driver, model, and effort from the socket peer and rejects a mismatch. The default idempotency key is `(batch_id, member_role, attempt)`; a replay returns the existing proposal.
+Attribution is engine-owned. The payload names the batch and target SHA, but the engine derives execution, member role, driver, model, and effort from the socket peer and rejects a mismatch. The default key hashes execution id, proposal kind, and canonical payload; identical submissions replay. Membership ownership and the accepted-report link separately enforce one accepted report per attempt. This differs from the proposal-id key used to materialize remediation.
 
 A `review_report` contains:
 
@@ -184,86 +176,73 @@ A `review_report` contains:
 
 The engine keeps the existing severity and category vocabulary so downstream revision rendering and gates remain compatible. A leaf no longer sends an authoritative `revision_warranted` bit; it reports evidence, and the consolidated verdict plus engine gate make that decision.
 
-The accepted report proposal is marked `applied` with its batch member as `applied_ref`. A `review_verdict` remains `proposed` until the verdict reconciler atomically records the durable batch verdict and its clean/remediation result, then marks it `applied` with the verdict or work-item id. This uses the proposal state model's intended asynchronous path rather than blocking the submission socket on GitHub and task creation.
+The accepted report proposal is marked `applied` with its batch member as `applied_ref`; retention preserves its report-owning proposal linkage. Supervisors and solo post-merge reviewers use `boss propose review-verdict --batch-id <batch> --verdict-file <path>`. A `review_verdict` remains `proposed` until the verdict reconciler atomically records the durable batch verdict and its clean/remediation result, then marks it `applied` with the verdict or work-item id. This uses the proposal state model's intended asynchronous path rather than blocking the submission socket on GitHub and task creation.
 
-During rollout, the old single-reviewer path remains available behind the batch feature flag. A batch is wholly old-mode or new-mode: leaf reports in a new batch never run the old per-execution finalizer and therefore cannot create two competing revisions. After genuine end-to-end validation and a telemetry soak, remove the transcript parser and direct artifact-to-revision materialization; the structured file remains only an input file to `boss propose`.
+During rollout, the legacy path remains available when the batch flag is off. A target uses legacy or batch finalization: leaf reports in a new batch never run the old per-execution finalizer and therefore cannot create two competing revisions. After genuine end-to-end validation and a telemetry soak, remove the transcript parser and direct artifact-to-revision materialization; the structured file remains only an input file to `boss propose`.
 
-### Use a non-verifying supervisor with a two-report quorum
+### Consolidate with source access and a two-report quorum
 
-The supervisor is a third execution on Claude Sonnet at provider effort `medium`. It starts only after both leaf roles have supplied valid reports. Legacy three-leaf batches follow the compatibility policy below.
+#2881 shipped a Claude supervisor as an ordinary `pr_review` execution with a `supervisor` member role. It receives accepted leaf findings, summaries, and coverage counts/limitations in its prompt, plus a checkout and explicit permission to re-read source to settle contradictions. It shares leaf static-analysis and mutation restrictions; read-only is not equivalent to non-verifying on the dimension of information access.
 
-The supervisor receives the validated report JSON and engine-stamped provenance in its prompt. It does not receive the PR diff, does not get a source checkout as an information source, and runs under a deny-by-default supervisor posture whose only write is `boss propose review-verdict`. This makes “just collating” a real boundary rather than a suggestion.
+The shipped [`SupervisorVerdict`](../../tools/boss/engine/pr-review/src/supervisor_types.rs) contains batch/PR/target/phase identity, summary, `revision_warranted`, consolidated findings, and contradictions. Each finding has severity, category, confidence, file/location, title/detail, and nonempty `sources` naming reviewer **roles**, not report/finding ids. Contradictions store role/claim positions, a resolution, and optional `resolved_in_favor_of`. Validation checks the schema, nonempty sources, at least two contradiction positions, and valid winners; application checks citations against accepted reports in that batch.
 
-Its output is bounded: a short summary, source report ids, missing roles, coverage union, and consolidated findings. The target is no more than 4,000 output tokens. Raw reports remain durable, so the supervisor never has to repeat all evidence merely to preserve it.
+The prompt requests semantic deduplication, independent judgment rather than voting, and explicit contradiction resolution from source where possible. Missing legacy roles are named, never treated as clean. Raw reports remain durable, but the verdict has no coverage union, per-source severity/confidence, rejected-finding ledger, or structured `disputed` finding. Schema/size validation does not enforce semantic deduplication, complete retention, maximum source severity, or the original 4,000-output-token target.
 
-Collation rules are:
+The engine projects **consolidated findings** into `ReviewResult` for the existing severity/category gate. A false `revision_warranted` cannot suppress a qualifying finding present there. This does not preserve every qualifying raw claim: contradictions are not independently gated, and application does not recover omitted or downgraded leaf findings. The original retention and conservatively gating dispute promises remain unresolved, not implemented guarantees. The reviewed history explains source adjudication but records no decision assessing that change against the original cost and evidence-preservation requirements.
 
-- **Same finding from multiple reviewers:** merge it once by affected location and underlying cause; preserve every source report id and each source severity/confidence. The displayed and gated severity is the maximum reported severity.
-- **Finding from one reviewer:** retain it when it has a concrete location/evidence and at least medium confidence. Consensus is supporting provenance, not an admission threshold. Low-confidence unique observations remain advisory.
-- **Contradiction:** do not adjudicate from memory and do not inspect source. Emit one `disputed` finding containing both claims and sources. If any concrete medium/high-confidence side carries a severity/category that would pass the existing gate, the disputed finding remains gating; otherwise it is advisory for human review.
-- **Malformed or vague observation:** identify the rejected report/finding and reason in the verdict; never silently drop it.
+All configured leaves must settle before consolidation. New batches require both Claude and Codex reports; persisted three-leaf batches retain Grok and two-of-three quorum. A missing/failed report gets one retry on the same driver/model/effort without rerunning successful siblings. An empty **findings list in a valid report** is clean evidence; absence of a report is failure. Insufficient quorum fails with `pr_review_quorum_failed` attention and cannot produce a clean verdict.
 
-The engine still applies its existing independent severity/category gate to the consolidated findings. The supervisor's `revision_warranted = false` cannot suppress a critical/high finding or a category that already forces remediation.
-
-One failed, timed-out, or empty leaf gets one retry on the same driver/model/profile. New batches require both Claude and Codex reports before the supervisor starts. In-flight three-leaf batches retain their persisted Grok member, retry policy, and two-of-three quorum: all configured leaves must settle, and at least two must report. The prompt names a missing legacy leaf explicitly. Historical Grok members, reports, proposals, and verdicts remain readable and renderable; verdict sources, contradiction positions, and resolved winners may cite only accepted reports from that batch, so new batches reject Grok citations. Fewer than two valid reports cannot produce a clean outcome: pre-merge work remains held with an attention and can be retried, while post-merge work records a failed safety-net batch without changing the already-merged task.
-
-This policy favors availability without turning one provider's opinion into an apparently multi-agent clean bill. It also avoids substituting a different provider for a failed role, which would make the promised driver composition false.
+#2895 extended recovery to supervisors orphaned without Stop and changed the initial no-retry policy to one retry. Attempt two is terminal. Recovery uses accepted reports and the frozen target; a known moved head or closed/merged PR settles the dead pre-merge supervisor's batch with attention. An unknown live head is not evidence of movement. This recovery requires durable execution death state; it does not itself detect phantom still-running workers.
 
 ### Apply one verdict and reuse the remediation lifecycle
 
-The `review_verdict` applier replaces per-leaf completion finalization. It validates that every source report belongs to the batch and target SHA, writes one extended `pr_review_verdicts` row for the batch, increments the review cycle once, and chooses one of three outcomes:
+The `review_verdict` applier replaces per-leaf completion finalization in batch mode. It validates source roles against accepted reports for the batch and target, writes one extended `pr_review_verdicts` row per batch, and updates cycle accounting at verdict application, never per leaf or retry. The cycle increment is suppressed when `last_reviewed_sha` already matches, including an explicit new generation at the same head. It chooses one of three outcomes:
 
 - clean/advisory only: mark the batch complete and advance the pre-merge work item to human Review;
 - qualifying findings while the origin PR is open: call the existing revision creation path with consolidated instructions and autostart the revision on the existing PR branch;
-- qualifying findings after the origin PR merged: materialize the same logical review remediation as an autostart `followup` with origin task/PR provenance, targeting a new PR against `main`.
+- qualifying findings after the origin PR merged or closed unmerged: materialize the same logical review remediation as an autostart `followup` with origin task/PR provenance, targeting a new PR against `main`.
 
-Extract the parent-close conversion's review-follow-up construction into a shared helper and use it from both the existing conversion path and the verdict applier. This preserves the established property—merged review findings become follow-up work—without manufacturing a temporary `revision` row that violates the invariant “revision implies an open parent PR.”
+#2897 extracted the parent-close conversion's review-follow-up constructor into a shared helper used by both paths. This preserves the established property—merged review findings become follow-up work—without manufacturing a temporary `revision` row that violates the invariant “revision implies an open parent PR.”
 
 The proposal id is the materialization idempotency key. Reapplying a verdict returns the same revision/follow-up even if the PR changed state between attempts. If the PR merges during application, the transaction retries through the merged branch and creates the follow-up instead of recording `revision_creation_failed` and discarding findings.
+
+Application preserves merged-parent deletion-signoff holds. A retry discovering that hold tombstones an already-created remediation and cancels its executions; superseded verdict materializations receive the same cleanup. Submission performs no GitHub probe: immediate asynchronous apply and a periodic sweep recover proposed verdicts.
 
 Revision-triggered re-reviews create a fresh pre-merge batch for the new head SHA. The existing maximum review-cycle policy applies to completed batches, not leaf attempts; retries and the supervisor consume no extra cycle.
 
 ### Run one deep post-merge integration review
 
-The merge poller's first idempotent transition to merged checks the persisted pre-merge profile. For a Deep batch containing production code, it enqueues one `post_merge_reviewer` member keyed by the origin PR and merge SHA. Existing or legacy PRs without a usable profile are conservatively classified at merge from the same GitHub metadata before this decision.
+#2909 captures the actual merge commit and creates one `post_merge_reviewer`. Cube's revision-target positioning checks out the landed commit, including squash merges after head-branch deletion. The immutable target satisfies `target_sha == merge_sha`; the old PR head is not a safe substitute because it may no longer be fetchable. Missing merge SHA logs a warning and skips creation; missing base SHA is logged and stored as empty.
 
-The post-merge worker uses Claude Opus at provider effort `high`. It is the only reviewer of the landed tree and runs alone rather than as one of two parallel leaves, so it carries no fan-out budget and is deliberately given more effort than a pre-merge leaf. It checks out the actual landed `main` commit, scopes attention to the origin PR's changed paths, and reviews integration with the final surrounding code: merge-resolution loss, callers outside the PR diff, interactions with changes that landed ahead of it, and behavior visible only in the merged tree. It remains static-analysis-only and submits a `review_verdict` directly; a supervisor would add no independent evidence to a single report.
+The worker is Claude Opus with stored effort `large` (resolved `high`). Its static review focuses on changed paths and integration with the landed tree, including merge-resolution loss and surrounding callers. It submits a verdict directly, moving `collecting` to `applying` without a supervisor. Its source attribution identifies its own Claude driver, not independent corroboration. Failed execution gets one retry, then attention and failed batch state without reopening the merged work item. Findings use the shared follow-up applier.
 
-This differs from pre-merge review in target, purpose, and topology. It does not delay or reopen the merged PR. A qualifying verdict creates the follow-up described above, whose ordinary implementation worker builds/tests the fix and opens a new PR against `main`.
+The [eligibility trigger](../../tools/boss/engine/core/src/merge_poller/post_merge_review.rs) loads the cycle root's latest pre-merge classification and checks `profile == Deep`. It does **not** check `has_production_code`, and skips roots without a pre-merge batch instead of classifying legacy metadata at merge. The [test](../../tools/boss/engine/core/src/merge_poller/tests/post_merge_review_trigger_tests.rs) `no_post_merge_review_without_a_pre_merge_batch_on_record` pins that reduced scope. No reviewed product decision accepts these departures from the promised Deep-production safety net.
 
-Post-merge enqueue is best-effort but durable: one failed execution gets one retry, then an attention and failed batch state. The merge poller never waits for the agent call and never enqueues the same `(origin PR, merge SHA)` twice.
+Creation is idempotent once a batch exists, keyed by cycle root, phase, merge SHA, and generation one. Enqueue itself is not durably retried: the merge sweep marks the root done before triggering, while `AdmissionDeferred` only logs and writes no pending intent. Normal merge candidates are `in_review`, and the deferred-admission sweep covers pre-merge work. Capacity or transient trigger failures can therefore lose a safety-net pass; idempotent insertion is not equivalent to eventual admission.
+
+#2938 reports that no post-merge review had completed before its fix: three cleanup paths killed reviewers because their cycle root was done. It added phase-aware exemptions to batch reaping, live terminal-work cleanup, and startup abandonment. The invariant is that **a live post-merge execution may validly belong to a completed root**; deleted roots, terminal executions, and genuinely stale batches still receive cleanup. Regression tests cover those decisions; the PR explicitly did not perform a live merged-PR completion check.
 
 ### Expand the static review pool to 16 slots
 
-Raise the review pool's default and maximum from eight to 16, extending its global slot range from 25–32 to 25–40. Update the protocol worker-name mapping and the macOS roster in the same PR so slot identity remains bijective and visible; do not alter slots 1–16 or 17–24.
+#2896 expanded review slots from 25–32 to 25–40 and updated protocol/macOS worker-name rosters together. Interactive slots 1–16 and automation slots 17–24 retain their behavior.
 
-Admission is weighted inside the review pool:
+Pre-merge batches reserve four units through `collecting`, `supervising`, and `applying`; retries reuse the reservation. Four remains conservative after the two-leaf change, accommodating historical three-leaf batches. Pre-merge admission uses configured capacity clamped to 4–16. The floor permits one batch even with fewer than four physical slots; the scheduler still enforces actual execution capacity.
 
-- a pre-merge batch reserves four units from creation through supervisor completion;
-- a post-merge single-reviewer batch reserves one unit;
-- retries reuse their batch's reservation;
-- pre-merge work has priority over post-merge safety-net work.
+Pre-merge admission counts only other pre-merge reservations; post-merge admission counts both phases. This gives admission priority, not preemption of running safety-net workers. Full pre-merge capacity leaves the producer pending review with an idempotent attention marker; a dedicated sweep retries and recognizes already-reviewed heads. Reaping publishes execution-terminal events so releasing reservations also tears down workers.
 
-With capacity 16, four pre-merge PRs can progress concurrently. Reservation is conservative—the supervisor follows its leaves—but prevents a fifth wave of leaves from occupying every slot just as earlier batches become ready to collate. This is static capacity and static admission accounting, not dynamic pool sizing.
+Two accounting gaps remain in [`review_batches.rs`](../../tools/boss/engine/core/src/work/review_batches.rs). `reserved_batch_count_in_tx` excludes all done/archived roots, so normal active post-merge batches do not count toward their one-unit budget even after #2938 allowed them to survive. `create_post_merge_review_batch` uses default capacity rather than live configured capacity. These cases do not enforce the intended post-merge reservation policy.
 
-### Roll out as validation of the chosen design
+### Rollout evidence and diagnostics
 
-The rollout study validates this architecture's cost, latency, and reliability claims; it is not a study choosing between fan-out and a single reviewer after implementation has already committed to fan-out.
+The planned study validates this architecture's cost, latency, and reliability; it was not designed to choose fan-out over a single reviewer. The retrospective two-leaf decision is a separate provider-contribution comparison with its stated lack of ground truth. Neither validates the original cheap, non-verifying supervisor envelope for the source-reading implementation.
 
-Before default-on rollout, exercise the genuine end-to-end path on a controlled PR with the real Claude and Codex drivers, the real proposal socket, scheduler, supervisor, and remediation applier. Unit tests and a hand-built transcript fixture are necessary but cannot stand in for that integration path.
+#2917 delivered `bossctl review batches <work-item>` and `bossctl review live-batches`, both with JSON output. Per-item lookup resolves revisions to their cycle root; live listing shows nonterminal batches oldest first. Diagnostics expose persisted model/driver/effort, attempts, member states, proposal links, and timestamps. Behavioral Codex/Grok build-denial tests and zero-report fail-closed coverage also landed. These verify components, not the genuine end-to-end path.
 
-Record per batch:
+That PR explicitly deferred the real-driver controlled-PR exercise, default-on cutover, and legacy-finalizer removal. [The flag registry](../../tools/boss/engine/feature-flags/src/lib.rs) still defaults `review_batch_fanout` off, and `finalize_pr_review_pass` retains legacy artifact/transcript handling. A deployment operator can enable the flag; this review neither reads nor changes live overrides. The rollout gate could block default-on deployment, not earlier optional deployments or the implementation phase itself.
 
-- queue and awake duration by role and end-to-end;
-- input/output tokens and resolved model by member;
-- valid report, retry, missing-role, and quorum rates by driver;
-- raw versus consolidated finding counts, duplicate groups, and disputes;
-- supervisor output tokens and duration;
-- clean, revision, merged-race follow-up, and post-merge follow-up outcomes;
-- reviewer build-command guard denials;
-- pool reservation and queue depth.
+Remaining acceptance must use real providers, the actual proposal socket, scheduler, supervisor, and remediation path on controlled PRs. Record immutable-target correlation, sub-quorum holds, open-PR revision, merge-during-apply follow-up, and post-merge verdict survival across cleanup. Verify the wake assertion before comparing latency. Collect per-role/end-to-end queue and awake time, models and input/output tokens, retry/quorum rates, raw/consolidated/disputed findings, guard denials, reservations, and deferred admission. Rows and gauges supply some inputs; the reviewed PRs contain no completed economic acceptance report.
 
-The wake-assertion prerequisite must be present before latency is assessed. Default-on is blocked if the genuine path cannot correlate all proposals to one immutable target, if a sub-quorum batch can advance clean, or if findings can be lost at the open-to-merged transition. The initial economic check is supervisor median output below 9,702 tokens and batch awake wall below 7.6 minutes; the design target is materially better at no more than 4,000 supervisor output tokens and roughly 3.7 minutes end to end.
+The original targets—supervisor median output below 9,702 tokens and batch awake wall below 7.6 minutes, with goals of 4,000 tokens and roughly 3.7 minutes—are historical hypotheses, not measured shipped results. Source access and profile-selected supervisor models require an explicit decision about whether those bounds and evidence-preservation requirements still govern rollout.
 
 ## Alternatives considered
 
@@ -273,140 +252,30 @@ Rejected because an execution currently owns exactly one driver process, lease, 
 
 ### Keep one reviewer and choose a stronger model for large PRs
 
-Rejected as the target architecture because it does not provide provider diversity and the supplied baseline is unfavorable: one xhigh reviewer produced a median 34,380 output tokens over 7.6 awake minutes, versus the proposed planning envelope of about 28,678 tokens over 3.7 minutes. Stronger models remain useful inside the Deep profile, but as one of the two leaves rather than a substitute for independent reports.
+This remains the fallback when batch mode is disabled. It lacks cross-provider evidence diversity, the specific property sought by fan-out; the runtime baseline does not prove inferior accuracy. The original three-leaf envelope projected 28,678 output tokens and 3.7 awake minutes versus a single xhigh reviewer's measured 34,380 and 7.6. That projection assumed non-verifying collation, not the shipped system or a controlled comparison.
 
 ### Deterministically union the two JSON reports
 
 Rejected because exact fingerprints cannot recognize differently worded reports of the same underlying bug, and a union cannot render contradictions as one intelligible outcome. Majority voting is worse: it would suppress a high-quality unique finding, even though diversity is the reason to pay for two providers. The supervisor performs semantic grouping while the engine preserves mechanical severity gates and raw evidence.
 
-### Let the supervisor inspect source and verify disputed findings
+### Non-verifying collation versus source adjudication
 
-Rejected for this version because it turns collation into a third review, adds another diff/context load and tool surface, and weakens the cost/latency case. Current practice already relies on the implementation revision and CI to verify actionable findings. Disputes therefore remain visible and conservatively gating when their strongest concrete claim would gate; a future verifier would be a different architecture requiring its own evidence.
+The original design rejected source inspection because it adds context and tools and weakens the cost/latency case; implementation revisions and CI already verify actionable claims. #2881 nevertheless shipped source adjudication to settle disagreements. Downstream remediation can test a proposed fix, but does not determine which claims the earlier verdict should retain.
+
+This records shipped behavior, not retroactive approval of the tradeoff. The missing decision is whether supervisor authority may weaken mandatory retention and conservative dispute gating, and what evidence/economic bounds replace them. No reviewed record resolves that question; schema tests cannot answer it.
 
 ### Run the full review batch again post-merge
 
 Rejected because the post-merge pass answers a narrower question—whether the landed tree introduces integration defects after an already-diverse pre-merge review. One strong static reviewer against the merge commit is the requested safety net. Repeating both leaves plus a supervisor would nearly double review spend without a stated requirement or baseline showing that extra diversity after merge is worth it.
 
-## Risks / open questions
+## Risks and remaining work
 
-- **Threshold calibration:** the initial profile cutoffs are policy, not empirical quality boundaries. Persisting raw inputs allows later calibration without changing historical classifications. Threshold changes must be reviewed as policy changes and must not reuse work-item effort.
-- **Supervisor compression could erase nuance:** raw reports remain durable, every consolidated finding cites source report ids, and rejected/malformed observations are enumerated. The 4,000-token target constrains repetition, not evidence retention.
-- **Two reports are required:** either provider exhausting its retry fails a new batch. Legacy three-leaf batches can still produce a degraded two-report verdict.
-- **Static pool expansion increases simultaneous provider load:** batch reservations cap pre-merge concurrency at four PRs and post-merge work is lower priority. Dynamic capacity remains deliberately outside this project.
-- **Provider/model menus drift:** selection resolves through each driver's model menu and stores the actual resolved model on the member. An unavailable mapping fails that member visibly rather than silently changing providers.
-- **Merged-race correctness spans two existing paths:** the shared remediation helper and proposal-id idempotency are load-bearing. Tests must cover open→merged races before and after verdict persistence, plus replay after a revision has already converted to a follow-up.
-- **Sleep masks the claimed speedup:** no latency conclusion is valid until the separate wake assertion is deployed. That external dependency is a rollout prerequisite, not an implementation entry here.
+These gaps are separate from durable reasoning above. The former nine-entry implementation plan is no longer a status list: the pipeline and diagnostics landed, recovery expanded, and final acceptance/cutover scope did not finish.
 
-No load-bearing product decision remains open for implementation. Model tiers, thresholds, quorum, supervisor authority, post-merge topology, and static capacity are chosen above; telemetry may justify a later policy revision, but it is not permission for the initial implementation to improvise them.
+- **Resolve supervisor authority and evidence preservation.** Decide source access, maximum-severity retention, qualifying unique findings, unresolved disputes, rejection provenance, and fixed-Sonnet/token assumptions. Align prompt, schema, gating, and tests together. Current source validation establishes report attribution, not preservation of every qualifying claim.
+- **Complete genuine-path acceptance and gated cutover.** Validate the real pipeline, including survival after #2938, collect economic/outcome evidence, verify the external wake prerequisite, then finish default-on rollout and legacy removal after the intended soak. #2917 explicitly deferred this; the default and finalizer confirm it remains incomplete. An authorized operator or suitably isolated integration environment needs real provider and GitHub capabilities.
+- **Finish post-merge eligibility.** Consume production-code presence as well as Deep, and classify legacy/no-profile origins as promised. Replace tests pinning silent exclusion alongside the implementation; those tests do not establish a product decision.
+- **Make post-merge reservations accurate.** Count live post-merge batches on done roots and use configured capacity. Preserve deleted-root cleanup, pre-merge priority, and physical slot limits. #2938 fixed reaping but not the reservation query.
+- **Persist and retry post-merge admission intent.** Deferred/transiently failed triggers must remain discoverable after the origin becomes done and across restart, without duplicating a merge-SHA batch. Log-only deferral does not deliver durable enqueue.
 
-## Proposed implementation task breakdown
-
-Breakdown size: 9 entries (9 in-scope, 0 deferred) — the change has nine reviewable seams across review policy/data, proposal ingress, driver restrictions, orchestration, consolidation, remediation, merge triggering, pool/UI capacity, and genuine-path cutover.
-
-### Add review profiles, model tiers, and batch persistence
-
-Scope: in-scope
-
-Add the pure PR-metadata classifier and its Light/Standard/Deep tests to the review crate; extend each driver model menu with the concrete review-tier mapping; add persisted review batch/member protocol types, schema migration, uniqueness rules, and query APIs. This PR introduces no production fan-out and does not change automation policy.
-
-Effort hint: large
-
-Dependencies: none
-
-Parallelism: may start immediately. It establishes the contract consumed by every later review task.
-
-### Add review report and verdict proposal ingress
-
-Scope: in-scope
-
-Extend the closed proposal vocabulary, typed payload validation, rate caps, idempotency derivation, `boss propose` CLI, and worker-tier authorization for `review-report` and `review-verdict`. Auto-accept reports into their batch member; leave verdict application asynchronous and unimplemented in this PR.
-
-Effort hint: medium
-
-Dependencies: Add review profiles, model tiers, and batch persistence
-
-Parallelism: must follow the batch contract because validation keys on its identities. It precedes prompt migration so no worker is instructed to call a missing verb.
-
-### Harden reviewer capabilities and submit reports in-run
-
-Scope: in-scope
-
-Add the cross-driver reviewer build/test/execution guard, preserve the current mutation/publish fences, update the leaf prompt and structured schema, and make a reviewer write its body file then call `boss propose review-report`. Claims needing execution are marked for runtime verification; missing proposals become explicit member failure rather than transcript recovery.
-
-Effort hint: large
-
-Dependencies: Add review report and verdict proposal ingress
-
-Parallelism: begins after proposal ingress. This task owns driver permission files and reviewer prompt/rendering; later orchestration work must consume rather than duplicate those policies.
-
-### Dispatch and recover two role-aware leaf reviewers
-
-Scope: in-scope
-
-Replace single-execution enqueue/dedup with batch creation, two atomic member executions, member-selected driver/model/effort at spawn, the same-batch read-only chain-guard exception, and role-scoped one-retry recovery. Keep the new mode feature-flagged and ensure old-mode and batch-mode finalizers cannot both act on one target.
-
-Effort hint: large
-
-Dependencies: Add review profiles, model tiers, and batch persistence; Harden reviewer capabilities and submit reports in-run
-
-Parallelism: follows capability hardening because a two-way dispatch must not briefly ship with unrestricted reviewers. It substantially edits coordinator/runner dispatch surfaces, so pool expansion is ordered after it and must forward-port these changes preservingly.
-
-### Add supervisory consolidation and quorum progression
-
-Scope: in-scope
-
-Add the supervisor execution/worker posture, prompt and bounded verdict schema, two-report quorum state machine (with legacy two-of-three support), semantic dedup/source attribution, contradiction handling, and `boss propose review-verdict` submission. Advance a batch only after all roles report or exhaust retry; fewer than two reports must hold rather than produce a clean verdict.
-
-Effort hint: large
-
-Dependencies: Dispatch and recover two role-aware leaf reviewers
-
-Parallelism: follows fan-out because it consumes real member lifecycle. It also touches execution-kind and runner/coordinator matches, so review-pool expansion is explicitly sequenced after this task and must integrate these additions rather than overwrite them.
-
-### Apply consolidated verdicts through unified remediation
-
-Scope: in-scope
-
-Implement asynchronous `review-verdict` application, one verdict/cycle update per batch, clean advancement, and proposal-idempotent remediation. Extract and reuse the review-findings follow-up constructor so an open origin creates a revision and a merged origin creates a follow-up against `main`, including the merge-during-apply race; stop leaf completion from directly creating revisions in batch mode.
-
-Effort hint: large
-
-Dependencies: Add supervisory consolidation and quorum progression
-
-Parallelism: after the supervisor task, this can run in parallel with static pool expansion because it primarily edits proposal/completion/revision helpers rather than coordinator slot and app-roster files.
-
-### Trigger the landed-code post-merge review
-
-Scope: in-scope
-
-Extend the merge probe/transition with idempotent Deep-production eligibility and merge-SHA batch creation; dispatch one Opus/high post-merge reviewer against the real landed tree, retry once, and route its verdict through unified follow-up materialization without blocking the merge poller.
-
-Effort hint: large
-
-Dependencies: Apply consolidated verdicts through unified remediation
-
-Parallelism: may run in parallel with static pool expansion after unified remediation exists. It owns merge-poller integration and must reuse, never reimplement, batch classification and follow-up construction.
-
-### Expand the static review pool and add weighted admission
-
-Scope: in-scope
-
-Raise the review pool default/maximum to 16, extend slot identities through 40 in protocol and macOS roster code, and add four-unit pre-merge versus one-unit post-merge reservation accounting with pre-merge priority. Interactive and automation ranges and admission behavior remain byte-for-byte equivalent in behavior.
-
-Effort hint: medium
-
-Dependencies: Add supervisory consolidation and quorum progression
-
-Parallelism: may run in parallel with verdict application and post-merge work once the supervisor task lands. It is ordered after the fan-out/supervisor coordinator edits because those tasks substantially overlap the same dispatch files; forward-port them preservingly.
-
-### Validate the genuine path, cut over, and remove legacy finalization
-
-Scope: in-scope
-
-Add batch-level observability and operator diagnostics, exercise a controlled PR through the real two review drivers, proposal socket, supervisor, revision path, merged-race follow-up, and post-merge path, then enable batch mode and remove transcript scraping plus direct artifact-to-revision finalization after fallback telemetry is quiet. The external wake assertion must be deployed before latency acceptance; tests must prove build-command denials and sub-quorum fail-closed behavior.
-
-Effort hint: large
-
-Dependencies: Trigger the landed-code post-merge review; Expand the static review pool and add weighted admission
-
-Parallelism: final integration and cutover task; it cannot run in parallel with unfinished implementation entries because only the genuine assembled path can validate the design's claims.
+Thresholds remain policy rather than calibrated quality boundaries; frozen inputs and resolved models make later changes auditable. The two-leaf switch trades some unique Grok findings for latency and requires both remaining providers to report. Its measurement limits remain above rather than becoming a claim of equivalent review quality.
