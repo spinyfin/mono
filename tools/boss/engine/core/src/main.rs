@@ -147,8 +147,21 @@ fn open_log_file(path: &Path, max_files: usize) -> Result<RotatingState> {
         .with_context(|| format!("failed to open engine log file {}", path.display()))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Build the runtime by hand rather than via `#[tokio::main]`: its implicit
+/// drop waits for every blocking task forever, so a wedged subprocess could
+/// keep the process alive after the engine had finished shutting down. See
+/// [`boss_engine::runtime_shutdown`].
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the tokio runtime")?;
+    let result = runtime.block_on(run_engine());
+    boss_engine::runtime_shutdown::shutdown_engine_runtime(runtime);
+    result
+}
+
+async fn run_engine() -> Result<()> {
     // Handle --version before the full startup so we print our custom
     // "boss-engine 0+<sha> built <time>" format and exit cleanly
     // without initialising logging or touching the audit log.

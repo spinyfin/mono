@@ -159,6 +159,7 @@ pub mod rotating_file;
 pub mod run_done_backstop;
 pub mod run_reconcile;
 pub mod runner;
+pub mod runtime_shutdown;
 pub mod semantic_progress;
 pub mod settings;
 pub mod sleep_assertion;

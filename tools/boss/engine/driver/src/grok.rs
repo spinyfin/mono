@@ -49,6 +49,7 @@ mod model_menu;
 mod permissions;
 mod preflight;
 mod progress;
+mod provisioning;
 mod transcript;
 mod turn_end_recovery;
 
@@ -63,6 +64,7 @@ pub use home::{
 use classify_error::classify_grok_error;
 use environment::GrokProcessEnvironment;
 use home::{provision_grok_home, read_session_id, read_workspace_path_stamp};
+pub use preflight::abandon_in_flight_preflight_commands;
 use progress::GrokProgressSession;
 use transcript::GrokTranscriptSession;
 use turn_end_recovery::{is_cancelled_turn_end, prepare_snapshot};
@@ -420,9 +422,7 @@ impl AgentDriver for GrokDriver {
         prompt_text: &str,
         run_id: &str,
     ) -> anyhow::Result<Option<DriverRuntimeState>> {
-        let runtime = provision_grok_home(workspace, prompt_text, run_id)
-            .with_context(|| format!("provisioning Boss-owned GROK_HOME for run_id {run_id:?}"))?;
-        Ok(Some(runtime.to_driver_runtime_state()))
+        provisioning::provision_workspace(workspace, prompt_text, run_id, provision_grok_home).await
     }
 
     async fn teardown_workspace(
