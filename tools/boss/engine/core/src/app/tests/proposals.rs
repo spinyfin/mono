@@ -202,6 +202,151 @@ async fn question_answer_reports_a_minted_execution_only_for_the_first_yes() {
     assert!(!minted, "a No mints nothing");
 }
 
+async fn parked_question_task_with_dispatch_bus() -> (Arc<ServerState>, tempfile::TempDir, String) {
+    // `kick()` only publishes `DispatchReady` when the bus flag is on, which
+    // is what makes the wakeup observable without racing a real scheduler.
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .enable_dispatch_ready_bus(true)
+            .build(),
+        None,
+    ));
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        ServerStateOverrides {
+            cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    state.feature_flags.set("worker_proposals", true).unwrap();
+    state.feature_flags.set("run_done_proposals_seam", true).unwrap();
+    let (execution, task) = new_execution(&state, "Run-done target");
+    state
+        .work_db
+        .start_execution_run(
+            &execution,
+            "worker",
+            "repo",
+            "lease-run-done",
+            "workspace-run-done",
+            temp.path().to_str().unwrap(),
+        )
+        .unwrap();
+    state
+        .worker_registry
+        .register(std::process::id() as libc::pid_t, execution.clone());
+    {
+        let conn = state.work_db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET kind = 'project_task', description = 'Original brief' WHERE id = ?1",
+            [&task],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET kind = 'task_implementation' WHERE id = ?1",
+            [&execution],
+        )
+        .unwrap();
+    }
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(&execution, ProposalKind::RunDone, operator_question_payload()),
+        )
+        .await,
+    );
+    (state, temp, task)
+}
+
+async fn dispatch_ready_count(subscription: &mut boss_event_bus::Subscription) -> usize {
+    let mut count = 0;
+    while let Ok(Some(_)) = tokio::time::timeout(std::time::Duration::from_millis(200), subscription.recv()).await {
+        count += 1;
+    }
+    count
+}
+
+/// A first Yes mints a ready execution, and answering through the RPC handler
+/// must wake the scheduler so the restart does not wait for the heartbeat.
+/// Only the Yes path is asserted: every handled answer also publishes a work
+/// invalidation, which kicks the scheduler on its own, so a No or an
+/// idempotent repeat is not a "no wakeup" case at this layer (the storage
+/// layer's `minted` flag, tested above, is what distinguishes them).
+#[tokio::test]
+async fn question_yes_answer_through_the_handler_wakes_the_scheduler() {
+    let (state, _dir, task_id) = parked_question_task_with_dispatch_bus().await;
+    let mut wakeups = state
+        .execution_coordinator
+        .event_bus()
+        .subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::DispatchReady,
+        ));
+    assert_eq!(
+        dispatch_ready_count(&mut wakeups).await,
+        0,
+        "nothing wakes before the answer"
+    );
+    assert!(matches!(
+        answer_question(&state, &task_id, true).await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    assert!(
+        dispatch_ready_count(&mut wakeups).await >= 1,
+        "a Yes answer wakes the scheduler"
+    );
+    let task = question_task(&state, &task_id);
+    assert!(task.autostart);
+    assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn question_survives_external_ref_and_automation_reads() {
+    let (state, _dir, _, task_id) = parked_question_task().await;
+    let db = &state.work_db;
+    let expected = question_task(&state, &task_id).operator_question;
+    assert!(expected.is_some());
+    db.set_external_ref(&task_id, "github", "spinyfin/mono#560", &json!({"issue_number": 560}))
+        .unwrap();
+    let automation = db
+        .create_automation(
+            boss_protocol::CreateAutomationInput::builder()
+                .product_id(question_task(&state, &task_id).product_id)
+                .name("auto-q")
+                .trigger(boss_protocol::AutomationTrigger::Schedule {
+                    cron: "0 14 * * *".to_owned(),
+                    timezone: "UTC".to_owned(),
+                })
+                .standing_instruction("x")
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET source_automation_id = ?2 WHERE id = ?1",
+            [&task_id, &automation.id],
+        )
+        .unwrap();
+
+    let crate::work::WorkItem::Task(linked) = db.get_task_with_external_ref(&task_id).unwrap() else {
+        panic!("expected task");
+    };
+    assert_eq!(linked.operator_question, expected);
+    let found = db.find_by_external_ref("github", "spinyfin/mono#560").unwrap().unwrap();
+    assert_eq!(found.operator_question, expected);
+    let produced = db.list_tasks_for_automation(&automation.id).unwrap();
+    assert_eq!(produced.len(), 1);
+    assert_eq!(produced[0].operator_question, expected);
+}
+
 #[tokio::test]
 async fn question_no_records_decline_and_remains_in_backlog() {
     let (state, _dir, _, task_id) = parked_question_task().await;

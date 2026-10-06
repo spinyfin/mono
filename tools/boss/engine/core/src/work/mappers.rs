@@ -186,18 +186,6 @@ pub(crate) fn map_comment_thread_entry(row: &Row<'_>) -> rusqlite::Result<Commen
 /// Maps a task row whose SELECT includes the `operator_question` column; a
 /// SELECT that omits it is an error rather than a silent `None`.
 pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
-    map_task_columns(row, true)
-}
-
-/// Like [`map_task`] for the few SELECTs that do not project
-/// `operator_question` (the external-ref lookups and the automation task
-/// lists): the field is reported as `None` there, so these reads must not be
-/// used to re-render a parked task's Needs Attention state.
-fn map_task_without_operator_question(row: &Row<'_>) -> rusqlite::Result<Task> {
-    map_task_columns(row, false)
-}
-
-fn map_task_columns(row: &Row<'_>, requires_operator_question: bool) -> rusqlite::Result<Task> {
     let effort_raw: Option<String> = row.get(19)?;
     let effort_level = match effort_raw.as_deref() {
         None | Some("") => None,
@@ -232,7 +220,6 @@ fn map_task_columns(row: &Row<'_>, requires_operator_question: bool) -> rusqlite
                     })
                 })
                 .transpose()?,
-            Err(_) if !requires_operator_question => None,
             Err(err) => return Err(err),
         },
         product_id: row.get(1)?,
@@ -411,7 +398,7 @@ pub(crate) fn encode_task_tags(tags: &[String]) -> String {
 /// `list_tasks_for_automation` so produced tasks carry their provenance
 /// on the wire.
 pub(crate) fn map_task_with_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
-    let mut task = map_task_without_operator_question(row)?;
+    let mut task = map_task(row)?;
     task.source_automation_id = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
     Ok(task)
 }
@@ -528,14 +515,6 @@ pub(crate) fn derive_external_ref_web_url(kind: &str, canonical_id: &str) -> Str
 /// (Column 33 is `reasoning`, and 34-35 are `review_cycle`/`last_reviewed_sha`,
 /// all part of the base SELECT.)
 pub(crate) fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
-    let mut task = map_task_without_operator_question(row)?;
-    populate_external_ref_from_row(&mut task, row, 36)?;
-    Ok(task)
-}
-
-/// [`map_task_with_external_ref`] for SELECTs that also project
-/// `operator_question`; the wider mappers below build on it.
-fn map_task_with_external_ref_and_operator_question(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
     populate_external_ref_from_row(&mut task, row, 36)?;
     Ok(task)
@@ -545,7 +524,7 @@ fn map_task_with_external_ref_and_operator_question(row: &Row<'_>) -> rusqlite::
 /// `parent_task_id`. Used in `get_work_tree` where the SELECT explicitly
 /// includes the external-ref columns (36-40) followed by `parent_task_id`.
 pub(crate) fn map_task_with_external_ref_and_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
-    let mut task = map_task_with_external_ref_and_operator_question(row)?;
+    let mut task = map_task_with_external_ref(row)?;
     task.parent_task_id = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
     Ok(task)
 }
