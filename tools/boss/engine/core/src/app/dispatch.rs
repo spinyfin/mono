@@ -319,9 +319,7 @@ pub(super) async fn dispatch_request(mut ctx: Dispatch, request: FrontendRequest
         r @ FrontendRequest::SetTaskDocPointer { .. } => Box::pin(work_items::handle_set_task_doc_pointer(ctx, r)),
         r @ FrontendRequest::Shutdown { .. } => Box::pin(sessions::handle_shutdown(ctx, r)),
         r @ FrontendRequest::SpawnCapabilityRestored => Box::pin(sessions::handle_spawn_capability_restored(ctx, r)),
-        r @ FrontendRequest::StartProjectPostmortem { .. } => {
-            Box::pin(project_postmortem_ops::handle_start(ctx, r))
-        }
+        r @ FrontendRequest::StartProjectPostmortem { .. } => Box::pin(project_postmortem_ops::handle_start(ctx, r)),
         r @ FrontendRequest::StopRun { .. } => Box::pin(executions::handle_stop_run(ctx, r)),
         r @ FrontendRequest::SubmitAttachment { .. } => Box::pin(attachments::handle_submit_attachment(ctx, r)),
         r @ FrontendRequest::SubmitProposal { .. } => Box::pin(proposals::handle_submit_proposal(ctx, r)),
