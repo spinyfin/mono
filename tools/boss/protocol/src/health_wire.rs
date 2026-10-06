@@ -76,6 +76,7 @@ pub struct EngineHealthReport {
     /// prose; this is the structured form for CLI / `jq` consumers. Empty
     /// when no combination is in a streak.
     #[serde(default)]
+    #[builder(default)]
     pub spawn_failure_streaks: Vec<SpawnFailureStreak>,
 }
 
