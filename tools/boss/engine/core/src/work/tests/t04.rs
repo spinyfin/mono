@@ -380,7 +380,7 @@ fn fresh_init_includes_external_tracker_schema() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "33");
+    assert_eq!(version, crate::work::schema_init::CURRENT_SCHEMA_VERSION.to_string());
     let _ = std::fs::remove_file(path);
 }
 

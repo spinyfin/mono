@@ -9,6 +9,11 @@ mod baseline;
 /// boss-v1.0.707 (cc72dac8), including its final last_error migration.
 const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 
+/// Schema version stamped once every post-floor migration has run. Bump it
+/// together with the migration that earns it; the guard and the stamp in
+/// `init` both read this constant.
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 33;
+
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
     std::sync::LazyLock::new(|| {
@@ -58,9 +63,12 @@ impl WorkDb {
             )?;
             SCHEMA_COMPATIBILITY_FLOOR.1
         };
-        if version < 33 {
+        if version < CURRENT_SCHEMA_VERSION {
             project_postmortem::migrate_project_postmortem_signals(&tx)?;
-            tx.execute("UPDATE metadata SET value = '33' WHERE key = 'schema_version'", [])?;
+            tx.execute(
+                "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
+                [CURRENT_SCHEMA_VERSION.to_string()],
+            )?;
         }
         // Required runtime data, not a historical migration. Capability
         // discovery remains outside DB startup (no processes or network).
@@ -186,7 +194,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, "33");
+        assert_eq!(schema_version, CURRENT_SCHEMA_VERSION.to_string());
 
         let boothby_passes_exists: bool = conn
             .query_row(
@@ -483,14 +491,14 @@ mod floor_tests {
 
     #[test]
     fn supported_databases_apply_post_floor_migrations_without_losing_data() {
-        for version in [32, 33, 34] {
+        for version in [32, CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
             let conn = Connection::open(&path).unwrap();
             // Construct an existing DB from the independent released-chain
             // golden, rather than opening through the implementation under test.
             seed_released_schema(&conn);
-            if version >= 33 {
+            if version >= CURRENT_SCHEMA_VERSION {
                 project_postmortem::migrate_project_postmortem_signals(&conn).unwrap();
             }
             conn.execute(
@@ -520,7 +528,7 @@ mod floor_tests {
                         row.get(0)
                     })
                     .unwrap();
-                assert_eq!(observed, version.max(33).to_string());
+                assert_eq!(observed, version.max(CURRENT_SCHEMA_VERSION).to_string());
                 let stamp: String = conn
                     .query_row(
                         "SELECT value FROM metadata WHERE key = ?1",
