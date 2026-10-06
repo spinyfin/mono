@@ -6,7 +6,7 @@ import UpdateCore
 // Debug logger for the work-item doc-link render path. Uses .debug() so
 // it is silent in normal use; enable via Console.app subsystem filter or
 // Xcode debug console. Surfaces work_item_id, kind, pr_url value, column,
-// and whether PRURLLink will render — letting the operator identify which
+// and whether PRURLLink will render — letting the user identify which
 // of the three known gap sites (delivery, render, stale build) is live.
 private let kanbanDocLinkLog = Logger(
     subsystem: "dev.spinyfin.bossmacapp",
@@ -441,7 +441,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Invoked with an attention item id when the popup's "Create task"
     /// button is tapped.
     var onCreateTaskFromDeferredScope: ((String) -> Void)? = nil
-    /// Invoked with the operator's Yes/No when they answer the inline
+    /// Invoked with the user's Yes/No when they answer the inline
     /// question. Only called when `snapshot.operatorQuestion` is non-nil.
     var onAnswerOperatorQuestion: ((OperatorAnswer) -> Void)? = nil
 

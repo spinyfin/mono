@@ -102,9 +102,9 @@ final class ChatViewModel: ObservableObject {
     /// `work_error` (refusal) arrives, or the connection drops. Drives the
     /// card's disabled-buttons state so a double click cannot answer twice.
     @Published var operatorAnswerInFlightByTaskID: [String: String] = [:]
-    /// Task id → operator-readable reason the last answer attempt was
-    /// refused. Cleared by the next attempt or by the task's next
-    /// `work_item_updated`.
+    /// Task id → user-readable reason the last answer attempt was
+    /// refused. Cleared by the next attempt or when a task update
+    /// closes or replaces the question.
     @Published var operatorAnswerErrorByTaskID: [String: String] = [:]
     /// Attention *groups* keyed by product id — the agent-authored
     /// notification feature (attentions.md), distinct from the operational
@@ -274,7 +274,7 @@ final class ChatViewModel: ObservableObject {
         didSet { notePublishedWorkInputChanged() }
     }
     /// When true, the Review column shows only `readyForReview` cards —
-    /// waiting on the operator and nothing else: no block, no in-progress
+    /// waiting on the user and nothing else: no block, no in-progress
     /// revision, CI green, no merge conflict. Sticky across app restarts
     /// (persisted like the other board filters below), scoped to the
     /// Review column only.
@@ -509,7 +509,7 @@ final class ChatViewModel: ObservableObject {
     /// Fetched document bodies keyed by their full `(repo, path, ref)`
     /// triple. Keyed by the triple rather than held in a single
     /// "current document" slot so a slow fetch landing after the
-    /// operator clicked elsewhere cannot overwrite the visible document.
+    /// user clicked elsewhere cannot overwrite the visible document.
     @Published var designDocContentByRef: [DesignDocRef: DesignDocContent] = [:]
     /// The document the Designs tab reader pane is showing, if any.
     @Published var selectedDesignDocRef: DesignDocRef?
@@ -1048,7 +1048,7 @@ final class ChatViewModel: ObservableObject {
     /// with. Drives `CoordinatorUpdateBanner`; `nil` renders nothing. Clears
     /// itself the moment a reset makes the versions match again — there is
     /// no separate dismiss, since a wrong "up to date" reading is worse than
-    /// the banner persisting until the operator acts.
+    /// the banner persisting until the user acts.
     @Published var coordinatorUpdateAvailable: String?
 
     /// Whether the engine has confirmed this client is the registered app session.

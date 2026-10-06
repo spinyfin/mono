@@ -201,7 +201,6 @@ extension ChatViewModel {
             handleOperatorQuestionError(message: message, requestId: requestId)
         case .workError(let message, let requestId):
             abandonBackgroundWorkRequest(requestId: requestId)
-            clearOperatorAnswerInFlight(requestId: requestId)
             // The engine's WorkError reply carries no request context, so we
             // can't tell which in-flight list_executions/list_attachments
             // call failed. `hasOtherTrackedAppRequestInFlight` checks every
@@ -218,6 +217,7 @@ extension ChatViewModel {
             // case: one viewer window open, nothing else in flight) do we
             // attribute the error to the waiting viewer(s).
             let otherRequestInFlight = hasOtherTrackedAppRequestInFlight()
+            clearOperatorAnswerInFlight(requestId: requestId)
             if let attemptID = engineAttemptDetailRequestID {
                 engineAttemptDetailErrors[attemptID] = message
                 engineAttemptDetailRequestID = nil
@@ -842,6 +842,7 @@ extension ChatViewModel {
         if !retryingReviewGuideRootTaskIDs.isEmpty { return true }
         if !plannerActionInFlightProjectIDs.isEmpty { return true }
         if !deferredScopeActionInFlightIDs.isEmpty { return true }
+        if !operatorAnswerInFlightByTaskID.isEmpty { return true }
         if !pendingMoveOriginByTaskID.isEmpty { return true }
         if pendingDragAdmissionCheck != nil { return true }
         if engineAttemptDetailRequestID != nil { return true }

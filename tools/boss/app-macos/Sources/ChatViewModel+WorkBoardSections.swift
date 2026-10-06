@@ -48,7 +48,7 @@ extension ChatViewModel {
     }
 
     /// Build the Doing column's "Needs Attention" section — blocked tasks
-    /// whose worker ended by asking the operator a question
+    /// whose worker ended by asking the user a question
     /// (`WorkTask.isAwaitingOperatorAnswer`), rendered collapsible above any
     /// project groups. Returns `nil` when `items` is empty so the caller
     /// omits the section entirely rather than render an empty header.
@@ -287,8 +287,8 @@ extension ChatViewModel {
             return sections
         }
         // Doing's "Needs Attention" section sits above everything else —
-        // flat or project-grouped alike: a task stuck on the operator is
-        // stuck regardless of which project it belongs to, so the project
+        // flat or project-grouped alike: a task waiting on an answer needs attention
+        // regardless of which project it belongs to, so the project
         // groups are built from the remaining items only.
         var needsAttention: [WorkBoardSection] = []
         var remaining = items

@@ -2,7 +2,7 @@ import SwiftUI
 
 // ===========================================================================
 // The inline question on a Doing ▸ Needs Attention card: what a blocked
-// worker asked the operator, a "Why?" disclosure with the full detail, and
+// worker asked the user, a "Why?" disclosure with the full detail, and
 // Yes / No buttons.
 //
 // Equatable over its own [[OperatorQuestionPresentation]] so a live-status
@@ -11,7 +11,7 @@ import SwiftUI
 // ===========================================================================
 
 /// Inputs the question block paints. `nil` for every card that is not
-/// awaiting an operator answer, so ordinary cards pay nothing.
+/// awaiting an answer, so ordinary cards pay nothing.
 struct WorkBoardCardOperatorQuestionSlice: Equatable {
     let presentation: OperatorQuestionPresentation
 
@@ -27,7 +27,7 @@ struct WorkBoardCardOperatorQuestionSlice: Equatable {
 
 struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
     let slice: WorkBoardCardOperatorQuestionSlice
-    /// Invoked with the operator's answer. The card never applies it
+    /// Invoked with the user's answer. The card never applies it
     /// locally: the engine's `work_item_updated` reply moves the card.
     var onAnswer: ((OperatorAnswer) -> Void)? = nil
 
@@ -84,9 +84,9 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
     }
 }
 
-/// "Why?" popover: the whole question, why the worker asked, and when —
+/// "Why?" popover: the whole question, why the worker asked, the run summary, and when —
 /// scrollable and never truncated.
-private struct OperatorQuestionDetailPopover: View {
+struct OperatorQuestionDetailPopover: View {
     let question: OperatorQuestionPresentation
 
     var body: some View {
@@ -96,6 +96,7 @@ private struct OperatorQuestionDetailPopover: View {
                 if !question.explanation.isEmpty {
                     section("Why the worker is asking", question.explanation)
                 }
+                section("Run summary", question.runSummary ?? "No run summary recorded.")
                 if let asked = Self.askedLabel(question.askedAt) {
                     section("Asked", asked)
                 }

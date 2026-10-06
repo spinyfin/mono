@@ -22,6 +22,7 @@ final class OperatorQuestionKanbanTests: XCTestCase {
             "explanation": "Sweeps 48 files.",
             "asked_at": "1790000000",
             "execution_id": "exec_1",
+            "run_summary": "Prepared the migration; awaiting permission to expand its scope.",
         ] as [String: Any]
 
         let task = try XCTUnwrap(client.parseTask(payload))
@@ -33,6 +34,9 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertEqual(question.explanation, "Sweeps 48 files.")
         XCTAssertEqual(question.askedAt, "1790000000")
         XCTAssertEqual(question.executionID, "exec_1")
+        let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .doing))
+        XCTAssertEqual(snapshot.operatorQuestion?.runSummary, "Prepared the migration; awaiting permission to expand its scope.")
+        XCTAssertNotEqual(snapshot.operatorQuestion?.runSummary, question.explanation)
         XCTAssertTrue(task.isAwaitingOperatorAnswer)
     }
 
@@ -369,6 +373,64 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertNil(model.operatorAnswerErrorByTaskID["task_q"])
         XCTAssertEqual(model.task(withID: "task_q")?.boardColumn, .doing)
         XCTAssertFalse(model.workSections(in: .doing).contains { $0.title == "Needs Attention" })
+    }
+
+    func testUnrelatedUpdateKeepsAnswerPendingUntilItsRefusalArrives() {
+        let model = makeModel()
+        let task = awaiting(id: "task_q")
+        model.choresByProductID = ["prod_test": [task]]
+        model.isConnected = true
+        model.operatorAnswerInFlightByTaskID[task.id] = "req-1"
+        var updated = task
+        updated.name = "Renamed while answering"
+        model.applyEventForTest(.workItemUpdated(item: .chore(updated)))
+
+        XCTAssertEqual(model.operatorAnswerInFlightByTaskID[task.id], "req-1")
+        XCTAssertFalse(model.answerOperatorQuestion(for: updated, answer: .yesNo(false)))
+        model.applyEventForTest(.operatorQuestionError(message: "Answer refused", requestId: "req-1"))
+        XCTAssertEqual(model.operatorAnswerErrorByTaskID[task.id], "Answer refused")
+        XCTAssertNil(model.operatorAnswerInFlightByTaskID[task.id])
+        model.applyEventForTest(.workItemUpdated(item: .chore(updated)))
+        XCTAssertEqual(model.operatorAnswerErrorByTaskID[task.id], "Answer refused")
+    }
+
+    func testChangedQuestionSettlesOldAnswer() {
+        let model = makeModel()
+        var task = awaiting(id: "task_q")
+        model.choresByProductID = ["prod_test": [task]]
+        model.operatorAnswerInFlightByTaskID[task.id] = "req-1"
+        task.operatorQuestion = OperatorQuestion(
+            id: "oq_new", text: "Approve new scope?", answerType: .yesNo,
+            explanation: "Scope changed", askedAt: "1790000100", executionID: "exec_2"
+        )
+        model.applyEventForTest(.workItemUpdated(item: .chore(task)))
+        XCTAssertNil(model.operatorAnswerInFlightByTaskID[task.id])
+    }
+
+    func testDoingDropOnNeedsAttentionSendsNothing() {
+        let model = makeModel()
+        let task = makeTask(id: "task_active", status: "active", reason: nil, question: nil)
+        model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.engine.outboundRecorder = { sent.append($0) }
+
+        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: .needsAttention))
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertNil(model.optimisticColumnByTaskID[task.id])
+        XCTAssertNil(model.pendingDragAdmissionCheck)
+    }
+
+    func testUnattributedErrorWhileAnsweringDoesNotBlameViewer() {
+        let model = makeModel()
+        model.operatorAnswerInFlightByTaskID["task_q"] = "req-1"
+        model.executionsInFlightTaskIDs.insert("task_viewer")
+        model.attachmentsInFlightTaskIDs.insert("task_viewer")
+
+        model.applyEventForTest(.workError(message: "Answer request failed", requestId: nil))
+
+        XCTAssertEqual(model.executionsLoadFailureByTaskID["task_viewer"], "Loading failed. Retry?")
+        XCTAssertEqual(model.attachmentsLoadFailureByTaskID["task_viewer"], "Loading failed. Retry?")
+        XCTAssertEqual(model.operatorAnswerInFlightByTaskID["task_q"], "req-1")
     }
 
     // MARK: - Card snapshot

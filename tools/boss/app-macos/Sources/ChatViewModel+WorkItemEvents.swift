@@ -215,10 +215,12 @@ extension ChatViewModel {
                 bounceBackOptimisticMoves(message: nil)
             }
             maybeFireReviewNotification(for: updatedTask)
-            // The engine has spoken for this task: whatever answer was in
-            // flight is settled (accepted, or already answered elsewhere).
-            operatorAnswerInFlightByTaskID.removeValue(forKey: updatedTask.id)
-            operatorAnswerErrorByTaskID.removeValue(forKey: updatedTask.id)
+            // Unrelated updates do not settle an answer to the same open question.
+            if updatedTask.operatorQuestion == nil ||
+                updatedTask.operatorQuestion?.id != task(withID: updatedTask.id)?.operatorQuestion?.id {
+                operatorAnswerInFlightByTaskID.removeValue(forKey: updatedTask.id)
+                operatorAnswerErrorByTaskID.removeValue(forKey: updatedTask.id)
+            }
             // Apply the update directly to the in-memory store instead of
             // fetching the full work tree. The payload already carries the
             // updated task, so a second round-trip is unnecessary.

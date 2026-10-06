@@ -1,13 +1,13 @@
 import Foundation
 
-/// The open question a blocked worker asked the operator, as projected onto a
+/// The open question a blocked worker asked the user, as projected onto a
 /// task by the engine (`Task.operator_question`, `OperatorQuestionView` on the
 /// wire). `nil` on `WorkTask` once the question is answered or withdrawn.
 ///
 /// The card renders `text` inline and keeps `explanation` behind the "Why?"
 /// popover; `askedAt` orders the Doing column's "Needs Attention" section.
 struct OperatorQuestion: Hashable {
-    /// How the operator answers. Mirrors `OperatorAnswerType`; v1 only has
+    /// How the user answers. Mirrors `OperatorAnswerType`; v1 only has
     /// Yes/No, and a payload carrying any other kind is not decoded (see
     /// [[parse(_:)]]) because the card has no UI to answer it.
     enum AnswerType: String, Hashable {
@@ -22,6 +22,7 @@ struct OperatorQuestion: Hashable {
     let askedAt: String
     /// The run that asked; the answer restarts the task in a new run.
     let executionID: String
+    var runSummary: String? = nil
 
     /// Decode the wire `operator_question` object. Absent / null / malformed
     /// → `nil`, and so is a question whose `answer_type.kind` this build
@@ -44,12 +45,13 @@ struct OperatorQuestion: Hashable {
             answerType: answerType,
             explanation: (dict["explanation"] as? String) ?? "",
             askedAt: askedAt,
-            executionID: (dict["execution_id"] as? String) ?? ""
+            executionID: (dict["execution_id"] as? String) ?? "",
+            runSummary: dict["run_summary"] as? String
         )
     }
 }
 
-/// The operator's answer, shaped by the question's `AnswerType`. Encodes to
+/// The user's answer, shaped by the question's `AnswerType`. Encodes to
 /// the wire `OperatorAnswer` tagged object.
 enum OperatorAnswer: Equatable {
     case yesNo(Bool)
@@ -74,15 +76,16 @@ struct OperatorQuestionPresentation: Equatable {
     let answerInFlight: Bool
     /// Transient refusal from the last answer attempt (`Conflict`,
     /// `NotFound`, …). The card stays in place until the next
-    /// `WorkItemUpdated` moves it; this tells the operator why a click did
+    /// `WorkItemUpdated` moves it; this tells the user why a click did
     /// nothing.
     let errorMessage: String?
+    var runSummary: String? = nil
 
     /// The inline question is capped here; the popover shows the whole text.
     static let inlineLineLimit = 3
 }
 
-/// Operator-readable text for the engine's typed `OperatorQuestionError`
+/// User-readable text for the engine's typed `OperatorQuestionError`
 /// (`{"code": "not_found" | "conflict" | "validation_failed", ...}`).
 enum OperatorQuestionFailure {
     static func message(from value: Any?) -> String {

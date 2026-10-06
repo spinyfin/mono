@@ -173,7 +173,7 @@ struct WorkTask: Identifiable, Hashable {
     /// the automation-provenance badge on the card and to route execution
     /// to the automations worker pool. Cards with this set DO appear on
     /// the kanban — the purple wand icon distinguishes them from human-filed
-    /// work so the operator can still review and merge their PRs.
+    /// work so the user can still review and merge their PRs.
     var sourceAutomationId: String? = nil
     /// `true` while an independent `pr_review` reviewer execution is running
     /// for this task. The task is held in the Doing column until the reviewer
@@ -194,7 +194,7 @@ struct WorkTask: Identifiable, Hashable {
     /// — there is nothing to reveal in that case. Mirrors
     /// `Task.ai_review_findings_revision_id` on the wire.
     var aiReviewFindingsRevisionId: String? = nil
-    /// `true` when this is a Review-lane card waiting on the operator and
+    /// `true` when this is a Review-lane card waiting on the user and
     /// nothing else: an open PR with no blocked pill, no `in revision`
     /// badge, all required CI checks green, and no merge conflict with the
     /// base branch. Engine-computed (not derived in the view layer) so the
@@ -276,7 +276,7 @@ struct WorkTask: Identifiable, Hashable {
     var dispatchFailedReason: String? = nil
     /// Human-readable error text for `dispatchFailedReason` (e.g. the
     /// underlying cube lease error message). Rendered directly on the
-    /// kanban card so the operator can see why without digging into
+    /// kanban card so the user can see why without digging into
     /// dispatch logs. Mirrors `Task.dispatch_failed_error` on the wire.
     var dispatchFailedError: String? = nil
     /// RFC 3339 timestamp of the dispatch failure recorded in
@@ -284,14 +284,14 @@ struct WorkTask: Identifiable, Hashable {
     /// Mirrors `Task.dispatch_failed_at` on the wire.
     var dispatchFailedAt: String? = nil
 
-    /// Free-form operator/agent labels on this leaf work item. Empty when
+    /// Free-form user/agent labels on this leaf work item. Empty when
     /// none are set. Mirrors `Task.tags` on the wire. Owned by the leaf
     /// card row — revisions do not inherit parent tags. Caps enforced by
     /// the engine (24 chars / 5 tags); the card truncates display further
     /// if needed and collapses entirely when empty.
     var tags: [String] = []
 
-    /// The open question a blocked worker asked the operator, or `nil` when
+    /// The open question a blocked worker asked the user, or `nil` when
     /// there is none (never asked, answered, withdrawn, or of an answer type
     /// this build cannot render). Mirrors `Task.operator_question`.
     var operatorQuestion: OperatorQuestion? = nil
@@ -473,8 +473,7 @@ extension WorkTask {
     ///     shows the reason badge so the state is legible.
     ///   • `awaiting_operator_answer` with an open question
     ///     (`isAwaitingOperatorAnswer`) → Doing's "Needs Attention"
-    ///     section: the task is work in progress that is stuck on the
-    ///     operator, not shelved work.
+    ///     section: the task is work in progress waiting on an answer.
     ///   • Everything else (dependency, nil, unknown) → Backlog: the item
     ///     can't start yet, so from the user's perspective it sits with
     ///     the not-yet-active pile.
@@ -538,7 +537,7 @@ extension WorkTask {
         }
     }
 
-    /// `true` when a worker ended its run by asking the operator a question
+    /// `true` when a worker ended its run by asking the user a question
     /// and nobody has answered yet: the task is `blocked` for
     /// `awaiting_operator_answer` *and* the engine projected an open question
     /// onto it. Routes the card into Doing's "Needs Attention" section

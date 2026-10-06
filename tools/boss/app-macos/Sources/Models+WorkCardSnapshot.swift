@@ -300,7 +300,8 @@ struct WorkCardSnapshot: Equatable {
                 explanation: question.explanation,
                 askedAt: question.askedAt,
                 answerInFlight: context.operatorAnswerInFlight,
-                errorMessage: context.operatorAnswerError
+                errorMessage: context.operatorAnswerError,
+                runSummary: question.runSummary
             )
         }()
 

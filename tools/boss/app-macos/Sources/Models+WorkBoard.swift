@@ -61,7 +61,7 @@ enum WorkBoardColumnKey: String, CaseIterable, Identifiable {
 ///
 /// Mirrors `boss_protocol::BoardGroup` — the raw values go on the wire.
 enum WorkBoardGroupKey: String {
-    /// Doing ▸ "Needs Attention": `blocked` rows waiting on the operator's
+    /// Doing ▸ "Needs Attention": `blocked` rows waiting on the user's
     /// answer to a worker's question (`WorkTask.isAwaitingOperatorAnswer`).
     /// A **client-only** key: the engine's `BoardGroup` has no such group,
     /// so it never goes on the wire (see `isEngineBoardGroup`) and a drop on

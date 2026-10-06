@@ -54,6 +54,22 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
         XCTAssertGreaterThan(refused, plain)
     }
 
+    func testPopoverRendersRunSummarySeparatelyFromExplanation() throws {
+        var question = presentation()
+        question.runSummary = "Prepared migration changes and stopped for authorization."
+        let first = try renderView(OperatorQuestionDetailPopover(question: question))
+        question.runSummary = "Validated the migration; all checks passed before asking."
+        let second = try renderView(OperatorQuestionDetailPopover(question: question))
+        guard !isUniformlyBlank(first) else {
+            throw XCTSkip("render came back uniformly blank; host does not support offscreen SwiftUI rendering")
+        }
+        XCTAssertNotEqual(
+            first.representation(using: .png, properties: [:]),
+            second.representation(using: .png, properties: [:]),
+            "Changing only the run summary must change the popover"
+        )
+    }
+
     // MARK: - Helpers
 
     private func presentation(
@@ -90,7 +106,11 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
     }
 
     private func render(_ presentation: OperatorQuestionPresentation) throws -> NSBitmapImageRep {
-        let host = NSHostingView(rootView: block(presentation))
+        try renderView(block(presentation))
+    }
+
+    private func renderView<Content: View>(_ view: Content) throws -> NSBitmapImageRep {
+        let host = NSHostingView(rootView: view)
         let height = max(host.fittingSize.height, 60)
         host.appearance = NSAppearance(named: .aqua)
         host.frame = NSRect(x: 0, y: 0, width: width, height: height)
