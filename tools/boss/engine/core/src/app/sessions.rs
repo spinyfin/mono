@@ -733,10 +733,8 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
         peer_pid,
         ..
     } = ctx;
-    let (token, only_if_idle) = match req {
-        FrontendRequest::Shutdown { token } => (token, false),
-        FrontendRequest::ShutdownWhenIdle { token } => (token, true),
-        _ => unreachable!(),
+    let FrontendRequest::Shutdown { token } = req else {
+        unreachable!()
     };
     {
         // The token written to disk at startup is the auth
@@ -750,7 +748,7 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
         // Support/`, so a test that lands here without the
         // file in scope will fail with `token_missing` rather
         // than killing a 9-hour-old engine.
-        let mut outcome = match server_state.control_token.as_deref() {
+        let outcome = match server_state.control_token.as_deref() {
             None => {
                 // In-process serve() without a control token —
                 // shouldn't happen for any process that has a
@@ -767,35 +765,6 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
                 }
             }
         };
-        if outcome == "accepted" && only_if_idle {
-            // Do not wait on a spawn: refuse and let the app retry once it is idle.
-            match server_state.live_worker_states.shutdown_admission.try_write() {
-                Ok(mut admission) => {
-                    // Remote workers register a live-state slot only on their first hook;
-                    // until then a launched run is tracked by its pending-launch marker.
-                    // A marker whose execution already settled is stale, not live.
-                    let pending_remote = server_state
-                        .live_worker_states
-                        .pending_remote_launches()
-                        .into_iter()
-                        .filter(|run_id| {
-                            !server_state
-                                .work_db
-                                .get_execution(run_id)
-                                .is_ok_and(|execution| execution.status.is_terminal())
-                        })
-                        .count();
-                    if pending_remote > 0
-                        || super::engine_meta::count_live_workers(&server_state.live_worker_states.snapshot()) > 0
-                    {
-                        outcome = "workers_live";
-                    } else {
-                        *admission = true;
-                    }
-                }
-                Err(_) => outcome = "workers_spawning",
-            }
-        }
         crate::audit::record_shutdown_rpc(outcome, peer_pid);
         if outcome == "accepted" {
             tracing::info!(
@@ -835,103 +804,6 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
 mod tests {
     use super::super::tests::{make_session_sink, test_server_state};
     use super::*;
-
-    #[tokio::test]
-    async fn guarded_shutdown_refuses_live_and_spawning_then_closes_admission() {
-        let temp = tempfile::tempdir().unwrap();
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder()
-                .cwd(temp.path().to_path_buf())
-                .db_path(temp.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let state = ServerState::new_arc_with_app_pid_and_merge_probe(
-            cfg,
-            None,
-            Some(Arc::new("test-token".to_owned())),
-            super::super::ServerStateOverrides::default(),
-        )
-        .unwrap();
-        let sink = make_session_sink();
-        let request = || FrontendRequest::ShutdownWhenIdle {
-            token: "test-token".to_owned(),
-        };
-        let spawn = state.live_worker_states.shutdown_admission.read().await;
-        handle_shutdown(dispatch_ctx(&state, &sink), request()).await;
-        assert!(matches!(sink.next().await.unwrap().payload,
-            FrontendEvent::ShutdownRejected { reason } if reason == "workers_spawning"));
-        assert!(!*spawn);
-        drop(spawn);
-        state.live_worker_states.register_spawn(1, "run", "model", 123, None);
-        handle_shutdown(dispatch_ctx(&state, &sink), request()).await;
-        assert!(matches!(sink.next().await.unwrap().payload,
-            FrontendEvent::ShutdownRejected { reason } if reason == "workers_live"));
-        assert!(!*state.live_worker_states.shutdown_admission.read().await);
-        state.live_worker_states.release_slot_for_run("run");
-        handle_shutdown(dispatch_ctx(&state, &sink), request()).await;
-        assert!(matches!(
-            sink.next().await.unwrap().payload,
-            FrontendEvent::ShutdownAccepted
-        ));
-        // A new spawn cannot pass its admission check after acceptance.
-        assert!(*state.live_worker_states.shutdown_admission.read().await);
-    }
-
-    #[tokio::test]
-    async fn guarded_shutdown_refuses_unregistered_remote_launch_and_blocks_later_spawns() {
-        let temp = tempfile::tempdir().unwrap();
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder()
-                .cwd(temp.path().to_path_buf())
-                .db_path(temp.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let state = ServerState::new_arc_with_app_pid_and_merge_probe(
-            cfg,
-            None,
-            Some(Arc::new("test-token".to_owned())),
-            super::super::ServerStateOverrides::default(),
-        )
-        .unwrap();
-        let sink = make_session_sink();
-        let request = || FrontendRequest::ShutdownWhenIdle {
-            token: "test-token".to_owned(),
-        };
-        let states = &state.live_worker_states;
-        // A remote launch that has not yet sent its first hook is not invisible.
-        let product = crate::test_support::create_test_product(&state.work_db);
-        let chore = crate::test_support::create_test_chore(&state.work_db, product.id.clone(), "c");
-        let execution = crate::test_support::create_ready_chore_execution(&state.work_db, chore.id.clone());
-        states.note_remote_launch(&execution.id);
-        handle_shutdown(dispatch_ctx(&state, &sink), request()).await;
-        assert!(matches!(sink.next().await.unwrap().payload,
-            FrontendEvent::ShutdownRejected { reason } if reason == "workers_live"));
-        assert!(states.try_admit_spawn().is_ok());
-        // Once the marker clears (slot registered / run released) shutdown is accepted...
-        states.clear_remote_launch(&execution.id);
-        handle_shutdown(dispatch_ctx(&state, &sink), request()).await;
-        assert!(matches!(
-            sink.next().await.unwrap().payload,
-            FrontendEvent::ShutdownAccepted
-        ));
-        // ...and every later spawn path (dispatch, SSH, local) is refused as a deferral.
-        assert_eq!(
-            states.try_admit_spawn().err(),
-            Some(crate::live_worker_state::AdmissionRefusal::ShuttingDown)
-        );
-    }
-
-    #[tokio::test]
-    async fn guarded_shutdown_refuses_while_dispatch_holds_admission() {
-        let registry = crate::live_worker_state::LiveWorkerStateRegistry::new();
-        // Dispatch holds the guard from run start; shutdown's try_write cannot win.
-        let guard = registry.try_admit_spawn().unwrap();
-        assert!(registry.shutdown_admission.try_write().is_err());
-        drop(guard);
-        assert!(registry.shutdown_admission.try_write().is_ok());
-    }
 
     /// `ServerState::coordinator_model` — sourced from
     /// `WorkConfig::coordinator_model` (`BOSS_COORDINATOR_MODEL`, default

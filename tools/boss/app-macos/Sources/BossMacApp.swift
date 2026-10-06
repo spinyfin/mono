@@ -22,7 +22,6 @@ struct BossMacApp: App {
                     // quiet background launch free of network activity.
                     if !BossEnginePaths.isIsolatedInstance {
                         appDelegate.updateModel.startPollingIfNeeded()
-                        appDelegate.startEngineFreshnessDriver(chatModel: chatModel)
                     }
                     if BossEnginePaths.isIsolatedInstance {
                         // Window title is invisible in-window under
@@ -343,20 +342,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Owned here so the App struct can inject it into CheckForUpdatesCommand and
     /// environment objects before any view renders or menu fires.
     let updateModel: UpdateModel = UpdateModel.makeForApp(defaults: BossDefaults.store)
-    /// Reports the newest published release to the engine and applies staged
-    /// updates at an idle boundary. See [[EngineFreshnessDriver]].
-    private var engineFreshnessDriver: EngineFreshnessDriver?
-
-    func startEngineFreshnessDriver(chatModel: ChatViewModel) {
-        guard engineFreshnessDriver == nil, !BossEnginePaths.isRunningInTestContext else { return }
-        let driver = EngineFreshnessDriver(
-            updateModel: updateModel,
-            chatModel: chatModel,
-            liveWorkerStates: chatModel.liveWorkerStates
-        )
-        engineFreshnessDriver = driver
-        driver.start()
-    }
 
     /// Set by `BossMacApp.task` once `ContentView` has appeared. The
     /// flush that matters is gated on

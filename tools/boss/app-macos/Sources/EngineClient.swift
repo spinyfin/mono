@@ -705,11 +705,7 @@ final class EngineClient: @unchecked Sendable {
                 let apiKeyPresent = (report["anthropic_api_key_present"] as? NSNumber)?.boolValue ?? false
                 let rawIssues = report["issues"] as? [[String: Any]] ?? []
                 let issues = rawIssues.compactMap(parseEngineHealthIssue)
-                emit(.engineHealthResult(
-                    apiKeyPresent: apiKeyPresent,
-                    issues: issues,
-                    release: EngineReleaseInfo(report: report)
-                ))
+                emit(.engineHealthResult(apiKeyPresent: apiKeyPresent, issues: issues))
             case "driver_traffic_split_result":
                 let raw = payload["split"] as? [String: Any] ?? [:]
                 // A share the engine did not send would make the decoded

@@ -10,7 +10,6 @@ rust_binary(
         "src/dispatch_stats.rs",
         "src/doctor.rs",
         "src/doctor_tests.rs",
-        "src/health.rs",
         "src/hosts.rs",
         "src/logs.rs",
         "src/main.rs",

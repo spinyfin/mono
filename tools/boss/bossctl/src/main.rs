@@ -27,7 +27,6 @@ mod command_types;
 mod comments;
 mod dispatch_stats;
 mod doctor;
-mod health;
 mod hosts;
 mod logs;
 mod pause;
@@ -161,10 +160,6 @@ enum Command {
         #[command(subcommand)]
         action: LiveStatusAction,
     },
-    /// Print the engine's health report: running engine version, the
-    /// newest published release the app updater has reported, whether
-    /// the engine is behind it, and any open health issues. Read-only.
-    Health,
     /// Run local runtime diagnostics that do not require an engine connection.
     Doctor {
         #[command(subcommand)]
@@ -1345,7 +1340,6 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::LiveStatus {
             action: LiveStatusAction::Debug,
         } => live_status_debug(&cli.socket_path, cli.json).await,
-        Command::Health => health::run(&cli.socket_path, cli.json).await,
         Command::Doctor {
             action: DoctorAction::Tmux,
         } => doctor::run_tmux_preflight(cli.json).await,

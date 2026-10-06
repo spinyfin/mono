@@ -273,141 +273,6 @@ final class EngineProcessControllerTests: XCTestCase {
         XCTAssertTrue(fixture.processObserver.signals.isEmpty)
     }
 
-    func testLaunchTimeUpgradeDoesNotStopAnEngineWithLiveWorkers() throws {
-        let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
-        fixture.socketControl.liveWorkers = 2
-        let launchRecorder = LaunchRecorder()
-        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, socketPath in
-            launchRecorder.record(socketPath)
-            return 4242
-        }
-        defer { controller.stop() }
-
-        try controller.start()
-
-        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
-        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
-        XCTAssertNotNil(controller.bundledEngineMismatchKey)
-    }
-
-    func testGuardedRestartDoesNotSignalAnUnreachableEngine() throws {
-        let fixture = try Fixture(reachableSocket: .none)
-        try "\(fixture.runningPid)\n".write(toFile: fixture.paths.pidPath, atomically: true, encoding: .utf8)
-        fixture.processObserver.markRunning(fixture.runningPid)
-        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, _ in
-            XCTFail("An unreachable engine must not be replaced by an idle update")
-            return 4242
-        }
-        defer { controller.stop() }
-        XCTAssertNotEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
-        XCTAssertTrue(fixture.processObserver.signals.isEmpty)
-        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
-    }
-
-    func testGuardedRestartDoesNotTreatLegacyMissingCountAsIdle() throws {
-        let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "legacy-engine")
-        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, _ in 4242 }
-        defer { controller.stop() }
-        XCTAssertNotEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
-        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
-    }
-
-    func testFailedVersionQueryNeverStopsReachableEngine() throws {
-        for restarting in [false, true] {
-            let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
-            fixture.socketControl.queryFailed = true
-            let recorder = LaunchRecorder()
-            let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, path in
-                recorder.record(path)
-                return 4242
-            }
-            defer { controller.stop() }
-            if restarting {
-                XCTAssertNotEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
-            } else {
-                try controller.start()
-            }
-            XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
-            XCTAssertTrue(fixture.processObserver.signals.isEmpty)
-            XCTAssertTrue(recorder.socketPaths.isEmpty)
-        }
-    }
-
-    func testRefusedGuardedShutdownDoesNotEscalateToSignals() throws {
-        for restarting in [false, true] {
-            let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
-            fixture.socketControl.liveWorkers = 0
-            fixture.socketControl.refuseShutdown = true
-            fixture.processObserver.markRunning(fixture.runningPid)
-            let recorder = LaunchRecorder()
-            let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, path in
-                recorder.record(path)
-                return 4242
-            }
-            defer { controller.stop() }
-            if restarting {
-                XCTAssertNotEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
-            } else {
-                try controller.start()
-            }
-            XCTAssertEqual(fixture.socketControl.shutdownRequests.count, 1)
-            XCTAssertTrue(fixture.processObserver.signals.isEmpty)
-            XCTAssertTrue(recorder.socketPaths.isEmpty)
-        }
-    }
-
-    func testAcceptedGuardedStopOnLaunchSendsOnlyIfIdleAndRelaunchesOnce() throws {
-        let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
-        fixture.socketControl.liveWorkers = 0
-        let recorder = LaunchRecorder()
-        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, path in
-            recorder.record(path)
-            return 4242
-        }
-        defer { controller.stop() }
-
-        try controller.start()
-
-        XCTAssertEqual(fixture.socketControl.shutdownOnlyIfIdleFlags, [true])
-        XCTAssertEqual(recorder.socketPaths.count, 1)
-    }
-
-    func testAcceptedGuardedRestartSendsOnlyIfIdleAndPerformsWithOneRelaunch() throws {
-        let fixture = try Fixture(reachableSocket: .primary)
-        fixture.socketControl.liveWorkers = 0
-        let recorder = LaunchRecorder()
-        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, path in
-            recorder.record(path)
-            return 4242
-        }
-        defer { controller.stop() }
-
-        XCTAssertEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
-
-        XCTAssertEqual(fixture.socketControl.shutdownOnlyIfIdleFlags, [true])
-        XCTAssertEqual(recorder.socketPaths.count, 1)
-    }
-
-    func testLegacyEngineLaunchPathStillSendsUnguardedShutdown() throws {
-        let fixture = try Fixture(reachableSocket: .legacy, runningFingerprint: "stale-engine")
-        let controller = fixture.makeController { _, _, _ in 4242 }
-        defer { controller.stop() }
-
-        try controller.start()
-
-        XCTAssertEqual(fixture.socketControl.shutdownOnlyIfIdleFlags, [false])
-    }
-
-    func testGuardedRestartLeavesAnEngineWithLiveWorkersRunning() throws {
-        let fixture = try Fixture(reachableSocket: .primary)
-        fixture.socketControl.liveWorkers = 1
-        let controller = fixture.makeController(stopPolicy: Fixture.fastStopPolicy) { _, _, _ in 4242 }
-        defer { controller.stop() }
-
-        XCTAssertNotEqual(try controller.restart(onlyIfNoLiveWorkers: true), .performed)
-        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
-    }
-
     func testStopEscalatesSIGTERMThenSIGKILLWhenPidSurvivesSocketClose() throws {
         let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
         fixture.processObserver.markRunning(fixture.runningPid)
@@ -620,11 +485,6 @@ private extension EngineProcessControllerTests {
         private let runningPid: pid_t?
         private var requests: [String] = []
         private var shutdowns: [String] = []
-        private var shutdownIdleFlags: [Bool] = []
-        var refuseShutdown = false
-        var queryFailed = false
-        /// What the engine reports as live; `nil` models an engine that predates the field.
-        var liveWorkers: Int?
 
         init(reachableSocket: String, expectedFingerprint: String?, runningPid: pid_t?) {
             self.reachableSocket = reachableSocket
@@ -640,11 +500,6 @@ private extension EngineProcessControllerTests {
             lock.withLock { shutdowns }
         }
 
-        /// The `onlyIfIdle` value of each shutdown request, in order.
-        var shutdownOnlyIfIdleFlags: [Bool] {
-            lock.withLock { shutdownIdleFlags }
-        }
-
         func isReachable(socketPath: String, timeoutSeconds _: Double) -> Bool {
             socketPath == reachableSocket
         }
@@ -653,18 +508,13 @@ private extension EngineProcessControllerTests {
             socketPath == reachableSocket ? runningPid : nil
         }
 
-        func version(socketPath: String, timeoutSeconds _: Double) -> EngineVersionSnapshot? {
+        func fingerprint(socketPath: String, timeoutSeconds _: Double) -> String? {
             lock.withLock { requests.append(socketPath) }
-            guard !queryFailed, let expectedFingerprint else { return nil }
-            return EngineVersionSnapshot(fingerprint: expectedFingerprint, liveWorkers: liveWorkers)
+            return expectedFingerprint
         }
 
-        func shutdown(socketPath: String, tokenPath _: String, timeoutSeconds _: Double, onlyIfIdle: Bool) throws -> pid_t? {
-            lock.withLock {
-                shutdowns.append(socketPath)
-                shutdownIdleFlags.append(onlyIfIdle)
-            }
-            if refuseShutdown { throw NSError(domain: "test guarded refusal", code: 1) }
+        func shutdown(socketPath: String, tokenPath _: String, timeoutSeconds _: Double) throws -> pid_t? {
+            lock.withLock { shutdowns.append(socketPath) }
             return runningPid
         }
 

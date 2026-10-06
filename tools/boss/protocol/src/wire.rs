@@ -2108,18 +2108,6 @@ pub enum FrontendRequest {
         task_ids: Vec<String>,
     },
 
-    /// The app's updater tells the engine the newest published `boss-v`
-    /// release it knows about (`1.0.N`, no `boss-v` prefix). The engine
-    /// never polls GitHub itself; this is its only source for the
-    /// running-vs-published comparison in [`EngineHealthReport`]. Held in
-    /// memory only — the app re-reports on every connect and after every
-    /// update check. Replies with [`FrontendEvent::EngineHealthResult`]
-    /// and pushes the same report on the engine-health topic, or
-    /// [`FrontendEvent::WorkError`] when `version` is not `MAJOR.MINOR.PATCH`.
-    ReportNewestPublishedRelease {
-        version: String,
-    },
-
     /// App reports which product its chooser is now set to, so the
     /// engine — not the app, and not a coordinator-side cache — is the
     /// system of record for the current selection. `product_id` is
@@ -2549,10 +2537,6 @@ pub enum FrontendRequest {
     /// issue #705. The macOS app, `boss engine stop`, and bossctl all
     /// take this route; SIGTERM remains the OS-shutdown fallback.
     Shutdown {
-        token: String,
-    },
-    /// Atomically refuse shutdown while workers are live or being spawned.
-    ShutdownWhenIdle {
         token: String,
     },
 
