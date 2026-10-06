@@ -57,12 +57,10 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
     func testPopoverRendersRunSummarySeparatelyFromExplanation() throws {
         var question = presentation()
         question.runSummary = "Prepared migration changes and stopped for authorization."
-        let first = try renderView(OperatorQuestionDetailPopover(question: question))
+        let first = try renderView(OperatorQuestionDetailPopover(question: question), size: CGSize(width: 340, height: 360))
         question.runSummary = "Validated the migration; all checks passed before asking."
-        let second = try renderView(OperatorQuestionDetailPopover(question: question))
-        guard !isUniformlyBlank(first) else {
-            throw XCTSkip("render came back uniformly blank; host does not support offscreen SwiftUI rendering")
-        }
+        let second = try renderView(OperatorQuestionDetailPopover(question: question), size: CGSize(width: 340, height: 360))
+        XCTAssertFalse(isUniformlyBlank(first), "The popover must render visible content")
         XCTAssertNotEqual(
             first.representation(using: .png, properties: [:]),
             second.representation(using: .png, properties: [:]),
@@ -109,11 +107,11 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
         try renderView(block(presentation))
     }
 
-    private func renderView<Content: View>(_ view: Content) throws -> NSBitmapImageRep {
-        let host = NSHostingView(rootView: view)
-        let height = max(host.fittingSize.height, 60)
+    private func renderView<Content: View>(_ view: Content, size: CGSize? = nil) throws -> NSBitmapImageRep {
+        let host = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)))
+        let height = size?.height ?? max(host.fittingSize.height, 60)
         host.appearance = NSAppearance(named: .aqua)
-        host.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        host.frame = NSRect(x: 0, y: 0, width: size?.width ?? width, height: height)
         host.layoutSubtreeIfNeeded()
         guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
             throw XCTSkip("bitmapImageRepForCachingDisplay returned nil")
