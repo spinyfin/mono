@@ -111,9 +111,9 @@ fn work_resumed_evidence() -> String {
 /// `EXISTS` clause for [`ClearedBy::ExecutionKindCompleted`]: an execution of
 /// that kind for the same work item reached `completed` at or after the
 /// attention was most recently raised, **and is not the execution the
-/// attention is about**. Mirrors the shape of
-/// `migrate_backfill_resolve_stale_dead_review_attentions`, which established
-/// this evidence rule for `pr_review_died_without_findings`.
+/// attention is about**. This also applies to
+/// `pr_review_died_without_findings`: only another completed review can
+/// supply clearing evidence.
 ///
 /// The self-exclusion is load-bearing. Producers on this path routinely file
 /// the attention from inside the very pass they are about and then mark that

@@ -735,38 +735,6 @@ fn reconcile_bounds_dispatch_failures_and_fails_missing_repository() {
     }
 }
 
-#[test]
-fn migration_retires_legacy_duplicates_and_enforces_one_live_series() {
-    let (_dir, db) = open_db();
-    let (root, series, comparison) = seeded_series(&db);
-    let first = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
-    let first = db.dispatch_pr_review_guide_attempt(&first.id, &root).unwrap();
-    let conn = db.connect().unwrap();
-    conn.execute_batch("DROP INDEX pr_review_guide_attempts_one_live_series")
-        .unwrap();
-    conn.execute(
-        "INSERT INTO pr_review_guide_attempts (id, series_id, comparison_id, request_epoch, ordinal, status, prompt_version, created_at)
-         VALUES ('legacy-newer', ?1, ?2, 2, 2, 'queued', 'test', datetime('now'))",
-        params![series, comparison]).unwrap();
-    migrate_pr_review_guide_job_tables(&conn).unwrap();
-    migrate_pr_review_guide_job_tables(&conn).unwrap();
-    assert_eq!(
-        query_pr_review_guide_attempt(&conn, &first.id).unwrap().unwrap().status,
-        "superseded"
-    );
-    assert_eq!(
-        query_execution(&conn, first.execution_id.as_deref().unwrap())
-            .unwrap()
-            .unwrap()
-            .status,
-        ExecutionStatus::Cancelled
-    );
-    assert!(conn.execute(
-        "INSERT INTO pr_review_guide_attempts (id, series_id, comparison_id, request_epoch, ordinal, status, prompt_version, created_at)
-         VALUES ('duplicate', ?1, ?2, 3, 3, 'queued', 'test', datetime('now'))",
-        params![series, comparison]).is_err());
-}
-
 #[tokio::test]
 async fn hook_usage_is_lossless_durable_and_isolated_between_attempts() {
     let (dir, db) = open_db();

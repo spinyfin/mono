@@ -1,19 +1,6 @@
 use super::*;
 use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
 
-pub(super) fn migrate_execution_bookmarks(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS execution_bookmarks (
-        execution_id TEXT PRIMARY KEY REFERENCES work_executions(id),
-        repo_path TEXT NOT NULL,
-        host_id TEXT NOT NULL,
-        recovered_from TEXT,
-        recovered_work INTEGER
-    );",
-    )?;
-    Ok(())
-}
-
 impl WorkDb {
     pub(crate) fn terminal_bookmark_executions(&self, grace: i64, lookback: i64) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;

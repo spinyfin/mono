@@ -3,7 +3,6 @@
 use super::*;
 
 use crate::work::{TmuxPaneObservationKind, TmuxPaneObservationRecord};
-use rusqlite::Connection;
 
 fn dead_record() -> TmuxPaneObservationRecord {
     TmuxPaneObservationRecord {
@@ -14,71 +13,6 @@ fn dead_record() -> TmuxPaneObservationRecord {
         run_id: None,
         observed_at: None,
     }
-}
-
-#[test]
-fn migrate_work_runs_tmux_pane_observation_adds_nullable_columns_to_existing_rows() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE work_runs (id TEXT PRIMARY KEY, execution_id TEXT NOT NULL);
-         INSERT INTO work_runs (id, execution_id) VALUES ('run_legacy', 'exec_legacy');",
-    )
-    .unwrap();
-
-    crate::work::migrate_work_runs_tmux_pane_observation(&conn).unwrap();
-    crate::work::migrate_work_runs_tmux_pane_observation(&conn).unwrap();
-
-    let columns: Vec<(String, i64)> = conn
-        .prepare(
-            "SELECT name, \"notnull\" FROM pragma_table_info('work_runs')
-             WHERE name IN (
-                 'tmux_observed_pane_dead',
-                 'tmux_observed_pane_dead_status',
-                 'tmux_observed_session_name',
-                 'tmux_pane_observation',
-                 'tmux_pane_observation_at'
-             )
-             ORDER BY name",
-        )
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    assert_eq!(
-        columns,
-        vec![
-            ("tmux_observed_pane_dead".to_owned(), 0),
-            ("tmux_observed_pane_dead_status".to_owned(), 0),
-            ("tmux_observed_session_name".to_owned(), 0),
-            ("tmux_pane_observation".to_owned(), 0),
-            ("tmux_pane_observation_at".to_owned(), 0),
-        ],
-        "all five observation columns must be present and nullable",
-    );
-
-    let row_values: Vec<Option<String>> = conn
-        .query_row(
-            "SELECT tmux_observed_pane_dead, tmux_observed_pane_dead_status,
-                    tmux_observed_session_name, tmux_pane_observation, tmux_pane_observation_at
-             FROM work_runs WHERE id = 'run_legacy'",
-            [],
-            |row| {
-                Ok(vec![
-                    row.get::<_, Option<i64>>(0)?.map(|v| v.to_string()),
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ])
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        row_values,
-        vec![None, None, None, None, None],
-        "a legacy row must read every observation column (including the new timestamp) as unset",
-    );
 }
 
 #[test]

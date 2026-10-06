@@ -73,95 +73,14 @@ pub enum PrSourceCapturePersistOutcome {
     IgnoredStaleObservation,
 }
 
-/// Additive persistence for the source-capture foundation. A series identifies
-/// a canonical PR and its root task. A force-push, base advance, or later poll
-/// preserves earlier comparisons; incomplete packets may be upgraded in place.
-/// Rows are removed only when their referenced artifacts are unreadable.
-pub(crate) fn migrate_pr_review_guide_source_capture_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS pr_review_guide_source_series (
-            id TEXT PRIMARY KEY,
-            root_task_id TEXT NOT NULL,
-            canonical_pr_url TEXT NOT NULL UNIQUE,
-            latest_observation_sequence INTEGER NOT NULL DEFAULT 0,
-            selected_comparison_id TEXT,
-            last_capture_error TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        DROP INDEX IF EXISTS pr_review_guide_source_series_root_idx;
-        CREATE INDEX IF NOT EXISTS pr_review_guide_source_series_observation_idx
-            ON pr_review_guide_source_series(root_task_id, latest_observation_sequence DESC, id DESC);
-        CREATE TABLE IF NOT EXISTS pr_review_guide_source_comparisons (
-            id TEXT PRIMARY KEY,
-            series_id TEXT NOT NULL REFERENCES pr_review_guide_source_series(id),
-            observation_sequence INTEGER NOT NULL,
-            observed_base_sha TEXT NOT NULL,
-            merge_base_sha TEXT NOT NULL,
-            head_sha TEXT NOT NULL,
-            trigger TEXT NOT NULL,
-            packet_hash TEXT NOT NULL,
-            complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
-            omission_count INTEGER NOT NULL DEFAULT 0,
-            packet_path TEXT,
-            omission_summary_json TEXT,
-            captured_at TEXT NOT NULL,
-            UNIQUE(series_id, observed_base_sha, head_sha)
-        );
-        CREATE INDEX IF NOT EXISTS pr_review_guide_source_comparisons_series_sequence_idx
-            ON pr_review_guide_source_comparisons(series_id, observation_sequence DESC, captured_at DESC);
-        CREATE TABLE IF NOT EXISTS pr_review_guide_source_observation_sequence (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            last_sequence INTEGER NOT NULL
-        );
-        INSERT OR IGNORE INTO pr_review_guide_source_observation_sequence (id, last_sequence)
-            VALUES (1, 0);",
-    )?;
-    // Databases created by the original capture PR used CREATE TABLE without
-    // `omission_summary_json` and with a write-only `packet_json` column.
-    // Fresh databases take the shape above; these two statements converge
-    // already-created tables without re-adding columns that CREATE already
-    // listed.
-    if !table_has_column(conn, "pr_review_guide_source_comparisons", "omission_summary_json")? {
-        conn.execute(
-            "ALTER TABLE pr_review_guide_source_comparisons ADD COLUMN omission_summary_json TEXT",
-            [],
-        )?;
-    }
-    for (column, definition) in [
-        ("probe_base_sha", "TEXT"),
-        ("attempt_count", "INTEGER NOT NULL DEFAULT 1"),
-    ] {
-        if !table_has_column(conn, "pr_review_guide_source_comparisons", column)? {
-            conn.execute(
-                &format!("ALTER TABLE pr_review_guide_source_comparisons ADD COLUMN {column} {definition}"),
-                [],
-            )?;
-        }
-    }
-    if table_has_column(conn, "pr_review_guide_source_comparisons", "packet_json")? {
-        conn.execute_batch(
-            "UPDATE pr_review_guide_source_series SET selected_comparison_id = NULL
-             WHERE selected_comparison_id IN
-               (SELECT id FROM pr_review_guide_source_comparisons WHERE packet_path IS NULL);
-             DELETE FROM pr_review_guide_source_comparisons WHERE packet_path IS NULL;
-             ALTER TABLE pr_review_guide_source_comparisons DROP COLUMN packet_json;",
-        )?;
-    }
-    Ok(())
-}
-
 impl WorkDb {
     /// Allocate the global observation order before starting an asynchronous
     /// source read. The returned sequence, rather than a response timestamp,
     /// fences delayed GitHub responses from replacing a newer observation.
     pub(crate) fn allocate_pr_review_guide_source_observation_sequence(&self) -> Result<i64> {
         let conn = self.connect()?;
-        // The additive migration normally seeds this row. Repeating the
-        // idempotent seed here also makes mixed-version test fixtures and an
-        // interrupted first-open migration converge before allocating an
-        // observation, rather than turning a missing seed into a silent
-        // ordering gap.
+        // Seed the singleton on first use. Subsequent allocations preserve
+        // the sequence persisted by earlier engine versions.
         conn.execute(
             "INSERT OR IGNORE INTO pr_review_guide_source_observation_sequence (id, last_sequence)
              VALUES (1, 0)",

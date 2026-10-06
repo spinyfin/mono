@@ -662,13 +662,6 @@ mod insert_helpers;
 mod list_filter;
 mod mappers;
 mod metrics_db;
-mod migrations_a;
-mod migrations_answer_agent;
-mod migrations_attachments;
-mod migrations_b;
-mod migrations_boothby;
-mod migrations_c;
-mod migrations_review_batches;
 mod output_types;
 mod planner_runs;
 mod pr_flow;
@@ -689,6 +682,9 @@ mod revise_doc;
 mod revision_helpers;
 mod run_rows;
 mod schema_init;
+pub(crate) use schema_init::table_exists;
+#[cfg(test)]
+use schema_init::table_has_column;
 mod semantic_progress;
 mod task_targets;
 #[cfg(test)]
@@ -720,19 +716,11 @@ pub(crate) use driver_allocation::*;
 pub(crate) use exec_status_helpers::*;
 pub(crate) use exec_tail::content_checksum;
 use ideas::list_ideas_in_tx;
-pub(crate) use ideas::migrate_ideas_tables;
 pub(crate) use insert_helpers::*;
 // Private on purpose: only the list-read submodules under `work` build
 // these queries, so it stays visible to `work` and its children only.
 use list_filter::ListFilterQuery;
 pub(crate) use mappers::*;
-pub(crate) use migrations_a::*;
-pub(crate) use migrations_answer_agent::*;
-pub(crate) use migrations_attachments::*;
-pub(crate) use migrations_b::*;
-pub(crate) use migrations_boothby::*;
-pub(crate) use migrations_c::*;
-pub(crate) use migrations_review_batches::*;
 pub(crate) use pr_state::stored_pr_number;
 pub(crate) use products_design::{
     attach_task_doc_link_state, attach_task_doc_link_states, attach_task_doc_link_states_for_groups,
@@ -740,12 +728,10 @@ pub(crate) use products_design::{
 };
 pub(crate) use review_guide_jobs::{
     PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,
-    ReviewGuideReenqueueReport, migrate_pr_review_guide_job_tables, notify_review_guide_changed,
-    to_wire_review_guide_summary,
+    ReviewGuideReenqueueReport, notify_review_guide_changed, to_wire_review_guide_summary,
 };
 pub(crate) use review_guide_sources::{
     PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger,
-    migrate_pr_review_guide_source_capture_tables,
 };
 // Only the unit-test suite (and the resolver itself) call this directly;
 // production attach sites go through `attach_task_doc_link_state`.

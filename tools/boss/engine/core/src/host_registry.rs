@@ -1,4 +1,4 @@
-/// Host registry: tables, types, migration helpers, and `WorkDb` methods.
+/// Host registry: types, initialization, and `WorkDb` methods.
 ///
 /// Phase 1 of the distributed-agent-execution design. Adds `hosts`,
 /// `host_capabilities`, and `work_capability_requirements` tables plus
@@ -65,101 +65,7 @@ pub struct HostCapability {
     pub source: String,
 }
 
-// ── Migration helpers (called from WorkDb::init) ──────────────────────────────
-
-pub(crate) fn migrate_host_registry_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS hosts (
-             id             TEXT PRIMARY KEY,
-             ssh_target     TEXT,
-             pool_size      INTEGER NOT NULL DEFAULT 1,
-             enabled        INTEGER NOT NULL DEFAULT 1,
-             last_seen_at   TEXT,
-             last_error_text TEXT,
-             created_at     TEXT NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS host_capabilities (
-             host_id    TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
-             capability TEXT NOT NULL,
-             source     TEXT NOT NULL,
-             PRIMARY KEY (host_id, capability)
-         );
-         CREATE TABLE IF NOT EXISTS work_capability_requirements (
-             subject_kind TEXT NOT NULL,
-             subject_id   TEXT NOT NULL,
-             capability   TEXT NOT NULL,
-             PRIMARY KEY (subject_kind, subject_id, capability)
-         );",
-    )?;
-    Ok(())
-}
-
-/// Add the health-tracking column used by the dispatch-time host
-/// circuit breaker (`record_host_dispatch_failure` / `_success`).
-/// Existing rows default to `0` (healthy) so upgrading engines don't
-/// spuriously trip the breaker on their first post-migration dispatch.
-pub(crate) fn migrate_hosts_health_columns(conn: &Connection) -> Result<()> {
-    let cols = pragma_columns(conn, "hosts")?;
-    if !cols.contains(&"consecutive_failures".to_owned()) {
-        conn.execute(
-            "ALTER TABLE hosts ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    Ok(())
-}
-
-pub(crate) fn migrate_work_executions_host_columns(conn: &Connection) -> Result<()> {
-    let cols = pragma_columns(conn, "work_executions")?;
-    if !cols.contains(&"pinned_host_id".to_owned()) {
-        conn.execute("ALTER TABLE work_executions ADD COLUMN pinned_host_id TEXT", [])?;
-    }
-    if !cols.contains(&"host_id".to_owned()) {
-        conn.execute("ALTER TABLE work_executions ADD COLUMN host_id TEXT", [])?;
-    }
-    Ok(())
-}
-
-/// Add the Phase 3 host attribution columns to `work_runs`. Per the
-/// design's "Storage Additions": `host_id` defaults to `'local'` so
-/// the existing local-only deployment is unaffected by the migration;
-/// `cube_workspace_id` and `remote_pid` are NULL for legacy rows and
-/// populated for new runs (the cube workspace id pair `(host_id,
-/// cube_workspace_id)` is the durable identity per Q8 of the design;
-/// `remote_pid` is the addressing key for Phase 4 signal delivery).
-pub(crate) fn migrate_work_runs_host_columns(conn: &Connection) -> Result<()> {
-    let cols = pragma_columns(conn, "work_runs")?;
-    if !cols.contains(&"host_id".to_owned()) {
-        conn.execute(
-            "ALTER TABLE work_runs ADD COLUMN host_id TEXT NOT NULL DEFAULT 'local'",
-            [],
-        )?;
-    }
-    if !cols.contains(&"cube_workspace_id".to_owned()) {
-        conn.execute("ALTER TABLE work_runs ADD COLUMN cube_workspace_id TEXT", [])?;
-    }
-    if !cols.contains(&"remote_pid".to_owned()) {
-        conn.execute("ALTER TABLE work_runs ADD COLUMN remote_pid INTEGER", [])?;
-    }
-    Ok(())
-}
-
-/// Add the `shell_pid` column to `work_runs` on databases created before the
-/// durable-pane-liveness change. It holds the real OS shell pid of a *local*
-/// tmux worker pane, recorded by `spawn_flow.rs` when tmux creates the
-/// detached worker session. Unlike `remote_pid`
-/// (the SSH-wrapper handshake pid) this is a local pid the engine can probe
-/// with `kill(pid, 0)` across a restart — the restart-robust signal
-/// [`crate::dead_pane_sweep`] uses to detect a pane that died with its host
-/// app (e.g. an app relaunch) while the execution row is still `waiting_human`
-/// and its cube lease is still green. Idempotent.
-pub(crate) fn migrate_work_runs_shell_pid(conn: &Connection) -> Result<()> {
-    let cols = pragma_columns(conn, "work_runs")?;
-    if !cols.contains(&"shell_pid".to_owned()) {
-        conn.execute("ALTER TABLE work_runs ADD COLUMN shell_pid INTEGER", [])?;
-    }
-    Ok(())
-}
+// ── Runtime initialization (called from WorkDb::init) ──────────────────────────────
 
 /// Ensure the `local` host row exists. Idempotent — the `INSERT OR IGNORE`
 /// is a no-op on subsequent engine starts.
@@ -742,19 +648,11 @@ fn now_epoch_string() -> String {
     boss_engine_utils::epoch_time::now_epoch_secs().to_string()
 }
 
-fn pragma_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let cols = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(cols)
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────────
 //
 // Behavioral coverage for the `WorkDb` host-registry methods. Everything
 // runs against a fresh `:memory:` database, which `WorkDb::open` seeds with
-// the migrations plus `ensure_local_host` only; local auto-capabilities
+// the baseline plus `ensure_local_host` only; local auto-capabilities
 // are written by `WorkDb::refresh_local_host_auto_capabilities`, which
 // tests that need them must call (or seed via `insert_host_capability`)
 // themselves.

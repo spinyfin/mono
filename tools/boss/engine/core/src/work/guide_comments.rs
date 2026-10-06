@@ -7,29 +7,6 @@ use boss_protocol::GuideCommentContext;
 mod tests;
 use crate::comments_anchor::{CommentFuzzyConfig, resolve_anchor};
 
-pub(crate) fn migrate_guide_comments(conn: &Connection) -> Result<()> {
-    for (column, definition) in [
-        ("guide_version_id", "TEXT REFERENCES pr_review_guide_versions(id)"),
-        ("guide_context_json", "TEXT"),
-    ] {
-        if !table_has_column(conn, "work_comments", column)? {
-            conn.execute(
-                &format!("ALTER TABLE work_comments ADD COLUMN {column} {definition}"),
-                [],
-            )?;
-        }
-    }
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS work_comments_guide_version_idx ON work_comments(guide_version_id);
-         CREATE TRIGGER IF NOT EXISTS immutable_guide_comment_context
-         BEFORE UPDATE OF artifact_kind, artifact_id, guide_version_id, guide_context_json,
-                          anchor_json, doc_version, plain_text_projection_version ON work_comments
-         WHEN OLD.guide_version_id IS NOT NULL
-         BEGIN SELECT RAISE(ABORT, 'guide comment authored context is immutable'); END;",
-    )?;
-    Ok(())
-}
-
 pub(super) fn context_for_create(
     conn: &Connection,
     input: &CreateCommentInput,

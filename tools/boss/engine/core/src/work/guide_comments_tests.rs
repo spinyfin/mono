@@ -235,28 +235,6 @@ fn create_and_resolve_reject_missing_or_cross_series_version() {
 }
 
 #[test]
-fn additive_migration_preserves_legacy_comments_and_is_repeatable() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE work_comments (
-            id TEXT PRIMARY KEY, artifact_kind TEXT, artifact_id TEXT, anchor_json TEXT,
-            doc_version TEXT, plain_text_projection_version INTEGER, body TEXT);
-         INSERT INTO work_comments VALUES ('legacy', 'work_item', 'task', '{}', 'hash', 1, 'Keep me');",
-    )
-    .unwrap();
-    migrate_guide_comments(&conn).unwrap();
-    migrate_guide_comments(&conn).unwrap();
-    let row: (String, Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT body, guide_version_id, guide_context_json FROM work_comments WHERE id = 'legacy'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(row, ("Keep me".into(), None, None));
-}
-
-#[test]
 fn active_published_guide_versions_survive_beyond_recent_comparisons() {
     let (_dir, db) = open_db();
     let root = create_active_chore(&db, &create_product(&db), "active guide retention");

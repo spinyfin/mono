@@ -1629,10 +1629,6 @@ pub fn pool_dispatch_policy_for_worker_id(worker_id: &str) -> Option<PoolDispatc
 /// to an ordinary `worker-N` slot, so provenance alone is not a pool-driver
 /// guarantee and is intentionally not included here.
 ///
-/// Also a second site to update if a future kind joins the pool-bound set:
-/// [`crate::work::migrations_b::migrate_backfill_pool_driver_decisions`]
-/// hardcodes the same `pr_review` / `automation_triage` kind list in SQL, and
-/// has no way to build it from this function's match arms.
 pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
     match kind {
         ExecutionKind::PrReview | ExecutionKind::AutomationTriage => true,

@@ -99,12 +99,6 @@ use super::*;
 /// never read a half-applied edit that transits through an invalid split.
 const METADATA_KEY_DRIVER_TRAFFIC_SPLIT: &str = "driver_traffic_split";
 
-/// The superseded single-Codex-percentage key. Read only by
-/// `migrations_b::migrate_driver_traffic_split_from_codex_percentage`, which
-/// folds any persisted value into an equivalent split once and then removes
-/// it, so this module has exactly one source of truth.
-pub(crate) const METADATA_KEY_CODEX_DISPATCH_PERCENTAGE: &str = "codex_dispatch_percentage";
-
 /// `execution_driver_decisions.reason`: the row (or its product) pinned a
 /// driver; the split was not consulted.
 pub(crate) const REASON_EXPLICIT: &str = "explicit";

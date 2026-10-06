@@ -26,22 +26,6 @@ pub struct RecordedGuideCommentOutcome {
     pub regeneration: Option<Result<RetryReviewGuideOutcome, String>>,
 }
 
-pub(crate) fn migrate_guide_feedback_outcomes(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS guide_comment_outcomes (
-             comment_id TEXT PRIMARY KEY,
-             revise_task_id TEXT NOT NULL,
-             disposition TEXT NOT NULL,
-             response TEXT NOT NULL,
-             request_regeneration INTEGER NOT NULL DEFAULT 0,
-             created_at TEXT NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS guide_comment_outcomes_by_task
-             ON guide_comment_outcomes(revise_task_id);",
-    )?;
-    Ok(())
-}
-
 impl WorkDb {
     /// Same-PR revision for a `pr_review_guide` artifact. Claims comments and
     /// inserts the revision in one transaction so a losing concurrent claim
