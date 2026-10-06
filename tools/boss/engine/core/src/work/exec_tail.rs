@@ -441,8 +441,7 @@ impl WorkDb {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, external_ref_kind, external_ref_canonical_id,
-                    external_ref_raw, external_ref_synced_at, external_ref_unbound_at,
-                    (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
+                    external_ref_raw, external_ref_synced_at, external_ref_unbound_at
              FROM tasks
              WHERE product_id                = ?1
                AND external_ref_canonical_id IS NOT NULL

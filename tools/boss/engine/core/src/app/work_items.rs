@@ -51,12 +51,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         return;
     };
     match work_db.answer_operator_question(&id, answer) {
-        Ok((item, minted_execution)) => {
-            if minted_execution {
-                // The answer transaction stages no DispatchReady; without
-                // this the restart waits for the scheduler heartbeat.
-                server_state.execution_coordinator.kick();
-            }
+        Ok((item, _)) => {
             let product_id = item.product_id().to_string();
             let revision = publish_work_invalidation(
                 &server_state,

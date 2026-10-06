@@ -280,13 +280,11 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         merge_queue_detail: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
         driver: row.get::<_, Option<String>>(31)?.filter(|s| !s.is_empty()),
         pr_mergeable_state: row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty()),
-        // Standard queries omit the external_ref columns; the T8 methods
-        // use map_task_with_external_ref which adds columns 33-37.
-        // T1 schema columns; populated by T8 WorkDb methods when the migration
-        // has run. Until then the protocol field carries None.
+        // Base task mapping leaves external_ref unset; map_task_with_external_ref
+        // populates it from columns 36-40.
         external_ref: None,
         parent_task_id: None,
-        // completed_at is not in the base 33-column SELECT; extended
+        // completed_at is not in the base task SELECT; extended
         // mappers (map_task_with_parent_and_provenance and
         // map_task_with_external_ref_parent_source_and_provenance) read it
         // from the appended column in their respective SELECTs.
