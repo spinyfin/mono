@@ -76,6 +76,11 @@ struct WorkCardSnapshotContext: Equatable {
     var parentShortID: Int? = nil
     var deferredScopeItems: [DeferredScopeAttention] = []
     var deferredScopeActionInFlightIDs: Set<String> = []
+    /// An answer to this card's operator question is awaiting the engine's
+    /// reply (`ChatViewModel.operatorAnswerInFlightByTaskID`).
+    var operatorAnswerInFlight: Bool = false
+    /// Why the last answer attempt was refused, if it was.
+    var operatorAnswerError: String? = nil
     /// True when the caller will supply an `onOpenTerminal` closure.
     var showsTerminalButton: Bool = false
     var terminalTooltip: String = "Open terminal on PR branch"
@@ -154,6 +159,9 @@ struct WorkCardSnapshot: Equatable {
     let terminalTooltip: String
     let deferredScopeItems: [DeferredScopeAttention]
     let deferredScopeActionInFlightIDs: Set<String>
+    /// The inline question + Yes/No block. Non-nil only for a Doing card whose
+    /// task is awaiting an operator answer (`WorkTask.isAwaitingOperatorAnswer`).
+    let operatorQuestion: OperatorQuestionPresentation?
     /// Card fill / border / shadow chrome (see `KanbanBoardStyle`).
     let boardStyle: KanbanBoardStyle
 
@@ -279,6 +287,23 @@ struct WorkCardSnapshot: Equatable {
         let mergeQueueState: String? = inMerging ? task.mergeQueueState : nil
         let mergeQueueDetail: String? = inMerging ? task.mergeQueueDetail : nil
 
+        // Gated on the effective column, not just the task: an optimistic
+        // drag out of Doing must not leave answer buttons on a card that has
+        // visibly left Needs Attention.
+        let operatorQuestion: OperatorQuestionPresentation? = {
+            guard column == .doing, task.isAwaitingOperatorAnswer,
+                  let question = task.operatorQuestion
+            else { return nil }
+            return OperatorQuestionPresentation(
+                questionID: question.id,
+                text: question.text,
+                explanation: question.explanation,
+                askedAt: question.askedAt,
+                answerInFlight: context.operatorAnswerInFlight,
+                errorMessage: context.operatorAnswerError
+            )
+        }()
+
         let blockedBadgeText = WorkBlockedBadge.badgeText(for: task)
         let blockedBadgeTooltip = WorkBlockedBadge.badgeTooltip(for: task)
         let blockedBadgeHasMoreInfo = WorkBlockedBadge.hasMoreInfo(for: task)
@@ -387,6 +412,7 @@ struct WorkCardSnapshot: Equatable {
             terminalTooltip: context.terminalTooltip,
             deferredScopeItems: context.deferredScopeItems,
             deferredScopeActionInFlightIDs: context.deferredScopeActionInFlightIDs,
+            operatorQuestion: operatorQuestion,
             boardStyle: context.boardStyle,
             isDispatchPending: isDispatchPending,
             isResolvingConflicts: isResolvingConflicts,

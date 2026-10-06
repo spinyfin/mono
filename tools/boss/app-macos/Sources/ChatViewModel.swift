@@ -96,6 +96,16 @@ final class ChatViewModel: ObservableObject {
     /// `ChatViewModel+EventHandling.swift`) so a failed request or a dropped
     /// connection never leaves a row stuck disabled.
     @Published var deferredScopeActionInFlightIDs: Set<String> = []
+    /// Task id → envelope id of the `answer_operator_question` awaiting the
+    /// engine's reply. A task is present from the Yes/No click until its
+    /// `work_item_updated` (success) or `operator_question_error` /
+    /// `work_error` (refusal) arrives, or the connection drops. Drives the
+    /// card's disabled-buttons state so a double click cannot answer twice.
+    @Published var operatorAnswerInFlightByTaskID: [String: String] = [:]
+    /// Task id → operator-readable reason the last answer attempt was
+    /// refused. Cleared by the next attempt or by the task's next
+    /// `work_item_updated`.
+    @Published var operatorAnswerErrorByTaskID: [String: String] = [:]
     /// Attention *groups* keyed by product id — the agent-authored
     /// notification feature (attentions.md), distinct from the operational
     /// `attentionItemsByWorkItemID` store above. Loaded on product selection /

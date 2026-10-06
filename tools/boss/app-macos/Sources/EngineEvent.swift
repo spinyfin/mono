@@ -28,6 +28,10 @@ enum EngineEvent {
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
     case workError(message: String, requestId: String?)
+    /// Typed refusal of an `answer_operator_question` request (`not_found`,
+    /// `conflict`, `validation_failed`). `message` is operator-readable;
+    /// `requestId` is the envelope id of the answer request it refuses.
+    case operatorQuestionError(message: String, requestId: String?)
     case error(message: String)
     /// Snapshot of every allocated worker slot's live runtime state.
     /// Delivered both as a one-shot reply to

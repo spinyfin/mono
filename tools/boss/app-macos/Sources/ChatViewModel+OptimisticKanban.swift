@@ -227,12 +227,18 @@ extension ChatViewModel {
     }
 
     /// Which of its column's named groups `task` currently renders in, or
-    /// `nil` for a column with no groups. Mirrors the Done-column split in
-    /// `computeWorkSections`; kept here so the drop path and the section
-    /// builder cannot drift.
+    /// `nil` for a column with no groups. Mirrors the Doing- and Done-column
+    /// splits in `computeWorkSections`; kept here so the drop path and the
+    /// section builder cannot drift.
     func boardGroup(for task: WorkTask) -> WorkBoardGroupKey? {
-        guard effectiveBoardColumn(for: task) == .done else { return nil }
-        return task.isInMergingSection ? .merging : .completed
+        switch effectiveBoardColumn(for: task) {
+        case .doing:
+            return task.isAwaitingOperatorAnswer ? .needsAttention : nil
+        case .done:
+            return task.isInMergingSection ? .merging : .completed
+        default:
+            return nil
+        }
     }
 
     func clearDragRefusal() {

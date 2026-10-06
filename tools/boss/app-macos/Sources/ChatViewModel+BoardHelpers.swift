@@ -532,6 +532,8 @@ extension ChatViewModel {
                 parentShortID: parentShortID,
                 deferredScopeItems: deferredScopeItems,
                 deferredScopeActionInFlightIDs: deferredScopeActionInFlightIDs,
+                operatorAnswerInFlight: operatorAnswerInFlightByTaskID[task.id] != nil,
+                operatorAnswerError: operatorAnswerErrorByTaskID[task.id],
                 showsTerminalButton: showsTerminalButton,
                 terminalTooltip: terminalTooltip,
                 showsMergeWhenReady: showsMergeWhenReady,

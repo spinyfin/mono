@@ -93,6 +93,7 @@ extension ChatViewModel {
             // without this, a disconnect mid-request leaves the row
             // permanently disabled since no work_error will ever arrive.
             deferredScopeActionInFlightIDs.removeAll()
+            operatorAnswerInFlightByTaskID.removeAll()
             // Same reasoning for a review-guide retry in flight: no
             // `review_guide_retry_queued` or `work_error` reply is ever
             // coming for a request the disconnect killed in transit, so
@@ -196,8 +197,11 @@ extension ChatViewModel {
             if let productID = deletedTask?.productID ?? currentSelectedProductID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
+        case .operatorQuestionError(let message, let requestId):
+            handleOperatorQuestionError(message: message, requestId: requestId)
         case .workError(let message, let requestId):
             abandonBackgroundWorkRequest(requestId: requestId)
+            clearOperatorAnswerInFlight(requestId: requestId)
             // The engine's WorkError reply carries no request context, so we
             // can't tell which in-flight list_executions/list_attachments
             // call failed. `hasOtherTrackedAppRequestInFlight` checks every

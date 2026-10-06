@@ -209,6 +209,9 @@ struct WorkBoardCardItem: View {
                     onAcceptDeferredScope: { id in model.acceptDeferredScopeAttention(id: id) },
                     onCreateTaskFromDeferredScope: { id in
                         model.createTaskFromDeferredScopeAttention(attentionID: id)
+                    },
+                    onAnswerOperatorQuestion: { answer in
+                        model.answerOperatorQuestion(for: task, answer: answer)
                     }
                 )
                 // `WorkBoardCardView` is `Equatable` over its snapshot and
@@ -438,6 +441,9 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Invoked with an attention item id when the popup's "Create task"
     /// button is tapped.
     var onCreateTaskFromDeferredScope: ((String) -> Void)? = nil
+    /// Invoked with the operator's Yes/No when they answer the inline
+    /// question. Only called when `snapshot.operatorQuestion` is non-nil.
+    var onAnswerOperatorQuestion: ((OperatorAnswer) -> Void)? = nil
 
     @State private var isHovered: Bool = false
 
@@ -465,6 +471,10 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 .equatable()
             if let liveStatus = WorkBoardCardLiveStatusRowSlice(snapshot: snap) {
                 WorkBoardCardLiveStatusRow(slice: liveStatus)
+                    .equatable()
+            }
+            if let operatorQuestion = WorkBoardCardOperatorQuestionSlice(snapshot: snap) {
+                WorkBoardCardOperatorQuestion(slice: operatorQuestion, onAnswer: onAnswerOperatorQuestion)
                     .equatable()
             }
             WorkBoardCardBadgeStrip(

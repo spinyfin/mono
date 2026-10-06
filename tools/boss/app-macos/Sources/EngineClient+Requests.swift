@@ -602,7 +602,7 @@ extension EngineClient {
         observedPauseSinceEpochS: UInt64? = nil
     ) {
         var target: [String: Any] = ["column": column.rawValue]
-        if let group {
+        if let group, group.isEngineBoardGroup {
             target["group"] = group.rawValue
         }
         var payload: [String: Any] = [
@@ -640,6 +640,22 @@ extension EngineClient {
         sendLine([
             "type": "request_execution",
             "work_item_id": workItemId,
+        ])
+    }
+
+    /// Answer a blocked worker's question. `id` is the question id (`oq_…`)
+    /// or its task's id. The engine replies with `work_item_updated` (the
+    /// task as it stands after the answer) or `operator_question_error`
+    /// (`not_found`, `conflict`, `validation_failed`). Yes re-authorizes and
+    /// restarts the task; No parks it in Backlog.
+    /// Returns the envelope id (see `sendLine`) so the caller can match a
+    /// refusal to the answer that provoked it; `nil` when nothing was sent.
+    @discardableResult
+    func sendAnswerOperatorQuestion(id: String, answer: OperatorAnswer) -> String? {
+        sendLine([
+            "type": "answer_operator_question",
+            "id": id,
+            "answer": answer.wirePayload,
         ])
     }
 

@@ -291,6 +291,11 @@ struct WorkTask: Identifiable, Hashable {
     /// if needed and collapses entirely when empty.
     var tags: [String] = []
 
+    /// The open question a blocked worker asked the operator, or `nil` when
+    /// there is none (never asked, answered, withdrawn, or of an answer type
+    /// this build cannot render). Mirrors `Task.operator_question`.
+    var operatorQuestion: OperatorQuestion? = nil
+
     var isChore: Bool {
         kind == "chore" || kind == "followup"
     }
@@ -371,6 +376,7 @@ enum WorkBlockedBadge {
         case "ci_failure": return "CI Failure"
         case "ci_failure_exhausted": return "CI Failed"
         case "review_feedback": return "Review"
+        case "awaiting_operator_answer": return "Needs Answer"
         default: return reason.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
@@ -383,6 +389,7 @@ enum WorkBlockedBadge {
     /// exactly the case that can be truncated prose).
     private static let knownReasons: Set<String> = [
         "dependency", "merge_conflict", "ci_failure", "ci_failure_exhausted", "review_feedback",
+        "awaiting_operator_answer",
     ]
 
     /// Whether the blocked pill has meaningfully more to say than its
@@ -464,6 +471,10 @@ extension WorkTask {
     ///     `ci_failure_exhausted`, `review_feedback`) → Review. The item
     ///     has an open PR; the block is transient and in-flight. The card
     ///     shows the reason badge so the state is legible.
+    ///   • `awaiting_operator_answer` with an open question
+    ///     (`isAwaitingOperatorAnswer`) → Doing's "Needs Attention"
+    ///     section: the task is work in progress that is stuck on the
+    ///     operator, not shelved work.
     ///   • Everything else (dependency, nil, unknown) → Backlog: the item
     ///     can't start yet, so from the user's perspective it sits with
     ///     the not-yet-active pile.
@@ -508,6 +519,8 @@ extension WorkTask {
             return .doing
         case "blocked" where isReviewPhaseBlocked:
             return .review
+        case "blocked" where isAwaitingOperatorAnswer:
+            return .doing
         default:
             return .backlog
         }
@@ -523,6 +536,24 @@ extension WorkTask {
         default:
             return false
         }
+    }
+
+    /// `true` when a worker ended its run by asking the operator a question
+    /// and nobody has answered yet: the task is `blocked` for
+    /// `awaiting_operator_answer` *and* the engine projected an open question
+    /// onto it. Routes the card into Doing's "Needs Attention" section
+    /// (`boardColumn`).
+    ///
+    /// Gated on `status`, for the same stale-scalar reason `WorkBlockedBadge`
+    /// is: a `blocked_reason` or question that outlives the status must not
+    /// route a card. Gated on the question too: a parked task with the
+    /// reason but nothing to answer (an answer type this build cannot render,
+    /// or a payload racing the question's withdrawal) stays a plain blocked
+    /// card in Backlog rather than a Needs Attention card with no buttons.
+    var isAwaitingOperatorAnswer: Bool {
+        status == "blocked"
+            && blockedReason == "awaiting_operator_answer"
+            && operatorQuestion != nil
     }
 
     /// `true` when the task's PR is either in GitHub's merge queue or has

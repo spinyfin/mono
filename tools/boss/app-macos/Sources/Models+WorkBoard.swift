@@ -61,6 +61,12 @@ enum WorkBoardColumnKey: String, CaseIterable, Identifiable {
 ///
 /// Mirrors `boss_protocol::BoardGroup` — the raw values go on the wire.
 enum WorkBoardGroupKey: String {
+    /// Doing ▸ "Needs Attention": `blocked` rows waiting on the operator's
+    /// answer to a worker's question (`WorkTask.isAwaitingOperatorAnswer`).
+    /// A **client-only** key: the engine's `BoardGroup` has no such group,
+    /// so it never goes on the wire (see `isEngineBoardGroup`) and a drop on
+    /// the section reports just the column.
+    case needsAttention = "needs_attention"
     /// Done ▸ "Merging": `in_review` rows whose PR is in a merge queue or has
     /// Merge When Ready armed. In flight, **not** complete.
     case merging
@@ -69,6 +75,16 @@ enum WorkBoardGroupKey: String {
     /// wire value because a drop cannot choose which bucket a card lands in —
     /// that is derived from `completed_at`.
     case completed
+
+    /// Whether the engine's `BoardGroup` vocabulary includes this key. Only
+    /// those are sent in a `move_work_item_on_board` target; sending any
+    /// other would fail the request's deserialization engine-side.
+    var isEngineBoardGroup: Bool {
+        switch self {
+        case .merging, .completed: return true
+        case .needsAttention: return false
+        }
+    }
 }
 
 enum WorkBoardGrouping: String, CaseIterable, Identifiable {

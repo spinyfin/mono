@@ -47,6 +47,39 @@ extension ChatViewModel {
         )
     }
 
+    /// Build the Doing column's "Needs Attention" section — blocked tasks
+    /// whose worker ended by asking the operator a question
+    /// (`WorkTask.isAwaitingOperatorAnswer`), rendered collapsible above any
+    /// project groups. Returns `nil` when `items` is empty so the caller
+    /// omits the section entirely rather than render an empty header.
+    ///
+    /// Oldest question first (`operatorQuestion.askedAt` ascending), so the
+    /// task that has waited longest is at the top; ties — and a missing or
+    /// unparseable timestamp, which sorts last — break on task id for a
+    /// stable order. `AutomationTime.parse` accepts both the engine's epoch
+    /// seconds and RFC 3339.
+    static func needsAttentionSection(items: [WorkTask]) -> WorkBoardSection? {
+        guard !items.isEmpty else { return nil }
+        let sorted = items.sorted { lhs, rhs in
+            let lhsAsked = lhs.operatorQuestion.flatMap { AutomationTime.parse($0.askedAt) }
+            let rhsAsked = rhs.operatorQuestion.flatMap { AutomationTime.parse($0.askedAt) }
+            switch (lhsAsked, rhsAsked) {
+            case let (l?, r?) where l != r: return l < r
+            case (.some, .none): return true
+            case (.none, .some): return false
+            default: return lhs.id < rhs.id
+            }
+        }
+        return WorkBoardSection(
+            id: "doing-needs-attention",
+            title: "Needs Attention",
+            items: sorted,
+            isCollapsible: true,
+            defaultExpanded: true,
+            groupKey: .needsAttention
+        )
+    }
+
     /// Bucket completed tasks by recency for the Done lane:
     ///   Today | Yesterday | <weekday names back to start of current week>
     ///   | Last Week | Earlier
@@ -253,15 +286,32 @@ extension ChatViewModel {
             sections.append(contentsOf: Self.doneSections(items: completed))
             return sections
         }
+        // Doing's "Needs Attention" section sits above everything else —
+        // flat or project-grouped alike: a task stuck on the operator is
+        // stuck regardless of which project it belongs to, so the project
+        // groups are built from the remaining items only.
+        var needsAttention: [WorkBoardSection] = []
+        var remaining = items
+        if column == .doing {
+            let awaiting = items.filter(\.isAwaitingOperatorAnswer)
+            remaining = items.filter { !$0.isAwaitingOperatorAnswer }
+            if let section = Self.needsAttentionSection(items: awaiting) {
+                needsAttention.append(section)
+            }
+        }
         guard workBoardGrouping == .project else {
-            return [WorkBoardSection(id: column.rawValue, title: column.title, items: items)]
+            // With a Needs Attention section present, an empty flat section
+            // would only be a headerless no-op under it.
+            if remaining.isEmpty, !needsAttention.isEmpty { return needsAttention }
+            return needsAttention
+                + [WorkBoardSection(id: column.rawValue, title: column.title, items: remaining)]
         }
 
-        let grouped = Dictionary(grouping: items) { task in
+        let grouped = Dictionary(grouping: remaining) { task in
             projectName(for: task.projectID) ?? "No Project"
         }
 
-        return grouped.keys.sorted().compactMap { key in
+        return needsAttention + grouped.keys.sorted().compactMap { key in
             guard let sectionItems = grouped[key], !sectionItems.isEmpty else { return nil }
             let projectID = sectionItems.first?.projectID
             return WorkBoardSection(
