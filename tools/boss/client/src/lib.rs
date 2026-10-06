@@ -736,10 +736,7 @@ fn walk_to_workspace_root(start: &Path) -> Option<PathBuf> {
         if is_bazel_workspace(current) {
             return Some(current.to_path_buf());
         }
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => return None,
-        }
+        current = current.parent()?;
     }
 }
 

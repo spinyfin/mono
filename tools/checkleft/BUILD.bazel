@@ -261,7 +261,7 @@ _CHECKLEFT_LIB_TEST_COMPILE_DATA = [
 # The real, pinned-toolchain rustfmt (the same `@rules_rust//tools/upstream_wrapper:rustfmt`
 # label the format/rust check's `bazel` default binding resolves in production),
 # staged the same way so rustfmt_skip_children_fix_e2e.rs can drive the actual
-# fix path against the hermetic 1.95.0-toolchain rustfmt rather than whatever
+# fix path against the hermetic 1.99.0-toolchain rustfmt rather than whatever
 # `rustfmt` happens to be on the host PATH. The wrapper is itself a rust_binary
 # that resolves its wrapped tool via runfiles (see its rustc_env
 # WRAPPED_TOOL_TARGET); because `spawn()` (executor.rs) never clears the child

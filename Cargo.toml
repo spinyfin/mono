@@ -100,7 +100,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0.97"
-async-trait = "0.1.86"
+async-trait = "0.1.92"
 base64 = "0.22"
 bon = "3.9.1"
 # chrono / chrono-tz: IANA-timezone-aware occurrence math for the

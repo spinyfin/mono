@@ -482,7 +482,7 @@ impl WorkDb {
         )?;
 
         commit_and_publish(tx, pending, self.event_bus())?;
-        Ok(Some(applied_ref).filter(|_| remediating_task_id.is_some()))
+        Ok(remediating_task_id.is_some().then_some(applied_ref))
     }
 
     /// `list_worker_proposals` orders newest-first (its `bossctl` callers

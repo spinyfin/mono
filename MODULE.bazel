@@ -111,8 +111,8 @@ rust.toolchain(
     # target_compatible_with is [wasm32, wasi, wasi_preview_2] — unambiguous, so
     # it is only ever selected for the //platforms:wasm32_wasip2 platform.
     extra_target_triples = ["wasm32-wasip2"],
-    rustfmt_version = "1.95.0",
-    versions = ["1.95.0"],
+    rustfmt_version = "1.99.0",
+    versions = ["1.99.0"],
 )
 use_repo(rust, "rust_toolchains")
 
