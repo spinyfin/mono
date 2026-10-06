@@ -235,7 +235,7 @@ public final class UpdateModel: ObservableObject {
     /// the bundle's `CFBundleShortVersionString` is unavailable (e.g. `swift run` without plist).
     ///
     /// Callers in the macOS app must pass `BossDefaults.store` so isolated capture
-    /// instances keep update prefs out of the operator's production defaults suite.
+    /// instances keep update prefs out of the production defaults suite.
     public static func makeForApp(defaults: UserDefaults = .standard) -> UpdateModel {
         if let model = fromBundle(defaults: defaults) { return model }
         // No `.app` bundle (e.g. `swift run` / bazel-run local dev). This is always a
