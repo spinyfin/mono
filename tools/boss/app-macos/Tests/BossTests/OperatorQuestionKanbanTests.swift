@@ -435,6 +435,20 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
     // MARK: - Card snapshot
 
+    func testMatchingAnswerErrorSettlesAnswerWithoutBlamingViewer() {
+        let model = makeModel()
+        model.operatorAnswerInFlightByTaskID["task_q"] = "req-1"
+        model.executionsInFlightTaskIDs.insert("task_viewer")
+        model.attachmentsInFlightTaskIDs.insert("task_viewer")
+
+        model.applyEventForTest(.workError(message: "Answer request failed", requestId: "req-1"))
+
+        XCTAssertNil(model.operatorAnswerInFlightByTaskID["task_q"])
+        XCTAssertEqual(model.executionsLoadFailureByTaskID["task_viewer"], "Loading failed. Retry?")
+        XCTAssertEqual(model.attachmentsLoadFailureByTaskID["task_viewer"], "Loading failed. Retry?")
+        XCTAssertEqual(model.workErrorMessage, "Answer request failed")
+    }
+
     func testSnapshotCarriesTheQuestionForADoingCardOnly() throws {
         let task = awaiting(id: "task_q")
 

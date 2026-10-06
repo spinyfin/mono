@@ -667,7 +667,6 @@ pub struct OperatorQuestionView {
     pub execution_id: String,
     /// Summary recorded by the run that declared this question.
     #[serde(default)]
-    #[builder(default)]
     pub run_summary: Option<String>,
 }
 
