@@ -89,18 +89,11 @@ extension ChatViewModel {
             return true
         }
 
-        if task.status == "blocked",
-           hasGatingPrereqs(task)
-        {
-            let count = gatingPrereqs(for: task.id).count
-            let plural = count == 1 ? "prerequisite" : "prerequisites"
-            dragRefusalNotice = DragRefusalNotice(
-                taskID: task.id,
-                message: "\(task.name) is gated by \(count) incomplete \(plural) — clear them or remove the edge first."
-            )
-            scheduleDragRefusalDismiss(for: task.id)
-            return false
-        }
+        // The engine owns dependency admission through `gating_prereqs_for`,
+        // as for an explicit `RequestExecution`: an `in_review` prerequisite
+        // satisfies a revision. Forward the drop; refusals return as
+        // `work_error`, and `bounceBackOptimisticMoves` shows the reason on
+        // the card. Display helpers do not decide admission.
 
         // Moving out of Doing while a live worker is attached is blocked
         // except for two intentional gestures — see `moveTask`, which applies

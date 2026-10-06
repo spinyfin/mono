@@ -259,6 +259,8 @@ pub fn status_satisfies(status: &str) -> bool {
 ///
 /// For all non-revision dependents the standard `done`/`archived` rules
 /// apply.
+/// Display counterpart: `ChatViewModel+Dependencies.swift`
+/// `prerequisiteStatusSatisfies`; keep its display rule and tests in sync.
 pub fn status_satisfies_for_dependent(prereq_status: &str, dependent_kind: Option<&str>) -> bool {
     if dependent_kind == Some("revision") && prereq_status == "in_review" {
         return true;
