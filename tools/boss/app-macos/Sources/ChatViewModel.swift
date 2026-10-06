@@ -1,5 +1,4 @@
 import Foundation
-import UpdateCore
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -423,16 +422,6 @@ final class ChatViewModel: ObservableObject {
     /// `issues` list. `true` until the engine answers at least once,
     /// so the banner doesn't flash on a transient reconnect.
     @Published var engineAnthropicApiKeyPresent: Bool = true
-    /// The engine's running version against the newest published
-    /// release, from the same `get_engine_health` reply. `nil` until a
-    /// report arrives, or from an engine too old to send one.
-    @Published var engineRelease: EngineReleaseInfo?
-
-    /// Forward the updater's newest published release (`1.0.N`) to the
-    /// engine, which has no release poller of its own.
-    func reportNewestPublishedRelease(_ version: String) {
-        engine.sendReportNewestPublishedRelease(version: version)
-    }
 
     /// Current driver traffic split: how eligible, `standard`-reasoning
     /// implementation work is allocated between the `grok`, `claude`, and
@@ -975,9 +964,6 @@ final class ChatViewModel: ObservableObject {
     /// or has exhausted its bounded retry policy.
     @Published private(set) var engineSupervisionState: EngineSupervisionState = .running
 
-    /// Identifies the bundled-engine fingerprint mismatch the process controller last saw, if any.
-    var bundledEngineMismatchKey: String? { processController.bundledEngineMismatchKey }
-
     /// User-initiated recovery from the unreachable banner. Discovers the
     /// reachable engine by socket (token-auth shutdown RPC first, then a
     /// validated peer/pid-file SIGTERM/SIGKILL fallback) and
@@ -988,29 +974,15 @@ final class ChatViewModel: ObservableObject {
     /// `startIfNeeded()` uses so the main thread never blocks on
     /// `terminateEngine`'s up-to-5s SIGKILL wait. `isRestartingEngine`
     /// drives the banner button's `.disabled` state.
-    ///
-    /// With `onlyIfNoLiveWorkers` the controller re-checks the engine's own
-    /// live-worker count at the moment it would stop the engine, and leaves
-    /// the engine running if any worker is live (used by update applies).
-    ///
-    /// `completion`, when given, runs on the main actor once the restart settles:
-    /// `.performed` — the engine was stopped and relaunched; `.deferred(message)` —
-    /// the engine was left running (live workers, a refused guarded stop, or a
-    /// restart already in flight) and the caller should retry later; `.failed(message)`
-    /// — the restart errored and the engine may be down.
-    func restartEngine(onlyIfNoLiveWorkers: Bool = false, completion: (@MainActor @Sendable (IdleApplyOutcome) -> Void)? = nil) {
-        guard !isRestartingEngine else {
-            completion?(.deferred("Waiting for the current engine restart."))
-            return
-        }
+    func restartEngine() {
+        guard !isRestartingEngine else { return }
         isRestartingEngine = true
 
         let processController = self.processController
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var restartError: Error?
-            var outcome: IdleApplyOutcome = .performed
             do {
-                outcome = try processController.restart(onlyIfNoLiveWorkers: onlyIfNoLiveWorkers)
+                try processController.restart()
             } catch {
                 restartError = error
             }
@@ -1022,11 +994,6 @@ final class ChatViewModel: ObservableObject {
                         "Failed to restart engine: \(restartError.localizedDescription)",
                         alwaysShow: true
                     )
-                }
-                if let restartError {
-                    completion?(.failed(restartError.localizedDescription))
-                } else {
-                    completion?(outcome)
                 }
                 // Make sure the EngineClient is started even if the
                 // very first `startIfNeeded()` failed before launching

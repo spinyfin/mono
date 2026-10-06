@@ -112,14 +112,6 @@ extension EngineClient {
         sendLine(["type": "get_engine_health"])
     }
 
-    /// Tell the engine the newest published `boss-v` release the app's
-    /// updater knows about (`1.0.N`). The engine has no release poller
-    /// of its own; this feeds its running-vs-published comparison. The
-    /// reply is an `engine_health_result`.
-    func sendReportNewestPublishedRelease(version: String) {
-        sendLine(["type": "report_newest_published_release", "version": version])
-    }
-
     /// Pause or resume global dispatch — the same `SetDispatchPaused`
     /// RPC `bossctl dispatch resume` drives. Replies with
     /// `FrontendEvent::DispatchStateResult`; the caller re-polls

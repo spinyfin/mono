@@ -312,62 +312,15 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         });
     }
 
-    let engine_version = crate::build_info::version();
-    let newest_published_release = server_state.newest_published_release.lock().unwrap().clone();
-    let freshness = boss_protocol::engine_release_freshness(engine_version, newest_published_release.as_deref());
-    if let Some(issue) = engine_behind_release_issue(engine_version, newest_published_release.as_deref(), freshness) {
-        issues.push(issue);
-    }
-
     EngineHealthReport {
-        engine_version: engine_version.to_owned(),
+        engine_version: crate::build_info::version().to_owned(),
         engine_git_sha: crate::build_info::git_sha().to_owned(),
-        newest_published_release,
-        engine_release_status: freshness.status,
-        engine_is_dev_build: freshness.is_dev_build,
         anthropic_api_key_present,
         dispatch_paused,
         automation_paused,
         review_guide_reenqueue: server_state.review_guide_reenqueue_summary(),
         issues,
     }
-}
-
-/// The health issue for an engine older than the newest published
-/// release: "a merged fix is not a deployed fix". `None` unless the
-/// comparison says [`EngineReleaseStatus::Behind`] — an unknown version
-/// is reported through the report's status field, not as a warning.
-///
-/// Raised for dev builds too. A dev build is never auto-installed over,
-/// but the gap is still real and still shown.
-///
-/// [`EngineReleaseStatus::Behind`]: boss_protocol::EngineReleaseStatus::Behind
-pub(super) fn engine_behind_release_issue(
-    engine_version: &str,
-    newest_published_release: Option<&str>,
-    freshness: boss_protocol::EngineReleaseFreshness,
-) -> Option<boss_protocol::EngineHealthIssue> {
-    if freshness.status != boss_protocol::EngineReleaseStatus::Behind {
-        return None;
-    }
-    let newest = newest_published_release?;
-    let remedy = if freshness.is_dev_build {
-        "This engine is a dev build, which Boss never auto-installs over. Rebuild from a checkout that \
-         includes the release, or install the published release."
-    } else {
-        "The engine ships inside the Boss app bundle, so it updates with the app. Use Update & Restart \
-         in the Boss app; the update is applied once no workers are live. In automatic update mode Boss \
-         does this on its own at the next idle boundary."
-    };
-    Some(boss_protocol::EngineHealthIssue {
-        kind: boss_protocol::ENGINE_BEHIND_PUBLISHED_RELEASE_KIND.to_owned(),
-        severity: "warning".to_owned(),
-        title: format!("Running engine {engine_version} is older than published release {newest}"),
-        body: format!(
-            "Boss {newest} is published, but the running engine is still {engine_version}. Fixes merged \
-             since {engine_version} are not running until the engine restarts on the newer build.\n\n{remedy}"
-        ),
-    })
 }
 
 /// Build the per-slot diagnostic snapshot the `live-status debug`

@@ -407,7 +407,6 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ProbeStatus { .. }
         | FrontendRequest::ReapRun { .. }
         | FrontendRequest::ReleaseReviewTerminal { .. }
-        | FrontendRequest::ReportNewestPublishedRelease { .. }
         | FrontendRequest::EvaluateDispatchAdmission { .. }
         | FrontendRequest::RequestExecution { .. }
         | FrontendRequest::RetirePane { .. }
@@ -453,7 +452,6 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ReportSelectedProduct { .. }
         | FrontendRequest::SetCoordinatorHandoff { .. }
         | FrontendRequest::Shutdown { .. }
-        | FrontendRequest::ShutdownWhenIdle { .. }
         | FrontendRequest::SpawnCapabilityRestored => coordinator(variant_name(request)),
 
         // ── Denied: coordinator control surfaces ─────────────────────────

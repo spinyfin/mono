@@ -204,29 +204,12 @@ pub(super) async fn handle_worker_pool_summary(ctx: Dispatch, req: FrontendReque
     }
 }
 
-/// Workers that hold a slot and a conversation: everything except errored
-/// and terminated, matching the app's own "live" definition.
-pub(super) fn count_live_workers(states: &[boss_protocol::LiveWorkerState]) -> u32 {
-    use boss_protocol::WorkerActivity::{Idle, Spawning, WaitingForInput, Working};
-    let live = states
-        .iter()
-        .filter(|s| matches!(s.activity, Spawning | Working | WaitingForInput | Idle))
-        .count();
-    u32::try_from(live).unwrap_or(u32::MAX)
-}
-
 pub(super) async fn handle_get_engine_version(ctx: Dispatch, req: FrontendRequest) {
-    let Dispatch {
-        server_state,
-        sink,
-        request_id,
-        ..
-    } = ctx;
+    let Dispatch { sink, request_id, .. } = ctx;
     let FrontendRequest::GetEngineVersion = req else {
         unreachable!()
     };
     {
-        let live_worker_count = count_live_workers(&server_state.live_worker_states.snapshot());
         send_response(
             &sink,
             &request_id,
@@ -235,7 +218,6 @@ pub(super) async fn handle_get_engine_version(ctx: Dispatch, req: FrontendReques
                 git_sha: crate::build_info::git_sha().to_owned(),
                 build_time: crate::build_info::build_time().to_owned(),
                 binary_fingerprint: crate::build_info::binary_fingerprint().to_owned(),
-                live_worker_count: Some(live_worker_count),
             },
         );
     }
@@ -255,45 +237,6 @@ pub(super) async fn handle_get_engine_health(ctx: Dispatch, req: FrontendRequest
         let report = build_engine_health_report(&server_state);
         send_response(&sink, &request_id, FrontendEvent::EngineHealthResult { report });
     }
-}
-
-pub(super) async fn handle_report_newest_published_release(ctx: Dispatch, req: FrontendRequest) {
-    let Dispatch {
-        server_state,
-        sink,
-        request_id,
-        ..
-    } = ctx;
-    let FrontendRequest::ReportNewestPublishedRelease { version } = req else {
-        unreachable!()
-    };
-    if boss_protocol::parse_release_version(&version).is_none() {
-        send_work_error(
-            &sink,
-            &request_id,
-            format!("ReportNewestPublishedRelease: `{version}` is not a MAJOR.MINOR.PATCH release version"),
-        );
-        return;
-    }
-    let changed = {
-        let mut newest = server_state.newest_published_release.lock().unwrap();
-        let changed = newest.as_deref() != Some(version.as_str());
-        *newest = Some(version.clone());
-        changed
-    };
-    let report = build_engine_health_report(&server_state);
-    if changed {
-        tracing::info!(
-            newest_published_release = %version,
-            engine_version = %report.engine_version,
-            engine_release_status = report.engine_release_status.as_str(),
-            "newest published release reported by the app updater",
-        );
-        // Every subscribed frontend (not just the reporter) sees the
-        // stale-engine indicator appear or clear.
-        server_state.broadcast_engine_health().await;
-    }
-    send_response(&sink, &request_id, FrontendEvent::EngineHealthResult { report });
 }
 
 pub(super) async fn handle_list_feature_flags(ctx: Dispatch, req: FrontendRequest) {

@@ -234,38 +234,6 @@ The check flow carries `os.log` observability (`subsystem: dev.spinyfin.bossmaca
 - Swap-in-progress is brief; the main feedback is simply relaunching into the new version. A swap that succeeded but couldn't relaunch (vetoed quit, missing helper) is reported truthfully as "installed — quit to finish" (#1855), never as a failure.
 - Errors are non-blocking: a status line in the Settings pane and terminal states in the sheet/popover. We never throw a modal that interrupts work.
 
-### 6. Stale-engine indicator and apply-at-idle
-
-Added after incident 008 (postmortem in mono#3048): a fix was published as a release, but the engine that had started before it kept running for another 24 hours. Swap-on-quit and swap-on-startup only help someone who quits. This section closes the gap for a long-lived session, without adding a second update channel: the engine still ships inside the app bundle and still follows it.
-
-**Showing it.** The engine has no release poller. The app forwards the newest installable `boss-v*` release `UpdateChecker` has seen to the engine with `ReportNewestPublishedRelease` — on every connect and whenever the value changes. The engine holds it in memory and owns the one comparison (`engine_release_freshness` in `boss-protocol`): its stamped version against that release gives `current`, `behind`, or `unknown`, plus a separate dev-build flag. The result rides on the existing health report:
-
-- `EngineHealthReport` carries `engine_version`, `newest_published_release`, `engine_release_status`, and `engine_is_dev_build`. `bossctl health` prints them.
-- When the status is `behind`, the report also carries an `engine_behind_published_release` warning naming both versions, so the app's health banner shows it with no app-side comparison.
-- A dev build that is behind is reported like any other. It is only excluded from installing.
-- `unknown` (unstamped engine, or nothing reported yet) is a status, not a warning.
-
-**Applying it.** `IdleUpdateApplier` (`UpdateCore`) decides when a staged update may be applied while Boss keeps running; `EngineFreshnessDriver` (app target) feeds it and performs the result. Applying means the existing swap plus an app relaunch through the existing relaunch helper, so the watchdog and rollback still cover it; the relaunch's launch-time fingerprint check is what replaces the engine. If the bundle is already current and only the engine is older, it restarts just the engine onto the bundled binary. A launch-time fingerprint mismatch also queues this engine-only recovery when versions are equal or the bundle is a dev build. Completing that deferred launch is independent of release-update mode; it does not install a release over a dev build.
-
-| Mode                 | Behaviour                                                                                                                                                                                      |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Automatic            | Stages as before, then applies unattended at the first idle boundary.                                                                                                                          |
-| Notify               | Never applies unattended. The banner's **Update & Restart** button stages the release and queues the same apply for the first moment no workers are live.                                      |
-| Manual               | Same button, but the stale-engine indicator and button appear only after a manual **Check for Updates…**: manual mode runs no background polling, so the newest release is unknown until then. |
-| Dev build (any mode) | Indicator shown; nothing is ever installed, and the button is hidden.                                                                                                                          |
-
-Safety rules, all enforced in `IdleUpdateApplier.decide`:
-
-- **No restart loop.** Completed attempts and failures start a 10-minute cooldown. An unattended engine-only restart is remembered by its engine/bundle fingerprint pair (version pair when fingerprints are unavailable) only after it actually ran; an explicit request overrides this. A deferred restart keeps the explicit request queued and remains eligible on the next idle tick.
-- **No live workers.** A live worker is any worker the engine reports as spawning, working, waiting for input, or idle at its prompt — the same count the quit confirmation uses. Any live worker blocks the apply; nothing is drained, interrupted, or restarted underneath.
-- **Engine reachable.** With no engine connection the worker count is stale, so that is treated as not idle.
-- **No sheet or modal dialog open.**
-- **Unattended applies only:** no live workers for 60 seconds continuously (so the gap between two back-to-back dispatches is not mistaken for idle), and no keyboard or mouse input for 120 seconds. An explicit **Update & Restart** skips both waits but not the rules above.
-
-A host that always has live workers is never auto-restarted; it keeps the indicator until an idle moment or a quit. Launch reads the fingerprint and live-worker count from one version reply; a failed query keeps the reachable engine running. Guarded restarts require a known zero count, then use an engine-side conditional shutdown that refuses live workers or an in-flight spawn and closes new spawn admission before accepting. The admission read guard is taken where dispatch commits to a run (`schedule_execution`, before the cube lease), moved into the spawned run task, and held through live-state registration; the SSH adapter and local `start_worker` take the same guard before any launch side effect. A refusal there is a deferral: the dispatch claim is reverted and the row is retried, never recorded as a start failure. A launched remote worker registers a live-state slot only on its first forwarded hook, so the engine also records a pending-launch marker that the shutdown check counts as live until the slot registers or the run is released (markers for already-terminal executions are ignored). Known residual window: a remote worker re-adopted after an engine restart is counted only once its first hook registers a slot. Refused or unanswered guarded shutdowns never escalate to signals. For compatibility, a successful launch-time reply from a legacy engine with no worker-count field retains the historical replacement behavior.
-
-Bundle-mismatch deferrals and install failures remain visible in the banner even without a release-version warning. An install failure remains visible after its request has been cleared and on later idle ticks.
-
 ### Component summary (as built)
 
 ```

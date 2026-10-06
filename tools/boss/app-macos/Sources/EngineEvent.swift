@@ -153,9 +153,7 @@ enum EngineEvent {
     /// any element drives the top-of-window banner and the Settings
     /// pane warning. Introduced after #699 where a missing API key
     /// silently broke summarization with no UI affordance.
-    /// `release` is the engine's own running-vs-newest-published
-    /// comparison; `nil` from an engine that predates it.
-    case engineHealthResult(apiKeyPresent: Bool, issues: [EngineHealthIssue], release: EngineReleaseInfo? = nil)
+    case engineHealthResult(apiKeyPresent: Bool, issues: [EngineHealthIssue])
     /// Response to `get_driver_traffic_split` / `set_driver_traffic_split`
     /// — the current effective three-way allocation of eligible,
     /// `standard`-reasoning implementation work between the `grok`,

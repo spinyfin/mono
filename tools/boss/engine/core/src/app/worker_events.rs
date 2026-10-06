@@ -1085,8 +1085,6 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
         );
         server_state.broadcast_live_worker_states().await;
     }
-    // The live-state entry now carries this worker for the idle-shutdown check.
-    server_state.live_worker_states.clear_remote_launch(run_id);
     Some(slot_id)
 }
 
