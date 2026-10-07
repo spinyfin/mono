@@ -217,12 +217,12 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
             control.font = nil
             let baseline = control.fittingSize.width
             control.font = font
-            guard fitted <= baseline else { return fitted }
+            guard abs(fitted - baseline) < 0.5 else { return fitted }
             let defaultFont = NSFont.systemFont(ofSize: NSFont.systemFontSize(for: controlSize))
             func labelWidth(_ font: NSFont) -> CGFloat {
                 titles.reduce(0) { $0 + ceil(($1 as NSString).size(withAttributes: [.font: font]).width) }
             }
-            return baseline + max(0, labelWidth(font) - labelWidth(defaultFont))
+            return baseline + labelWidth(font) - labelWidth(defaultFont)
         }
     }
 

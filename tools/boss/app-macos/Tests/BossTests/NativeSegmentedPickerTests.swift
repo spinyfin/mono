@@ -465,6 +465,21 @@ final class NativeSegmentedPickerTests: XCTestCase {
         )
     }
 
+    func testSmallerDynamicTypeDoesNotInflateIdealWidth() throws {
+        let standard = hostedPicker(width: nil, height: nil, dynamicTypeSize: .large)
+        let small = hostedPicker(width: nil, height: nil, dynamicTypeSize: .xSmall)
+        standard.layoutSubtreeIfNeeded()
+        small.layoutSubtreeIfNeeded()
+
+        let standardControl = try XCTUnwrap(segmentedControls(in: standard).first)
+        let smallControl = try XCTUnwrap(segmentedControls(in: small).first)
+        XCTAssertLessThan(
+            try XCTUnwrap(smallControl.font).pointSize,
+            NSFont.systemFontSize(for: standardControl.controlSize)
+        )
+        XCTAssertLessThan(small.fittingSize.width, standard.fittingSize.width)
+    }
+
     // MARK: - Hosts
 
     private var modeTitles: [(String, String)] {
