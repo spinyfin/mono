@@ -12,6 +12,12 @@ use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+mod redispatch;
+pub use redispatch::{RestoreReport, restore_rebased};
+
+#[cfg(test)]
+mod redispatch_tests;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionBookmark {
     pub execution_id: String,
@@ -108,7 +114,7 @@ fn revision(bookmark: &str) -> String {
     )
 }
 
-async fn resolve(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<String> {
+async fn resolve_optional(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<Option<String>> {
     let output = jj
         .run(
             repo,
@@ -125,11 +131,82 @@ async fn resolve(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<String> {
         .await?;
     let ids: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
     ensure!(
-        ids.len() == 1,
+        ids.len() <= 1,
         "recovery bookmark {bookmark} must resolve to exactly one change; found {}",
         ids.len()
     );
-    Ok(ids[0].to_owned())
+    Ok(ids.first().map(|id| (*id).to_owned()))
+}
+
+async fn resolve(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<String> {
+    resolve_optional(jj, repo, bookmark)
+        .await?
+        .with_context(|| format!("recovery bookmark {bookmark} must resolve to exactly one change; found 0"))
+}
+
+async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
+    let recovery = resolve_optional(jj, &record.repo_path, &record.head()).await?;
+    let publication = resolve_optional(jj, &record.repo_path, &record.publication()).await?;
+    let base = resolve(jj, &record.repo_path, &record.base()).await?;
+    for head in [&recovery, &publication].into_iter().flatten() {
+        let connected = jj
+            .run(
+                &record.repo_path,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("({base})::({head}) & ({head})"),
+                    "-T",
+                    "change_id",
+                ],
+            )
+            .await?;
+        ensure!(
+            connected.trim() == head,
+            "preserved execution pointer is not descended from its engine-created baseline {}",
+            record.base()
+        );
+    }
+    match (recovery, publication) {
+        (Some(recovery), Some(publication)) if recovery != publication => {
+            for (ancestor, descendant, bookmark) in [
+                (&publication, &recovery, record.head()),
+                (&recovery, &publication, record.publication()),
+            ] {
+                let connected = jj
+                    .run(
+                        &record.repo_path,
+                        &[
+                            "--ignore-working-copy",
+                            "log",
+                            "--no-graph",
+                            "-r",
+                            &format!("({ancestor})::({descendant}) & ({descendant})"),
+                            "-T",
+                            "change_id",
+                        ],
+                    )
+                    .await?;
+                if connected.trim() == descendant {
+                    return Ok(bookmark);
+                }
+            }
+            bail!(
+                "preserved pointers {} and {} diverged; refusing to drop either history",
+                record.head(),
+                record.publication()
+            )
+        }
+        (Some(_), _) => Ok(record.head()),
+        (None, Some(_)) => Ok(record.publication()),
+        (None, None) => bail!(
+            "expected recovery pointer {} or {} to resolve to exactly one change; both are missing",
+            record.head(),
+            record.publication()
+        ),
+    }
 }
 
 /// Called after positioning, before a worker can run. Existing refs are errors:
@@ -181,29 +258,7 @@ pub async fn create_from(
 /// A successful empty diff proves an empty run. Missing/conflicted references,
 /// unavailable jj, and unrelated targets are errors, never empty results.
 pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
-    let head = resolve(jj, &record.repo_path, &record.head()).await?;
-    let base = resolve(jj, &record.repo_path, &record.base()).await?;
-    let ancestry = format!("({base})::({head}) & ({head})");
-    let connected = jj
-        .run(
-            &record.repo_path,
-            &[
-                "--ignore-working-copy",
-                "log",
-                "--no-graph",
-                "-r",
-                &ancestry,
-                "-T",
-                "change_id",
-            ],
-        )
-        .await?;
-    if connected.trim() != head {
-        bail!(
-            "recovery bookmark {} is not descended from its engine-created baseline",
-            record.head()
-        );
-    }
+    let head_bookmark = head_bookmark(jj, record).await?;
     let patch = jj
         .run(
             &record.repo_path,
@@ -214,7 +269,7 @@ pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
                 "--from",
                 &revision(&record.base()),
                 "--to",
-                &revision(&record.head()),
+                &revision(&head_bookmark),
             ],
         )
         .await?;
@@ -235,7 +290,7 @@ pub async fn restore(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path) 
         workspace,
         &[
             "new",
-            &revision(&record.head()),
+            &revision(&head_bookmark(jj, record).await?),
             "-m",
             "Resume recovered execution work",
         ],
@@ -254,7 +309,7 @@ pub async fn unpublished_diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result
     let range = format!(
         "({}::{} ~ ::remote_bookmarks()) & ~empty()",
         revision(&record.base()),
-        revision(&record.head())
+        revision(&head_bookmark(jj, record).await?)
     );
     let unpublished = jj
         .run(

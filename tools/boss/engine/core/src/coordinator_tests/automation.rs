@@ -868,6 +868,7 @@ async fn preempted_automation_work_redispatches_once_capacity_frees() {
     let pool = WorkerPool::new(MAIN_POOL);
     let preemptor = Arc::new(FakePreemptor::new(pool.clone(), PreemptOutcome::Released));
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
+    super::recovery::configure_recovery_origin(&repo.repo);
     let cube = Arc::new(
         FakeCubeClient {
             workspace_root: Some(dir.path().to_path_buf()),

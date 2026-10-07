@@ -12,7 +12,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 34;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 35;
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -66,8 +66,13 @@ impl WorkDb {
         if version < 33 {
             project_postmortem::migrate_project_postmortem_signals(&tx)?;
         }
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 34 {
             pr_flow::migrate_operator_questions(&tx)?;
+        }
+        if version < 35 {
+            tx.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)")?;
+        }
+        if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
                 "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
                 [CURRENT_SCHEMA_VERSION.to_string()],
@@ -494,7 +499,7 @@ mod floor_tests {
 
     #[test]
     fn supported_databases_apply_post_floor_migrations_without_losing_data() {
-        for version in [32, 33, CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1] {
+        for version in [32, 33, 34, CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
             let conn = Connection::open(&path).unwrap();
@@ -504,8 +509,11 @@ mod floor_tests {
             if version >= 33 {
                 project_postmortem::migrate_project_postmortem_signals(&conn).unwrap();
             }
-            if version >= CURRENT_SCHEMA_VERSION {
+            if version >= 34 {
                 pr_flow::migrate_operator_questions(&conn).unwrap();
+            }
+            if version >= 35 {
+                conn.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
             }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
@@ -523,6 +531,7 @@ mod floor_tests {
             seed_released_schema(&expected);
             project_postmortem::migrate_project_postmortem_signals(&expected).unwrap();
             pr_flow::migrate_operator_questions(&expected).unwrap();
+            expected.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
             expected.execute_batch("CREATE TABLE sentinel (value TEXT)").unwrap();
             let before = capture(&expected);
             drop(conn);

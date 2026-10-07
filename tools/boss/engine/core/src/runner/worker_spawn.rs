@@ -1101,7 +1101,10 @@ pub(crate) async fn compose_worker_spawn(
     let prompt_text = if execution.kind == ExecutionKind::PrReviewGuide {
         prompt_text
     } else {
-        let bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions(execution);
+        let mut bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions(execution);
+        if let Some(report) = work_db.execution_restore_report(&execution.id)? {
+            bookmark_instructions.push_str(&report.instructions());
+        }
         let (opening, rest) = prompt_text.split_once('\n').unwrap_or((&prompt_text, ""));
         format!("{opening}\n\n{bookmark_instructions}{rest}")
     };

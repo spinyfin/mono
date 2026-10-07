@@ -163,7 +163,7 @@ async fn blocked_revision_retry_ignores_old_workspace_markers() {
 }
 
 #[tokio::test]
-async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
+async fn blocked_recovery_missing_bookmark_fails_loudly() {
     for dirty_verified in [None, Some(false), Some(true)] {
         let dir = tempdir().unwrap();
         let (db, prior, next) = blocked_pair(&dir.path().join("boss.db"));
@@ -183,24 +183,17 @@ async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
             workspace_path: dir.path().to_path_buf(),
             dirty_verified,
         };
-        let recovered = coordinator
+        let error = coordinator
             .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter)
             .await
-            .unwrap();
-        assert_eq!(recovered, None, "missing predecessor bookmark is nothing to recover");
-        let events = recording.events_for(&next.id).await;
-        let skipped = events
-            .iter()
-            .find(|e| e.stage == "workspace_recovery")
-            .expect("missing bookmark must still emit a workspace_recovery event");
-        assert_eq!(skipped.outcome, "skipped");
-        assert_eq!(skipped.details["reason"], "missing_bookmark");
-        assert_eq!(skipped.details["predecessor"], prior.id);
+            .unwrap_err();
+        assert!(error.to_string().contains(&prior.id));
+        assert!(error.to_string().contains("expected engine-created recovery pointer"));
     }
 }
 
 #[tokio::test]
-async fn missing_predecessor_bookmark_dispatches_into_a_clean_workspace() {
+async fn missing_predecessor_bookmark_blocks_dispatch_with_detail() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
     let (db, prior, next) = blocked_pair(&path);
@@ -229,29 +222,25 @@ async fn missing_predecessor_bookmark_dispatches_into_a_clean_workspace() {
         .claim_worker(&next.id, None)
         .await
         .unwrap();
-    coordinator
+    let error = coordinator
         .schedule_execution(&next, &worker, DispatchAdmission::Queued)
         .await
-        .unwrap();
-    assert_ne!(
-        cube.lease_calls.lock().await[0].2.clone().unwrap_or_default(),
-        "workspace-old",
-        "missing bookmark must not pin the predecessor workspace"
+        .unwrap_err();
+    assert!(error.to_string().contains(&prior.id));
+    assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
+    let WorkItem::Chore(failed) = db.get_work_item(&next.work_item_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert!(
+        failed
+            .blocked_detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("recovery pointer")
     );
-    assert!(cube.lease_calls.lock().await[0].2.is_none());
+    assert!(db.execution_bookmark_optional(&next.id).unwrap().is_none());
     assert!(!repo.replacement.join("revision.txt").exists());
-    assert_eq!(db.bookmark_recovery(&next.id).unwrap(), None);
-    assert_eq!(
-        db.execution_bookmark(&next.id).unwrap().head(),
-        format!("boss-recovery/{}", next.id)
-    );
-    let events = recording.events_for(&next.id).await;
-    let skipped = events
-        .iter()
-        .find(|e| e.stage == "workspace_recovery")
-        .expect("dispatch must record the skipped recovery");
-    assert_eq!(skipped.outcome, "skipped");
-    assert_eq!(skipped.details["predecessor"], prior.id);
+    assert!(cube.goto_calls.lock().await.is_empty());
 }
 
 #[tokio::test]
@@ -272,6 +261,8 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
         use boss_engine_recovery::execution_bookmark::{LocalJj, create};
         use boss_engine_test_git::jj::JjRepo;
         let repo = JjRepo::new(dir.path());
+        super::recovery::configure_recovery_origin(&repo.repo);
+        JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "main"]);
         let record = create(&LocalJj, &repo.worker, &prior.id, "local").await.unwrap();
         db.record_execution_bookmark(&record).unwrap();
         std::fs::write(repo.worker.join("revision.txt"), "unpushed revision").unwrap();
@@ -305,8 +296,8 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
             .await
             .unwrap();
         assert!(
-            cube.goto_calls.lock().await.is_empty(),
-            "PR positioning must not overwrite recovered work"
+            cube.goto_calls.lock().await.len() == 1,
+            "resolve the bound PR once before recovering unpushed work"
         );
         assert_eq!(
             std::fs::read_to_string(repo.replacement.join("revision.txt")).unwrap(),

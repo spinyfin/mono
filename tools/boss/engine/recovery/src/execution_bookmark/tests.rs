@@ -179,7 +179,7 @@ async fn empty_run_is_distinct_from_a_missing_or_unrelated_pointer() {
             .contains("baseline")
     );
     LocalJj
-        .run(&f.repo, &["bookmark", "delete", &record.head()])
+        .run(&f.repo, &["bookmark", "delete", &record.head(), &record.publication()])
         .await
         .unwrap();
     assert!(

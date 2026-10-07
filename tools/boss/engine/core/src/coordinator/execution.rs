@@ -1509,6 +1509,23 @@ impl ExecutionCoordinator {
                 if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
                     tracing::error!(?release_err, "failed to release lease after bookmark recovery failure");
                 }
+                if matches!(
+                    execution.kind,
+                    ExecutionKind::ChoreImplementation
+                        | ExecutionKind::TaskImplementation
+                        | ExecutionKind::RevisionImplementation
+                ) {
+                    self.work_db.update_work_item_as_actor(
+                        &execution.work_item_id,
+                        boss_protocol::WorkItemPatch::builder()
+                            .status("blocked")
+                            .blocked_reason("execution_recovery_failed")
+                            .blocked_detail(format!("{err:#}"))
+                            .autostart(false)
+                            .build(),
+                        "engine",
+                    )?;
+                }
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
@@ -1523,7 +1540,8 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        let recovered_blocked = recovered.as_ref().is_some_and(|(_, has_work)| *has_work);
+        let recovered_blocked = recovered.as_ref().is_some_and(|(_, has_work)| *has_work)
+            || self.work_db.execution_restore_report(&execution.id)?.is_some();
         let goto_target = match (pr_for_goto, immutable_target_sha.as_deref()) {
             _ if recovered_blocked => None,
             (_, Some(sha)) => Some(GotoTarget::Revision(sha)),
@@ -2309,7 +2327,11 @@ impl ExecutionCoordinator {
             worker_id,
             cube_repo_id,
             &error_text,
-            &self.pre_start_retry_delays,
+            if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED {
+                &[]
+            } else {
+                &self.pre_start_retry_delays
+            },
         )?;
 
         match outcome {

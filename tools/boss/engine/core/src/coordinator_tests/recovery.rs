@@ -148,6 +148,10 @@ async fn revision_resume_uses_fresh_scratch_without_workspace_pinning() {
 
 async fn record_recovery_work(db: &WorkDb, id: &str, workspace: &std::path::Path) {
     use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    let shared = boss_engine_recovery::execution_bookmark::Jj::shared_repo(&LocalJj, workspace)
+        .await
+        .unwrap();
+    configure_recovery_origin(&shared);
     let record = create(&LocalJj, workspace, id, "local").await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
 }
@@ -182,7 +186,14 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
         )
         .await
         .unwrap();
-    assert_eq!(restored, Some((dead_id, true)));
+    assert_eq!(restored, Some((dead_id.clone(), true)));
+    let report = coordinator
+        .work_db
+        .execution_restore_report(&resume.id)
+        .unwrap()
+        .unwrap();
+    assert!(report.pointer.contains(&dead_id));
+    assert_eq!(report.base_sha.len(), 40);
     assert_eq!(
         std::fs::read_to_string(repo.replacement.join("hello.txt")).unwrap(),
         "recovered work\n"
@@ -190,6 +201,21 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
     assert!(
         patch.exists(),
         "legacy evidence is retained, never replayed or consumed"
+    );
+    // A pre-start failure after restoring can later be pruned. Its report
+    // must follow the execution instead of preventing retention cleanup.
+    coordinator
+        .work_db
+        .connect()
+        .unwrap()
+        .execute("DELETE FROM work_executions WHERE id = ?1", [&resume.id])
+        .unwrap();
+    assert!(
+        coordinator
+            .work_db
+            .execution_restore_report(&resume.id)
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -214,7 +240,14 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
         )
         .await
         .unwrap();
-    assert_eq!(restored, Some((dead_id, true)));
+    assert_eq!(restored, Some((dead_id.clone(), true)));
+    let report = coordinator
+        .work_db
+        .execution_restore_report(&resume.id)
+        .unwrap()
+        .unwrap();
+    assert!(report.pointer.contains(&dead_id));
+    assert_eq!(report.base_sha.len(), 40);
     assert_eq!(
         std::fs::read_to_string(repo.replacement.join("hello.txt")).unwrap(),
         "recovered work\n"
@@ -234,7 +267,15 @@ async fn a_failed_bookmark_recovery_is_loud_and_legacy_evidence_is_kept() {
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let (dead_id, resume) = seed_resume_pair(&db);
     record_recovery_work(&db, &dead_id, &repo.worker).await;
-    JjRepo::run(&repo.repo, &["bookmark", "delete", &format!("boss-recovery/{dead_id}")]);
+    JjRepo::run(
+        &repo.repo,
+        &[
+            "bookmark",
+            "delete",
+            &format!("boss-recovery/{dead_id}"),
+            &format!("boss/{dead_id}"),
+        ],
+    );
     let patch = dir.path().join(format!("{dead_id}.patch"));
     std::fs::write(&patch, "legacy evidence").unwrap();
     let coordinator = recovery_coordinator(db);
@@ -794,4 +835,20 @@ async fn resume_pane_spawn_still_reenters_when_the_bookmark_is_present() {
         sleep(Duration::from_millis(10)).await;
     }
     assert!(saw_call, "the runner must be invoked for the already-running execution");
+}
+
+pub(super) fn configure_recovery_origin(shared: &std::path::Path) {
+    use boss_engine_test_git::jj::JjRepo;
+    JjRepo::run(shared, &["bookmark", "set", "main", "-r", "@"]);
+    JjRepo::run(shared, &["git", "export"]);
+    JjRepo::run(
+        shared,
+        &[
+            "git",
+            "remote",
+            "add",
+            "origin",
+            shared.join(".jj/repo/store/git").to_str().unwrap(),
+        ],
+    );
 }
