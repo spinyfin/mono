@@ -531,7 +531,9 @@ impl LiveWorkerStateRegistry {
             routing.kind,
             routing.tmux_hosted,
         );
-        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        // Persona DB work stays outside the registry lock: dispatch holds the
+        // DB connection while calling `is_run_live`, so the reverse order
+        // could deadlock.
         if let Some(db) = &self.persona_store {
             match db.lease_persona_for_execution(&state.run_id) {
                 Ok(name) => state.name = name,
@@ -540,6 +542,7 @@ impl LiveWorkerStateRegistry {
                 }
             }
         }
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
         // Copy what the trace line needs before `state` is moved into the
         // map. The line itself is emitted *after* the mutation, mirroring
         // `release_slot` — the two halves are meant to be diffed by
@@ -591,6 +594,11 @@ impl LiveWorkerStateRegistry {
         // `cleared` for the same slot, and diffing the pair for the
         // displaced run id would give the wrong answer.
         if let Some(prior) = displaced {
+            // The displaced run's lease would otherwise stay active forever
+            // (a same-run re-registration keeps its lease).
+            if prior.run_id != run_id {
+                self.release_persona_for_run(&prior.run_id);
+            }
             tracing::warn!(
                 slot_id,
                 run_id = %prior.run_id,
@@ -648,16 +656,33 @@ impl LiveWorkerStateRegistry {
         evidence: ReadoptionEvidence,
     ) {
         let run_id = run_id.into();
+        // A prior DB failure may have left a placeholder name: look the persona
+        // up outside the registry lock, then revalidate before patching.
+        let needs_name_repair = self.persona_store.is_some()
+            && self
+                .inner
+                .lock()
+                .expect("registry mutex poisoned")
+                .get(&slot_id)
+                .is_some_and(|entry| {
+                    entry.state.run_id == run_id && entry.state.name == boss_protocol::placeholder_worker_name(&run_id)
+                });
+        let repaired_name = match (needs_name_repair, &self.persona_store) {
+            (true, Some(db)) => match db.lease_persona_for_execution(&run_id) {
+                Ok(name) => Some(name),
+                Err(error) => {
+                    tracing::warn!(slot_id, run_id = %run_id, %error, "re-adoption could not repair placeholder persona name");
+                    None
+                }
+            },
+            _ => None,
+        };
         let (retained_existing_state, repaired_shell_pid) = {
             let mut guard = self.inner.lock().expect("registry mutex poisoned");
             match guard.get_mut(&slot_id) {
                 Some(entry) if entry.state.run_id == run_id => {
-                    // A prior read-only DB failure may have left an execution
-                    // placeholder. Repair only that missing name; a leased
-                    // persona and the rest of the live state stay unchanged.
-                    if entry.state.name == format!("Worker {run_id}")
-                        && let Some(db) = &self.persona_store
-                        && let Ok(name) = db.lease_persona_for_execution(&run_id)
+                    if let Some(name) = repaired_name
+                        && entry.state.name == boss_protocol::placeholder_worker_name(&run_id)
                     {
                         entry.state.name = name;
                     }
@@ -873,10 +898,10 @@ impl LiveWorkerStateRegistry {
         // every piece of engine bookkeeping — so no field can outlive the
         // occupant it describes.
         let removed = guard.remove(&slot_id).map(|entry| entry.state);
+        drop(guard);
         if let Some(state) = &removed {
             self.release_persona_for_run(&state.run_id);
         }
-        drop(guard);
 
         match removed {
             Some(state) => tracing::info!(
@@ -915,6 +940,7 @@ impl LiveWorkerStateRegistry {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let slot_id = guard.values().find(|entry| entry.state.run_id == run_id)?.state.slot_id;
         guard.remove(&slot_id);
+        drop(guard);
         self.release_persona_for_run(run_id);
         tracing::info!(slot_id, run_id, cleared_by = %std::panic::Location::caller(), "live-state registry: matching run entry cleared");
         Some(slot_id)

@@ -1148,6 +1148,12 @@ impl ServerState {
         // event would ever reach a subscriber.
         let mut timeline = crate::startup_timing::StartupTimeline::begin("server_state");
         let event_bus = Arc::new(EventBus::new());
+        // Engine counter-metrics registry. Built up front so it can be cloned
+        // into ServerState and handed to WorkDb (persona overflow counter); the
+        // registry is plumbed explicitly rather than stashed in a global per
+        // the framework design. `init_all` runs further down once the
+        // Arc<ServerState> is in hand so a duplicate registration panics
+        // during this boot path instead of inside the first increment.
         let metrics_registry = Arc::new(crate::metrics::Registry::new());
         let work_db = Arc::new(
             WorkDb::open(cfg.work.db_path.clone())?
@@ -1353,15 +1359,6 @@ impl ServerState {
         let dispatch_event_root: PathBuf = state_root.clone();
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
             Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
-
-        // Engine counter-metrics registry. Built up front so it can
-        // be cloned into ServerState; the registry is plumbed
-        // explicitly rather than stashed in a global per the
-        // framework design. `init_all` runs further down once the
-        // Arc<ServerState> is in hand so a duplicate registration
-        // panics during this boot path instead of inside the first
-        // increment.
-
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();

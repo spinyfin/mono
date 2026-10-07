@@ -910,7 +910,7 @@ impl ServerState {
                     tracing::warn!(run_id = %display_run_id, %error, "could not read hosted worker persona");
                     None
                 })
-                .unwrap_or_else(|| format!("Worker {display_run_id}"));
+                .unwrap_or_else(|| boss_protocol::placeholder_worker_name(&display_run_id));
             statuses.push(HostedPaneStatus {
                 slot_id: pane.slot_id,
                 run_id: display_run_id,

@@ -311,7 +311,7 @@ impl LiveWorkerState {
         let run_id = run_id.into();
         Self {
             slot_id,
-            name: format!("Worker {run_id}"),
+            name: placeholder_worker_name(&run_id),
             run_id,
             model: model.into(),
             shell_pid,
@@ -337,6 +337,12 @@ impl LiveWorkerState {
 /// Subscribers receive the whole snapshot via
 /// [`crate::FrontendEvent::WorkerLiveStatesList`].
 pub const TOPIC_WORKER_LIVE_STATES: &str = "worker.live_states";
+
+/// The execution-identity display name used before a durable persona is
+/// known. Single source of truth so callers can detect and repair it.
+pub fn placeholder_worker_name(run_id: &str) -> String {
+    format!("Worker {run_id}")
+}
 
 #[cfg(test)]
 mod tests {

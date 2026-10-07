@@ -70,6 +70,16 @@ impl ExecutionCoordinator {
             run_outcome.as_ref(),
             Ok(outcome) if outcome.slot_id.is_some()
         );
+        // A successful remote launch (`WorkerPaneAlive`, no local slot) frees
+        // the local dispatch-pool claim below, but the remote process keeps
+        // running: its persona lease and live-state entry must survive until
+        // confirmed termination (`release_worker_pane`), or the persona could
+        // be handed to another worker while this one is still alive.
+        let remote_worker_alive = matches!(
+            run_outcome.as_ref(),
+            Ok(outcome) if outcome.slot_id.is_none()
+                && outcome.wait_state == RunWaitState::WorkerPaneAlive
+        );
 
         // Set inside the `Err(err)` arm below once a `SlotBusy` pane-spawn
         // rejection has actually been recorded as a terminal `failed`
@@ -757,11 +767,13 @@ impl ExecutionCoordinator {
                 // This runner has completed cleanup (including remote runs and
                 // failed spawns). Deferred local panes retain their lease until
                 // the live-state release path runs instead.
-                if let Some(states) = &self.live_worker_states {
-                    states.release_slot_for_run(&execution.id);
-                }
-                if let Err(error) = self.work_db.release_persona(&execution.id) {
-                    tracing::error!(execution_id = %execution.id, %error, "could not release persona after runner cleanup");
+                if !remote_worker_alive {
+                    if let Some(states) = &self.live_worker_states {
+                        states.release_slot_for_run(&execution.id);
+                    }
+                    if let Err(error) = self.work_db.release_persona(&execution.id) {
+                        tracing::error!(execution_id = %execution.id, %error, "could not release persona after runner cleanup");
+                    }
                 }
                 self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
                     .await;

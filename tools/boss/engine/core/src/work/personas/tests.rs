@@ -260,3 +260,77 @@ fn held_persona_is_readable_when_adoption_cannot_write() {
     db.connect().unwrap().execute_batch("PRAGMA query_only = ON").unwrap();
     assert_eq!(db.lease_persona_for_execution(&execution.id).unwrap(), "Riker");
 }
+
+#[test]
+fn displaced_registry_occupant_releases_its_persona_lease() {
+    let (_dir, db) = open_db();
+    let db = Arc::new(db);
+    let states = LiveWorkerStateRegistry::with_work_db(db.clone());
+    let (first, _) = start(&db, "local");
+    let (second, _) = start(&db, "local");
+    states.register_spawn(8, &first.id, "model", 123, None);
+    // Re-registering the slot for a different run displaces `first` without a
+    // `release_slot`; its lease must be reclaimed, the new occupant's kept.
+    states.register_spawn(8, &second.id, "model", 124, None);
+    let (_, third) = start(&db, "local");
+    assert_eq!(third.persona.as_deref(), Some("Riker"), "displaced persona reused");
+    assert_eq!(db.persona_display_name(&first.id).unwrap().as_deref(), Some("Riker"));
+    assert_eq!(states.get(8).unwrap().name, "Data");
+}
+
+#[test]
+fn restart_then_dead_verdict_release_frees_persona_and_keeps_history() {
+    let (_dir, db) = open_db();
+    let (dead, _) = start(&db, "local");
+    let path = db.path.clone();
+    drop(db);
+    // After a restart the lease is still active: terminal status never frees it.
+    let db = WorkDb::open(path).unwrap();
+    db.mark_execution_orphaned(&dead.id, "probe proved dead").unwrap();
+    let (_, held) = start(&db, "local");
+    assert_eq!(
+        held.persona.as_deref(),
+        Some("Data"),
+        "lease survives restart + orphaning"
+    );
+    // The startup Dead-verdict branch releases the lease.
+    db.release_persona(&dead.id).unwrap();
+    let (_, reused) = start(&db, "local");
+    assert_eq!(reused.persona.as_deref(), Some("Riker"));
+    assert_eq!(db.persona_display_name(&dead.id).unwrap().as_deref(), Some("Riker"));
+}
+
+/// Dispatch holds the DB connection and then asks the registry whether a run is
+/// live. Spawn registration must therefore never hold the registry lock while
+/// waiting for the DB connection.
+#[test]
+fn spawn_registration_does_not_hold_registry_lock_while_waiting_for_db() {
+    let (_dir, db) = open_db();
+    let db = Arc::new(db);
+    let states = Arc::new(LiveWorkerStateRegistry::with_work_db(db.clone()));
+    let (execution, _) = start(&db, "local");
+    let conn = db.connect().unwrap();
+    let spawner = {
+        let states = states.clone();
+        let run_id = execution.id.clone();
+        std::thread::spawn(move || states.register_spawn(8, &run_id, "model", 123, None))
+    };
+    // Give the spawner time to block on the DB connection we hold.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probe = {
+        let states = states.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((states.is_run_live("some-run"), states.snapshot().len()));
+        })
+    };
+    let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+    drop(conn);
+    assert!(
+        result.is_ok(),
+        "registry lock was held while waiting on the DB connection"
+    );
+    probe.join().unwrap();
+    spawner.join().unwrap();
+    assert_eq!(states.get(8).unwrap().name, "Riker");
+}

@@ -106,8 +106,8 @@ fn work_item_fallback_eligible(reference: &str) -> bool {
 /// Resolve `reference` to a work item via the engine's shared id-resolution
 /// choke point (`GetWorkItem` → `WorkDb::resolve_work_item_ref`).
 ///
-/// Accepts friendly short ids (`T42`, `t42`, `P7`, `#42`, bare `42`,
-/// `slug/n`) and primary `task_…` / `proj_…` / `prod_…` ids. Ambiguous
+/// Accepts typed friendly short ids, hash-prefixed or bare numeric ids,
+/// `slug/n` product-scoped selectors, and primary `task_…` / `proj_…` / `prod_…` ids. Ambiguous
 /// short ids hard-error with every candidate listed — never silently
 /// pick the first product match.
 ///
@@ -155,8 +155,8 @@ pub(crate) async fn resolve_work_item_ref(client: &mut BossClient, reference: &s
     }
 }
 
-/// If `selector` looks like a friendly work-item id (`T42`, `t42`, `P7`,
-/// `p7`), resolve it to the primary id via the engine and search `states`
+/// If `selector` looks like a typed friendly work-item id (a letter
+/// prefix plus number, any case), resolve it to the primary id via the engine and search `states`
 /// for a live worker running that work item. Returns the matching state,
 /// or `None` when the selector isn't a friendly-id form or no live worker
 /// is found for the resolved item.
@@ -183,7 +183,7 @@ async fn resolve_tnnn_to_live_worker<'a>(
 ///    order (a worker the live registry has dropped — crash, terminal-fail
 ///    path, spawn-ack timeout — but the app and durable state still
 ///    account for).
-/// 3. Friendly work-item id (`T42`, `P7`) — but only when `reference`
+/// 3. Friendly work-item id (typed short id) — but only when `reference`
 ///    does not itself look like a slot id or a crew name. A bare decimal
 ///    integer or a roster name is far more likely to be a worker
 ///    reference than a work-item short id here, since every verb sharing
@@ -294,7 +294,16 @@ pub(crate) fn resolve_hosted_pane_ref<'a>(
         .filter(|p| p.crew_name.eq_ignore_ascii_case(reference))
         .collect();
     if !by_name.is_empty() {
-        return pick_unique_pane(reference, by_name).map(Some);
+        // A durable persona name outlives its release and can be reallocated,
+        // so a lingering husk may share a name with a live pane. Prefer the
+        // non-husk panes and report ambiguity only among same-liveness panes.
+        let live: Vec<&HostedPaneStatus> = by_name
+            .iter()
+            .copied()
+            .filter(|p| !matches!(p.state, HostedPaneState::Husk))
+            .collect();
+        let candidates = if live.is_empty() { by_name } else { live };
+        return pick_unique_pane(reference, candidates).map(Some);
     }
     Ok(None)
 }
@@ -391,8 +400,8 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
         }
     }
 
-    // Not a live worker. If the reference resolves to a work item (T42,
-    // P7, or a primary task_/proj_/prod_ id), report on it directly. This
+    // Not a live worker. If the reference resolves to a work item (a typed
+    // short id or a primary task_/proj_/prod_ id), report on it directly. This
     // is the only path available for a work item the engine has *parked*
     // rather than dispatched — e.g. the orphan-sweep / pr_review-recovery
     // churn guard: there is no live worker and (if it never got far enough
@@ -1318,7 +1327,7 @@ async fn executions_cancel_for_work_item(
     reason: Option<String>,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
-    // Resolve friendly short ids (`T42`) to the canonical task id —
+    // Resolve typed friendly short ids to the canonical task id —
     // `ListExecutions` filters on the primary key and does not do this
     // itself. Mirrors `GetWorkItem`'s resolving contract.
     let resolved_work_item_id = {
@@ -2405,6 +2414,18 @@ mod tests {
         let err = resolve_hosted_pane_ref("data", &panes).expect_err("two panes share a name");
         let msg = err.to_string();
         assert!(msg.contains("matches multiple tracked panes"), "message was: {msg}");
+    }
+
+    #[test]
+    fn resolve_hosted_pane_ref_prefers_live_pane_over_husk_with_reused_name() {
+        let panes = [
+            hosted_pane(1, "exec_old", "Data", HostedPaneState::Husk),
+            hosted_pane(2, "exec_new", "Data", HostedPaneState::Live),
+        ];
+        let pane = resolve_hosted_pane_ref("data", &panes)
+            .expect("a live pane disambiguates")
+            .expect("name matches");
+        assert_eq!(pane.run_id, "exec_new");
     }
 
     /// Requirement: a total miss must list what was searched, including

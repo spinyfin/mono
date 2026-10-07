@@ -1487,6 +1487,12 @@ pub async fn serve_with_overrides(
         if !matches!(verdict, crate::run_reconcile::RunReconcileVerdict::Dead) {
             continue;
         }
+        // The probe is authoritative proof the worker is dead, so its durable
+        // persona lease (which survives restarts) can be reclaimed. The
+        // historical persona text stays on the row for display.
+        if let Err(error) = server_state.work_db.release_persona(execution_id) {
+            tracing::error!(execution_id, %error, "startup reaper: could not release persona of dead worker");
+        }
         match server_state
             .work_db
             .mark_execution_orphaned(execution_id, orphan_reason)
