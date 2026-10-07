@@ -182,6 +182,10 @@ pub(super) fn structured_output_env_vars(
 }
 
 pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
+    with_bazel_caching_rule(compose_execution_prompt_body(params))
+}
+
+fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     let ExecutionPromptParams {
         execution,
         work_item,
@@ -681,6 +685,16 @@ pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String 
     )
 }
 
+/// Apply the cache policy to generic and separately composed worker prompts.
+pub(super) fn with_bazel_caching_rule(mut prompt: String) -> String {
+    prompt.push_str(bazel_caching_rule_text());
+    prompt
+}
+
+fn bazel_caching_rule_text() -> &'static str {
+    "\n**Trust Bazel's caching.** Bazel's action cache, disk cache and remote cache are reliable. Never disable, bypass or bust them in CI steps, scripts, verification gates, or as a debugging reflex. That means no `--disk_cache=` overrides, no `--remote_accept_cached=false`, no `--noremote_*` or `--nouse_action_cache`, no `bazel clean` \"to be sure\", no cache-key-busting env/`--action_env` changes, and no \"rebuild uncached and compare\" determinism checks. If a result looks stale, treat it as a defect to root-cause (an undeclared input, a non-hermetic action, a toolchain auto-detection leak) and fix that. Never route around the cache. The one documented exception is `bazel clean --expunge` to repair Xcode/Apple-toolchain config after an Xcode or macOS upgrade.\n"
+}
+
 /// Hard constraint text forbidding check/CI bypasses. Injected into every
 /// prompt surface where a worker might encounter a failing check or CI failure.
 fn check_bypass_prohibition_text() -> &'static str {
@@ -691,8 +705,7 @@ fn check_bypass_prohibition_text() -> &'static str {
      - Passing `--no-verify` / skipping git hooks; adding broad `#[allow(...)]` / `// swiftlint:disable` / `# noqa` annotations solely to suppress a warning or error.\n\
      - Deleting, `#[ignore]`-ing, `xfail`-ing, skipping, or weakening assertions in a failing test to make it pass.\n\
      - Raising a threshold or limit (e.g. `max_lines` in a file-size check) solely to accommodate the offending file without reducing its size.\n\n\
-     Required behavior: fix the real problem — split the oversized file, fix the lint/compile error, fix the test failure, resolve the root cause. If a check genuinely SHOULD be relaxed (a legitimately needed exclusion or threshold change), that is a human decision — STOP and surface it for operator approval with full justification. Use the typed question flags on a blocked declaration described in Declaring your run finished when that channel is enabled. Do not decide this autonomously.\n\n\
-     **Trust Bazel's caching.** Bazel's action cache, disk cache and remote cache are reliable. Never disable, bypass or bust them in CI steps, scripts, verification gates, or as a debugging reflex. That means no `--disk_cache=` overrides, no `--remote_accept_cached=false`, no `--noremote_*` or `--nouse_action_cache`, no `bazel clean` \"to be sure\", no cache-key-busting env/`--action_env` changes, and no \"rebuild uncached and compare\" determinism checks. If a result looks stale, treat it as a defect to root-cause (an undeclared input, a non-hermetic action, a toolchain auto-detection leak) and fix that. Never route around the cache. The one documented exception is `bazel clean --expunge` to repair Xcode/Apple-toolchain config after an Xcode or macOS upgrade.\n"
+     Required behavior: fix the real problem — split the oversized file, fix the lint/compile error, fix the test failure, resolve the root cause. If a check genuinely SHOULD be relaxed (a legitimately needed exclusion or threshold change), that is a human decision — STOP and surface it for operator approval with full justification. Use the typed question flags on a blocked declaration described in Declaring your run finished when that channel is enabled. Do not decide this autonomously.\n"
 }
 
 /// Render the `[editorial-rules]` block for the worker prompt (chore #5).

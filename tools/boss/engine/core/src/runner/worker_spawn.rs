@@ -22,6 +22,7 @@ use boss_protocol::{
 use super::answer_agent_prompt::compose_answer_agent_prompt;
 use super::prompt::{
     ExecutionPromptParams, compose_execution_prompt, designated_output_kind, render_merge_order_preservation_lines,
+    with_bazel_caching_rule,
 };
 use super::review_guide_prompt::compose_review_guide_prompt;
 use super::work_item::{
@@ -761,14 +762,15 @@ pub(crate) async fn compose_worker_spawn(
                     .list_recently_completed_automation_tasks_for_product(&automation.product_id, since_epoch)
                     .unwrap_or_default();
                 let triage_context = crate::automation_triage::TriageContext::from_rows(open_tasks, merged_tasks);
-                crate::automation_triage::render_triage_preamble(
+                let prompt = crate::automation_triage::render_triage_preamble(
                     &automation,
                     &product_name,
                     &siblings,
                     &triage_context,
                     &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::TriageDecision),
                     automation_outcome_proposals_seam_enabled,
-                )
+                );
+                with_bazel_caching_rule(prompt)
             }
             other => {
                 tracing::warn!(
@@ -1012,7 +1014,7 @@ pub(crate) async fn compose_worker_spawn(
                 )),
                 None => None,
             };
-            match report_destination.as_ref() {
+            let prompt = match report_destination.as_ref() {
                 Some((ReviewBatchMemberRole::Supervisor, destination)) => {
                     let cycle_root_id = work_db.review_cycle_root_id(&execution.work_item_id);
                     let reports = load_batch_leaf_reports(work_db, &cycle_root_id, &destination.batch_id)
@@ -1061,20 +1063,21 @@ pub(crate) async fn compose_worker_spawn(
                     pr_review_context.as_ref(),
                     &reviewer_repo_slug,
                 ),
-            }
+            };
+            with_bazel_caching_rule(prompt)
         }
     } else if execution.kind == ExecutionKind::AnswerAgent {
         // An `answer_agent` execution renders the answer-agent prompt
         // (doc content, comment, thread history, reply instructions) instead
         // of the ordinary implementer prompt. Its `work_item_id` is the
         // comment id (see `WorkDb::create_answer_agent_execution`).
-        compose_answer_agent_prompt(work_db, execution).await
+        with_bazel_caching_rule(compose_answer_agent_prompt(work_db, execution).await)
     } else if execution.kind == ExecutionKind::PrReviewGuide {
         // A `pr_review_guide` execution renders the review-guide prompt
         // (exact versioned template + embedded source packet) instead of
         // the ordinary implementer prompt. Its `work_item_id` is the
         // comparison id (see `WorkDb::create_pr_review_guide_execution`).
-        compose_review_guide_prompt(work_db, execution)?
+        with_bazel_caching_rule(compose_review_guide_prompt(work_db, execution)?)
     } else {
         compose_execution_prompt(
             ExecutionPromptParams::builder()
@@ -1507,6 +1510,12 @@ mod compose_worker_spawn_tests {
     //! branch: branch selection (PrReview vs. other kinds), the no-pr-url
     //! fallback to the generic implementer prompt, and the URL-only reviewer
     //! prompt rendered when the PR metadata fetch fails.
+
+    fn assert_bazel_caching_rule(prompt: &str) {
+        assert_eq!(prompt.matches("Trust Bazel's caching").count(), 1);
+        assert!(prompt.contains("--remote_accept_cached=false"));
+    }
+
     use super::*;
     use crate::work::Task;
     use boss_protocol::{EffortLevel, ExecutionKind, ExecutionStatus, TaskKind, TaskStatus};
@@ -1618,6 +1627,7 @@ mod compose_worker_spawn_tests {
             )
             .await
             .unwrap();
+            assert_bazel_caching_rule(&composed.prompt_text);
             let prompt = composed.prompt_text;
             assert_eq!(prompt.contains("## Origin PR backlink"), origin.is_some(), "{prompt}");
             if origin.is_some() {
@@ -1660,6 +1670,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
         let prompt = composed.prompt_text;
         assert!(
             prompt.contains("This `post-merge review findings` follow-up derives from [the origin PR](https://github.com/org/repo/pull/2685)."),
@@ -1697,6 +1708,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
 
         assert!(
             !composed.prompt_text.contains("## Origin PR backlink"),
@@ -1807,6 +1819,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
 
         assert!(
             !composed.prompt_text.contains("# PR review"),
@@ -1848,6 +1861,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
 
         let triage_path =
             crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::TriageDecision);
@@ -1878,6 +1892,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
 
         assert!(
             composed.prompt_text.contains("# PR review"),
@@ -2006,6 +2021,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
 
         assert!(
             composed
@@ -2135,6 +2151,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
 
         assert!(
             composed.prompt_text.contains("Implement a revision-aware broker."),
@@ -2184,6 +2201,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
 
         assert!(
             !composed.prompt_text.contains("# PR review"),
@@ -2223,6 +2241,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
 
         assert!(
             !composed.prompt_text.contains("expected branch name"),
@@ -2297,6 +2316,7 @@ mod compose_worker_spawn_tests {
             )
             .await
             .unwrap();
+            assert_bazel_caching_rule(&composed.prompt_text);
 
             match level {
                 EffortLevel::Trivial | EffortLevel::Small => {
@@ -2359,6 +2379,7 @@ mod compose_worker_spawn_tests {
             )
             .await
             .unwrap();
+            assert_bazel_caching_rule(&composed.prompt_text);
 
             assert!(
                 composed.spawn_config.prompt_addendum.is_some(),
@@ -2416,6 +2437,7 @@ mod compose_worker_spawn_tests {
             )
             .await
             .unwrap();
+            assert_bazel_caching_rule(&composed.prompt_text);
 
             assert!(
                 composed.spawn_config.prompt_addendum.is_some(),
@@ -2475,6 +2497,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .unwrap();
+        assert_bazel_caching_rule(&composed.prompt_text);
 
         assert!(
             composed.prompt_text.contains("house style: terse commit messages"),
@@ -2704,6 +2727,7 @@ mod compose_worker_spawn_tests {
         )
         .await
         .expect("review-guide spawn must compose");
+        assert_bazel_caching_rule(&composed.prompt_text);
         assert!(
             !composed.prompt_text.contains("jj bookmark set"),
             "review-guide workers cannot run jj bookmark commands: {}",
