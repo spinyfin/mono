@@ -30,7 +30,7 @@ load(
 )
 
 # Must match the version in MODULE.bazel rust.toolchain().
-_RUST_VERSION = "1.95.0"
+_RUST_VERSION = "1.99.0"
 
 # Exec triples for which we register a musl cross-compile toolchain.
 # Covers macOS (arm/x86) and Linux (arm/x86) CI agents.

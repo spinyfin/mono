@@ -12,7 +12,7 @@ include:
 # Binary resolution:
 #   - In a Bazel workspace (mono CI): the hermetic rustfmt from rules_rust is used
 #     automatically. The channel (stable or nightly) depends on rustfmt_version in
-#     MODULE.bazel. Currently this repo pins rustfmt_version = "1.95.0" (stable).
+#     MODULE.bazel. Currently this repo pins rustfmt_version = "1.99.0" (stable).
 #   - In non-Bazel repos or local dev: the fallback `path: "rustfmt"` uses whatever
 #     rustfmt is on PATH, and the framework warns loudly on stderr so you know the
 #     hermetic toolchain was skipped.
@@ -72,7 +72,7 @@ invocations:
       # airlock anyway (safety.rs:190-196), since only the staged file can be
       # written back — so skipping them costs nothing and avoids a guaranteed abort.
       # skip_children is unstable but honoured via CLI --config= override on the
-      # pinned stable toolchain (rustfmt 1.9.0-stable on rustc 1.95.0); see the
+      # pinned stable toolchain (rustfmt 1.10.0-stable on rustc 1.99.0); see the
       # hermetic regression test guarding against a future toolchain closing that
       # loophole. Check invocation above is intentionally left untouched — do not
       # add this flag there, it would narrow read scope for no gain.

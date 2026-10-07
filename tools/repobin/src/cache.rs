@@ -769,7 +769,7 @@ mod tests {
         assert!(
             super::sha_matches(&pinned_sha, &shas[0]),
             "pinned checkout should be at sha[0]={}, got {pinned_sha}",
-            &shas[0]
+            shas[0]
         );
     }
 

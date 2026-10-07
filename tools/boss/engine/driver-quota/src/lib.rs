@@ -196,10 +196,8 @@ pub mod parse {
         let time_part = time_part.trim();
         let (hm, is_pm) = if let Some(s) = time_part.strip_suffix("am") {
             (s, false)
-        } else if let Some(s) = time_part.strip_suffix("pm") {
-            (s, true)
         } else {
-            return None;
+            (time_part.strip_suffix("pm")?, true)
         };
         let (hour_str, minute_str) = hm.split_once(':').unwrap_or((hm, "0"));
         let mut hour: u32 = hour_str.trim().parse().ok()?;
