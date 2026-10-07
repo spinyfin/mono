@@ -1519,6 +1519,7 @@ impl ServerState {
         // reverse forward at the production engine.
         let provider_events_socket = crate::runner::bound_events_socket_path(&cfg);
         let provider_control_dir = crate::ssh_transport::default_control_socket_dir();
+        let remote_pane_releaser = pane_releaser.clone();
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
                 work_db.clone(),
@@ -1582,6 +1583,7 @@ impl ServerState {
                     ),
                 ));
             }
+            execution_coordinator_inner.set_remote_pane_releaser(remote_pane_releaser);
             let execution_coordinator = Arc::new(execution_coordinator_inner);
             completion_handler.set_host_adapter_provider(execution_coordinator.host_adapter_provider());
 

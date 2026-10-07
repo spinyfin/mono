@@ -1942,3 +1942,5 @@ async fn disabled_finalize_does_not_allocate_a_source_observation() {
         .await;
     assert_eq!(db.allocate_pr_review_guide_source_observation_sequence().unwrap(), 1);
 }
+
+mod remote_release;

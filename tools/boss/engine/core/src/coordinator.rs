@@ -2031,6 +2031,7 @@ pub struct ExecutionCoordinator {
     /// [`crate::host_adapter::SshHostAdapterProvider`] via
     /// [`Self::set_host_adapter_provider`].
     host_adapter_provider: Arc<dyn HostAdapterProvider>,
+    remote_pane_releaser: Option<Arc<dyn crate::completion::WorkerPaneReleaser>>,
     #[builder(default = Arc::new(NoopExecutionPublisher))]
     publisher: Arc<dyn ExecutionPublisher>,
     /// Structured stream of dispatch-pipeline events. Defaults to a

@@ -11,7 +11,8 @@ impl WorkerCompletionHandler {
     /// duplicate calls (e.g. completion-detection followed by a manual
     /// stop, or two clients racing to mark a chore done) become no-ops
     /// on the second pass via the registry's `take_slot_for_run`
-    /// invariant and the DB's lease-id ownership transfer.
+    /// invariant and cleared lease columns. Concurrent remote releases are
+    /// idempotent at the owning host; its lease stays recorded until success.
     ///
     /// Does NOT change the execution's status field. Callers that need
     /// the execution marked `completed` / `failed` should drive that
@@ -45,6 +46,33 @@ impl WorkerCompletionHandler {
                  so an occupied workspace is never re-leased",
             );
             return ForceReleaseOutcome::HeldForInFlightSpawn;
+        }
+
+        // Remote leases belong to the owning host. Keep the durable lease
+        // columns until its adapter confirms release so a failed call can retry.
+        match self.remote_cleanup_adapter(execution_id).await {
+            Ok(Some(adapter)) => {
+                let execution = match self.work_db.get_execution(execution_id) {
+                    Ok(execution) => execution,
+                    Err(_) => return ForceReleaseOutcome::WorkspaceColumnClearFailed,
+                };
+                let Some(lease_id) = execution.cube_lease_id else {
+                    return ForceReleaseOutcome::NoLeaseHeld;
+                };
+                if let Err(err) = adapter.force_release_lease(&lease_id, Some("force release")).await {
+                    tracing::warn!(execution_id, ?err, "force_release: remote cube release failed");
+                    return ForceReleaseOutcome::LeaseReleaseFailed { lease_id };
+                }
+                return match self.work_db.clear_execution_workspace(execution_id) {
+                    Ok(_) => ForceReleaseOutcome::Released { lease_id },
+                    Err(_) => ForceReleaseOutcome::WorkspaceColumnClearFailed,
+                };
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(execution_id, ?err, "force_release: host lookup failed; retaining lease");
+                return ForceReleaseOutcome::WorkspaceColumnClearFailed;
+            }
         }
 
         // Cube release: claim ownership of the lease id atomically by

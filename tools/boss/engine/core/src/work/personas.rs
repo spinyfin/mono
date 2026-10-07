@@ -183,6 +183,30 @@ impl WorkDb {
         persona_display_name(&conn, execution_id)
     }
 
+    /// Terminal remote rows can predate registry registration or survive a
+    /// crash between terminalization and cleanup. Never reclaim tmux owners.
+    pub(crate) fn terminal_remote_persona_executions(&self) -> Result<Vec<String>> {
+        let candidates = {
+            let conn = self.connect()?;
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT r.execution_id FROM work_runs r
+                 WHERE r.persona_lease_active = 1 AND r.host_id != 'local'
+                 AND NOT EXISTS (SELECT 1 FROM work_runs t
+                     WHERE t.execution_id = r.execution_id AND t.tmux_spawn_token IS NOT NULL)",
+            )?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        candidates
+            .into_iter()
+            .filter_map(|id| match self.get_execution(&id) {
+                Ok(execution) if execution.status.is_terminal() => Some(Ok(id)),
+                Ok(_) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect()
+    }
+
     pub fn release_persona(&self, execution_id: &str) -> Result<()> {
         self.connect()?.execute(
             "UPDATE work_runs SET persona_lease_active = 0 WHERE execution_id = ?1 AND persona_lease_active = 1",
