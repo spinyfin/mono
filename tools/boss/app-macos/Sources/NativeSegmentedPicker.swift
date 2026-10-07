@@ -178,6 +178,15 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
                 control.font = nil
             }
             var size = control.fittingSize
+            if let font {
+                size.width = Self.widthAccountingForFont(
+                    fitted: size.width,
+                    control: control,
+                    titles: titles,
+                    controlSize: controlSize,
+                    font: font
+                )
+            }
             if size.width <= 0 || size.height <= 0 {
                 let cellSize = control.cell?.cellSize ?? NSSize(width: 8, height: 22)
                 size = CGSize(
@@ -190,6 +199,30 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
             cachedFontKey = fontKey
             cachedSize = size
             return size
+        }
+
+        /// `NSSegmentedControl` sizes its segments from AppKit's default
+        /// font on recent macOS releases even when `font` is overridden, so
+        /// the fitted width stays flat while the rendered labels grow. When
+        /// the override did not move the fitted width off the default-font
+        /// width, add the label-width delta between the override and the
+        /// default font so the ideal still tracks Dynamic Type.
+        private static func widthAccountingForFont(
+            fitted: CGFloat,
+            control: NSSegmentedControl,
+            titles: [String],
+            controlSize: NSControl.ControlSize,
+            font: NSFont
+        ) -> CGFloat {
+            control.font = nil
+            let baseline = control.fittingSize.width
+            control.font = font
+            guard fitted <= baseline else { return fitted }
+            let defaultFont = NSFont.systemFont(ofSize: NSFont.systemFontSize(for: controlSize))
+            func labelWidth(_ font: NSFont) -> CGFloat {
+                titles.reduce(0) { $0 + ceil(($1 as NSString).size(withAttributes: [.font: font]).width) }
+            }
+            return baseline + max(0, labelWidth(font) - labelWidth(defaultFont))
         }
     }
 
