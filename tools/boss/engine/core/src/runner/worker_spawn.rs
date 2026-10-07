@@ -2818,13 +2818,13 @@ mod compose_worker_spawn_tests {
         for (conflicts, first_task) in [("", false), ("Commit abc:\nbase.txt\n", true)] {
             db.record_execution_restore_report(
                 &execution.id,
-                &RestoreReport {
-                    inherited_base: None,
-                    pointer: "boss-recovery/exec_prior + pr/99".into(),
-                    commits: "abc1234 Preserved work\n".into(),
-                    base_sha: "0123456789abcdef".into(),
-                    conflicts: conflicts.into(),
-                },
+                &RestoreReport::builder()
+                    .pointer("boss-recovery/exec_prior + pr/99")
+                    .commits("abc1234 Preserved work\n")
+                    .base_sha("0123456789abcdef")
+                    .conflicts(conflicts)
+                    .pr_bound(true)
+                    .build(),
             )
             .unwrap();
             let prompt = compose().await;

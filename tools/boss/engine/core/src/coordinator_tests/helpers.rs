@@ -113,6 +113,8 @@ pub(super) struct FakeCubeClient {
     pub(super) fail_goto: bool,
     /// Make `recovery_pr_base` fail, as for a non-GitHub origin or a deleted PR base.
     pub(super) fail_pr_base: AtomicBool,
+    /// Base branch `recovery_pr_base` reports; defaults to `main`.
+    pub(super) pr_base: Mutex<Option<String>>,
     pub(super) dirty_verified: Option<bool>,
     pub(super) recovery_status: Option<CubeWorkspaceStatus>,
     pub(super) workspace_root: Option<PathBuf>,
@@ -354,9 +356,9 @@ crate::stub_cube_client! { FakeCubeClient {
     }
     async fn recovery_pr_base(&self, _origin: &str, _pr: u64) -> Result<String> {
         if self.fail_pr_base.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(anyhow!("PR base unavailable"));
+            return Err(boss_engine_recovery::execution_bookmark::base_unresolvable_error("PR base unavailable"));
         }
-        Ok("main".into())
+        Ok(self.pr_base.lock().await.clone().unwrap_or_else(|| "main".into()))
     }
     async fn create_execution_bookmark(&self, workspace: &std::path::Path, execution_id: &str, predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>, inherited_base: Option<&str>) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
         self.bookmark_calls.lock().await.push(execution_id.to_owned());

@@ -1,7 +1,8 @@
 //! Refresh preserved execution history before handing it to another worker.
 use super::*;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct RestoreReport {
     pub pointer: String,
     pub commits: String,
@@ -10,6 +11,16 @@ pub struct RestoreReport {
     /// Baseline of staged history; predecessor provenance stays untouched.
     #[serde(default)]
     pub inherited_base: Option<String>,
+    /// True when a PR head bookmark was restaged (a revision), so the PR must be
+    /// rewritten through `cube pr update`.
+    #[serde(default)]
+    #[builder(default)]
+    pub pr_bound: bool,
+    /// Set when the PR's own base could not be used and history was restaged
+    /// onto a substitute branch; records the requested base, the branch used
+    /// and why.
+    #[serde(default)]
+    pub base_fallback: Option<String>,
 }
 
 impl RestoreReport {
@@ -22,12 +33,18 @@ impl RestoreReport {
                 self.conflicts
             )
         };
-        // Only a PR-bound (revision) report carries a `pr/<n>` pointer; a chore
-        // or task has no PR bookmark to rewrite.
-        let pr_rewrite = if self.pointer.contains("pr/") {
-            "For a revision, the PR history was restaged onto its current base branch (including a stacked PR base). Its head-branch bookmark still points at the original head: publishing requires moving that bookmark to the completed history with `jj bookmark set --allow-backwards` and rewriting the existing PR through `cube pr update`.\n\n"
+        let pr_rewrite = if !self.pr_bound {
+            String::new()
         } else {
-            ""
+            let base = match &self.base_fallback {
+                Some(note) => format!(
+                    "WARNING: the PR's own base branch could not be used ({note}). History was restaged onto that substitute branch instead, so if the PR is stacked, its unmerged parent's commits may now appear among the inherited commits: inspect them and drop any that belong to the parent PR before publishing. "
+                ),
+                None => "For a revision, the PR history was restaged onto its current base branch (including a stacked PR base). ".to_owned(),
+            };
+            format!(
+                "{base}The PR head-branch bookmark still points at the original head: publishing requires moving that bookmark to the completed history with `jj bookmark set --allow-backwards` and rewriting the existing PR through `cube pr update`.\n\n"
+            )
         };
         format!(
             "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine staged copies of this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
@@ -58,7 +75,7 @@ pub async fn restore_rebased(
         serde_json::to_string(base_branch)?,
         serde_json::to_string(upstream)?
     );
-    let base_sha = one_commit(jj, workspace, &base_ref).await?;
+    let base_sha = base_commit(jj, workspace, &base_ref, base_branch, upstream).await?;
     let pointer = head_bookmark(jj, record).await?;
     let head = revision(&pointer);
     let pr_head = match pr_bookmark {
@@ -130,16 +147,18 @@ pub async fn restore_rebased(
         conflicts.push_str(&format!("Commit {commit}:\n"));
         conflicts.push_str(&jj.run(workspace, &["resolve", "--list", "-r", commit]).await?);
     }
-    Ok(RestoreReport {
-        pointer: match pr_bookmark {
-            Some(pr) => format!("{pointer} + {pr}"),
-            None => pointer,
-        },
-        commits,
-        base_sha,
-        conflicts,
-        inherited_base,
-    })
+    let pointer = match pr_bookmark {
+        Some(pr) => format!("{pointer} + {pr}"),
+        None => pointer,
+    };
+    Ok(RestoreReport::builder()
+        .pointer(pointer)
+        .commits(commits)
+        .base_sha(base_sha)
+        .conflicts(conflicts)
+        .maybe_inherited_base(inherited_base)
+        .pr_bound(pr_bookmark.is_some())
+        .build())
 }
 
 async fn one_commit(jj: &dyn Jj, workspace: &Path, revset: &str) -> Result<String> {
@@ -150,6 +169,29 @@ async fn one_commit(jj: &dyn Jj, workspace: &Path, revset: &str) -> Result<Strin
         )
         .await?;
     let commits: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
+    ensure!(
+        commits.len() == 1,
+        "expected exactly one commit for {revset}; found {}",
+        commits.len()
+    );
+    Ok(commits[0].to_owned())
+}
+
+/// Like [`one_commit`], but a base that resolves to no commit is the typed
+/// [`base_unresolvable_error`] so callers can tell it from a transient failure.
+async fn base_commit(jj: &dyn Jj, workspace: &Path, revset: &str, branch: &str, upstream: &str) -> Result<String> {
+    let output = jj
+        .run(
+            workspace,
+            &["log", "--no-graph", "-r", revset, "-T", "commit_id ++ \"\\n\""],
+        )
+        .await?;
+    let commits: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
+    if commits.is_empty() {
+        return Err(base_unresolvable_error(format!(
+            "base branch `{branch}` has no commit on remote `{upstream}`"
+        )));
+    }
     ensure!(
         commits.len() == 1,
         "expected exactly one commit for {revset}; found {}",

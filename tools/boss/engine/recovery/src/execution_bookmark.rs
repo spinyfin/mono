@@ -41,6 +41,30 @@ pub fn is_pointer_integrity_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<PointerIntegrityError>())
 }
 
+/// The requested PR base branch cannot be resolved to a commit (no such remote
+/// bookmark, or a non-GitHub origin). Unlike a failed fetch or SSH hop, retrying
+/// cannot fix it, so it is the only failure that may justify restaging onto a
+/// substitute base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseUnresolvableError(pub String);
+
+impl std::fmt::Display for BaseUnresolvableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BaseUnresolvableError {}
+
+pub fn base_unresolvable_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(BaseUnresolvableError(message.into()))
+}
+
+/// True when `error` (or any cause in its chain) is a base-unresolvable failure.
+pub fn is_base_unresolvable_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<BaseUnresolvableError>())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionBookmark {
     pub execution_id: String,

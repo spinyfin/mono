@@ -734,10 +734,93 @@ async fn revision_recovery_falls_back_to_main_when_the_pr_base_is_unavailable() 
         .unwrap()
         .expect("report");
     assert!(report.pointer.contains("pr/99"), "{}", report.pointer);
+    assert!(report.pr_bound);
+    assert!(
+        report.base_fallback.as_deref().unwrap().contains("`main`"),
+        "{report:?}"
+    );
+    assert!(
+        report.instructions().contains("could not be used"),
+        "{}",
+        report.instructions()
+    );
     assert_eq!(
         std::fs::read_to_string(h.repo.replacement.join("revision.txt")).unwrap(),
         "unpushed revision"
     );
+}
+
+#[tokio::test]
+async fn revision_recovery_discloses_a_missing_pr_base_branch() {
+    let h = chain_harness(true, true, false).await;
+    // The PR base resolves, but no such remote bookmark exists.
+    *h.cube.pr_base.lock().await = Some("gone-parent".into());
+    h.dispatch().await.unwrap();
+    let report = h
+        .coordinator
+        .work_db
+        .execution_restore_report(&h.next.id)
+        .unwrap()
+        .expect("report");
+    let note = report.base_fallback.clone().expect("fallback is recorded");
+    assert!(note.contains("gone-parent") && note.contains("`main`"), "{note}");
+    let prompt = report.instructions();
+    assert!(
+        prompt.contains("gone-parent") && prompt.contains("parent's commits may now appear"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("restaged onto its current base branch"), "{prompt}");
+    assert_eq!(
+        std::fs::read_to_string(h.repo.replacement.join("revision.txt")).unwrap(),
+        "unpushed revision"
+    );
+}
+
+#[tokio::test]
+async fn transient_restore_failure_keeps_the_stacked_parent_base_on_retry() {
+    use boss_engine_test_git::jj::JjRepo;
+    let h = chain_harness(true, true, false).await;
+    JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Stacked parent"]);
+    std::fs::write(h.repo.repo.join("parent.txt"), "parent").unwrap();
+    JjRepo::run(&h.repo.repo, &["bookmark", "set", "stack-parent", "-r", "@"]);
+    JjRepo::run(&h.repo.repo, &["git", "export"]);
+    let parent_sha = JjRepo::run(
+        &h.repo.repo,
+        &["log", "-r", "stack-parent", "--no-graph", "-T", "commit_id"],
+    );
+    *h.cube.pr_base.lock().await = Some("stack-parent".into());
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-transient".into(),
+        workspace_id: "replacement".into(),
+        workspace_path: h.repo.replacement.clone(),
+        dirty_verified: Some(true),
+    };
+    // Make the fetch fail the way a network blip would: the remote vanishes.
+    let git_dir = h.repo.repo.join(".jj/repo/store/git");
+    let parked = h.repo.repo.join(".jj/repo/store/git-parked");
+    std::fs::rename(&git_dir, &parked).unwrap();
+    let first = h
+        .coordinator
+        .recover_execution_bookmark(&h.next, &lease, &h.coordinator.host_adapter, "mono", Some(99))
+        .await;
+    std::fs::rename(&parked, &git_dir).unwrap();
+    let err = first.expect_err("a failed fetch must propagate, not fall back");
+    assert!(
+        !boss_engine_recovery::execution_bookmark::is_base_unresolvable_error(&err),
+        "{err:#}"
+    );
+    h.coordinator
+        .recover_execution_bookmark(&h.next, &lease, &h.coordinator.host_adapter, "mono", Some(99))
+        .await
+        .unwrap();
+    let report = h
+        .coordinator
+        .work_db
+        .execution_restore_report(&h.next.id)
+        .unwrap()
+        .expect("report");
+    assert_eq!(report.base_fallback, None);
+    assert_eq!(report.base_sha, parent_sha.trim());
 }
 
 #[tokio::test]

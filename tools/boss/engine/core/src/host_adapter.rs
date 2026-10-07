@@ -104,7 +104,11 @@ fn remote_driver_config_paths(
 
 /// The one implementation behind every `recovery_pr_base` default.
 pub(crate) async fn fetch_recovery_pr_base(origin: &str, pr: u64) -> Result<String> {
-    let slug = git_utils::repo_slug::parse_github_slug(origin).context("invalid recovery repository URL")?;
+    // A non-GitHub origin can never yield a PR base; every other failure here
+    // (gh, network) is transient and must stay retryable.
+    let slug = git_utils::repo_slug::parse_github_slug(origin).ok_or_else(|| {
+        execution_bookmark::base_unresolvable_error(format!("origin `{origin}` is not a GitHub repository"))
+    })?;
     git_utils::gh_cli::fetch_pr_base_ref(&slug, pr).await
 }
 

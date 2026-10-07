@@ -1,5 +1,5 @@
 use super::*;
-use boss_engine_recovery::execution_bookmark::pointer_integrity_error;
+use boss_engine_recovery::execution_bookmark::{is_base_unresolvable_error, pointer_integrity_error};
 
 impl ExecutionCoordinator {
     /// Restore the predecessor's engine-created reference into the new lease.
@@ -60,22 +60,24 @@ impl ExecutionCoordinator {
                 .iter()
                 .find(|repo| repo.repo_id == repo_id)
                 .ok_or_else(|| anyhow!("recovery repository {repo_id} is absent from cube repo list"))?;
+            let mut base_fallback = None;
             let base_branch = if execution.kind == ExecutionKind::RevisionImplementation {
                 let pr = pr_for_goto
                     .ok_or_else(|| pointer_integrity_error("revision recovery requires its bound PR URL"))?;
                 match adapter.recovery_pr_base(&repo.origin, pr).await {
                     Ok(base) => base,
-                    Err(err) => {
-                        // A non-GitHub origin or an unreadable PR base cannot be
-                        // fixed by retrying; restage onto the default branch.
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            ?err,
-                            fallback = %repo.main_branch,
-                            "could not resolve the PR base branch; restaging recovery onto the main branch"
-                        );
+                    // Only a base that can never be resolved (e.g. a non-GitHub
+                    // origin) falls back; transient gh/network errors propagate to
+                    // the pre-start retry path with the base unchanged.
+                    Err(err) if is_base_unresolvable_error(&err) => {
+                        tracing::warn!(execution_id = %execution.id, ?err, fallback = %repo.main_branch, "PR base branch is unresolvable; restaging recovery onto the main branch");
+                        base_fallback = Some(format!(
+                            "its base branch could not be determined: {err:#}; used `{}`",
+                            repo.main_branch
+                        ));
                         repo.main_branch.clone()
                     }
+                    Err(err) => return Err(err),
                 }
             } else {
                 repo.main_branch.clone()
@@ -98,14 +100,21 @@ impl ExecutionCoordinator {
                     &base_branch,
                 )
                 .await;
-            let report = match restore {
+            let mut report = match restore {
                 Ok(report) => report,
                 Err(err)
-                    if execution.kind == ExecutionKind::RevisionImplementation && base_branch != repo.main_branch =>
+                    if execution.kind == ExecutionKind::RevisionImplementation
+                        && base_branch != repo.main_branch
+                        && is_base_unresolvable_error(&err) =>
                 {
-                    // The PR base branch resolved but its remote bookmark is gone
-                    // (e.g. a stacked parent deleted after merge): retry on main.
-                    tracing::warn!(execution_id = %execution.id, ?err, "restaging onto the PR base failed; retrying on the main branch");
+                    // The PR base resolved but its remote bookmark is gone (e.g. a
+                    // stacked parent deleted after merge). Any other failure is
+                    // transient and must not silently change the base.
+                    tracing::warn!(execution_id = %execution.id, ?err, "PR base has no remote commit; retrying on the main branch");
+                    base_fallback = Some(format!(
+                        "requested base `{base_branch}`: {err:#}; used `{}`",
+                        repo.main_branch
+                    ));
                     adapter
                         .restore_rebased_execution_bookmark(
                             &record,
@@ -117,6 +126,7 @@ impl ExecutionCoordinator {
                 }
                 Err(err) => return Err(err),
             };
+            report.base_fallback = base_fallback;
             self.work_db.record_execution_restore_report(&execution.id, &report)?;
             has_work
         } else {
