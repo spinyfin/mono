@@ -152,6 +152,35 @@ filegroup(
 """,
     )
 
+def _codex_probe_runtime(repository_ctx):
+    """Separate inputs: only a test declaring these gets the host login shell.
+
+    Codex resolves the shell from passwd, ignoring SHELL. As with host_tmux,
+    keep this out of the common runtime manifest and bin/* PATH directory.
+    The CA bundle lets the probe verify TLS without accessing the Keychain.
+    """
+    result = repository_ctx.execute([
+        "/usr/bin/python3",
+        "-c",
+        "import os,pwd; print(pwd.getpwuid(os.getuid()).pw_shell)",
+    ])
+    if result.return_code != 0:
+        fail("cannot resolve Codex probe login shell: " + result.stderr)
+    repository_ctx.symlink(repository_ctx.path(result.stdout.strip()).realpath, "codex/login-shell")
+    for candidate in ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"]:
+        if repository_ctx.path(candidate).exists:
+            repository_ctx.symlink(repository_ctx.path(candidate).realpath, "codex/ca.pem")
+            break
+    repository_ctx.file(
+        "codex/BUILD.bazel",
+        content = 'exports_files(["login-shell", "ca.pem"], visibility = ["@@//tools/boss/engine/core:__pkg__"])\n',
+    )
+
+codex_probe_runtime_repository = repository_rule(
+    implementation = _codex_probe_runtime,
+    local = True,
+)
+
 test_runtime_repository = repository_rule(
     implementation = _test_runtime_repository_impl,
     configure = True,

@@ -38,9 +38,9 @@
 //! expensive, opt-in half: for each dispatched model, it runs one live
 //! `codex exec` turn — through the exact same `CodexDriver` methods
 //! production uses (`provision_workspace`, `write_permission_config`,
-//! `spawn_invocation`, `apply_permission_extra_args`), so the arming, the
-//! live hook-trust attestation, and the spawned command line are the real
-//! ones, not a hand-rolled stand-in — with a fixed prompt that walks through
+//! `spawn_invocation`, `apply_permission_extra_args`), so arming and live
+//! hook-trust attestation use the production path. The harness explicitly
+//! substitutes `codex exec` for the TUI invocation. Its fixed prompt covers
 //! six tool-surface routes already known to matter, and asserts the observed
 //! `(tool_name, tool_input key set, aggregate guard decision, guard name
 //! set)` for each against [`EXPECTED_PROBES`]. A mismatch fails the test; it
@@ -71,6 +71,10 @@
 //!    a regression that made the path guard stop reading `*** Add File:`
 //!    headers out of `tool_input.command` would leave probe 3 green but
 //!    must fail this one.
+//!
+//! This exec probe does not exercise TUI keyboard input, interruption, or saved
+//! session resume. Step 4 tests a model tool opening an interactive shell, not
+//! stdin delivery to the production Codex TUI.
 //!
 //! # Grouping the trace into one verdict per probe
 //!
@@ -532,7 +536,10 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
     // private PATH entry.
     let codex_bin_dir = tmp.path().join("codex-bin");
     std::fs::create_dir_all(&codex_bin_dir).expect("create codex bin dir");
-    std::os::unix::fs::symlink(codex_bin, codex_bin_dir.join("codex")).expect("link pinned codex");
+    std::fs::copy(codex_bin, codex_bin_dir.join("codex")).expect("stage pinned codex");
+    let host = std::env::var_os("BOSS_TEST_CODEX_CODE_MODE_HOST")
+        .expect("live probe requires the pinned code-mode host runtime input");
+    std::fs::copy(host, codex_bin_dir.join("codex-code-mode-host")).expect("stage pinned code-mode host beside codex");
     let _auth = codex_auth_source_and_path_override(&homes_root, &private_auth, &codex_bin_dir);
 
     // Arm the real path guard rather than leaving it unset: a local Standard
@@ -592,6 +599,13 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
         // terminal; this harness drives the same model, hooks and config
         // headlessly through `codex exec`, whose hook and guard behaviour is the
         // surface under test.
+        assert_eq!(
+            command
+                .matches("codex --strict-config --no-alt-screen -a never")
+                .count(),
+            1,
+            "production spawn changed; review the exec probe substitution: {command}"
+        );
         let command = command.replacen(
             "codex --strict-config --no-alt-screen -a never",
             "codex --strict-config -a never exec --skip-git-repo-check",
@@ -603,16 +617,22 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
     // The resolved command starts with a bare `codex`; make sure it resolves
     // to the confirmed binary regardless of this process's ambient PATH
     // (Bazel's test sandbox does not inherit the operator's).
-    let path_with_codex = match codex_bin.parent() {
-        Some(dir) => format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default()),
-        None => std::env::var("PATH").unwrap_or_default(),
-    };
+    let path_with_codex = format!(
+        "{}:{}",
+        codex_bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default(),
+    );
 
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
         .current_dir(&workspace)
         .env("CODEX_HOME", &codex_home)
+        .env(
+            "SSL_CERT_FILE",
+            std::fs::canonicalize(std::env::var_os("SSL_CERT_FILE").expect("live target declares a CA bundle"))
+                .expect("resolve live target CA bundle"),
+        )
         .env("PATH", path_with_codex)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -691,7 +711,7 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
         EXPECTED_PROBES.len(),
         "{model}: expected {} tool-call groups (one per fixed probe step) but observed {}; the \
          model likely deviated from the fixed probe script, or Codex's tool surface / guard wiring \
-         changed shape. raw trace={records:?}\ncodex stdout={stdout}",
+         changed shape. raw trace={records:?}\ncodex stdout={stdout}\ncodex stderr={stderr}",
         EXPECTED_PROBES.len(),
         groups.len(),
     );

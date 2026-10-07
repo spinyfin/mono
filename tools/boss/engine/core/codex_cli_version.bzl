@@ -9,14 +9,17 @@ asserts the installed CLI matches it.
 
 Bump procedure:
 1. Update CODEX_CLI_VERSION below.
-2. Update the sha256 for each platform entry in codex_test_archives.bzl to the
-   new release's published checksums.
+2. Update sha256 (CLI) and host_sha256 (code-mode host) for each platform in
+   codex_test_archives.bzl to the new release's published checksums.
 3. Re-run the driver's config_compatibility_tests and engine/core's
    conformance tests (version_pin, guard_conformance) against the new binary;
    both targets receive the pinned release through `BOSS_TEST_CODEX`, so a
    plain `bazel test //tools/boss/engine/driver:driver_test
    //tools/boss/engine/core:engine_lib_test` exercises it. Update fixtures if
-   behavior changed.
+   behavior changed. Also run the opt-in network target
+   `bazel test //tools/boss/engine/core:codex_guard_live_test
+   --test_env=BOSS_CODEX_AUTH_SOURCE=<auth.json>`; the ordinary test targets
+   do not execute its live model probes.
 4. Drive the bare TUI live (the driver screen-scrapes it) and re-measure the
    pane-monitor markers, the interrupt path and the hook block path; see
    tools/boss/docs/investigations/codex-0.160.1-qualification-2026-10-06.md

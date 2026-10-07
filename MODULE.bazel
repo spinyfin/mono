@@ -59,6 +59,13 @@ host_tmux_repository = use_repo_rule(
 
 host_tmux_repository(name = "host_tmux")
 
+codex_probe_runtime_repository = use_repo_rule(
+    "//tools/test-sandbox:repositories.bzl",
+    "codex_probe_runtime_repository",
+)
+
+codex_probe_runtime_repository(name = "codex_probe_runtime")
+
 jj_test_repository = use_repo_rule("//tools/boss/engine/recovery:jj_repository.bzl", "jj_test_repository")
 
 jj_test_repository(name = "jj_test_tools")
