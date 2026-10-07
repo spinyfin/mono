@@ -127,6 +127,7 @@ async fn missing_preserved_pointer_fails_before_modifying_the_destination() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains(&prior.head()));
+    assert!(is_pointer_integrity_error(&error));
     assert_eq!(
         before,
         JjRepo::run(&repo.replacement, &["log", "-r", "@", "--no-graph", "-T", "commit_id"])
@@ -155,4 +156,45 @@ async fn publication_pointer_restores_newer_work_and_survives_a_missing_recovery
         assert!(report.commits.contains("Publication advanced"));
         assert!(repo.replacement.join("fix").exists());
     }
+}
+
+#[tokio::test]
+async fn failed_fetch_is_not_a_pointer_integrity_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    // No `origin` remote: the fetch fails although the pointer is intact.
+    let prior = create(&LocalJj, &repo.worker, "exec_fetch", "local").await.unwrap();
+    let error = restore_rebased(&LocalJj, &prior, &repo.replacement, None)
+        .await
+        .unwrap_err();
+    assert!(!is_pointer_integrity_error(&error), "{error:#}");
+}
+
+#[tokio::test]
+async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    origin(&repo);
+    std::fs::write(repo.worker.join("stale-pr"), "old published").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "Old published PR"]);
+    JjRepo::run(&repo.worker, &["bookmark", "set", "pr/78", "-r", "@"]);
+    JjRepo::run(&repo.worker, &["new", "-m", "Unpushed revision"]);
+    let prior = create(&LocalJj, &repo.worker, "exec_rewritten", "local").await.unwrap();
+    std::fs::write(repo.worker.join("local-fix"), "preserved").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    // The PR branch is force-pushed to a sibling of the old published commit.
+    JjRepo::run(&repo.repo, &["new", "main", "-m", "Rewritten PR"]);
+    std::fs::write(repo.repo.join("rewritten-pr"), "force pushed").unwrap();
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "set", "pr/78", "--allow-backwards", "-r", "@"],
+    );
+    let report = restore_rebased(&LocalJj, &prior, &repo.replacement, Some("pr/78"))
+        .await
+        .unwrap();
+    assert!(report.conflicts.is_empty());
+    for file in ["rewritten-pr", "local-fix"] {
+        assert!(repo.replacement.join(file).exists(), "{file}");
+    }
+    assert!(!repo.replacement.join("stale-pr").exists());
 }

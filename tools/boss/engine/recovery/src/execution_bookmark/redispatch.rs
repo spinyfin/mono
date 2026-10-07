@@ -34,10 +34,11 @@ pub async fn restore_rebased(
     workspace: &Path,
     pr_bookmark: Option<&str>,
 ) -> Result<RestoreReport> {
-    ensure!(
-        jj.shared_repo(workspace).await? == record.repo_path,
-        "recovery destination belongs to a different shared repository"
-    );
+    if jj.shared_repo(workspace).await? != record.repo_path {
+        return Err(pointer_integrity_error(
+            "recovery destination belongs to a different shared repository",
+        ));
+    }
     diff(jj, record).await?;
     jj.run(workspace, &["git", "fetch"]).await?;
     let main = "remote_bookmarks(exact:main, exact:origin)";
@@ -70,7 +71,10 @@ pub async fn restore_rebased(
     jj.run(workspace, &["new", &head, "-m", "Resume recovered execution work"])
         .await?;
     if let Some(pr) = &pr_head {
-        let unpublished = format!("{pr}..@ ~ ::{base_sha}");
+        // Bound by the prior execution's own baseline so a force-pushed PR
+        // head does not make its old published commits look unpublished.
+        let baseline = revision(&record.base());
+        let unpublished = format!("({baseline}..@) ~ (::{pr} | ::{base_sha})");
         jj.run(
             workspace,
             &["rebase", "-r", &unpublished, "-d", pr, "--ignore-immutable"],

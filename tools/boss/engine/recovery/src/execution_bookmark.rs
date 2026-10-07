@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,29 @@ pub use redispatch::{RestoreReport, restore_rebased};
 
 #[cfg(test)]
 mod redispatch_tests;
+
+/// The preserved pointer itself is missing, ambiguous, divergent or aimed at
+/// the wrong repository. Retrying cannot repair it, unlike a failed `jj`
+/// invocation (network, SSH, unavailable host), which stays an ordinary error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerIntegrityError(pub String);
+
+impl std::fmt::Display for PointerIntegrityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PointerIntegrityError {}
+
+pub fn pointer_integrity_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(PointerIntegrityError(message.into()))
+}
+
+/// True when `error` (or any cause in its chain) is a pointer-integrity failure.
+pub fn is_pointer_integrity_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<PointerIntegrityError>())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionBookmark {
@@ -130,18 +153,21 @@ async fn resolve_optional(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<Op
         )
         .await?;
     let ids: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
-    ensure!(
-        ids.len() <= 1,
-        "recovery bookmark {bookmark} must resolve to exactly one change; found {}",
-        ids.len()
-    );
+    if ids.len() > 1 {
+        return Err(pointer_integrity_error(format!(
+            "recovery bookmark {bookmark} must resolve to exactly one change; found {}",
+            ids.len()
+        )));
+    }
     Ok(ids.first().map(|id| (*id).to_owned()))
 }
 
 async fn resolve(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<String> {
-    resolve_optional(jj, repo, bookmark)
-        .await?
-        .with_context(|| format!("recovery bookmark {bookmark} must resolve to exactly one change; found 0"))
+    resolve_optional(jj, repo, bookmark).await?.ok_or_else(|| {
+        pointer_integrity_error(format!(
+            "recovery bookmark {bookmark} must resolve to exactly one change; found 0"
+        ))
+    })
 }
 
 async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
@@ -163,11 +189,12 @@ async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String
                 ],
             )
             .await?;
-        ensure!(
-            connected.trim() == head,
-            "preserved execution pointer is not descended from its engine-created baseline {}",
-            record.base()
-        );
+        if connected.trim() != head {
+            return Err(pointer_integrity_error(format!(
+                "preserved execution pointer is not descended from its engine-created baseline {}",
+                record.base()
+            )));
+        }
     }
     match (recovery, publication) {
         (Some(recovery), Some(publication)) if recovery != publication => {
@@ -193,19 +220,19 @@ async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String
                     return Ok(bookmark);
                 }
             }
-            bail!(
+            Err(pointer_integrity_error(format!(
                 "preserved pointers {} and {} diverged; refusing to drop either history",
                 record.head(),
                 record.publication()
-            )
+            )))
         }
         (Some(_), _) => Ok(record.head()),
         (None, Some(_)) => Ok(record.publication()),
-        (None, None) => bail!(
+        (None, None) => Err(pointer_integrity_error(format!(
             "expected recovery pointer {} or {} to resolve to exactly one change; both are missing",
             record.head(),
             record.publication()
-        ),
+        ))),
     }
 }
 

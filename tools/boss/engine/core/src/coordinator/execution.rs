@@ -1503,18 +1503,27 @@ impl ExecutionCoordinator {
         // above — the PR is MERGED by construction, which `--pr` refuses
         // outright). Both must happen before handing the workspace to the
         // worker. If positioning fails, abort dispatch with a diagnosable stage.
-        let recovered = match self.recover_execution_bookmark(execution, &lease, &adapter).await {
+        let recovered = match self
+            .recover_execution_bookmark(execution, &lease, &adapter, pr_for_goto)
+            .await
+        {
             Ok(recovered) => recovered,
             Err(err) => {
                 if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
                     tracing::error!(?release_err, "failed to release lease after bookmark recovery failure");
                 }
-                if matches!(
-                    execution.kind,
-                    ExecutionKind::ChoreImplementation
-                        | ExecutionKind::TaskImplementation
-                        | ExecutionKind::RevisionImplementation
-                ) {
+                // Only a damaged or missing pointer blocks the item: retrying
+                // cannot repair it. Fetch, goto and SSH failures are transient
+                // and keep the ordinary pre-start retry backoff.
+                let pointer_damaged = boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(&err);
+                if pointer_damaged
+                    && matches!(
+                        execution.kind,
+                        ExecutionKind::ChoreImplementation
+                            | ExecutionKind::TaskImplementation
+                            | ExecutionKind::RevisionImplementation
+                    )
+                {
                     self.work_db.update_work_item_as_actor(
                         &execution.work_item_id,
                         boss_protocol::WorkItemPatch::builder()
@@ -1526,15 +1535,23 @@ impl ExecutionCoordinator {
                         "engine",
                     )?;
                 }
+                let attention = if pointer_damaged {
+                    (
+                        crate::execution_bookmark_recovery::RECOVERY_FAILED,
+                        "Execution bookmark recovery failed",
+                    )
+                } else {
+                    (
+                        "cube_workspace_positioning_failed",
+                        "Execution bookmark restore failed (will retry)",
+                    )
+                };
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
                     worker_id,
                     Some(&repo.repo_id),
-                    (
-                        crate::execution_bookmark_recovery::RECOVERY_FAILED,
-                        "Execution bookmark recovery failed",
-                    ),
+                    attention,
                     &err,
                 )?;
                 return Err(err);

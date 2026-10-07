@@ -184,7 +184,7 @@ async fn blocked_recovery_missing_bookmark_fails_loudly() {
             dirty_verified,
         };
         let error = coordinator
-            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter)
+            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains(&prior.id));
@@ -304,6 +304,12 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
             "unpushed revision"
         );
         assert_eq!(db.bookmark_recovery(&next.id).unwrap(), Some((prior.id, true)));
+        let report = db
+            .execution_restore_report(&next.id)
+            .unwrap()
+            .expect("restore report recorded");
+        assert!(report.pointer.contains("pr/99"), "{}", report.pointer);
+        assert!(report.conflicts.is_empty());
         assert_eq!(
             db.execution_bookmark(&next.id).unwrap().head(),
             format!("boss-recovery/{}", next.id)
@@ -317,4 +323,200 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
         assert!(cube.create_calls.lock().await.is_empty());
         assert!(cube.lease_calls.lock().await[0].1.starts_with(&format!("{} ", next.id)));
     }
+}
+
+struct ChainHarness {
+    cube: Arc<FakeCubeClient>,
+    coordinator: Arc<ExecutionCoordinator>,
+    next: WorkExecution,
+    repo: boss_engine_test_git::jj::JjRepo,
+    _dir: tempfile::TempDir,
+}
+
+/// A revision chain whose root task owns the bound PR, with the replacement
+/// execution created through `request_resume_execution` (which never stamps
+/// `pr_url`). `chain_root_pr` / `origin` toggle the failure shapes.
+async fn chain_harness(chain_root_pr: bool, origin: bool, conflict: bool) -> ChainHarness {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_test_git::jj::JjRepo;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let db = Arc::new(WorkDb::open(path.clone()).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let parent = create_test_chore_manual(&db, product.id, "Chain root");
+    if chain_root_pr {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = 'https://github.com/spinyfin/mono/pull/99' WHERE id = ?1",
+                [&parent.id],
+            )
+            .unwrap();
+    }
+    let revision = if chain_root_pr {
+        db.create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(parent.id.clone())
+                .description("Revise")
+                .build(),
+            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+        )
+        .unwrap()
+        .id
+    } else {
+        parent.id.clone()
+    };
+    let prior = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&revision)
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &prior.id,
+        "worker",
+        "mono",
+        "lease-old",
+        "workspace-old",
+        "/tmp/workspace-old",
+    )
+    .unwrap();
+    db.mark_execution_orphaned(&prior.id, "engine crash").unwrap();
+    let next = db.request_resume_execution(&prior.id, 1, 0, "test").unwrap();
+    assert!(next.pr_url.is_none(), "resume executions carry no pr_url");
+
+    let repo = JjRepo::new(dir.path());
+    if origin {
+        super::recovery::configure_recovery_origin(&repo.repo);
+    } else {
+        JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
+    }
+    JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "main"]);
+    let record = create(&LocalJj, &repo.worker, &prior.id, "local").await.unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    let (file, text) = if conflict {
+        ("base.txt", "worker change\n")
+    } else {
+        ("revision.txt", "unpushed revision")
+    };
+    std::fs::write(repo.worker.join(file), text).unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    if conflict {
+        JjRepo::run(&repo.repo, &["new", "main", "-m", "Conflicting main"]);
+        std::fs::write(repo.repo.join("base.txt"), "main change\n").unwrap();
+        JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
+        JjRepo::run(&repo.repo, &["git", "export"]);
+    }
+    let cube = Arc::new(FakeCubeClient {
+        workspace_root: Some(dir.path().to_path_buf()),
+        next_workspace_id: Mutex::new(Some("replacement".into())),
+        real_bookmarks: true,
+        ..FakeCubeClient::default()
+    });
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        runner,
+    ));
+    ChainHarness {
+        cube,
+        coordinator,
+        next,
+        repo,
+        _dir: dir,
+    }
+}
+
+impl ChainHarness {
+    async fn dispatch(&self) -> Result<()> {
+        let worker = self
+            .coordinator
+            .pool_for_execution(&self.next)
+            .claim_worker(&self.next.id, None)
+            .await
+            .unwrap();
+        self.coordinator
+            .schedule_execution(&self.next, &worker, DispatchAdmission::Queued)
+            .await
+            .map(|_| ())
+    }
+}
+
+#[tokio::test]
+async fn resumed_revision_without_pr_url_recovers_using_the_chain_root_pr() {
+    let h = chain_harness(true, true, false).await;
+    h.dispatch().await.unwrap();
+    assert_eq!(h.cube.goto_calls.lock().await.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(h.repo.replacement.join("revision.txt")).unwrap(),
+        "unpushed revision"
+    );
+    let report = h
+        .coordinator
+        .work_db
+        .execution_restore_report(&h.next.id)
+        .unwrap()
+        .expect("report");
+    assert!(report.pointer.contains("pr/99"), "{}", report.pointer);
+    assert!(report.conflicts.is_empty());
+}
+
+#[tokio::test]
+async fn conflicting_revision_restore_reaches_the_database() {
+    let h = chain_harness(true, true, true).await;
+    h.dispatch().await.unwrap();
+    let report = h
+        .coordinator
+        .work_db
+        .execution_restore_report(&h.next.id)
+        .unwrap()
+        .expect("report");
+    assert!(report.conflicts.contains("base.txt"), "{}", report.conflicts);
+    assert!(report.instructions().contains("FIRST TASK"));
+}
+
+#[tokio::test]
+async fn revision_without_any_bound_pr_blocks_the_work_item() {
+    let h = chain_harness(false, true, false).await;
+    let error = h.dispatch().await.unwrap_err();
+    assert!(error.to_string().contains("bound PR"), "{error:#}");
+    assert!(h.cube.goto_calls.lock().await.is_empty());
+    let (WorkItem::Chore(item) | WorkItem::Task(item)) =
+        h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap()
+    else {
+        panic!("expected chore")
+    };
+    assert_eq!(item.status, TaskStatus::Blocked);
+    assert!(!item.autostart);
+}
+
+#[tokio::test]
+async fn transient_fetch_failure_keeps_the_item_retryable() {
+    // No origin remote: `jj git fetch` fails while the pointer is intact.
+    let h = chain_harness(true, false, false).await;
+    let autostart_before = match h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap() {
+        WorkItem::Chore(item) | WorkItem::Task(item) => item.autostart,
+        _ => panic!("expected task"),
+    };
+    h.dispatch().await.unwrap_err();
+    let (WorkItem::Chore(item) | WorkItem::Task(item)) =
+        h.coordinator.work_db.get_work_item(&h.next.work_item_id).unwrap()
+    else {
+        panic!("expected chore")
+    };
+    assert_ne!(item.status, TaskStatus::Blocked, "transient failure must not block");
+    assert_eq!(item.autostart, autostart_before, "autostart must not be cleared");
+    assert_ne!(
+        h.coordinator.work_db.get_execution(&h.next.id).unwrap().status,
+        ExecutionStatus::Failed
+    );
 }

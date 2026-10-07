@@ -183,6 +183,7 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
             &resume,
             &lease_for(&repo.replacement, Some(true)),
             &coordinator.host_adapter,
+            None,
         )
         .await
         .unwrap();
@@ -237,6 +238,7 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
             &resume,
             &lease_for(&repo.replacement, Some(false)),
             &coordinator.host_adapter,
+            None,
         )
         .await
         .unwrap();
@@ -280,7 +282,12 @@ async fn a_failed_bookmark_recovery_is_loud_and_legacy_evidence_is_kept() {
     std::fs::write(&patch, "legacy evidence").unwrap();
     let coordinator = recovery_coordinator(db);
     let error = coordinator
-        .recover_execution_bookmark(&resume, &lease_for(&repo.replacement, None), &coordinator.host_adapter)
+        .recover_execution_bookmark(
+            &resume,
+            &lease_for(&repo.replacement, None),
+            &coordinator.host_adapter,
+            None,
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("exactly one"), "{error:#}");
@@ -301,7 +308,12 @@ async fn bookkeeping_only_work_is_not_reported_as_a_recovery() {
     JjRepo::run(&repo.worker, &["status"]);
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(&resume, &lease_for(&repo.replacement, None), &coordinator.host_adapter)
+        .recover_execution_bookmark(
+            &resume,
+            &lease_for(&repo.replacement, None),
+            &coordinator.host_adapter,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(restored, Some((dead_id, false)));
@@ -321,7 +333,7 @@ async fn recovery_is_a_no_op_for_a_non_resume_dispatch() {
         .unwrap();
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(&fresh, &lease_for(dir.path(), None), &coordinator.host_adapter)
+        .recover_execution_bookmark(&fresh, &lease_for(dir.path(), None), &coordinator.host_adapter, None)
         .await
         .unwrap();
     assert!(restored.is_none());
