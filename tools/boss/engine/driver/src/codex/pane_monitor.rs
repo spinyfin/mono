@@ -137,8 +137,9 @@ mod tests {
         );
     }
 
-    /// Viewport polls captured verbatim from codex-cli 0.160.1 under the
-    /// driver's own spawn line in a 140×45 tmux pane (2026-10-06). The
+    /// Abbreviated excerpts (placeholder paths, trimmed scrollback) of viewport
+    /// polls measured on codex-cli 0.160.1 under the driver's own spawn line
+    /// in a 140×45 tmux pane (2026-10-06); the raw captures are not checked in. The
     /// 0.159/0.160 TUI overhaul changed the welcome screen and the footers;
     /// these pin that the declared markers still classify each state.
     #[test]

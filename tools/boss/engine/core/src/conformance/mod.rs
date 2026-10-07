@@ -78,9 +78,9 @@ fn truthy_env(var: &str) -> bool {
 /// a dev shell that happened to have the right `codex` installed.
 const BOSS_TEST_CODEX_ENV: &str = "BOSS_TEST_CODEX";
 
-/// Whether the live Codex pins must run (a skip is a failure). True when the
-/// operator asks for it (`BOSS_REQUIRE_CODEX_CLI`) and, always, when Bazel
-/// handed us the pinned binary — a checksum-pinned release that is present
+/// Whether the live Codex pins must run (a skip is a failure). True when
+/// `BOSS_REQUIRE_CODEX_CLI` is truthy and, always, when Bazel supplies a
+/// nonempty `BOSS_TEST_CODEX` path — a checksum-pinned release that is present
 /// but silently skipped would defeat the pin.
 fn require_codex_cli() -> bool {
     truthy_env("BOSS_REQUIRE_CODEX_CLI") || std::env::var_os(BOSS_TEST_CODEX_ENV).is_some_and(|v| !v.is_empty())

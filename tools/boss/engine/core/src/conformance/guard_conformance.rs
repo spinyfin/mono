@@ -106,10 +106,10 @@ use std::time::{Duration, Instant};
 
 use boss_protocol::{EffortLevel, ReasoningMode};
 
-use crate::conformance::{codex_cli_binary, require_codex_cli, which};
+use crate::conformance::{codex_cli_binary, require_codex_cli};
 use crate::driver::codex::CODEX_AUTH_SOURCE_ENV;
 use crate::driver::codex::guard_trace::{GuardTraceRecord, ToolInputKeys, guard_trace_path, read_records_from};
-use crate::driver::test_support::codex_auth_source_override;
+use crate::driver::test_support::codex_auth_source_and_path_override;
 use crate::driver::{AgentDriver, CodexDriver, PermissionInput, SpawnRequest, WorkerKind, apply_permission_extra_args};
 
 /// Every model [`CodexDriver`] actually dispatches, sourced from the driver's
@@ -484,8 +484,11 @@ fn codex_guard_conformance_against_live_dispatched_models() {
         return;
     }
 
-    let codex_bin = which("codex").unwrap_or_else(|| {
-        panic!("BOSS_CODEX_GUARD_LIVE_PROBE=1 but `codex` is not on PATH; install it or unset the var to skip.")
+    let codex_bin = codex_cli_binary().unwrap_or_else(|| {
+        panic!(
+            "BOSS_CODEX_GUARD_LIVE_PROBE=1 but no Codex CLI was found: BOSS_TEST_CODEX is unset \
+             and `codex` is not on PATH; install it or unset the var to skip."
+        )
     });
     let auth_source = resolve_probe_auth_source().unwrap_or_else(|| {
         panic!(
@@ -514,8 +517,23 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
     std::fs::create_dir_all(&data_dir).expect("create data dir");
 
     // Isolate CODEX_HOME under this run's tempdir — never the interactive
-    // ~/.codex — and point the auth snapshot at the resolved credential.
-    let _auth = codex_auth_source_override(&homes_root, auth_source);
+    // ~/.codex — and point the auth snapshot at a private copy of the resolved
+    // credential. The snapshot takes a `<source>.boss-lock` sibling lock and may
+    // adopt a refreshed token back into its source, so the source must live
+    // somewhere writable (Bazel's hermetic sandbox denies writes beside a
+    // credential outside the test tmpdir) and a refresh must never rewrite the
+    // caller's real `auth.json`.
+    let private_auth_dir = tmp.path().join("auth-source");
+    std::fs::create_dir_all(&private_auth_dir).expect("create private auth dir");
+    let private_auth = private_auth_dir.join("auth.json");
+    std::fs::copy(auth_source, &private_auth).expect("copy auth source into the probe tempdir");
+    // The hook-trust gate resolves `codex` from PATH, which Bazel's hermetic
+    // wrapper replaces, so expose the exact binary under test as `codex` on a
+    // private PATH entry.
+    let codex_bin_dir = tmp.path().join("codex-bin");
+    std::fs::create_dir_all(&codex_bin_dir).expect("create codex bin dir");
+    std::os::unix::fs::symlink(codex_bin, codex_bin_dir.join("codex")).expect("link pinned codex");
+    let _auth = codex_auth_source_and_path_override(&homes_root, &private_auth, &codex_bin_dir);
 
     // Arm the real path guard rather than leaving it unset: a local Standard
     // worker in production defaults to the data-dir sandbox enabled, which
@@ -536,7 +554,7 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
         driver
             .provision_workspace(&workspace, PROBE_PROMPT, &run_id)
             .await
-            .unwrap_or_else(|err| panic!("provision_workspace for {model}: {err}"));
+            .unwrap_or_else(|err| panic!("provision_workspace for {model}: {err:#}"));
 
         let codex_home = crate::driver::codex::codex_home_for_run(&run_id)
             .unwrap_or_else(|err| panic!("codex_home_for_run for {model}: {err}"));
@@ -570,6 +588,15 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
             run_id: Some(&run_id),
         });
         let command = apply_permission_extra_args(&plan.command, &artifacts.extra_args);
+        // The driver's production command is the interactive TUI, which needs a
+        // terminal; this harness drives the same model, hooks and config
+        // headlessly through `codex exec`, whose hook and guard behaviour is the
+        // surface under test.
+        let command = command.replacen(
+            "codex --strict-config --no-alt-screen -a never",
+            "codex --strict-config -a never exec --skip-git-repo-check",
+            1,
+        );
         (codex_home, command)
     });
 
