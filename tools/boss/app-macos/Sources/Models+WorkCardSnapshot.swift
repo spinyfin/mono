@@ -76,7 +76,7 @@ struct WorkCardSnapshotContext: Equatable {
     var parentShortID: Int? = nil
     var deferredScopeItems: [DeferredScopeAttention] = []
     var deferredScopeActionInFlightIDs: Set<String> = []
-    /// An answer to this card's operator question is awaiting the engine's
+    /// An answer to this card's open question is awaiting the engine's
     /// reply (`ChatViewModel.operatorAnswerInFlightByTaskID`).
     var operatorAnswerInFlight: Bool = false
     /// Why the last answer attempt was refused, if it was.
@@ -160,7 +160,7 @@ struct WorkCardSnapshot: Equatable {
     let deferredScopeItems: [DeferredScopeAttention]
     let deferredScopeActionInFlightIDs: Set<String>
     /// The inline question + Yes/No block. Non-nil only for a Doing card whose
-    /// task is awaiting an operator answer (`WorkTask.isAwaitingOperatorAnswer`).
+    /// task is waiting on a Yes/No answer (`WorkTask.isAwaitingOperatorAnswer`).
     let operatorQuestion: OperatorQuestionPresentation?
     /// Card fill / border / shadow chrome (see `KanbanBoardStyle`).
     let boardStyle: KanbanBoardStyle
