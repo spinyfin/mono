@@ -80,6 +80,27 @@ pub async fn restore_rebased(
             &["rebase", "-r", &unpublished, "-d", pr, "--ignore-immutable"],
         )
         .await?;
+        // A transplant can leave the old published baseline, and pointers at
+        // that baseline, outside the restored ancestry. Retain all restored
+        // work and use the new PR head as its baseline for successor recovery.
+        jj.run(
+            workspace,
+            &[
+                "bookmark",
+                "set",
+                &record.head(),
+                &record.publication(),
+                "-r",
+                "@",
+                "--allow-backwards",
+            ],
+        )
+        .await?;
+        jj.run(
+            workspace,
+            &["bookmark", "set", &record.base(), "-r", pr, "--allow-backwards"],
+        )
+        .await?;
     }
     // Like cube workspace rebase, published PR commits must be rewritable.
     // The selected range excludes current main; no immutable main commit moves.

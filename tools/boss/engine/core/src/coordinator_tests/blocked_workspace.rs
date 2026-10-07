@@ -485,6 +485,58 @@ async fn conflicting_revision_restore_reaches_the_database() {
 }
 
 #[tokio::test]
+async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery() {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, diff};
+    use boss_engine_test_git::jj::JjRepo;
+    let mut h = chain_harness(true, true, false).await;
+    let db = h.coordinator.work_db.clone();
+    let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
+    let record = db.execution_bookmark(&prior.id).unwrap();
+    JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Old published PR"]);
+    std::fs::write(h.repo.repo.join("stale-pr"), "old published").unwrap();
+    JjRepo::run(&h.repo.repo, &["bookmark", "set", "pr/99", &record.base(), "-r", "@"]);
+    JjRepo::run(&h.repo.worker, &["rebase", "-r", "@", "-d", "pr/99"]);
+    JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Rewritten PR"]);
+    std::fs::write(h.repo.repo.join("rewritten-pr"), "force pushed").unwrap();
+    JjRepo::run(
+        &h.repo.repo,
+        &["bookmark", "set", "pr/99", "-r", "@", "--allow-backwards"],
+    );
+
+    h.dispatch().await.unwrap();
+    let successor = db.execution_bookmark(&h.next.id).unwrap();
+    assert!(diff(&LocalJj, &successor).await.unwrap().contains("unpushed revision"));
+    assert!(!h.repo.replacement.join("stale-pr").exists());
+    std::fs::write(h.repo.replacement.join("successor-fix"), "successor work").unwrap();
+    JjRepo::run(&h.repo.replacement, &["status"]);
+
+    db.mark_execution_orphaned(&h.next.id, "second crash").unwrap();
+    h.next = db.request_resume_execution(&h.next.id, 1, 0, "test").unwrap();
+    *h.cube.next_workspace_id.lock().await = Some("replacement".into());
+    // A fresh coordinator models the restart and gives dispatch a fresh pool.
+    h.coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        h.cube.clone(),
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        }),
+    ));
+    h.dispatch().await.unwrap();
+    let patch = diff(&LocalJj, &db.execution_bookmark(&h.next.id).unwrap())
+        .await
+        .unwrap();
+    assert!(patch.contains("unpushed revision") && patch.contains("successor work"));
+    assert_eq!(
+        db.bookmark_recovery(&h.next.id).unwrap(),
+        Some((successor.execution_id, true))
+    );
+    assert!(h.repo.replacement.join("rewritten-pr").exists());
+    assert!(!h.repo.replacement.join("stale-pr").exists());
+}
+
+#[tokio::test]
 async fn revision_without_any_bound_pr_blocks_the_work_item() {
     let h = chain_harness(false, true, false).await;
     let error = h.dispatch().await.unwrap_err();

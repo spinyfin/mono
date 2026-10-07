@@ -1541,10 +1541,7 @@ impl ExecutionCoordinator {
                         "Execution bookmark recovery failed",
                     )
                 } else {
-                    (
-                        "cube_workspace_positioning_failed",
-                        "Execution bookmark restore failed (will retry)",
-                    )
+                    ("cube_workspace_positioning_failed", "Execution bookmark restore failed")
                 };
                 self.record_start_failure(
                     Arc::clone(self),

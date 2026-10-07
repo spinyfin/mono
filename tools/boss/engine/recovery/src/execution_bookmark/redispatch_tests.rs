@@ -180,6 +180,19 @@ async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
     JjRepo::run(&repo.worker, &["bookmark", "set", "pr/78", "-r", "@"]);
     JjRepo::run(&repo.worker, &["new", "-m", "Unpushed revision"]);
     let prior = create(&LocalJj, &repo.worker, "exec_rewritten", "local").await.unwrap();
+    // The publication pointer may still be at the old PR baseline while
+    // recovery has advanced to unpublished work.
+    JjRepo::run(
+        &repo.worker,
+        &[
+            "bookmark",
+            "set",
+            &prior.publication(),
+            "-r",
+            &prior.base(),
+            "--allow-backwards",
+        ],
+    );
     std::fs::write(repo.worker.join("local-fix"), "preserved").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
     // The PR branch is force-pushed to a sibling of the old published commit.
@@ -189,12 +202,30 @@ async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
         &repo.repo,
         &["bookmark", "set", "pr/78", "--allow-backwards", "-r", "@"],
     );
+    JjRepo::run(&repo.repo, &["new", "main", "-m", "Main advances"]);
+    std::fs::write(repo.repo.join("toolchain"), "updated").unwrap();
+    publish_main(&repo);
     let report = restore_rebased(&LocalJj, &prior, &repo.replacement, Some("pr/78"))
         .await
         .unwrap();
     assert!(report.conflicts.is_empty());
-    for file in ["rewritten-pr", "local-fix"] {
+    for file in ["rewritten-pr", "local-fix", "toolchain"] {
         assert!(repo.replacement.join(file).exists(), "{file}");
     }
+    assert!(!repo.replacement.join("stale-pr").exists());
+    let prior_patch = diff(&LocalJj, &prior).await.unwrap();
+    assert!(prior_patch.contains("preserved"));
+    assert!(!prior_patch.contains("old published"));
+    let next = create_from(&LocalJj, &repo.replacement, "exec_successor", "local", Some(&prior))
+        .await
+        .unwrap();
+    std::fs::write(repo.replacement.join("successor-fix"), "successor work").unwrap();
+    JjRepo::run(&repo.replacement, &["status"]);
+    let patch = diff(&LocalJj, &next).await.unwrap();
+    assert!(patch.contains("preserved") && patch.contains("successor work"));
+    restore_rebased(&LocalJj, &next, &repo.replacement, Some("pr/78"))
+        .await
+        .unwrap();
+    assert!(diff(&LocalJj, &next).await.unwrap().contains("successor work"));
     assert!(!repo.replacement.join("stale-pr").exists());
 }
