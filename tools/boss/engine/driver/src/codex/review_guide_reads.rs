@@ -79,6 +79,23 @@ def guide_shell_read(payload):
         if args and args[0] == '-n':
             args = args[1:]
         return bool(args) and all(guide_path(p, cwd) for p in args)
+    if prog == 'nl':
+        # Only explicit numbering options; never treat unknown options as paths.
+        options = {'-b': '[atn]', '-h': '[atn]', '-f': '[atn]', '-n': '(?:ln|rn|rz)', '-i': '[0-9]+', '-v': '[0-9]+', '-w': '[0-9]+'}
+        while args and args[0].startswith('-'):
+            flag = args[0]
+            args = args[1:]
+            if flag == '-p':
+                continue
+            pattern = options.get(flag[:2])
+            value = flag[2:]
+            if not value and args:
+                value, args = args[0], args[1:]
+            if pattern is None or not re.fullmatch(pattern, value):
+                return False
+        return bool(args) and all(guide_path(p, cwd) for p in args)
+    if prog == 'wc':
+        return len(args) >= 2 and args[0] == '-l' and all(guide_path(p, cwd) for p in args[1:])
     if prog in ('head', 'tail'):
         if len(args) >= 2 and args[0] == '-n' and args[1].isdigit():
             args = args[2:]

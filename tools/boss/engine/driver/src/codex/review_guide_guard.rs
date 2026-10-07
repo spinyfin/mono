@@ -14,6 +14,8 @@ pub fn review_guide_allow_rules() -> Vec<String> {
         "Bash(git diff --no-ext-diff --no-textconv:*)".to_owned(),
         "Bash(git --no-pager diff --no-ext-diff --no-textconv:*)".to_owned(),
         "Bash(cat:*)".to_owned(),
+        "Bash(nl:*)".to_owned(),
+        "Bash(wc -l:*)".to_owned(),
         "Bash(rg:*)".to_owned(),
         "Bash(head:*)".to_owned(),
         "Bash(tail:*)".to_owned(),
@@ -146,6 +148,9 @@ mod tests {
         assert!(!allow.contains(&"Bash(sed:*)".into()));
         assert!(allow.contains(&"Bash(git show:*)".into()));
         assert!(allow.contains(&"Bash(sed -n:*)".into()));
+        assert!(allow.contains(&"Bash(nl:*)".into()));
+        assert!(allow.contains(&"Bash(wc -l:*)".into()));
+        assert!(!allow.contains(&"Bash(wc:*)".into()));
         let deny = review_guide_deny_rules();
         for command in [
             "git fetch",
@@ -302,6 +307,46 @@ mod tests {
                 expected,
                 "{tool}"
             );
+        }
+    }
+
+    #[test]
+    fn numbering_and_line_counts_require_literal_source_paths() {
+        for command in ["nl", "nl -ba", "nl -b a -h n -ft -n rz -w6 -v 1 -i2 -p", "wc -l"] {
+            for (paths, expected) in [
+                ("src/a.rs", "approve"),
+                ("/repo/src/a.rs", "approve"),
+                ("src/a.rs src/b.rs", "approve"),
+                ("'/repo/src/a file.rs'", "approve"),
+                ("/etc/passwd", "block"),
+                ("../secret", "block"),
+                ("src/a.rs /etc/passwd", "block"),
+                (".git/config", "block"),
+                ("$FILE", "block"),
+                ("$(cat src/a.rs)", "block"),
+                ("src/*", "block"),
+                ("src/a.rs | cat", "block"),
+                ("src/a.rs > src/b.rs", "block"),
+                ("", "block"),
+                ("-", "block"),
+            ] {
+                let command = format!("{command} {paths}");
+                let payload = serde_json::json!({"tool_name":"Bash", "cwd":"/repo", "tool_input":{"command":command}});
+                assert_eq!(decide_with_source(payload.clone(), true).0, expected, "{command}");
+                assert_eq!(decide(payload).0, "block", "no pinned workspace: {command}");
+            }
+        }
+        for command in [
+            "wc src/a.rs",
+            "wc -c src/a.rs",
+            "wc -lw src/a.rs",
+            "wc -l --files0-from=src/a.rs",
+            "nl --unknown src/a.rs",
+            "nl -b src/a.rs",
+            "nl -w nope src/a.rs",
+        ] {
+            let payload = serde_json::json!({"tool_name":"Bash", "cwd":"/repo", "tool_input":{"command":command}});
+            assert_eq!(decide_with_source(payload, true).0, "block", "{command}");
         }
     }
 
