@@ -32,11 +32,14 @@ use boss_protocol::{EffortLevel, ReasoningMode};
 /// re-running the investigation harness and updating fixtures.
 ///
 /// Stream fixtures (`CODEX_STDOUT_SESSION_JSONL`) were originally captured
-/// on 0.145.0. Re-verified live against 0.153.4 (2026-09-08):
-/// `thread.started` / `turn.started` / `item.completed` still fire, item
-/// ids still use [`PINNED_CODEX_ITEM_ID_BASE`], and `error` items still
-/// carry operational warnings. The checked-in JSONL is unchanged because
-/// those invariants still hold.
+/// on 0.145.0. Re-verified live against 0.153.4 (2026-09-08) and 0.160.1
+/// (2026-10-06, one real `codex exec --json` turn): `thread.started` /
+/// `turn.started` / `item.started` / `item.completed` / `turn.completed`
+/// still fire, item ids still use [`PINNED_CODEX_ITEM_ID_BASE`] (`item_0`,
+/// `item_1`, …), `turn.completed.usage` still carries every pinned field
+/// including `cache_write_input_tokens`, and `error` items still carry
+/// operational warnings. The checked-in JSONL is unchanged because those
+/// invariants still hold.
 pub const PINNED_CODEX_CLI_VERSION: &str = env!("CODEX_CLI_VERSION");
 
 /// Item-id base observed on the pinned Codex CLI.
@@ -44,8 +47,8 @@ pub const PINNED_CODEX_CLI_VERSION: &str = env!("CODEX_CLI_VERSION");
 /// On 0.137.0 item ids were 1-based (`item_1`, `item_2`, …). On 0.145.0 the
 /// investigation still saw `item_2`/`item_3` mid-turn (ids are opaque tokens
 /// with a numeric suffix, not a dense 0-based counter starting at the first
-/// envelope). Re-verified on 0.153.4: a live turn still emits `item_0`
-/// (same prefix). The harness pins the *prefix form* `item_<n>` and the
+/// envelope). Re-verified on 0.153.4 and 0.160.1: a live turn still emits
+/// `item_0` (same prefix). The harness pins the *prefix form* `item_<n>` and the
 /// concrete ids present in the fixtures; a base change that renumbers those
 /// ids must break the pin, not be absorbed.
 pub const PINNED_CODEX_ITEM_ID_BASE: &str = "item_";
@@ -258,11 +261,18 @@ pub fn normalize_session_start_source(mut event: WorkerEvent) -> WorkerEvent {
 /// `-a never` pins the approval policy so a long-lived interactive session
 /// never blocks on a human approval prompt Boss cannot answer — Boss's own
 /// `--sandbox` policy is the real authorization boundary.
+///
+/// `--strict-config` additionally pins the session to embedded mode on
+/// codex-cli ≥ 0.157, where the TUI otherwise attaches to (and auto-starts)
+/// a shared background app-server daemon — measured on 0.160.1, see
+/// `CodexDriver::build_codex_command`. Dropping it would change process
+/// lifetime, not just config strictness.
 pub const CODEX_REQUIRED_FLAGS: &[&str] = &["--strict-config", "--no-alt-screen", "-a never"];
 
 /// Long-form flags that must never appear on a Codex spawn line — each is a
 /// hard argument error on the bare TUI, measured against `codex-cli
-/// 0.145.0` in the pivot spike.
+/// 0.145.0` in the pivot spike and re-measured on 0.153.4 and 0.160.1
+/// (2026-10-06: `error: unexpected argument` for all three on both).
 ///
 /// `--color` and `--skip-git-repo-check` were required on the retired
 /// `codex exec` shape; both are rejected outright by the TUI.

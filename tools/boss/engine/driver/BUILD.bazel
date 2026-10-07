@@ -114,4 +114,6 @@ filegroup(
         ":x86_64_linux": ["@codex_test_x86_64_linux//:codex"],
         ":aarch64_linux": ["@codex_test_aarch64_linux//:codex"],
     }),
+    # engine/core's conformance live pins run against the same pinned release.
+    visibility = ["//tools/boss/engine/core:__pkg__"],
 )

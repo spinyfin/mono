@@ -212,6 +212,10 @@ rust_test(
     timeout = "moderate",
     crate = ":engine_lib",
     data = [
+        # The checksum-pinned Codex release (codex_test_archives.bzl) that the
+        # conformance live pins (version_pin, guard_conformance) exercise; the
+        # hermetic wrapper strips PATH, so without it they could only skip.
+        "//tools/boss/engine/driver:codex_test_binary",
         "//tools/repobin",
         "@jj_test_tools//:jj",
     ],
@@ -219,6 +223,7 @@ rust_test(
     env = {
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
         "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "BOSS_TEST_CODEX": "$(rootpath //tools/boss/engine/driver:codex_test_binary)",
         "BOSS_TEST_REPOBIN": "$(rootpath //tools/repobin)",
         "HOME": "/tmp",
     },

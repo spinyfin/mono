@@ -32,6 +32,12 @@
 //! `.*` `PreToolUse` guard that printed the payload and running one real
 //! `codex exec` turn. Evidence:
 //! `tools/boss/docs/investigations/codex-pretooluse-decision-vocabulary-2026-07-30.md`.
+//! Re-verified on `codex-cli 0.160.1` (2026-10-06): the shipping binary still
+//! carries every rejection string in `BINARY_REJECTION_STRINGS`, and a live
+//! TUI turn rendered a guard's `{"decision":"block","reason":"…"}` as
+//! `• Blocked by hook` with the reason beneath it, the call never ran, and the
+//! model reported the refusal — see
+//! `tools/boss/docs/investigations/codex-0.160.1-qualification-2026-10-06.md`.
 //!
 //! | guard stdout                                                        | Codex     | tool call |
 //! | ------------------------------------------------------------------- | --------- | --------- |

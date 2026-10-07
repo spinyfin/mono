@@ -70,8 +70,33 @@ fn truthy_env(var: &str) -> bool {
     }
 }
 
+/// Bazel-supplied pinned Codex release binary (`engine_lib_test`'s
+/// `BOSS_TEST_CODEX`, the same channel the driver's
+/// `config_compatibility_tests` use). The hermetic test wrapper strips
+/// `PATH`, so without this channel every live Codex pin below would
+/// soft-skip under `bazel test` and the pin would only ever be exercised on
+/// a dev shell that happened to have the right `codex` installed.
+const BOSS_TEST_CODEX_ENV: &str = "BOSS_TEST_CODEX";
+
+/// Whether the live Codex pins must run (a skip is a failure). True when the
+/// operator asks for it (`BOSS_REQUIRE_CODEX_CLI`) and, always, when Bazel
+/// handed us the pinned binary — a checksum-pinned release that is present
+/// but silently skipped would defeat the pin.
 fn require_codex_cli() -> bool {
-    truthy_env("BOSS_REQUIRE_CODEX_CLI")
+    truthy_env("BOSS_REQUIRE_CODEX_CLI") || std::env::var_os(BOSS_TEST_CODEX_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// Resolve the Codex CLI the live pins exercise: the Bazel-supplied pinned
+/// release (`BOSS_TEST_CODEX`, canonicalised so the runfiles-relative path
+/// survives a `current_dir` change) first, else whatever `codex` is on
+/// `PATH`. `None` is the caller's soft-skip case — never reached under Bazel,
+/// where the variable is always set.
+fn codex_cli_binary() -> Option<std::path::PathBuf> {
+    if let Some(raw) = std::env::var_os(BOSS_TEST_CODEX_ENV).filter(|v| !v.is_empty()) {
+        let path = std::path::PathBuf::from(raw);
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    which("codex")
 }
 
 fn require_grok_cli() -> bool {

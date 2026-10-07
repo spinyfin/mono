@@ -12,11 +12,18 @@ Bump procedure:
 2. Update the sha256 for each platform entry in codex_test_archives.bzl to the
    new release's published checksums.
 3. Re-run the driver's config_compatibility_tests and engine/core's
-   conformance version_pin test against the new binary; update fixtures if
+   conformance tests (version_pin, guard_conformance) against the new binary;
+   both targets receive the pinned release through `BOSS_TEST_CODEX`, so a
+   plain `bazel test //tools/boss/engine/driver:driver_test
+   //tools/boss/engine/core:engine_lib_test` exercises it. Update fixtures if
    behavior changed.
+4. Drive the bare TUI live (the driver screen-scrapes it) and re-measure the
+   pane-monitor markers, the interrupt path and the hook block path; see
+   tools/boss/docs/investigations/codex-0.160.1-qualification-2026-10-06.md
+   for the harness and the checklist.
 Do not bump only one consumer — a version pin that isn't reflected everywhere
 silently reintroduces the test/production divergence this pin exists to
 prevent.
 """
 
-CODEX_CLI_VERSION = "0.153.4"
+CODEX_CLI_VERSION = "0.160.1"

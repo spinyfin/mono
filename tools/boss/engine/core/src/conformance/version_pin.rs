@@ -27,7 +27,7 @@ use crate::conformance::fixtures::{
     CODEX_STDOUT_SESSION_JSONL, PINNED_CODEX_CLI_VERSION, PINNED_CODEX_ITEM_ID_BASE, assert_codex_spawn_contract,
     codex_shaped_driver, decode_jsonl,
 };
-use crate::conformance::{require_codex_cli, require_grok_cli, which};
+use crate::conformance::{codex_cli_binary, require_codex_cli, require_grok_cli};
 use crate::driver::{AgentDriver, GrokDriver};
 
 /// Parse `codex-cli X.Y.Z` (or `codex X.Y.Z`) stdout from `codex --version`.
@@ -54,11 +54,19 @@ fn pinned_version_constant_is_semver_shaped() {
 
 #[test]
 fn installed_codex_matches_pinned_version_when_present() {
-    // Soft skip when `codex` is absent (CI images without the CLI); fixture-side
-    // pins below still defend the stream contract. Set BOSS_REQUIRE_CODEX_CLI=1
-    // to require the binary and fail instead of skipping.
+    // Under Bazel the checksum-pinned release binary arrives via
+    // `BOSS_TEST_CODEX` and this check is required; on a dev shell without it,
+    // soft skip when `codex` is absent (fixture-side pins below still defend
+    // the stream contract) unless BOSS_REQUIRE_CODEX_CLI=1 asks for a failure.
     let require = require_codex_cli();
-    let output = match Command::new("codex").arg("--version").output() {
+    let Some(codex_bin) = codex_cli_binary() else {
+        if require {
+            panic!("BOSS_REQUIRE_CODEX_CLI is set but codex is not on PATH");
+        }
+        eprintln!("codex not on PATH; skipping live version check (set BOSS_REQUIRE_CODEX_CLI=1 to require it)");
+        return;
+    };
+    let output = match Command::new(&codex_bin).arg("--version").output() {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             if require {
@@ -217,13 +225,12 @@ fn codex_spawn_satisfies_shared_flag_contract() {
 /// exclusive, distinguishable outcomes — never a race.
 #[test]
 fn generated_config_toml_loads_under_strict_config_on_pinned_codex() {
-    use std::io::Read;
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     let require = require_codex_cli();
-    let Some(codex_bin) = which("codex") else {
+    let Some(codex_bin) = codex_cli_binary() else {
         if require {
             panic!("BOSS_REQUIRE_CODEX_CLI is set but codex is not on PATH");
         }
@@ -270,42 +277,90 @@ fn generated_config_toml_loads_under_strict_config_on_pinned_codex() {
         .spawn()
         .expect("spawn codex exec");
 
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    // Both pipes are streamed line by line through one channel so the wait
+    // below can stop the moment either verdict appears, instead of holding
+    // the process for a fixed wall-clock budget and reading everything
+    // afterwards. The deadline is therefore only a hang bound: under
+    // `bazel test` this probe shares the host with every other shard, and a
+    // cold start of a 240 MB binary on a loaded machine took well over the
+    // 5 s that an idle dev shell needs, which produced an empty stdout and a
+    // false "never reached thread.started" — not a config-load failure.
+    enum Line {
+        Stdout(String),
+        Stderr(String),
+    }
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<Line>();
+    let stdout_pipe = child.stdout.take().expect("stdout piped");
+    let stderr_pipe = child.stderr.take().expect("stderr piped");
+    let stdout_tx = line_tx.clone();
     let stdout_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout_pipe).lines().map_while(Result::ok) {
+            if stdout_tx.send(Line::Stdout(line)).is_err() {
+                break;
+            }
+        }
     });
     let stderr_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr_pipe).lines().map_while(Result::ok) {
+            if line_tx.send(Line::Stderr(line)).is_err() {
+                break;
+            }
+        }
     });
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    const CONFIG_LOAD_ERRORS: [&str; 2] = ["Error loading config.toml", "unknown configuration field"];
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
+        match line_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(Line::Stdout(line)) => {
+                stdout.push_str(&line);
+                stdout.push('\n');
             }
-            Err(err) => panic!("waiting on codex exec: {err}"),
+            Ok(Line::Stderr(line)) => {
+                stderr.push_str(&line);
+                stderr.push('\n');
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        let decided = stdout.contains("\"thread.started\"")
+            || CONFIG_LOAD_ERRORS
+                .iter()
+                .any(|needle| stdout.contains(needle) || stderr.contains(needle));
+        if decided || Instant::now() >= deadline {
+            break;
+        }
+        if let Ok(Some(_status)) = child.try_wait() {
+            // Exited on its own (the bad-config case): drain what is left.
+            while let Ok(line) = line_rx.recv_timeout(Duration::from_millis(200)) {
+                match line {
+                    Line::Stdout(line) => {
+                        stdout.push_str(&line);
+                        stdout.push('\n');
+                    }
+                    Line::Stderr(line) => {
+                        stderr.push_str(&line);
+                        stderr.push('\n');
+                    }
+                }
+            }
+            break;
         }
     }
     // Best-effort: process may have already exited (bad-config case).
     let _ = child.kill();
     let _ = child.wait();
-
-    let stdout = String::from_utf8_lossy(&stdout_reader.join().expect("join stdout reader")).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr_reader.join().expect("join stderr reader")).into_owned();
+    drop(line_rx);
+    stdout_reader.join().expect("join stdout reader");
+    stderr_reader.join().expect("join stderr reader");
     let combined = format!("{stdout}\n{stderr}");
 
     assert!(
-        !combined.contains("Error loading config.toml") && !combined.contains("unknown configuration field"),
+        !CONFIG_LOAD_ERRORS.iter().any(|needle| combined.contains(needle)),
         "generated config.toml must load under --strict-config on pinned codex \
          {PINNED_CODEX_CLI_VERSION}; got stdout={stdout:?} stderr={stderr:?}",
     );

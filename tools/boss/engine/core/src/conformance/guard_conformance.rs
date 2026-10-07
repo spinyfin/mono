@@ -106,7 +106,7 @@ use std::time::{Duration, Instant};
 
 use boss_protocol::{EffortLevel, ReasoningMode};
 
-use crate::conformance::{require_codex_cli, which};
+use crate::conformance::{codex_cli_binary, require_codex_cli, which};
 use crate::driver::codex::CODEX_AUTH_SOURCE_ENV;
 use crate::driver::codex::guard_trace::{GuardTraceRecord, ToolInputKeys, guard_trace_path, read_records_from};
 use crate::driver::test_support::codex_auth_source_override;
@@ -141,8 +141,8 @@ fn dispatched_codex_models() -> Vec<&'static str> {
 /// `tool_mode` values covered by the live guard harness
 /// ([`codex_guard_conformance_against_live_dispatched_models`]).
 /// `gpt-6-astra` reports `code_mode_only` via `codex
-/// debug models` (`PINNED_CODEX_CLI_VERSION` / 0.153.4, 2026-09-08), a
-/// covered mode. A dispatched model
+/// debug models` (`PINNED_CODEX_CLI_VERSION` / 0.153.4, 2026-09-08; re-captured
+/// unchanged on 0.160.1, 2026-10-06), a covered mode. A dispatched model
 /// reporting anything else (including no `tool_mode` at all, the `gpt-5.5`
 /// shape the original design doc evidence came from) means this harness has
 /// never verified that model's tool surface and must not be trusted for it.
@@ -151,7 +151,8 @@ const COVERED_TOOL_MODES: &[&str] = &["code_mode", "code_mode_only"];
 /// Checked-in `codex debug models` `(slug, tool_mode)` capture — the fixture
 /// that makes [`codex_dispatched_models_have_covered_tool_mode`] hermetic.
 /// Captured from `codex debug models` on `PINNED_CODEX_CLI_VERSION`
-/// (codex-cli 0.153.4) on 2026-09-08: `gpt-6-astra` reports `code_mode_only`.
+/// (codex-cli 0.153.4) on 2026-09-08 and re-captured on codex-cli 0.160.1 on
+/// 2026-10-06: `gpt-6-astra` reports `code_mode_only` on both.
 /// This table lists the currently selected Codex models and excludes
 /// catalog-only models such as terra and luna.
 /// Re-capture via a live `codex debug models` run and
@@ -202,7 +203,16 @@ fn codex_dispatched_models_have_covered_tool_mode() {
 #[test]
 fn captured_tool_mode_table_matches_installed_codex_cli() {
     let require = require_codex_cli();
-    let output = match Command::new("codex").args(["debug", "models"]).output() {
+    let Some(codex_bin) = codex_cli_binary() else {
+        if require {
+            panic!("BOSS_REQUIRE_CODEX_CLI is set but codex is not on PATH");
+        }
+        eprintln!(
+            "codex not on PATH; skipping the captured-table freshness check (set BOSS_REQUIRE_CODEX_CLI=1 to require it)"
+        );
+        return;
+    };
+    let output = match Command::new(&codex_bin).args(["debug", "models"]).output() {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             if require {
