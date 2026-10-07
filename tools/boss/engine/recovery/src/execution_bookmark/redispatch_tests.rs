@@ -49,6 +49,8 @@ async fn chore_restores_all_commits_on_fetched_main_and_reports_provenance() {
     }
     assert!(report.instructions().contains(&main));
     assert!(report.instructions().contains(&prior.head()));
+    assert!(!report.instructions().contains("--allow-backwards"));
+    assert!(report.instructions().contains("earlier validation does not satisfy"));
     let next = create_from(
         &LocalJj,
         &repo.replacement,
@@ -89,6 +91,7 @@ async fn revision_preserves_unpushed_fixes_on_top_of_newer_bound_pr_head() {
         .await
         .unwrap();
     assert_eq!(report.base_sha, main);
+    assert!(report.instructions().contains("--allow-backwards"));
     assert!(report.commits.contains("Unpushed revision"));
     assert!(report.commits.contains("New PR commit"));
     for file in ["pr", "local-fix", "remote-fix", "toolchain"] {

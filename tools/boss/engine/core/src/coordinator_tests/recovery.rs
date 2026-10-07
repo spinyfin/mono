@@ -183,6 +183,7 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
             &resume,
             &lease_for(&repo.replacement, Some(true)),
             &coordinator.host_adapter,
+            "mono",
             None,
         )
         .await
@@ -238,6 +239,7 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
             &resume,
             &lease_for(&repo.replacement, Some(false)),
             &coordinator.host_adapter,
+            "mono",
             None,
         )
         .await
@@ -286,6 +288,7 @@ async fn a_failed_bookmark_recovery_is_loud_and_legacy_evidence_is_kept() {
             &resume,
             &lease_for(&repo.replacement, None),
             &coordinator.host_adapter,
+            "mono",
             None,
         )
         .await
@@ -312,6 +315,7 @@ async fn bookkeeping_only_work_is_not_reported_as_a_recovery() {
             &resume,
             &lease_for(&repo.replacement, None),
             &coordinator.host_adapter,
+            "mono",
             None,
         )
         .await
@@ -333,7 +337,13 @@ async fn recovery_is_a_no_op_for_a_non_resume_dispatch() {
         .unwrap();
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(&fresh, &lease_for(dir.path(), None), &coordinator.host_adapter, None)
+        .recover_execution_bookmark(
+            &fresh,
+            &lease_for(dir.path(), None),
+            &coordinator.host_adapter,
+            "mono",
+            None,
+        )
         .await
         .unwrap();
     assert!(restored.is_none());

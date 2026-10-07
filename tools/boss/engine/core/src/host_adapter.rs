@@ -102,6 +102,12 @@ fn remote_driver_config_paths(
     (directory, prompt, gitignore)
 }
 
+/// The one implementation behind every `recovery_pr_base` default.
+pub(crate) async fn fetch_recovery_pr_base(origin: &str, pr: u64) -> Result<String> {
+    let slug = git_utils::repo_slug::parse_github_slug(origin).context("invalid recovery repository URL")?;
+    git_utils::gh_cli::fetch_pr_base_ref(&slug, pr).await
+}
+
 /// Abstracts all host-specific operations: workspace lifecycle and
 /// worker spawn. Later phases extend this with control-channel
 /// (probe/interrupt/stop) and event-socket/transcript-readback setup.
@@ -112,8 +118,7 @@ fn remote_driver_config_paths(
 #[async_trait]
 pub trait HostAdapter: Send + Sync {
     async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
-        let slug = git_utils::repo_slug::parse_github_slug(origin).context("invalid recovery repository URL")?;
-        git_utils::gh_cli::fetch_pr_base_ref(&slug, pr).await
+        fetch_recovery_pr_base(origin, pr).await
     }
 
     async fn create_execution_bookmark(

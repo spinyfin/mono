@@ -10,6 +10,10 @@ impl ExecutionCoordinator {
     /// those failures are typed (`PointerIntegrityError`) so the caller can tell
     /// them apart from transient fetch/goto/SSH failures, which stay retryable.
     ///
+    /// `repo_id` is the handle `ensure_repo` returned for this execution; the
+    /// registered repo is selected by it because `execution.repo_remote_url`
+    /// may be a shorthand, resolver slug, or alternate URL spelling.
+    ///
     /// `pr_for_goto` is the bound PR number already resolved by
     /// `pr_number_for_workspace_goto` (including the chain-root fallback), since
     /// resume executions do not carry `pr_url`.
@@ -18,6 +22,7 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         lease: &CubeWorkspaceLease,
         adapter: &Arc<dyn HostAdapter>,
+        repo_id: &str,
         pr_for_goto: Option<u64>,
     ) -> Result<Option<(String, bool)>> {
         let prior = if self.work_db.execution_bookmark_optional(&execution.id)?.is_some() {
@@ -39,13 +44,13 @@ impl ExecutionCoordinator {
                 adapter.host_id()
             )));
         }
-        let has_work = if prior.id != execution.id
-            && matches!(
-                execution.kind,
-                ExecutionKind::ChoreImplementation
-                    | ExecutionKind::TaskImplementation
-                    | ExecutionKind::RevisionImplementation
-            ) {
+        let is_implementation = matches!(
+            execution.kind,
+            ExecutionKind::ChoreImplementation
+                | ExecutionKind::TaskImplementation
+                | ExecutionKind::RevisionImplementation
+        );
+        let has_work = if prior.id != execution.id && is_implementation {
             let has_work = !adapter.execution_bookmark_diff(&record).await?.trim().is_empty();
             if execution.kind == ExecutionKind::RevisionImplementation && pr_for_goto.is_none() && !has_work {
                 return Ok(None);
@@ -53,12 +58,25 @@ impl ExecutionCoordinator {
             let repos = adapter.list_repos().await?;
             let repo = repos
                 .iter()
-                .find(|repo| repo.origin == execution.repo_remote_url)
-                .ok_or_else(|| anyhow!("recovery repository is absent from cube repo list"))?;
+                .find(|repo| repo.repo_id == repo_id)
+                .ok_or_else(|| anyhow!("recovery repository {repo_id} is absent from cube repo list"))?;
             let base_branch = if execution.kind == ExecutionKind::RevisionImplementation {
                 let pr = pr_for_goto
                     .ok_or_else(|| pointer_integrity_error("revision recovery requires its bound PR URL"))?;
-                adapter.recovery_pr_base(&repo.origin, pr).await?
+                match adapter.recovery_pr_base(&repo.origin, pr).await {
+                    Ok(base) => base,
+                    Err(err) => {
+                        // A non-GitHub origin or an unreadable PR base cannot be
+                        // fixed by retrying; restage onto the default branch.
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            ?err,
+                            fallback = %repo.main_branch,
+                            "could not resolve the PR base branch; restaging recovery onto the main branch"
+                        );
+                        repo.main_branch.clone()
+                    }
+                }
             } else {
                 repo.main_branch.clone()
             };
@@ -72,19 +90,42 @@ impl ExecutionCoordinator {
             } else {
                 None
             };
-            let report = adapter
+            let restore = adapter
                 .restore_rebased_execution_bookmark(
                     &record,
                     &lease.workspace_path,
                     pr_bookmark.as_deref(),
                     &base_branch,
                 )
-                .await?;
+                .await;
+            let report = match restore {
+                Ok(report) => report,
+                Err(err)
+                    if execution.kind == ExecutionKind::RevisionImplementation && base_branch != repo.main_branch =>
+                {
+                    // The PR base branch resolved but its remote bookmark is gone
+                    // (e.g. a stacked parent deleted after merge): retry on main.
+                    tracing::warn!(execution_id = %execution.id, ?err, "restaging onto the PR base failed; retrying on the main branch");
+                    adapter
+                        .restore_rebased_execution_bookmark(
+                            &record,
+                            &lease.workspace_path,
+                            pr_bookmark.as_deref(),
+                            &repo.main_branch,
+                        )
+                        .await?
+                }
+                Err(err) => return Err(err),
+            };
             self.work_db.record_execution_restore_report(&execution.id, &report)?;
             has_work
         } else {
             adapter
-                .restore_execution_bookmark(&record, &lease.workspace_path, prior.id == execution.id)
+                .restore_execution_bookmark(
+                    &record,
+                    &lease.workspace_path,
+                    is_implementation && prior.id == execution.id,
+                )
                 .await?
         };
         self.dispatch_events

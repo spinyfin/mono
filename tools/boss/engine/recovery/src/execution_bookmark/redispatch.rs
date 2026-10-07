@@ -22,8 +22,15 @@ impl RestoreReport {
                 self.conflicts
             )
         };
+        // Only a PR-bound (revision) report carries a `pr/<n>` pointer; a chore
+        // or task has no PR bookmark to rewrite.
+        let pr_rewrite = if self.pointer.contains("pr/") {
+            "For a revision, the PR history was restaged onto its current base branch (including a stacked PR base). Its head-branch bookmark still points at the original head: publishing requires moving that bookmark to the completed history with `jj bookmark set --allow-backwards` and rewriting the existing PR through `cube pr update`.\n\n"
+        } else {
+            ""
+        };
         format!(
-            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine staged copies of this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n\n{conflict_task}\n\nFor a revision, the PR history was restaged onto its current base branch (including a stacked PR base). Its head-branch bookmark still points at the original head: publishing requires moving that bookmark to the completed history with `jj bookmark set --allow-backwards` and rewriting the existing PR through `cube pr update`.\n\nStay at `@`, inspect the inherited history, and rerun the required gates before publishing.\n\n",
+            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine staged copies of this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
             self.pointer, self.base_sha, self.commits
         )
     }

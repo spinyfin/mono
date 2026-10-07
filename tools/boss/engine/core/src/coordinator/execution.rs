@@ -1504,7 +1504,7 @@ impl ExecutionCoordinator {
         // outright). Both must happen before handing the workspace to the
         // worker. If positioning fails, abort dispatch with a diagnosable stage.
         let recovered = match self
-            .recover_execution_bookmark(execution, &lease, &adapter, pr_for_goto)
+            .recover_execution_bookmark(execution, &lease, &adapter, &repo.repo_id, pr_for_goto)
             .await
         {
             Ok(recovered) => recovered,
@@ -1554,7 +1554,14 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        let recovered_blocked = self.work_db.execution_bookmark_optional(&execution.id)?.is_some()
+        let is_implementation = matches!(
+            execution.kind,
+            ExecutionKind::ChoreImplementation
+                | ExecutionKind::TaskImplementation
+                | ExecutionKind::RevisionImplementation
+        );
+        let recovered_blocked = (is_implementation
+            && self.work_db.execution_bookmark_optional(&execution.id)?.is_some())
             || recovered.as_ref().is_some_and(|(_, has_work)| *has_work)
             || self.work_db.execution_restore_report(&execution.id)?.is_some();
         let goto_target = match (pr_for_goto, immutable_target_sha.as_deref()) {

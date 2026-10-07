@@ -184,7 +184,7 @@ async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
             dirty_verified,
         };
         let recovered = coordinator
-            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, None)
+            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None)
             .await
             .unwrap();
         assert!(recovered.is_none());
@@ -720,4 +720,71 @@ async fn non_implementation_pointer_failure_keeps_pre_start_retries() {
     let after = db.get_execution(&next.id).unwrap();
     assert_ne!(after.status, ExecutionStatus::Failed);
     assert_eq!(after.pre_start_failure_count, 1);
+}
+
+#[tokio::test]
+async fn revision_recovery_falls_back_to_main_when_the_pr_base_is_unavailable() {
+    let h = chain_harness(true, true, false).await;
+    h.cube.fail_pr_base.store(true, std::sync::atomic::Ordering::SeqCst);
+    h.dispatch().await.unwrap();
+    let report = h
+        .coordinator
+        .work_db
+        .execution_restore_report(&h.next.id)
+        .unwrap()
+        .expect("report");
+    assert!(report.pointer.contains("pr/99"), "{}", report.pointer);
+    assert_eq!(
+        std::fs::read_to_string(h.repo.replacement.join("revision.txt")).unwrap(),
+        "unpushed revision"
+    );
+}
+
+#[tokio::test]
+async fn revision_recovery_selects_the_repo_by_id_not_by_stored_url() {
+    let mut h = chain_harness(true, true, false).await;
+    for spelling in ["spinyfin/mono", "mono", "git@github.com:spinyfin/mono.git"] {
+        h.next.repo_remote_url = spelling.to_owned();
+        let lease = CubeWorkspaceLease {
+            lease_id: "lease-spelling".into(),
+            workspace_id: "replacement".into(),
+            workspace_path: h.repo.replacement.clone(),
+            dirty_verified: Some(true),
+        };
+        let recovered = h
+            .coordinator
+            .recover_execution_bookmark(&h.next, &lease, &h.coordinator.host_adapter, "mono", Some(99))
+            .await
+            .unwrap();
+        assert!(recovered.is_some(), "{spelling}");
+    }
+}
+
+#[tokio::test]
+async fn pr_review_self_retry_with_a_record_still_positions_via_goto() {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    let mut h = chain_harness(true, true, false).await;
+    let db = h.coordinator.work_db.clone();
+    rusqlite::Connection::open(h._dir.path().join("boss.db"))
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'pr_review' WHERE id = ?1",
+            [&h.next.id],
+        )
+        .unwrap();
+    rusqlite::Connection::open(h._dir.path().join("boss.db"))
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://github.com/spinyfin/mono/pull/99' WHERE id = ?1",
+            [&h.next.work_item_id],
+        )
+        .unwrap();
+    h.next = db.get_execution(&h.next.id).unwrap();
+    assert_eq!(h.next.kind, ExecutionKind::PrReview);
+    let own = create(&LocalJj, &h.repo.replacement, &h.next.id, "local")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&own).unwrap();
+    h.dispatch().await.unwrap();
+    assert_eq!(h.cube.goto_calls.lock().await.len(), 1, "must run cube workspace goto");
 }
