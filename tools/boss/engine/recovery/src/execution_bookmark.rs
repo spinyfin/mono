@@ -309,12 +309,23 @@ pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
 
 /// Fork from the reference so later edits cannot rewrite the predecessor's work.
 pub async fn restore(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path) -> Result<bool> {
+    restore_for_retry(jj, record, workspace, false).await
+}
+
+/// A retry must keep its own baseline and pointers in the working history,
+/// even when that execution has no unpublished diff.
+pub async fn restore_for_retry(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    workspace: &Path,
+    self_retry: bool,
+) -> Result<bool> {
     ensure!(
         jj.shared_repo(workspace).await? == record.repo_path,
         "recovery destination belongs to a different shared repository"
     );
     let has_work = !unpublished_diff(jj, record).await?.trim().is_empty();
-    if !has_work {
+    if !has_work && !self_retry {
         return Ok(false);
     }
     jj.run(

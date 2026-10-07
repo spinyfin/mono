@@ -617,6 +617,11 @@ pub struct CubeRepoSummary {
 
 #[async_trait]
 pub trait CubeClient: Send + Sync {
+    async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
+        let slug = git_utils::repo_slug::parse_github_slug(origin).context("invalid recovery repository URL")?;
+        git_utils::gh_cli::fetch_pr_base_ref(&slug, pr).await
+    }
+
     async fn create_execution_bookmark(
         &self,
         workspace: &Path,

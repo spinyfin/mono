@@ -29,6 +29,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     cube_change_id: Option<&'a str>,
     /// The coordinator's shared-store recovery result; never inferred from a lease.
     bookmark_recovery: Option<&'a (String, bool)>,
+    restore_report: Option<&'a boss_engine_recovery::execution_bookmark::RestoreReport>,
     conflict_attempt: Option<&'a ConflictResolution>,
     ci_attempt: Option<&'a CiRemediation>,
     editorial_rules: Option<&'a EditorialRules>,
@@ -193,6 +194,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         workspace_path,
         cube_change_id,
         bookmark_recovery,
+        restore_report,
         conflict_attempt,
         ci_attempt,
         editorial_rules,
@@ -245,6 +247,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     let existing_pr_url = work_item_pr_url(work_item);
     prompt.push_str(&crate::execution_bookmark_recovery::recovery_instructions(
         bookmark_recovery,
+        restore_report,
     ));
     if let Some(pr_url) = existing_pr_url {
         let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)

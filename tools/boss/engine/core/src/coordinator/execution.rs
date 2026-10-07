@@ -1554,7 +1554,8 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        let recovered_blocked = recovered.as_ref().is_some_and(|(_, has_work)| *has_work)
+        let recovered_blocked = self.work_db.execution_bookmark_optional(&execution.id)?.is_some()
+            || recovered.as_ref().is_some_and(|(_, has_work)| *has_work)
             || self.work_db.execution_restore_report(&execution.id)?.is_some();
         let goto_target = match (pr_for_goto, immutable_target_sha.as_deref()) {
             _ if recovered_blocked => None,
@@ -2347,7 +2348,14 @@ impl ExecutionCoordinator {
             worker_id,
             cube_repo_id,
             &error_text,
-            if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED {
+            if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
+                && matches!(
+                    execution.kind,
+                    ExecutionKind::ChoreImplementation
+                        | ExecutionKind::TaskImplementation
+                        | ExecutionKind::RevisionImplementation
+                )
+            {
                 &[]
             } else {
                 &self.pre_start_retry_delays

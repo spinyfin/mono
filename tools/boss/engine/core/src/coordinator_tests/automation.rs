@@ -874,7 +874,8 @@ async fn preempted_automation_work_redispatches_once_capacity_frees() {
             workspace_root: Some(dir.path().to_path_buf()),
             ..FakeCubeClient::default()
         }
-        .with_next_workspace_id("worker"),
+        .with_next_workspace_id("worker")
+        .with_recovery_repo(),
     );
     let mut coord = ExecutionCoordinator::new(
         db.clone(),
@@ -951,7 +952,9 @@ async fn preempted_automation_work_redispatches_once_capacity_frees() {
     coordinator.kick();
 
     let mut redispatched = None;
-    for _ in 0..300 {
+    // Recovery performs real jj fetch and history staging under suite contention.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
         let running: Vec<_> = db
             .list_executions(Some(&spilled_work_item))
             .unwrap()

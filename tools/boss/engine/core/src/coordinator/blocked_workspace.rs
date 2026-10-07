@@ -5,7 +5,7 @@ impl ExecutionCoordinator {
     /// Restore the predecessor's engine-created reference into the new lease.
     /// No read of its old workspace or lease history occurs.
     ///
-    /// A started predecessor must have a durable pointer. Missing or unreadable
+    /// A recorded predecessor must have a durable pointer. Missing or unreadable
     /// pointers fail dispatch rather than silently discarding preserved work;
     /// those failures are typed (`PointerIntegrityError`) so the caller can tell
     /// them apart from transient fetch/goto/SSH failures, which stay retryable.
@@ -27,12 +27,10 @@ impl ExecutionCoordinator {
         } else {
             return Ok(None);
         };
-        let record = self.work_db.execution_bookmark_optional(&prior.id)?.ok_or_else(|| {
-            pointer_integrity_error(format!(
-                "expected engine-created recovery pointer for prior execution {}; no bookmark record exists",
-                prior.id
-            ))
-        })?;
+        let Some(record) = self.work_db.execution_bookmark_optional(&prior.id)? else {
+            self.warn_missing_execution_bookmark(execution, Some(&prior.id)).await;
+            return Ok(None);
+        };
         if record.host_id != adapter.host_id() {
             return Err(pointer_integrity_error(format!(
                 "execution {} recovery store is on host {}; dispatch selected {}",
@@ -41,12 +39,29 @@ impl ExecutionCoordinator {
                 adapter.host_id()
             )));
         }
-        let has_work = if matches!(
-            execution.kind,
-            ExecutionKind::ChoreImplementation
-                | ExecutionKind::TaskImplementation
-                | ExecutionKind::RevisionImplementation
-        ) {
+        let has_work = if prior.id != execution.id
+            && matches!(
+                execution.kind,
+                ExecutionKind::ChoreImplementation
+                    | ExecutionKind::TaskImplementation
+                    | ExecutionKind::RevisionImplementation
+            ) {
+            let has_work = !adapter.execution_bookmark_diff(&record).await?.trim().is_empty();
+            if execution.kind == ExecutionKind::RevisionImplementation && pr_for_goto.is_none() && !has_work {
+                return Ok(None);
+            }
+            let repos = adapter.list_repos().await?;
+            let repo = repos
+                .iter()
+                .find(|repo| repo.origin == execution.repo_remote_url)
+                .ok_or_else(|| anyhow!("recovery repository is absent from cube repo list"))?;
+            let base_branch = if execution.kind == ExecutionKind::RevisionImplementation {
+                let pr = pr_for_goto
+                    .ok_or_else(|| pointer_integrity_error("revision recovery requires its bound PR URL"))?;
+                adapter.recovery_pr_base(&repo.origin, pr).await?
+            } else {
+                repo.main_branch.clone()
+            };
             let pr_bookmark = if execution.kind == ExecutionKind::RevisionImplementation {
                 let pr = pr_for_goto
                     .ok_or_else(|| pointer_integrity_error("revision recovery requires its bound PR URL"))?;
@@ -57,15 +72,19 @@ impl ExecutionCoordinator {
             } else {
                 None
             };
-            let has_work = !adapter.execution_bookmark_diff(&record).await?.trim().is_empty();
             let report = adapter
-                .restore_rebased_execution_bookmark(&record, &lease.workspace_path, pr_bookmark.as_deref())
+                .restore_rebased_execution_bookmark(
+                    &record,
+                    &lease.workspace_path,
+                    pr_bookmark.as_deref(),
+                    &base_branch,
+                )
                 .await?;
             self.work_db.record_execution_restore_report(&execution.id, &report)?;
             has_work
         } else {
             adapter
-                .restore_execution_bookmark(&record, &lease.workspace_path)
+                .restore_execution_bookmark(&record, &lease.workspace_path, prior.id == execution.id)
                 .await?
         };
         self.dispatch_events

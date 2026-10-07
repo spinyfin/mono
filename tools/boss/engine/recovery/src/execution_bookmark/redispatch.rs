@@ -7,7 +7,7 @@ pub struct RestoreReport {
     pub commits: String,
     pub base_sha: String,
     pub conflicts: String,
-    /// Baseline of staged revision history; predecessor provenance stays untouched.
+    /// Baseline of staged history; predecessor provenance stays untouched.
     #[serde(default)]
     pub inherited_base: Option<String>,
 }
@@ -23,7 +23,7 @@ impl RestoreReport {
             )
         };
         format!(
-            "## Restored work rebased onto main\n\nRestored pointer: `{}`. After `jj git fetch`, the engine rebased this history onto main SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n\n{conflict_task}\n\nStay at `@`, inspect the inherited history, and rerun the required gates before publishing.\n\n",
+            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine staged copies of this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n\n{conflict_task}\n\nFor a revision, the PR history was restaged onto its current base branch (including a stacked PR base). Its head-branch bookmark still points at the original head: publishing requires moving that bookmark to the completed history with `jj bookmark set --allow-backwards` and rewriting the existing PR through `cube pr update`.\n\nStay at `@`, inspect the inherited history, and rerun the required gates before publishing.\n\n",
             self.pointer, self.base_sha, self.commits
         )
     }
@@ -36,6 +36,8 @@ pub async fn restore_rebased(
     record: &ExecutionBookmark,
     workspace: &Path,
     pr_bookmark: Option<&str>,
+    base_branch: &str,
+    upstream: &str,
 ) -> Result<RestoreReport> {
     if jj.shared_repo(workspace).await? != record.repo_path {
         return Err(pointer_integrity_error(
@@ -43,9 +45,13 @@ pub async fn restore_rebased(
         ));
     }
     diff(jj, record).await?;
-    jj.run(workspace, &["git", "fetch"]).await?;
-    let main = "remote_bookmarks(exact:main, exact:origin)";
-    let base_sha = one_commit(jj, workspace, main).await?;
+    jj.run(workspace, &["git", "fetch", "--remote", upstream]).await?;
+    let base_ref = format!(
+        "remote_bookmarks(exact:{}, exact:{})",
+        serde_json::to_string(base_branch)?,
+        serde_json::to_string(upstream)?
+    );
+    let base_sha = one_commit(jj, workspace, &base_ref).await?;
     let pointer = head_bookmark(jj, record).await?;
     let head = revision(&pointer);
     let pr_head = match pr_bookmark {
@@ -70,7 +76,7 @@ pub async fn restore_rebased(
         )
         .await?;
     let inherited_base = if let Some(pr) = &pr_head {
-        // Stage copies on main, never rewrite the predecessor or the bound PR.
+        // Stage copies on the PR base, never rewrite the predecessor or the bound PR.
         // Every fallible command can be retried from the original durable refs.
         jj.run(workspace, &["new", &base_sha, "-m", "Resume recovered execution work"])
             .await?;
@@ -85,11 +91,19 @@ pub async fn restore_rebased(
             .await?;
         Some(baseline)
     } else {
-        jj.run(workspace, &["new", &head, "-m", "Resume recovered execution work"])
+        jj.run(workspace, &["new", &base_sha, "-m", "Resume recovered execution work"])
             .await?;
-        jj.run(workspace, &["rebase", "-b", "@", "-d", &base_sha, "--ignore-immutable"])
-            .await?;
-        None
+        jj.run(
+            workspace,
+            &[
+                "duplicate",
+                &format!("{}..{head} ~ ::{base_sha}", revision(&record.base())),
+                "--insert-before",
+                "@",
+            ],
+        )
+        .await?;
+        Some(base_sha.clone())
     };
     let conflicted = jj
         .run(

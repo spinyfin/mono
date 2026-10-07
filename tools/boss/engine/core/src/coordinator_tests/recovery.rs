@@ -38,7 +38,7 @@ fn recovery_coordinator(db: Arc<WorkDb>) -> Arc<ExecutionCoordinator> {
     Arc::new(ExecutionCoordinator::new(
         db,
         WorkerPool::new(1),
-        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeCubeClient::default().with_recovery_repo()),
         Arc::new(FakeExecutionRunner::default()),
     ))
 }

@@ -163,10 +163,10 @@ async fn blocked_revision_retry_ignores_old_workspace_markers() {
 }
 
 #[tokio::test]
-async fn blocked_recovery_missing_bookmark_fails_loudly() {
+async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
     for dirty_verified in [None, Some(false), Some(true)] {
         let dir = tempdir().unwrap();
-        let (db, prior, next) = blocked_pair(&dir.path().join("boss.db"));
+        let (db, _prior, next) = blocked_pair(&dir.path().join("boss.db"));
         let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
         let coordinator = Arc::new(
             ExecutionCoordinator::new(
@@ -183,20 +183,19 @@ async fn blocked_recovery_missing_bookmark_fails_loudly() {
             workspace_path: dir.path().to_path_buf(),
             dirty_verified,
         };
-        let error = coordinator
+        let recovered = coordinator
             .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, None)
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains(&prior.id));
-        assert!(error.to_string().contains("expected engine-created recovery pointer"));
+            .unwrap();
+        assert!(recovered.is_none());
     }
 }
 
 #[tokio::test]
-async fn missing_predecessor_bookmark_blocks_dispatch_with_detail() {
+async fn missing_predecessor_bookmark_dispatches_into_a_clean_workspace() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
-    let (db, prior, next) = blocked_pair(&path);
+    let (db, _prior, next) = blocked_pair(&path);
     seed_local_claude_driver(&db);
     use boss_engine_test_git::jj::JjRepo;
     let repo = JjRepo::new(dir.path());
@@ -222,23 +221,12 @@ async fn missing_predecessor_bookmark_blocks_dispatch_with_detail() {
         .claim_worker(&next.id, None)
         .await
         .unwrap();
-    let error = coordinator
+    coordinator
         .schedule_execution(&next, &worker, DispatchAdmission::Queued)
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains(&prior.id));
-    assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
-    let WorkItem::Chore(failed) = db.get_work_item(&next.work_item_id).unwrap() else {
-        panic!("expected chore")
-    };
-    assert!(
-        failed
-            .blocked_detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("recovery pointer")
-    );
-    assert!(db.execution_bookmark_optional(&next.id).unwrap().is_none());
+        .unwrap();
+    assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Running);
+    assert!(db.execution_bookmark_optional(&next.id).unwrap().is_some());
     assert!(!repo.replacement.join("revision.txt").exists());
     assert!(cube.goto_calls.lock().await.is_empty());
 }
@@ -530,6 +518,8 @@ async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery(
         &record,
         &h.repo.replacement,
         Some("pr/99"),
+        "main",
+        "origin",
     )
     .await
     .unwrap_err();
@@ -610,4 +600,124 @@ async fn transient_fetch_failure_keeps_the_item_retryable() {
         h.coordinator.work_db.get_execution(&h.next.id).unwrap().status,
         ExecutionStatus::Failed
     );
+}
+
+#[tokio::test]
+async fn recorded_predecessor_with_deleted_refs_blocks_dispatch() {
+    use boss_engine_test_git::jj::JjRepo;
+    let h = chain_harness(true, true, false).await;
+    let db = &h.coordinator.work_db;
+    let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
+    let record = db.execution_bookmark(&prior.id).unwrap();
+    JjRepo::run(
+        &h.repo.repo,
+        &["bookmark", "delete", &record.head(), &record.publication()],
+    );
+    let error = h.dispatch().await.unwrap_err();
+    assert!(boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(
+        &error
+    ));
+    let (WorkItem::Task(item) | WorkItem::Chore(item)) = db.get_work_item(&h.next.work_item_id).unwrap() else {
+        panic!("expected implementation item")
+    };
+    assert_eq!(item.status, TaskStatus::Blocked);
+    assert!(!item.autostart);
+}
+
+#[tokio::test]
+async fn revision_start_retry_keeps_its_own_pointers_on_the_staged_history() {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, diff};
+    use boss_engine_test_git::jj::JjRepo;
+    for fresh in [false, true] {
+        let mut h = chain_harness(true, true, false).await;
+        let db = h.coordinator.work_db.clone();
+        let conn = rusqlite::Connection::open(h._dir.path().join("boss.db")).unwrap();
+        if fresh {
+            conn.execute("DELETE FROM execution_bookmarks WHERE execution_id != ?1", [&h.next.id])
+                .unwrap();
+        }
+        conn.execute_batch("CREATE TRIGGER fail_run_start BEFORE INSERT ON work_runs WHEN NEW.status = 'active' BEGIN SELECT RAISE(FAIL, 'injected run start failure'); END;").unwrap();
+        assert!(
+            h.dispatch()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected run start failure")
+        );
+        let record = db.execution_bookmark(&h.next.id).unwrap();
+        let patch = diff(&LocalJj, &record).await.unwrap();
+        conn.execute_batch("DROP TRIGGER fail_run_start; UPDATE work_executions SET status = 'ready', dispatch_not_before = NULL WHERE started_at IS NULL;").unwrap();
+        // A later retry sees a changed main and PR head, but must not restage its own refs.
+        JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Main advanced before retry"]);
+        std::fs::write(h.repo.repo.join("later"), "later main").unwrap();
+        JjRepo::run(&h.repo.repo, &["bookmark", "set", "main", "pr/99", "-r", "@"]);
+        JjRepo::run(&h.repo.repo, &["git", "export"]);
+        *h.cube.next_workspace_id.lock().await = Some("replacement".into());
+        h.coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            h.cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        ));
+        h.next = db.get_execution(&h.next.id).unwrap();
+        h.dispatch().await.unwrap();
+        assert_eq!(h.cube.goto_calls.lock().await.len(), 1);
+        assert_eq!(diff(&LocalJj, &record).await.unwrap(), patch);
+        for pointer in [record.base(), record.head(), record.publication()] {
+            assert!(
+                !JjRepo::run(
+                    &h.repo.replacement,
+                    &[
+                        "log",
+                        "-r",
+                        &format!("bookmarks(exact:{pointer}) & ::@"),
+                        "--no-graph",
+                        "-T",
+                        "commit_id"
+                    ]
+                )
+                .is_empty()
+            );
+        }
+        JjRepo::run(
+            &h.repo.replacement,
+            &["bookmark", "set", &record.head(), &record.publication(), "-r", "@"],
+        );
+        assert_eq!(diff(&LocalJj, &record).await.unwrap(), patch);
+        if fresh {
+            assert!(db.execution_restore_report(&h.next.id).unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_implementation_pointer_failure_keeps_pre_start_retries() {
+    let dir = tempdir().unwrap();
+    let (db, _, mut next) = blocked_pair(&dir.path().join("boss.db"));
+    next.kind = ExecutionKind::PrReview;
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![Duration::from_secs(60)]),
+    );
+    coordinator
+        .record_start_failure(
+            coordinator.clone(),
+            &next,
+            "worker",
+            None,
+            (crate::execution_bookmark_recovery::RECOVERY_FAILED, "Recovery failed"),
+            &boss_engine_recovery::execution_bookmark::pointer_integrity_error("deleted refs"),
+        )
+        .unwrap();
+    let after = db.get_execution(&next.id).unwrap();
+    assert_ne!(after.status, ExecutionStatus::Failed);
+    assert_eq!(after.pre_start_failure_count, 1);
 }

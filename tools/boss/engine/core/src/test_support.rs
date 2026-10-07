@@ -851,6 +851,10 @@ macro_rules! stub_cube_client {
         ] @done $($rest)*);
     };
 
+    (@munch $ty:ty [$($acc:tt)*] @done async fn recovery_pr_base $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn recovery_pr_base $a -> $r $b] @done $($rest)*);
+    };
+
     // ── emit ────────────────────────────────────────────────────────────────
     (@munch $ty:ty [$($acc:tt)*] @done) => {
         #[::async_trait::async_trait]

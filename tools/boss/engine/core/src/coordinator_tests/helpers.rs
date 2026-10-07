@@ -146,6 +146,18 @@ impl FakeCubeClient {
         self
     }
 
+    pub(super) fn with_recovery_repo(self) -> Self {
+        self.with_repos(vec![
+            CubeRepoSummary::builder()
+                .repo_id("mono")
+                .origin(crate::test_support::TEST_REPO_REMOTE_URL)
+                .main_branch("main")
+                .workspace_root(PathBuf::from("/tmp"))
+                .workspace_prefix("test")
+                .build(),
+        ])
+    }
+
     pub(super) fn with_repos(self, repos: Vec<CubeRepoSummary>) -> Self {
         *self.repos.try_lock().expect("uncontended") = repos;
         self
@@ -326,7 +338,20 @@ crate::stub_cube_client! { FakeCubeClient {
 
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
         *self.list_repos_calls.lock().await += 1;
-        Ok(self.repos.lock().await.clone())
+        let repos = self.repos.lock().await.clone();
+        if repos.is_empty() && self.real_bookmarks {
+            return Ok(vec![CubeRepoSummary::builder()
+                .repo_id("mono")
+                .origin(crate::test_support::TEST_REPO_REMOTE_URL)
+                .main_branch("main")
+                .workspace_root(self.workspace_root.clone().unwrap())
+                .workspace_prefix("test")
+                .build()]);
+        }
+        Ok(repos)
+    }
+    async fn recovery_pr_base(&self, _origin: &str, _pr: u64) -> Result<String> {
+        Ok("main".into())
     }
     async fn create_execution_bookmark(&self, workspace: &std::path::Path, execution_id: &str, predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>, inherited_base: Option<&str>) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
         self.bookmark_calls.lock().await.push(execution_id.to_owned());

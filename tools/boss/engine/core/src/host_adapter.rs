@@ -111,6 +111,11 @@ fn remote_driver_config_paths(
 /// remote (Phase 3+).
 #[async_trait]
 pub trait HostAdapter: Send + Sync {
+    async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
+        let slug = git_utils::repo_slug::parse_github_slug(origin).context("invalid recovery repository URL")?;
+        git_utils::gh_cli::fetch_pr_base_ref(&slug, pr).await
+    }
+
     async fn create_execution_bookmark(
         &self,
         workspace: &Path,
@@ -127,8 +132,13 @@ pub trait HostAdapter: Send + Sync {
         bail!("execution bookmark inspection is not supported by this host adapter")
     }
 
-    async fn restore_execution_bookmark(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<bool> {
-        let _ = (record, workspace);
+    async fn restore_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        self_retry: bool,
+    ) -> Result<bool> {
+        let _ = (record, workspace, self_retry);
         bail!("execution bookmark recovery is not supported by this host adapter")
     }
     async fn restore_rebased_execution_bookmark(
@@ -136,8 +146,9 @@ pub trait HostAdapter: Send + Sync {
         record: &ExecutionBookmark,
         workspace: &Path,
         pr_bookmark: Option<&str>,
+        base_branch: &str,
     ) -> Result<execution_bookmark::RestoreReport> {
-        let _ = (record, workspace, pr_bookmark);
+        let _ = (record, workspace, pr_bookmark, base_branch);
         bail!("rebased execution recovery is not supported by this host adapter")
     }
     /// Stable host identifier (e.g. `"local"`, `"zakalwe"`).
@@ -366,6 +377,10 @@ impl LocalHostAdapter {
 
 #[async_trait]
 impl HostAdapter for LocalHostAdapter {
+    async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
+        self.cube_client.recovery_pr_base(origin, pr).await
+    }
+
     async fn create_execution_bookmark(
         &self,
         workspace: &Path,
@@ -387,25 +402,35 @@ impl HostAdapter for LocalHostAdapter {
         execution_bookmark::unpublished_diff(&LocalJj, record).await
     }
 
-    async fn restore_execution_bookmark(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<bool> {
+    async fn restore_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        self_retry: bool,
+    ) -> Result<bool> {
         anyhow::ensure!(
             record.host_id == "local",
             "recovery bookmark belongs to host {}",
             record.host_id
         );
-        execution_bookmark::restore(&LocalJj, record, workspace).await
+        execution_bookmark::restore_for_retry(&LocalJj, record, workspace, self_retry).await
     }
     async fn restore_rebased_execution_bookmark(
         &self,
         record: &ExecutionBookmark,
         workspace: &Path,
         pr_bookmark: Option<&str>,
+        base_branch: &str,
     ) -> Result<execution_bookmark::RestoreReport> {
         anyhow::ensure!(
             record.host_id == self.host_id(),
             "recovery store belongs to another host"
         );
-        execution_bookmark::restore_rebased(&LocalJj, record, workspace, pr_bookmark).await
+        let remotes = Jj::run(&LocalJj, workspace, &["git", "remote", "list"]).await?;
+        let remote = git_utils::repo_slug::parse_github_remote(&remotes)
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| "origin".into());
+        execution_bookmark::restore_rebased(&LocalJj, record, workspace, pr_bookmark, base_branch, &remote).await
     }
 
     fn host_id(&self) -> &str {
@@ -851,25 +876,35 @@ impl HostAdapter for SshHostAdapter {
         execution_bookmark::unpublished_diff(self, record).await
     }
 
-    async fn restore_execution_bookmark(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<bool> {
+    async fn restore_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        self_retry: bool,
+    ) -> Result<bool> {
         anyhow::ensure!(
             record.host_id == self.host_id(),
             "recovery bookmark belongs to host {}",
             record.host_id
         );
-        execution_bookmark::restore(self, record, workspace).await
+        execution_bookmark::restore_for_retry(self, record, workspace, self_retry).await
     }
     async fn restore_rebased_execution_bookmark(
         &self,
         record: &ExecutionBookmark,
         workspace: &Path,
         pr_bookmark: Option<&str>,
+        base_branch: &str,
     ) -> Result<execution_bookmark::RestoreReport> {
         anyhow::ensure!(
             record.host_id == self.host_id(),
             "recovery store belongs to another host"
         );
-        execution_bookmark::restore_rebased(self, record, workspace, pr_bookmark).await
+        let remotes = Jj::run(self, workspace, &["git", "remote", "list"]).await?;
+        let remote = git_utils::repo_slug::parse_github_remote(&remotes)
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| "origin".into());
+        execution_bookmark::restore_rebased(self, record, workspace, pr_bookmark, base_branch, &remote).await
     }
 
     fn host_id(&self) -> &str {
