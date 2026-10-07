@@ -98,7 +98,7 @@ impl WorkDb {
 
         let mut stmt = conn.prepare(
             "SELECT id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
-                    artifacts_path, created_at, started_at, finished_at
+                    artifacts_path, created_at, started_at, finished_at, persona
              FROM work_runs
              WHERE execution_id = ?1
              ORDER BY created_at ASC, id ASC",

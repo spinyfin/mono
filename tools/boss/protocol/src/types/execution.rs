@@ -899,6 +899,9 @@ impl WorkExecution {
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkRun {
+    /// Durable crew persona; absent on rows created before persona leasing.
+    #[serde(default)]
+    pub persona: Option<String>,
     pub id: String,
     pub agent_id: String,
     pub execution_id: String,

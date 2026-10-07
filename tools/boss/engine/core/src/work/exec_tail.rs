@@ -143,6 +143,12 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let prior = execution.cube_lease_id.clone();
+        // Workspace handback follows verified worker cleanup, including runs
+        // that never acquired an in-memory slot. Preserve the historical name.
+        tx.execute(
+            "UPDATE work_runs SET persona_lease_active = 0 WHERE execution_id = ?1",
+            [execution_id],
+        )?;
         if let Some(lease_id) = prior {
             tx.execute(
                 "UPDATE work_executions

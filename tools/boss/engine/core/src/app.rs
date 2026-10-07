@@ -1148,7 +1148,12 @@ impl ServerState {
         // event would ever reach a subscriber.
         let mut timeline = crate::startup_timing::StartupTimeline::begin("server_state");
         let event_bus = Arc::new(EventBus::new());
-        let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?.with_event_bus(event_bus.clone()));
+        let metrics_registry = Arc::new(crate::metrics::Registry::new());
+        let work_db = Arc::new(
+            WorkDb::open(cfg.work.db_path.clone())?
+                .with_event_bus(event_bus.clone())
+                .with_persona_metrics(metrics_registry.clone()),
+        );
         timeline.mark("work_db_open");
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
         timeline.mark("agent_config");
@@ -1356,7 +1361,7 @@ impl ServerState {
         // Arc<ServerState> is in hand so a duplicate registration
         // panics during this boot path instead of inside the first
         // increment.
-        let metrics_registry = Arc::new(crate::metrics::Registry::new());
+
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();
@@ -1425,7 +1430,7 @@ impl ServerState {
         // completion handler (background-children probe, idle-park hold
         // check), the coordinator's occupancy guard, and `ServerState` all
         // share the SAME instances.
-        let live_worker_states = Arc::new(LiveWorkerStateRegistry::new());
+        let live_worker_states = Arc::new(LiveWorkerStateRegistry::with_work_db(work_db.clone()));
         let live_worker_states_for_coordinator = live_worker_states.clone();
         let live_worker_states_for_completion = live_worker_states.clone();
         let hold_registry = Arc::new(crate::hold_registry::HoldRegistry::new());
@@ -1983,6 +1988,7 @@ impl ServerState {
     /// live-state. Acting unconditionally would tear down a newer occupant's
     /// viewer, pool claim and live state out from under it.
     async fn detach_untracked_worker_viewer(&self, run_id: &str) -> PaneReleaseOutcome {
+        self.live_worker_states.release_persona_for_run(run_id);
         if let Some(slot_id) = self.hosted_pane_slot_for_run(run_id) {
             let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
             let pool_holder = self.execution_coordinator.claim_holder(&worker_id).await;

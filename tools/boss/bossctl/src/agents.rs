@@ -89,7 +89,12 @@ pub(crate) fn looks_like_name_or_slot(reference: &str) -> bool {
     if !reference.is_empty() && reference.bytes().all(|byte| byte.is_ascii_digit()) {
         return true;
     }
-    ROSTER.iter().any(|name| name.eq_ignore_ascii_case(reference))
+    let normalized = reference.to_ascii_lowercase();
+    let persona = normalized.strip_suffix(" (remote)").unwrap_or(&normalized);
+    ROSTER.iter().any(|name| name.eq_ignore_ascii_case(persona))
+        || persona
+            .strip_prefix("ensign ")
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Whether a worker-resolution miss may fall back to a friendly work-item
@@ -2152,6 +2157,31 @@ mod tests {
         let resolved = resolve_agent_ref("dATa", &states).expect("crew name should resolve");
         assert_eq!(resolved.slot_id, 2);
         assert_eq!(resolved.run_id, "exec_def");
+    }
+
+    #[test]
+    fn resolves_durable_personas_independently_of_slots_including_overflow() {
+        let states = [worker(27, "local", "Riker"), worker(241, "remote", "Ensign 1 (Remote)")];
+        assert_eq!(resolve_agent_ref("riker", &states).unwrap().run_id, "local");
+        assert_eq!(
+            resolve_agent_ref("ENSIGN 1 (REMOTE)", &states).unwrap().run_id,
+            "remote"
+        );
+        assert_eq!(resolve_agent_ref("241", &states).unwrap().run_id, "remote");
+        let panes = [hosted_pane(9, "historical", "Ensign 2", HostedPaneState::Husk)];
+        assert_eq!(
+            resolve_hosted_pane_ref("ensign 2", &panes).unwrap().unwrap().run_id,
+            "historical"
+        );
+    }
+
+    #[test]
+    fn missing_overflow_and_remote_names_never_become_work_item_selectors() {
+        for name in ["Ensign 1", "ensign 56", "Ensign 3 (Remote)", "riker (REMOTE)"] {
+            assert!(looks_like_name_or_slot(name), "{name}");
+            assert!(!work_item_fallback_eligible(name), "{name}");
+        }
+        assert!(!looks_like_name_or_slot("Ensign engineering"));
     }
 
     /// Slot 4's crew name is "La Forge" — the space is part of the name,

@@ -566,6 +566,8 @@ struct InMemoryAnchor {
 /// connection guarded by a mutex."
 pub(crate) type PooledConnection<'a> = std::sync::MutexGuard<'a, Connection>;
 
+#[derive(bon::Builder)]
+#[builder(on(String, into), builder_type(vis = "pub(self)"), start_fn(vis = "pub(self)"))]
 pub struct WorkDb {
     path: PathBuf,
     /// Present only when the database is in-memory (path == ":memory:").
@@ -598,6 +600,7 @@ pub struct WorkDb {
     /// it via [`Self::with_event_bus`] so every clone shares the one
     /// instance subscribers attach to.
     event_bus: Arc<EventBus>,
+    persona_metrics: Arc<crate::metrics::Registry>,
 }
 
 impl Clone for WorkDb {
@@ -608,6 +611,7 @@ impl Clone for WorkDb {
             conn: Arc::clone(&self.conn),
             boothby_action: Arc::clone(&self.boothby_action),
             event_bus: Arc::clone(&self.event_bus),
+            persona_metrics: Arc::clone(&self.persona_metrics),
         }
     }
 }
@@ -649,6 +653,7 @@ mod executions_runs;
 mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
+pub(crate) mod personas;
 mod project_postmortem;
 #[cfg(test)]
 mod project_postmortem_tests;

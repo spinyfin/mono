@@ -754,6 +754,15 @@ impl ExecutionCoordinator {
                 }
                 self.kick();
             } else {
+                // This runner has completed cleanup (including remote runs and
+                // failed spawns). Deferred local panes retain their lease until
+                // the live-state release path runs instead.
+                if let Some(states) = &self.live_worker_states {
+                    states.release_slot_for_run(&execution.id);
+                }
+                if let Err(error) = self.work_db.release_persona(&execution.id) {
+                    tracing::error!(execution_id = %execution.id, %error, "could not release persona after runner cleanup");
+                }
                 self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
                     .await;
             }
@@ -904,6 +913,9 @@ impl ExecutionCoordinator {
             .release_worker_if_execution(worker_id, execution_id, None)
             .await;
         if released {
+            if let Err(error) = self.work_db.release_persona(execution_id) {
+                tracing::error!(execution_id, %error, "could not release persona for reconciled pool claim");
+            }
             self.rescan_active_dispatch_after_release();
             self.kick();
         }

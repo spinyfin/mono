@@ -391,6 +391,62 @@ async fn list_hosted_pane_statuses_classifies_occupancy_not_the_viewers_claimed_
     ));
 }
 
+#[tokio::test]
+async fn hosted_persona_comes_from_durable_run_even_after_registry_release() {
+    let (server, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product(&server.work_db);
+    let chore = crate::test_support::create_test_chore_manual(&server.work_db, product.id, "hosted persona");
+    let execution = server
+        .work_db
+        .request_execution(
+            boss_protocol::RequestExecutionInput::builder()
+                .work_item_id(chore.id)
+                .build(),
+        )
+        .unwrap();
+    let (_, run) = server
+        .work_db
+        .start_execution_run(
+            &execution.id,
+            "worker-27",
+            "repo",
+            "lease",
+            "workspace",
+            "/tmp/workspace",
+        )
+        .unwrap();
+    assert_eq!(run.persona.as_deref(), Some("Riker"));
+    server.work_db.release_persona(&execution.id).unwrap();
+    let sink = make_session_sink();
+    server.register_app_session("session-app".into(), sink.clone()).await;
+    let clone = server.clone();
+    let list = tokio::spawn(async move { clone.list_hosted_pane_statuses().await });
+    let envelope = sink.next().await.unwrap();
+    let FrontendEvent::EngineRequest { request_id, .. } = envelope.payload else {
+        panic!("expected request")
+    };
+    server
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Ok(crate::protocol::ListHostedPanesResult {
+                    panes: vec![crate::protocol::HostedPaneEntry {
+                        slot_id: 27,
+                        run_id: execution.id.clone(),
+                        summary: None,
+                        task_title: None,
+                    }],
+                }),
+            },
+        )
+        .await;
+    let statuses = list.await.unwrap().unwrap();
+    assert_eq!(statuses[0].slot_id, 27);
+    assert_eq!(statuses[0].run_id, execution.id);
+    assert_eq!(statuses[0].crew_name, "Riker");
+}
+
 // ─── 2026-07-28 regression: no live-state entry is not proof of death either ──
 //
 // The 2026-07-26 fix taught the classifier to distrust a TERMINAL live-state

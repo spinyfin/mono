@@ -1333,8 +1333,10 @@ impl WorkDb {
         )?;
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        let overflow = personas::allocate(&tx, &run_id)?;
         let run = query_run(&tx, &run_id)?.with_context(|| format!("missing run after insert: {run_id}"))?;
         tx.commit()?;
+        self.record_persona_overflow(u64::from(overflow));
         Ok((execution, run))
     }
 
