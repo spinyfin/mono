@@ -182,6 +182,10 @@ pub(super) fn structured_output_env_vars(
 }
 
 pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
+    with_bazel_caching_rule(compose_execution_prompt_body(params))
+}
+
+fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     let ExecutionPromptParams {
         execution,
         work_item,
@@ -679,6 +683,16 @@ pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String 
          \n\
          {failure_sentence}"
     )
+}
+
+/// Apply the cache policy to generic and separately composed worker prompts.
+pub(super) fn with_bazel_caching_rule(mut prompt: String) -> String {
+    prompt.push_str(bazel_caching_rule_text());
+    prompt
+}
+
+fn bazel_caching_rule_text() -> &'static str {
+    "\n**Trust Bazel's caching.** Bazel's action cache, disk cache and remote cache are reliable. Never disable, bypass or bust them in CI steps, scripts, verification gates, or as a debugging reflex. That means no `--disk_cache=` overrides, no `--remote_accept_cached=false`, no `--noremote_*` or `--nouse_action_cache`, no `bazel clean` \"to be sure\", no cache-key-busting env/`--action_env` changes, and no \"rebuild uncached and compare\" determinism checks. If a result looks stale, treat it as a defect to root-cause (an undeclared input, a non-hermetic action, a toolchain auto-detection leak) and fix that. Never route around the cache. The one documented exception is `bazel clean --expunge` to repair Xcode/Apple-toolchain config after an Xcode or macOS upgrade.\n"
 }
 
 /// Hard constraint text forbidding check/CI bypasses. Injected into every

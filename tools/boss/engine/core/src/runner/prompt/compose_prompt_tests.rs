@@ -10,6 +10,53 @@ use crate::work::Task;
 mod blocked_recovery;
 mod invocation;
 
+#[test]
+fn execution_prompts_include_bazel_caching_rule_once() {
+    let mut postmortem = design_task();
+    if let WorkItem::Task(task) = &mut postmortem {
+        task.kind = TaskKind::DesignPostmortem;
+    }
+    for (kind, work_item) in [
+        (ExecutionKind::TaskImplementation, chore_without_pr()),
+        (ExecutionKind::ChoreImplementation, chore_without_pr()),
+        (
+            ExecutionKind::RevisionImplementation,
+            chore_with_pr("https://github.com/org/repo/pull/42"),
+        ),
+        (ExecutionKind::ProjectDesign, design_task()),
+        (ExecutionKind::ProjectDesign, postmortem),
+        (ExecutionKind::InvestigationImplementation, chore_without_pr()),
+        (
+            ExecutionKind::ConflictResolution,
+            chore_with_pr("https://github.com/org/repo/pull/42"),
+        ),
+        (
+            ExecutionKind::CiRemediation,
+            chore_with_pr("https://github.com/org/repo/pull/42"),
+        ),
+    ] {
+        let mut execution = base_execution();
+        execution.kind = kind;
+        let attempt = sample_ci_attempt();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&execution)
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .ci_attempt(&attempt)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert_eq!(
+            prompt.matches("Trust Bazel's caching").count(),
+            1,
+            "{:?}",
+            execution.kind
+        );
+        assert!(prompt.contains("--remote_accept_cached=false"), "{:?}", execution.kind);
+    }
+}
+
 fn base_execution() -> WorkExecution {
     WorkExecution::builder()
         .id("exec_abc123_01")
