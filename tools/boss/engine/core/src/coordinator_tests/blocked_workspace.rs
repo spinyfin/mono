@@ -313,18 +313,18 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
     }
 }
 
-struct ChainHarness {
-    cube: Arc<FakeCubeClient>,
-    coordinator: Arc<ExecutionCoordinator>,
-    next: WorkExecution,
-    repo: boss_engine_test_git::jj::JjRepo,
-    _dir: tempfile::TempDir,
+pub(super) struct ChainHarness {
+    pub(super) cube: Arc<FakeCubeClient>,
+    pub(super) coordinator: Arc<ExecutionCoordinator>,
+    pub(super) next: WorkExecution,
+    pub(super) repo: boss_engine_test_git::jj::JjRepo,
+    pub(super) _dir: tempfile::TempDir,
 }
 
 /// A revision chain whose root task owns the bound PR, with the replacement
 /// execution created through `request_resume_execution` (which never stamps
 /// `pr_url`). `chain_root_pr` / `origin` toggle the failure shapes.
-async fn chain_harness(chain_root_pr: bool, origin: bool, conflict: bool) -> ChainHarness {
+pub(super) async fn chain_harness(chain_root_pr: bool, origin: bool, conflict: bool) -> ChainHarness {
     use boss_engine_recovery::execution_bookmark::{LocalJj, create};
     use boss_engine_test_git::jj::JjRepo;
     let dir = tempdir().unwrap();
@@ -774,53 +774,6 @@ async fn revision_recovery_discloses_a_missing_pr_base_branch() {
         std::fs::read_to_string(h.repo.replacement.join("revision.txt")).unwrap(),
         "unpushed revision"
     );
-}
-
-#[tokio::test]
-async fn transient_restore_failure_keeps_the_stacked_parent_base_on_retry() {
-    use boss_engine_test_git::jj::JjRepo;
-    let h = chain_harness(true, true, false).await;
-    JjRepo::run(&h.repo.repo, &["new", "main", "-m", "Stacked parent"]);
-    std::fs::write(h.repo.repo.join("parent.txt"), "parent").unwrap();
-    JjRepo::run(&h.repo.repo, &["bookmark", "set", "stack-parent", "-r", "@"]);
-    JjRepo::run(&h.repo.repo, &["git", "export"]);
-    let parent_sha = JjRepo::run(
-        &h.repo.repo,
-        &["log", "-r", "stack-parent", "--no-graph", "-T", "commit_id"],
-    );
-    *h.cube.pr_base.lock().await = Some("stack-parent".into());
-    let lease = CubeWorkspaceLease {
-        lease_id: "lease-transient".into(),
-        workspace_id: "replacement".into(),
-        workspace_path: h.repo.replacement.clone(),
-        dirty_verified: Some(true),
-    };
-    // Make the fetch fail the way a network blip would: the remote vanishes.
-    let git_dir = h.repo.repo.join(".jj/repo/store/git");
-    let parked = h.repo.repo.join(".jj/repo/store/git-parked");
-    std::fs::rename(&git_dir, &parked).unwrap();
-    let first = h
-        .coordinator
-        .recover_execution_bookmark(&h.next, &lease, &h.coordinator.host_adapter, "mono", Some(99))
-        .await;
-    std::fs::rename(&parked, &git_dir).unwrap();
-    let err = first.expect_err("a failed fetch must propagate, not fall back");
-    assert!(
-        !boss_engine_recovery::execution_bookmark::is_base_unresolvable_error(&err),
-        "{err:#}"
-    );
-    h.coordinator
-        .recover_execution_bookmark(&h.next, &lease, &h.coordinator.host_adapter, "mono", Some(99))
-        .await
-        .unwrap();
-    let report = h
-        .coordinator
-        .work_db
-        .execution_restore_report(&h.next.id)
-        .unwrap()
-        .expect("report");
-    assert_eq!(report.base_fallback, None);
-    assert_eq!(report.base_sha, parent_sha.trim());
 }
 
 #[tokio::test]
