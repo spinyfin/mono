@@ -1482,22 +1482,10 @@ pub async fn serve_with_overrides(
     // in-flight commits the next worker should resume against.
     //
     // See docs/post-crash-recovery.md for the full flow.
-    let orphan_reason = "engine startup: recovery probe proved worker dead across restart";
     for (execution_id, verdict) in &probe_report.verdicts {
-        if !matches!(verdict, crate::run_reconcile::RunReconcileVerdict::Dead) {
-            continue;
-        }
-        // The probe is authoritative proof the worker is dead, so its durable
-        // persona lease (which survives restarts) can be reclaimed. The
-        // historical persona text stays on the row for display.
-        if let Err(error) = server_state.work_db.release_persona(execution_id) {
-            tracing::error!(execution_id, %error, "startup reaper: could not release persona of dead worker");
-        }
-        match server_state
-            .work_db
-            .mark_execution_orphaned(execution_id, orphan_reason)
-        {
-            Ok(execution) => {
+        match server_state.work_db.reap_startup_dead_execution(execution_id, verdict) {
+            Ok(None) => continue,
+            Ok(Some(execution)) => {
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,

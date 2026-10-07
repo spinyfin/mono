@@ -73,7 +73,7 @@ impl ExecutionCoordinator {
         // A successful remote launch (`WorkerPaneAlive`, no local slot) frees
         // the local dispatch-pool claim below, but the remote process keeps
         // running: its persona lease and live-state entry must survive until
-        // confirmed termination (`release_worker_pane`), or the persona could
+        // terminal remote cleanup in `release_worker_pane`, or the persona could
         // be handed to another worker while this one is still alive.
         let remote_worker_alive = matches!(
             run_outcome.as_ref(),
@@ -764,14 +764,14 @@ impl ExecutionCoordinator {
                 }
                 self.kick();
             } else {
-                // This runner has completed cleanup (including remote runs and
-                // failed spawns). Deferred local panes retain their lease until
-                // the live-state release path runs instead.
+                // Failed spawns can release immediately. Successful remote
+                // launches retain their lease until terminal remote cleanup;
+                // deferred local panes retain it until verified tmux teardown.
                 if !remote_worker_alive {
                     if let Some(states) = &self.live_worker_states {
                         states.release_slot_for_run(&execution.id);
-                    }
-                    if let Err(error) = self.work_db.release_persona(&execution.id) {
+                        states.release_persona_for_run(&execution.id);
+                    } else if let Err(error) = self.work_db.release_persona(&execution.id) {
                         tracing::error!(execution_id = %execution.id, %error, "could not release persona after runner cleanup");
                     }
                 }

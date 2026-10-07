@@ -1823,11 +1823,35 @@ impl ServerState {
     /// mapping has already been removed, so a future release can't
     /// retry without a fresh registration.
     ///
-    /// Durable tmux identity and verified teardown are required before removing
+    /// Remote executions release their virtual slot once terminal. For local workers,
+    /// durable tmux identity and verified teardown are required before removing
     /// the registry entry or returning the workspace lease. Missing identity
     /// or unavailable tmux evidence preserves the worker for rollback/drain.
     /// A verified teardown also clears live-state and detaches its app viewer.
     pub async fn release_worker_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        // Remote workers have no durable tmux identity. Their terminal
+        // execution is the completion authority, including after a restart.
+        if self.execution_is_terminal(run_id)
+            && self
+                .work_db
+                .latest_run_host_for_execution(run_id)
+                .ok()
+                .flatten()
+                .is_some_and(|host| host != "local")
+            && matches!(self.work_db.tmux_identity_for_execution(run_id), Ok(None))
+        {
+            self.worker_registry.take_slot_for_run(run_id);
+            if let Some(slot_id) = self.live_worker_states.release_slot_for_run(run_id) {
+                self.live_status_manager.stop_slot_for_run(slot_id, run_id);
+            }
+            self.live_worker_states.release_persona_for_run(run_id);
+            self.agent_jsonl_progress_manager.stop_run(run_id);
+            self.transcript_path_cache.forget(run_id);
+            self.run_cost_capture.forget(run_id);
+            crate::stale_worker_sweep::resolve_stale_worker_attention(&self.work_db, run_id);
+            self.broadcast_live_worker_states().await;
+            return PaneReleaseOutcome::Reaped;
+        }
         if self.reap_tmux_worker(run_id).await != tmux_teardown::TmuxTeardownOutcome::Reaped {
             return PaneReleaseOutcome::NoLiveWorker;
         }

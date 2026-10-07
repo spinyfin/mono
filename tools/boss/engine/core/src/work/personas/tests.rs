@@ -286,15 +286,14 @@ fn restart_then_dead_verdict_release_frees_persona_and_keeps_history() {
     drop(db);
     // After a restart the lease is still active: terminal status never frees it.
     let db = WorkDb::open(path).unwrap();
-    db.mark_execution_orphaned(&dead.id, "probe proved dead").unwrap();
     let (_, held) = start(&db, "local");
-    assert_eq!(
-        held.persona.as_deref(),
-        Some("Data"),
-        "lease survives restart + orphaning"
-    );
+    assert_eq!(held.persona.as_deref(), Some("Data"), "lease survives restart");
     // The startup Dead-verdict branch releases the lease.
-    db.release_persona(&dead.id).unwrap();
+    let orphan = db
+        .reap_startup_dead_execution(&dead.id, &crate::run_reconcile::RunReconcileVerdict::Dead)
+        .unwrap()
+        .unwrap();
+    assert!(orphan.status.is_terminal());
     let (_, reused) = start(&db, "local");
     assert_eq!(reused.persona.as_deref(), Some("Riker"));
     assert_eq!(db.persona_display_name(&dead.id).unwrap().as_deref(), Some("Riker"));
@@ -310,13 +309,16 @@ fn spawn_registration_does_not_hold_registry_lock_while_waiting_for_db() {
     let states = Arc::new(LiveWorkerStateRegistry::with_work_db(db.clone()));
     let (execution, _) = start(&db, "local");
     let conn = db.connect().unwrap();
+    let (boundary_tx, boundary_rx) = std::sync::mpsc::channel();
+    *states.persona_boundary.lock().unwrap() = Some(Box::new(move || {
+        let _ = boundary_tx.send(());
+    }));
     let spawner = {
         let states = states.clone();
         let run_id = execution.id.clone();
         std::thread::spawn(move || states.register_spawn(8, &run_id, "model", 123, None))
     };
-    // Give the spawner time to block on the DB connection we hold.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    let boundary = boundary_rx.recv_timeout(std::time::Duration::from_secs(5));
     let (tx, rx) = std::sync::mpsc::channel();
     let probe = {
         let states = states.clone();
@@ -326,11 +328,70 @@ fn spawn_registration_does_not_hold_registry_lock_while_waiting_for_db() {
     };
     let result = rx.recv_timeout(std::time::Duration::from_secs(5));
     drop(conn);
+    probe.join().unwrap();
+    spawner.join().unwrap();
+    assert!(boundary.is_ok(), "spawner never reached the persona DB boundary");
     assert!(
         result.is_ok(),
         "registry lock was held while waiting on the DB connection"
     );
-    probe.join().unwrap();
-    spawner.join().unwrap();
     assert_eq!(states.get(8).unwrap().name, "Riker");
+}
+
+#[test]
+fn same_run_readoption_waits_for_removed_entry_persona_release() {
+    let (_dir, db) = open_db();
+    let db = Arc::new(db);
+    let states = Arc::new(LiveWorkerStateRegistry::with_work_db(db.clone()));
+    let (execution, run) = start(&db, "local");
+    states.register_spawn(8, &execution.id, "model", 123, None);
+    let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *states.persona_boundary.lock().unwrap() = Some(Box::new(move || {
+        let _ = removed_tx.send(());
+        let _ = resume_rx.recv_timeout(std::time::Duration::from_secs(5));
+    }));
+    let releaser = {
+        let states = states.clone();
+        let id = execution.id.clone();
+        std::thread::spawn(move || states.release_slot_for_run(&id))
+    };
+    let removed = removed_rx.recv_timeout(std::time::Duration::from_secs(5));
+    let absent = states.get(8).is_none();
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+    *states.lifecycle_waiter.lock().unwrap() = Some(waiting_tx);
+    let readopter = {
+        let states = states.clone();
+        let id = execution.id.clone();
+        std::thread::spawn(move || {
+            states.register_readoption(
+                8,
+                id,
+                "model",
+                123,
+                None,
+                false,
+                LiveSpawnRouting::none(),
+                ReadoptionEvidence::LiveShellPid,
+            );
+        })
+    };
+    let waiting = waiting_rx.recv_timeout(std::time::Duration::from_secs(5));
+    let _ = resume_tx.send(());
+    releaser.join().unwrap();
+    readopter.join().unwrap();
+    assert!(removed.is_ok() && waiting.is_ok() && absent);
+    assert_eq!(states.get(8).unwrap().name, "Riker");
+    let active: bool = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT persona_lease_active FROM work_runs WHERE id = ?1",
+            [&run.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(active, "surviving registry entry must retain its persona lease");
+    let (_, next) = start(&db, "local");
+    assert_eq!(next.persona.as_deref(), Some("Data"));
 }

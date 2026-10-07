@@ -88,6 +88,25 @@ pub(super) fn allocate(conn: &Connection, run_id: &str) -> Result<bool> {
 }
 
 impl WorkDb {
+    /// Apply the authoritative startup death verdict before dispatch reconciliation.
+    pub(crate) fn reap_startup_dead_execution(
+        &self,
+        execution_id: &str,
+        verdict: &crate::run_reconcile::RunReconcileVerdict,
+    ) -> Result<Option<WorkExecution>> {
+        if !matches!(verdict, crate::run_reconcile::RunReconcileVerdict::Dead) {
+            return Ok(None);
+        }
+        if let Err(error) = self.release_persona(execution_id) {
+            tracing::error!(execution_id, %error, "startup reaper: could not release persona of dead worker");
+        }
+        self.mark_execution_orphaned(
+            execution_id,
+            "engine startup: recovery probe proved worker dead across restart",
+        )
+        .map(Some)
+    }
+
     pub fn with_persona_metrics(mut self, registry: Arc<crate::metrics::Registry>) -> Self {
         self.persona_metrics = registry;
         self
