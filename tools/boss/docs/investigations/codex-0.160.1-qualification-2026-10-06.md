@@ -74,7 +74,7 @@ Sources: the GitHub release notes for [0.154.0](https://github.com/openai/codex/
 | 0.160.1       | Windows remote MCP env preservation                                                                                          | no impact — Windows/remote MCP only (`driver/src/codex.rs:1056`).                                                                                                                                                                                                                                                                       |
 | 0.154–0.160   | Windows sandbox / daemon / WSL / voice / Touch ID / Mermaid / themes / `/usage` / worktrees / Bedrock / plugin / OAuth items | no impact — not reachable from the Unix `--strict-config --no-alt-screen -a never` spawn line (`driver/src/codex.rs:1056`).                                                                                                                                                                                                             |
 
-### Engine-contract review (modules the brief named)
+### Engine-contract review (Codex-dependent engine modules)
 
 - `core/src/codex_guard_trace.rs` (module doc L1-27) consumes the `GUARD_TRACE_MARKER` / `GUARDS_SILENT_MARKER` notifications that `driver/src/codex/progress.rs` emits from `drain_guard_trace_notifications` (L161). Those read the shim's own trace file (`guard_trace.rs` `guard_trace_path` L101, `read_records_from` L527) and the on-disk armed chain (`guard_chain::armed_chain_status`), not any Codex stream field. The measured PreToolUse payload keys, hook dialect, and "untrusted hook is silently skipped" behaviour are unchanged on 0.160.1, so no 0.154–0.160 change alters what the trace observes. Verdict: no impact.
 - `core/src/codex_unobserved_command.rs` (module doc L1-21) depends on a start record with no matching completion at the turn boundary. The rollout record types (`custom_tool_call` / `custom_tool_call_output`) and the code-mode cell dialect were measured identical, and 0.158's launch-failure events surface as ordinary completions, so the start/complete pairing is unchanged. Verdict: no impact.
@@ -107,4 +107,37 @@ The driver target now has `tags = ["exclusive"]`, so Bazel runs its 30 real trus
 
 That post-change invocation's engine shards hit their existing 300 s timeout while still completing tests. This is recorded separately from the driver scheduling result in the PR validation, including the complete isolated-shard rerun; it is not counted as a passing combined suite.
 
-The complete isolated rerun, `bazel test //tools/boss/engine/core:engine_lib_test --local_test_jobs=1 --nocache_test_results`, passed all 11 shards (invocation `86154daa-7e9f-4570-bb88-d6aa1a7adcb0`; shard range 3.4–210.7 s). This passing rerun, the earlier passing parallel run, and the absence of engine production-path changes classify the timeout as environmental concurrency sensitivity, rather than a new assertion failure. No engine test limit or assertion was changed.
+The earlier isolated run reported 3.4–210.7 s per shard (invocation `86154daa-7e9f-4570-bb88-d6aa1a7adcb0`). Its shard-level logs are not available in this revision, so the 210.7 s observation cannot be assigned reliably to a test or shard. It is not evidence for a cause of the timeout. The previous attribution to environmental concurrency sensitivity is withdrawn; the reproducible base/head measurements below replace it.
+
+## Base/head timeout comparison
+
+Measured on 2026-10-07 at the original PR base `9be18e6b` and the reviewed head `40f36ffc`, in the same leased workspace with the same Bazel configuration. Each run used `--nocache_test_results`; compilation is excluded from the per-shard times. Shard numbers are one-based Bazel shard IDs. Comparing the recorded test names confirms that both revisions ran the same 5,850 engine tests with the same shard partitions.
+
+- Combined: `bazel test //tools/boss/engine/driver:driver_test //tools/boss/engine/core:engine_lib_test --nocache_test_results`.
+- Serial: `bazel test //tools/boss/engine/core:engine_lib_test --local_test_jobs=1 --nocache_test_results`.
+- Head combined invocation: `39ffe08a-cb71-4dec-a820-bff7b1d2fa90`, exit 0; driver 3.944 s.
+- Base combined invocation: `aad9cf5e-5851-45a5-a73f-4603dc3853d3`, exit 0; driver 4.498 s.
+- Head serial invocation: `4e09d660-54a5-457a-9199-1148ba689591`, exit 3 for the retention assertion described below.
+- Base serial invocation: `ad153b0f-bbc0-4a7c-be57-c3bcc5a8190e`, exit 0.
+
+| Engine shard | Base combined (s) | Head combined (s) | Base serial (s) | Head serial (s) | Head serial retry (s) |
+| ------------ | ----------------- | ----------------- | --------------- | --------------- | --------------------- |
+| 1            | 233.082           | 213.740           | 3.222           | 4.183           | 5.294                 |
+| 2            | 236.147           | 216.277           | 3.683           | 5.066           | 3.765                 |
+| 3            | 235.650           | 215.853           | 4.651           | 4.613           | 4.761                 |
+| 4            | 234.793           | 214.950           | 7.238           | 7.250 (failed)  | 7.241                 |
+| 5            | 236.288           | 216.425           | 3.582           | 3.696           | 89.555                |
+| 6            | 234.866           | 215.060           | 4.193           | 4.033           | 3.326                 |
+| 7            | 237.105           | 217.484           | 5.391           | 5.649           | 5.734                 |
+| 8            | 235.977           | 216.170           | 3.922           | 3.946           | 6.560                 |
+| 9            | 236.185           | 216.371           | 3.803           | 3.867           | 3.890                 |
+| 10           | 236.246           | 216.359           | 3.718           | 4.103           | 4.693                 |
+| 11           | 235.264           | 215.535           | 3.942           | 3.237           | 3.400                 |
+
+The large parallel-versus-serial slowdown already occurs on the base, whose engine target does not supply `BOSS_TEST_CODEX`. All eleven base parallel shards were slower than the corresponding head shard in these runs. This does not reproduce the earlier 300 s timeout or establish its specific cause, but it does rule out treating the observed slowdown as new evidence against the pinned CLI. No timeout or assertion was changed, and the measurements do not justify moving the live pins solely to fix this slowdown.
+
+The head logs place `conformance::version_pin::generated_config_toml_loads_under_strict_config_on_pinned_codex` in shard 3, `conformance::version_pin::installed_codex_matches_pinned_version_when_present` in shard 6, and `conformance::guard_conformance::captured_tool_mode_table_matches_installed_codex_cli` in shard 8; all three passed in both runs. The slowest head parallel shard was **7 (217.484 s)**, which contains none of those live pins. Its conformance tests are `conformance::claude_goldens::golden_settings_json_standard_worker`, `conformance::grok_goldens::golden_grok_pane_command_with_reasoning_effort`, `conformance::native_transcript::every_registered_driver_surfaces_blocked_marker_from_its_native_dialect`, and `conformance::version_pin::pinned_version_constant_is_semver_shaped`; it runs 532 tests overall. Those are names from the new recorded run, not an invented mapping for the historical 210.7 s observation.
+
+The first head serial run failed `work::review_guide_sources::upstream_tests::retention_keeps_selection_and_recent_history_then_expires_terminal_series` in shard 4: artifact count was 6 instead of 0 after terminal-series collection. The test and retention implementation are byte-identical on the original base and head; the same test passed in the head combined run and both base runs. This is an unrelated intermittent assertion, not a Codex compatibility failure; no unrelated retention behavior is changed here.
+
+The complete head serial retry passed all 11 shards, including that retention test (invocation `ebd03f4b-247e-4693-9c8f-e1870d721020`, exit 0; 3.326–89.555 s per shard). Shard 5 was the 89.555 s outlier and contains none of the three live Codex pins. The explicit `bazel build //tools/boss/engine/driver:driver_test //tools/boss/engine/core:engine_lib_test` also passed (invocation `cb64bc2a-c9fa-4357-a300-02772e803f54`, exit 0).
