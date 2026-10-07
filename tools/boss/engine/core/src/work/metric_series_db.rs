@@ -64,7 +64,7 @@ fn duration_ms(started_at: Option<i64>, finished_at: i64) -> Option<i64> {
 }
 
 fn nonempty(value: Option<String>) -> Option<String> {
-    value.and_then(|v| if v.is_empty() { None } else { Some(v) })
+    value.filter(|v| !v.is_empty())
 }
 
 /// SQL expression for `dim` on the given execution-table alias, or `None`
