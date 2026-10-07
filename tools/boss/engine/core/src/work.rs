@@ -670,6 +670,7 @@ mod products_design;
 mod proposal_apply;
 mod proposals;
 mod query_ensure;
+mod review_badge;
 mod review_batches;
 mod review_findings_followup;
 mod review_guide_findings;
@@ -748,7 +749,6 @@ pub use review_batches::{
 };
 pub(crate) use review_findings_followup::*;
 pub(crate) use review_verdict_apply::*;
-pub(crate) use review_verdicts::query_latest_informative_review_verdicts;
 pub(crate) use revision_helpers::*;
 pub(crate) use task_targets::*;
 

@@ -1749,7 +1749,7 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
                     "an in-progress revision must keep ready_for_review false"
                 );
                 assert!(!t.ai_reviewing);
-                assert!(t.ai_review_state.is_none());
+                assert_eq!(t.ai_review_state.as_deref(), Some("not_reviewed"));
                 assert!(t.ai_review_findings_revision_id.is_none());
                 assert!(
                     t.has_attachments,

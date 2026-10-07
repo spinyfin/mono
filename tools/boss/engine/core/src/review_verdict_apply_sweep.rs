@@ -13,6 +13,32 @@ use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::DispatchEventSink;
 use crate::work::{GhPrStateChecker, ReviewVerdictApplyStats, WorkDb};
 
+/// Bridge the committed verdict fact to the existing work-tree invalidation
+/// channel. This covers both immediate application and crash-recovery sweeps.
+pub fn spawn_notifications(
+    event_bus: Arc<boss_event_bus::EventBus>,
+    publisher: Arc<dyn crate::coordinator::ExecutionPublisher>,
+) -> tokio::task::JoinHandle<()> {
+    // Subscribe before returning so an immediately applied verdict is not lost.
+    let subscription = event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+        boss_event_bus::EventKind::ReviewVerdictApplied,
+    ));
+    tokio::spawn(async move {
+        forward_notifications(subscription, publisher.as_ref()).await;
+    })
+}
+
+async fn forward_notifications(
+    mut subscription: boss_event_bus::Subscription,
+    publisher: &dyn crate::coordinator::ExecutionPublisher,
+) {
+    while let Some(boss_event_bus::Event::ReviewVerdictApplied { product_id, task_id }) = subscription.recv().await {
+        publisher
+            .publish_work_item_changed(&product_id, &task_id, "review_verdict_applied")
+            .await;
+    }
+}
+
 /// Cadence for the crash-recovery pass. Fresh submissions are applied
 /// immediately from the proposal handler; this interval only covers
 /// engine restarts and a failed first attempt.

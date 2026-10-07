@@ -216,7 +216,7 @@ struct PrCiIndicator: View {
 
     var body: some View {
         if let icon = systemImage {
-            Image(systemName: icon)
+            Label("CI", systemImage: icon)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(tint)
                 .help(tooltipText)
@@ -748,37 +748,19 @@ struct ResolvingCIFailureBadge: View {
     }
 }
 
-/// AI-review-state badge for a kanban card. Engine-resolved via
-/// `WorkTask.aiReviewState`; the caller only builds this view when that
-/// field is non-nil (`nil` — "not reviewed yet" — renders no badge at all,
-/// so exactly one of the five states below is ever on screen at once).
-///
-/// Icon + tooltip, not a text pill — matching `PrCiIndicator`/
-/// `PrReviewIndicator` (the two other multi-state card indicators) rather
-/// than the capsule-chip style most other badges in this file use. Glyph
-/// vocabulary is deliberately borrowed from `PrReviewIndicator` rather than
-/// four ad-hoc "brain" variants (there is no distinct SF Symbol per review
-/// outcome): `reviewed_with_findings` reuses its `changes_requested` glyph/
-/// tint (orange `exclamationmark.circle.fill` — "needs attention"),
-/// `reviewed_all_clear` reuses its `approved` glyph/tint (green
-/// `checkmark.seal.fill` — "signed off"). `reviewing` keeps the plain
-/// `brain` glyph the pre-existing "AI reviewing" chip used, for
-/// continuity with the state this badge subsumes. `review_queued` uses a
-/// clock to distinguish a pool wait from an active review. `review_not_required`
-/// gets a plain `minus.circle` — a kind never touched by AI review at all.
-///
-/// Only `reviewed_with_findings` is actionable: tapping it reveals the
-/// follow-up revision that carries the review comments, when one exists
-/// (`onRevealFindings` is `nil` when revision creation itself failed —
-/// same optional-action pattern as `PrInRevisionIndicator`).
+/// Displays the engine's current-head AI review projection. The visible
+/// label distinguishes this result from the separate CI indicator.
+/// Only findings are actionable; tapping reveals their revision.
 struct AIReviewStateBadge: View {
     let state: String
     var onRevealFindings: (() -> Void)? = nil
 
-    private var systemImage: String {
+    var systemImage: String {
         switch state {
         case "reviewing": return "brain"
         case "review_queued": return "clock.badge"
+        case "not_reviewed": return "questionmark.circle"
+        case "reviewed_clean_pending": return "clock.badge.checkmark"
         case "reviewed_with_findings": return "exclamationmark.circle.fill"
         case "reviewed_all_clear": return "checkmark.seal.fill"
         case "review_not_required": return "minus.circle"
@@ -786,10 +768,10 @@ struct AIReviewStateBadge: View {
         }
     }
 
-    private var tint: Color {
+    var tint: Color {
         switch state {
         case "reviewing": return .accentColor
-        case "review_queued": return .secondary
+        case "review_queued", "not_reviewed", "reviewed_clean_pending": return .secondary
         case "reviewed_with_findings": return .orange
         case "reviewed_all_clear": return .green
         case "review_not_required": return .secondary
@@ -797,7 +779,7 @@ struct AIReviewStateBadge: View {
         }
     }
 
-    private var tooltip: String {
+    var tooltip: String {
         switch state {
         case "reviewing":
             return "An AI reviewer pass is running on this PR."
@@ -808,7 +790,11 @@ struct AIReviewStateBadge: View {
                 ? "The AI reviewer found issues on this PR — click to reveal the follow-up revision that addresses them."
                 : "The AI reviewer found issues on this PR, but the follow-up revision could not be created."
         case "reviewed_all_clear":
-            return "The AI reviewer completed with no findings."
+            return "AI review passed for the current PR head. Required CI checks passed and no revisions are pending."
+        case "not_reviewed":
+            return "The current PR head has no completed AI review, or its head is not yet known."
+        case "reviewed_clean_pending":
+            return "AI review passed for the current PR head. CI, mergeability, or work in progress still prevent readiness."
         case "review_not_required":
             return "This kind of work item is not reviewed by the AI reviewer."
         default:
@@ -820,6 +806,8 @@ struct AIReviewStateBadge: View {
         switch state {
         case "reviewing": return "AI reviewing"
         case "review_queued": return "AI review queued"
+        case "not_reviewed": return "AI review: current head not reviewed"
+        case "reviewed_clean_pending": return "AI review passed; PR not ready"
         case "reviewed_with_findings": return "AI review found issues"
         case "reviewed_all_clear": return "AI review: all clear"
         case "review_not_required": return "AI review not required"
@@ -828,7 +816,7 @@ struct AIReviewStateBadge: View {
     }
 
     var body: some View {
-        let icon = Image(systemName: systemImage)
+        let icon = Label("AI review", systemImage: systemImage)
             .font(.caption2.weight(.semibold))
             .foregroundStyle(tint)
 

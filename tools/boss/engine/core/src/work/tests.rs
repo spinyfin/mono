@@ -507,6 +507,7 @@ mod t04;
 mod ai_review_state_tests;
 mod blocked_workspace_tests;
 mod ci_remediation_tests;
+mod current_head_review_badge_tests;
 mod decision_tests;
 mod design_doc_audit_tests;
 mod effort_model_tests;

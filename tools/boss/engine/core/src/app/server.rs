@@ -2076,6 +2076,10 @@ pub async fn serve_with_overrides(
     // stays `proposed` so GitHub probes and remediation task creation do
     // not block the worker socket. This sweep is the crash-recovery path;
     // `app::proposals` also applies immediately after a fresh submit.
+    let _review_verdict_notifications = crate::review_verdict_apply_sweep::spawn_notifications(
+        server_state.event_bus.clone(),
+        server_state.publisher.clone(),
+    );
     let _review_verdict_apply_sweep_handle = crate::review_verdict_apply_sweep::spawn_loop(
         server_state.work_db.clone(),
         server_state.execution_coordinator.clone(),

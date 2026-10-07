@@ -1590,7 +1590,7 @@ fn get_work_item_has_in_progress_revision() {
         "an in-progress revision must keep ready_for_review false"
     );
     assert!(!root.ai_reviewing, "in_review is not the AI-reviewing lane");
-    assert!(root.ai_review_state.is_none());
+    assert_eq!(root.ai_review_state.as_deref(), Some("not_reviewed"));
     assert!(root.ai_review_findings_revision_id.is_none());
     assert!(root.revision_seq.is_none(), "chain roots are not sequenced");
     assert!(root.revision_parent_pr_url.is_none());

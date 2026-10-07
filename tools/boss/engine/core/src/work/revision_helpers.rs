@@ -726,120 +726,27 @@ pub(crate) const AI_REVIEW_STATE_REVIEW_QUEUED: &str = "review_queued";
 pub(crate) const AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS: &str = "reviewed_with_findings";
 pub(crate) const AI_REVIEW_STATE_REVIEWED_ALL_CLEAR: &str = "reviewed_all_clear";
 pub(crate) const AI_REVIEW_STATE_REVIEW_NOT_REQUIRED: &str = "review_not_required";
+pub(crate) const AI_REVIEW_STATE_NOT_REVIEWED: &str = "not_reviewed";
+pub(crate) const AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING: &str = "reviewed_clean_pending";
 
-/// Resolve and set `ai_review_state` (+ `ai_review_findings_revision_id`) on
-/// every task and chore — the single AI-review badge state a kanban card
-/// should show. Must run after [`attach_revision_projections`] (reads
-/// `revision_seq`) and after [`attach_ai_reviewing_flag`] (reads
-/// `ai_reviewing`) in `get_work_tree`.
-///
-/// Precedence, evaluated top to bottom for every row — a row can satisfy
-/// more than one of these at once (e.g. reopened to Doing after an earlier
-/// completed review), so this order is load-bearing, not incidental:
-///
-/// 1. **Kind-excluded** ([`task_kind_excluded_from_ai_review`]) → always
-///    `review_not_required`, regardless of status or revision history.
-///    Deliberate simplification: a `design`/`design_postmortem`/
-///    `investigation` chain root never gets an *initial* AI review
-///    (`should_enqueue_reviewer_for_primary` excludes it), but a revision
-///    under it CAN still be reviewed via the separate, kind-independent
-///    revision-review trigger — this rule does not look through to that; the
-///    chain root's own card still reads `review_not_required`.
-/// 2. **Active (Doing)** → `reviewing` when [`attach_ai_reviewing_flag`]
-///    already set `ai_reviewing`, `review_queued` when a review is waiting
-///    for a pool slot ([`review_execution_target_id`]-attributed, so a
-///    `revision` task held `active` pending its review cycle root's review
-///    pass reads that root's `pr_review` execution rather than its own — a
-///    revision never owns one), else no badge ("not reviewed yet"). Any older verdict is ignored here: a row back in Doing has
-///    fresh, not-yet-reviewed work in flight, so a stale `reviewed_*` badge
-///    would misrepresent the current head.
-/// 3. **In Review** → same `reviewing` / `review_queued` check as Active
-///    (also fed by [`attach_ai_reviewing_flag`]) takes precedence first: a
-///    row that has already reached `in_review` stays there while a fresh
-///    automated review pass runs against it (`start_execution_run` /
-///    `request_pr_review_in_tx` deliberately never pull it back to
-///    `active` for this — see their doc comments and
-///    `tools/boss/docs/designs/work-kanban.md`'s cycle-root status
-///    contract), so the Review-lane card needs the same "a pass is running"
-///    signal Doing would have shown had the row still been there. Only when
-///    neither is true does it fall through to the verdict resolution below.
-/// 4. **In Review (no live pass) or Done** → resolve the most recent
-///    *informative* verdict (never `gave_up`/`dropped_duplicate_head` — see
-///    [`query_latest_informative_review_verdicts`]; a give-up or dropped
-///    duplicate is treated exactly like "no verdict at all," per the
-///    deliberate absence of a "review failed" state), preferring the last
-///    completed (`in_review`/`done`) direct-child revision's own id when one
-///    exists, and falling back to the row's own id when that preferred
-///    target has no informative verdict of its own (e.g. the terminal
-///    revision was never reviewed, but the chain root itself was).
-///    `completed_clean` → `reviewed_all_clear`. `completed_with_findings` /
-///    `revision_creation_failed` → `reviewed_with_findings`, plus the
-///    verdict's `revision_task_id` (the follow-up revision carrying those
-///    review comments — `None` when revision creation itself failed, so
-///    there is nothing to reveal). No informative verdict at either the
-///    preferred target or the fallback → no badge.
-/// 5. Anything else (backlog/blocked/cancelled/archived) → no badge.
+/// Resolve the card's AI review from the PR owner's observed head and the
+/// verdict ledger across its revision chain. Revision status never proves
+/// that a head was reviewed. Live review executions take precedence.
 pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
     let review_targets = review_execution_target_ids(conn, tasks, chores);
-    // The last completed (in_review/done) direct-child revision per parent
-    // id, keyed by the highest `revision_seq`. Revisions always parent
-    // directly to the chain root (never to another revision — see
-    // `insert_revision_in_tx`), so a single non-recursive group-by answers
-    // "last completed revision" with no chain walk.
-    let mut last_completed_by_parent: std::collections::HashMap<String, (i64, String)> =
-        std::collections::HashMap::new();
-    for t in tasks.iter() {
-        if t.kind != TaskKind::Revision || !matches!(t.status, TaskStatus::InReview | TaskStatus::Done) {
-            continue;
-        }
-        let parent_id = match t.parent_task_id.clone() {
-            Some(p) => p,
-            None => continue,
-        };
-        let seq = t.revision_seq.unwrap_or(0);
-        last_completed_by_parent
-            .entry(parent_id)
-            .and_modify(|(best_seq, best_id)| {
-                if seq > *best_seq {
-                    *best_seq = seq;
-                    *best_id = t.id.clone();
-                }
-            })
-            .or_insert((seq, t.id.clone()));
-    }
-
-    // Which id's verdict actually answers "is THIS card reviewed": the
-    // row's own id, unless it's a chain root in Review/Done with a last
-    // completed revision, in which case that revision's own id (verdicts
-    // are recorded against whichever row actually produced the reviewed
-    // push — see `pr_review_verdicts.work_item_id` — so a revision's own
-    // review is never recorded on the chain root).
-    let target_id = |row: &Task| -> String {
-        if row.kind != TaskKind::Revision
-            && matches!(row.status, TaskStatus::InReview | TaskStatus::Done)
-            && let Some((_, revision_id)) = last_completed_by_parent.get(&row.id)
-        {
-            return revision_id.clone();
-        }
-        row.id.clone()
-    };
-
-    // Only rows whose badge might depend on a verdict lookup — kind-
-    // reviewable and in Review/Done — need one; Active and everything-else
-    // rows resolve from `ai_reviewing`/kind alone. Collecting just those ids
-    // keeps the batched query no larger than it needs to be.
-    let mut lookup_ids: Vec<String> = tasks
+    // Only rows that can display a verdict badge need the batched lookup;
+    // a revision carries no `pr_url` of its own (its chain root does).
+    let lookup_ids: Vec<String> = tasks
         .iter()
         .chain(chores.iter())
         .filter(|row| {
             !task_kind_excluded_from_ai_review(&row.kind)
-                && matches!(row.status, TaskStatus::InReview | TaskStatus::Done)
+                && matches!(row.status, TaskStatus::Active | TaskStatus::InReview | TaskStatus::Done)
+                && (row.kind == TaskKind::Revision || row.pr_url.as_deref().is_some_and(|u| !u.is_empty()))
         })
-        .flat_map(|row| [target_id(row), row.id.clone()])
+        .map(|row| row.id.clone())
         .collect();
-    lookup_ids.sort_unstable();
-    lookup_ids.dedup();
-    let verdicts = query_latest_informative_review_verdicts(conn, &lookup_ids)?;
+    let verdicts = super::review_badge::current_head_review_states(conn, &lookup_ids)?;
     // Queue lookup is for Active/InReview cards (`review_queued`), not the
     // verdict `lookup_ids` slice above. Scope to the tree being rendered
     // rather than every ready `pr_review` in the database. InReview is
@@ -880,14 +787,6 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
             .collect()
     };
 
-    // The redirect to the last completed revision's verdict is a
-    // preference, not a hard cutover: when that target has no
-    // informative verdict of its own, fall back to the row's own
-    // verdict rather than rendering nothing. Without this fallback, a
-    // chain root whose terminal revision was never reviewed would
-    // render no badge despite holding its own verdict — a shape that
-    // occurs disproportionately once a card reaches Done and its last
-    // revision flips to `done`.
     let resolve = |row: &Task| -> (Option<&'static str>, Option<String>) {
         if task_kind_excluded_from_ai_review(&row.kind) {
             return (Some(AI_REVIEW_STATE_REVIEW_NOT_REQUIRED), None);
@@ -900,35 +799,20 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
                 .is_some_and(|targets| targets.iter().any(|target| queued_reviews.contains(target)))
         };
         match row.status {
-            TaskStatus::Active => {
-                if row.ai_reviewing {
-                    (Some(AI_REVIEW_STATE_REVIEWING), None)
-                } else if is_queued() {
-                    (Some(AI_REVIEW_STATE_REVIEW_QUEUED), None)
-                } else {
-                    (None, None)
-                }
-            }
-            TaskStatus::InReview if row.ai_reviewing => (Some(AI_REVIEW_STATE_REVIEWING), None),
-            TaskStatus::InReview if is_queued() => (Some(AI_REVIEW_STATE_REVIEW_QUEUED), None),
-            TaskStatus::InReview | TaskStatus::Done => {
-                let target = target_id(row);
-                let verdict = verdicts
-                    .get(&target)
-                    .or_else(|| if target != row.id { verdicts.get(&row.id) } else { None });
-                match verdict {
-                    None => (None, None),
-                    Some(v) => match v.gate_outcome.as_str() {
-                        REVIEW_GATE_OUTCOME_COMPLETED_CLEAN => (Some(AI_REVIEW_STATE_REVIEWED_ALL_CLEAR), None),
-                        REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS | REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED => {
-                            (Some(AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS), v.revision_task_id.clone())
-                        }
-                        // Not reachable: `query_latest_informative_review_verdicts`
-                        // already restricts to these three outcomes.
-                        _ => (None, None),
-                    },
-                }
-            }
+            TaskStatus::Active | TaskStatus::InReview if row.ai_reviewing => (Some(AI_REVIEW_STATE_REVIEWING), None),
+            TaskStatus::Active | TaskStatus::InReview if is_queued() => (Some(AI_REVIEW_STATE_REVIEW_QUEUED), None),
+            TaskStatus::Active | TaskStatus::InReview => verdicts
+                .get(&row.id)
+                .map(|(state, revision)| (Some(*state), revision.clone()))
+                .unwrap_or((None, None)),
+            // Closed work shows no badge unless a verdict matches the last
+            // observed head; "not reviewed" is only meaningful while the PR
+            // is still open (`pr_head_sha` is NULL for legacy merged cards).
+            TaskStatus::Done => verdicts
+                .get(&row.id)
+                .filter(|(state, _)| *state != AI_REVIEW_STATE_NOT_REVIEWED)
+                .map(|(state, revision)| (Some(*state), revision.clone()))
+                .unwrap_or((None, None)),
             _ => (None, None),
         }
     };
@@ -1008,7 +892,7 @@ struct ReviewGuideCardState {
 /// [`attach_review_guide_state`]. A free function (not a `WorkDb` method)
 /// so a board/work-tree read can call it on its own already-open connection
 /// rather than opening a second one — matches
-/// `query_latest_informative_review_verdicts`. The `LEFT JOIN` against
+/// `review_badge::current_head_review_states`. The `LEFT JOIN` against
 /// `pr_review_guide_versions` resolves the readable version's own
 /// `comparison_id` so staleness can be derived without a second round trip.
 ///

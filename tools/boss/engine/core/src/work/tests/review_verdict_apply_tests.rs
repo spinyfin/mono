@@ -148,12 +148,16 @@ fn findings_verdict_payload(batch_id: &str, target_sha: &str) -> String {
     )
 }
 
-#[test]
-fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
+#[tokio::test]
+async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
     let db = WorkDb::open(temp_db_path("verdict-apply-clean")).unwrap();
     let product = create_test_product(&db);
+    let product_id = product.id.clone();
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
     bind_open_pr(&db, &cycle_root.id);
+    let publisher = std::sync::Arc::new(crate::test_support::RecordingPublisher::default());
+    let notifications =
+        crate::review_verdict_apply_sweep::spawn_notifications(db.event_bus().clone(), publisher.clone());
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -185,10 +189,46 @@ fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
         .unwrap()
         .unwrap();
 
+    // The supervisor has stopped before asynchronous application. Neither
+    // the root's status nor a later worker event can refresh this clean pass.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            [&supervisor.id],
+        )
+        .unwrap();
+    db.connect().unwrap().execute(
+        "UPDATE tasks SET pr_head_sha = 'head-sha', ci_required_state = 'success', pr_mergeable_state = 'mergeable' WHERE id = ?1",
+        [&cycle_root.id],
+    ).unwrap();
     let created = db
         .apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
         .unwrap();
     assert_eq!(created, None);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !publisher.events.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("committed clean verdict must invalidate the card");
+    assert_eq!(
+        *publisher.events.lock().await,
+        vec![(
+            product_id.clone(),
+            cycle_root.id.clone(),
+            "review_verdict_applied".to_owned()
+        )]
+    );
+    notifications.abort();
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let card = tree.chores.iter().find(|task| task.id == cycle_root.id).unwrap();
+    assert_eq!(card.ai_review_state.as_deref(), Some("reviewed_all_clear"));
 
     let after = query_task(&db.connect().unwrap(), &cycle_root.id).unwrap().unwrap();
     assert_eq!(after.status, TaskStatus::InReview);

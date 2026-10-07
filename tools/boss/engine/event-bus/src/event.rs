@@ -29,6 +29,8 @@ pub enum Event {
     AnswerAgentDied { execution_id: String },
     /// Review/merge lifecycle wants one PR re-checked out of band.
     PrReconcileRequested { pr_url: String },
+    /// A durable review verdict changed the card's derived review state.
+    ReviewVerdictApplied { product_id: String, task_id: String },
     /// A `ready` execution was enqueued for dispatch.
     DispatchReady,
     /// A timer-wheel deadline elapsed.
@@ -53,6 +55,7 @@ pub enum EventKind {
     TransientErrorIdle,
     AnswerAgentDied,
     PrReconcileRequested,
+    ReviewVerdictApplied,
     DispatchReady,
     Timer,
     AutomationMutation,
@@ -74,6 +77,7 @@ impl EventKind {
             EventKind::TransientErrorIdle => "transient_error_idle",
             EventKind::AnswerAgentDied => "answer_agent_died",
             EventKind::PrReconcileRequested => "pr_reconcile_requested",
+            EventKind::ReviewVerdictApplied => "review_verdict_applied",
             EventKind::DispatchReady => "dispatch_ready",
             EventKind::Timer => "timer",
             EventKind::AutomationMutation => "automation_mutation",
@@ -93,6 +97,7 @@ impl Event {
             Event::TransientErrorIdle { .. } => EventKind::TransientErrorIdle,
             Event::AnswerAgentDied { .. } => EventKind::AnswerAgentDied,
             Event::PrReconcileRequested { .. } => EventKind::PrReconcileRequested,
+            Event::ReviewVerdictApplied { .. } => EventKind::ReviewVerdictApplied,
             Event::DispatchReady => EventKind::DispatchReady,
             Event::Timer { .. } => EventKind::Timer,
             Event::AutomationMutation => EventKind::AutomationMutation,
@@ -118,6 +123,7 @@ impl Event {
             Event::TransientErrorIdle { execution_id } => execution_id.clone(),
             Event::AnswerAgentDied { execution_id } => execution_id.clone(),
             Event::PrReconcileRequested { pr_url } => pr_url.clone(),
+            Event::ReviewVerdictApplied { task_id, .. } => task_id.clone(),
             Event::DispatchReady => String::new(),
             Event::Timer { deadline_id } => deadline_id.clone(),
             Event::AutomationMutation => String::new(),

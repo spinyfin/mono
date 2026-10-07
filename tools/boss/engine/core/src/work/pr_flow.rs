@@ -1580,6 +1580,11 @@ impl WorkDb {
             "UPDATE tasks
              SET pr_mergeable_state    = ?2,
                  pr_merge_state_status = COALESCE(?3, pr_merge_state_status),
+                 -- CI is only polled in full sweeps, so a snapshot recorded for
+                 -- the previous head says nothing about a new one: drop it
+                 -- until the next poll reports CI for the new head.
+                 ci_required_state     = CASE WHEN ?4 IS NOT NULL AND ?4 != COALESCE(pr_head_sha, '')
+                                              THEN NULL ELSE ci_required_state END,
                  pr_head_sha           = COALESCE(?4, pr_head_sha),
                  pr_status_observed_at = ?5
              WHERE id = ?1 AND deleted_at IS NULL",
