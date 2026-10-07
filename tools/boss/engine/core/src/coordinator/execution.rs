@@ -1794,8 +1794,14 @@ impl ExecutionCoordinator {
                     .filter(|(_, has_work)| *has_work)
                     .map(|(id, _)| self.work_db.execution_bookmark(id))
                     .transpose()?;
+                let report = self.work_db.execution_restore_report(&execution.id)?;
                 let record = adapter
-                    .create_execution_bookmark(&lease.workspace_path, &execution.id, predecessor.as_ref())
+                    .create_execution_bookmark(
+                        &lease.workspace_path,
+                        &execution.id,
+                        predecessor.as_ref(),
+                        report.as_ref().and_then(|r| r.inherited_base.as_deref()),
+                    )
                     .await?;
                 self.work_db.record_execution_bookmark(&record)?;
             }

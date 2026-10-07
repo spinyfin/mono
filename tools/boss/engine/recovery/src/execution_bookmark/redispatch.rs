@@ -7,6 +7,9 @@ pub struct RestoreReport {
     pub commits: String,
     pub base_sha: String,
     pub conflicts: String,
+    /// Baseline of staged revision history; predecessor provenance stays untouched.
+    #[serde(default)]
+    pub inherited_base: Option<String>,
 }
 
 impl RestoreReport {
@@ -66,46 +69,28 @@ pub async fn restore_rebased(
             ],
         )
         .await?;
-    // Keep a child as the worker's editable change. Rebase follows the
-    // preserved branch, including published PR commits, without squashing it.
-    jj.run(workspace, &["new", &head, "-m", "Resume recovered execution work"])
-        .await?;
-    if let Some(pr) = &pr_head {
-        // Bound by the prior execution's own baseline so a force-pushed PR
-        // head does not make its old published commits look unpublished.
-        let baseline = revision(&record.base());
-        let unpublished = format!("({baseline}..@) ~ (::{pr} | ::{base_sha})");
+    let inherited_base = if let Some(pr) = &pr_head {
+        // Stage copies on main, never rewrite the predecessor or the bound PR.
+        // Every fallible command can be retried from the original durable refs.
+        jj.run(workspace, &["new", &base_sha, "-m", "Resume recovered execution work"])
+            .await?;
         jj.run(
             workspace,
-            &["rebase", "-r", &unpublished, "-d", pr, "--ignore-immutable"],
+            &["duplicate", &format!("{base_sha}..{pr}"), "--insert-before", "@"],
         )
         .await?;
-        // A transplant can leave the old published baseline, and pointers at
-        // that baseline, outside the restored ancestry. Retain all restored
-        // work and use the new PR head as its baseline for successor recovery.
-        jj.run(
-            workspace,
-            &[
-                "bookmark",
-                "set",
-                &record.head(),
-                &record.publication(),
-                "-r",
-                "@",
-                "--allow-backwards",
-            ],
-        )
-        .await?;
-        jj.run(
-            workspace,
-            &["bookmark", "set", &record.base(), "-r", pr, "--allow-backwards"],
-        )
-        .await?;
-    }
-    // Like cube workspace rebase, published PR commits must be rewritable.
-    // The selected range excludes current main; no immutable main commit moves.
-    jj.run(workspace, &["rebase", "-b", "@", "-d", &base_sha, "--ignore-immutable"])
-        .await?;
+        let baseline = one_commit(jj, workspace, "@-").await?;
+        let unpublished = format!("({}..{head}) ~ (::{pr} | ::{base_sha})", revision(&record.base()));
+        jj.run(workspace, &["duplicate", &unpublished, "--insert-before", "@"])
+            .await?;
+        Some(baseline)
+    } else {
+        jj.run(workspace, &["new", &head, "-m", "Resume recovered execution work"])
+            .await?;
+        jj.run(workspace, &["rebase", "-b", "@", "-d", &base_sha, "--ignore-immutable"])
+            .await?;
+        None
+    };
     let conflicted = jj
         .run(
             workspace,
@@ -132,6 +117,7 @@ pub async fn restore_rebased(
         commits,
         base_sha,
         conflicts,
+        inherited_base,
     })
 }
 

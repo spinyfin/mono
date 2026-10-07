@@ -239,17 +239,19 @@ async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String
 /// Called after positioning, before a worker can run. Existing refs are errors:
 /// retry callers must use their persisted record, never overwrite provenance.
 pub async fn create(jj: &dyn Jj, workspace: &Path, execution_id: &str, host_id: &str) -> Result<ExecutionBookmark> {
-    create_from(jj, workspace, execution_id, host_id, None).await
+    create_from(jj, workspace, execution_id, host_id, None, None).await
 }
 
 /// Preserve inherited unpublished work across consecutive interrupted runs,
-/// even when the next worker makes no additional edits.
+/// even when the next worker makes no additional edits. A staged revision
+/// supplies its copied PR baseline through the persisted restore report.
 pub async fn create_from(
     jj: &dyn Jj,
     workspace: &Path,
     execution_id: &str,
     host_id: &str,
     predecessor: Option<&ExecutionBookmark>,
+    inherited_base: Option<&str>,
 ) -> Result<ExecutionBookmark> {
     ensure!(
         !execution_id.is_empty() && execution_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'),
@@ -266,7 +268,9 @@ pub async fn create_from(
             "inherited baseline belongs to another recovery store"
         );
         diff(jj, prior).await?;
-        revision(&prior.base())
+        inherited_base
+            .map(str::to_owned)
+            .unwrap_or_else(|| revision(&prior.base()))
     } else {
         "@-".to_owned()
     };

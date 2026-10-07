@@ -103,7 +103,7 @@ async fn consecutive_recoveries_keep_inherited_work_when_the_next_run_makes_no_e
     let prior = f.record("exec_prior").await;
     f.edit(&prior).await;
     assert!(restore(&LocalJj, &prior, &f.replacement).await.unwrap());
-    let next = create_from(&LocalJj, &f.replacement, "exec_next", "local", Some(&prior))
+    let next = create_from(&LocalJj, &f.replacement, "exec_next", "local", Some(&prior), None)
         .await
         .unwrap();
     std::fs::remove_dir_all(&f.worker).unwrap();

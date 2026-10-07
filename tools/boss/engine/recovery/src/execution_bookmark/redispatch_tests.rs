@@ -49,7 +49,7 @@ async fn chore_restores_all_commits_on_fetched_main_and_reports_provenance() {
     }
     assert!(report.instructions().contains(&main));
     assert!(report.instructions().contains(&prior.head()));
-    let next = create_from(&LocalJj, &repo.replacement, "exec_next", "local", Some(&prior))
+    let next = create_from(&LocalJj, &repo.replacement, "exec_next", "local", Some(&prior), None)
         .await
         .unwrap();
     assert!(diff(&LocalJj, &next).await.unwrap().contains("second fix"));
@@ -83,13 +83,22 @@ async fn revision_preserves_unpushed_fixes_on_top_of_newer_bound_pr_head() {
         assert!(repo.replacement.join(file).exists(), "{file}");
     }
     assert!(report.conflicts.is_empty());
+    let baseline = report.inherited_base.as_ref().unwrap();
     assert!(
         !JjRepo::run(
             &repo.replacement,
-            &["log", "-r", "pr/77::@", "--no-graph", "-T", "commit_id"]
+            &["log", "-r", &format!("{baseline}::@"), "--no-graph", "-T", "commit_id"],
         )
         .is_empty()
     );
+    let files = JjRepo::run(&repo.replacement, &["file", "list", "-r", baseline]);
+    let names: Vec<_> = files
+        .lines()
+        .map(|f| Path::new(f).file_name().unwrap().to_str().unwrap())
+        .collect();
+    assert!(names.contains(&"pr"), "{files}");
+    assert!(names.contains(&"remote-fix"), "{files}");
+    assert!(!names.contains(&"local-fix"), "{files}");
 }
 
 #[tokio::test]
@@ -110,9 +119,16 @@ async fn conflicts_remain_in_history_and_are_an_explicit_first_task() {
     assert!(report.instructions().contains("FIRST TASK"));
     let text = std::fs::read_to_string(repo.replacement.join("base.txt")).unwrap();
     assert!(text.contains("worker change") && text.contains("main change"));
-    create_from(&LocalJj, &repo.replacement, "exec_conflict_next", "local", Some(&prior))
-        .await
-        .unwrap();
+    create_from(
+        &LocalJj,
+        &repo.replacement,
+        "exec_conflict_next",
+        "local",
+        Some(&prior),
+        None,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -216,11 +232,19 @@ async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
     let prior_patch = diff(&LocalJj, &prior).await.unwrap();
     assert!(prior_patch.contains("preserved"));
     assert!(!prior_patch.contains("old published"));
-    let next = create_from(&LocalJj, &repo.replacement, "exec_successor", "local", Some(&prior))
-        .await
-        .unwrap();
+    let next = create_from(
+        &LocalJj,
+        &repo.replacement,
+        "exec_successor",
+        "local",
+        Some(&prior),
+        report.inherited_base.as_deref(),
+    )
+    .await
+    .unwrap();
     std::fs::write(repo.replacement.join("successor-fix"), "successor work").unwrap();
     JjRepo::run(&repo.replacement, &["status"]);
+    assert_eq!(diff(&LocalJj, &prior).await.unwrap(), prior_patch);
     let patch = diff(&LocalJj, &next).await.unwrap();
     assert!(patch.contains("preserved") && patch.contains("successor work"));
     restore_rebased(&LocalJj, &next, &repo.replacement, Some("pr/78"))
@@ -228,4 +252,22 @@ async fn rewritten_pr_head_does_not_replay_stale_published_commits() {
         .unwrap();
     assert!(diff(&LocalJj, &next).await.unwrap().contains("successor work"));
     assert!(!repo.replacement.join("stale-pr").exists());
+}
+
+#[tokio::test]
+async fn abandoning_revision_child_keeps_predecessor_pointers_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    origin(&repo);
+    JjRepo::run(&repo.repo, &["bookmark", "set", "pr/79", "-r", "main"]);
+    let prior = create(&LocalJj, &repo.worker, "exec_abandon", "local").await.unwrap();
+    std::fs::write(repo.worker.join("fix"), "preserved").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let patch = diff(&LocalJj, &prior).await.unwrap();
+    restore_rebased(&LocalJj, &prior, &repo.replacement, Some("pr/79"))
+        .await
+        .unwrap();
+    std::fs::write(repo.replacement.join("successor"), "unvalidated").unwrap();
+    JjRepo::run(&repo.replacement, &["abandon", "@"]);
+    assert_eq!(diff(&LocalJj, &prior).await.unwrap(), patch);
 }

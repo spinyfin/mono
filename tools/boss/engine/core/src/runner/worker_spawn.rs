@@ -2786,6 +2786,7 @@ mod compose_worker_spawn_tests {
             db.record_execution_restore_report(
                 &execution.id,
                 &RestoreReport {
+                    inherited_base: None,
                     pointer: "boss-recovery/exec_prior + pr/99".into(),
                     commits: "abc1234 Preserved work\n".into(),
                     base_sha: "0123456789abcdef".into(),

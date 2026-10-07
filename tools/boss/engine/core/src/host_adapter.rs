@@ -116,8 +116,9 @@ pub trait HostAdapter: Send + Sync {
         workspace: &Path,
         execution_id: &str,
         predecessor: Option<&ExecutionBookmark>,
+        inherited_base: Option<&str>,
     ) -> Result<ExecutionBookmark> {
-        let _ = (workspace, execution_id, predecessor);
+        let _ = (workspace, execution_id, predecessor, inherited_base);
         bail!("execution bookmarks are not supported by this host adapter")
     }
 
@@ -370,9 +371,10 @@ impl HostAdapter for LocalHostAdapter {
         workspace: &Path,
         execution_id: &str,
         predecessor: Option<&ExecutionBookmark>,
+        inherited_base: Option<&str>,
     ) -> Result<ExecutionBookmark> {
         self.cube_client
-            .create_execution_bookmark(workspace, execution_id, predecessor)
+            .create_execution_bookmark(workspace, execution_id, predecessor, inherited_base)
             .await
     }
 
@@ -827,8 +829,17 @@ impl HostAdapter for SshHostAdapter {
         workspace: &Path,
         execution_id: &str,
         predecessor: Option<&ExecutionBookmark>,
+        inherited_base: Option<&str>,
     ) -> Result<ExecutionBookmark> {
-        execution_bookmark::create_from(self, workspace, execution_id, self.host_id(), predecessor).await
+        execution_bookmark::create_from(
+            self,
+            workspace,
+            execution_id,
+            self.host_id(),
+            predecessor,
+            inherited_base,
+        )
+        .await
     }
 
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {

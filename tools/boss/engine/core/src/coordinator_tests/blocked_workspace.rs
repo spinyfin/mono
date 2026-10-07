@@ -484,6 +484,27 @@ async fn conflicting_revision_restore_reaches_the_database() {
     assert!(report.instructions().contains("FIRST TASK"));
 }
 
+/// Model a lost SSH reply after the transplant committed, before its baseline
+/// could be returned to the coordinator and persisted.
+struct InterruptedTransplant;
+
+#[async_trait::async_trait]
+impl boss_engine_recovery::execution_bookmark::Jj for InterruptedTransplant {
+    async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
+        use boss_engine_recovery::execution_bookmark::LocalJj;
+        let result = LocalJj.run(repo, args).await?;
+        if args.first() == Some(&"duplicate") && args[1].contains("boss-base/") {
+            return Err(anyhow!("injected lost reply after transplant"));
+        }
+        Ok(result)
+    }
+
+    async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
+        use boss_engine_recovery::execution_bookmark::LocalJj;
+        LocalJj.shared_repo(workspace).await
+    }
+}
+
 #[tokio::test]
 async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery() {
     use boss_engine_recovery::execution_bookmark::{LocalJj, diff};
@@ -503,13 +524,31 @@ async fn rewritten_pr_dispatch_preserves_successor_work_through_second_recovery(
         &["bookmark", "set", "pr/99", "-r", "@", "--allow-backwards"],
     );
 
+    let prior_patch = diff(&LocalJj, &record).await.unwrap();
+    let error = boss_engine_recovery::execution_bookmark::restore_rebased(
+        &InterruptedTransplant,
+        &record,
+        &h.repo.replacement,
+        Some("pr/99"),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("injected lost reply"));
+    assert_eq!(diff(&LocalJj, &record).await.unwrap(), prior_patch);
+
+    // Retry through the full coordinator, including predecessor validation.
     h.dispatch().await.unwrap();
+    let (WorkItem::Task(item) | WorkItem::Chore(item)) = db.get_work_item(&h.next.work_item_id).unwrap() else {
+        panic!("expected task or chore");
+    };
+    assert_ne!(item.status, TaskStatus::Blocked);
     let successor = db.execution_bookmark(&h.next.id).unwrap();
     assert!(diff(&LocalJj, &successor).await.unwrap().contains("unpushed revision"));
     assert!(!h.repo.replacement.join("stale-pr").exists());
     std::fs::write(h.repo.replacement.join("successor-fix"), "successor work").unwrap();
     JjRepo::run(&h.repo.replacement, &["status"]);
 
+    assert_eq!(diff(&LocalJj, &record).await.unwrap(), prior_patch);
     db.mark_execution_orphaned(&h.next.id, "second crash").unwrap();
     h.next = db.request_resume_execution(&h.next.id, 1, 0, "test").unwrap();
     *h.cube.next_workspace_id.lock().await = Some("replacement".into());

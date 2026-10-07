@@ -328,12 +328,12 @@ crate::stub_cube_client! { FakeCubeClient {
         *self.list_repos_calls.lock().await += 1;
         Ok(self.repos.lock().await.clone())
     }
-    async fn create_execution_bookmark(&self, workspace: &std::path::Path, execution_id: &str, predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
+    async fn create_execution_bookmark(&self, workspace: &std::path::Path, execution_id: &str, predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>, inherited_base: Option<&str>) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
         self.bookmark_calls.lock().await.push(execution_id.to_owned());
         if self.fail_bookmark_create { return Err(anyhow!("jj bookmark create failed")); }
         if self.real_bookmarks {
             return boss_engine_recovery::execution_bookmark::create_from(
-                &boss_engine_recovery::execution_bookmark::LocalJj, workspace, execution_id, "local", predecessor
+                &boss_engine_recovery::execution_bookmark::LocalJj, workspace, execution_id, "local", predecessor, inherited_base
             ).await;
         }
         Ok(boss_engine_recovery::execution_bookmark::ExecutionBookmark {

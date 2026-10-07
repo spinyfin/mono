@@ -622,8 +622,9 @@ pub trait CubeClient: Send + Sync {
         workspace: &Path,
         execution_id: &str,
         predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>,
+        inherited_base: Option<&str>,
     ) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
-        let _ = (workspace, execution_id, predecessor);
+        let _ = (workspace, execution_id, predecessor, inherited_base);
         anyhow::bail!("execution bookmarks are not supported by this CubeClient")
     }
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
@@ -891,6 +892,7 @@ impl CubeClient for CommandCubeClient {
         workspace: &Path,
         execution_id: &str,
         predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>,
+        inherited_base: Option<&str>,
     ) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
         boss_engine_recovery::execution_bookmark::create_from(
             &boss_engine_recovery::execution_bookmark::LocalJj,
@@ -898,6 +900,7 @@ impl CubeClient for CommandCubeClient {
             execution_id,
             "local",
             predecessor,
+            inherited_base,
         )
         .await
     }
