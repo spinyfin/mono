@@ -1503,27 +1503,59 @@ impl ExecutionCoordinator {
         // above — the PR is MERGED by construction, which `--pr` refuses
         // outright). Both must happen before handing the workspace to the
         // worker. If positioning fails, abort dispatch with a diagnosable stage.
-        let recovered = match self.recover_execution_bookmark(execution, &lease, &adapter).await {
+        let recovered = match self
+            .recover_execution_bookmark(execution, &lease, &adapter, pr_for_goto)
+            .await
+        {
             Ok(recovered) => recovered,
             Err(err) => {
                 if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
                     tracing::error!(?release_err, "failed to release lease after bookmark recovery failure");
                 }
+                // Only a damaged or missing pointer blocks the item: retrying
+                // cannot repair it. Fetch, goto and SSH failures are transient
+                // and keep the ordinary pre-start retry backoff.
+                let pointer_damaged = boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(&err);
+                if pointer_damaged
+                    && matches!(
+                        execution.kind,
+                        ExecutionKind::ChoreImplementation
+                            | ExecutionKind::TaskImplementation
+                            | ExecutionKind::RevisionImplementation
+                    )
+                {
+                    self.work_db.update_work_item_as_actor(
+                        &execution.work_item_id,
+                        boss_protocol::WorkItemPatch::builder()
+                            .status("blocked")
+                            .blocked_reason("execution_recovery_failed")
+                            .blocked_detail(format!("{err:#}"))
+                            .autostart(false)
+                            .build(),
+                        "engine",
+                    )?;
+                }
+                let attention = if pointer_damaged {
+                    (
+                        crate::execution_bookmark_recovery::RECOVERY_FAILED,
+                        "Execution bookmark recovery failed",
+                    )
+                } else {
+                    ("cube_workspace_positioning_failed", "Execution bookmark restore failed")
+                };
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
                     worker_id,
                     Some(&repo.repo_id),
-                    (
-                        crate::execution_bookmark_recovery::RECOVERY_FAILED,
-                        "Execution bookmark recovery failed",
-                    ),
+                    attention,
                     &err,
                 )?;
                 return Err(err);
             }
         };
-        let recovered_blocked = recovered.as_ref().is_some_and(|(_, has_work)| *has_work);
+        let recovered_blocked = recovered.as_ref().is_some_and(|(_, has_work)| *has_work)
+            || self.work_db.execution_restore_report(&execution.id)?.is_some();
         let goto_target = match (pr_for_goto, immutable_target_sha.as_deref()) {
             _ if recovered_blocked => None,
             (_, Some(sha)) => Some(GotoTarget::Revision(sha)),
@@ -1762,8 +1794,14 @@ impl ExecutionCoordinator {
                     .filter(|(_, has_work)| *has_work)
                     .map(|(id, _)| self.work_db.execution_bookmark(id))
                     .transpose()?;
+                let report = self.work_db.execution_restore_report(&execution.id)?;
                 let record = adapter
-                    .create_execution_bookmark(&lease.workspace_path, &execution.id, predecessor.as_ref())
+                    .create_execution_bookmark(
+                        &lease.workspace_path,
+                        &execution.id,
+                        predecessor.as_ref(),
+                        report.as_ref().and_then(|r| r.inherited_base.as_deref()),
+                    )
                     .await?;
                 self.work_db.record_execution_bookmark(&record)?;
             }
@@ -2309,7 +2347,11 @@ impl ExecutionCoordinator {
             worker_id,
             cube_repo_id,
             &error_text,
-            &self.pre_start_retry_delays,
+            if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED {
+                &[]
+            } else {
+                &self.pre_start_retry_delays
+            },
         )?;
 
         match outcome {

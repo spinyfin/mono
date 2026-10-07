@@ -8,9 +8,38 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+mod redispatch;
+pub use redispatch::{RestoreReport, restore_rebased};
+
+#[cfg(test)]
+mod redispatch_tests;
+
+/// The preserved pointer itself is missing, ambiguous, divergent or aimed at
+/// the wrong repository. Retrying cannot repair it, unlike a failed `jj`
+/// invocation (network, SSH, unavailable host), which stays an ordinary error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerIntegrityError(pub String);
+
+impl std::fmt::Display for PointerIntegrityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PointerIntegrityError {}
+
+pub fn pointer_integrity_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(PointerIntegrityError(message.into()))
+}
+
+/// True when `error` (or any cause in its chain) is a pointer-integrity failure.
+pub fn is_pointer_integrity_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<PointerIntegrityError>())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionBookmark {
@@ -108,7 +137,7 @@ fn revision(bookmark: &str) -> String {
     )
 }
 
-async fn resolve(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<String> {
+async fn resolve_optional(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<Option<String>> {
     let output = jj
         .run(
             repo,
@@ -124,28 +153,105 @@ async fn resolve(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<String> {
         )
         .await?;
     let ids: Vec<_> = output.lines().filter(|s| !s.is_empty()).collect();
-    ensure!(
-        ids.len() == 1,
-        "recovery bookmark {bookmark} must resolve to exactly one change; found {}",
-        ids.len()
-    );
-    Ok(ids[0].to_owned())
+    if ids.len() > 1 {
+        return Err(pointer_integrity_error(format!(
+            "recovery bookmark {bookmark} must resolve to exactly one change; found {}",
+            ids.len()
+        )));
+    }
+    Ok(ids.first().map(|id| (*id).to_owned()))
+}
+
+async fn resolve(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<String> {
+    resolve_optional(jj, repo, bookmark).await?.ok_or_else(|| {
+        pointer_integrity_error(format!(
+            "recovery bookmark {bookmark} must resolve to exactly one change; found 0"
+        ))
+    })
+}
+
+async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
+    let recovery = resolve_optional(jj, &record.repo_path, &record.head()).await?;
+    let publication = resolve_optional(jj, &record.repo_path, &record.publication()).await?;
+    let base = resolve(jj, &record.repo_path, &record.base()).await?;
+    for head in [&recovery, &publication].into_iter().flatten() {
+        let connected = jj
+            .run(
+                &record.repo_path,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("({base})::({head}) & ({head})"),
+                    "-T",
+                    "change_id",
+                ],
+            )
+            .await?;
+        if connected.trim() != head {
+            return Err(pointer_integrity_error(format!(
+                "preserved execution pointer is not descended from its engine-created baseline {}",
+                record.base()
+            )));
+        }
+    }
+    match (recovery, publication) {
+        (Some(recovery), Some(publication)) if recovery != publication => {
+            for (ancestor, descendant, bookmark) in [
+                (&publication, &recovery, record.head()),
+                (&recovery, &publication, record.publication()),
+            ] {
+                let connected = jj
+                    .run(
+                        &record.repo_path,
+                        &[
+                            "--ignore-working-copy",
+                            "log",
+                            "--no-graph",
+                            "-r",
+                            &format!("({ancestor})::({descendant}) & ({descendant})"),
+                            "-T",
+                            "change_id",
+                        ],
+                    )
+                    .await?;
+                if connected.trim() == descendant {
+                    return Ok(bookmark);
+                }
+            }
+            Err(pointer_integrity_error(format!(
+                "preserved pointers {} and {} diverged; refusing to drop either history",
+                record.head(),
+                record.publication()
+            )))
+        }
+        (Some(_), _) => Ok(record.head()),
+        (None, Some(_)) => Ok(record.publication()),
+        (None, None) => Err(pointer_integrity_error(format!(
+            "expected recovery pointer {} or {} to resolve to exactly one change; both are missing",
+            record.head(),
+            record.publication()
+        ))),
+    }
 }
 
 /// Called after positioning, before a worker can run. Existing refs are errors:
 /// retry callers must use their persisted record, never overwrite provenance.
 pub async fn create(jj: &dyn Jj, workspace: &Path, execution_id: &str, host_id: &str) -> Result<ExecutionBookmark> {
-    create_from(jj, workspace, execution_id, host_id, None).await
+    create_from(jj, workspace, execution_id, host_id, None, None).await
 }
 
 /// Preserve inherited unpublished work across consecutive interrupted runs,
-/// even when the next worker makes no additional edits.
+/// even when the next worker makes no additional edits. A staged revision
+/// supplies its copied PR baseline through the persisted restore report.
 pub async fn create_from(
     jj: &dyn Jj,
     workspace: &Path,
     execution_id: &str,
     host_id: &str,
     predecessor: Option<&ExecutionBookmark>,
+    inherited_base: Option<&str>,
 ) -> Result<ExecutionBookmark> {
     ensure!(
         !execution_id.is_empty() && execution_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'),
@@ -162,7 +268,9 @@ pub async fn create_from(
             "inherited baseline belongs to another recovery store"
         );
         diff(jj, prior).await?;
-        revision(&prior.base())
+        inherited_base
+            .map(str::to_owned)
+            .unwrap_or_else(|| revision(&prior.base()))
     } else {
         "@-".to_owned()
     };
@@ -181,29 +289,7 @@ pub async fn create_from(
 /// A successful empty diff proves an empty run. Missing/conflicted references,
 /// unavailable jj, and unrelated targets are errors, never empty results.
 pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
-    let head = resolve(jj, &record.repo_path, &record.head()).await?;
-    let base = resolve(jj, &record.repo_path, &record.base()).await?;
-    let ancestry = format!("({base})::({head}) & ({head})");
-    let connected = jj
-        .run(
-            &record.repo_path,
-            &[
-                "--ignore-working-copy",
-                "log",
-                "--no-graph",
-                "-r",
-                &ancestry,
-                "-T",
-                "change_id",
-            ],
-        )
-        .await?;
-    if connected.trim() != head {
-        bail!(
-            "recovery bookmark {} is not descended from its engine-created baseline",
-            record.head()
-        );
-    }
+    let head_bookmark = head_bookmark(jj, record).await?;
     let patch = jj
         .run(
             &record.repo_path,
@@ -214,7 +300,7 @@ pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
                 "--from",
                 &revision(&record.base()),
                 "--to",
-                &revision(&record.head()),
+                &revision(&head_bookmark),
             ],
         )
         .await?;
@@ -235,7 +321,7 @@ pub async fn restore(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path) 
         workspace,
         &[
             "new",
-            &revision(&record.head()),
+            &revision(&head_bookmark(jj, record).await?),
             "-m",
             "Resume recovered execution work",
         ],
@@ -254,7 +340,7 @@ pub async fn unpublished_diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result
     let range = format!(
         "({}::{} ~ ::remote_bookmarks()) & ~empty()",
         revision(&record.base()),
-        revision(&record.head())
+        revision(&head_bookmark(jj, record).await?)
     );
     let unpublished = jj
         .run(

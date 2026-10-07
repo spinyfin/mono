@@ -856,7 +856,7 @@ macro_rules! stub_cube_client {
         #[::async_trait::async_trait]
         impl $crate::coordinator::CubeClient for $ty {
             $($acc)*
-            async fn create_execution_bookmark(&self, workspace: &::std::path::Path, execution_id: &str, _predecessor: Option<&::boss_engine_recovery::execution_bookmark::ExecutionBookmark>) -> ::anyhow::Result<::boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
+            async fn create_execution_bookmark(&self, workspace: &::std::path::Path, execution_id: &str, _predecessor: Option<&::boss_engine_recovery::execution_bookmark::ExecutionBookmark>, _inherited_base: Option<&str>) -> ::anyhow::Result<::boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
                 Ok(::boss_engine_recovery::execution_bookmark::ExecutionBookmark {
                     execution_id: execution_id.to_owned(),
                     repo_path: workspace.to_path_buf(),

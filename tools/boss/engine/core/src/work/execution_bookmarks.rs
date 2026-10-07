@@ -2,6 +2,32 @@ use super::*;
 use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
 
 impl WorkDb {
+    pub(crate) fn record_execution_restore_report(
+        &self,
+        execution_id: &str,
+        report: &boss_engine_recovery::execution_bookmark::RestoreReport,
+    ) -> Result<()> {
+        self.connect()?.execute("INSERT INTO execution_restore_reports (execution_id, report) VALUES (?1, ?2) ON CONFLICT(execution_id) DO UPDATE SET report = excluded.report", params![execution_id, serde_json::to_string(report)?])?;
+        Ok(())
+    }
+
+    pub(crate) fn execution_restore_report(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<boss_engine_recovery::execution_bookmark::RestoreReport>> {
+        let report: Option<String> = self
+            .connect()?
+            .query_row(
+                "SELECT report FROM execution_restore_reports WHERE execution_id = ?1",
+                [execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        report
+            .map(|text| serde_json::from_str(&text).map_err(Into::into))
+            .transpose()
+    }
+
     pub(crate) fn terminal_bookmark_executions(&self, grace: i64, lookback: i64) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -70,8 +96,15 @@ impl WorkDb {
         let id: Option<String> = conn
             .query_row(
                 "SELECT id FROM work_executions WHERE work_item_id = ?1 AND id != ?2
-             AND started_at IS NOT NULL ORDER BY created_at DESC, id DESC LIMIT 1",
-                params![execution.work_item_id, execution.id],
+             AND kind = ?3 AND (started_at IS NOT NULL OR EXISTS (
+                 SELECT 1 FROM execution_bookmarks WHERE execution_id = work_executions.id
+             )) AND created_at <= ?4 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![
+                    execution.work_item_id,
+                    execution.id,
+                    execution.kind.as_str(),
+                    execution.created_at
+                ],
                 |row| row.get(0),
             )
             .optional()?;

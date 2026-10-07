@@ -1,43 +1,73 @@
 use super::*;
+use boss_engine_recovery::execution_bookmark::pointer_integrity_error;
 
 impl ExecutionCoordinator {
     /// Restore the predecessor's engine-created reference into the new lease.
     /// No read of its old workspace or lease history occurs.
     ///
-    /// A missing predecessor bookmark yields `None`: recovery is a precaution
-    /// layered on top of dispatch and must never be able to break it. Restore
-    /// failures of a recorded bookmark still fail the dispatch.
+    /// A started predecessor must have a durable pointer. Missing or unreadable
+    /// pointers fail dispatch rather than silently discarding preserved work;
+    /// those failures are typed (`PointerIntegrityError`) so the caller can tell
+    /// them apart from transient fetch/goto/SSH failures, which stay retryable.
+    ///
+    /// `pr_for_goto` is the bound PR number already resolved by
+    /// `pr_number_for_workspace_goto` (including the chain-root fallback), since
+    /// resume executions do not carry `pr_url`.
     pub(super) async fn recover_execution_bookmark(
         &self,
         execution: &WorkExecution,
         lease: &CubeWorkspaceLease,
         adapter: &Arc<dyn HostAdapter>,
+        pr_for_goto: Option<u64>,
     ) -> Result<Option<(String, bool)>> {
-        if let Some(record) = self.work_db.execution_bookmark_optional(&execution.id)? {
-            // A dispatch retry already owns this reference. Validate and reuse
-            // it instead of recreating refs or overwriting its provenance.
-            let has_work = adapter
-                .restore_execution_bookmark(&record, &lease.workspace_path)
-                .await?;
-            return Ok(Some((execution.id.clone(), has_work)));
+        let prior = if self.work_db.execution_bookmark_optional(&execution.id)?.is_some() {
+            execution.clone()
+        } else if let Some(prior) = self.work_db.recovery_predecessor(execution)? {
+            prior
+        } else {
+            return Ok(None);
+        };
+        let record = self.work_db.execution_bookmark_optional(&prior.id)?.ok_or_else(|| {
+            pointer_integrity_error(format!(
+                "expected engine-created recovery pointer for prior execution {}; no bookmark record exists",
+                prior.id
+            ))
+        })?;
+        if record.host_id != adapter.host_id() {
+            return Err(pointer_integrity_error(format!(
+                "execution {} recovery store is on host {}; dispatch selected {}",
+                prior.id,
+                record.host_id,
+                adapter.host_id()
+            )));
         }
-        let Some(prior) = self.work_db.recovery_predecessor(execution)? else {
-            return Ok(None);
+        let has_work = if matches!(
+            execution.kind,
+            ExecutionKind::ChoreImplementation
+                | ExecutionKind::TaskImplementation
+                | ExecutionKind::RevisionImplementation
+        ) {
+            let pr_bookmark = if execution.kind == ExecutionKind::RevisionImplementation {
+                let pr = pr_for_goto
+                    .ok_or_else(|| pointer_integrity_error("revision recovery requires its bound PR URL"))?;
+                // Cube resolves the bound PR head, fetches it, and writes pr/<n>.
+                // The preserved execution pointer survives this checkout.
+                adapter.goto_workspace(&lease.workspace_path, pr).await?;
+                Some(format!("pr/{pr}"))
+            } else {
+                None
+            };
+            let has_work = !adapter.execution_bookmark_diff(&record).await?.trim().is_empty();
+            let report = adapter
+                .restore_rebased_execution_bookmark(&record, &lease.workspace_path, pr_bookmark.as_deref())
+                .await?;
+            self.work_db.record_execution_restore_report(&execution.id, &report)?;
+            has_work
+        } else {
+            adapter
+                .restore_execution_bookmark(&record, &lease.workspace_path)
+                .await?
         };
-        let Some(record) = self.work_db.execution_bookmark_optional(&prior.id)? else {
-            self.warn_missing_execution_bookmark(execution, Some(&prior.id)).await;
-            return Ok(None);
-        };
-        anyhow::ensure!(
-            record.host_id == adapter.host_id(),
-            "execution {} recovery store is on host {}; dispatch selected {}",
-            prior.id,
-            record.host_id,
-            adapter.host_id()
-        );
-        let has_work = adapter
-            .restore_execution_bookmark(&record, &lease.workspace_path)
-            .await?;
         self.dispatch_events
             .emit(
                 DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Ok, &execution.id)

@@ -1104,7 +1104,10 @@ pub(crate) async fn compose_worker_spawn(
     let prompt_text = if execution.kind == ExecutionKind::PrReviewGuide {
         prompt_text
     } else {
-        let bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions(execution);
+        let mut bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions(execution);
+        if let Some(report) = work_db.execution_restore_report(&execution.id)? {
+            bookmark_instructions.push_str(&report.instructions());
+        }
         let (opening, rest) = prompt_text.split_once('\n').unwrap_or((&prompt_text, ""));
         format!("{opening}\n\n{bookmark_instructions}{rest}")
     };
@@ -2765,5 +2768,62 @@ mod compose_worker_spawn_tests {
         // Task pin is present, so product pin is left as-is for the resolver
         // (which will not consult it).
         assert_eq!(product, Some("grok"));
+    }
+
+    #[tokio::test]
+    async fn restore_report_reaches_the_initial_prompt_only_when_recorded() {
+        use boss_engine_recovery::execution_bookmark::RestoreReport;
+        let workspace = TempDir::new().unwrap();
+        let db = WorkDb::open(workspace.path().join("boss.db")).unwrap();
+        let product = crate::test_support::create_test_product(&db);
+        let chore = crate::test_support::create_test_chore_manual(&db, product.id, "Resume me");
+        let execution = db
+            .create_execution(
+                crate::work::CreateExecutionInput::builder()
+                    .work_item_id(&chore.id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url("git@github.com:org/repo.git")
+                    .build(),
+            )
+            .unwrap();
+        let item = WorkItem::Chore(chore);
+        let compose = || async {
+            compose_worker_spawn(
+                &db,
+                "worker-1",
+                &execution,
+                &item,
+                workspace.path(),
+                None,
+                WorkerSpawnOpts::default(),
+            )
+            .await
+            .unwrap()
+            .prompt_text
+        };
+
+        let without = compose().await;
+        assert!(!without.contains("## Restored work rebased onto main"), "{without}");
+
+        for (conflicts, first_task) in [("", false), ("Commit abc:\nbase.txt\n", true)] {
+            db.record_execution_restore_report(
+                &execution.id,
+                &RestoreReport {
+                    inherited_base: None,
+                    pointer: "boss-recovery/exec_prior + pr/99".into(),
+                    commits: "abc1234 Preserved work\n".into(),
+                    base_sha: "0123456789abcdef".into(),
+                    conflicts: conflicts.into(),
+                },
+            )
+            .unwrap();
+            let prompt = compose().await;
+            assert!(prompt.contains("## Restored work rebased onto main"), "{prompt}");
+            assert!(prompt.contains("boss-recovery/exec_prior + pr/99"), "{prompt}");
+            assert!(prompt.contains("0123456789abcdef"), "{prompt}");
+            assert!(prompt.contains("abc1234 Preserved work"), "{prompt}");
+            assert_eq!(prompt.contains("FIRST TASK"), first_task, "{prompt}");
+        }
     }
 }

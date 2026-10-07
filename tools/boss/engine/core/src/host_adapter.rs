@@ -116,8 +116,9 @@ pub trait HostAdapter: Send + Sync {
         workspace: &Path,
         execution_id: &str,
         predecessor: Option<&ExecutionBookmark>,
+        inherited_base: Option<&str>,
     ) -> Result<ExecutionBookmark> {
-        let _ = (workspace, execution_id, predecessor);
+        let _ = (workspace, execution_id, predecessor, inherited_base);
         bail!("execution bookmarks are not supported by this host adapter")
     }
 
@@ -129,6 +130,15 @@ pub trait HostAdapter: Send + Sync {
     async fn restore_execution_bookmark(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<bool> {
         let _ = (record, workspace);
         bail!("execution bookmark recovery is not supported by this host adapter")
+    }
+    async fn restore_rebased_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        pr_bookmark: Option<&str>,
+    ) -> Result<execution_bookmark::RestoreReport> {
+        let _ = (record, workspace, pr_bookmark);
+        bail!("rebased execution recovery is not supported by this host adapter")
     }
     /// Stable host identifier (e.g. `"local"`, `"zakalwe"`).
     fn host_id(&self) -> &str;
@@ -361,9 +371,10 @@ impl HostAdapter for LocalHostAdapter {
         workspace: &Path,
         execution_id: &str,
         predecessor: Option<&ExecutionBookmark>,
+        inherited_base: Option<&str>,
     ) -> Result<ExecutionBookmark> {
         self.cube_client
-            .create_execution_bookmark(workspace, execution_id, predecessor)
+            .create_execution_bookmark(workspace, execution_id, predecessor, inherited_base)
             .await
     }
 
@@ -384,6 +395,19 @@ impl HostAdapter for LocalHostAdapter {
         );
         execution_bookmark::restore(&LocalJj, record, workspace).await
     }
+    async fn restore_rebased_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        pr_bookmark: Option<&str>,
+    ) -> Result<execution_bookmark::RestoreReport> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery store belongs to another host"
+        );
+        execution_bookmark::restore_rebased(&LocalJj, record, workspace, pr_bookmark).await
+    }
+
     fn host_id(&self) -> &str {
         "local"
     }
@@ -805,8 +829,17 @@ impl HostAdapter for SshHostAdapter {
         workspace: &Path,
         execution_id: &str,
         predecessor: Option<&ExecutionBookmark>,
+        inherited_base: Option<&str>,
     ) -> Result<ExecutionBookmark> {
-        execution_bookmark::create_from(self, workspace, execution_id, self.host_id(), predecessor).await
+        execution_bookmark::create_from(
+            self,
+            workspace,
+            execution_id,
+            self.host_id(),
+            predecessor,
+            inherited_base,
+        )
+        .await
     }
 
     async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
@@ -826,6 +859,19 @@ impl HostAdapter for SshHostAdapter {
         );
         execution_bookmark::restore(self, record, workspace).await
     }
+    async fn restore_rebased_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        pr_bookmark: Option<&str>,
+    ) -> Result<execution_bookmark::RestoreReport> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery store belongs to another host"
+        );
+        execution_bookmark::restore_rebased(self, record, workspace, pr_bookmark).await
+    }
+
     fn host_id(&self) -> &str {
         &self.transport.host_id
     }
