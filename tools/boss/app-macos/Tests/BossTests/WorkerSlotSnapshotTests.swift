@@ -9,11 +9,63 @@ import XCTest
 @MainActor
 final class WorkerSlotSnapshotTests: XCTestCase {
 
+    func testEnginePersonaNamesAndPortraits() throws {
+        let client = EngineClient(socketPath: "/tmp/persona-test-\(UUID().uuidString).sock")
+        let cases: [(String?, String, TrekCharacter?)] = [
+            ("Worf", "Worf", .worf),
+            ("Ensign 41", "Ensign 41", nil),
+            ("Data (Remote)", "Data (Remote)", .data),
+            (nil, "Worker run-persona", nil),
+            ("", "Worker run-persona", nil),
+        ]
+        let store = LiveWorkerStateStore()
+        var previous: WorkerSlotSnapshot?
+        for (name, expected, portrait) in cases {
+            var payload: [String: Any] = [
+                "slot_id": 1, "run_id": "run-persona",
+                "model": "opus", "activity": "working",
+            ]
+            payload["name"] = name
+            let live = try XCTUnwrap(client.parseWorkerLiveState(payload))
+            store.update(states: [live])
+            XCTAssertEqual(store.byRunID["run-persona"]?.displayName, expected)
+            let snapshot = WorkerSlotSnapshot.build(
+                slot: WorkerSlot(slotId: 1, runId: "run-persona", idleFlavorCycle: 0),
+                liveState: live, liveStatusEnabled: true
+            )
+            XCTAssertEqual(snapshot.displayName, expected)
+            XCTAssertEqual(TrekCharacter.forPersona(snapshot.live?.name), portrait)
+            if let previous { XCTAssertNotEqual(previous, snapshot) }
+            previous = snapshot
+        }
+        let fallback = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 9, runId: "run-persona", idleFlavorCycle: 0),
+            liveState: nil, liveStatusEnabled: true
+        )
+        XCTAssertEqual(fallback.displayName, "Worker run-persona")
+    }
+
+    func testTerminalTitleUsesPersonaAndIgnoresShellTitle() {
+        let session = TerminalPaneSession(
+            id: "run-example", role: .worker(slot: 1),
+            launchSpec: TerminalLaunchSpec(
+                fontSize: 10, workingDirectory: "/tmp", initialInput: ""
+            )
+        )
+        XCTAssertEqual(session.displayTitle, "Worker example")
+        session.setWorkerName("Data (Remote)")
+        session.setTitle("Riker")
+        XCTAssertEqual(session.displayTitle, "Data (Remote)")
+        session.setTitle("")
+        XCTAssertEqual(session.displayTitle, "Data (Remote)")
+    }
+
     // MARK: - Exhaustive WorkerLiveState stored-property classification
 
     /// Fields `WorkerSlotLiveSlice` reads. Each must have a case in
     /// `testEveryRenderedLiveStateFieldFlipsSnapshotEquality`.
     private static let renderedLiveStateFieldNames: Set<String> = [
+        "name",
         "activity",
         "liveStatus",
         "recoveryStatus",
@@ -121,6 +173,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         )
 
         let flips: [(String, WorkerLiveState)] = [
+            ("name", Self.makeLiveState(name: "Worf")),
             ("activity", Self.makeLiveState(activity: .idle)),
             ("liveStatus", Self.makeLiveState(liveStatus: "something else")),
             ("recoveryStatus", Self.makeLiveState(recoveryStatus: "recovering from API error")),
@@ -446,6 +499,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     }
 
     private static func makeLiveState(
+        name: String? = nil,
         slotId: Int = 1,
         runId: String = "exec-1",
         model: String = "m",
@@ -460,6 +514,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         tmuxHosted: Bool? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
+            name: name,
             slotId: slotId,
             runId: runId,
             model: model,

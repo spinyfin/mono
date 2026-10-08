@@ -11,6 +11,17 @@ import Foundation
 /// engine's `LiveWorkerState`. Keyed by `slotId` (1..=16) — survives
 /// run-record finalisation, which happens within a second of spawn.
 struct WorkerLiveState {
+    var name: String? = nil
+
+    var displayName: String {
+        Self.displayName(name: name, runId: runId)
+    }
+
+    static func displayName(name: String?, runId: String) -> String {
+        guard let name, !name.isEmpty else { return "Worker \(runId)" }
+        return name
+    }
+
     let slotId: Int
     let runId: String
     let model: String
@@ -77,7 +88,8 @@ extension WorkerLiveState: Hashable {
     /// display forward on an independent `TimelineView` timer, so it
     /// does not depend on a fresh publish for every elapsed second.
     static func == (lhs: WorkerLiveState, rhs: WorkerLiveState) -> Bool {
-        lhs.slotId == rhs.slotId
+        lhs.name == rhs.name
+            && lhs.slotId == rhs.slotId
             && lhs.runId == rhs.runId
             && lhs.model == rhs.model
             && lhs.shellPid == rhs.shellPid
@@ -90,6 +102,7 @@ extension WorkerLiveState: Hashable {
     }
 
     func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
         hasher.combine(slotId)
         hasher.combine(runId)
         hasher.combine(model)

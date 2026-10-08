@@ -580,6 +580,7 @@ extension EngineClient {
         }
         let shellPid = (payload["shell_pid"] as? NSNumber)?.int32Value ?? 0
         return WorkerLiveState(
+            name: payload["name"] as? String,
             slotId: slotId,
             runId: runId,
             model: model,

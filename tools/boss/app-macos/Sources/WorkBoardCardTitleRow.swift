@@ -13,6 +13,7 @@ import SwiftUI
 struct WorkBoardCardTitleRowSlice: Equatable {
     let activityState: AgentActivityState?
     let assignedSlotId: Int?
+    let assignedWorkerName: String?
     let showsBlockedLock: Bool
     let name: String
     /// Used only for the revision 2-line name cap.
@@ -28,6 +29,7 @@ struct WorkBoardCardTitleRowSlice: Equatable {
     init(snapshot: WorkCardSnapshot) {
         self.activityState = snapshot.activityState
         self.assignedSlotId = snapshot.assignedSlotId
+        self.assignedWorkerName = snapshot.assignedWorkerName
         self.showsBlockedLock = snapshot.showsBlockedLock
         self.name = snapshot.name
         self.kind = snapshot.kind
@@ -59,16 +61,21 @@ struct WorkBoardCardTitleRow: View, @MainActor Equatable {
                     AgentActivityDot(state: activityState)
                         .padding(.top, 5)
                 }
-                if let slotId = slice.assignedSlotId,
-                   let character = TrekCharacter.forSlot(slotId),
-                   let nsImage = TrekIconAssets.image(character, size: .small) {
-                    Image(nsImage: nsImage)
-                        .resizable()
-                        .interpolation(.high)
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 20, height: 26)
-                        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                        .help("\(character.displayName) (slot \(slotId))")
+                if let slotId = slice.assignedSlotId, let name = slice.assignedWorkerName {
+                    Group {
+                        if let character = TrekCharacter.forPersona(name),
+                           let nsImage = TrekIconAssets.image(character, size: .small) {
+                            Image(nsImage: nsImage)
+                                .resizable()
+                                .interpolation(.high)
+                                .aspectRatio(contentMode: .fit)
+                        } else {
+                            Image(systemName: "person.crop.square")
+                        }
+                    }
+                    .frame(width: 20, height: 26)
+                    .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                    .help("\(name) (slot \(slotId))")
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
