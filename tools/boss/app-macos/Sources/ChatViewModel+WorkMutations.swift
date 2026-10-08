@@ -269,9 +269,11 @@ extension ChatViewModel {
 
     func moveSelectedTask(offset: Int) {
         guard let task = selectedTask,
-              !task.isChore,
               let projectID = task.projectID,
-              var tasks = tasksByProjectID[projectID]?.sorted(by: taskSort),
+              // The reorder endpoint accepts only ordinary project tasks;
+              // design tasks and other project members retain their ordinals.
+              var tasks = tasksByProjectID[projectID]?
+                .filter({ $0.kind == "project_task" }).sorted(by: taskSort),
               let currentIndex = tasks.firstIndex(where: { $0.id == task.id })
         else {
             return

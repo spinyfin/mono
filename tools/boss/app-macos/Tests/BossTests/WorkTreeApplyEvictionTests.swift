@@ -104,14 +104,60 @@ final class WorkTreeApplyEvictionTests: XCTestCase {
         XCTAssertEqual(after?.hasAttachments, true)
     }
 
+    func testProjectFollowupStaysInProjectAfterChoreUpdate() {
+        let model = makeModel()
+        let followup = makeTask(id: "followup", projectID: "proj_a", kind: "followup")
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [followup]))
+        XCTAssertEqual(model.task(withID: followup.id)?.status, "todo")
+
+        var updated = followup
+        updated.status = "active"
+        model.applyEventForTest(.workItemUpdated(item: .chore(updated)))
+
+        XCTAssertEqual(model.tasksByProjectID["proj_a"]?.map(\.id), [followup.id])
+        XCTAssertEqual(model.task(withID: followup.id)?.status, "active")
+        XCTAssertTrue(model.choresByProductID.values.flatMap { $0 }.isEmpty)
+        XCTAssertTrue(model.productLevelTasksByProductID.values.flatMap { $0 }.isEmpty)
+        XCTAssertTrue(model.productLevelRevisionsByProductID.values.flatMap { $0 }.isEmpty)
+        XCTAssertFalse(ChatViewModel.incrementalUpdateRequiresFullInvalidation(
+            previous: followup, updated: updated, isChore: true
+        ))
+
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [updated]))
+        XCTAssertEqual(model.tasksByProjectID["proj_a"]?.map(\.id), [followup.id])
+    }
+
+    func testMoveOrdinaryTaskInProjectWithFollowupOnlyReordersOrdinaryTasks() {
+        let model = makeModel()
+        var first = makeTask(id: "first", projectID: "proj_a", kind: "project_task")
+        first.ordinal = 1
+        var second = makeTask(id: "second", projectID: "proj_a", kind: "project_task")
+        second.ordinal = 3
+        var followup = makeTask(id: "followup", projectID: "proj_a", kind: "followup")
+        followup.ordinal = 2
+        var design = makeTask(id: "design", projectID: "proj_a", kind: "design")
+        design.ordinal = 0
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [design, first, followup, second]))
+        model.selectedWorkCardID = first.id
+        var sent: [[String: Any]] = []
+        model.engine.outboundRecorder = { sent.append($0) }
+
+        model.moveSelectedTask(offset: 1)
+
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?["type"] as? String, "reorder_project_tasks")
+        XCTAssertEqual(sent.first?["project_id"] as? String, "proj_a")
+        XCTAssertEqual(sent.first?["task_ids"] as? [String], [second.id, first.id])
+    }
+
     // MARK: - Helpers
 
-    private func makeTask(id: String, projectID: String?) -> WorkTask {
+    private func makeTask(id: String, projectID: String?, kind: String = "task") -> WorkTask {
         WorkTask(
             id: id,
             productID: "prod_test",
             projectID: projectID,
-            kind: "task",
+            kind: kind,
             name: "Task \(id)",
             description: "",
             status: "todo",

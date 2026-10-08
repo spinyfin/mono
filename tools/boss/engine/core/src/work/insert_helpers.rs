@@ -209,8 +209,8 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
 /// commits, the row is already `blocked` (if any prerequisite is
 /// unsatisfied), so the auto-dispatcher's reconcile sees the gate and
 /// parks the execution in `waiting_dependency` instead of dispatching a
-/// worker. `prerequisite_ids` are canonical work-item ids — the caller
-/// (CLI) resolves selectors like `T42` before sending. A freshly
+/// worker. `prerequisite_ids` are canonical work-item IDs. The CLI
+/// resolves short selectors to canonical work-item IDs before sending. A freshly
 /// created row can't have a live worker, so the cancelled-execution
 /// channel of [`add_dependency_edge_in_tx`] is always empty here.
 pub(crate) fn apply_create_time_dependencies(
