@@ -18,7 +18,7 @@ struct OperatorQuestion: Hashable {
     let text: String
     let answerType: AnswerType
     let explanation: String
-    /// RFC 3339 timestamp the worker's run declared the question.
+    /// When the worker's run declared the question, as the engine's epoch-seconds string (`AutomationTime.parse` also accepts RFC 3339).
     let askedAt: String
     /// The run that asked; the answer restarts the task in a new run.
     let executionID: String

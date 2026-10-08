@@ -533,7 +533,7 @@ extension ChatViewModel {
                 deferredScopeItems: deferredScopeItems,
                 deferredScopeActionInFlightIDs: deferredScopeActionInFlightIDs,
                 operatorAnswerInFlight: operatorAnswerInFlightByTaskID[task.id] != nil,
-                operatorAnswerError: operatorAnswerErrorByTaskID[task.id],
+                operatorAnswerError: operatorAnswerError(for: task),
                 showsTerminalButton: showsTerminalButton,
                 terminalTooltip: terminalTooltip,
                 showsMergeWhenReady: showsMergeWhenReady,

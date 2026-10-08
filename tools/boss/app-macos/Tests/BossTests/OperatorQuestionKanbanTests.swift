@@ -444,9 +444,32 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         model.applyEventForTest(.workError(message: "Answer request failed", requestId: "req-1"))
 
         XCTAssertNil(model.operatorAnswerInFlightByTaskID["task_q"])
-        XCTAssertEqual(model.executionsLoadFailureByTaskID["task_viewer"], "Loading failed. Retry?")
-        XCTAssertEqual(model.attachmentsLoadFailureByTaskID["task_viewer"], "Loading failed. Retry?")
+        XCTAssertEqual(model.operatorAnswerErrorByTaskID["task_q"], "Answer request failed")
+        XCTAssertTrue(model.executionsInFlightTaskIDs.contains("task_viewer"))
+        XCTAssertTrue(model.attachmentsInFlightTaskIDs.contains("task_viewer"))
+        XCTAssertNil(model.executionsLoadFailureByTaskID["task_viewer"])
+        XCTAssertNil(model.attachmentsLoadFailureByTaskID["task_viewer"])
+        XCTAssertTrue(model.mergeErrorNoticesByTaskID.isEmpty)
         XCTAssertEqual(model.workErrorMessage, "Answer request failed")
+    }
+
+    func testRefusalForEarlierQuestionIsNotShownOnALaterQuestion() {
+        let model = makeModel()
+        var task = awaiting(id: "task_q")
+        model.choresByProductID = ["prod_test": [task]]
+        model.operatorAnswerInFlightByTaskID["task_q"] = "req-1"
+        model.handleOperatorQuestionError(message: "Answer refused", requestId: "req-1")
+        XCTAssertEqual(model.operatorAnswerError(for: task), "Answer refused")
+
+        // The task re-parks later with a different question (seen via a refetch).
+        let first = task.operatorQuestion
+        task.operatorQuestion = first.map {
+            OperatorQuestion(
+                id: $0.id + "_next", text: $0.text, answerType: $0.answerType,
+                explanation: $0.explanation, askedAt: $0.askedAt, executionID: $0.executionID
+            )
+        }
+        XCTAssertNil(model.operatorAnswerError(for: task))
     }
 
     func testSnapshotCarriesTheQuestionForADoingCardOnly() throws {
