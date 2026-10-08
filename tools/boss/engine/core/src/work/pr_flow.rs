@@ -1982,14 +1982,18 @@ fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRecord> {
         .build())
 }
 
+/// The one select `map_question` reads: every `operator_questions` column
+/// plus the declaring run's summary. Append a `WHERE` clause.
+const OPERATOR_QUESTION_RECORD_SELECT: &str = "SELECT *, (SELECT json_extract(payload_json, '$.summary') \
+     FROM worker_proposals WHERE worker_proposals.id = operator_questions.proposal_id) AS run_summary \
+     FROM operator_questions";
+
 impl WorkDb {
     pub fn list_operator_questions(&self, work_item_id: &str) -> Result<Vec<OperatorQuestionRecord>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT *, (SELECT json_extract(payload_json, '$.summary') FROM worker_proposals
-             WHERE worker_proposals.id = operator_questions.proposal_id) AS run_summary
-             FROM operator_questions WHERE work_item_id = ?1 ORDER BY created_at, id",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{OPERATOR_QUESTION_RECORD_SELECT} WHERE work_item_id = ?1 ORDER BY created_at, id"
+        ))?;
         collect_rows(stmt.query_map([work_item_id], map_question)?)
     }
 
@@ -2024,10 +2028,10 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let question = tx
             .query_row(
-                "SELECT *, (SELECT json_extract(payload_json, '$.summary') FROM worker_proposals
-                 WHERE worker_proposals.id = operator_questions.proposal_id) AS run_summary
-                 FROM operator_questions WHERE id = ?1 OR work_item_id = ?1
-             ORDER BY (status = 'open') DESC, created_at DESC, id DESC LIMIT 1",
+                &format!(
+                    "{OPERATOR_QUESTION_RECORD_SELECT} WHERE id = ?1 OR work_item_id = ?1
+                     ORDER BY (status = 'open') DESC, created_at DESC, id DESC LIMIT 1"
+                ),
                 [id],
                 map_question,
             )
@@ -2099,12 +2103,7 @@ impl WorkDb {
                 minted_execution = true;
             }
             OperatorAnswer::YesNo { value: false } => {
-                let summary: String = tx.query_row(
-                    "SELECT json_extract(payload_json, '$.summary') FROM worker_proposals
-                     WHERE id = (SELECT proposal_id FROM operator_questions WHERE id = ?1)",
-                    [&question.question.id],
-                    |row| row.get(0),
-                )?;
+                let summary = question.question.run_summary.as_deref().unwrap_or("(not recorded)");
                 let detail = format!(
                     "Operator declined on {}: \"{}\"\n\nWorker's explanation: {}\n\nRun summary: {}",
                     answered_at.format("%Y-%m-%d"),

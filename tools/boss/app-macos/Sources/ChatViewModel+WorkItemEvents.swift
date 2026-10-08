@@ -220,6 +220,7 @@ extension ChatViewModel {
                 updatedTask.operatorQuestion?.id != task(withID: updatedTask.id)?.operatorQuestion?.id {
                 operatorAnswerInFlightByTaskID.removeValue(forKey: updatedTask.id)
                 operatorAnswerErrorByTaskID.removeValue(forKey: updatedTask.id)
+                operatorAnswerErrorQuestionIDByTaskID.removeValue(forKey: updatedTask.id)
             }
             // Apply the update directly to the in-memory store instead of
             // fetching the full work tree. The payload already carries the

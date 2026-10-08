@@ -106,6 +106,8 @@ final class ChatViewModel: ObservableObject {
     /// refused. Cleared by the next attempt or when a task update
     /// closes or replaces the question.
     @Published var operatorAnswerErrorByTaskID: [String: String] = [:]
+    /// The question id each `operatorAnswerErrorByTaskID` entry was recorded for.
+    var operatorAnswerErrorQuestionIDByTaskID: [String: String] = [:]
     /// Attention *groups* keyed by product id — the agent-authored
     /// notification feature (attentions.md), distinct from the operational
     /// `attentionItemsByWorkItemID` store above. Loaded on product selection /

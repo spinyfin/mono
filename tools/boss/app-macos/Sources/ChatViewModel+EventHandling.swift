@@ -200,6 +200,9 @@ extension ChatViewModel {
         case .operatorQuestionError(let message, let requestId):
             handleOperatorQuestionError(message: message, requestId: requestId)
         case .workError(let message, let requestId):
+            // An error carrying the answer's own request id is not ambiguous:
+            // settle it onto that card without blaming any other request.
+            if settleOperatorAnswerWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
             // The engine's WorkError reply carries no request context, so we
             // can't tell which in-flight list_executions/list_attachments
@@ -217,7 +220,6 @@ extension ChatViewModel {
             // case: one viewer window open, nothing else in flight) do we
             // attribute the error to the waiting viewer(s).
             let otherRequestInFlight = hasOtherTrackedAppRequestInFlight()
-            clearOperatorAnswerInFlight(requestId: requestId)
             if let attemptID = engineAttemptDetailRequestID {
                 engineAttemptDetailErrors[attemptID] = message
                 engineAttemptDetailRequestID = nil

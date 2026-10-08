@@ -72,9 +72,11 @@ impl WorkDb {
         if version < 35 {
             tx.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)")?;
         }
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 36 {
             // Schema 36 refreshes existing question views with the declaring run's summary.
             pr_flow::migrate_operator_questions(&tx)?;
+        }
+        if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
                 "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
                 [CURRENT_SCHEMA_VERSION.to_string()],

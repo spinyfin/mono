@@ -17,12 +17,13 @@ extension ChatViewModel {
         guard let question = task.operatorQuestion else { return false }
         guard operatorAnswerInFlightByTaskID[task.id] == nil else { return false }
         operatorAnswerErrorByTaskID.removeValue(forKey: task.id)
+        operatorAnswerErrorQuestionIDByTaskID.removeValue(forKey: task.id)
         guard isConnected else {
-            operatorAnswerErrorByTaskID[task.id] = "Not connected to the engine — reconnect and try again."
+            setOperatorAnswerError("Not connected to the engine — reconnect and try again.", taskID: task.id, questionID: question.id)
             return false
         }
         guard let requestID = engine.sendAnswerOperatorQuestion(id: question.id, answer: answer) else {
-            operatorAnswerErrorByTaskID[task.id] = "Couldn't send the answer to the engine. Try again."
+            setOperatorAnswerError("Couldn't send the answer to the engine. Try again.", taskID: task.id, questionID: question.id)
             return false
         }
         operatorAnswerInFlightByTaskID[task.id] = requestID
@@ -40,15 +41,36 @@ extension ChatViewModel {
             return
         }
         operatorAnswerInFlightByTaskID.removeValue(forKey: taskID)
-        operatorAnswerErrorByTaskID[taskID] = message
+        setOperatorAnswerError(message, taskID: taskID, questionID: task(withID: taskID)?.operatorQuestion?.id)
     }
 
-    /// A generic `work_error` that answers an in-flight answer request must
-    /// not leave its buttons disabled forever. The error text itself is
-    /// surfaced by the caller's normal `work_error` path.
-    func clearOperatorAnswerInFlight(requestId: String?) {
-        guard let taskID = taskIDForOperatorAnswer(requestId: requestId) else { return }
+    /// Record a refusal against the question it was about, so a later
+    /// question on the same task never shows it.
+    private func setOperatorAnswerError(_ message: String, taskID: String, questionID: String?) {
+        operatorAnswerErrorByTaskID[taskID] = message
+        operatorAnswerErrorQuestionIDByTaskID[taskID] = questionID
+    }
+
+    /// The refusal text to paint under `task`'s buttons — only when it was
+    /// recorded for the question the card currently shows.
+    func operatorAnswerError(for task: WorkTask) -> String? {
+        guard let message = operatorAnswerErrorByTaskID[task.id] else { return nil }
+        if let recorded = operatorAnswerErrorQuestionIDByTaskID[task.id],
+           recorded != task.operatorQuestion?.id {
+            return nil
+        }
+        return message
+    }
+
+    /// A `work_error` whose request id is an in-flight answer belongs to that
+    /// answer alone: settle it onto the card. Returns whether it matched.
+    func settleOperatorAnswerWorkError(message: String, requestId: String?) -> Bool {
+        guard let taskID = taskIDForOperatorAnswer(requestId: requestId) else { return false }
+        abandonBackgroundWorkRequest(requestId: requestId)
         operatorAnswerInFlightByTaskID.removeValue(forKey: taskID)
+        setOperatorAnswerError(message, taskID: taskID, questionID: task(withID: taskID)?.operatorQuestion?.id)
+        workErrorMessage = message
+        return true
     }
 
     private func taskIDForOperatorAnswer(requestId: String?) -> String? {
