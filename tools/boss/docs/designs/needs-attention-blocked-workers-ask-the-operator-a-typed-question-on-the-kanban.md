@@ -293,7 +293,9 @@ Any failure (a cycle, a description guard) rolls the whole answer back and the q
 
 **No** is the Yes/No decline unchanged: `worker_failed` in Backlog with the decline detail, which quotes the prerequisite question.
 
-**Known limit.** The dependency layer treats a prerequisite in `in_review` as satisfied for a `revision` dependent (so a revision can stack on its parent's open PR). A revision parked behind a prerequisite _chore_ is therefore redispatched when that chore opens its PR, not when it merges. That rule is pre-existing and shared with every other dependency; narrowing it to the revision's own chain is a separate change.
+**Revision dependents.** The dependency layer treats a prerequisite in `in_review` as satisfied for a `revision` dependent so a revision can stack on its own chain's open PR. `gating_prereqs_for` limits that relaxation to prerequisites in the revision's own chain: an unrelated prerequisite linked by this question (new or deduplicated) gates a revision until it is `done`, and completion redispatches it.
+
+**Dedup.** The equivalence lookup skips tasks a human has blocked, and a matching `todo` task with autostart off has autostart turned on (and the note says so), so the linked prerequisite is always one that will be dispatched.
 
 ## Risks / open questions
 

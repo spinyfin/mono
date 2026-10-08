@@ -1,8 +1,8 @@
 //! The Yes path of a `create_prerequisite_task` operator question.
 //!
 //! A blocked worker that cannot proceed until some other, unrelated piece of
-//! work lands proposes that work as a prerequisite task. When the operator
-//! answers Yes, [`approve_in_tx`] runs inside the answer transaction and:
+//! work lands proposes that work as a prerequisite task. On a Yes answer,
+//! [`approve_in_tx`] runs inside the answer transaction and:
 //!
 //! 1. finds an equivalent open task in the product or creates the proposed
 //!    one as a chore with normal dispatch (autostart on),
@@ -11,7 +11,7 @@
 //!    existing dependency cascade redispatches it once the prerequisite is
 //!    satisfied,
 //! 3. appends a dated note to the blocked task's brief recording the
-//!    operator-approved prerequisite.
+//!    approved prerequisite.
 //!
 //! Everything shares the caller's transaction, so a failure anywhere (a
 //! dependency cycle, a guard rejecting the brief) rolls the whole answer back
@@ -19,7 +19,7 @@
 
 use super::dispatch_admission::primary_pr_awaits_review;
 use super::*;
-use boss_protocol::{CREATED_VIA_ENGINE_AUTO, OperatorQuestionView};
+use boss_protocol::{CREATED_VIA_ENGINE_AUTO, OperatorQuestionView, TaskStatus};
 use chrono::{DateTime, Utc};
 
 /// The prerequisite the blocked task now waits on.
@@ -35,7 +35,8 @@ pub(super) struct LinkedPrerequisite {
 /// and case-folded, not yet satisfied (`done` / `archived`) and not deleted.
 ///
 /// Oldest first, so a repeat resolves to the same task every time. The blocked
-/// task itself is never its own prerequisite, and a candidate that already
+/// task itself is never its own prerequisite, a task a human has blocked is
+/// skipped (nothing would dispatch it), and a candidate that already
 /// depends (transitively) on the blocked task is skipped — linking to it
 /// would form a cycle the dependency layer rejects.
 fn find_equivalent_open_task(conn: &Connection, task: &Task, name: &str) -> Result<Option<Task>> {
@@ -43,6 +44,7 @@ fn find_equivalent_open_task(conn: &Connection, task: &Task, name: &str) -> Resu
         "SELECT id FROM tasks
          WHERE product_id = ?1 AND id != ?2 AND deleted_at IS NULL
            AND status NOT IN ('done', 'archived')
+           AND (status != 'blocked' OR blocked_reason = 'dependency')
            AND lower(trim(name)) = lower(trim(?3))
          ORDER BY created_at ASC, id ASC",
     )?;
@@ -90,11 +92,21 @@ pub(super) fn approve_in_tx(
         }
     };
 
+    // A same-name task parked in the backlog (autostart off) would never be
+    // dispatched, leaving the dependent waiting with no signal.
+    let enabled_dispatch = !created && prerequisite.status == TaskStatus::Todo && !prerequisite.autostart;
+    if enabled_dispatch {
+        conn.execute(
+            "UPDATE tasks SET autostart = 1, updated_at = ?2 WHERE id = ?1",
+            params![prerequisite.id, now],
+        )?;
+    }
+
     let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
     let description = format!(
         "{}{}",
         task.description,
-        prerequisite_note(question, &prerequisite, created, &timestamp)
+        prerequisite_note(question, &prerequisite, created, enabled_dispatch, &timestamp)
     );
     super::description_guard::validate_description_update(&task.description, &description, false)?;
     // `todo` + autostart first, so the edge below parks the task through the
@@ -138,7 +150,8 @@ fn queue_gated_execution(conn: &Connection, task: &Task, question: &OperatorQues
     }
     let Some(repo_remote_url) = resolve_repo_for_work_item(conn, &task.id)? else {
         // Same condition under which the reconciler refuses to mint; the
-        // sticky `repo_unresolved` attention it files is the operator's cue.
+        // sticky `repo_unresolved` attention it files surfaces the missing
+        // repository.
         return Ok(());
     };
     let preferred = query_execution(conn, &question.execution_id)?.and_then(|asking| asking.preferred_workspace_id);
@@ -157,13 +170,20 @@ fn queue_gated_execution(conn: &Connection, task: &Task, question: &OperatorQues
     Ok(())
 }
 
-fn prerequisite_note(question: &OperatorQuestionView, prerequisite: &Task, created: bool, timestamp: &str) -> String {
-    let label = match prerequisite.short_id {
-        Some(short_id) => format!("{} (T{short_id})", prerequisite.name),
-        None => prerequisite.name.clone(),
-    };
+fn prerequisite_note(
+    question: &OperatorQuestionView,
+    prerequisite: &Task,
+    created: bool,
+    enabled_dispatch: bool,
+    timestamp: &str,
+) -> String {
+    // The canonical id, never the friendly short id: a worker that quotes the
+    // note in a commit or PR body must not trip the work-item-id leakage check.
+    let label = format!("{} (`{}`)", prerequisite.name, prerequisite.id);
     let outcome = if created {
         "The engine created it as a chore with normal dispatch."
+    } else if enabled_dispatch {
+        "An equivalent task already existed in the backlog with autostart off, so the engine linked to it and turned autostart on so it is dispatched."
     } else {
         "An equivalent open task already existed, so the engine linked to it instead of creating a duplicate."
     };

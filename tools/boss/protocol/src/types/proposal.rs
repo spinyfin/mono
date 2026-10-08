@@ -651,7 +651,7 @@ pub struct OperatorQuestion {
 pub enum OperatorAnswerType {
     YesNo,
     /// The blocked task cannot proceed until some other, unrelated piece of
-    /// work lands. The operator still answers Yes/No ([`OperatorAnswer::YesNo`]);
+    /// work lands. The answer is still Yes/No ([`OperatorAnswer::YesNo`]);
     /// Yes makes the engine create `name` as a chore with `brief` as its
     /// description (or reuse an equivalent open task) and gate the blocked task
     /// behind it. The "why this task cannot unblock without it" line is the

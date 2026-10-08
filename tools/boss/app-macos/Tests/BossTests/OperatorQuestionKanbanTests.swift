@@ -104,8 +104,8 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertEqual(OperatorAnswer.yesNo(true).wirePayload["kind"] as? String, "yes_no")
     }
 
-    /// A proposal with no name or brief gives the operator nothing to judge
-    /// behind "Why?", so it falls back to the plain blocked card.
+    /// A proposal with no name or brief cannot be displayed behind
+    /// "Why?", so it falls back to the plain blocked card.
     func testParseTaskDropsPrerequisiteQuestionMissingItsProposal() throws {
         let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         var payload = basePayload()

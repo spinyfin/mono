@@ -384,8 +384,8 @@ pub(crate) struct RunDoneArgs {
     )]
     prerequisite_name: Option<String>,
 
-    /// Self-contained brief for the proposed prerequisite task: the operator
-    /// reads it on the card and the task's worker sees nothing else.
+    /// Self-contained brief for the proposed prerequisite task: the card
+    /// shows it and the task's worker sees nothing else.
     #[arg(
         long,
         requires = "answer_type",

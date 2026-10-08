@@ -47,8 +47,8 @@ struct OperatorQuestion: Hashable {
         else { return nil }
         var prerequisiteTask: PrerequisiteTaskProposal? = nil
         if answerType == .createPrerequisiteTask {
-            // A proposal with nothing to show behind "Why?" is not one the
-            // operator can judge; fall back to the plain blocked card.
+            // A proposal with nothing to show behind "Why?" cannot be
+            // displayed; fall back to the plain blocked card.
             guard let name = answerTypeDict["name"] as? String,
                   let brief = answerTypeDict["brief"] as? String
             else { return nil }

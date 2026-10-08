@@ -325,15 +325,15 @@ async fn prerequisite_yes_creates_chore_edge_and_note_then_redispatches_when_it_
         .unwrap()
         .format("%Y-%m-%d %H:%M UTC")
         .to_string();
-    let short = prerequisite.short_id.unwrap();
     assert_eq!(
         task.description,
         format!(
             "Original brief\n\n---\n\n## Operator-approved prerequisite ({timestamp})\n\n\
-- **Prerequisite task:** {PREREQUISITE_NAME} (T{short})\n\
+- **Prerequisite task:** {PREREQUISITE_NAME} (`{}`)\n\
 - **Why this task cannot proceed without it:** CI cannot go green until the fixture is fixed on main.\n\
 - **Asked by run:** `{old_execution}`\n\n\
-The operator approved this on the kanban. The engine created it as a chore with normal dispatch. This task now depends on it (a `blocks` dependency): it stays parked until the prerequisite is done, and the engine then dispatches it again. When you resume, assume the prerequisite's change is on `main`; do not redo its work here.\n"
+The operator approved this on the kanban. The engine created it as a chore with normal dispatch. This task now depends on it (a `blocks` dependency): it stays parked until the prerequisite is done, and the engine then dispatches it again. When you resume, assume the prerequisite's change is on `main`; do not redo its work here.\n",
+            prerequisite.id
         )
     );
 
@@ -442,6 +442,132 @@ async fn prerequisite_yes_links_an_equivalent_open_task_instead_of_duplicating_i
         ),
         "the brief says the existing task was reused: {}",
         task.description
+    );
+}
+
+#[tokio::test]
+async fn prerequisite_yes_enables_dispatch_on_a_backlog_candidate_and_skips_a_human_blocked_one() {
+    let (state, _dir, _, task_id) = parked_task_with_question(prerequisite_question_payload()).await;
+    let product_id = question_task(&state, &task_id).product_id;
+    let blocked = crate::test_support::create_test_chore_manual(&state.work_db, product_id.clone(), PREREQUISITE_NAME);
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'worker_failed' WHERE id = ?1",
+            [&blocked.id],
+        )
+        .unwrap();
+    let backlog = state
+        .work_db
+        .create_chore(
+            boss_protocol::CreateChoreInput::builder()
+                .product_id(product_id.clone())
+                .name(PREREQUISITE_NAME)
+                .autostart(false)
+                .force_duplicate(true)
+                .build(),
+        )
+        .unwrap();
+    assert!(!backlog.autostart);
+
+    let FrontendEvent::WorkItemUpdated {
+        item: crate::work::WorkItem::Task(task),
+    } = answer_question(&state, &task_id, true).await
+    else {
+        panic!("expected updated task");
+    };
+    assert_eq!(prerequisites_of(&state, &task_id), vec![backlog.id.clone()]);
+    let crate::work::WorkItem::Chore(linked) = state.work_db.get_work_item(&backlog.id).unwrap() else {
+        panic!("expected chore");
+    };
+    assert!(linked.autostart, "the linked backlog task is made dispatchable");
+    assert!(task.description.contains("turned autostart on so it is dispatched"));
+}
+
+/// A revision parked behind an unrelated prerequisite (new or deduplicated)
+/// is released only when that prerequisite is done, not when it opens its PR;
+/// a prerequisite in the revision's own chain keeps the `in_review` release.
+#[tokio::test]
+async fn unrelated_prerequisite_gates_a_revision_until_done_but_own_chain_does_not() {
+    use crate::test_support::{create_test_chore_manual, create_test_product_with_repo};
+    let (state, _dir) = test_server_state_with_fakes();
+    let db = &state.work_db;
+    let product = create_test_product_with_repo(db, "RevisionPrereq", Some("git@example.com:rev/prereq.git"));
+    let root = create_test_chore_manual(db, product.id.clone(), "Chain root chore");
+    let set = |id: &str, status: &str| {
+        db.update_work_item(
+            id,
+            boss_protocol::WorkItemPatch {
+                status: Some(status.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    };
+    db.update_work_item(
+        &root.id,
+        boss_protocol::WorkItemPatch {
+            status: Some("in_review".into()),
+            pr_url: Some("https://github.com/example/repo/pull/1".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let revision = db
+        .create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(root.id.as_str())
+                .description("Fix failing CI")
+                .autostart(false)
+                .build(),
+            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+        )
+        .unwrap();
+    // Both a freshly created prerequisite and an already in-review
+    // deduplicated one are unrelated tasks to the revision's chain.
+    let created = create_test_chore_manual(db, product.id.clone(), "Fresh prerequisite");
+    let deduped = create_test_chore_manual(db, product.id.clone(), "Deduplicated prerequisite");
+    set(&deduped.id, "in_review");
+    for prerequisite in [&created, &deduped] {
+        db.add_dependency(boss_protocol::AddDependencyInput {
+            dependent: revision.id.clone(),
+            prerequisite: prerequisite.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+    }
+    assert!(db.gating_prereqs_for(&revision.id).unwrap().contains(&deduped.id));
+    set(&created.id, "in_review");
+    let gating = db.gating_prereqs_for(&revision.id).unwrap();
+    assert_eq!(
+        gating.len(),
+        2,
+        "in_review on an unrelated prerequisite must not release the revision"
+    );
+    set(&created.id, "done");
+    set(&deduped.id, "done");
+    assert!(
+        db.gating_prereqs_for(&revision.id).unwrap().is_empty(),
+        "done releases the revision"
+    );
+
+    // Same-chain stacking keeps the in_review relaxation.
+    let sibling = db
+        .create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(root.id.as_str())
+                .description("Address review findings")
+                .autostart(false)
+                .build(),
+            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+        )
+        .unwrap();
+    set(&revision.id, "in_review");
+    assert!(
+        db.gating_prereqs_for(&sibling.id).unwrap().is_empty(),
+        "an in_review revision in the same chain does not gate the next writer"
     );
 }
 

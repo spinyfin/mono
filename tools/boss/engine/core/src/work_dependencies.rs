@@ -342,6 +342,11 @@ pub fn lookup_work_item_status_for_gating(conn: &Connection, work_item_id: &str)
     Ok(None)
 }
 
+/// Whether `a` and `b` share a revision chain root.
+fn same_revision_chain(conn: &Connection, a: &str, b: &str) -> Result<bool> {
+    Ok(crate::work::chain_root(conn, a)? == crate::work::chain_root(conn, b)?)
+}
+
 /// Return the prerequisite ids that currently *gate* `work_item_id`
 /// — `blocks` edges whose prereq has not reached a satisfied
 /// status. Used by both the dispatcher (to demote a gated dependent
@@ -358,7 +363,18 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
     for edge in edges {
         let status = lookup_work_item_status_for_gating(conn, &edge.prerequisite_id)?;
         match status {
-            Some(s) if status_satisfies_for_dependent(&s, dependent_kind.as_deref()) => {}
+            Some(s) if status_satisfies_for_dependent(&s, dependent_kind.as_deref()) => {
+                // The `in_review` relaxation exists so a revision can push to
+                // its own chain's open PR. A prerequisite outside that chain
+                // (an unrelated task linked by a prerequisite question) must
+                // actually land before the revision runs.
+                if dependent_kind.as_deref() == Some("revision")
+                    && s == "in_review"
+                    && !same_revision_chain(conn, work_item_id, &edge.prerequisite_id)?
+                {
+                    gating.push(edge.prerequisite_id);
+                }
+            }
             _ => gating.push(edge.prerequisite_id),
         }
     }
