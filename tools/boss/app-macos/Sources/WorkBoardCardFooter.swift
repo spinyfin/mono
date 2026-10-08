@@ -86,13 +86,15 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                             prMergeableState: slice.prMergeableState
                         )
                         .layoutPriority(-1)
-                    } else if let ciState = slice.ciRequiredState {
-                        PrCiIndicator(
-                            state: ciState,
-                            detail: slice.ciRequiredDetail
-                        )
+                    } else {
+                        if let ciState = slice.ciRequiredState {
+                            PrCiIndicator(
+                                state: ciState,
+                                detail: slice.ciRequiredDetail
+                            )
+                        }
+                        PrConflictIndicator(prMergeableState: slice.prMergeableState)
                     }
-                    PrConflictIndicator(prMergeableState: slice.prMergeableState)
                     PRURLLink(
                         urlString: prURL,
                         font: .caption,

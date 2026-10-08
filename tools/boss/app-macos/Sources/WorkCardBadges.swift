@@ -186,7 +186,7 @@ struct CIFailureChip: View {
 /// and merge-queue readiness both say nothing about whether the head merges
 /// cleanly, so a passing signal there must never be promoted to "ready" on
 /// a PR known to conflict. Keeping the comparison in one place is what stops
-/// the two call sites — `PrCiIndicator` and `MergeQueueBadge` — from drifting
+/// the two call sites — `PrConflictIndicator` and `MergeQueueBadge` — from drifting
 /// to different spellings of the same state.
 enum PrMergeability {
     static func isConflicting(_ rawState: String?) -> Bool {
@@ -204,7 +204,6 @@ enum PrMergeability {
 /// This reflects required-CI state only. Merge conflicts are a separate
 /// signal rendered by `PrConflictIndicator` beside it, so a conflicting PR
 /// with passing CI shows a green CI marker plus a conflict badge.
-
 struct PrCiIndicator: View {
     let state: String
     var detail: String? = nil
@@ -434,7 +433,7 @@ struct MergeQueueBadge: View {
     /// not-yet-queued Merge-When-Ready case. `ciRequiredState` alone says
     /// nothing about whether the PR's head actually merges cleanly — a PR
     /// can have `ciRequiredState == "success"` while GitHub reports it
-    /// `CONFLICTING` (T3271 / mono#2303), so this must be checked ahead of
+    /// `CONFLICTING` (mono#2303), so this must be checked ahead of
     /// the CI-only fallback rather than inferred from CI passing.
     var prMergeableState: String?
 
@@ -489,7 +488,7 @@ struct MergeQueueBadge: View {
         // reflects required-check status only, and auto-merge stays armed
         // on GitHub while a conflict blocks it (mono#2023 "merge when
         // ready" semantics), so CI alone must never render as mergeable
-        // when the PR is known to conflict (T3271 / mono#2303).
+        // when the PR is known to conflict (mono#2303).
         if PrMergeability.isConflicting(prMergeableState) {
             return .unmergeable
         }
