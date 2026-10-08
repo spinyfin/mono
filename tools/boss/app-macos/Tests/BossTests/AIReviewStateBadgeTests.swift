@@ -1,6 +1,7 @@
 import XCTest
 @testable import Boss
 
+@MainActor
 final class AIReviewStateBadgeTests: XCTestCase {
     @MainActor
     func testFindingsClickOpensRevisionBriefWithoutRevealingParentCard() {
@@ -46,20 +47,73 @@ final class AIReviewStateBadgeTests: XCTestCase {
         )
     }
 
+    private let presentation = AIReviewBadgePresentation(
+        label: "AI review: clean",
+        systemImage: "checkmark.seal.fill",
+        tooltip: "Last reviewed abc1234 on 2026-10-08 13:00 UTC: clean."
+    )
+
     func testOnlyCurrentHeadAllClearRendersGreen() {
-        XCTAssertEqual(AIReviewStateBadge(state: "reviewed_all_clear").tint, .green)
+        XCTAssertEqual(AIReviewStateBadge(state: "reviewed_all_clear", presentation: presentation).tint, .green)
         for state in ["not_reviewed", "reviewed_clean_pending", "reviewed_with_findings",
                       "reviewing", "review_queued", "review_not_required"] {
-            XCTAssertNotEqual(AIReviewStateBadge(state: state).tint, .green, state)
+            XCTAssertNotEqual(AIReviewStateBadge(state: state, presentation: presentation).tint, .green, state)
         }
     }
 
-    func testUnknownHeadAndCleanButNotReadyHaveDistinctExplanations() {
-        let unreviewed = AIReviewStateBadge(state: "not_reviewed")
-        XCTAssertEqual(unreviewed.systemImage, "questionmark.circle")
-        XCTAssertTrue(unreviewed.tooltip.contains("no completed AI review"))
-        let pending = AIReviewStateBadge(state: "reviewed_clean_pending")
-        XCTAssertTrue(pending.tooltip.contains("AI review passed"))
-        XCTAssertTrue(pending.tooltip.contains("prevent readiness"))
+    func testEnginePresentationVisibleOnlyInReviewForEveryCardKind() {
+        for kind in ["task", "chore", "project_task", "revision"] {
+            var task = makeTask(kind: kind)
+            task.aiReviewState = "reviewed_all_clear"
+            task.aiReviewBadge = presentation
+            task.aiReviewFindingsRevisionId = "revision"
+            for lane in [WorkBoardColumnKey.backlog, .doing, .review, .done] {
+                let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: lane))
+                let strip = WorkBoardCardBadgeStripSlice(snapshot: snapshot)
+                if lane == .review {
+                    XCTAssertEqual(strip.aiReviewBadge, presentation, kind)
+                } else {
+                    XCTAssertNil(strip.aiReviewBadge, "\(kind) in \(lane)")
+                    XCTAssertNil(strip.aiReviewState)
+                    XCTAssertNil(strip.aiReviewFindingsRevisionId)
+                }
+            }
+        }
+    }
+
+    func testBadgeCopyParticipatesInSnapshotEquality() {
+        var task = makeTask(kind: "chore")
+        task.aiReviewBadge = AIReviewBadgePresentation.parse([
+            "label": "AI review: clean", "system_image": "checkmark.seal.fill", "tooltip": "Earlier review"
+        ])
+        XCTAssertEqual(task.aiReviewBadge?.tooltip, "Earlier review")
+        let context = WorkCardSnapshotContext(column: .review)
+        let before = WorkCardSnapshot.build(task: task, context: context)
+        task.aiReviewBadge = presentation
+        let after = WorkCardSnapshot.build(task: task, context: context)
+        XCTAssertNotEqual(before, after)
+        XCTAssertNotEqual(WorkBoardCardBadgeStripSlice(snapshot: before), WorkBoardCardBadgeStripSlice(snapshot: after))
+    }
+
+    func testParserPreservesEngineCopyAndAllowsOlderPayloads() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var payload: [String: Any] = [
+            "id": "card", "product_id": "product", "kind": "chore", "name": "Card",
+            "description": "", "status": "in_review", "created_at": "0", "updated_at": "0"
+        ]
+        XCTAssertNil(try XCTUnwrap(client.parseTask(payload)).aiReviewBadge)
+        payload["ai_review_badge"] = [
+            "label": presentation.label, "system_image": presentation.systemImage,
+            "tooltip": presentation.tooltip
+        ]
+        XCTAssertEqual(try XCTUnwrap(client.parseTask(payload)).aiReviewBadge, presentation)
+    }
+
+    private func makeTask(kind: String) -> WorkTask {
+        WorkTask(
+            id: "card", productID: "product", projectID: nil, kind: kind,
+            name: "Card", description: "", status: "active", priority: "medium",
+            ordinal: nil, prURL: nil, deletedAt: nil, createdAt: "0", updatedAt: "0"
+        )
     }
 }

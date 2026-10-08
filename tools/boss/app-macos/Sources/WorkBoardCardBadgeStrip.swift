@@ -21,6 +21,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
     let showsProjectBadge: Bool
     let projectName: String?
     let aiReviewState: String?
+    let aiReviewBadge: AIReviewBadgePresentation?
     let aiReviewFindingsRevisionId: String?
     let showsResolvingConflictsBadge: Bool
     let showsResolvingCIBadge: Bool
@@ -61,6 +62,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
         self.showsProjectBadge = snapshot.showsProjectBadge
         self.projectName = snapshot.projectName
         self.aiReviewState = snapshot.aiReviewState
+        self.aiReviewBadge = snapshot.aiReviewBadge
         self.aiReviewFindingsRevisionId = snapshot.aiReviewFindingsRevisionId
         self.showsResolvingConflictsBadge = snapshot.showsResolvingConflictsBadge
         self.showsResolvingCIBadge = snapshot.showsResolvingCIBadge
@@ -147,9 +149,10 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
             if slice.showsProjectBadge, let projectName = slice.projectName {
                 WorkStatusBadge(text: projectName)
             }
-            if let aiReviewState = slice.aiReviewState {
+            if let aiReviewState = slice.aiReviewState, let presentation = slice.aiReviewBadge {
                 AIReviewStateBadge(
                     state: aiReviewState,
+                    presentation: presentation,
                     onRevealFindings: slice.aiReviewFindingsRevisionId != nil ? onRevealAIReviewFindings : nil
                 )
             }

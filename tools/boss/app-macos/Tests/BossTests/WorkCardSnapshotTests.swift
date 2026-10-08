@@ -55,6 +55,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "operatorQuestion",
         "aiReviewing",
         "aiReviewState",
+        "aiReviewBadge",
         "aiReviewFindingsRevisionId",
         "ciRequiredState",
         "ciRequiredDetail",
@@ -541,8 +542,20 @@ final class WorkCardSnapshotTests: XCTestCase {
                 }
             ),
             Case(
+                name: "aiReviewBadge",
+                context: review,
+                base: { Self.makeTask(id: "task_1", status: "in_review") },
+                mutate: {
+                    var t = $0
+                    t.aiReviewBadge = AIReviewBadgePresentation(
+                        label: "AI reviewing…", systemImage: "brain", tooltip: "Review running"
+                    )
+                    return t
+                }
+            ),
+            Case(
                 name: "aiReviewState",
-                context: backlog,
+                context: review,
                 base: {
                     var t = Self.makeTask(id: "task_1")
                     t.aiReviewState = nil
@@ -554,7 +567,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             ),
             Case(
                 name: "aiReviewFindingsRevisionId",
-                context: backlog,
+                context: review,
                 base: {
                     var t = Self.makeTask(id: "task_1")
                     t.aiReviewState = "reviewed_with_findings"
@@ -852,7 +865,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             context: WorkCardSnapshotContext(column: .doing)
         )
         XCTAssertTrue(snap.isAIReviewing)
-        XCTAssertEqual(snap.aiReviewState, "reviewing")
+        XCTAssertNil(snap.aiReviewState)
     }
 
     func testIsAIReviewingFalseOutsideDoing() {
@@ -863,11 +876,9 @@ final class WorkCardSnapshotTests: XCTestCase {
             task: task,
             context: WorkCardSnapshotContext(column: .backlog)
         )
-        // Badge visibility follows the engine-resolved `aiReviewState`
-        // verbatim (no app-side column gating); the lane activity boolean
-        // is what's column-gated.
+        // Both the badge and live activity respect their lane visibility.
         XCTAssertFalse(snap.isAIReviewing)
-        XCTAssertEqual(snap.aiReviewState, "reviewing")
+        XCTAssertNil(snap.aiReviewState)
         XCTAssertNil(snap.activityState)
     }
 
@@ -875,8 +886,7 @@ final class WorkCardSnapshotTests: XCTestCase {
     /// review pass runs against it — `start_execution_run` and
     /// `request_pr_review_in_tx` deliberately never pull it back to
     /// `active` for this. The Review-lane card must still surface that a
-    /// pass is running via the same `aiReviewState` badge Doing would show,
-    /// since nothing moves the row to make the Doing-lane chip visible.
+    /// pass is running via the Review-only badge.
     func testAIReviewStateBadgeVisibleOnReviewLaneCard() {
         var task = Self.makeTask(status: "in_review", prURL: "https://github.com/spinyfin/mono/pull/1")
         task.aiReviewing = true
