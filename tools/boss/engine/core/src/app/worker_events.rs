@@ -1546,8 +1546,7 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
 /// On the driver's turn boundary, pop a pending probe for the run (if
 /// any) and type the text into the worker's pane via tmux `send-keys`.
 /// The injection arrives at the pane just as the worker becomes idle, so
-/// the agent
-/// treats it as the next user prompt. After a successful dispatch,
+/// the agent treats it as the next user prompt. After a successful dispatch,
 /// records an in-flight entry (with the transcript path and current
 /// byte offset) so `dispatch_probe_reply_on_stop` can emit the
 /// matching `FrontendEvent::ProbeReplied` when the next boundary lands.

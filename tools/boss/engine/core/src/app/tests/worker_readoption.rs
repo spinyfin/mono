@@ -18,28 +18,6 @@ fn dead_pid() -> i64 {
     4_194_303
 }
 
-fn last_tmux_paste(runner: &RecordingPaneRunner) -> String {
-    if let Some(stdin) = runner.stdin().last()
-        && !stdin.is_empty()
-    {
-        return String::from_utf8(stdin.clone()).expect("paste is utf-8");
-    }
-    for call in runner.calls().iter().rev() {
-        if call.iter().any(|arg| arg == "send-keys")
-            && call.iter().any(|arg| arg == "-l")
-            && let Some(idx) = call.iter().position(|arg| arg == "--")
-            && let Some(text) = call.get(idx + 1)
-        {
-            return text.clone();
-        }
-    }
-    panic!(
-        "expected a tmux pane write; calls={:?} stdin={:?}",
-        runner.calls(),
-        runner.stdin()
-    )
-}
-
 /// Seed a chore with a worker in the post-spawn shape, then terminalize its
 /// execution the way a mis-fired reap does — leaving the process alive.
 /// Returns `(work_item_id, execution_id)`.
@@ -777,7 +755,7 @@ async fn readoption_registers_the_durable_tmux_session_name() {
         runner.calls(),
         runner.stdin(),
     );
-    let pasted = last_tmux_paste(&runner);
+    let pasted = runner.last_paste();
     assert!(
         pasted.contains("readopt-nudge"),
         "the pasted text must be the input sent after readoption, got {pasted:?}"
