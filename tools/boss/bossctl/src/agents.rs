@@ -1094,15 +1094,9 @@ pub(crate) async fn open_document(socket_path: &Option<String>, json: bool, path
     }
 }
 
-/// Inject `text` into the worker pane referenced by `agent`, as if
-/// the user had typed it and pressed Return. The submit step is the
-/// app-side writer's responsibility: after pasting the body via
-/// libghostty's text path it synthesises a Return keystroke, which
-/// is what makes the prompt land. Earlier revisions of this CLI
-/// appended a trailing `\n` here in the hope that the paste path
-/// would treat it as Enter; it does not (the `\n` lands as a literal
-/// newline character in the input field), so the writer owns
-/// submission now and the CLI ships the text verbatim.
+/// Send a nudge through the engine's pane delivery path. Busy interactive
+/// workers are interrupted before submission; parked workers receive the
+/// text directly. The engine owns the submit keystroke.
 pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent: String, text: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
@@ -1118,6 +1112,7 @@ pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent:
         FrontendEvent::WorkerInputSent {
             run_id: returned,
             slot_id,
+            probe_id,
         } => {
             if json {
                 println!(
@@ -1126,10 +1121,14 @@ pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent:
                         "status": "sent",
                         "run_id": returned,
                         "slot_id": slot_id,
+                        "probe_id": probe_id,
                     })
                 );
             } else {
                 println!("sent input to slot {slot_id} (run {returned})");
+                if let Some(probe_id) = probe_id {
+                    println!("check delivery with: bossctl probe-status {probe_id}");
+                }
             }
             Ok(())
         }

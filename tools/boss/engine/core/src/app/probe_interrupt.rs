@@ -161,7 +161,7 @@ enum TurnEndWait {
 /// ([`InterruptPlan::worst_case_duration`]) plus one verification window, so
 /// it cannot hang the request indefinitely.
 pub(super) async fn deliver_probe_interrupting(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     probe_id: &str,
 ) -> InterruptingDelivery {
@@ -234,7 +234,7 @@ fn refuse_if_write_transport_not_ready(server_state: &ServerState, run_id: &str)
 ///
 /// `Ok((outcome, attempts))` means the pane will now take a write.
 async fn interrupt_and_confirm(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     slot_id: u8,
 ) -> Result<(ProbeInterruptOutcome, u8), InterruptFailure> {
@@ -424,12 +424,7 @@ async fn interrupt_and_confirm(
 ///   visibly stopped.
 ///
 /// Never a fixed sleep: an interrupt that takes 200 ms is acted on in 200 ms.
-async fn wait_for_turn_end(
-    server_state: &Arc<ServerState>,
-    run_id: &str,
-    slot_id: u8,
-    plan: &InterruptPlan,
-) -> TurnEndWait {
+async fn wait_for_turn_end(server_state: &ServerState, run_id: &str, slot_id: u8, plan: &InterruptPlan) -> TurnEndWait {
     let deadline = tokio::time::Instant::now() + plan.confirm_window;
     let mut next_pane_read = tokio::time::Instant::now() + PANE_TEXT_POLL_INTERVAL;
     loop {
@@ -473,7 +468,7 @@ async fn wait_for_turn_end(
 /// re-snapshotted first so the interrupted turn's own trailing output is not
 /// later mistaken for the worker's reply.
 async fn inject_after_interrupt(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     slot_id: u8,
     probe: PendingProbe,
@@ -548,12 +543,13 @@ async fn inject_after_interrupt(
                 attempts,
                 "probe delivered after interrupting the worker's turn (delivery confirmed)",
             );
-            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
+            let detail = "submitted=true; resumed=confirmed by matching prompt hook or transcript".to_owned();
+            server_state.set_probe_lifecycle_detail(&probe_id, ProbeDeliveryState::Consumed, Some(detail.clone()));
             InterruptingDelivery {
                 state: ProbeDeliveryState::Consumed,
                 interrupt,
                 attempts,
-                detail: None,
+                detail: Some(detail),
             }
         }
         PaneInjectOutcome::PaneEcho => {
@@ -563,7 +559,7 @@ async fn inject_after_interrupt(
                 slot_id,
                 &probe_id,
                 ProbeDeliveryState::Consumed,
-                "probe pane echo observed after interrupt (parked-write consumption)",
+                "submitted=true; resumed=unconfirmed (only the pane echo was observed)",
             )
             .await;
             InterruptingDelivery {
@@ -620,7 +616,7 @@ async fn inject_after_interrupt(
                 slot_id,
                 &probe_id,
                 ProbeDeliveryState::Consumed,
-                "probe written into parked pane after interrupt (parked-write consumption)",
+                "submitted=true; resumed=unconfirmed (no matching prompt hook or transcript yet)",
             )
             .await;
             InterruptingDelivery {
@@ -682,7 +678,7 @@ async fn inject_after_interrupt(
 /// The revert only belongs on the terminal `Abandoned` branch below, where
 /// the probe truly never reaches the pane.
 async fn requeue_after_write_declined(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     probe: PendingProbe,
     interrupt: ProbeInterruptOutcome,
@@ -724,7 +720,7 @@ async fn requeue_after_write_declined(
 /// Settle a probe whose interrupt phase failed. Nothing was written, so this
 /// is terminal: no reply can arrive to correct it.
 async fn settle_interrupt_failure(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     probe: PendingProbe,
     failure: InterruptFailure,
@@ -763,7 +759,7 @@ async fn settle_interrupt_failure(
 /// and settling only the one the caller asked about would leave its siblings
 /// reading `queued` forever with nothing left to deliver them.
 async fn abandon_before_write(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     probe_id: &str,
     cause: &str,
@@ -796,11 +792,7 @@ async fn abandon_before_write(
 /// `Injected`), wait for it to record an outcome so the interrupting RPC
 /// does not answer `queued` for a write that is already in flight — the
 /// shape that made a delivered probe look like a lost one.
-async fn raced_to_another_dispatcher(
-    server_state: &Arc<ServerState>,
-    run_id: &str,
-    probe_id: &str,
-) -> InterruptingDelivery {
+async fn raced_to_another_dispatcher(server_state: &ServerState, run_id: &str, probe_id: &str) -> InterruptingDelivery {
     let in_flight_id = server_state.in_flight_probe_id(run_id);
     let state = if in_flight_id.as_deref() == Some(probe_id) {
         wait_for_other_path_to_settle(server_state, probe_id).await

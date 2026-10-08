@@ -80,10 +80,19 @@ impl ProbeQueuer for ServerStateProbeQueuer {
             tracing::debug!(run_id, "probe queuer: server state already dropped");
             return;
         };
-        // Completion-driven probes don't need the minted id — only
-        // the human-driven `ProbeRun` RPC surfaces it back to the
-        // caller. Discard it here. Completion probes are never urgent.
-        let _ = server.queue_probe(run_id.to_owned(), text.to_owned(), false);
+        // Keep the specific id: an older --no-interrupt probe must not be
+        // substituted for this nudge when the worker is busy.
+        let probe_id = server.queue_probe(run_id.to_owned(), text.to_owned(), false);
+        let busy = server
+            .worker_registry
+            .slot_for_run(run_id)
+            .is_some_and(|slot| server.pane_input_posture_for_run(run_id, slot) == PaneInputPosture::MidTurnBuffered);
+        if busy {
+            let run_id = run_id.to_owned();
+            tokio::spawn(async move {
+                super::probe_interrupt::deliver_probe_interrupting(&server, &run_id, &probe_id).await;
+            });
+        }
     }
 
     fn clear_pending_probes(&self, run_id: &str, reason: &str) {
@@ -98,12 +107,10 @@ impl ProbeQueuer for ServerStateProbeQueuer {
         server.clear_pending_probes(run_id, reason);
     }
 
-    /// Reuses the same delivery path the human-driven `ProbeRun` RPC calls
-    /// ([`super::worker_events::dispatch_probe_now`]) — including its
-    /// in-flight guard, its `(activity, driver)` posture check, and its
-    /// mid-turn-vs-parked branch. A parked (`Idle`/`WaitingForInput`) pane
-    /// is documented there as "a reliable arrival point just like Stop",
-    /// which is exactly the posture a stalled worker sits in.
+    /// Deliver parked workers through the ordinary immediate path. Busy
+    /// interactive workers already have their specific nudge scheduled by
+    /// `queue_probe`; do not race that interrupt with a composer write.
+    /// Drivers that reject mid-turn input keep waiting for their boundary.
     ///
     /// Spawned rather than awaited because [`ProbeQueuer`] is a sync trait
     /// and this is fire-and-forget by contract: the caller has already
@@ -123,6 +130,16 @@ impl ProbeQueuer for ServerStateProbeQueuer {
         };
         let run_id = run_id.to_owned();
         tokio::spawn(async move {
+            let busy = server.worker_registry.slot_for_run(&run_id).is_some_and(|slot| {
+                server.pane_input_posture_for_run(&run_id, slot) == PaneInputPosture::MidTurnBuffered
+            });
+            if busy {
+                // queue_probe already scheduled this nudge's interrupt.
+                // Do not race it with an unverified composer write or
+                // interrupt an older explicitly non-interrupting probe.
+                tracing::debug!(run_id, "probe queuer: busy nudge uses its scheduled interrupt delivery");
+                return;
+            }
             let outcome = super::worker_events::dispatch_probe_now(&server, &run_id).await;
             tracing::debug!(
                 run_id,
