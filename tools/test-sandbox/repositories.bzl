@@ -159,18 +159,30 @@ def _codex_probe_runtime(repository_ctx):
     keep this out of the common runtime manifest and bin/* PATH directory.
     The CA bundle lets the probe verify TLS without accessing the Keychain.
     """
+
+    # No python dependency: macOS resolves the shell via dscl, Linux via getent.
     result = repository_ctx.execute([
-        "/usr/bin/python3",
+        "/bin/sh",
         "-c",
-        "import os,pwd; print(pwd.getpwuid(os.getuid()).pw_shell)",
+        'u=$(id -un); if command -v dscl >/dev/null 2>&1; then dscl . -read "/Users/$u" UserShell | sed "s/^UserShell: //"; else getent passwd "$u" | cut -d: -f7; fi',
     ])
-    if result.return_code != 0:
+    shell = result.stdout.strip()
+    if result.return_code != 0 or not shell:
         fail("cannot resolve Codex probe login shell: " + result.stderr)
-    repository_ctx.symlink(repository_ctx.path(result.stdout.strip()).realpath, "codex/login-shell")
-    for candidate in ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"]:
+    repository_ctx.symlink(repository_ctx.path(shell).realpath, "codex/login-shell")
+    ca_candidates = [
+        "/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    ]
+    found_ca = False
+    for candidate in ca_candidates:
         if repository_ctx.path(candidate).exists:
             repository_ctx.symlink(repository_ctx.path(candidate).realpath, "codex/ca.pem")
+            found_ca = True
             break
+    if not found_ca:
+        fail("cannot find a CA bundle for the Codex probe; tried: " + ", ".join(ca_candidates))
     repository_ctx.file(
         "codex/BUILD.bazel",
         content = 'exports_files(["login-shell", "ca.pem"], visibility = ["@@//tools/boss/engine/core:__pkg__"])\n',

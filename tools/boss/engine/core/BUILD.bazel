@@ -215,7 +215,8 @@ rust_test(
     data = [
         # The checksum-pinned Codex release (codex_test_archives.bzl) that the
         # conformance live pins (version_pin, guard_conformance) exercise; the
-        # hermetic wrapper strips PATH, so without it they could only skip.
+        # hermetic wrapper strips PATH, so this target supplies it explicitly
+        # and the probe hard-fails when it is absent.
         "//tools/boss/engine/driver:codex_test_binary",
         "//tools/repobin",
         "@jj_test_tools//:jj",

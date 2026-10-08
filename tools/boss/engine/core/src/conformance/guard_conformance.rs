@@ -94,14 +94,20 @@
 //!
 //! # Live-probe gating
 //!
-//! The live probe requires the real `codex` binary and a real credential —
-//! set `BOSS_CODEX_GUARD_LIVE_PROBE=1` to opt in; unset (the default), it
-//! reports a skip and returns without spending anything. Opting in without a
-//! usable `codex` binary or credential is a hard failure, not a silent
-//! skip — set `BOSS_CODEX_AUTH_SOURCE=<path to an auth.json>` if the
-//! default operator-auth discovery (`$CODEX_HOME/auth.json` or
-//! `$HOME/.codex/auth.json`) will not find one under this process's `HOME`
-//! (Bazel's sandbox does not inherit the real one).
+//! The live probe requires the pinned `codex` release, the pinned code-mode
+//! host, a CA bundle, network access and a real credential. The supported
+//! entry point is the Bazel target that supplies all of them:
+//!
+//! ```text
+//! bazel test //tools/boss/engine/core:codex_guard_live_test --test_env=BOSS_CODEX_AUTH_SOURCE=<auth.json>
+//! ```
+//!
+//! Without `BOSS_CODEX_GUARD_LIVE_PROBE=1` (the default in every other
+//! target) the test reports a skip and returns without spending anything.
+//! Setting it on any other target is a hard failure, not a silent skip,
+//! because those targets do not provide the host runtime input or CA bundle.
+//! `BOSS_CODEX_AUTH_SOURCE` is needed because Bazel's sandbox does not
+//! inherit the real `HOME`, so default operator-auth discovery finds nothing.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -188,7 +194,7 @@ fn codex_dispatched_models_have_covered_tool_mode() {
              tool_mode in this harness's covered modes {COVERED_TOOL_MODES:?} (got {tool_mode:?}). \
              This is exactly the shape of gap that let a gpt-5.5-captured payload go unverified \
              against the gpt-5.6-* code-mode models Boss actually dispatches: run `codex debug \
-             models` for {model}, re-run the live probe (BOSS_CODEX_GUARD_LIVE_PROBE=1) against it, \
+             models` for {model}, re-run the live probe (`bazel test //tools/boss/engine/core:codex_guard_live_test --test_env=BOSS_CODEX_AUTH_SOURCE=<auth.json>`) against it, \
              confirm the shipped guards still behave as EXPECTED_PROBES describes, and add its \
              tool_mode to CAPTURED_CODEX_TOOL_MODES and COVERED_TOOL_MODES deliberately — do not add \
              it without re-verifying.",
@@ -326,7 +332,7 @@ struct ProbeExpectation {
 /// 2026-07-30 for `gpt-5.6-terra` and `gpt-5.6-sol` (byte-identical
 /// shape on both). Re-capture and update deliberately on a genuine drift —
 /// do not hand-edit these values to match a belief about the tool surface;
-/// re-capture them from a live probe run (`BOSS_CODEX_GUARD_LIVE_PROBE=1`),
+/// re-capture them from a live probe run (`codex_guard_live_test`),
 /// or the fixture reproduces exactly the drift it exists to catch.
 const EXPECTED_PROBES: &[ProbeExpectation] = &[
     ProbeExpectation {
@@ -480,18 +486,16 @@ fn codex_guard_conformance_against_live_dispatched_models() {
         eprintln!(
             "BOSS_CODEX_GUARD_LIVE_PROBE is not set; skipping the live Codex guard-conformance \
              probe (it spends real API calls against a real model, on purpose only when asked). \
-             Set BOSS_CODEX_GUARD_LIVE_PROBE=1 to run it — and, if the default operator-auth \
-             discovery ($CODEX_HOME/auth.json or $HOME/.codex/auth.json) will not find a \
-             credential under this process's HOME (Bazel's sandbox does not inherit the real \
-             one), also set {CODEX_AUTH_SOURCE_ENV}=<path to an auth.json>."
+             Run `bazel test //tools/boss/engine/core:codex_guard_live_test --test_env=BOSS_CODEX_AUTH_SOURCE=<auth.json>` to run it."
         );
         return;
     }
 
     let codex_bin = codex_cli_binary().unwrap_or_else(|| {
         panic!(
-            "BOSS_CODEX_GUARD_LIVE_PROBE=1 but no Codex CLI was found: BOSS_TEST_CODEX is unset \
-             and `codex` is not on PATH; install it or unset the var to skip."
+            "BOSS_CODEX_GUARD_LIVE_PROBE=1 but BOSS_TEST_CODEX is unset or unusable; the live \
+             probe only runs against the pinned release supplied by the Bazel target. Run \
+             `bazel test //tools/boss/engine/core:codex_guard_live_test --test_env=BOSS_CODEX_AUTH_SOURCE=<auth.json>`."
         )
     });
     let auth_source = resolve_probe_auth_source().unwrap_or_else(|| {
@@ -538,7 +542,7 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
     std::fs::create_dir_all(&codex_bin_dir).expect("create codex bin dir");
     std::fs::copy(codex_bin, codex_bin_dir.join("codex")).expect("stage pinned codex");
     let host = std::env::var_os("BOSS_TEST_CODEX_CODE_MODE_HOST")
-        .expect("live probe requires the pinned code-mode host runtime input");
+        .expect("BOSS_TEST_CODEX_CODE_MODE_HOST is unset; run the live probe via `bazel test //tools/boss/engine/core:codex_guard_live_test --test_env=BOSS_CODEX_AUTH_SOURCE=<auth.json>`");
     std::fs::copy(host, codex_bin_dir.join("codex-code-mode-host")).expect("stage pinned code-mode host beside codex");
     let _auth = codex_auth_source_and_path_override(&homes_root, &private_auth, &codex_bin_dir);
 
@@ -630,7 +634,7 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
         .env("CODEX_HOME", &codex_home)
         .env(
             "SSL_CERT_FILE",
-            std::fs::canonicalize(std::env::var_os("SSL_CERT_FILE").expect("live target declares a CA bundle"))
+            std::fs::canonicalize(std::env::var_os("SSL_CERT_FILE").expect("SSL_CERT_FILE is unset; run the live probe via `bazel test //tools/boss/engine/core:codex_guard_live_test --test_env=BOSS_CODEX_AUTH_SOURCE=<auth.json>`"))
                 .expect("resolve live target CA bundle"),
         )
         .env("PATH", path_with_codex)

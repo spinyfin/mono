@@ -101,17 +101,13 @@ Fresh spawns use `driver/src/codex.rs:1056` and never reload a saved CLI session
 
 ## Concurrent trust-observation measurement
 
-The review's concurrent shape was re-run with `bazel test //tools/boss/engine/driver:driver_test //tools/boss/engine/core:engine_lib_test --nocache_test_results`. With warm outputs and 12 overlapping actions, the driver took **50.4 s** and the slowest engine shard took **50.5 s** (invocation `fce4defe-7101-43e6-bea8-0cb6d5fea728`). This attempt passed, but reproduced the large slowdown close to the driver's 60 s budget; the earlier reviewed failure is not claimed to have repeated.
+When `driver_test` and `engine_lib_test` run in one Bazel invocation (`bazel test //tools/boss/engine/driver:driver_test //tools/boss/engine/core:engine_lib_test --nocache_test_results`), the driver's 30 real trust observations overlap the 11 engine shards. With warm outputs and 12 overlapping actions, the driver took 50.4 s, close to its 60 s budget, while the slowest engine shard took 50.5 s. Because of this contention, the driver target is tagged `exclusive`, so Bazel runs those observations after the engine shards finish; in the same invocation shape the driver then passed in 4.8 s. The production 10 s trust deadline, target size, and all assertions are unchanged. The tag prevents contention within one Bazel invocation; it does not reserve the host against other workloads.
 
-The driver target now has `tags = ["exclusive"]`, so Bazel runs its 30 real trust observations after the engine shards finish. In the same invocation shape after the change, driver_test passed in **4.8 s** (invocation `ee60ecc9-d0fa-40e8-aaa8-9dd45dcfb7d0`). The production 10 s trust deadline, target size, and all assertions remain unchanged. This prevents contention within one Bazel invocation; it does not reserve the host against other workloads.
-
-That post-change invocation's engine shards hit their existing 300 s timeout while still completing tests. This is recorded separately from the driver scheduling result in the PR validation, including the complete isolated-shard rerun; it is not counted as a passing combined suite.
-
-The earlier isolated run reported 3.4–210.7 s per shard (invocation `86154daa-7e9f-4570-bb88-d6aa1a7adcb0`). Its shard-level logs are not available in this revision, so the 210.7 s observation cannot be assigned reliably to a test or shard. It is not evidence for a cause of the timeout. The previous attribution to environmental concurrency sensitivity is withdrawn; the reproducible base/head measurements below replace it.
+Engine shards in a combined invocation have also hit their 300 s timeout while still completing tests. The cause was not isolated, and an earlier isolated run reporting up to 210.7 s for a shard has no shard-level logs, so that observation cannot be attributed to a test. The measurements below are reproducible and show the slowdown is present before the Codex bump.
 
 ## Base/head timeout comparison
 
-Measured on 2026-10-07 at the original PR base `9be18e6b` and the reviewed head `40f36ffc`, in the same leased workspace with the same Bazel configuration. Each run used `--nocache_test_results`; compilation is excluded from the per-shard times. Shard numbers are one-based Bazel shard IDs. Comparing the recorded test names confirms that both revisions ran the same 5,850 engine tests with the same shard partitions.
+Measured on 2026-10-07 on the pre-bump tree (`9be18e6b`, "base") and the post-bump tree (`40f36ffc`, "head") with the same Bazel configuration. Each run used `--nocache_test_results`; compilation is excluded from the per-shard times. Shard numbers are one-based Bazel shard IDs. Comparing the recorded test names confirms that both revisions ran the same 5,850 engine tests with the same shard partitions.
 
 - Combined: `bazel test //tools/boss/engine/driver:driver_test //tools/boss/engine/core:engine_lib_test --nocache_test_results`.
 - Serial: `bazel test //tools/boss/engine/core:engine_lib_test --local_test_jobs=1 --nocache_test_results`.
