@@ -431,18 +431,14 @@ Response / Error` enums in `boss-protocol` (PR #152).
     `sendDraft`, the `selectedAgent*` accessors, and
     `preferredDefaultAgentID` removed from `ChatViewModel`
     (PR #160).
-- BOSS_RUN_ID hook-correlation fix (PR #197). The Swift pane
-  allocator returns `shell_pid: 0` (the `proc_listpids` lookup
-  is still TODO at
-  `app-macos/Sources/Ghostty/WorkersWorkspaceModel.swift:42-47`),
-  which used to mean hook events couldn't correlate to runs via
-  the `LOCAL_PEERPID` ancestor walk. PR #197 sidesteps that by
-  setting `BOSS_RUN_ID` in the worker spawn env, having the
-  `boss-event` shim splice `_boss_run_id` into the JSON payload,
-  and having the events socket prefer the payload field over the
-  pid lookup. The pid path is kept as a fallback so direct-socket
-  fixtures still work and so wiring `proc_listpids` later remains
-  additive.
+- BOSS_RUN_ID hook-correlation fix (PR #197). Hook events could not
+  correlate to runs via the `LOCAL_PEERPID` ancestor walk, so PR #197
+  sets `BOSS_RUN_ID` in the worker spawn env, has the `boss-event`
+  shim splice `_boss_run_id` into the JSON payload, and has the
+  events socket prefer the payload field over the pid lookup. The
+  pid path is kept as a fallback for direct-socket fixtures. (The
+  app-side `proc_listpids` TODO this originally referenced is gone:
+  the engine now reads the pane pid from tmux.)
 - Operational follow-ups from running the spawn path end-to-end:
   - `RegisterAppSession` accepts any engine ancestor as the app;
     app sets `BOSS_APP_PID` (PRs #172, #173).
@@ -581,17 +577,13 @@ interrupt, launch, stop, transcript}`, `probe <run_id> <text>`,
 - `bossctl agents send` — needs an engine→app RPC that injects
   user-typed input into a worker pane.
 - ~~`bossctl agents interrupt`~~ — landed. Verb resolves
-  agent → run id → slot via `WorkerRegistry`, sends
-  `EngineToAppRequest::InterruptWorkerPane(slot_id)` over the
-  engine→app channel; the app synthesises an Esc keypress on
-  the slot's libghostty surface via `ghostty_surface_key` (the
-  same path `keyDown(with:)` uses), so libghostty's keymap
-  translation produces the ESC byte sequence in the pty and
-  Claude treats it as an in-flight-turn cancel. Worker run
-  stays alive — only the current turn is cancelled. Coverage:
-  `app::tests::interrupt_worker_pane_round_trips_to_app`,
-  `interrupt_worker_pane_unknown_run_returns_unknown_run`,
-  `interrupt_worker_pane_surfaces_app_error`, plus the
+  agent → run id via `WorkerRegistry` and has the engine send the
+  Esc keystroke straight to the worker's tmux pane, so Claude
+  treats it as an in-flight-turn cancel. Worker run stays alive —
+  only the current turn is cancelled. (The original
+  `EngineToAppRequest::InterruptWorkerPane(slot_id)` app round trip
+  was removed with app-hosted panes; the engine→app channel is
+  viewer-only now.) Coverage includes the
   `agents_interrupt_does_not_reject_local_caller_as_boss_only`
   integration smoke.
 - ~~`bossctl agents launch`~~ — landed. Maps to
@@ -667,7 +659,7 @@ R3, R5, R8.
   worker's workspace. If a PR exists, the work item moves to
   `in_review`, the execution finalises (`completed`, lease
   cleared, `finished_at` stamped), and `WorkerPaneReleaser` tears
-  down the libghostty pane (PR #192 wires the releaser). If no
+  down the worker's tmux session (PR #192 wired the releaser). If no
   PR exists, an `awaiting_input` signal goes out on the
   execution topic so the pane indicator can flag the worker as
   idle. Regression tests at `completion.rs:560+` cover both

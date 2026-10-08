@@ -1,10 +1,12 @@
 # Post-crash recovery: orphaned executions
 
-When the Boss macOS app is force-quit (or crashes) while a worker is
-mid-task, the libghostty pane that hosted the worker dies along with
-the app. On the next relaunch the engine restores the `work_executions`
-row from sqlite but has no live worker to reattach it to — the row is
-**orphaned**.
+Local workers live in engine-owned tmux sessions, so a Boss macOS app
+force-quit or crash does **not** kill them: the app is only a viewer that
+re-attaches on relaunch. A row becomes **orphaned** when the engine loses
+the worker itself — the tmux session is gone or absent, its identity token
+no longer matches, or an engine restart cannot re-adopt it — and the
+`work_executions` row restored from sqlite has no live worker to reattach
+to.
 
 This doc describes how the engine detects orphans, how to recover from
 them manually, and what state survives the cycle.
@@ -15,7 +17,8 @@ them manually, and what state survives the cycle.
 alongside `completed` / `failed` / `cancelled` / `abandoned`. It
 specifically denotes: _a worker was spawned for this execution, then
 the engine lost the ability to verify it was still alive (typically
-because the libghostty pane died across an engine restart)._
+because the tmux session died, its token mismatched, or the engine could
+not re-adopt it across a restart)._
 
 Compared to the other terminal statuses:
 
@@ -49,12 +52,13 @@ not yet expired; the verdict is one of:
 
 - `Live` — cube confirms the lease. The engine re-heartbeats it so the
   workspace survives the restart gap. If the row is `running` and no
-  pane was ever registered (tmux adoption missed it, no shell pid, the
-  app does not host one), startup recovery re-issues the pane spawn
-  against the already-leased workspace instead of waiting for the 300 s
-  never-attached reaper. If pane presence cannot be determined (no app
-  session yet), that is a loud `startup_pane_respawn` error, retried
-  when the app session registers — never a silent pass.
+  pane was ever registered (tmux adoption missed it: no durable tmux
+  identity matched), startup recovery re-issues the pane spawn against
+  the already-leased workspace instead of waiting for the 300 s
+  never-attached reaper. Presence is decided from the durable tmux
+  identity (`EnginePaneOracle`), not from the app; if it cannot be
+  determined, that is a loud `startup_pane_respawn` error, retried on
+  the next pass — never a silent pass.
 - `Dead` — cube says the workspace is free, the lease id has changed,
   or the lease has logically expired (TTL passed). The engine marks
   the execution `orphaned` immediately and inherits the workspace_id
@@ -74,9 +78,16 @@ status no longer matches a live execution.
 The automatic probe is bounded by cube's lease TTL (24 hours by
 default — see `tools/cube/src/app/workspace.rs::DEFAULT_LEASE_TTL_SECS`,
 and the engine's matching `LEASE_TTL_SECS` in
-`tools/boss/engine/core/src/cube_lease_heartbeat.rs`). If the
-app crash was recent, cube still reports the lease as `leased` and the
-probe verdict is `Live`, even though the worker pane is gone.
+`tools/boss/engine/core/src/cube_lease_heartbeat.rs`). If the worker's
+tmux session died recently, cube still reports the lease as `leased` and
+the probe verdict is `Live`, even though the worker is gone.
+
+**An app crash or relaunch alone is never a reason to reap.** The worker
+keeps running in its tmux session, and `agents reap` tears that session
+down (token-verified) and orphans the execution — killing a healthy,
+still-working worker. Before reaping, confirm the tmux session is really
+gone (`bossctl agents list` and the tmux inventory both show no live
+worker for the run).
 
 For that gap, the coordinator (Boss-only) can reap manually:
 
@@ -223,10 +234,11 @@ recovery-patch GC (catalogue action #17) is scoped accordingly — see
 
 ```
 # Inspect: is the execution still considered live?
-bossctl agents list                 # in-memory live workers (empty on relaunch)
+bossctl agents list                 # live workers (tmux-backed; survive app relaunch)
 boss chore show <work-item-id>      # kanban + latest execution status
 
-# Force the orphan reap if the engine missed it:
+# Force the orphan reap if the engine missed it (ONLY once the tmux
+# session is confirmed gone; never just because the app crashed):
 bossctl agents reap <run-id>
 
 # Re-dispatch a fresh worker:

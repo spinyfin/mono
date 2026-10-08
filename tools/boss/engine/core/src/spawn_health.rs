@@ -1,11 +1,14 @@
-//! Circuit breaker for the app session's worker-pane **spawn capability**.
+//! Circuit breaker for the engine's worker-pane **spawn capability** (tmux
+//! session creation and pane-pid read).
 //!
 //! ## The incident this guards against
 //!
 //! On 2026-07-05 the laptop woke from sleep and every worker-pane spawn
-//! silently produced no shell for 1.5+ hours: `ghostty_surface_new` returned
-//! NULL (no active display), the app parked the pane in a surface-less
-//! placeholder, and the engine saw `shell_pid=0` with zero hook events. The
+//! silently produced no shell for 1.5+ hours: at the time the app hosted the
+//! panes, `ghostty_surface_new` returned NULL (no active display) and the
+//! engine saw `shell_pid=0` with zero hook events. Panes are now engine-owned
+//! tmux sessions, but the same fleet-wide failure shape (no shell, no driver
+//! signal, across many work items) can still come from tmux. The
 //! [`crate::spawn_ack_sweep`] reaped each execution after 60s and redispatched
 //! it, only to fail identically. The per-work-item churn guard in
 //! [`crate::orphan_sweep`] could not stop this: it counts terminal executions
@@ -19,8 +22,8 @@
 //! periodic [`crate::spawn_ack_sweep`] feed
 //! [`SpawnHealthTracker::record_failure`]. When
 //! [`SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD`] **distinct** work items have
-//! failed to spawn a shell within [`SPAWN_HEALTH_WINDOW_SECS`], the app
-//! session's spawn path — not any one work item — is treated as broken and
+//! failed to spawn a shell within [`SPAWN_HEALTH_WINDOW_SECS`], the engine's
+//! tmux spawn path — not any one work item — is treated as broken and
 //! [`trip_spawn_capability_circuit`] fires: it always logs loudly and raises
 //! the single `app_spawn_capability_unhealthy` attention item, instead of
 //! independently churning each work item into its own churn guard.
@@ -72,10 +75,9 @@
 //! signal for that canary (hook event or transcript path — not merely a
 //! pane pid) is proof the spawn path works again and
 //! auto-resumes dispatch ([`resume_dispatch_after_breaker_recovery`]); a
-//! reap of the canary (driver-start timeout or app NACK) backs off
-//! exponentially before the next attempt. Dispatch also auto-resumes when a
-//! fresh app session registers, including after an app relaunch, which
-//! clears the breaker exactly like a driver-originated signal would. This recovery machinery is
+//! reap of the canary (driver-start timeout) backs off
+//! exponentially before the next attempt. An app relaunch does not touch the
+//! breaker: it has no effect on tmux spawning. This recovery machinery is
 //! self-gating: it only ever activates on top of a real Breaker-origin
 //! pause, and a real pause only happens when the flag is enabled, so no
 //! separate flag check is needed inside it.
@@ -278,7 +280,7 @@ pub struct SpawnFailureEvidence {
     pub class: SpawnFailureClass,
     /// The dispatch stage of the reap (`driver_start_timeout` today;
     /// historical rows may still say `spawn_ack_timeout`, `spawn_nack`,
-    /// or `pane_death_before_start`).
+    /// or `pane_death_before_start`; those decode as driver-start timeouts).
     pub cause: String,
     /// What the reap observed, in the reap's own words: the orphan reason
     /// it recorded, including its liveness-probe result.
@@ -299,13 +301,10 @@ pub struct FailureComposition {
 }
 
 /// How [`SpawnFailureClass::ShellWithoutDriverSignal`] rows broke down by
-/// recorded `cause`. An app NACK or pane death with a transcript is not a
-/// driver-start timeout.
+/// recorded `cause`. Only driver-start timeouts are produced today.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TranscriptCauses {
     pub driver_start_timeouts: usize,
-    pub spawn_nacks: usize,
-    pub pane_deaths: usize,
 }
 
 impl FailureComposition {
@@ -324,11 +323,7 @@ impl FailureComposition {
                     if entry.shell_pid <= 0 {
                         composition.every_driver_start_had_a_shell = false;
                     }
-                    match entry.cause.as_str() {
-                        "spawn_nack" => composition.with_transcript.spawn_nacks += 1,
-                        "pane_death_before_start" => composition.with_transcript.pane_deaths += 1,
-                        _ => composition.with_transcript.driver_start_timeouts += 1,
-                    }
+                    composition.with_transcript.driver_start_timeouts += 1;
                 }
             }
         }
@@ -338,11 +333,6 @@ impl FailureComposition {
     /// The one-line description of what the in-window failures observed,
     /// e.g. `4 driver-start timeouts (a pane and shell came up but ...)` or
     /// `2 spawns with no shell (...) and 1 driver-start timeout (...)`.
-    ///
-    /// Names each observed cause rather than treating every
-    /// [`SpawnFailureClass::ShellWithoutDriverSignal`] row as a driver-start
-    /// timeout: an app NACK or pane death with a transcript on disk is not
-    /// a timeout.
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
         if self.no_shell > 0 {
@@ -364,19 +354,6 @@ impl FailureComposition {
                 self.with_transcript.driver_start_timeouts, observed
             ));
         }
-        if self.with_transcript.spawn_nacks > 0 {
-            parts.push(format!(
-                "{} spawn nack(s) (app reported spawn failure; a transcript was on disk)",
-                self.with_transcript.spawn_nacks
-            ));
-        }
-        if self.with_transcript.pane_deaths > 0 {
-            parts.push(format!(
-                "{} pane-death-before-start report(s) (app reported the pane died; a transcript \
-                 was on disk)",
-                self.with_transcript.pane_deaths
-            ));
-        }
         if parts.is_empty() {
             "no per-failure evidence recorded in the window".to_owned()
         } else {
@@ -386,36 +363,29 @@ impl FailureComposition {
 
     /// Where the operator should look first, given what was observed.
     pub fn diagnosis_hint(&self) -> &'static str {
-        let app_reported = self.with_transcript.spawn_nacks + self.with_transcript.pane_deaths;
-        match (self.no_shell, self.with_transcript.driver_start_timeouts, app_reported) {
-            (0, n, 0) if n > 0 && self.every_driver_start_had_a_shell => {
-                "Every failure in the window had a working pane and shell, so the app's pane-spawn \
-                 path is NOT implicated. Look at the driver and its progress signal: for a \
+        match (self.no_shell, self.with_transcript.driver_start_timeouts) {
+            (0, n) if n > 0 && self.every_driver_start_had_a_shell => {
+                "Every failure in the window had a working pane and shell, so tmux session \
+                 creation is NOT implicated. Look at the driver and its progress signal: for a \
                  file-tailing driver (Codex, Grok) read the engine log for `agent JSONL progress` \
                  discovery lines naming each reaped execution — they say whether a rollout existed \
                  and why it was not attached — and check the rollout on disk before concluding the \
                  driver never ran."
             }
-            (0, n, 0) if n > 0 => {
+            (0, n) if n > 0 => {
                 "Every failure in the window was a driver-start timeout, but not every \
-                 one reported a shell pid — do not assume the app's pane-spawn path is healthy. \
+                 one reported a shell pid — do not assume tmux pane spawning is healthy. \
                  Read each execution's observed text and the engine log for `agent JSONL progress` \
                  discovery lines before concluding where to look."
             }
-            (0, 0, n) if n > 0 => {
-                "Every failure in the window was an app-reported pane spawn failure (NACK or pane \
-                 death) with a transcript on disk. The transcript is evidence the driver had \
-                 started — look at the pane-spawn and NACK path, not at JSONL discovery or a \
-                 driver-start timeout."
-            }
-            (n, 0, 0) if n > 0 => {
-                "No shell came up for any failure in the window, so the app's pane-spawn path is \
-                 the thing to look at (most often `ghostty_surface_new` returning NULL after the \
-                 machine slept, i.e. no active display)."
+            (n, 0) if n > 0 => {
+                "No shell came up for any failure in the window, so the engine's tmux spawn path is \
+                 the thing to look at: the tmux preflight / `resolve_tmux`, session-creation errors \
+                 in the engine log, and the `display-message #{pane_pid}` read."
             }
             _ => {
-                "The window mixes causes: check the app's pane-spawn path for no-shell and \
-                 app-reported failures AND the driver's progress signal for any driver-start \
+                "The window mixes causes: check the tmux spawn path (preflight, session \
+                 creation, pane-pid read) for no-shell failures AND the driver's progress signal for any driver-start \
                  timeouts; one explanation is unlikely to cover both."
             }
         }
@@ -589,7 +559,7 @@ impl SpawnHealthTracker {
     }
 
     /// Reset the breaker. Called when a spawn provably worked (a
-    /// driver-originated signal was reported) or a fresh app session registered, so stale
+    /// driver-originated signal was reported), so stale
     /// pre-recovery failures no longer count toward a trip.
     ///
     /// Deliberately does NOT clear the disabled-mode signal window
@@ -691,14 +661,6 @@ impl SpawnHealthTracker {
         *probe = ProbeState::default();
         true
     }
-
-    /// Unconditionally clear all half-open probe state (in-flight canary,
-    /// backoff, failure count). Called when a fresh app session registers —
-    /// any probe or backoff left over from before is moot once the operator
-    /// has taken their own recovery action.
-    pub fn reset_probe(&self) {
-        *self.probe.lock().unwrap() = ProbeState::default();
-    }
 }
 
 /// Half-open recovery attempt: if dispatch is currently paused by
@@ -786,7 +748,7 @@ pub async fn maybe_admit_recovery_probe(
             tracing::warn!(
                 skipped_reviews,
                 "spawn-capability breaker: every ready execution is a PR review, which is never \
-                 eligible as a recovery canary; waiting for non-review work, a fresh app session, \
+                 eligible as a recovery canary; waiting for non-review work \
                  or `bossctl dispatch resume`",
             );
         }
@@ -844,8 +806,7 @@ pub async fn maybe_admit_recovery_probe(
 
 /// Auto-resume dispatch after Breaker-origin evidence that the app's spawn
 /// path is healthy again — either the half-open recovery probe's canary
-/// reported a driver-originated signal, or a fresh app session registered
-/// after an app relaunch.
+/// reported a driver-originated signal.
 ///
 /// No-ops when dispatch isn't currently paused, and — critically — when the
 /// current pause is [`DispatchPauseOrigin::Operator`]: a human pause stays
@@ -1528,19 +1489,6 @@ mod tests {
         assert!(tracker.try_admit_probe(1000));
     }
 
-    #[test]
-    fn reset_probe_clears_in_flight_and_backoff_unconditionally() {
-        let tracker = SpawnHealthTracker::with_config(3, 300);
-        tracker.mark_probe_dispatched("exec-1", 1000);
-        tracker.record_probe_failure("exec-1", 1000);
-        tracker.mark_probe_dispatched("exec-2", 1000);
-        assert!(!tracker.try_admit_probe(1000));
-
-        tracker.reset_probe();
-        assert!(tracker.try_admit_probe(1000));
-        assert!(!tracker.is_probe_execution("exec-2"));
-    }
-
     // ─── maybe_admit_recovery_probe / resume_dispatch_after_breaker_recovery ──
 
     use crate::dispatch_events::{NoopDispatchEventSink, RecordingDispatchEventSink};
@@ -2102,8 +2050,6 @@ mod tests {
                 every_driver_start_had_a_shell: true,
                 with_transcript: TranscriptCauses {
                     driver_start_timeouts: 4,
-                    spawn_nacks: 0,
-                    pane_deaths: 0,
                 },
             }
         );
@@ -2154,44 +2100,6 @@ mod tests {
             composition.diagnosis_hint().contains("mixes causes"),
             "got: {}",
             composition.diagnosis_hint()
-        );
-    }
-
-    /// An app NACK with a present transcript is classed
-    /// `ShellWithoutDriverSignal` but must not be announced as a
-    /// driver-start timeout in the aggregate pause text.
-    #[test]
-    fn composition_of_app_nacks_with_a_transcript_does_not_call_them_driver_start_timeouts() {
-        let mut nack = test_evidence(
-            "exec-nack",
-            "wi-nack",
-            "0",
-            0,
-            100,
-            SpawnFailureClass::ShellWithoutDriverSignal,
-        );
-        nack.cause = "spawn_nack".to_owned();
-        let evidence = vec![nack];
-        let composition = FailureComposition::of(&evidence);
-        assert_eq!(composition.with_transcript.spawn_nacks, 1);
-        assert_eq!(composition.with_transcript.driver_start_timeouts, 0);
-        let described = composition.describe();
-        assert!(
-            described.contains("spawn nack"),
-            "must name the cause that fired; got: {described}"
-        );
-        assert!(
-            !described.contains("driver-start timeout"),
-            "must not announce an app NACK as a driver-start timeout; got: {described}"
-        );
-        let hint = composition.diagnosis_hint();
-        assert!(
-            hint.contains("app-reported"),
-            "the hint must name the app-reported path; got: {hint}"
-        );
-        assert!(
-            !hint.contains("agent JSONL progress"),
-            "diagnosis must not be sent to JSONL discovery for an app NACK; got: {hint}"
         );
     }
 

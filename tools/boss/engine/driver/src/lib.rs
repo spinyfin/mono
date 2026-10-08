@@ -1030,7 +1030,7 @@ pub struct InterruptRecoverySnapshot {
 /// gone" is evidence of a *death*.
 ///
 /// Boss's process-liveness reapers ([`crate`]'s consumers: the engine's
-/// dead-pid sweep, the app's pane-death report, and the durable-pid dead-pane
+/// dead-pid sweep, the pane-input driver-exit check, and the durable-pid dead-pane
 /// sweep) are all written against a long-lived interactive session: it
 /// outlives every turn, so its exit can only ever mean the worker died
 /// mid-run. That inference was *false* for `codex exec`, whose CLI ran one
