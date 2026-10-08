@@ -46,6 +46,11 @@ steps:
       - "checks"
     agents:
       queue: "${BUILDKITE_MACOS_QUEUE:-macos-arm64}"
+    # Serialize manual and scheduled release runs so a scheduled run never
+    # races a manual run's in-progress draft; the later run sees the
+    # published release and skips as a no-op.
+    concurrency: 1
+    concurrency_group: "mono-boss-release"
     retry:
       automatic: false
     notify:
