@@ -223,3 +223,113 @@ fn current_head_review_badge_done_card_without_matching_verdict_shows_no_badge()
         .unwrap();
     assert_eq!(card(&db, &product, &root).ai_review_state, None);
 }
+
+/// Record the revision's single execution as completed. `head_after` is what
+/// the engine stores as `pr_head_after`: `None` when the worker made no commit.
+fn complete_revision_execution(db: &WorkDb, revision: &str, head_after: Option<&str>) {
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision)
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed', finished_at = '2026-01-01T00:00:00Z',
+                    pr_head_after = ?2 WHERE id = ?1",
+            rusqlite::params![execution.id, head_after],
+        )
+        .unwrap();
+}
+
+fn set_status(db: &WorkDb, id: &str, status: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = ?2 WHERE id = ?1",
+            rusqlite::params![id, status],
+        )
+        .unwrap();
+}
+
+fn findings_with_revision(db: &WorkDb, product: &str, root: &str, sha: &str) -> String {
+    let revision = insert_revision_row(db, product, root);
+    let findings = verdict(db, root, sha, "completed_with_findings");
+    db.set_review_verdict_revision_task_id(&findings, &revision).unwrap();
+    revision
+}
+
+#[test]
+fn current_head_review_badge_findings_revision_delivered_without_head_change_is_not_orange() {
+    let db = WorkDb::open(temp_db_path("current-head-review-no-commit-fix")).unwrap();
+    let product = make_revision_product(&db, "current-head-no-commit-fix");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8006");
+    observe(&db, &root, Some("h1"), "success", "mergeable");
+    let revision = findings_with_revision(&db, &product, &root, "h1");
+
+    // Revision still running: findings remain unresolved.
+    set_status(&db, &revision, "active");
+    let running = card(&db, &product, &root);
+    assert_eq!(running.ai_review_state.as_deref(), Some("reviewed_with_findings"));
+    assert_eq!(
+        running.ai_review_findings_revision_id.as_deref(),
+        Some(revision.as_str())
+    );
+
+    // Delivered, but no execution has completed yet: no evidence of resolution.
+    set_status(&db, &revision, "in_review");
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("reviewed_with_findings")
+    );
+
+    // Delivered with no commit (PR body edit / justified no-change).
+    complete_revision_execution(&db, &revision, None);
+    let delivered = card(&db, &product, &root);
+    assert_eq!(delivered.ai_review_state.as_deref(), Some("not_reviewed"));
+    assert!(delivered.ai_review_findings_revision_id.is_none());
+
+    // A newer verdict for the same head wins over the resolution.
+    verdict(&db, &root, "h1", "completed_with_findings");
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("reviewed_with_findings")
+    );
+    verdict(&db, &root, "h1", "completed_clean");
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("reviewed_all_clear")
+    );
+}
+
+#[test]
+fn current_head_review_badge_findings_revision_with_new_commit_keeps_head_rules() {
+    let db = WorkDb::open(temp_db_path("current-head-review-commit-fix")).unwrap();
+    let product = make_revision_product(&db, "current-head-commit-fix");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8007");
+    observe(&db, &root, Some("h1"), "success", "mergeable");
+    let revision = findings_with_revision(&db, &product, &root, "h1");
+    set_status(&db, &revision, "in_review");
+    // The revision pushed a new head the poller has not observed yet.
+    complete_revision_execution(&db, &revision, Some("h2"));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("reviewed_with_findings")
+    );
+
+    // Once the new head is observed, it is simply not yet reviewed.
+    observe(&db, &root, Some("h2"), "success", "mergeable");
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("not_reviewed")
+    );
+    verdict(&db, &root, "h2", "completed_clean");
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("reviewed_all_clear")
+    );
+}

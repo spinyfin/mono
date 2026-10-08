@@ -3,6 +3,14 @@ use super::*;
 /// Resolve against the observed PR head, across legacy revision-owned and
 /// modern cycle-root verdicts. Missing heads and late old-head results never
 /// establish a clean review. This is a single batched query for the tree.
+///
+/// A findings verdict whose findings revision has delivered without moving the
+/// head the verdict reviewed (it edited the PR title/body, or justified no
+/// change) no longer counts as unresolved: nothing will ever re-review that
+/// unchanged head, so the badge would otherwise stay orange forever. It
+/// resolves to `not_reviewed`, the same state a commit-based fix shows until
+/// its new head is reviewed. A newer verdict for the same head still wins
+/// because it is selected before this check.
 pub(super) fn current_head_review_states(
     conn: &Connection,
     ids: &[String],
@@ -37,7 +45,16 @@ pub(super) fn current_head_review_states(
                 root.ci_required_state, root.pr_mergeable_state,
                 root.status = 'active' OR EXISTS(SELECT 1 FROM family f JOIN tasks t ON t.id = f.id
                        WHERE f.root = root.id AND t.kind = 'revision'
-                         AND t.deleted_at IS NULL AND t.status IN ('todo', 'active', 'blocked'))
+                         AND t.deleted_at IS NULL AND t.status IN ('todo', 'active', 'blocked')),
+                EXISTS(SELECT 1 FROM tasks r
+                       WHERE r.id = v.revision_task_id AND r.kind = 'revision'
+                         AND r.deleted_at IS NULL AND r.status IN ('in_review', 'done')
+                         AND EXISTS(SELECT 1 FROM work_executions we
+                                    WHERE we.id = (SELECT e.id FROM work_executions e
+                                                   WHERE e.work_item_id = r.id AND e.status = 'completed'
+                                                     AND e.kind = 'revision_implementation'
+                                                   ORDER BY e.finished_at DESC, e.id DESC LIMIT 1)
+                                      AND (we.pr_head_after IS NULL OR we.pr_head_after = v.head_sha)))
          FROM owners o JOIN tasks root ON root.id = o.id
          LEFT JOIN pr_review_verdicts v ON v.id = (
              SELECT rv.id FROM pr_review_verdicts rv
@@ -57,12 +74,16 @@ pub(super) fn current_head_review_states(
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, bool>(5)?,
+            row.get::<_, bool>(6)?,
         ))
     })?;
     let mut result = std::collections::HashMap::new();
     for row in rows {
-        let (id, outcome, revision, ci, mergeable, pending_work) = row?;
+        let (id, outcome, revision, ci, mergeable, pending_work, revision_delivered_unmoved) = row?;
         let (state, revision) = match outcome.as_deref() {
+            Some(REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS) if revision_delivered_unmoved => {
+                (AI_REVIEW_STATE_NOT_REVIEWED, None)
+            }
             Some(REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS | REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED) => {
                 (AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS, revision)
             }
