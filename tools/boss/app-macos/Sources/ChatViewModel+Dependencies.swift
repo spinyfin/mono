@@ -54,7 +54,7 @@ extension ChatViewModel {
                 return nil
             }
             guard let name = workItemName(for: edge.prerequisiteID),
-                  !isWorkItemSatisfied(edge.prerequisiteID, forDependentKind: task.kind)
+                  !isWorkItemSatisfied(edge.prerequisiteID, forDependentID: task.id)
             else {
                 return nil
             }
@@ -101,9 +101,8 @@ extension ChatViewModel {
     /// predicate. Display only: the drag path never consults it — the
     /// engine owns the gate (see `attemptDrop`).
     func gatingPrereqs(for taskID: String) -> [WorkDependencyRow] {
-        let dependentKind = task(withID: taskID)?.kind
         return dependencyPrereqs(for: taskID).filter {
-            !isWorkItemRowSatisfied($0, forDependentKind: dependentKind)
+            !isWorkItemRowSatisfied($0, forDependentID: taskID)
         }
     }
 
@@ -258,8 +257,8 @@ extension ChatViewModel {
 
                 // Skip prereqs that already satisfy `current`'s gate — they
                 // aren't holding anything up (for a revision dependent that
-                // includes an `in_review` prereq, same as the engine).
-                guard !isWorkItemSatisfied(prereqID, forDependentKind: task(withID: current)?.kind)
+                // includes only a same-chain `in_review` prereq).
+                guard !isWorkItemSatisfied(prereqID, forDependentID: current)
                 else { continue }
 
                 visited.insert(prereqID)
@@ -298,36 +297,50 @@ extension ChatViewModel {
                 // Filter on the status already resolved into each row rather
                 // than calling isWorkItemSatisfied(_:), which would look the
                 // same id up a second time — halving the lookups per edge.
-                // The dependent's own kind decides what "satisfied" means.
-                let dependentKind = task(withID: taskID)?.kind
-                gating[taskID] = rows.filter { !isWorkItemRowSatisfied($0, forDependentKind: dependentKind) }
+                // Revision gates also check whether both rows share a chain.
+                gating[taskID] = rows.filter { !isWorkItemRowSatisfied($0, forDependentID: taskID) }
             }
         }
         cachedDependencyPrereqs = prereqs
         cachedGatingPrereqs = gating
     }
 
-    /// Row-status equivalent of `isWorkItemSatisfied(_:forDependentKind:)`.
+    /// Row-status equivalent of `isWorkItemSatisfied(_:forDependentID:)`.
     /// An unresolved prereq (kind `.unknown`, status `"unknown"`) is
     /// treated as unsatisfied, matching the id-based helper's nil-lookup
     /// behaviour.
-    private func isWorkItemRowSatisfied(_ row: WorkDependencyRow, forDependentKind dependentKind: String?) -> Bool {
-        Self.prerequisiteStatusSatisfies(row.status, dependentKind: dependentKind)
+    private func isWorkItemRowSatisfied(_ row: WorkDependencyRow, forDependentID dependentID: String) -> Bool {
+        prerequisiteStatusSatisfies(row.status, prerequisiteID: row.id, dependentID: dependentID)
     }
 
     /// Display mirror of the engine's `status_satisfies_for_dependent`
     /// rule (`work_dependencies.rs`), which is what the engine's drop and
     /// explicit-start paths both enforce:
     ///   - every prerequisite satisfies at `done` or `archived`;
-    ///   - for a `revision` dependent, `in_review` also satisfies — the
+    ///   - for a `revision` dependent, only same-chain `in_review` satisfies — the
     ///     prerequisite's commits are pushed and the PR is open, which is
     ///     all the next writer on that PR needs. Waiting for `done` would
     ///     deadlock a CI-fix revision behind a PR that cannot merge until
     ///     that very fix lands.
+    /// This applies to every `blocks` edge, including explicit depends-on edges.
+    /// Unrelated prerequisites still gate until done or archived.
     /// This decides only what the kanban *labels* as gating; the engine
     /// decides whether a move or start is actually refused.
-    static func prerequisiteStatusSatisfies(_ status: String, dependentKind: String?) -> Bool {
-        if dependentKind == "revision", status == "in_review" {
+    private func prerequisiteStatusSatisfies(_ status: String, prerequisiteID: String, dependentID: String) -> Bool {
+        guard status == "in_review", task(withID: dependentID)?.kind == "revision" else {
+            return Self.prerequisiteStatusSatisfies(status, dependentKind: nil)
+        }
+        let root = revisionChainRootID(for: dependentID)
+        return Self.prerequisiteStatusSatisfies(
+            status, dependentKind: "revision",
+            sameRevisionChain: root != nil && root == revisionChainRootID(for: prerequisiteID)
+        )
+    }
+
+    static func prerequisiteStatusSatisfies(
+        _ status: String, dependentKind: String?, sameRevisionChain: Bool = false
+    ) -> Bool {
+        if dependentKind == "revision", status == "in_review", sameRevisionChain {
             return true
         }
         return status == "done" || status == "archived"
@@ -361,11 +374,11 @@ extension ChatViewModel {
         return task(withID: id)?.name
     }
 
-    /// Whether prerequisite `id` satisfies a dependent of `dependentKind`
+    /// Whether prerequisite `id` satisfies a dependent `dependentID`
     /// — see `prerequisiteStatusSatisfies`. Used to hide already-satisfied
     /// prereqs from the "Blocked by …" label on the off-chance an edge
     /// survives a status change momentarily.
-    private func isWorkItemSatisfied(_ id: String, forDependentKind dependentKind: String?) -> Bool {
+    private func isWorkItemSatisfied(_ id: String, forDependentID dependentID: String) -> Bool {
         let status: String?
         if id.hasPrefix("proj_") {
             status = project(withID: id)?.status
@@ -373,6 +386,6 @@ extension ChatViewModel {
             status = task(withID: id)?.status
         }
         guard let status else { return false }
-        return Self.prerequisiteStatusSatisfies(status, dependentKind: dependentKind)
+        return prerequisiteStatusSatisfies(status, prerequisiteID: id, dependentID: dependentID)
     }
 }

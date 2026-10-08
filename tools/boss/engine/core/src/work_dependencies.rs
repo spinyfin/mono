@@ -257,6 +257,10 @@ pub fn status_satisfies(status: &str) -> bool {
 /// Waiting for `done` (merged) is a hard deadlock because by the
 /// time the PR merges the revision can no longer push to it.
 ///
+/// This is the status-only part of the rule. `gating_prereqs_for` additionally
+/// requires the prerequisite to share the revision's chain root before accepting
+/// `in_review`, for every `blocks` edge including explicit `--depends-on` edges.
+/// Unrelated prerequisites must reach `done` or `archived`.
 /// For all non-revision dependents the standard `done`/`archived` rules
 /// apply.
 /// Display counterpart: `ChatViewModel+Dependencies.swift`
@@ -353,8 +357,10 @@ fn same_revision_chain(conn: &Connection, a: &str, b: &str) -> Result<bool> {
 /// to `waiting_dependency`) and the auto-block / unblock path.
 ///
 /// The satisfaction check is revision-aware: for `kind = 'revision'`
-/// dependents a prerequisite also satisfies when it reaches
-/// `in_review` (the PR is open and the revision can push to it).
+/// dependents only a same-chain prerequisite also satisfies at `in_review`
+/// (the PR is open and the revision can push to it). Unrelated prerequisites
+/// still gate until done/archived. This applies to every `blocks` edge,
+/// including explicit `--depends-on` edges, not just prerequisite questions.
 /// For all other dependents the standard `done`/`archived` rules apply.
 pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
     let dependent_kind = lookup_work_item_kind(conn, work_item_id)?;

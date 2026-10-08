@@ -36,14 +36,14 @@ pub(super) struct LinkedPrerequisite {
 ///
 /// Oldest first, so a repeat resolves to the same task every time. The blocked
 /// task itself is never its own prerequisite, a task a human has blocked is
-/// skipped (nothing would dispatch it), and a candidate that already
-/// depends (transitively) on the blocked task is skipped — linking to it
-/// would form a cycle the dependency layer rejects.
+/// skipped, as are deferred and human-driven tasks (nothing would dispatch
+/// them). A candidate that already depends (transitively) on the blocked task
+/// is skipped — linking to it would form a cycle the dependency layer rejects.
 fn find_equivalent_open_task(conn: &Connection, task: &Task, name: &str) -> Result<Option<Task>> {
     let mut stmt = conn.prepare(
         "SELECT id FROM tasks
          WHERE product_id = ?1 AND id != ?2 AND deleted_at IS NULL
-           AND status NOT IN ('done', 'archived')
+           AND status NOT IN ('done', 'archived') AND human_driven = 0 AND deferred = 0
            AND (status != 'blocked' OR blocked_reason = 'dependency')
            AND lower(trim(name)) = lower(trim(?3))
          ORDER BY created_at ASC, id ASC",
@@ -94,12 +94,28 @@ pub(super) fn approve_in_tx(
 
     // A same-name task parked in the backlog (autostart off) would never be
     // dispatched, leaving the dependent waiting with no signal.
-    let enabled_dispatch = !created && prerequisite.status == TaskStatus::Todo && !prerequisite.autostart;
+    let schedulable = matches!(prerequisite.status, TaskStatus::Todo | TaskStatus::Blocked);
+    let enabled_dispatch = !created && schedulable && !prerequisite.autostart;
     if enabled_dispatch {
         conn.execute(
             "UPDATE tasks SET autostart = 1, updated_at = ?2 WHERE id = ?1",
             params![prerequisite.id, now],
         )?;
+    }
+
+    // Approval is an explicit restart, including after a terminal prior run.
+    // Queue it here: the periodic reconciler intentionally cannot restart one.
+    if !created && schedulable && query_live_execution_for_work_item(conn, &prerequisite.id)?.is_none() {
+        if deps::gating_prereqs_for(conn, &prerequisite.id)?.is_empty() {
+            request_execution_in_tx_with_live_check(
+                pending,
+                conn,
+                RequestExecutionInput::builder().work_item_id(&prerequisite.id).build(),
+                |_| false,
+            )?;
+        } else {
+            queue_gated_execution(conn, &prerequisite, question)?;
+        }
     }
 
     let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
@@ -154,7 +170,12 @@ fn queue_gated_execution(conn: &Connection, task: &Task, question: &OperatorQues
         // repository.
         return Ok(());
     };
-    let preferred = query_execution(conn, &question.execution_id)?.and_then(|asking| asking.preferred_workspace_id);
+    if query_latest_execution_for_work_item(conn, &task.id)?.is_some_and(|execution| !execution.status.is_terminal()) {
+        return Ok(());
+    }
+    let preferred = query_execution(conn, &question.execution_id)?
+        .filter(|asking| asking.work_item_id == task.id)
+        .and_then(|asking| asking.preferred_workspace_id);
     insert_execution(
         conn,
         CreateExecutionInput::builder()
@@ -183,7 +204,7 @@ fn prerequisite_note(
     let outcome = if created {
         "The engine created it as a chore with normal dispatch."
     } else if enabled_dispatch {
-        "An equivalent task already existed in the backlog with autostart off, so the engine linked to it and turned autostart on so it is dispatched."
+        "An equivalent task already existed in the backlog with autostart off, so the engine linked to it and turned autostart on and queued it for dispatch once its dependencies are satisfied."
     } else {
         "An equivalent open task already existed, so the engine linked to it instead of creating a duplicate."
     };
