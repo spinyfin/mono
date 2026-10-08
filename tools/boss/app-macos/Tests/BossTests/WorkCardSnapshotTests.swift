@@ -26,14 +26,16 @@ final class WorkCardSnapshotTests: XCTestCase {
 
     func testDoingCardUsesEnginePersonaAndFallback() {
         var live = Self.makeLiveState(liveStatus: nil)
-        for name in ["Worf", "Ensign 41", "Data (Remote)", ""] {
+        let names: [String?] = ["Worf", "Ensign 41", "Data (Remote)", "", nil]
+        for name in names {
             live.name = name
             let snapshot = WorkCardSnapshot.build(
                 task: Self.makeTask(status: "active"),
                 context: WorkCardSnapshotContext(column: .doing, liveState: live)
             )
             let slice = WorkBoardCardTitleRowSlice(snapshot: snapshot)
-            XCTAssertEqual(slice.assignedWorkerName, name.isEmpty ? "Worker \(live.runId)" : name)
+            let expected = (name == nil || name == "") ? "Worker \(live.runId)" : name
+            XCTAssertEqual(slice.assignedWorkerName, expected)
             XCTAssertEqual(slice.assignedSlotId, live.slotId)
         }
     }
