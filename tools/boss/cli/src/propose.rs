@@ -358,16 +358,40 @@ pub(crate) struct RunDoneArgs {
     #[arg(long)]
     summary: String,
 
-    /// One specific Yes/No decision preventing delivery.
-    #[arg(long, requires_all = ["answer_type", "explanation"])]
+    /// One specific Yes/No decision preventing delivery. Required with
+    /// `--answer-type yes-no`; not accepted with `create-prerequisite-task`,
+    /// whose question the engine words from `--prerequisite-name`.
+    #[arg(long, requires_all = ["answer_type", "explanation"], required_if_eq("answer_type", "yes-no"))]
     question: Option<String>,
 
-    #[arg(long, value_parser = ["yes-no"], requires = "question")]
+    /// `yes-no` for a plain approval. `create-prerequisite-task` when this
+    /// task cannot proceed until some other, unrelated piece of work lands
+    /// first: also pass `--prerequisite-name` and `--prerequisite-brief`, and
+    /// make `--explanation` the one line saying why this task cannot unblock
+    /// without it.
+    #[arg(long, value_parser = ["yes-no", "create-prerequisite-task"], requires = "explanation")]
     answer_type: Option<String>,
 
     /// Why the decision is needed and what Yes authorizes.
-    #[arg(long, requires = "question")]
+    #[arg(long, requires = "answer_type")]
     explanation: Option<String>,
+
+    /// Name of the proposed prerequisite task (`create-prerequisite-task`).
+    #[arg(
+        long,
+        requires = "answer_type",
+        required_if_eq("answer_type", "create-prerequisite-task")
+    )]
+    prerequisite_name: Option<String>,
+
+    /// Self-contained brief for the proposed prerequisite task: the operator
+    /// reads it on the card and the task's worker sees nothing else.
+    #[arg(
+        long,
+        requires = "answer_type",
+        required_if_eq("answer_type", "create-prerequisite-task")
+    )]
+    prerequisite_brief: Option<String>,
 
     #[command(flatten)]
     common: IdempotencyArgs,
@@ -661,16 +685,64 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             serde_json::to_value(RunDoneProposalPayload {
                 outcome: RunDoneOutcome::from(args.outcome),
                 summary: args.summary,
-                question: args.question.map(|text| boss_protocol::OperatorQuestion {
-                    text,
-                    answer_type: boss_protocol::OperatorAnswerType::YesNo,
-                    explanation: args.explanation.unwrap_or_default(),
-                }),
+                question: operator_question_from_flags(
+                    args.question,
+                    args.answer_type.as_deref(),
+                    args.explanation,
+                    args.prerequisite_name,
+                    args.prerequisite_brief,
+                )?,
             })
             .map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
     })
+}
+
+/// Assemble the blocked declaration's question from its flags. clap has
+/// already enforced which flags must travel together; what it cannot express
+/// is that the two question shapes exclude each other's flags.
+fn operator_question_from_flags(
+    question: Option<String>,
+    answer_type: Option<&str>,
+    explanation: Option<String>,
+    prerequisite_name: Option<String>,
+    prerequisite_brief: Option<String>,
+) -> Result<Option<boss_protocol::OperatorQuestion>, CliError> {
+    let explanation = explanation.unwrap_or_default();
+    match answer_type {
+        None => Ok(None),
+        Some("yes-no") => {
+            if prerequisite_name.is_some() || prerequisite_brief.is_some() {
+                return Err(CliError::usage(
+                    "--prerequisite-name and --prerequisite-brief only apply to --answer-type create-prerequisite-task",
+                ));
+            }
+            Ok(question.map(|text| boss_protocol::OperatorQuestion {
+                text,
+                answer_type: boss_protocol::OperatorAnswerType::YesNo,
+                explanation,
+            }))
+        }
+        Some("create-prerequisite-task") => {
+            if question.is_some() {
+                return Err(CliError::usage(
+                    "--question does not apply to --answer-type create-prerequisite-task; \
+                     the engine words the question from --prerequisite-name",
+                ));
+            }
+            let name = prerequisite_name.unwrap_or_default();
+            Ok(Some(boss_protocol::OperatorQuestion {
+                text: boss_protocol::OperatorAnswerType::prerequisite_question_text(name.trim()),
+                answer_type: boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                    name,
+                    brief: prerequisite_brief.unwrap_or_default(),
+                },
+                explanation,
+            }))
+        }
+        Some(other) => Err(CliError::usage(format!("unsupported --answer-type `{other}`"))),
+    }
 }
 
 async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result<(), CliError> {
@@ -820,6 +892,8 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::RunDone, "question" | "question.text") => Some("--question"),
         (ProposalKind::RunDone, "question.answer_type.kind") => Some("--answer-type"),
         (ProposalKind::RunDone, "question.explanation") => Some("--explanation"),
+        (ProposalKind::RunDone, "question.answer_type.name") => Some("--prerequisite-name"),
+        (ProposalKind::RunDone, "question.answer_type.brief") => Some("--prerequisite-brief"),
 
         _ => None,
     }
@@ -907,6 +981,74 @@ mod tests {
         for flag in ["--yes", "--no"] {
             assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example", flag]).is_ok());
         }
+    }
+
+    #[test]
+    fn prerequisite_question_flags_travel_together_and_build_the_typed_question() {
+        let base = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "CI needs a fix on main first",
+            "--answer-type",
+            "create-prerequisite-task",
+            "--explanation",
+            "CI cannot go green until the fixture is fixed",
+        ];
+        // Name and brief are both required with the prerequisite type.
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from(base.iter().copied().chain(["--prerequisite-name", "Fix fixture"])).is_err());
+        let flags = [
+            "--prerequisite-name",
+            " Fix fixture ",
+            "--prerequisite-brief",
+            "Stand-alone brief",
+        ];
+        let cli = Cli::try_parse_from(base.iter().copied().chain(flags)).unwrap();
+        let Commands::Propose(args) = cli.command else {
+            panic!("expected propose")
+        };
+        let (_, payload, _) = payload_for(args.command.unwrap()).unwrap();
+        let answer_type = &payload["question"]["answer_type"];
+        assert_eq!(answer_type["kind"], "create_prerequisite_task");
+        assert_eq!(answer_type["brief"], "Stand-alone brief");
+        assert_eq!(
+            payload["question"]["text"],
+            "Create prerequisite task 'Fix fixture'? This task will wait for it."
+        );
+
+        // The two shapes do not mix flags.
+        let with_question = base.iter().copied().chain(flags).chain(["--question", "Approve?"]);
+        let Commands::Propose(args) = Cli::try_parse_from(with_question).unwrap().command else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+        let yes_no_with_prerequisite = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "s",
+            "--question",
+            "Approve?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+            "Why",
+            "--prerequisite-name",
+            "x",
+            "--prerequisite-brief",
+            "y",
+        ];
+        let Commands::Propose(args) = Cli::try_parse_from(yes_no_with_prerequisite).unwrap().command else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
     }
 
     fn parse_propose(args: &[&str]) -> ProposeArgs {

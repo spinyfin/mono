@@ -60,6 +60,11 @@ pub const MAX_SHORT_FIELD_CHARS: usize = 4_096;
 /// stop a worker pasting a whole transcript into a proposal row.
 pub const MAX_LONG_FIELD_CHARS: usize = 64 * 1024;
 
+/// Longest accepted name for a proposed prerequisite task. It becomes the task
+/// title and is quoted in the single-line question, so it stays well inside the
+/// question's own 500-character cap.
+pub const MAX_PREREQUISITE_NAME_CHARS: usize = 200;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -542,7 +547,7 @@ impl<'a> PayloadReader<'a> {
             self.error("question", "a question is only meaningful on a blocked declaration");
         }
         if let Some(kind) = value.pointer("/answer_type/kind").and_then(Value::as_str)
-            && kind != "yes_no"
+            && !matches!(kind, "yes_no" | "create_prerequisite_task")
         {
             self.error("question.answer_type.kind", format!("unsupported answer type: {kind}"));
             return None;
@@ -554,9 +559,30 @@ impl<'a> PayloadReader<'a> {
                 return None;
             }
         };
-        question.text = self.text_from("question.text", &Value::String(question.text), 500)?;
-        if question.text.contains(['\n', '\r']) {
-            self.error("question.text", "must be a single line");
+        if let boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief } = question.answer_type {
+            let name = self.text_from(
+                "question.answer_type.name",
+                &Value::String(name),
+                MAX_PREREQUISITE_NAME_CHARS,
+            );
+            let brief = self.text_from(
+                "question.answer_type.brief",
+                &Value::String(brief),
+                MAX_LONG_FIELD_CHARS,
+            );
+            let (name, brief) = (name?, brief?);
+            if name.contains(['\n', '\r']) {
+                self.error("question.answer_type.name", "must be a single line");
+            }
+            // The engine owns the wording so the card always reads the same;
+            // whatever the worker sent as `text` is replaced.
+            question.text = boss_protocol::OperatorAnswerType::prerequisite_question_text(&name);
+            question.answer_type = boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief };
+        } else {
+            question.text = self.text_from("question.text", &Value::String(question.text), 500)?;
+            if question.text.contains(['\n', '\r']) {
+                self.error("question.text", "must be a single line");
+            }
         }
         question.explanation = self.text_from(
             "question.explanation",
@@ -766,5 +792,72 @@ mod operator_question_tests {
         boundary["question"]["text"] = json!("é".repeat(500));
         boundary["question"]["explanation"] = json!("x".repeat(MAX_LONG_FIELD_CHARS));
         assert!(validate_payload(ProposalKind::RunDone, &boundary).is_ok());
+    }
+
+    fn prerequisite_payload() -> serde_json::Value {
+        json!({"outcome":"blocked", "summary":"CI needs another fix first", "question":{
+            "answer_type":{"kind":"create_prerequisite_task",
+                "name":"  Fix the retention-cleanup fixture race  ",
+                "brief":"  A stand-alone brief.  "},
+            "explanation":"  CI cannot go green until the fixture is fixed on main.  "
+        }})
+    }
+
+    #[test]
+    fn prerequisite_question_is_canonicalized_and_owns_its_wording() {
+        let canonical = validate_payload(ProposalKind::RunDone, &prerequisite_payload()).unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        let question = parsed.question.unwrap();
+        assert_eq!(
+            question.text,
+            "Create prerequisite task 'Fix the retention-cleanup fixture race'? This task will wait for it."
+        );
+        assert_eq!(
+            question.answer_type,
+            boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name: "Fix the retention-cleanup fixture race".into(),
+                brief: "A stand-alone brief.".into(),
+            }
+        );
+        assert_eq!(
+            question.explanation,
+            "CI cannot go green until the fixture is fixed on main."
+        );
+
+        // Worker-supplied wording is replaced, not trusted.
+        let mut with_text = prerequisite_payload();
+        with_text["question"]["text"] = json!("Totally different words?");
+        let canonical = validate_payload(ProposalKind::RunDone, &with_text).unwrap();
+        assert!(canonical.canonical_json.contains("Create prerequisite task"));
+        assert!(!canonical.canonical_json.contains("Totally different"));
+    }
+
+    #[test]
+    fn prerequisite_question_rejects_incomplete_or_malformed_proposals() {
+        for (field, bad) in [
+            ("name", json!("")),
+            ("name", json!("two\nlines")),
+            ("name", json!("n".repeat(MAX_PREREQUISITE_NAME_CHARS + 1))),
+            ("brief", json!("   ")),
+            ("brief", json!("b".repeat(MAX_LONG_FIELD_CHARS + 1))),
+        ] {
+            let mut invalid = prerequisite_payload();
+            invalid["question"]["answer_type"][field] = bad;
+            assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err(), "{field}");
+        }
+        for missing in ["name", "brief"] {
+            let mut invalid = prerequisite_payload();
+            invalid["question"]["answer_type"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err(), "{missing}");
+        }
+        let mut not_blocked = prerequisite_payload();
+        not_blocked["outcome"] = json!("delivered");
+        assert!(validate_payload(ProposalKind::RunDone, &not_blocked).is_err());
+        let mut no_explanation = prerequisite_payload();
+        no_explanation["question"]["explanation"] = json!("");
+        assert!(validate_payload(ProposalKind::RunDone, &no_explanation).is_err());
     }
 }

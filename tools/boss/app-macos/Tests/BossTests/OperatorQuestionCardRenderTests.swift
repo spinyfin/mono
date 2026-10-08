@@ -68,6 +68,22 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
         )
     }
 
+    func testPopoverShowsTheProposedPrerequisiteTask() throws {
+        var question = presentation()
+        let plain = try renderView(OperatorQuestionDetailPopover(question: question), size: CGSize(width: 340, height: 360))
+        question.prerequisiteTask = PrerequisiteTaskProposal(
+            name: "Fix the retention-cleanup fixture race",
+            brief: "The shared fixture races retention cleanup. Fix it on main."
+        )
+        let proposed = try renderView(OperatorQuestionDetailPopover(question: question), size: CGSize(width: 340, height: 360))
+        XCTAssertFalse(isUniformlyBlank(proposed), "The popover must render visible content")
+        XCTAssertNotEqual(
+            plain.representation(using: .png, properties: [:]),
+            proposed.representation(using: .png, properties: [:]),
+            "A prerequisite proposal must add the task's name and brief to the popover"
+        )
+    }
+
     // MARK: - Helpers
 
     private func presentation(

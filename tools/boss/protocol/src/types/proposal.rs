@@ -638,6 +638,9 @@ pub struct ReviewGuideProposalPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorQuestion {
+    /// Absent on the wire for a prerequisite proposal: the engine writes the
+    /// canonical wording during validation.
+    #[serde(default)]
     pub text: String,
     pub answer_type: OperatorAnswerType,
     pub explanation: String,
@@ -647,6 +650,24 @@ pub struct OperatorQuestion {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperatorAnswerType {
     YesNo,
+    /// The blocked task cannot proceed until some other, unrelated piece of
+    /// work lands. The operator still answers Yes/No ([`OperatorAnswer::YesNo`]);
+    /// Yes makes the engine create `name` as a chore with `brief` as its
+    /// description (or reuse an equivalent open task) and gate the blocked task
+    /// behind it. The "why this task cannot unblock without it" line is the
+    /// question's `explanation`.
+    CreatePrerequisiteTask {
+        name: String,
+        brief: String,
+    },
+}
+
+impl OperatorAnswerType {
+    /// The question wording the kanban shows for a prerequisite proposal. The
+    /// engine owns the phrasing so every producer (CLI, validation) agrees.
+    pub fn prerequisite_question_text(name: &str) -> String {
+        format!("Create prerequisite task '{name}'? This task will wait for it.")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -756,6 +777,31 @@ mod tests {
             assert!(serde_json::from_value::<OperatorAnswerType>(json.clone()).is_err());
             assert!(serde_json::from_value::<OperatorAnswer>(json).is_err());
         }
+        // The prerequisite type carries the proposed task and round-trips.
+        let prerequisite = OperatorAnswerType::CreatePrerequisiteTask {
+            name: "Fix fixture race".into(),
+            brief: "Stand-alone brief".into(),
+        };
+        let json = serde_json::to_value(&prerequisite).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "create_prerequisite_task", "name": "Fix fixture race", "brief": "Stand-alone brief"})
+        );
+        assert_eq!(
+            serde_json::from_value::<OperatorAnswerType>(json).unwrap(),
+            prerequisite
+        );
+        assert!(
+            serde_json::from_value::<OperatorAnswerType>(
+                serde_json::json!({"kind": "create_prerequisite_task", "name": "x"})
+            )
+            .is_err(),
+            "a prerequisite proposal without a brief is not decodable"
+        );
+        assert_eq!(
+            OperatorAnswerType::prerequisite_question_text("Fix fixture race"),
+            "Create prerequisite task 'Fix fixture race'? This task will wait for it."
+        );
         let old: super::RunDoneProposalPayload =
             serde_json::from_str(r#"{"outcome":"blocked","summary":"Waiting"}"#).unwrap();
         assert!(old.question.is_none());

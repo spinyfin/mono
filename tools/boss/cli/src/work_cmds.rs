@@ -1538,11 +1538,22 @@ pub(crate) async fn run_show_leaf(
         for record in &questions {
             let q = &record.question;
             println!("\nOperator question {} ({:?}): {}", q.id, record.status, q.text);
+            let answer_type = match &q.answer_type {
+                boss_protocol::OperatorAnswerType::YesNo => "yes_no",
+                boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { .. } => "create_prerequisite_task",
+            };
             println!(
-                "  Answer type: yes_no; asked: {}; execution: {}",
+                "  Answer type: {answer_type}; asked: {}; execution: {}",
                 q.asked_at, q.execution_id
             );
             println!("  Explanation: {}", q.explanation);
+            if let boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief } = &q.answer_type {
+                println!("  Proposed prerequisite task: {name}");
+                println!("  Proposed brief:");
+                for line in brief.lines() {
+                    println!("    {line}");
+                }
+            }
             if let Some(boss_protocol::OperatorAnswer::YesNo { value }) = &record.answer {
                 println!(
                     "  Answer: {}; by: {}; at: {}",

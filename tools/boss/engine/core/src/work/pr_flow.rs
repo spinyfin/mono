@@ -1,7 +1,7 @@
 use super::*;
 use boss_protocol::{
-    DispatchAdmissionEntryPoint, OperatorAnswer, OperatorQuestion, OperatorQuestionError, OperatorQuestionRecord,
-    OperatorQuestionStatus, OperatorQuestionView,
+    DispatchAdmissionEntryPoint, OperatorAnswer, OperatorAnswerType, OperatorQuestion, OperatorQuestionError,
+    OperatorQuestionRecord, OperatorQuestionStatus, OperatorQuestionView,
 };
 
 /// The `blocked_reason` value the incident-002 postmortem tripwire stamps on
@@ -2019,13 +2019,19 @@ impl WorkDb {
 
     /// The selector is a question id or a canonical task id (RPC resolves short ids).
     ///
-    /// The returned flag is true only when this call minted a ready execution
-    /// (a first Yes answer); the caller must then kick the scheduler, since the
-    /// transaction stages no dispatch wakeup of its own. It is false for No
-    /// answers and for idempotent repeats.
-    pub fn answer_operator_question(&self, id: &str, answer: OperatorAnswer) -> Result<(WorkItem, bool)> {
+    /// `minted_execution` is true only when this call minted a ready execution
+    /// (a first Yes on a plain question); the caller must then kick the
+    /// scheduler, since the transaction stages no dispatch wakeup of its own.
+    /// It is false for No answers, for idempotent repeats, and for a
+    /// prerequisite approval (the task is parked behind its prerequisite; the
+    /// dependency cascade dispatches it later).
+    ///
+    /// Immediate, so two racing answers serialize on the write lock instead of
+    /// failing at the read-to-write upgrade: the loser then reads the winner's
+    /// `answered` row and is an idempotent repeat (or a `Conflict`).
+    pub fn answer_operator_question(&self, id: &str, answer: OperatorAnswer) -> Result<OperatorAnswerOutcome> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let question = tx
             .query_row(
                 &format!(
@@ -2042,7 +2048,7 @@ impl WorkDb {
             .ok_or(OperatorQuestionError::NotFound)?;
         if question.status != OperatorQuestionStatus::Open {
             if question.status == OperatorQuestionStatus::Answered && question.answer.as_ref() == Some(&answer) {
-                return Ok((task_to_item(task), false));
+                return Ok(OperatorAnswerOutcome::unchanged(task_to_item(task)));
             }
             return Err(OperatorQuestionError::Conflict {
                 state: match question.status {
@@ -2072,8 +2078,21 @@ impl WorkDb {
         anyhow::ensure!(changed == 1, "question transition lost inside its transaction");
         let mut pending = PendingEvents::new();
         let mut minted_execution = false;
-        match answer {
-            OperatorAnswer::YesNo { value: true } => {
+        let mut prerequisite_work_item_id = None;
+        match (answer, &question.question.answer_type) {
+            (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::CreatePrerequisiteTask { name, brief }) => {
+                let linked = super::prerequisite_question::approve_in_tx(
+                    &mut pending,
+                    &tx,
+                    &task,
+                    &question.question,
+                    (name, brief),
+                    answered_at,
+                    &now,
+                )?;
+                prerequisite_work_item_id = Some(linked.id);
+            }
+            (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::YesNo) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let description = format!(
                     "{}{}",
@@ -2102,7 +2121,7 @@ impl WorkDb {
                 )?;
                 minted_execution = true;
             }
-            OperatorAnswer::YesNo { value: false } => {
+            (OperatorAnswer::YesNo { value: false }, _) => {
                 let summary = question.question.run_summary.as_deref().unwrap_or("(not recorded)");
                 let detail = format!(
                     "Operator declined on {}: \"{}\"\n\nWorker's explanation: {}\n\nRun summary: {}",
@@ -2120,7 +2139,33 @@ impl WorkDb {
         }
         let updated = query_task(&tx, &task.id).require("task", &task.id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
-        Ok((task_to_item(updated), minted_execution))
+        Ok(OperatorAnswerOutcome {
+            item: task_to_item(updated),
+            minted_execution,
+            prerequisite_work_item_id,
+        })
+    }
+}
+
+/// What [`WorkDb::answer_operator_question`] did, for the RPC layer.
+#[derive(Debug)]
+pub struct OperatorAnswerOutcome {
+    /// The answered task as it stands after the answer.
+    pub item: WorkItem,
+    /// See [`WorkDb::answer_operator_question`].
+    pub minted_execution: bool,
+    /// The prerequisite task a Yes created or linked, so the RPC layer can
+    /// invalidate it alongside the answered task.
+    pub prerequisite_work_item_id: Option<String>,
+}
+
+impl OperatorAnswerOutcome {
+    fn unchanged(item: WorkItem) -> Self {
+        Self {
+            item,
+            minted_execution: false,
+            prerequisite_work_item_id: None,
+        }
     }
 }
 

@@ -84,8 +84,9 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
     }
 }
 
-/// "Why?" popover: the whole question, why the worker asked, the run summary, and when —
-/// scrollable and never truncated.
+/// "Why?" popover: the whole question, the proposed task (for a prerequisite
+/// question), why the worker asked, the run summary, and when — scrollable and
+/// never truncated.
 struct OperatorQuestionDetailPopover: View {
     let question: OperatorQuestionPresentation
 
@@ -93,6 +94,10 @@ struct OperatorQuestionDetailPopover: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 section("Question", question.text)
+                if let proposed = question.prerequisiteTask {
+                    section("Proposed task", proposed.name)
+                    section("Proposed brief", proposed.brief)
+                }
                 if !question.explanation.isEmpty {
                     section("Why the worker is asking", question.explanation)
                 }
