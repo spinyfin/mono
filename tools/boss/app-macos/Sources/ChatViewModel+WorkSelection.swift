@@ -154,6 +154,16 @@ extension ChatViewModel {
         selectedWorkProductID = task.productID
     }
 
+    /// Findings live in the revision brief. Open that document directly;
+    /// revealing a rolled-up revision would redirect to the originating card.
+    func openAIReviewFindings(revisionID: String) {
+        guard let revision = task(withID: revisionID) else {
+            workErrorMessage = "Couldn't open the review findings: the revision is no longer available."
+            return
+        }
+        openTaskDescription(revision)
+    }
+
     /// Navigate the kanban to `taskID` and play a 1.5 s highlight.
     /// Switches to the Work tab, selects the task's product, clears
     /// every active board filter, and queues a scroll. If the task's

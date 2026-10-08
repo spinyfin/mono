@@ -750,7 +750,7 @@ struct ResolvingCIFailureBadge: View {
 
 /// Displays the engine's current-head AI review projection. The visible
 /// label distinguishes this result from the separate CI indicator.
-/// Only findings are actionable; tapping reveals their revision.
+/// Only findings are actionable; tapping opens their revision brief.
 struct AIReviewStateBadge: View {
     let state: String
     var onRevealFindings: (() -> Void)? = nil
@@ -787,8 +787,8 @@ struct AIReviewStateBadge: View {
             return "An AI reviewer pass is queued for a review-pool slot."
         case "reviewed_with_findings":
             return onRevealFindings != nil
-                ? "The AI reviewer found issues on this PR — click to reveal the follow-up revision that addresses them."
-                : "The AI reviewer found issues on this PR, but the follow-up revision could not be created."
+                ? "The AI reviewer found issues on this PR — click to read the findings in the follow-up revision."
+                : "The AI reviewer found issues on this PR, but no separate findings revision is available from this card."
         case "reviewed_all_clear":
             return "AI review passed for the current PR head. Required CI checks passed and no revisions are pending."
         case "not_reviewed":
