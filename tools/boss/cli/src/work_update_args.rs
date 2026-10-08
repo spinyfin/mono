@@ -10,7 +10,7 @@ pub(crate) struct TaskUpdateArgs {
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 
-    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// Resolve a friendly short id (`42`, `#42`) against this product
     /// (slug or id). Optional when the short id is globally unique.
     /// Ignored when the selector already embeds a product slug
     /// (`boss/42`) or when the selector is a primary id.

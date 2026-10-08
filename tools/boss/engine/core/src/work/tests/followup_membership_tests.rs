@@ -126,6 +126,14 @@ fn followups_in_a_project_get_distinct_ordinals_and_reorder() {
         })
         .unwrap();
     let origin = create_test_chore_manual(&db, product.id.clone(), "Origin");
+    db.update_work_item(
+        &origin.id,
+        WorkItemPatch {
+            pr_url: Some("https://github.com/org/repo/pull/117".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let mut followup_ids = Vec::new();
     for name in ["Followup A", "Followup B"] {
         let followup = db
@@ -140,6 +148,7 @@ fn followups_in_a_project_get_distinct_ordinals_and_reorder() {
                     .build(),
             )
             .unwrap();
+        assert_eq!(followup.kind, TaskKind::Followup);
         followup_ids.push(followup.id);
     }
     let move_into = |id: &str| {
@@ -152,8 +161,12 @@ fn followups_in_a_project_get_distinct_ordinals_and_reorder() {
         )
         .unwrap()
     };
-    move_into(&followup_ids[0]);
-    move_into(&followup_ids[1]);
+    for id in &followup_ids {
+        let WorkItem::Task(moved) = move_into(id) else {
+            panic!("expected project-bound followup")
+        };
+        assert_eq!(moved.kind, TaskKind::Followup);
+    }
     let regular = db
         .create_task(
             CreateTaskInput::builder()
@@ -163,6 +176,11 @@ fn followups_in_a_project_get_distinct_ordinals_and_reorder() {
                 .build(),
         )
         .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Moved regular");
+    let WorkItem::Task(moved_regular) = move_into(&chore.id) else {
+        panic!("expected moved task")
+    };
+    assert_eq!(moved_regular.kind, TaskKind::ProjectTask);
 
     let ordinal_of = |id: &str| {
         db.list_tasks(&product.id, Some(&project.id), None, false)
@@ -172,14 +190,20 @@ fn followups_in_a_project_get_distinct_ordinals_and_reorder() {
             .and_then(|row| row.ordinal)
             .unwrap()
     };
-    let (a, b, r) = (
+    let (a, b, r, m) = (
         ordinal_of(&followup_ids[0]),
         ordinal_of(&followup_ids[1]),
         ordinal_of(&regular.id),
+        ordinal_of(&chore.id),
     );
-    assert!(a < b && b < r, "ordinals must be increasing: {a} {b} {r}");
+    assert!(a < b && b < r && r < m, "ordinals must be increasing: {a} {b} {r} {m}");
 
-    let reordered = vec![regular.id.clone(), followup_ids[1].clone(), followup_ids[0].clone()];
+    let reordered = vec![
+        chore.id.clone(),
+        followup_ids[1].clone(),
+        regular.id.clone(),
+        followup_ids[0].clone(),
+    ];
     db.reorder_project_tasks(&project.id, &reordered).unwrap();
     let listed: Vec<String> = db
         .list_tasks(&product.id, Some(&project.id), None, false)
@@ -188,5 +212,10 @@ fn followups_in_a_project_get_distinct_ordinals_and_reorder() {
         .map(|row| row.id)
         .collect();
     assert_eq!(listed, reordered);
+    for id in &followup_ids {
+        let rows = db.list_tasks(&product.id, Some(&project.id), None, false).unwrap();
+        let row = rows.iter().find(|row| &row.id == id).unwrap();
+        assert_eq!(row.kind, TaskKind::Followup);
+    }
     let _ = std::fs::remove_file(path);
 }
