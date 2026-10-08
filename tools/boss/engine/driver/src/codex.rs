@@ -176,6 +176,12 @@ pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
 //   gpt-5.3-codex-spark       default=high    levels=low,medium,high,xhigh
 //   codex-auto-review         (hidden) default=medium  levels=low,medium,high,xhigh,max
 //
+// Re-captured on codex-cli 0.160.1 (2026-10-06): every slug above is still
+// listed with the same `tool_mode` (`code_mode_only` for the selected
+// `gpt-6-astra`); the catalog gained `gpt-6.1-sol` (priority 1), `gpt-6-sol`
+// and `gpt-6-luna` above/around astra, which stays at priority 2. None of
+// them is dispatched by this table.
+//
 // `ModelMenu` is static function pointers today, so this is a baked snapshot
 // rather than a live `codex debug models` parse. Per-model effort filtering
 // (only expose rungs the *selected* model supports) is follow-on work under
@@ -259,8 +265,11 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
-        // Highest-priority model in `codex debug models` (0.153.4): frontier
-        // agentic coding. Step-5 fall-through only — classified rows resolve
+        // Highest-priority model in `codex debug models` on 0.153.4: frontier
+        // agentic coding. 0.159.1 added `gpt-6.1-sol` above it (priority 1
+        // on 0.160.1); astra is retained deliberately — swapping the
+        // dispatched model is a product decision, not part of a CLI
+        // qualification. Step-5 fall-through only — classified rows resolve
         // through `model_for_reasoning`.
         engine_default: "gpt-6-astra",
         effort_value_for_level: codex_effort_value_for_level,
@@ -709,6 +718,9 @@ fn codex_hook_context(workspace: &Path) -> (String, PathBuf) {
 fn render_review_guide_config(workspace: &Path, socket: &Path) -> String {
     // Codex 0.153.4 requires a default whenever named permissions exist:
     // https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/core/src/config/mod.rs#L3404-L3413
+    // Unchanged on 0.160.1 ("config defines `[permissions]` profiles but does
+    // not set `default_permissions`"):
+    // https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/core/src/config/mod.rs#L3496-L3506
     // The hook-trust app-server loads this file before the worker's CLI
     // overrides exist, so selecting the profile only on the command line
     // makes hooks/list reject the config and return no hooks.
@@ -759,7 +771,8 @@ fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> Stri
          # demotes the worker launcher directory and sends bare `boss`/`cube`\n\
          # through repobin. Naming `$BOSS_BIN` is the invocation contract;\n\
          # pinning snapshot/profile off is the driver-env half of the same\n\
-         # hole. Verified to load under --strict-config on 0.145.0 and 0.150.0.\n\
+         # hole. Verified to load under --strict-config on 0.145.0, 0.150.0,\n\
+         # 0.153.4 and 0.160.1.\n\
          shell_snapshot = false\n\
          \n\
          [shell_environment_policy]\n\
@@ -1028,6 +1041,18 @@ fn toml_basic_string(s: &str) -> String {
 /// No `< /dev/null` stdin redirect: that existed so `codex exec` would not
 /// block reading stdin, and a TUI needs the tty to read typed input,
 /// including the pane's own initial-prompt line.
+///
+/// No `--no-daemon` either, and none is needed. codex-cli 0.156 introduced a
+/// shared background app-server daemon and 0.157 made interactive sessions
+/// attach to (and auto-start) it by default; a per-run `CODEX_HOME` that
+/// silently spawned a daemon outliving the pane would break teardown, home
+/// retention and the rollout contract. Measured on 0.160.1 (2026-10-06):
+/// `--strict-config` alone forces embedded mode — the TUI reports
+/// `Running without the shared background server: --strict-config requires
+/// embedded mode.` and no `codex app-server` process appears for the run's
+/// home — so the flag this contract already requires is the guarantee.
+/// `--no-daemon` would add nothing on 0.160.1 and is a hard argument error on
+/// 0.153.4, which production hosts may still be running.
 pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
     let SpawnRequest {
         model,

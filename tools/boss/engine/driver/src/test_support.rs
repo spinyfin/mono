@@ -300,6 +300,53 @@ impl Drop for CodexAuthSourceOverride {
     }
 }
 
+/// [`CodexAuthSourceOverride`] plus a `PATH` that finds a specific `codex`,
+/// obtained from [`codex_auth_source_and_path_override`].
+///
+/// The hook-trust gate resolves `codex` from `PATH` outside `cfg(test)` of
+/// this crate, and Bazel's hermetic test wrapper replaces `PATH` with its own
+/// runtime directory, so a cross-crate test that must attest guards against
+/// the pinned release has to supply one. `PATH` is restored on drop while the
+/// shared homes lock (held by the inner override) is still owned.
+pub struct CodexAuthSourcePathOverride {
+    path_prior: Option<std::ffi::OsString>,
+    _auth: CodexAuthSourceOverride,
+}
+
+/// Like [`codex_auth_source_override`], and additionally prepend `codex_bin_dir`
+/// (a directory containing an executable named `codex`) to `PATH` for as long
+/// as the returned guard lives.
+pub fn codex_auth_source_and_path_override(
+    homes_root: &Path,
+    auth_source: &Path,
+    codex_bin_dir: &Path,
+) -> CodexAuthSourcePathOverride {
+    let auth = codex_auth_source_override(homes_root, auth_source);
+    let path_prior = std::env::var_os("PATH");
+    let mut dirs = vec![codex_bin_dir.to_path_buf()];
+    if let Some(prior) = path_prior.as_ref() {
+        dirs.extend(std::env::split_paths(prior));
+    }
+    let joined = std::env::join_paths(dirs).expect("join PATH entries");
+    // SAFETY: `auth` holds the process-wide homes lock for the lifetime of
+    // the returned guard; `PATH` is restored in `Drop` before it is released.
+    unsafe { std::env::set_var("PATH", joined) };
+    CodexAuthSourcePathOverride {
+        path_prior,
+        _auth: auth,
+    }
+}
+
+impl Drop for CodexAuthSourcePathOverride {
+    fn drop(&mut self) {
+        // SAFETY: the inner override still owns the shared environment lock.
+        match self.path_prior.take() {
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+    }
+}
+
 /// A minimal [`DriverDescriptor`] to pair with [`StubDriver`]. Its menu
 /// resolves everything to one `"stub-model"` slug, which is enough for
 /// tests that only exercise capability declaration or the seams a stub

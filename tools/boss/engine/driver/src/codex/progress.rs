@@ -2279,6 +2279,153 @@ mod tests {
         );
     }
 
+    /// Records captured verbatim from a codex-cli 0.160.1 rollout written by
+    /// the driver's own spawn line (bare TUI, `--no-alt-screen -a never`,
+    /// `gpt-6-astra`) on 2026-10-06, with ids and paths shortened and the
+    /// multi-kilobyte `base_instructions` / `world_state` bodies dropped.
+    /// Two turns: a code-mode `exec` cell that ran `echo hello-boss-qual`
+    /// and completed, then a `sleep 45` cell whose turn was interrupted with
+    /// one Escape. The interleaved `item_completed`, `thread_settings_applied`,
+    /// `token_usage_record`, `world_state` and `turn_context` records are
+    /// what 0.160.1 (and 0.153.4) write around them; the normaliser declines
+    /// each one (`UnknownEvent`) and the stream consumer skips it, so the
+    /// milestone fanout below must come out identical with them present.
+    const ROLLOUT_0_160_1: &str = concat!(
+        r#"{"timestamp":"2026-10-07T01:59:04.958Z","ordinal":0,"type":"session_meta","payload":{"creator_user_id":"user-x","creator_account_id":"acct-x","session_id":"thread-0160","id":"thread-0160","timestamp":"2026-10-07T01:59:04.872Z","cwd":"/ws/mono-agent-001","runtime_workspace_roots":["/ws/mono-agent-001"],"originator":"codex-tui","cli_version":"0.160.1","source":"cli","thread_source":"user","model_provider":"openai"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:04.959Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","root_turn_id":"turn-1","started_at":1791338344,"model_context_window":258400,"collaboration_mode_kind":"default"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:06.803Z","ordinal":6,"type":"world_state","payload":{"full":true,"state":{"agents_md":{},"apps_instructions":false}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:06.804Z","ordinal":7,"type":"turn_context","payload":{"turn_id":"turn-1","root_turn_id":"turn-1","disabled_plugin_ids":[],"cwd":"/ws/mono-agent-001","workspace_roots":["/ws/mono-agent-001"]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:06.809Z","ordinal":9,"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-0160","turn_id":"turn-1","item":{"type":"UserMessage","id":"um-1","content":[{"type":"text","text":"Run the shell command `echo hello-boss-qual` and then reply with exactly: DONE-ONE"}]}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:09.301Z","ordinal":12,"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc-1","status":"completed","call_id":"call-1","name":"exec","input":"text(await tools.exec_command({cmd:\"echo hello-boss-qual\"}));\n","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1","create_time":1791338347.279956}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:09.318Z","ordinal":13,"type":"token_usage_record","payload":{"thread_id":"thread-0160","turn_id":"turn-1","session_id":"thread-0160","root_turn_id":"turn-1","response_id":"resp-1","usage":{"input_tokens":13794,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":0,"total_tokens":13834}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:09.659Z","ordinal":15,"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco-1","call_id":"call-1","output":[{"type":"input_text","text":"Script completed\nWall time 0.2 seconds\nOutput:\n"},{"type":"input_text","text":"{\"chunk_id\":\"741396\",\"wall_time_seconds\":0.00000725,\"exit_code\":0,\"original_token_count\":4,\"output\":\"hello-boss-qual\\n\"}"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1","create_time":1791338349.659072}},"metadata":{"client_authored":false,"fallback_token_limit_override":12000}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:09.659Z","ordinal":16,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":13794,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":0,"total_tokens":13834}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:13.087Z","ordinal":21,"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"DONE-ONE","started_at":1791338344,"completed_at":1791338353,"duration_ms":8129,"time_to_first_token_ms":3668}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:16.624Z","ordinal":22,"type":"event_msg","payload":{"type":"thread_settings_applied","thread_id":"thread-0160","thread_settings":{"model":"gpt-6-astra","model_provider_id":"openai","service_tier":"default","approval_policy":"never","approvals_reviewer":"user","permission_profile":{"type":"disabled"},"cwd":"/ws/mono-agent-001"}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:16.625Z","ordinal":23,"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2","root_turn_id":"turn-2","started_at":1791338356,"model_context_window":258400,"collaboration_mode_kind":"default"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:19.457Z","ordinal":31,"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc-2","status":"completed","call_id":"call-2","name":"exec","input":"text(await tools.exec_command({cmd:\"sleep 45 && echo late-output\",yield_time_ms:1000}));\n","internal_chat_message_metadata_passthrough":{"turn_id":"turn-2","create_time":1791338357.071264}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:20.674Z","ordinal":33,"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco-2","call_id":"call-2","output":[{"type":"input_text","text":"Script completed\nWall time 1.2 seconds\nOutput:\n"},{"type":"input_text","text":"{\"chunk_id\":\"f2fe3e\",\"wall_time_seconds\":1.001832083,\"session_id\":80143,\"original_token_count\":0,\"output\":\"\"}"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-2","create_time":1791338360.674208}},"metadata":{"client_authored":false,"fallback_token_limit_override":12000}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:26.574Z","ordinal":40,"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-2","reason":"interrupted","started_at":1791338356,"completed_at":1791338366,"duration_ms":9948}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn real_0_160_1_rollout_maps_to_ordered_milestones_with_abort() {
+        let mut session = CodexRolloutProgressSession::new(
+            Some("run-0160".into()),
+            None,
+            Some(PathBuf::from("/tmp/rollout-0160.jsonl")),
+        );
+        let mut events = Vec::new();
+        let mut declined = Vec::new();
+        for line in ROLLOUT_0_160_1.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).expect("fixture line is JSON");
+            match session.normalize_progress_events(&record) {
+                Ok(batch) => events.extend(batch),
+                Err(NormalizeError::UnknownEvent(name)) => declined.push(name),
+                Err(other) => panic!("0.160.1 record must never be malformed to the normaliser: {other:?} for {line}"),
+            }
+        }
+        // Everything 0.160.1 interleaves that the dialect has no milestone for
+        // is either an explicitly ignored record (`world_state`,
+        // `turn_context`, `token_count`) or declined by name — never
+        // silently mapped to a milestone, never fatal.
+        assert_eq!(
+            declined,
+            vec![
+                "event_msg/item_completed",
+                "token_usage_record",
+                "event_msg/thread_settings_applied",
+            ]
+        );
+
+        assert!(matches!(
+            &events[0],
+            WorkerEvent::SessionStart { session_id, .. } if session_id == "thread-0160"
+        ));
+        assert!(matches!(&events[1], WorkerEvent::UserPromptSubmit { .. }));
+        // The code-mode `exec` cell surfaces as a Bash call. Both 0.153.4 and
+        // 0.160.1 write the cell's argument object in JavaScript shorthand
+        // (`{cmd:"…"}`, unquoted key), which `codex-rollout`'s cell parser
+        // deliberately does not guess at, so the command text is the whole
+        // cell script rather than the inner `cmd` — unchanged across the pin.
+        let cell_1 = "text(await tools.exec_command({cmd:\"echo hello-boss-qual\"}));\n";
+        assert_eq!(
+            events[2],
+            WorkerEvent::PreToolUse {
+                session_id: "thread-0160".into(),
+                tool_name: "Bash".into(),
+                tool_input: json!({"command": cell_1}),
+            }
+        );
+        assert!(matches!(
+            &events[3],
+            WorkerEvent::PostToolUse { tool_name, tool_response, .. }
+                if tool_name == "Bash" && tool_response.to_string().contains("hello-boss-qual")
+        ));
+        assert_eq!(
+            events[4],
+            WorkerEvent::Stop {
+                session_id: "thread-0160".into(),
+                stop_hook_active: false,
+                stop_reason: StopReason::Completed,
+            }
+        );
+        // Second turn: the yielded cell, then the single-Escape abort lands as
+        // Notification + Stop{Interrupted} on the ordinary boundary channel.
+        assert!(matches!(&events[5], WorkerEvent::UserPromptSubmit { .. }));
+        let cell_2 = "text(await tools.exec_command({cmd:\"sleep 45 && echo late-output\",yield_time_ms:1000}));\n";
+        assert_eq!(
+            events[6],
+            WorkerEvent::PreToolUse {
+                session_id: "thread-0160".into(),
+                tool_name: "Bash".into(),
+                tool_input: json!({"command": cell_2}),
+            }
+        );
+        // The `sleep 45` cell's output chunk carries a `session_id` and no
+        // `exit_code`: the command was still running when the abort landed,
+        // so the cell-aware tracker keeps the call open and emits no
+        // PostToolUse for it — the Escape, not a result, ends the turn.
+        let tail = &events[7..];
+        assert!(
+            !tail.iter().any(|e| matches!(e, WorkerEvent::PostToolUse { .. })),
+            "a yielded, still-running cell must not be reported as finished: {tail:?}"
+        );
+        assert!(
+            tail.iter().any(|e| matches!(e, WorkerEvent::Notification { .. })),
+            "abort must carry a notification: {tail:?}"
+        );
+        assert_eq!(
+            tail.last(),
+            Some(&WorkerEvent::Stop {
+                session_id: "thread-0160".into(),
+                stop_hook_active: false,
+                stop_reason: StopReason::Interrupted,
+            })
+        );
+        assert_eq!(
+            session
+                .transcript_path_for_session(&json!({"type":"event_msg","payload":{"type":"task_complete"}}))
+                .as_deref(),
+            Some("/tmp/rollout-0160.jsonl")
+        );
+    }
+
     #[test]
     fn rollout_custom_tool_variant_and_abort_preserve_ordered_fanout() {
         let mut session = CodexRolloutProgressSession::new(None, None, None);

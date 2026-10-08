@@ -263,7 +263,7 @@
   "moduleExtensions": {
     "//tools/boss/engine/core:codex_test_archives.bzl%codex_test_archives": {
       "general": {
-        "bzlTransitiveDigest": "egKzq1YDQ7nKxFGG4XKlOnrUjGvgbZYqt5gyLxIIjz4=",
+        "bzlTransitiveDigest": "+h1H4D1StTDBfwDJ8IXV0+mFfoY5tS5bvCZFRLCIk3Q=",
         "usagesDigest": "QmWeV3Me4wHQnuSR7xGrIVbHYc1t0vbRtZn2lCk2/F4=",
         "recordedInputs": [],
         "generatedRepoSpecs": {
@@ -271,28 +271,32 @@
             "repoRuleId": "@@//tools/boss/engine/core:codex_test_archives.bzl%_codex_test_repo",
             "attributes": {
               "asset": "codex-aarch64-apple-darwin",
-              "sha256": "8cf911ea676523bfb2121ec561848d2aba564890ad536db4d8a3353f2b9850b1"
+              "sha256": "670af2b049d9c95afb74d7da385f30c5033d13a07175001dd8958c51944984d0",
+              "host_sha256": "6e502df69d9220fa305b0c3c7c17ba8f31ab1d4591fc140084dbb823e800c7db"
             }
           },
           "codex_test_x86_64_macos": {
             "repoRuleId": "@@//tools/boss/engine/core:codex_test_archives.bzl%_codex_test_repo",
             "attributes": {
               "asset": "codex-x86_64-apple-darwin",
-              "sha256": "d69200f0bf841b1d1a07f80b80cf742a2e4fc2bab91ae8a44b1042f8e8ca9fa4"
+              "sha256": "8d938ddb93c4424b1d45f1606984ed514c5aa70e463302a6a2227fba7af02db7",
+              "host_sha256": "cd0ae67e1c2c6cab9c065e3287a56f068961c5592e114c1ccd6e9a4909bba147"
             }
           },
           "codex_test_x86_64_linux": {
             "repoRuleId": "@@//tools/boss/engine/core:codex_test_archives.bzl%_codex_test_repo",
             "attributes": {
               "asset": "codex-x86_64-unknown-linux-musl",
-              "sha256": "f479424eca092484dc40d87ae28c44f4cc40234a60045d6131e493800d814a30"
+              "sha256": "9226581be592d18f7e7f740a352fdb63aa61e45e39f7eb9b09d3888c84bba33f",
+              "host_sha256": "8a69207d97545ac753b6585974e1e67a4c51ae5deacf06517db512bb25e0e3c2"
             }
           },
           "codex_test_aarch64_linux": {
             "repoRuleId": "@@//tools/boss/engine/core:codex_test_archives.bzl%_codex_test_repo",
             "attributes": {
               "asset": "codex-aarch64-unknown-linux-musl",
-              "sha256": "5cda6182bd94c3a30f2eb63a495489ebf7f691fddb14d70f48c6c1a5071b6cde"
+              "sha256": "f54dc5852042445bf41da3aa31156f3cb02f52c5a1a04074de73dc5598f7e1f7",
+              "host_sha256": "e5e027e6689efda2e3570aa600179f0ebb18632803350e152ed6c9b97dcf9741"
             }
           }
         }

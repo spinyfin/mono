@@ -38,9 +38,9 @@
 //! expensive, opt-in half: for each dispatched model, it runs one live
 //! `codex exec` turn — through the exact same `CodexDriver` methods
 //! production uses (`provision_workspace`, `write_permission_config`,
-//! `spawn_invocation`, `apply_permission_extra_args`), so the arming, the
-//! live hook-trust attestation, and the spawned command line are the real
-//! ones, not a hand-rolled stand-in — with a fixed prompt that walks through
+//! `spawn_invocation`, `apply_permission_extra_args`), so arming and live
+//! hook-trust attestation use the production path. The harness explicitly
+//! substitutes `codex exec` for the TUI invocation. Its fixed prompt covers
 //! six tool-surface routes already known to matter, and asserts the observed
 //! `(tool_name, tool_input key set, aggregate guard decision, guard name
 //! set)` for each against [`EXPECTED_PROBES`]. A mismatch fails the test; it
@@ -71,6 +71,10 @@
 //!    a regression that made the path guard stop reading `*** Add File:`
 //!    headers out of `tool_input.command` would leave probe 3 green but
 //!    must fail this one.
+//!
+//! This exec probe does not exercise TUI keyboard input, interruption, or saved
+//! session resume. Step 4 tests a model tool opening an interactive shell, not
+//! stdin delivery to the production Codex TUI.
 //!
 //! # Grouping the trace into one verdict per probe
 //!
@@ -106,10 +110,10 @@ use std::time::{Duration, Instant};
 
 use boss_protocol::{EffortLevel, ReasoningMode};
 
-use crate::conformance::{require_codex_cli, which};
+use crate::conformance::{codex_cli_binary, require_codex_cli};
 use crate::driver::codex::CODEX_AUTH_SOURCE_ENV;
 use crate::driver::codex::guard_trace::{GuardTraceRecord, ToolInputKeys, guard_trace_path, read_records_from};
-use crate::driver::test_support::codex_auth_source_override;
+use crate::driver::test_support::codex_auth_source_and_path_override;
 use crate::driver::{AgentDriver, CodexDriver, PermissionInput, SpawnRequest, WorkerKind, apply_permission_extra_args};
 
 /// Every model [`CodexDriver`] actually dispatches, sourced from the driver's
@@ -141,8 +145,8 @@ fn dispatched_codex_models() -> Vec<&'static str> {
 /// `tool_mode` values covered by the live guard harness
 /// ([`codex_guard_conformance_against_live_dispatched_models`]).
 /// `gpt-6-astra` reports `code_mode_only` via `codex
-/// debug models` (`PINNED_CODEX_CLI_VERSION` / 0.153.4, 2026-09-08), a
-/// covered mode. A dispatched model
+/// debug models` (`PINNED_CODEX_CLI_VERSION` / 0.153.4, 2026-09-08; re-captured
+/// unchanged on 0.160.1, 2026-10-06), a covered mode. A dispatched model
 /// reporting anything else (including no `tool_mode` at all, the `gpt-5.5`
 /// shape the original design doc evidence came from) means this harness has
 /// never verified that model's tool surface and must not be trusted for it.
@@ -151,7 +155,8 @@ const COVERED_TOOL_MODES: &[&str] = &["code_mode", "code_mode_only"];
 /// Checked-in `codex debug models` `(slug, tool_mode)` capture — the fixture
 /// that makes [`codex_dispatched_models_have_covered_tool_mode`] hermetic.
 /// Captured from `codex debug models` on `PINNED_CODEX_CLI_VERSION`
-/// (codex-cli 0.153.4) on 2026-09-08: `gpt-6-astra` reports `code_mode_only`.
+/// (codex-cli 0.153.4) on 2026-09-08 and re-captured on codex-cli 0.160.1 on
+/// 2026-10-06: `gpt-6-astra` reports `code_mode_only` on both.
 /// This table lists the currently selected Codex models and excludes
 /// catalog-only models such as terra and luna.
 /// Re-capture via a live `codex debug models` run and
@@ -202,7 +207,16 @@ fn codex_dispatched_models_have_covered_tool_mode() {
 #[test]
 fn captured_tool_mode_table_matches_installed_codex_cli() {
     let require = require_codex_cli();
-    let output = match Command::new("codex").args(["debug", "models"]).output() {
+    let Some(codex_bin) = codex_cli_binary() else {
+        if require {
+            panic!("BOSS_REQUIRE_CODEX_CLI is set but codex is not on PATH");
+        }
+        eprintln!(
+            "codex not on PATH; skipping the captured-table freshness check (set BOSS_REQUIRE_CODEX_CLI=1 to require it)"
+        );
+        return;
+    };
+    let output = match Command::new(&codex_bin).args(["debug", "models"]).output() {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             if require {
@@ -474,8 +488,11 @@ fn codex_guard_conformance_against_live_dispatched_models() {
         return;
     }
 
-    let codex_bin = which("codex").unwrap_or_else(|| {
-        panic!("BOSS_CODEX_GUARD_LIVE_PROBE=1 but `codex` is not on PATH; install it or unset the var to skip.")
+    let codex_bin = codex_cli_binary().unwrap_or_else(|| {
+        panic!(
+            "BOSS_CODEX_GUARD_LIVE_PROBE=1 but no Codex CLI was found: BOSS_TEST_CODEX is unset \
+             and `codex` is not on PATH; install it or unset the var to skip."
+        )
     });
     let auth_source = resolve_probe_auth_source().unwrap_or_else(|| {
         panic!(
@@ -504,8 +521,26 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
     std::fs::create_dir_all(&data_dir).expect("create data dir");
 
     // Isolate CODEX_HOME under this run's tempdir — never the interactive
-    // ~/.codex — and point the auth snapshot at the resolved credential.
-    let _auth = codex_auth_source_override(&homes_root, auth_source);
+    // ~/.codex — and point the auth snapshot at a private copy of the resolved
+    // credential. The snapshot takes a `<source>.boss-lock` sibling lock and may
+    // adopt a refreshed token back into its source, so the source must live
+    // somewhere writable (Bazel's hermetic sandbox denies writes beside a
+    // credential outside the test tmpdir) and a refresh must never rewrite the
+    // caller's real `auth.json`.
+    let private_auth_dir = tmp.path().join("auth-source");
+    std::fs::create_dir_all(&private_auth_dir).expect("create private auth dir");
+    let private_auth = private_auth_dir.join("auth.json");
+    std::fs::copy(auth_source, &private_auth).expect("copy auth source into the probe tempdir");
+    // The hook-trust gate resolves `codex` from PATH, which Bazel's hermetic
+    // wrapper replaces, so expose the exact binary under test as `codex` on a
+    // private PATH entry.
+    let codex_bin_dir = tmp.path().join("codex-bin");
+    std::fs::create_dir_all(&codex_bin_dir).expect("create codex bin dir");
+    std::fs::copy(codex_bin, codex_bin_dir.join("codex")).expect("stage pinned codex");
+    let host = std::env::var_os("BOSS_TEST_CODEX_CODE_MODE_HOST")
+        .expect("live probe requires the pinned code-mode host runtime input");
+    std::fs::copy(host, codex_bin_dir.join("codex-code-mode-host")).expect("stage pinned code-mode host beside codex");
+    let _auth = codex_auth_source_and_path_override(&homes_root, &private_auth, &codex_bin_dir);
 
     // Arm the real path guard rather than leaving it unset: a local Standard
     // worker in production defaults to the data-dir sandbox enabled, which
@@ -526,7 +561,7 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
         driver
             .provision_workspace(&workspace, PROBE_PROMPT, &run_id)
             .await
-            .unwrap_or_else(|err| panic!("provision_workspace for {model}: {err}"));
+            .unwrap_or_else(|err| panic!("provision_workspace for {model}: {err:#}"));
 
         let codex_home = crate::driver::codex::codex_home_for_run(&run_id)
             .unwrap_or_else(|err| panic!("codex_home_for_run for {model}: {err}"));
@@ -560,22 +595,44 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
             run_id: Some(&run_id),
         });
         let command = apply_permission_extra_args(&plan.command, &artifacts.extra_args);
+        // The driver's production command is the interactive TUI, which needs a
+        // terminal; this harness drives the same model, hooks and config
+        // headlessly through `codex exec`, whose hook and guard behaviour is the
+        // surface under test.
+        assert_eq!(
+            command
+                .matches("codex --strict-config --no-alt-screen -a never")
+                .count(),
+            1,
+            "production spawn changed; review the exec probe substitution: {command}"
+        );
+        let command = command.replacen(
+            "codex --strict-config --no-alt-screen -a never",
+            "codex --strict-config -a never exec --skip-git-repo-check",
+            1,
+        );
         (codex_home, command)
     });
 
     // The resolved command starts with a bare `codex`; make sure it resolves
     // to the confirmed binary regardless of this process's ambient PATH
     // (Bazel's test sandbox does not inherit the operator's).
-    let path_with_codex = match codex_bin.parent() {
-        Some(dir) => format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default()),
-        None => std::env::var("PATH").unwrap_or_default(),
-    };
+    let path_with_codex = format!(
+        "{}:{}",
+        codex_bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default(),
+    );
 
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
         .current_dir(&workspace)
         .env("CODEX_HOME", &codex_home)
+        .env(
+            "SSL_CERT_FILE",
+            std::fs::canonicalize(std::env::var_os("SSL_CERT_FILE").expect("live target declares a CA bundle"))
+                .expect("resolve live target CA bundle"),
+        )
         .env("PATH", path_with_codex)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -654,7 +711,7 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
         EXPECTED_PROBES.len(),
         "{model}: expected {} tool-call groups (one per fixed probe step) but observed {}; the \
          model likely deviated from the fixed probe script, or Codex's tool surface / guard wiring \
-         changed shape. raw trace={records:?}\ncodex stdout={stdout}",
+         changed shape. raw trace={records:?}\ncodex stdout={stdout}\ncodex stderr={stderr}",
         EXPECTED_PROBES.len(),
         groups.len(),
     );

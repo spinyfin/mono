@@ -1,6 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//tools/test-sandbox:defs.bzl", "network_enabled_rust_test")
 load(":codex_cli_version.bzl", "CODEX_CLI_VERSION")
 load(":engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND", "ENGINE_BINARY_NAME", "ENGINE_BINARY_TARGET")
 
@@ -212,6 +213,10 @@ rust_test(
     timeout = "moderate",
     crate = ":engine_lib",
     data = [
+        # The checksum-pinned Codex release (codex_test_archives.bzl) that the
+        # conformance live pins (version_pin, guard_conformance) exercise; the
+        # hermetic wrapper strips PATH, so without it they could only skip.
+        "//tools/boss/engine/driver:codex_test_binary",
         "//tools/repobin",
         "@jj_test_tools//:jj",
     ],
@@ -219,6 +224,7 @@ rust_test(
     env = {
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
         "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "BOSS_TEST_CODEX": "$(rootpath //tools/boss/engine/driver:codex_test_binary)",
         "BOSS_TEST_REPOBIN": "$(rootpath //tools/repobin)",
         "HOME": "/tmp",
     },
@@ -228,6 +234,50 @@ rust_test(
         proc_macro_dev = True,
     ),
     shard_count = 11,
+    deps = [
+        "//tools/boss/engine/test-git",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+network_enabled_rust_test(
+    name = "codex_guard_live_test",
+    size = "small",
+    timeout = "moderate",
+    args = [
+        "codex_guard_conformance_against_live_dispatched_models",
+        "--nocapture",
+    ],
+    crate = ":engine_lib",
+    data = [
+        "@codex_probe_runtime//codex:login-shell",
+        "@codex_probe_runtime//codex:ca.pem",
+        "//tools/boss/engine/driver:codex_test_code_mode_host",
+        # The checksum-pinned Codex release (codex_test_archives.bzl) that the
+        # conformance live pins (version_pin, guard_conformance) exercise; the
+        # hermetic wrapper strips PATH, so without it they could only skip.
+        "//tools/boss/engine/driver:codex_test_binary",
+        "//tools/repobin",
+        "@jj_test_tools//:jj",
+    ],
+    edition = "2024",
+    env = {
+        "SSL_CERT_FILE": "$(rootpath @codex_probe_runtime//codex:ca.pem)",
+        "BOSS_CODEX_GUARD_LIVE_PROBE": "1",
+        "BOSS_TEST_CODEX_CODE_MODE_HOST": "$(rootpath //tools/boss/engine/driver:codex_test_code_mode_host)",
+        "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
+        "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "BOSS_TEST_CODEX": "$(rootpath //tools/boss/engine/driver:codex_test_binary)",
+        "BOSS_TEST_REPOBIN": "$(rootpath //tools/repobin)",
+        "HOME": "/tmp",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    tags = ["manual"],
     deps = [
         "//tools/boss/engine/test-git",
     ] + all_crate_deps(

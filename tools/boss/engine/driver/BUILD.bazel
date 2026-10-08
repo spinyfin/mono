@@ -57,6 +57,10 @@ rust_test(
         # release the test binaries were fetched from.
         "CODEX_CLI_VERSION": CODEX_CLI_VERSION,
     },
+    # Thirty real app-server trust observations retain the production 10s
+    # deadline. Run after parallel engine shards instead of contending with
+    # them; neither the production deadline nor the small test budget changes.
+    tags = ["exclusive"],
     deps = [
         "//tools/boss/codex_auth",
         "//tools/boss/engine/codex-hook-trust",
@@ -114,4 +118,18 @@ filegroup(
         ":x86_64_linux": ["@codex_test_x86_64_linux//:codex"],
         ":aarch64_linux": ["@codex_test_aarch64_linux//:codex"],
     }),
+    # engine/core's conformance live pins run against the same pinned release.
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)
+
+filegroup(
+    name = "codex_test_code_mode_host",
+    srcs = select({
+        ":aarch64_macos": ["@codex_test_aarch64_macos//:code_mode_host"],
+        ":x86_64_macos": ["@codex_test_x86_64_macos//:code_mode_host"],
+        ":x86_64_linux": ["@codex_test_x86_64_linux//:code_mode_host"],
+        ":aarch64_linux": ["@codex_test_aarch64_linux//:code_mode_host"],
+    }),
+    # engine/core's conformance live pins run against the same pinned release.
+    visibility = ["//tools/boss/engine/core:__pkg__"],
 )
