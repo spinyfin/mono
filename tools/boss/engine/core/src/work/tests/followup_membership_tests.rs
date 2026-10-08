@@ -108,3 +108,85 @@ fn followup_moves_preserve_provenance_and_project_views() {
     }
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn followups_in_a_project_get_distinct_ordinals_and_reorder() {
+    let path = temp_db_path("followup-project-ordinals");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Ordered".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let origin = create_test_chore_manual(&db, product.id.clone(), "Origin");
+    let mut followup_ids = Vec::new();
+    for name in ["Followup A", "Followup B"] {
+        let followup = db
+            .create_review_findings_followup(
+                review_findings_followup::ReviewFindingsFollowupInsert::builder()
+                    .product_id(product.id.clone())
+                    .name(name)
+                    .created_via(format!("pr_review:{name}"))
+                    .description("Fix the finding")
+                    .chain_root_id(origin.id.clone())
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        followup_ids.push(followup.id);
+    }
+    let move_into = |id: &str| {
+        db.update_work_item(
+            id,
+            WorkItemPatch {
+                project_id: Some(project.id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    move_into(&followup_ids[0]);
+    move_into(&followup_ids[1]);
+    let regular = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Regular")
+                .build(),
+        )
+        .unwrap();
+
+    let ordinal_of = |id: &str| {
+        db.list_tasks(&product.id, Some(&project.id), None, false)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .and_then(|row| row.ordinal)
+            .unwrap()
+    };
+    let (a, b, r) = (
+        ordinal_of(&followup_ids[0]),
+        ordinal_of(&followup_ids[1]),
+        ordinal_of(&regular.id),
+    );
+    assert!(a < b && b < r, "ordinals must be increasing: {a} {b} {r}");
+
+    let reordered = vec![regular.id.clone(), followup_ids[1].clone(), followup_ids[0].clone()];
+    db.reorder_project_tasks(&project.id, &reordered).unwrap();
+    let listed: Vec<String> = db
+        .list_tasks(&product.id, Some(&project.id), None, false)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(listed, reordered);
+    let _ = std::fs::remove_file(path);
+}

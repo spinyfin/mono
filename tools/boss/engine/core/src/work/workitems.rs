@@ -1249,7 +1249,7 @@ impl WorkDb {
             let mut stmt = tx.prepare(
                 "SELECT id
                  FROM tasks
-                 WHERE project_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
+                 WHERE project_id = ?1 AND kind IN ('project_task', 'followup') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map([project_id], |row| row.get::<_, String>(0))?;

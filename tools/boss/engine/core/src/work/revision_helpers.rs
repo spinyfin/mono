@@ -1022,9 +1022,10 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
 }
 
 fn push_projection_row(task: Task, tasks: &mut Vec<Task>, chores: &mut Vec<Task>) {
-    match task.kind {
-        TaskKind::Chore | TaskKind::Followup => chores.push(task),
-        _ => tasks.push(task),
+    if is_chore_like(&task) {
+        chores.push(task);
+    } else {
+        tasks.push(task);
     }
 }
 

@@ -484,7 +484,7 @@ impl WorkDb {
 pub(crate) fn next_task_ordinal(conn: &Connection, project_id: &str) -> Result<i64> {
     let current = conn.query_row(
         "SELECT COALESCE(MAX(ordinal), 0) FROM tasks
-             WHERE project_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL",
+             WHERE project_id = ?1 AND kind IN ('project_task', 'followup') AND deleted_at IS NULL",
         [project_id],
         |row| row.get::<_, i64>(0),
     )?;
