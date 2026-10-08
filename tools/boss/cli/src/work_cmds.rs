@@ -381,12 +381,18 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
             )
             .await?;
             let design_doc = resolve_project_design_doc(&mut client, &project.id).await?;
+            let tasks: Vec<Task> = list_tasks(&mut client, &product.id, Some(&project.id), None, false)
+                .await?
+                .into_iter()
+                .map(with_display_status)
+                .collect();
             print_entity(
                 ctx,
                 &serde_json::json!({
                     "project": project,
                     "dependencies": detail,
                     "design_doc": design_doc,
+                    "tasks": tasks,
                 }),
                 || {
                     print_project_details("Project", &project, Some(&product), with_primary_id);
@@ -394,6 +400,8 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
                         println!("Design doc: {line}");
                     }
                     print_dependency_section(&detail);
+                    println!("\nTasks:");
+                    print_tasks_table(&tasks, with_primary_id);
                 },
             )
         }

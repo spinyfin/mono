@@ -1869,9 +1869,40 @@ fn post_merge_verdict_materialises_a_followup_despite_matching_the_prior_reviewe
 /// file), since only a `PostMerge` batch takes this branch.
 #[test]
 fn post_merge_verdict_followup_states_title_and_origin_provenance() {
+    assert_post_merge_followup_membership(false);
+}
+
+#[test]
+fn post_merge_verdict_followup_inherits_origin_project() {
+    assert_post_merge_followup_membership(true);
+}
+
+fn assert_post_merge_followup_membership(in_project: bool) {
     let db = WorkDb::open(temp_db_path("verdict-apply-post-merge-title-provenance")).unwrap();
     let product = create_test_product(&db);
-    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let cycle_root = if in_project {
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Origin project".to_owned(),
+                description: None,
+                goal: None,
+                autostart: false,
+                no_design_task: true,
+                design_reasoning_effort_xhigh: false,
+            })
+            .unwrap();
+        db.create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id)
+                .name("review target")
+                .build(),
+        )
+        .unwrap()
+    } else {
+        create_test_chore_manual(&db, product.id.clone(), "review target")
+    };
     bind_merged_pr(&db, &cycle_root.id);
 
     let merge_sha = "merge-commit-sha";
@@ -1911,6 +1942,34 @@ fn post_merge_verdict_followup_states_title_and_origin_provenance() {
         .expect("a post-merge verdict's findings must materialise a follow-up");
     let task = query_task(&db.connect().unwrap(), &created).unwrap().unwrap();
     assert_eq!(task.kind, TaskKind::Followup);
+    assert_eq!(task.project_id, cycle_root.project_id);
+    assert_eq!(task.ordinal, cycle_root.ordinal.map(|ordinal| ordinal + 1));
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let lane = if in_project { &tree.tasks } else { &tree.chores };
+    let tree_task = lane.iter().find(|tree_task| tree_task.id == task.id).unwrap();
+    assert_eq!(tree_task.project_id, cycle_root.project_id);
+    assert_eq!(
+        tree.tasks.iter().filter(|row| row.id == task.id).count(),
+        usize::from(in_project)
+    );
+    assert_eq!(
+        tree.chores.iter().filter(|row| row.id == task.id).count(),
+        usize::from(!in_project)
+    );
+    if let Some(project_id) = &cycle_root.project_id {
+        let listed = db.list_tasks(&product.id, Some(project_id), None, false).unwrap();
+        assert!(listed.iter().any(|listed_task| listed_task.id == task.id));
+        let next_task = db
+            .create_task(
+                CreateTaskInput::builder()
+                    .product_id(product.id.clone())
+                    .project_id(project_id.clone())
+                    .name("Next project task")
+                    .build(),
+            )
+            .unwrap();
+        assert_eq!(next_task.ordinal, task.ordinal.map(|ordinal| ordinal + 1));
+    }
     assert!(
         task.name.starts_with("Post-merge review findings: "),
         "follow-up title must identify it as post-merge review findings; got {:?}",

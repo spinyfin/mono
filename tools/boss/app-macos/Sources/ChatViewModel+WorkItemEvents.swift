@@ -303,11 +303,7 @@ extension ChatViewModel {
             }
 
             // Insert into the destination bucket for the updated shape.
-            if isChore {
-                var chores = choresByProductID[productID] ?? []
-                chores.append(updatedTask)
-                choresByProductID[productID] = chores.sorted(by: taskSort)
-            } else if let projectID = updatedTask.projectID {
+            if let projectID = updatedTask.projectID {
                 var tasks = tasksByProjectID[projectID] ?? []
                 tasks.append(updatedTask)
                 tasksByProjectID[projectID] = tasks.sorted(by: taskSort)
@@ -317,6 +313,10 @@ extension ChatViewModel {
                 // recorded or the next full apply will leave this bucket
                 // un-evicted and duplicate the task onto itself.
                 trackedProjectIDsByProductID[productID, default: []].insert(projectID)
+            } else if isChore {
+                var chores = choresByProductID[productID] ?? []
+                chores.append(updatedTask)
+                choresByProductID[productID] = chores.sorted(by: taskSort)
             } else if updatedTask.kind == "revision" {
                 var revisions = productLevelRevisionsByProductID[productID] ?? []
                 revisions.append(updatedTask)
@@ -365,7 +365,8 @@ extension ChatViewModel {
         if previous.kind != updated.kind { return true }
         if previous.projectID != updated.projectID { return true }
         if previous.productID != updated.productID { return true }
-        if previous.isChore != isChore { return true }
+        // Project membership determines the bucket regardless of the wire arm.
+        if updated.projectID == nil && previous.isChore != isChore { return true }
         return false
     }
 
