@@ -51,6 +51,41 @@ fn card(db: &WorkDb, product: &str, root: &str) -> Task {
 }
 
 #[test]
+fn current_head_review_badge_never_projects_a_self_referencing_findings_revision() {
+    let db = WorkDb::open(temp_db_path("current-head-review-self-link")).unwrap();
+    let product = make_revision_product(&db, "current-head-self-link");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8006");
+    let revision = insert_revision_row(&db, &product, &root);
+    let sibling = insert_revision_row(&db, &product, &root);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id IN (?1, ?2)",
+            rusqlite::params![revision, sibling],
+        )
+        .unwrap();
+    for (owner, head) in [(&root, "root-head"), (&revision, "revision-head")] {
+        observe(&db, &root, Some(head), "success", "mergeable");
+        let findings = verdict(&db, owner, head, "completed_with_findings");
+        db.set_review_verdict_revision_task_id(&findings, &revision).unwrap();
+        let tree = db.get_work_tree(&product).unwrap();
+        for id in [&root, &revision, &sibling] {
+            let task = tree
+                .tasks
+                .iter()
+                .chain(tree.chores.iter())
+                .find(|task| &task.id == id)
+                .unwrap();
+            assert_eq!(task.ai_review_state.as_deref(), Some("reviewed_with_findings"));
+            assert_eq!(
+                task.ai_review_findings_revision_id.as_deref(),
+                if id == &revision { None } else { Some(revision.as_str()) }
+            );
+        }
+    }
+}
+
+#[test]
 fn current_head_review_badge_findings_revision_clean_then_new_unreviewed_head() {
     let db = WorkDb::open(temp_db_path("current-head-review-transition")).unwrap();
     let product = make_revision_product(&db, "current-head-transition");

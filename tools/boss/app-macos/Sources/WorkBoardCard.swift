@@ -158,12 +158,7 @@ struct WorkBoardCardItem: View {
         )
         let onRevealAIReviewFindings: (() -> Void)? = snapshot.aiReviewFindingsRevisionId.map { revisionID in
             {
-                switch model.revealWorkCard(revisionID, productID: task.productID) {
-                case .revealed, .deferred:
-                    break
-                case .unreachable(let reason):
-                    model.workErrorMessage = "Couldn't reveal the review findings for \(task.name): \(reason)"
-                }
+                model.openAIReviewFindings(revisionID: revisionID)
             }
         }
         let onOpenDesignDoc: (() -> Void)? = {
@@ -431,8 +426,8 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// the button (also gated by `snapshot.showsAttachmentsAffordance`).
     var onOpenAttachments: (() -> Void)? = nil
     /// Invoked when the user taps the `reviewed_with_findings` AI-review
-    /// badge — reveals the follow-up revision carrying the review
-    /// comments. Only called when `snapshot.aiReviewFindingsRevisionId`
+    /// badge — opens the revision's findings description.
+    /// Only called when `snapshot.aiReviewFindingsRevisionId`
     /// is non-nil.
     var onRevealAIReviewFindings: (() -> Void)? = nil
     /// Invoked with an attention item id when the popup's "Accept" button

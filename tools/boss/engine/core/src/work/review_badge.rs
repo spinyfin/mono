@@ -98,6 +98,8 @@ pub(super) fn current_head_review_states(
             }
             _ => (AI_REVIEW_STATE_NOT_REVIEWED, None),
         };
+        // A revision inherits the owner's verdict, but must not link to itself.
+        let revision = revision.filter(|revision_id| revision_id != &id);
         result.insert(id, (state, revision));
     }
     Ok(result)
