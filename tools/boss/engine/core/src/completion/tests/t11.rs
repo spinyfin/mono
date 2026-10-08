@@ -773,3 +773,6 @@ async fn automation_outcome_proposals_first_flag_off_matches_pre_migration_behav
         "with the flag off nothing is counted",
     );
 }
+
+#[path = "remote_release.rs"]
+mod remote_release;

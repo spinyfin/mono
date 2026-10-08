@@ -526,6 +526,12 @@ mod floor_tests {
             }
             if version >= 35 {
                 conn.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
+                conn.execute_batch(
+                    "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+                     VALUES ('restored-execution', 'work', 'chore_implementation', 'completed', 'repo', '2026-01-01');
+                     INSERT INTO execution_restore_reports VALUES ('restored-execution', 'retained report');",
+                )
+                .unwrap();
             }
             if version >= 37 {
                 personas::migrate(&conn).unwrap();
@@ -555,6 +561,16 @@ mod floor_tests {
                 let db = WorkDb::open(path.clone()).unwrap();
                 let conn = db.connect().unwrap();
                 assert_eq!(capture(&conn), before);
+                if version >= 35 {
+                    let report: String = conn
+                        .query_row(
+                            "SELECT report FROM execution_restore_reports WHERE execution_id = 'restored-execution'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(report, "retained report");
+                }
                 let observed: String = conn
                     .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
                         row.get(0)
