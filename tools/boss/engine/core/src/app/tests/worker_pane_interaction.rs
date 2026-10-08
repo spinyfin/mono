@@ -186,6 +186,7 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
     .await;
 
     assert_eq!(send.await.expect("send task").expect("tmux send succeeds"), 7);
+    assert_eq!(runner.escape_presses(), 0, "an idle worker must not be interrupted");
     let calls = runner.calls();
     assert!(
         calls.len() >= 6,
@@ -583,7 +584,7 @@ async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
 /// closed — that unresolvable-driver path is what this test pins, *not*
 /// `Working` by itself. A mid-turn worker on a driver that buffers is
 /// injectable; see
-/// `send_input_to_worker_writes_to_a_mid_turn_worker_on_a_buffering_driver`.
+/// `send_input_to_worker_interrupts_a_long_tool_call_before_submitting`.
 /// The refusal is a typed error — not a silent drop and not a successful
 /// "unconfirmed" write.
 #[tokio::test]
@@ -646,61 +647,67 @@ async fn chore_update_notify_requeues_when_worker_not_accepting_input() {
     assert_eq!(queued.text, msg);
 }
 
-/// The other half of the mid-turn decision: a `Working` worker whose driver
-/// declares `MidTurnPaneInput::Buffers` (the engine default, `claude`) *is*
-/// injectable. `send_input_to_worker` writes the exact text to the pane and
-/// returns `Ok(slot_id)` on `PaneInjectOutcome::Buffered` — no
-/// `UserPromptSubmit` is expected inside the window, because the text is
-/// sitting in the agent's composer rather than having become a prompt. When
-/// the agent acts on it (a fresh turn on Claude, folded into the running turn
-/// on Codex's TUI) is the driver's business; this path returns without
-/// waiting for either, which is what keeps it correct on both.
+/// A long tool call emits no boundary until Escape arrives. Sending a nudge
+/// must create that boundary and submit exactly once before the tool finishes.
 #[tokio::test(start_paused = true)]
-async fn send_input_to_worker_writes_to_a_mid_turn_worker_on_a_buffering_driver() {
+async fn send_input_to_worker_interrupts_a_long_tool_call_before_submitting() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 6, None);
     let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+    let parker = super::probe_interrupt::park_once_interrupted(&server_state, &runner, 6);
+    let confirmer = super::probe_interrupt::confirm_write_when_it_lands(&server_state, &runner, &run_id);
+    let started = tokio::time::Instant::now();
 
-    let slot = server_state
-        .send_input_to_worker(&run_id, "mid-turn nudge".into())
+    let (slot, receipt) = server_state
+        .send_input_to_worker_with_receipt(&run_id, "mid-turn nudge".into())
         .await
-        .expect("a mid-turn write on a buffering driver must succeed");
+        .unwrap();
+    parker.await.unwrap();
+    confirmer.await.unwrap();
     assert_eq!(slot, 6);
-    assert!(
-        runner
-            .calls()
-            .iter()
-            .any(|call| call.iter().any(|arg| arg == "mid-turn nudge")),
-        "the exact text must reach the pane: {:?}",
-        runner.calls()
-    );
+    let record = server_state
+        .probe_record(&receipt.expect("busy send must return a receipt"))
+        .unwrap();
+    assert_eq!(record.state, ProbeDeliveryState::Consumed);
+    assert!(record.detail.unwrap().contains("resumed=confirmed"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(runner.escape_presses(), 1);
+    let calls = runner.calls();
+    let escape = calls
+        .iter()
+        .position(|c| c.last().is_some_and(|a| a == "Escape"))
+        .unwrap();
+    let paste = calls.iter().position(|c| c.iter().any(|a| a == "load-buffer")).unwrap();
+    assert!(escape < paste, "must interrupt before pasting: {calls:?}");
+    assert_eq!(calls.iter().filter(|c| c.iter().any(|a| a == "load-buffer")).count(), 1);
+    let pasted = String::from_utf8(runner.stdin().first().unwrap().clone()).unwrap();
+    assert!(pasted.ends_with("mid-turn nudge"));
+    assert!(server_state.pop_pending_probe(&run_id).is_none());
 }
 
-/// User-visible consequence of the above for the chore-update auto-notice:
-/// against a mid-turn worker on a buffering driver the notice is delivered
-/// into the composer now, rather than refused and re-queued as a probe for
-/// the next Stop boundary.
+/// Brief updates use the same interrupting path, including the reconciliation
+/// notice for any partial edit/build that the interrupt cancelled.
 #[tokio::test(start_paused = true)]
-async fn chore_update_notify_delivers_mid_turn_on_a_buffering_driver() {
+async fn chore_update_notify_interrupts_before_delivering() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 9, None);
     let runner = install_live_tmux_delivery(&server_state, &run_id, 9, "boss-9");
-
+    let parker = super::probe_interrupt::park_once_interrupted(&server_state, &runner, 9);
+    let confirmer = super::probe_interrupt::confirm_write_when_it_lands(&server_state, &runner, &run_id);
     let msg = build_chore_update_message("old", "new", "old desc", "new desc").expect("message");
-    match server_state.send_input_to_worker(&run_id, msg.clone()).await {
-        Ok(slot) => assert_eq!(slot, 9),
-        other => panic!("expected Ok(9) for a buffering mid-turn driver, got {other:?}"),
-    }
-    let pasted = String::from_utf8(runner.stdin().last().cloned().unwrap_or_default()).unwrap();
     assert_eq!(
-        pasted.trim_end_matches(['\r', '\n']),
-        msg.trim_end_matches(['\r', '\n']),
-        "the chore-update notice must reach the pane"
+        server_state.send_input_to_worker(&run_id, msg.clone()).await.unwrap(),
+        9
     );
-    assert!(
-        server_state.pop_pending_probe(&run_id).is_none(),
-        "a delivered mid-turn notice must not also be re-queued as a probe",
-    );
+    parker.await.unwrap();
+    confirmer.await.unwrap();
+    let pasted = String::from_utf8(runner.stdin().last().cloned().unwrap_or_default()).unwrap();
+    // Pane submission strips trailing line endings before pressing Enter.
+    assert!(pasted.ends_with(msg.trim_end_matches(['\r', '\n'])));
+    assert!(pasted.contains(super::super::probe_interrupt::INTERRUPT_NOTICE));
+    assert_eq!(runner.escape_presses(), 1);
+    assert_eq!(runner.stdin().len(), 1);
+    assert!(server_state.pop_pending_probe(&run_id).is_none());
 }
 
 /// Fail closed when the slot has no live-worker-state entry: unknown
@@ -761,4 +768,54 @@ async fn interrupt_worker_pane_without_tmux_identity_fails_closed() {
         .await
         .expect_err("local missing tmux identity must fail closed");
     assert!(matches!(err, InterruptPaneError::Tmux(_)));
+}
+
+/// The completion adapter must interrupt its own nudge, leaving an older
+/// explicitly queued probe untouched.
+#[tokio::test(start_paused = true)]
+async fn engine_nudge_interrupts_without_stealing_an_older_probe() {
+    use crate::completion::ProbeQueuer;
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 6, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+    let older = server_state.queue_probe(run_id.clone(), "wait for a boundary".into(), false);
+    let parker = super::probe_interrupt::park_once_interrupted(&server_state, &runner, 6);
+    let confirmer = super::probe_interrupt::confirm_write_when_it_lands(&server_state, &runner, &run_id);
+    let queuer = crate::app::probes::ServerStateProbeQueuer::default();
+    queuer.set_server_state(Arc::downgrade(&server_state));
+    queuer.queue_probe(&run_id, "act now");
+    queuer.deliver_queued_probes_now(&run_id);
+    parker.await.unwrap();
+    confirmer.await.unwrap();
+    assert_eq!(runner.escape_presses(), 1);
+    let pasted = String::from_utf8(runner.stdin().first().unwrap().clone()).unwrap();
+    assert!(pasted.contains("act now"));
+    assert!(!pasted.contains("wait for a boundary"));
+    assert_eq!(
+        server_state.probe_lifecycle_state(&older),
+        Some(ProbeDeliveryState::Queued)
+    );
+}
+
+/// Failure to interrupt must never be reported as a successful agents send.
+#[tokio::test(start_paused = true)]
+async fn send_input_fails_visibly_when_the_long_tool_call_does_not_stop() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 6, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+    let err = server_state
+        .send_input_to_worker(&run_id, "act now".into())
+        .await
+        .unwrap_err();
+    let SendInputError::NudgeDelivery { probe_id, state, .. } = err else {
+        panic!("expected a queryable failed nudge, got {err:?}");
+    };
+    assert_eq!(state, "interrupt_failed");
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::InterruptFailed)
+    );
+    assert_eq!(runner.escape_presses(), 2);
+    assert!(!runner.wrote_text());
+    assert!(server_state.pop_pending_probe(&run_id).is_none());
 }

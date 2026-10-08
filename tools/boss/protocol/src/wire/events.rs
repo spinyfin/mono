@@ -450,6 +450,9 @@ pub enum FrontendEvent {
     WorkerInputSent {
         run_id: String,
         slot_id: u8,
+        /// Busy-worker nudge receipt, queryable with ProbeStatus.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        probe_id: Option<String>,
     },
     /// Engine acknowledges an interrupt request — an Esc keystroke
     /// has been delivered to the worker pane's pty. Carries the

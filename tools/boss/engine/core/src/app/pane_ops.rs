@@ -33,6 +33,12 @@ pub enum FocusPaneError {
 pub enum SendInputError {
     #[error("no worker pane mapped for that run id")]
     UnknownRun,
+    #[error("nudge {probe_id} settled as {state}: {detail}")]
+    NudgeDelivery {
+        probe_id: String,
+        state: String,
+        detail: String,
+    },
     /// Live worker activity does not accept typed input (or is
     /// unknown). No bytes were written to the pane — see
     /// [`boss_protocol::WorkerActivity::accepts_typed_input`].
@@ -229,9 +235,9 @@ impl ServerState {
     /// when the run's `(activity, driver)` pair yields no injectable
     /// posture (see [`SendInputError::NotAcceptingInput`] /
     /// `pane_input_posture_for_run`). A mid-turn worker on a driver whose
-    /// foreground process buffers stdin *is* injectable — the write lands in
-    /// the agent's composer, exactly as a human's keystrokes would. When the
-    /// guard passes it also verifies the write actually became a queued
+    /// foreground process buffers stdin is interrupted and brought back to
+    /// its prompt before submission, using the shared probe delivery path.
+    /// When the guard passes it also verifies the write actually became a queued
     /// prompt. This is the chore-update auto-notice path implicated
     /// in the probe-6 incident.
     ///
@@ -250,11 +256,36 @@ impl ServerState {
     /// did reach the pane) and leaves the unverified state observable
     /// via the probe/lifecycle machinery rather than silently retrying.
     pub async fn send_input_to_worker(&self, run_id: &str, text: String) -> Result<u8, SendInputError> {
+        self.send_input_to_worker_with_receipt(run_id, text)
+            .await
+            .map(|(slot, _)| slot)
+    }
+
+    /// Preserve the probe id for callers that expose delivery verification.
+    pub(super) async fn send_input_to_worker_with_receipt(
+        &self,
+        run_id: &str,
+        text: String,
+    ) -> Result<(u8, Option<String>), SendInputError> {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(SendInputError::UnknownRun);
         };
-        let (transcript_path, offset_bytes) = super::worker_events::transcript_offset_for_run(self, run_id).await;
         let posture = self.pane_input_posture_for_run(run_id, slot_id);
+        if posture == PaneInputPosture::MidTurnBuffered {
+            let probe_id = self.queue_probe(run_id.to_owned(), text, false);
+            let delivery = super::probe_interrupt::deliver_probe_interrupting(self, run_id, &probe_id).await;
+            if delivery.state.is_delivered() {
+                return Ok((slot_id, Some(probe_id)));
+            }
+            return Err(SendInputError::NudgeDelivery {
+                probe_id,
+                state: delivery.state.as_str().to_owned(),
+                detail: delivery
+                    .detail
+                    .unwrap_or_else(|| "delivery is not confirmed; inspect probe-status before retrying".to_owned()),
+            });
+        }
+        let (transcript_path, offset_bytes) = super::worker_events::transcript_offset_for_run(self, run_id).await;
         match self
             .inject_pane_text_verified(
                 PaneInjectRequest::builder()
@@ -313,6 +344,7 @@ impl ServerState {
             }
             PaneInjectOutcome::SendFailed(PaneSendFailure::Tmux(err)) => Err(SendInputError::Tmux(err)),
         }
+        .map(|slot| (slot, None))
     }
 
     /// Resolve `run_id → slot_id` and deliver an Esc keystroke through tmux

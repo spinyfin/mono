@@ -80,15 +80,9 @@ enum Command {
         #[command(subcommand)]
         action: AgentsAction,
     },
-    /// Inject a probe prompt into a worker, delivered at the earliest
-    /// opportunity its pane offers. A parked worker (idle between turns, or
-    /// sitting at its prompt after a Stop that followed a
-    /// notification/permission prompt) takes the text immediately. A worker
-    /// that is mid-task also takes it immediately, buffered in its agent's
-    /// composer the same way text typed into the pane by hand would be — so
-    /// a probe can steer a worker in the middle of a long autonomous run
-    /// rather than reaching it as it exits. Only a worker whose driver reads
-    /// no mid-turn input at all waits for a boundary.
+    /// Deliver a probe promptly, interrupting a busy worker and confirming
+    /// its turn ended before submitting the text. An idle worker receives
+    /// it directly. Use --no-interrupt for buffered/boundary delivery.
     ///
     /// The engine checks that the probe can actually be delivered before
     /// accepting it, and prints the boundary it committed to. If it cannot
@@ -704,7 +698,7 @@ enum AgentsAction {
         /// see `agents --help` for resolution order.
         agent: String,
     },
-    /// Send text to a worker as if user-typed.
+    /// Send a nudge, interrupting a busy interactive worker before submission.
     Send {
         /// Worker reference: run id, slot id, or crew name; see `agents
         /// --help` for resolution order.

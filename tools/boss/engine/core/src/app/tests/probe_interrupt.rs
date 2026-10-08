@@ -108,7 +108,7 @@ fn park_slot(server_state: &ServerState, slot_id: u8) {
 /// unconditionally would let a test pass even if the engine typed first and
 /// interrupted second, which is the exact ordering bug this whole path
 /// exists to prevent.
-fn park_once_interrupted(
+pub(super) fn park_once_interrupted(
     server_state: &Arc<ServerState>,
     runner: &Arc<RecordingTmux>,
     slot_id: u8,
@@ -131,7 +131,7 @@ fn park_once_interrupted(
 /// `UserPromptSubmit` hook once the pane write has gone out. Reads the text
 /// back out of what actually reached tmux rather than reconstructing it, so
 /// the confirmation cannot accidentally paper over a mangled write.
-fn confirm_write_when_it_lands(
+pub(super) fn confirm_write_when_it_lands(
     server_state: &Arc<ServerState>,
     runner: &Arc<RecordingTmux>,
     run_id: &str,
@@ -191,11 +191,27 @@ async fn interrupting_probe_cuts_the_turn_short_before_writing() {
 
     match sole_response(&sink).await {
         FrontendEvent::ProbeDelivered {
+            probe_id,
             state,
             interrupt,
             interrupt_attempts,
             ..
         } => {
+            let status_sink = make_session_sink();
+            executions::handle_probe_status(
+                dispatch_for(&server_state, &status_sink),
+                FrontendRequest::ProbeStatus { probe_id },
+            )
+            .await;
+            match sole_response(&status_sink).await {
+                FrontendEvent::ProbeStatusResult {
+                    detail: Some(detail), ..
+                } => {
+                    assert!(detail.contains("submitted=true"));
+                    assert!(detail.contains("resumed=confirmed"));
+                }
+                other => panic!("status must report submission evidence: {other:?}"),
+            }
             assert_eq!(
                 state,
                 ProbeDeliveryState::Consumed,
@@ -989,6 +1005,9 @@ async fn interrupting_a_busy_worker_reports_delivered_without_a_prompt_submit_ho
                 server_state.probe_lifecycle_state(&probe_id),
                 Some(ProbeDeliveryState::Consumed),
             );
+            let detail = server_state.probe_record(&probe_id).unwrap().detail.unwrap();
+            assert!(detail.contains("submitted=true"));
+            assert!(detail.contains("resumed=unconfirmed"));
         }
         other => panic!("expected ProbeDelivered, got {other:?}"),
     }

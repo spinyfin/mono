@@ -1062,11 +1062,9 @@ pub(super) async fn apply_work_item_patch(
                 // in sequence — that's acceptable per the acceptance
                 // criteria.
                 //
-                // A mid-turn worker is injectable when its driver buffers
-                // pane input (the notice lands in the composer and the agent
-                // acts on it when the composer next drains — inside the
-                // running turn on a folding driver, at the next turn
-                // otherwise). When there is no injectable posture
+                // A mid-turn worker whose driver buffers pane input is
+                // interrupted and the notice submitted at its prompt.
+                // When there is no injectable posture
                 // — no live state, a pre-session/terminal worker, or a
                 // driver that does not read mid-turn stdin —
                 // `send_input_to_worker` refuses for safety, and the notice

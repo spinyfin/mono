@@ -1887,7 +1887,7 @@ pub(super) async fn record_pane_write_outcome(
         state = intended.as_str(),
         "{success_message}",
     );
-    server_state.set_probe_lifecycle(probe_id, intended);
+    server_state.set_probe_lifecycle_detail(probe_id, intended, Some(success_message.to_owned()));
     intended
 }
 
