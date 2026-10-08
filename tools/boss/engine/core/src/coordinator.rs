@@ -2295,6 +2295,12 @@ pub struct ExecutionCoordinator {
     /// wiring to be live in every build.
     #[builder(default = tokio::sync::watch::channel(0).0)]
     pause_state_changed: tokio::sync::watch::Sender<u64>,
+    /// Consecutive pre-start spawn failures per (driver, worker kind), fed
+    /// by both arms of [`Self::run_execution`]'s spawn outcome and read by
+    /// the engine health report. Visibility only — nothing in dispatch
+    /// consults it. See [`crate::pre_start_streak`].
+    #[builder(default)]
+    pre_start_streaks: Arc<crate::pre_start_streak::PreStartStreakTracker>,
 }
 
 mod blocked_workspace;

@@ -107,4 +107,48 @@ impl ServerState {
             }
         })
     }
+
+    /// Push a fresh engine-health snapshot whenever a pre-start
+    /// spawn-failure streak alert is raised, updated or resolved.
+    ///
+    /// The companion of [`Self::spawn_pause_state_health_broadcaster`] for
+    /// [`crate::pre_start_streak`], built the same way and for the same
+    /// reason: the alert is only worth anything if it reaches the app's
+    /// banner without a poll or RPC, so the push is keyed to the
+    /// tracker's own change notifier rather than to the code that happens
+    /// to record a failure. Every in-place update pushes too, so the banner
+    /// shows the live count and latest error rather than the values from
+    /// the moment the alert was first raised.
+    ///
+    /// Supervised, and each (re)start broadcasts once before waiting, so a
+    /// change that landed across a panic/restart is still delivered.
+    pub fn spawn_spawn_streak_health_broadcaster(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let weak_state = Arc::downgrade(self);
+        boss_event_bus::spawn_supervised("engine_spawn_streak_health", move || {
+            let weak_state = weak_state.clone();
+            async move {
+                let Some(state) = weak_state.upgrade() else {
+                    return;
+                };
+                let mut alert_changes = state.execution_coordinator.pre_start_streaks().subscribe();
+                state.broadcast_engine_health().await;
+                drop(state);
+                while alert_changes.changed().await.is_ok() {
+                    let Some(state) = weak_state.upgrade() else {
+                        return;
+                    };
+                    tracing::debug!(
+                        active_alerts = state.execution_coordinator.pre_start_streaks().active_alerts().len(),
+                        "pre-start spawn failure streak changed — broadcasting engine health to \
+                         subscribed frontends",
+                    );
+                    state.broadcast_engine_health().await;
+                }
+                tracing::warn!(
+                    "spawn-streak broadcaster: notifier closed, subscription ended; streak alert \
+                     changes will no longer push engine health",
+                );
+            }
+        })
+    }
 }

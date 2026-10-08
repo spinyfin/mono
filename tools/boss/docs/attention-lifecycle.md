@@ -39,6 +39,22 @@ A signal can be re-raised onto an already-open row instead of getting a fresh on
 
 Both apply the same rule, so the sweep is never doing anything the inline path would have disagreed with.
 
+## The fleet-level spawn-failure streak alert is not an attention item
+
+Attention items are scoped to one execution or one work item. A failure pattern that only exists _across_ executions has no row to live on, so it is raised as an engine-health issue instead.
+
+The one such signal today is `pre_start_spawn_failure_streak` (`engine/core/src/pre_start_streak.rs`). The engine counts pre-start spawn outcomes per (driver, worker kind). Two consecutive failures with no success in between raise one alert for that combination; each further failure updates the same alert with the live count and the latest full error; the combination's next successful spawn clears it. `SlotBusy` rejections are not counted. It never pauses dispatch and changes nothing about how each failure is handled.
+
+It appears in three places, all rendered from the same engine health report:
+
+- the app's chrome banner (first issue, red), with the latest error in the expanded body;
+- `bossctl state` (a `spawn alerts:` section) and `bossctl state --json` (`spawn_failure_streaks`);
+- the `engine.health` topic, pushed on raise, on every update and on resolve.
+
+Each failed spawn still gets its own execution-scoped `pane_spawn_failed` attention item. For an execution whose work item is not a task row — a review guide binds a source-comparison id — no board or work-item listing reaches that item, so the streak alert and the execution's own dispatch event log are where the failure is visible. The engine log line `filed pane_spawn_failed attention item for the failed spawn` and the `attention_item_id` on the `pane_spawned` error event say that the row exists.
+
+State is in memory and starts empty on engine restart; a combination that is still broken re-raises after two more failures.
+
 ## Adding a new attention kind
 
 Add an entry to `ATTENTION_LIFECYCLES` at the same time you add the kind. `ClearedBy::HumanDecision` is a perfectly good answer — an _undeclared_ kind is not. Filing an unregistered kind emits a `tracing::warn!` from `warn_if_lifecycle_undeclared`, and `every_attention_kind_constant_in_the_crate_is_registered` fails if a constant exists with no entry.

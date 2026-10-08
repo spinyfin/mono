@@ -196,7 +196,9 @@ enum Command {
         systems: Vec<PauseSystem>,
     },
     /// Show pause status for every system (dispatch, automation, ...) in
-    /// one view, including `paused_since` for whichever are paused.
+    /// one view, including `paused_since` for whichever are paused, plus
+    /// any active pre-start spawn-failure streak alert (a driver and worker
+    /// kind whose spawns keep failing, with the count and latest error).
     /// Equivalent to `bossctl pause state`.
     State,
     /// Inspect the dispatch-pipeline event stream (file-scan only —
