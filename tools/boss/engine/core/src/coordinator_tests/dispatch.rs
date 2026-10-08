@@ -1235,8 +1235,8 @@ async fn pane_spawn_run_does_not_release_worker_pool_slot() {
     // tmux worker spawn completes, but the user-visible worker
     // is just getting started. If the coordinator freed the
     // WorkerPool slot at that moment, the next dispatch could
-    // re-claim the slot and the app would reject the spawn with
-    // SlotBusy. Outcomes that carry slot_id = Some(N) must keep
+    // re-claim a slot that still belongs to a live worker.
+    // Outcomes that carry slot_id = Some(N) must keep
     // the slot claimed until `release_worker_pane` fires.
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
@@ -1261,7 +1261,7 @@ async fn pane_spawn_run_does_not_release_worker_pool_slot() {
     assert_eq!(
         coordinator.worker_pool().idle_count().await,
         0,
-        "WorkerPool slot must stay claimed while the libghostty pane is alive"
+        "WorkerPool slot must stay claimed while the tmux worker is alive"
     );
 }
 

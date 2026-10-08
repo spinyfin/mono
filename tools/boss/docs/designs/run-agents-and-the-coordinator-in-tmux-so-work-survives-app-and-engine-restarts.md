@@ -1,5 +1,7 @@
 # Boss: Workers outlive their supervisor — hosting agent panes and the coordinator in tmux
 
+> **Current implementation:** Local workers always run in engine-created tmux sessions with durable spawn tokens. The app only attaches viewers; app-owned worker lifecycle and input RPCs and the hosting-mode setting have been removed. Remote SSH workers remain detached on their separate lifecycle. The rollout stages and pre-migration inventory below are historical design context, not current operator instructions. `//tools/boss/engine/core:tmux_only_surface_test` guards the production surfaces.
+
 - **Status:** design proposal (not yet implemented). `kind=design` deliverable — architecture, failure-mode analysis and a dependency-ordered task list. No code.
 - **Project:** `proj_18c8288509223d90_21` — "Run agents and the coordinator in tmux so work survives app and engine restarts".
 - **Provenance:** design execution `exec_18c831d64a2ab588_6`.

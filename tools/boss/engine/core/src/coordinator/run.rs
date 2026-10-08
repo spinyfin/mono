@@ -3,8 +3,8 @@
 //! module split; see [`super`] for the struct and shared types.
 use super::*;
 
-/// Filed against a run when the worker pane never came up (libghostty IPC
-/// drop, slot busy, prompt composition error). See
+/// Filed against a run when the worker pane never came up (tmux creation failure,
+/// viewer rejection, or prompt composition error). See
 /// [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
 /// rule: `ClearedBy::WorkResumed`, since a later run starting for the item
 /// is direct evidence the pane-spawn problem is no longer blocking it.
@@ -57,10 +57,10 @@ impl ExecutionCoordinator {
             .await;
         drop(heartbeat);
 
-        // Pane-spawn runs hand the slot to a live libghostty pane; the
+        // Pane-spawn runs hand the slot to a live tmux worker; the
         // WorkerPool slot must remain claimed until that pane is torn
         // down by `ServerState::release_worker_pane` (completion, force
-        // release, or engine shutdown). Releasing it here would let a
+        // release). Releasing it here would let a
         // concurrent dispatch re-claim the same slot while the pane
         // still owns it, and the app would reject `AttachWorkerPane`
         // with `SlotBusy`. Non-pane runs (test fakes, future
@@ -376,7 +376,7 @@ impl ExecutionCoordinator {
                 // disagree about this specific slot's occupancy — the app
                 // itself documents this as "the engine should reconcile
                 // rather than retry blindly" (see
-                // `WorkersWorkspaceModel.spawnWorkerPane`'s doc comment).
+                // `ServerState::attach_worker_viewer`'s contract).
                 // It is an engine/app desync, not a genuine task or
                 // automation failure, so it is handled differently below:
                 // the work stays queued instead of bouncing to a terminal
@@ -387,7 +387,7 @@ impl ExecutionCoordinator {
                 let is_slot_busy = slot_busy;
 
                 // Historical silent-release path: a pane-spawn
-                // failure (libghostty IPC drop, slot busy, prompt
+                // failure (tmux creation failure, viewer rejection, prompt
                 // composition error) inside `run_execution` marked
                 // the run `failed` and released the lease without
                 // raising anything the operator could see. Attach a
@@ -588,7 +588,7 @@ impl ExecutionCoordinator {
                         // pessimistic `failed_will_retry` that the scheduler
                         // stamped when it dispatched the triage execution.
                         //
-                        // A genuine spawn failure (bad config, IPC down, …)
+                        // A genuine spawn failure (bad config, tmux unavailable, …)
                         // flips it to `failed_gave_up` so the Automations tab
                         // shows an accurate terminal state instead of implying
                         // a self-healing retry is pending — it will not
@@ -701,7 +701,7 @@ impl ExecutionCoordinator {
         if !defer_pool_slot_release {
             if hold_slot_busy {
                 // Do NOT hand the slot back to `select_claim_index` — the
-                // app just told us it's still hosting a real pane there, so
+                // app just told us it still has a viewer attached there, so
                 // freeing it now would let the very next dispatch pass
                 // re-select the same slot and repeat the rejection (an
                 // effective blind retry loop). Instead leave the claim
@@ -876,10 +876,9 @@ impl ExecutionCoordinator {
     /// Release `worker_id` back to the pool, then rescan + kick to
     /// pick up newly-eligible work. Used at the tail of non-pane
     /// `run_execution` calls and from [`ServerState::release_worker_pane`]
-    /// for the deferred pane-spawn case — the engine and the app must
-    /// agree on which slots are busy, so the WorkerPool free signal is
-    /// paired with the libghostty pane teardown rather than firing as
-    /// soon as the spawn RPC returns.
+    /// for the deferred pane-spawn case. The WorkerPool free signal
+    /// follows token-verified tmux teardown and viewer detach, keeping
+    /// the slot occupied until the worker has been released.
     pub async fn release_worker_and_kick(self: &Arc<Self>, worker_id: &str, last_workspace_id: Option<&str>) {
         self.pool_for_worker_id(worker_id)
             .release_worker(worker_id, last_workspace_id)

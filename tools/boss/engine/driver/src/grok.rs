@@ -748,7 +748,7 @@ impl AgentDriver for GrokDriver {
         classify_grok_error(raw_output)
     }
 
-    /// Probe is typed pane input (`SendToPane`) — Grok's interactive TUI
+    /// Probe is typed pane input (tmux `send-keys`) — Grok's interactive TUI
     /// reads stdin as the next user message, same as Claude's.
     fn probe(&self) -> ProbeDelivery {
         ProbeDelivery::PaneText

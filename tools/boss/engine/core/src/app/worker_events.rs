@@ -1544,7 +1544,7 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
 }
 
 /// On the driver's turn boundary, pop a pending probe for the run (if
-/// any) and `SendToPane` the text to the worker's slot. The injection
+/// any) and write the text into the worker's tmux pane. The injection
 /// arrives at the pane just as the worker becomes idle, so the agent
 /// treats it as the next user prompt. After a successful dispatch,
 /// records an in-flight entry (with the transcript path and current
@@ -1653,7 +1653,7 @@ async fn dispatch_probe_on_stop_inner(
 }
 
 /// Claim the next queued probe for `run_id` and write it into the pane with a
-/// plain `SendToPane`, trusting a successful write.
+/// plain pane write, trusting a successful write.
 ///
 /// The delivery mechanism for a pane the worker is *parked* at: the write
 /// becomes its next prompt, so nothing further needs to be observed to call
@@ -1712,9 +1712,9 @@ async fn deliver_probe_via_pane_write(
     server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Injected);
     match server_state.send_pane_text_checked(run_id, slot_id, &probe.text).await {
         Ok(()) => {
-            // The claim is conditional on somebody being home: `SendToPane`
-            // returning Ok proves the app wrote bytes into the pty, not that a
-            // process read them.
+            // The claim is conditional on somebody being home: a pane write
+            // returning Ok proves tmux accepted the keys, not that a process
+            // read them.
             let state = record_pane_write_outcome(
                 server_state,
                 run_id,
@@ -1786,7 +1786,7 @@ async fn deliver_probe_via_pane_write(
 /// exited or the run's pane has already been released out from under this
 /// write, and log the result. Returns the state actually recorded.
 ///
-/// `SendToPane` returning `Ok` only means the app wrote bytes into the pty. A
+/// A pane write returning `Ok` only means tmux accepted the keys. A
 /// pane whose foreground process has already exited (observed with `codex`)
 /// accepts those bytes with nobody to read them, so a `consumed` status alone
 /// is not evidence anyone read the text — the engine checks liveness before
@@ -1794,7 +1794,7 @@ async fn deliver_probe_via_pane_write(
 ///
 /// **Async, and must be awaited before this run's pane can be torn down
 /// again.** The claim (`try_reserve_probe_for_delivery`) and this recording
-/// happen on opposite sides of the `SendToPane` round trip, so a concurrent
+/// happen on opposite sides of the pane-write round trip, so a concurrent
 /// teardown (`release_worker_pane`, reached from completion, `bossctl agents
 /// stop`, or a dead-pid sweep) can run in between. `orphan_in_flight_probe_for_terminated_run`
 /// only sees the reservation if it is still in the in-flight table *when
@@ -1960,9 +1960,9 @@ const MID_TURN_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 /// cycle" holds for a folding driver too, on one boundary rather than two.
 ///
 /// When the guard passes, the write is not trusted just because
-/// `SendToPane` returned Ok: confirmation still requires a matching
+/// the pane write returned Ok: confirmation still requires a matching
 /// `UserPromptSubmit` hook or a transcript scan (probe-6). On a
-/// transport/app-level failure the probe is pushed back to the front
+/// tmux transport failure the probe is pushed back to the front
 /// so a later retry keeps the same id.
 ///
 /// A mid-turn injection that has not produced a `UserPromptSubmit` inside the
@@ -2360,7 +2360,7 @@ async fn dispatch_probe_now_inner(server_state: &Arc<ServerState>, run_id: &str)
         return inject_probe_mid_turn(server_state, run_id, slot_id, posture).await;
     }
     // Parked (Idle/WaitingForInput) is a reliable arrival point just like
-    // Stop, so a successful `SendToPane` here is treated as consumed —
+    // Stop, so a successful pane write here is treated as consumed —
     // provided the worker's process is actually still there to consume it.
     deliver_probe_via_pane_write(
         server_state,

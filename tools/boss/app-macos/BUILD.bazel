@@ -341,3 +341,11 @@ macos_application(
     visibility = ["//tools/boss/installer:__pkg__"],
     deps = [":boss_mac_app_lib"],
 )
+
+# Production sources scanned by `//tools/boss/engine/core:tmux_only_surface_test`,
+# the architecture guard for the tmux-only local-pane invariant.
+filegroup(
+    name = "swift_sources",
+    srcs = glob(["Sources/**/*.swift"]),
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)

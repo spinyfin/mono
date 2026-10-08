@@ -692,7 +692,7 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
                         pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
                     ),
                     HostedPaneState::Husk => println!(
-                        "slot {}  {}  run={}  HUSK (app-hosted, no engine-tracked run, no live process — \
+                        "slot {}  {}  run={}  HUSK (app viewer only, no engine-tracked run, no live process — \
                          retire with `bossctl agents retire-pane {}`)",
                         pane.slot_id, pane.crew_name, pane.run_id, pane.slot_id,
                     ),
@@ -841,8 +841,8 @@ fn looks_like_execution_id(reference: &str) -> bool {
 /// and the durable/hosted-pane roster (a pane already torn down
 /// everywhere but the DB row) is forwarded to the engine raw. The
 /// engine's stop path resolves the worker from durable state
-/// (`work_runs.shell_pid`) and reaps both the app-hosted pane and the OS
-/// process tree. Other reference forms (crew name, slot id) still fail
+/// (`work_runs.shell_pid`) and reaps the tmux worker and its OS process
+/// tree, detaching any app viewer. Other reference forms (crew name, slot id) still fail
 /// with the candidate list — a typo'd name must not be posted to the
 /// engine as a run id.
 pub(crate) async fn agents_stop(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
@@ -1856,7 +1856,7 @@ fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
             );
         }
         HostedPaneState::Husk => {
-            println!("  state: husk (app-hosted, no engine-tracked run, no live process)");
+            println!("  state: husk (app viewer only, no engine-tracked run, no live process)");
             println!("  retire with `bossctl agents retire-pane {}`", pane.slot_id);
         }
     }

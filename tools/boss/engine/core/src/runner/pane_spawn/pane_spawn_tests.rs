@@ -52,6 +52,8 @@ struct CapturingSpawner {
     /// When true, `capture-pane` stamps a driver-signal so the turn-start
     /// wait can succeed in tests.
     auto_confirm_turn: std::sync::atomic::AtomicBool,
+    /// Cancel exactly when confirmation first observes the pane.
+    cancel_on_capture: StdMutex<Option<(Arc<WorkDb>, String)>>,
 }
 
 impl CapturingSpawner {
@@ -63,6 +65,7 @@ impl CapturingSpawner {
             reaped: StdMutex::new(Vec::new()),
             pane_chrome: std::sync::atomic::AtomicBool::new(false),
             auto_confirm_turn: std::sync::atomic::AtomicBool::new(false),
+            cancel_on_capture: StdMutex::new(None),
         }
     }
 
@@ -147,6 +150,9 @@ impl CommandRunner for CapturingSpawner {
             }
             Some("display-message") => "4242",
             Some("capture-pane") => {
+                if let Some((db, execution_id)) = self.cancel_on_capture.lock().unwrap().take() {
+                    db.cancel_running_execution(&execution_id).unwrap();
+                }
                 if self.auto_confirm_turn.load(std::sync::atomic::Ordering::SeqCst) {
                     for state in self.live_states.snapshot() {
                         self.live_states
@@ -2311,12 +2317,9 @@ async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
     runner.set_skip_spawn_confirm(false);
     runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(80));
 
-    let exec_id = execution.id.clone();
-    let db = work_db.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-        db.cancel_running_execution(&exec_id).unwrap();
-    });
+    // Synchronize cancellation with confirmation instead of racing a sleep
+    // against its timeout on a loaded test host.
+    *spawner.cancel_on_capture.lock().unwrap() = Some((work_db.clone(), execution.id.clone()));
 
     let chore_item = work_db.get_work_item(&chore.id).unwrap();
     let outcome = runner
@@ -2330,5 +2333,9 @@ async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
         "a cancel that lands during confirmation must yield CancelledDuringSpawn",
     );
     assert!(outcome.slot_id.is_none());
+    assert!(
+        spawner.cancel_on_capture.lock().unwrap().is_none(),
+        "confirmation must observe the pane and trigger cancellation",
+    );
     assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
 }

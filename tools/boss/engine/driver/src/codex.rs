@@ -2036,7 +2036,7 @@ impl AgentDriver for CodexDriver {
         WorkerErrorClass::Indeterminate
     }
 
-    /// Existing engine path: probes go through `SendToPane`, either at a turn
+    /// Existing engine path: probes go through a tmux pane write, either at a turn
     /// boundary or into a live composer mid-turn — the TUI buffers the latter
     /// (see [`Self::mid_turn_pane_input`]), so there is no longer a refusal
     /// case for this driver. This declares today's transport so the seam is

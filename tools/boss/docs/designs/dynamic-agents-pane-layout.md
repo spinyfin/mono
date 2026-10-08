@@ -5,7 +5,7 @@
 - **Project:** Dynamic Agents pane layout
 - **Provenance:** project-design execution; no implementation code
 - **Verified against:** `main` at `2e351399284f` (2026-09-30), including merged mono#3010; source checkpoints below pin this revision
-- **Baseline:** [Tmux-only local worker panes](./make-tmux-the-only-pane-hosting-mode.md); remaining sequencing constraints: **Delete app-mediated worker input and narrow hosting status** and **Enforce and verify the tmux-only local-pane invariant**
+- **Baseline:** [Tmux-only local worker panes](./make-tmux-the-only-pane-hosting-mode.md); local worker ownership and input are engine-only, with the invariant enforced by `//tools/boss/engine/core:tmux_only_surface_test`.
 - **Direction notes:** [Fleet scaling, the slot model, and team semantics](./fleet-scaling-dynamic-panes-and-team-semantics.md)
 - **Related contract:** [Worker liveness](../worker-liveness-contract.md)
 
@@ -258,9 +258,9 @@ Filtering does not detach, pause, or throttle workers. CLI send, interrupt, stop
 
 Add `run_id` only to `DetachWorkerPaneInput` and `FocusWorkerPaneInput`; attach already carries it. Re-key `WorkersWorkspaceModel` by run id, retaining slot as capacity/diagnostic metadata. A delayed detach or focus for a prior run must never target the new occupant of its old slot.
 
-Do not modify `SendToPaneInput` or `InterruptWorkerPaneInput`: **Delete app-mediated worker input and narrow hosting status** deletes them. Follow that task when editing shared protocol enums.
+The app-mediated `SendToPaneInput` and engine→app interrupt request have been removed. The frontend `InterruptWorkerPaneInput` remains an operator request serviced by the engine through tmux.
 
-**Enforce and verify the tmux-only local-pane invariant** lands first and retires `retire_pane` Guard 3 and `list_hosted_pane_statuses`'s app process oracle. `HostedPaneEntry` already carries both `slot_id` and `run_id`; its slot report and the existing `SlotBusy` safety contract remain intact through that prerequisite. The subsequent RPC task removes slot-based safety compatibility and makes same-run attach idempotent: preserve the existing surface and return success, with no surviving slot-desync caller interpreting a changed error contract. Retain both fields in viewer reports for diagnostics; resolve personas in the engine by run id. Temporary slot-array projections support only the old grid, not process safety.
+`retire_pane` Guard 3 and `list_hosted_pane_statuses` resolve occupancy from engine state and durable runs; app inventory describes viewers only. `HostedPaneEntry` already carries both `slot_id` and `run_id`, and `SlotBusy` remains a viewer attachment error. The subsequent RPC task removes slot-based safety compatibility and makes same-run attach idempotent: preserve the existing surface and return success, with no surviving slot-desync caller interpreting a changed error contract. Retain both fields in viewer reports for diagnostics; resolve personas in the engine by run id. Temporary slot-array projections support only the old grid, not process safety.
 
 ### Header, empty state, and pool information
 

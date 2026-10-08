@@ -76,7 +76,7 @@ impl WorkerActivity {
     /// True iff the pane's foreground worker is **parked at its prompt**:
     /// [`Self::Idle`] (between turns) or [`Self::WaitingForInput`] (on a
     /// permission prompt / human redirect). In those postures a typed /
-    /// `SendToPane` write becomes the worker's next prompt under any driver,
+    /// pane write becomes the worker's next prompt under any driver,
     /// so this is the driver-independent floor for pane injection.
     ///
     /// This is **not** the whole injection decision, and callers must not use
@@ -159,8 +159,8 @@ pub struct LiveWorkerState {
     /// this with that authoritative value. Absent model on the hook
     /// (Codex stdout `thread.started`) leaves the launch default in place.
     pub model: String,
-    /// Best-effort shell pid the app returned at spawn. `0` if the
-    /// app did not yet plumb pid back through `proc_listpids`.
+    /// Tmux pane pid (`#{pane_pid}`). `0` for remote workers or before
+    /// the local pane pid has been registered.
     pub shell_pid: i32,
     /// ISO-8601 timestamp of the most recent hook event observed for
     /// this slot. Useful for staleness detection — a worker that has
@@ -246,11 +246,13 @@ pub struct LiveWorkerState {
     /// tolerant of payloads from older engines that omit the key.
     #[serde(default)]
     pub held: bool,
-    /// Whether this run was actually dispatched onto the tmux-hosting path
-    /// (`Some(true)`) or not (`Some(false)`) — stamped once, at spawn, from
-    /// the spawn decision itself. `None` for spawns where hosting mode isn't
-    /// meaningful (remote workers, which have no local pane at all) or for
-    /// payloads from an older engine that predates this field.
+    /// `Some(true)` for a local worker hosted in a tmux session — stamped
+    /// once, at spawn (or from the durable run row on re-adoption).
+    /// `Some(false)` marks a local run whose durable tmux stamp is missing:
+    /// an invariant failure that clients must surface as unavailable, never
+    /// a supported hosting mode. `None` for remote workers, which have no
+    /// local pane at all, or for payloads from an older engine that predates
+    /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_hosted: Option<bool>,
 }
@@ -295,10 +297,8 @@ impl LiveWorkerState {
     }
 
     /// Like [`Self::new_spawning_with_routing`], but also stamps
-    /// [`Self::tmux_hosted`] — the actual hosting mode this spawn was
-    /// dispatched under, resolved once at the spawn decision. See the
-    /// field doc for why this must not be re-derived from the current
-    /// settings value later.
+    /// [`Self::tmux_hosted`], resolved once at the spawn decision (or read
+    /// from the durable run row on re-adoption).
     #[allow(clippy::too_many_arguments)]
     pub fn new_spawning_with_routing_and_hosting(
         slot_id: u8,

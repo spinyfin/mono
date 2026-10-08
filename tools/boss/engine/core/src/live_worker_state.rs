@@ -52,11 +52,12 @@ pub struct LiveSpawnRouting {
     pub pool: Option<String>,
     /// Execution kind snake_case string (see [`ExecutionKind::as_str`]).
     pub kind: Option<String>,
-    /// Whether this spawn actually went onto the tmux-hosting path
-    /// (`Some(true)`) or the legacy app-owned pty path (`Some(false)`),
-    /// resolved once at the spawn decision (see `spawn_flow`'s use of
-    /// `StartWorkerInput::tmux_host`). `None` where hosting mode isn't
-    /// meaningful — e.g. remote workers, which have no local pane.
+    /// `Some(true)` for a local worker hosted in a tmux session, stamped
+    /// at spawn (or read from the durable run row on re-adoption).
+    /// `Some(false)` marks a local run whose durable tmux stamp is missing —
+    /// an invariant failure, never a supported hosting mode. `None` where
+    /// tmux hosting isn't meaningful — e.g. remote workers, which have no
+    /// local pane.
     pub tmux_hosted: Option<bool>,
 }
 
@@ -66,10 +67,9 @@ impl LiveSpawnRouting {
         Self::default()
     }
 
-    /// Stamp pool + kind for a production dispatch that does not (yet)
-    /// know its hosting mode — e.g. the remote-worker registration path,
-    /// which has no local pane at all. Use
-    /// [`Self::new_with_hosting`] for a spawn that does know it.
+    /// Stamp pool + kind for a production dispatch that has no local tmux
+    /// worker — e.g. the remote-worker registration path, which has no
+    /// local pane at all. Use [`Self::new_with_hosting`] for a local spawn.
     pub fn new(pool: impl Into<String>, kind: impl Into<String>) -> Self {
         Self {
             pool: Some(pool.into()),
@@ -78,8 +78,8 @@ impl LiveSpawnRouting {
         }
     }
 
-    /// Stamp pool, kind, and the resolved hosting mode for a production
-    /// dispatch that made a real spawn decision (local `start_worker`).
+    /// Stamp pool, kind, and the tmux-hosting stamp for a local production
+    /// dispatch (`start_worker`, or re-adoption from the durable run row).
     pub fn new_with_hosting(pool: Option<String>, kind: impl Into<String>, tmux_hosted: bool) -> Self {
         Self {
             pool,
@@ -260,10 +260,9 @@ struct SlotMeta {
     /// this driver started?" still has a single, unforgeable answer.
     ///
     /// Note what is deliberately absent: `shell_pid`. A reported
-    /// foreground pid is the *shell hosting the pane*, not the driver
-    /// (`GhosttyTerminalView.swift`'s `onSurfaceAttached` reads
-    /// `ghostty_surface_foreground_pid`, which is the login shell when
-    /// the driver was never exec'd). Every check that treated a positive
+    /// tmux pane pid (`#{pane_pid}`) identifies the pane process, which
+    /// may still be the shell if the driver was never exec'd. It is zero
+    /// for remote workers or before registration. Every check that treated a positive
     /// pid as evidence of a working worker is what the 2026-07-30
     /// incident walked through untouched.
     driver_signal_at: Option<i64>,
@@ -560,8 +559,9 @@ impl LiveWorkerStateRegistry {
             "live-state registry: slot entry registered; run is now visible to `bossctl agents list`",
         );
 
-        // A slot re-registered without an intervening `release_slot` is the
-        // desync `EngineToAppError::SlotBusy` exists to prevent. The prior
+        // A slot re-registered without an intervening `release_slot` is an
+        // engine bookkeeping desync (and what `EngineToAppError::SlotBusy`
+        // reports when the app's viewer disagrees). The prior
         // run silently disappears from `agents list` here, so without this
         // line the trace would carry two `registered` events and one
         // `cleared` for the same slot, and diffing the pair for the
@@ -868,9 +868,8 @@ impl LiveWorkerStateRegistry {
     ///
     /// For callers that only know the run id, not the slot — e.g.
     /// `TransientRecoveryReaper::reap_worker` after `release_worker_pane`
-    /// found no run→slot mapping (both the `NoLiveWorker` and untracked
-    /// `Reaped` arms of `reap_untracked_worker_process` skip
-    /// [`Self::release_slot`]). Left alone, that shape strands both the
+    /// found no run→slot mapping (its `NoLiveWorker` and untracked-viewer
+    /// arms skip [`Self::release_slot`]). Left alone, that shape strands both the
     /// pool claim and this live-state entry: an entry still backing the
     /// claim is exactly what `pool_claim_sweep` skips by design, so
     /// nothing else ever reconciles it. Dropping the entry here clears

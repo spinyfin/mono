@@ -1,5 +1,7 @@
 # Engine ↔ App pane RPC
 
+> **As-built note.** This document records the original app-hosted design, which is no longer how local workers run. Every local worker is hosted in a Boss-owned tmux session that the engine creates and tears down; the app only attaches and detaches a viewer. The worker-lifecycle and input RPCs described below (`SpawnWorkerPane`, `ReleaseWorkerPane`, `UpdateWorkerShellPid`, `WorkerPaneDied`, `ReportWorkerSpawnFailed`, `SendToPane`, and the engine→app `InterruptWorkerPane`) and the app-owned pty and shell-pid extraction no longer exist. The engine→app requests that remain are viewer-only: `AttachWorkerPane`, `AttachCoordinatorPane`, `DetachWorkerPane`, `FocusWorkerPane`, `RevealWorkItem`, `OpenDocument`, and `ListHostedPanes`. The transport, request-id correlation, and app-session sections still describe the live channel. See [Tmux-only local worker panes](./make-tmux-the-only-pane-hosting-mode.md) for the current model.
+
 Phase 6f needs the engine to drive pane allocation in the macOS app —
 when the `ExecutionCoordinator` schedules a run, the engine must
 ask the app to host a `libghostty` pane in one of the 8 worker slots,

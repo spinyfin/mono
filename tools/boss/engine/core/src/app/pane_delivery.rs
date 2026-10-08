@@ -515,14 +515,13 @@ impl ServerState {
             observed_process,
             "pane delivery refused: the worker driver is no longer foreground; terminalizing the run before text can reach its shell",
         );
-        let reaped = crate::dead_pid_sweep::reap_reported_pane_death(
+        let reaped = crate::dead_pid_sweep::reap_driver_exit_at_pane_input(
             self.work_db.as_ref(),
             self.live_worker_states.as_ref(),
             self.execution_coordinator.clone(),
             self.dispatch_events.as_ref(),
             self.cube_client.as_ref(),
             run_id,
-            boss_protocol::WorkerPaneDeathReason::DriverExited,
         )
         .await;
         let release = self.release_worker_pane(run_id).await;

@@ -746,7 +746,7 @@ pub(super) async fn apply_work_item_patch(
                 // terminal status (`done`, `archived`, or
                 // `cancelled`), tear down whatever resources
                 // its latest execution still holds: the
-                // libghostty pane and the cube workspace.
+                // tmux pane and the cube workspace.
                 // Idempotent — duplicate or no-op cases
                 // (already released, never spawned, not a
                 // task/chore) collapse inside force_release.

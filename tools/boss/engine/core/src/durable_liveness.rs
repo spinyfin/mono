@@ -147,7 +147,7 @@ pub fn corroborating_liveness(
     // killed mid-tool (activity still `Working`, `current_tool` still set)
     // would be spared forever by every durable-pid consumer — including
     // [`crate::dead_pane_sweep`], whose whole reason to exist is the deaths
-    // the app never reports via `reap_reported_pane_death`. Past the ceiling
+    // the engine has no direct observation of. Past the ceiling
     // the `Gone` verdict stands and a later pass reaps the row;
     // `stale_worker_sweep` itself skips while a tool is in flight, so this
     // bound is what clears that shape.

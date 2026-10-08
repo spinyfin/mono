@@ -303,7 +303,8 @@ pub enum FrontendRequest {
 
     /// Cancel a non-terminal execution. Marks the execution row
     /// `cancelled`, releases any cube workspace lease it still holds,
-    /// and tears down the libghostty pane (if one was allocated).
+    /// and performs a token-verified teardown of the run's tmux session
+    /// (if one was allocated), detaching any app viewer.
     /// Already-terminal rows return `WorkError` (not a silent no-op).
     ///
     /// When `queued_only` is true (used by `bossctl executions cancel`),
@@ -2558,8 +2559,9 @@ pub enum FrontendRequest {
         project_id: String,
     },
 
-    /// Boss-tier RPC: tear down the libghostty pane hosting `run_id`
-    /// and release the cube workspace its execution still holds.
+    /// Boss-tier RPC: tear down (token-verified) the tmux session hosting
+    /// `run_id`, detach the app viewer, and release the cube workspace
+    /// its execution still holds.
     /// Used by `bossctl agents stop`. Idempotent — duplicate requests
     /// (or one racing with completion-detection) collapse to a no-op
     /// on the second pass.
@@ -2801,52 +2803,6 @@ pub enum FrontendRequest {
     /// returned vector mirrors cube's view, optionally annotated with
     /// the engine's own knowledge of which leases back which executions.
     WorkspacePoolSummary,
-}
-
-/// The observed cause behind a dead worker pane.
-///
-/// Production currently produces only [`Self::DriverExited`]: a pre-write
-/// driver liveness check on the engine's tmux pane-delivery path. The other
-/// variants are retained for decoding old logs. No current producer.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerPaneDeathReason {
-    /// Historical app-owned surface-creation failure, retained for decoding
-    /// old logs. No current producer: viewer surface failures are recorded
-    /// in the app's spawn JSONL, not as a worker-pane death.
-    SurfaceCreationFailed,
-    /// Historical app-owned child-process exit, retained for decoding old
-    /// logs. No current producer: viewer closure is not worker death.
-    ChildProcessExited,
-    /// A pre-write foreground-process check found the driver's CLI had
-    /// returned and a shell (or no process) owned the worker PTY instead.
-    /// This is the only variant a current producer constructs.
-    DriverExited,
-    /// Historical value for reports from an app build that predated the
-    /// reason field, retained for decoding old logs. No current producer.
-    #[default]
-    Unknown,
-}
-
-impl WorkerPaneDeathReason {
-    /// Human-readable detail for durable lifecycle narratives.
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::SurfaceCreationFailed => "surface creation failed before a child process attached",
-            Self::ChildProcessExited => "attached child process exited",
-            Self::DriverExited => "worker driver exited before the engine delivered pane input",
-            Self::Unknown => "historical pane-death report did not identify which callback fired",
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SurfaceCreationFailed => "surface_creation_failed",
-            Self::ChildProcessExited => "child_process_exited",
-            Self::DriverExited => "driver_exited",
-            Self::Unknown => "unknown",
-        }
-    }
 }
 
 mod events;

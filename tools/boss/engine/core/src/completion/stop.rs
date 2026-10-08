@@ -789,7 +789,7 @@ impl WorkerCompletionHandler {
 
         // A probe minted on an earlier Stop can still be sitting undelivered in
         // the run's pending-probe queue (e.g. a `PROBE_NO_PR` nudge whose
-        // `SendToPane` failed and was requeued for retry on the next
+        // pane write failed and was requeued for retry on the next
         // Stop). `dispatch_probe_on_stop` pops whatever is queued for a
         // run on *every* Stop, independent of what this Stop's own
         // completion decision was — so without this, a stale nudge could

@@ -1,5 +1,7 @@
 # Tmux-only local worker panes after automatic-recovery parity
 
+> **Current implementation:** Local workers always run in engine-created tmux sessions with durable spawn tokens. The app only attaches viewers; app-owned worker lifecycle and input RPCs and the hosting-mode setting have been removed. Remote SSH workers remain detached on their separate lifecycle. The rollout stages and pre-migration inventory below are historical design context, not current operator instructions. `//tools/boss/engine/core:tmux_only_surface_test` guards the production surfaces.
+
 - **Date:** 2026-09-02
 - **Status:** design proposal
 - **Project:** Make tmux the only pane hosting mode

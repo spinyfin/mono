@@ -189,8 +189,8 @@ pub struct SpawnConfig {
 }
 
 impl SpawnConfig {
-    /// Worker spawn line written into the libghostty pane via the
-    /// spawn RPC's `initial_input`. Resolves [`Self::driver`] against the
+    /// Worker spawn line sent into the worker's tmux pane as its
+    /// initial input. Resolves [`Self::driver`] against the
     /// default [`DriverRegistry`] and delegates to that driver's
     /// [`AgentDriver::spawn_invocation`] (Spawn capability) — never a
     /// hardcoded concrete driver type.

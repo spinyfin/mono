@@ -18,8 +18,19 @@ impl Default for SourceRetentionPolicy {
 
 /// All callers acquire the store lock before the DB connection. Publishers
 /// share it; GC tries exclusively and skips instead of delaying publication.
-/// Dropping the file releases the OS lock, including on process exit.
-pub(super) fn packet_store_lock(root: &Path, exclusive: bool) -> Result<Option<fs::File>> {
+/// Explicitly unlock before closing: a concurrent fork can inherit the file
+/// description and keep a close-only lock alive until the child execs/exits.
+pub(super) struct PacketStoreLock(fs::File);
+
+impl Drop for PacketStoreLock {
+    fn drop(&mut self) {
+        if let Err(err) = FileExt::unlock(&self.0) {
+            tracing::warn!(?err, "could not release source packet store lock");
+        }
+    }
+}
+
+pub(super) fn packet_store_lock(root: &Path, exclusive: bool) -> Result<Option<PacketStoreLock>> {
     let directory = root.join(PACKET_ARTIFACT_DIR);
     fs::create_dir_all(&directory)?;
     let file = fs::OpenOptions::new()
@@ -35,7 +46,7 @@ pub(super) fn packet_store_lock(root: &Path, exclusive: bool) -> Result<Option<f
     } else {
         FileExt::lock_shared(&file)?;
     }
-    Ok(Some(file))
+    Ok(Some(PacketStoreLock(file)))
 }
 
 impl WorkDb {
@@ -161,5 +172,36 @@ impl WorkDb {
         )?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn publisher_unlocks_even_when_an_inherited_descriptor_remains_open() {
+        let root = tempfile::tempdir().unwrap();
+        let publisher = packet_store_lock(root.path(), false).unwrap().unwrap();
+        // dup and fork both retain the same open file description.
+        let inherited = publisher.0.try_clone().unwrap();
+        assert!(packet_store_lock(root.path(), true).unwrap().is_none());
+        drop(publisher);
+        let gc = packet_store_lock(root.path(), true)
+            .unwrap()
+            .expect("finished publisher must release its lock before inherited descriptors close");
+        drop(inherited);
+        drop(gc);
+    }
+
+    #[test]
+    fn releasing_one_publisher_preserves_another_publishers_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let first = packet_store_lock(root.path(), false).unwrap().unwrap();
+        let second = packet_store_lock(root.path(), false).unwrap().unwrap();
+        drop(first);
+        assert!(packet_store_lock(root.path(), true).unwrap().is_none());
+        drop(second);
+        assert!(packet_store_lock(root.path(), true).unwrap().is_some());
     }
 }

@@ -599,7 +599,7 @@ impl WorkDb {
 
     /// Return the run ids that belong to `execution_id` and have not
     /// yet finished. The cancel-execution flow uses this to find any
-    /// libghostty pane the execution still backs so the engine can
+    /// tmux pane the execution still backs so the engine can
     /// release it in addition to the cube workspace.
     pub fn active_run_ids_for_execution(&self, execution_id: &str) -> Result<Vec<String>> {
         let conn = self.connect()?;

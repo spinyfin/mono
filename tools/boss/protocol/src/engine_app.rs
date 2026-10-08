@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One env-var entry to set on the worker process. The shim and
-/// `claude` running inside the libghostty pane inherit these. Used to
+/// `claude` running in the tmux-hosted worker process inherit these. Used to
 /// thread `BOSS_EVENTS_SOCKET`, `BOSS_LEASE_ID`, etc.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvVar {

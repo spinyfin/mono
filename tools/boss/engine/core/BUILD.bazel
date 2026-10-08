@@ -689,3 +689,21 @@ sh_test(
     srcs = ["tests/no_gh_pr_merge_test.sh"],
     data = [":engine_srcs"],
 )
+
+# Fails if app-hosted worker machinery (the removed engine↔app lifecycle and
+# input RPCs, the hosting-mode setting) re-enters a production surface, or if
+# the local spawn path stops requiring durable tmux identity. Remote detached
+# workers are explicitly outside its scope.
+sh_test(
+    name = "tmux_only_surface_test",
+    size = "small",
+    srcs = ["tests/tmux_only_surface_test.sh"],
+    data = [
+        "tests/tmux_only_surface_test.py",
+        ":engine_srcs",
+        "//tools/boss/app-macos:swift_sources",
+        "//tools/boss/bossctl:srcs",
+        "//tools/boss/engine/driver:srcs",
+        "//tools/boss/protocol:srcs",
+    ],
+)
