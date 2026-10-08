@@ -127,7 +127,7 @@ final class WorkDependencyKanbanTests: XCTestCase {
 
     /// The display rule mirrors the engine's `status_satisfies_for_dependent`:
     /// `done`/`archived` satisfy everyone; `in_review` additionally
-    /// satisfies a `revision` dependent (its prerequisite's commits are
+    /// satisfies a same-chain `revision` dependent (its prerequisite's commits are
     /// pushed and the PR is open — all the next writer needs).
     func testPrerequisiteStatusSatisfiesMirrorsEngineRule() {
         for kind in ["task", "chore", "revision", "project_task"] {
@@ -137,7 +137,8 @@ final class WorkDependencyKanbanTests: XCTestCase {
             XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("active", dependentKind: kind), kind)
             XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("blocked", dependentKind: kind), kind)
         }
-        XCTAssertTrue(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: "revision"))
+        XCTAssertTrue(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: "revision", sameRevisionChain: true))
+        XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: "revision"))
         XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: "chore"))
         XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: "task"))
         XCTAssertFalse(ChatViewModel.prerequisiteStatusSatisfies("in_review", dependentKind: nil))
@@ -220,6 +221,20 @@ final class WorkDependencyKanbanTests: XCTestCase {
         XCTAssertEqual(model.gatingPrereqsByTaskID[chore.id]?.map(\.title), ["Address review findings"])
         XCTAssertTrue(model.isAutoBlocked(chore), "a chore behind an in_review row is still gated")
         XCTAssertEqual(model.blockedByLabel(for: chore), "Address review findings")
+
+        model.upsertTaskForTest(
+            id: "task_unrelated", name: "Unrelated prerequisite", status: "in_review",
+            lastStatusActor: "engine", kind: "chore"
+        )
+        model.dependenciesByProductID["prod_test", default: []].append(
+            WorkItemDependency(dependentID: ciFix.id, prerequisiteID: "task_unrelated", relation: "blocks")
+        )
+        model.invalidateWorkCache(.dependencies)
+        XCTAssertEqual(model.gatingPrereqs(for: ciFix.id).map(\.id), ["task_unrelated"])
+        XCTAssertEqual(model.gatingPrereqsByTaskID[ciFix.id]?.map(\.id), ["task_unrelated"])
+        XCTAssertEqual(model.blockedByLabel(for: ciFix), "Unrelated prerequisite")
+        XCTAssertTrue(model.isAutoBlocked(ciFix))
+        XCTAssertEqual(model.actionablePrereqFrontier(for: ciFix.id), ["task_unrelated"])
     }
 
     /// Default grouping (`.none`) renders the project badge on the

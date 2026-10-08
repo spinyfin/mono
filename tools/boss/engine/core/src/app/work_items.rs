@@ -51,8 +51,13 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         return;
     };
     match work_db.answer_operator_question(&id, answer) {
-        Ok((item, _)) => {
+        Ok(outcome) => {
+            let item = outcome.item;
             let product_id = item.product_id().to_string();
+            // A Yes on a prerequisite proposal also created (or linked) a
+            // task; the board must refresh that card too.
+            let mut changed = vec![work_item_id(&item)];
+            changed.extend(outcome.prerequisite_work_item_id);
             let revision = publish_work_invalidation(
                 &server_state,
                 &session_id,
@@ -60,7 +65,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                 vec![work_product_topic(&product_id)],
                 "operator_question_answered",
                 Some(product_id),
-                vec![work_item_id(&item)],
+                changed,
             )
             .await;
             send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });

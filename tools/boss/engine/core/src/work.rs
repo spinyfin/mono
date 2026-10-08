@@ -666,6 +666,7 @@ mod output_types;
 mod planner_runs;
 mod pr_flow;
 mod pr_state;
+mod prerequisite_question;
 mod products_design;
 mod proposal_apply;
 mod proposals;
@@ -737,6 +738,7 @@ pub(crate) use review_guide_sources::{
 // Only the unit-test suite (and the resolver itself) call this directly;
 // production attach sites go through `attach_task_doc_link_state`.
 pub use pr_flow::DeferredReviewAdmissionCandidate;
+pub use pr_flow::OperatorAnswerOutcome;
 #[cfg(test)]
 pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use proposal_apply::*;

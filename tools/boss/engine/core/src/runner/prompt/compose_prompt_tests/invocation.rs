@@ -182,6 +182,12 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
     assert!(prompt.contains("Yes appends authorization and restarts in the preserved workspace"));
     assert!(prompt.contains("No leaves the task blocked in Backlog"));
     assert!(
+        prompt.contains("--answer-type create-prerequisite-task --prerequisite-name"),
+        "blocked guidance must teach the prerequisite-task question type:\n{prompt}",
+    );
+    assert!(prompt.contains("The brief must stand alone"));
+    assert!(prompt.contains("remains the non-blocking path for nice-to-have work later"));
+    assert!(
         prompt.contains("the marker is Stop-boundary-only"),
         "worker_signal seam off: must describe the marker as Stop-boundary-only:\n{prompt}",
     );

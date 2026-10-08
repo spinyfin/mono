@@ -257,6 +257,10 @@ pub fn status_satisfies(status: &str) -> bool {
 /// Waiting for `done` (merged) is a hard deadlock because by the
 /// time the PR merges the revision can no longer push to it.
 ///
+/// This is the status-only part of the rule. `gating_prereqs_for` additionally
+/// requires the prerequisite to share the revision's chain root before accepting
+/// `in_review`, for every `blocks` edge including explicit `--depends-on` edges.
+/// Unrelated prerequisites must reach `done` or `archived`.
 /// For all non-revision dependents the standard `done`/`archived` rules
 /// apply.
 /// Display counterpart: `ChatViewModel+Dependencies.swift`
@@ -342,14 +346,21 @@ pub fn lookup_work_item_status_for_gating(conn: &Connection, work_item_id: &str)
     Ok(None)
 }
 
+/// Whether `a` and `b` share a revision chain root.
+fn same_revision_chain(conn: &Connection, a: &str, b: &str) -> Result<bool> {
+    Ok(crate::work::chain_root(conn, a)? == crate::work::chain_root(conn, b)?)
+}
+
 /// Return the prerequisite ids that currently *gate* `work_item_id`
 /// — `blocks` edges whose prereq has not reached a satisfied
 /// status. Used by both the dispatcher (to demote a gated dependent
 /// to `waiting_dependency`) and the auto-block / unblock path.
 ///
 /// The satisfaction check is revision-aware: for `kind = 'revision'`
-/// dependents a prerequisite also satisfies when it reaches
-/// `in_review` (the PR is open and the revision can push to it).
+/// dependents only a same-chain prerequisite also satisfies at `in_review`
+/// (the PR is open and the revision can push to it). Unrelated prerequisites
+/// still gate until done/archived. This applies to every `blocks` edge,
+/// including explicit `--depends-on` edges, not just prerequisite questions.
 /// For all other dependents the standard `done`/`archived` rules apply.
 pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
     let dependent_kind = lookup_work_item_kind(conn, work_item_id)?;
@@ -358,7 +369,18 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
     for edge in edges {
         let status = lookup_work_item_status_for_gating(conn, &edge.prerequisite_id)?;
         match status {
-            Some(s) if status_satisfies_for_dependent(&s, dependent_kind.as_deref()) => {}
+            Some(s) if status_satisfies_for_dependent(&s, dependent_kind.as_deref()) => {
+                // The `in_review` relaxation exists so a revision can push to
+                // its own chain's open PR. A prerequisite outside that chain
+                // (an unrelated task linked by a prerequisite question) must
+                // actually land before the revision runs.
+                if dependent_kind.as_deref() == Some("revision")
+                    && s == "in_review"
+                    && !same_revision_chain(conn, work_item_id, &edge.prerequisite_id)?
+                {
+                    gating.push(edge.prerequisite_id);
+                }
+            }
             _ => gating.push(edge.prerequisite_id),
         }
     }

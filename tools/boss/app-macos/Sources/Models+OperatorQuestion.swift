@@ -7,11 +7,14 @@ import Foundation
 /// The card renders `text` inline and keeps `explanation` behind the "Why?"
 /// popover; `askedAt` orders the Doing column's "Needs Attention" section.
 struct OperatorQuestion: Hashable {
-    /// How the user answers. Mirrors `OperatorAnswerType`; v1 only has
-    /// Yes/No, and a payload carrying any other kind is not decoded (see
-    /// [[parse(_:)]]) because the card has no UI to answer it.
+    /// How the user answers. Mirrors `OperatorAnswerType`. Both kinds are
+    /// answered with Yes/No; a payload carrying any other kind is not decoded
+    /// (see [[parse(_:)]]) because the card has no UI to answer it.
     enum AnswerType: String, Hashable {
         case yesNo = "yes_no"
+        /// The worker proposes a task that must land before it can proceed;
+        /// the proposal rides on [[OperatorQuestion.prerequisiteTask]].
+        case createPrerequisiteTask = "create_prerequisite_task"
     }
 
     let id: String
@@ -23,6 +26,9 @@ struct OperatorQuestion: Hashable {
     /// The run that asked; the answer restarts the task in a new run.
     let executionID: String
     var runSummary: String? = nil
+    /// The proposed task, present exactly when `answerType` is
+    /// `.createPrerequisiteTask`. The card shows it behind "Why?".
+    var prerequisiteTask: PrerequisiteTaskProposal? = nil
 
     /// Decode the wire `operator_question` object. Absent / null / malformed
     /// → `nil`, and so is a question whose `answer_type.kind` this build
@@ -39,6 +45,15 @@ struct OperatorQuestion: Hashable {
               let answerType = AnswerType(rawValue: kind),
               let askedAt = dict["asked_at"] as? String
         else { return nil }
+        var prerequisiteTask: PrerequisiteTaskProposal? = nil
+        if answerType == .createPrerequisiteTask {
+            // A proposal with nothing to show behind "Why?" cannot be
+            // displayed; fall back to the plain blocked card.
+            guard let name = answerTypeDict["name"] as? String,
+                  let brief = answerTypeDict["brief"] as? String
+            else { return nil }
+            prerequisiteTask = PrerequisiteTaskProposal(name: name, brief: brief)
+        }
         return OperatorQuestion(
             id: id,
             text: text,
@@ -46,9 +61,18 @@ struct OperatorQuestion: Hashable {
             explanation: (dict["explanation"] as? String) ?? "",
             askedAt: askedAt,
             executionID: (dict["execution_id"] as? String) ?? "",
-            runSummary: dict["run_summary"] as? String
+            runSummary: dict["run_summary"] as? String,
+            prerequisiteTask: prerequisiteTask
         )
     }
+}
+
+/// The task a blocked worker proposes as its prerequisite
+/// (`OperatorAnswerType::CreatePrerequisiteTask` on the wire).
+struct PrerequisiteTaskProposal: Hashable {
+    let name: String
+    /// The proposed task's self-contained brief.
+    let brief: String
 }
 
 /// The user's answer, shaped by the question's `AnswerType`. Encodes to
@@ -80,6 +104,9 @@ struct OperatorQuestionPresentation: Equatable {
     /// nothing.
     let errorMessage: String?
     var runSummary: String? = nil
+    /// Set for a "create a prerequisite task" question; the details popover
+    /// shows the proposed task's name and brief.
+    var prerequisiteTask: PrerequisiteTaskProposal? = nil
 
     /// The inline question is capped here; the popover shows the whole text.
     static let inlineLineLimit = 3

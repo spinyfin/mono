@@ -274,6 +274,29 @@ worker                 engine                                   app
   |        coordinator dispatches the ready execution        card shows in Doing, worker starts
 ```
 
+### 11. Second question type: create a prerequisite task
+
+`OperatorAnswerType` gains `CreatePrerequisiteTask { name, brief }` for the case where the task cannot proceed until some other, unrelated piece of work lands first (the motivating example: a CI-fix revision finds a pre-existing test fixture that races retention cleanup; that needs its own fix on main and is out of scope for the revision). It is separate from `boss propose followup-task`, which stays the non-blocking "nice to have later" path.
+
+**Worker side.** `boss propose done --outcome blocked --answer-type create-prerequisite-task --prerequisite-name <name> --prerequisite-brief <brief> --explanation <one line: why this task cannot unblock without it>`. `--question` is not accepted for this type: validation writes the wording ("Create prerequisite task '<name>'? This task will wait for it.") so every card reads the same, and replaces whatever `text` the payload carried. The name is single-line and at most 200 characters; the brief is bounded like any long field. The worker prompt teaches when to use this type and that the brief must stand alone, because a different worker picks the prerequisite up cold.
+
+**Kanban.** Identical to the Yes/No question: same Needs Attention section, same inline card, same Yes/No buttons, and the same `OperatorAnswer::YesNo` on the wire. The "Why?" popover additionally shows the proposed task's name and brief. An older app build that does not know the kind falls back to the plain blocked card, exactly as for any undecodable answer type.
+
+**Yes**, in the one answer transaction (the transaction is now `Immediate`, so racing answers serialize on the write lock and the loser is an idempotent repeat):
+
+1. Look for an equivalent open task: same product, same name once trimmed and case-folded, not `done`/`archived`/deleted, oldest first, skipping any candidate that already depends on the blocked task (it would form a cycle). If one exists, reuse it; otherwise create the proposed task as a chore in the same product with `autostart` on and the brief as its description. The recent-name guard `check_recent_duplicate` is bypassed (`force_duplicate`) in the create arm, as batch-accept does, because the open-task lookup above is the duplicate check here and the 60-second guard would only reject re-proposing a task that just finished.
+2. Add a `blocks` edge, blocked task depends on the prerequisite, through `add_dependency_edge_in_tx`. The blocked task is first put in `todo` with `autostart` on so the edge's ordinary auto-block parks it as `blocked` / `dependency`; it leaves Needs Attention because the question is `answered` and the block reason is no longer `awaiting_operator_answer`.
+3. Append a dated "Operator-approved prerequisite" note to the brief, saying whether the prerequisite was created or an existing task was linked.
+4. Leave a `waiting_dependency` execution on the blocked task (non-revision kinds), carrying the asking run's workspace preference. The dependency cascade only promotes an execution that already exists, and the ordinary reconcile deliberately never mints a replacement after a terminal run, so without this row the task would unblock to `todo` and stay there. When the prerequisite reaches its satisfied state the existing cascade moves the task to `todo` and promotes that execution to `ready`.
+
+Any failure (a cycle, a description guard) rolls the whole answer back and the question stays open. A repeated Yes finds the `answered` row first and returns the current task without touching anything; a No after a Yes is a `Conflict`.
+
+**No** is the Yes/No decline unchanged: `worker_failed` in Backlog with the decline detail, which quotes the prerequisite question.
+
+**Revision dependents.** The dependency layer treats a prerequisite in `in_review` as satisfied for a `revision` dependent so a revision can stack on its own chain's open PR. `gating_prereqs_for` limits that relaxation to prerequisites in the revision's own chain: an unrelated prerequisite linked by this question (new or deduplicated) gates a revision until it is `done`, and completion redispatches it.
+
+**Dedup.** The equivalence lookup skips tasks a human has blocked, and a matching `todo` task with autostart off has autostart turned on (and the note says so), so the linked prerequisite is always one that will be dispatched.
+
 ## Risks / open questions
 
 - **The restarted worker may not honour the authorization.** It is text in the brief, and the worker rules still say "never relax a repository check without approval". The prompt change (§7) tells the worker that the `## Operator authorization` section _is_ that approval, but a check relaxation still has to be made as a reviewable change in the PR; the authorization does not make `checkleft` or `cube pr create` behave differently. A reviewer should confirm this is the intended strength: the operator is authorizing the worker to _propose_ the relaxation with human backing, not granting a mechanical bypass.

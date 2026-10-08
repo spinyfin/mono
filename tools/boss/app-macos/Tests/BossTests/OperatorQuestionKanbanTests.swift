@@ -69,6 +69,63 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertEqual(task.boardColumn, .backlog, "an unanswerable question falls back to the plain blocked card")
     }
 
+    /// A "create a prerequisite task" question reads and routes exactly like
+    /// the Yes/No one; the proposal rides along for the "Why?" popover.
+    func testParseTaskDecodesPrerequisiteTaskQuestion() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var payload = basePayload()
+        payload["status"] = "blocked"
+        payload["blocked_reason"] = "awaiting_operator_answer"
+        payload["operator_question"] = [
+            "id": "oq_2",
+            "text": "Create prerequisite task 'Fix fixture race'? This task will wait for it.",
+            "answer_type": [
+                "kind": "create_prerequisite_task",
+                "name": "Fix fixture race",
+                "brief": "The shared fixture races retention cleanup. Fix it on main.",
+            ] as [String: Any],
+            "explanation": "CI cannot go green until the fixture is fixed.",
+            "asked_at": "1790000000",
+            "execution_id": "exec_1",
+        ] as [String: Any]
+
+        let task = try XCTUnwrap(client.parseTask(payload))
+
+        let question = try XCTUnwrap(task.operatorQuestion)
+        XCTAssertEqual(question.answerType, .createPrerequisiteTask)
+        XCTAssertEqual(question.prerequisiteTask?.name, "Fix fixture race")
+        XCTAssertEqual(question.prerequisiteTask?.brief, "The shared fixture races retention cleanup. Fix it on main.")
+        XCTAssertTrue(task.isAwaitingOperatorAnswer)
+        XCTAssertEqual(task.boardColumn, .doing, "same Needs Attention routing as the Yes/No question")
+        let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .doing))
+        XCTAssertEqual(snapshot.operatorQuestion?.text, question.text)
+        XCTAssertEqual(snapshot.operatorQuestion?.prerequisiteTask, question.prerequisiteTask)
+        // The answer is the same Yes/No wire object.
+        XCTAssertEqual(OperatorAnswer.yesNo(true).wirePayload["kind"] as? String, "yes_no")
+    }
+
+    /// A proposal with no name or brief cannot be displayed behind
+    /// "Why?", so it falls back to the plain blocked card.
+    func testParseTaskDropsPrerequisiteQuestionMissingItsProposal() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var payload = basePayload()
+        payload["status"] = "blocked"
+        payload["blocked_reason"] = "awaiting_operator_answer"
+        payload["operator_question"] = [
+            "id": "oq_2",
+            "text": "Create prerequisite task 'X'? This task will wait for it.",
+            "answer_type": ["kind": "create_prerequisite_task", "name": "X"] as [String: Any],
+            "explanation": "",
+            "asked_at": "1790000000",
+            "execution_id": "exec_1",
+        ] as [String: Any]
+
+        let task = try XCTUnwrap(client.parseTask(payload))
+
+        XCTAssertNil(task.operatorQuestion)
+        XCTAssertEqual(task.boardColumn, .backlog)
+    }
+
     // MARK: - boardColumn routing
 
     func testBlockedAwaitingAnswerWithQuestionRoutesToDoing() {
