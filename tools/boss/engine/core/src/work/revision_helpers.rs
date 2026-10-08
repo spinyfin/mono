@@ -827,7 +827,7 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
         chore.ai_review_state = state.map(str::to_owned);
         chore.ai_review_findings_revision_id = revision_id;
     }
-    Ok(())
+    super::review_badge::attach_review_badges(conn, tasks, chores)
 }
 
 /// Resolve every derived `Task::review_guide_*` projection (`lifecycle`,

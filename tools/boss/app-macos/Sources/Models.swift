@@ -187,6 +187,7 @@ struct WorkTask: Identifiable, Hashable {
     /// means AI passed but CI, mergeability, or revisions prevent readiness.
     /// Mirrors `Task.ai_review_state`; the app does not reconcile history.
     var aiReviewState: String? = nil
+    var aiReviewBadge: AIReviewBadgePresentation? = nil
     /// The revision task that carries the review comments for
     /// `aiReviewState == "reviewed_with_findings"`, when one was
     /// successfully created. `nil` for every other state, and also `nil`

@@ -11,6 +11,14 @@ use super::project::ProjectDesignDocState;
 use super::work_item::WorkItemExternalRef;
 use serde::{Deserialize, Serialize};
 
+/// Engine-authored card copy; clients only render this in the Review lane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiReviewBadge {
+    pub label: String,
+    pub system_image: String,
+    pub tooltip: String,
+}
+
 /// Discriminator for the `tasks.status` column. Exhaustive match enforces
 /// that every callsite handles new variants explicitly — adding a new status
 /// here produces a compile error at every status-keyed branch that must
@@ -1065,6 +1073,10 @@ pub struct Task {
     /// for another SHA never establish the outcome of the current head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_review_state: Option<String>,
+
+    /// Review-lane presentation derived by the engine, including review history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_review_badge: Option<AiReviewBadge>,
 
     /// The revision task that carries the review comments for
     /// `ai_review_state == "reviewed_with_findings"`, when one was

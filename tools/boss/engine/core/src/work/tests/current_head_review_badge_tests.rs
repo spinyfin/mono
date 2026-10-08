@@ -81,6 +81,12 @@ fn current_head_review_badge_never_projects_a_self_referencing_findings_revision
                 task.ai_review_findings_revision_id.as_deref(),
                 if id == &revision { None } else { Some(revision.as_str()) }
             );
+            let tooltip = &task.ai_review_badge.as_ref().unwrap().tooltip;
+            assert!(tooltip.contains(if id == &revision {
+                "No separate findings revision is available"
+            } else {
+                "Click to read the findings"
+            }));
         }
     }
 }
@@ -102,6 +108,11 @@ fn current_head_review_badge_findings_revision_clean_then_new_unreviewed_head() 
     db.set_review_verdict_revision_task_id(&findings, &revision).unwrap();
     let old = card(&db, &product, &root);
     assert_eq!(old.ai_review_state.as_deref(), Some("reviewed_with_findings"));
+    let badge = old.ai_review_badge.as_ref().unwrap();
+    assert_eq!(badge.label, "AI review: 2 findings");
+    assert!(badge.tooltip.contains("Last reviewed old"));
+    assert!(badge.tooltip.contains("Findings revision:"));
+
     assert_eq!(old.ai_review_findings_revision_id.as_deref(), Some(revision.as_str()));
 
     observe(&db, &root, Some("fixed"), "success", "mergeable");
@@ -122,6 +133,15 @@ fn current_head_review_badge_findings_revision_clean_then_new_unreviewed_head() 
     let clean = card(&db, &product, &root);
     assert_eq!(clean.ai_review_state.as_deref(), Some("reviewed_all_clear"));
     assert!(clean.ai_review_findings_revision_id.is_none());
+    assert_eq!(clean.ai_review_badge.as_ref().unwrap().label, "AI review: clean");
+    assert!(
+        clean
+            .ai_review_badge
+            .as_ref()
+            .unwrap()
+            .tooltip
+            .contains("Last reviewed fixed")
+    );
 
     // Returning to Doing preserves the current head's review evidence,
     // but must not imply readiness while implementation is in progress.
@@ -144,7 +164,16 @@ fn current_head_review_badge_findings_revision_clean_then_new_unreviewed_head() 
         card(&db, &product, &root).ai_review_state.as_deref(),
         Some("reviewed_all_clear")
     );
+    let badge = card(&db, &product, &root).ai_review_badge.unwrap();
+    assert!(badge.tooltip.contains("Last reviewed fixed"));
     observe(&db, &root, Some("next"), "success", "mergeable");
+    let badge = card(&db, &product, &root).ai_review_badge.unwrap();
+    assert!(
+        badge
+            .tooltip
+            .contains("Current head next differs from the reviewed commit")
+    );
+
     assert_eq!(
         card(&db, &product, &root).ai_review_state.as_deref(),
         Some("not_reviewed")
@@ -327,6 +356,20 @@ fn current_head_review_badge_findings_revision_delivered_without_head_change_is_
     let delivered = card(&db, &product, &root);
     assert_eq!(delivered.ai_review_state.as_deref(), Some("not_reviewed"));
     assert!(delivered.ai_review_findings_revision_id.is_none());
+    let badge = delivered.ai_review_badge.unwrap();
+    assert_eq!(badge.label, "Findings addressed");
+    assert_eq!(badge.system_image, "checkmark.circle");
+    assert!(badge.tooltip.contains("Last reviewed h1"));
+    assert!(badge.tooltip.contains("No subsequent AI review is recorded"));
+    assert!(badge.tooltip.contains("(Review)"));
+    let tree = db.get_work_tree(&product).unwrap();
+    let revision_card = tree.tasks.iter().find(|row| row.id == revision).unwrap();
+    let revision_badge = revision_card.ai_review_badge.as_ref().unwrap();
+    assert_eq!(revision_badge.label, badge.label);
+    assert_eq!(revision_badge.system_image, badge.system_image);
+    assert!(revision_badge.tooltip.contains("This revision addresses the findings"));
+    assert!(!revision_badge.tooltip.contains("Findings revision:"));
+    assert!(revision_card.ai_review_findings_revision_id.is_none());
 
     // A newer verdict for the same head wins over the resolution.
     verdict(&db, &root, "h1", "completed_with_findings");
@@ -358,6 +401,15 @@ fn current_head_review_badge_findings_revision_with_new_commit_keeps_head_rules(
 
     // Once the new head is observed, it is simply not yet reviewed.
     observe(&db, &root, Some("h2"), "success", "mergeable");
+    let badge = card(&db, &product, &root).ai_review_badge.unwrap();
+    assert_eq!(badge.label, "Not reviewed: latest commit");
+    assert!(badge.tooltip.contains("Current head h2 differs"));
+    assert!(
+        badge
+            .tooltip
+            .contains("Findings addressed; the fix has not been AI-reviewed")
+    );
+
     assert_eq!(
         card(&db, &product, &root).ai_review_state.as_deref(),
         Some("not_reviewed")
@@ -367,4 +419,59 @@ fn current_head_review_badge_findings_revision_with_new_commit_keeps_head_rules(
         card(&db, &product, &root).ai_review_state.as_deref(),
         Some("reviewed_all_clear")
     );
+}
+
+#[test]
+fn review_badge_presentation_is_review_only_for_roots_and_revisions() {
+    let db = WorkDb::open(temp_db_path("review-badge-lanes")).unwrap();
+    let product = make_revision_product(&db, "review-badge-lanes");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8010");
+    let revision = insert_revision_row(&db, &product, &root);
+    observe(&db, &root, Some("head"), "success", "mergeable");
+    verdict(&db, &root, "head", "completed_clean");
+    for id in [&root, &revision] {
+        for status in ["todo", "active", "blocked", "in_review", "done"] {
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                    rusqlite::params![id, status],
+                )
+                .unwrap();
+            let conn = db.connect().unwrap();
+            let mut row = query_task(&conn, id).unwrap().unwrap();
+            attach_ai_review_state(&conn, std::slice::from_mut(&mut row), &mut []).unwrap();
+            assert_eq!(row.ai_review_badge.is_some(), status == "in_review", "{id}: {status}");
+        }
+    }
+}
+
+#[test]
+fn review_badge_does_not_attribute_a_headless_verdict_to_a_legacy_reviewed_sha() {
+    let db = WorkDb::open(temp_db_path("review-badge-headless-verdict")).unwrap();
+    let product = make_revision_product(&db, "review-badge-headless-verdict");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8011");
+    observe(&db, &root, Some("current-head"), "success", "mergeable");
+    let execution = verdict(&db, &root, "unknown", "completed_clean");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET last_reviewed_sha = ?2 WHERE id = ?1",
+            rusqlite::params![root, "legacy-head"],
+        )
+        .unwrap();
+    for sha in [None, Some("")] {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE pr_review_verdicts SET head_sha = ?2 WHERE execution_id = ?1",
+                rusqlite::params![execution, sha],
+            )
+            .unwrap();
+        let badge = card(&db, &product, &root).ai_review_badge.unwrap();
+        assert_eq!(badge.label, "Not reviewed: latest commit");
+        assert!(badge.tooltip.contains("Last reviewed legacy-"));
+        assert!(badge.tooltip.contains("review time and verdict unavailable"));
+        assert!(!badge.tooltip.contains(": clean"));
+    }
 }

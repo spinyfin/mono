@@ -184,6 +184,7 @@ struct WorkCardSnapshot: Equatable {
     let showsHumanDrivenBadge: Bool
     let showsProjectBadge: Bool
     let aiReviewState: String?
+    let aiReviewBadge: AIReviewBadgePresentation?
     let aiReviewFindingsRevisionId: String?
     let showsResolvingConflictsBadge: Bool
     let showsResolvingCIBadge: Bool
@@ -428,8 +429,9 @@ struct WorkCardSnapshot: Equatable {
             showsDeferredBadge: task.deferred,
             showsHumanDrivenBadge: task.humanDriven,
             showsProjectBadge: projectNameNonEmpty,
-            aiReviewState: task.aiReviewState,
-            aiReviewFindingsRevisionId: task.aiReviewFindingsRevisionId,
+            aiReviewState: column == .review ? task.aiReviewState : nil,
+            aiReviewBadge: column == .review ? task.aiReviewBadge : nil,
+            aiReviewFindingsRevisionId: column == .review ? task.aiReviewFindingsRevisionId : nil,
             showsResolvingConflictsBadge: showsResolvingConflicts,
             showsResolvingCIBadge: showsResolvingCI,
             blockedBadgeText: showsBlockedBadge ? blockedBadgeText : nil,

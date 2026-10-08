@@ -755,87 +755,52 @@ struct ResolvingCIFailureBadge: View {
 
 /// Displays the engine's current-head AI review projection. The visible
 /// label distinguishes this result from the separate CI indicator.
+struct AIReviewBadgePresentation: Hashable {
+    let label: String
+    let systemImage: String
+    let tooltip: String
+
+    static func parse(_ value: Any?) -> Self? {
+        guard let value = value as? [String: Any],
+              let label = value["label"] as? String,
+              let systemImage = value["system_image"] as? String,
+              let tooltip = value["tooltip"] as? String else { return nil }
+        return Self(label: label, systemImage: systemImage, tooltip: tooltip)
+    }
+}
+
 /// Only findings are actionable; tapping opens their revision brief.
 struct AIReviewStateBadge: View {
     let state: String
+    let presentation: AIReviewBadgePresentation
     var onRevealFindings: (() -> Void)? = nil
-
-    var systemImage: String {
-        switch state {
-        case "reviewing": return "brain"
-        case "review_queued": return "clock.badge"
-        case "not_reviewed": return "questionmark.circle"
-        case "reviewed_clean_pending": return "clock.badge.checkmark"
-        case "reviewed_with_findings": return "exclamationmark.circle.fill"
-        case "reviewed_all_clear": return "checkmark.seal.fill"
-        case "review_not_required": return "minus.circle"
-        default: return "brain"
-        }
-    }
 
     var tint: Color {
         switch state {
         case "reviewing": return .accentColor
-        case "review_queued", "not_reviewed", "reviewed_clean_pending": return .secondary
         case "reviewed_with_findings": return .orange
         case "reviewed_all_clear": return .green
-        case "review_not_required": return .secondary
         default: return .secondary
         }
     }
 
-    var tooltip: String {
-        switch state {
-        case "reviewing":
-            return "An AI reviewer pass is running on this PR."
-        case "review_queued":
-            return "An AI reviewer pass is queued for a review-pool slot."
-        case "reviewed_with_findings":
-            return onRevealFindings != nil
-                ? "The AI reviewer found issues on this PR — click to read the findings in the follow-up revision."
-                : "The AI reviewer found issues on this PR, but no separate findings revision is available from this card."
-        case "reviewed_all_clear":
-            return "AI review passed for the current PR head. Required CI checks passed and no revisions are pending."
-        case "not_reviewed":
-            return "The current PR head has no completed AI review, or its head is not yet known."
-        case "reviewed_clean_pending":
-            return "AI review passed for the current PR head. CI, mergeability, or work in progress still prevent readiness."
-        case "review_not_required":
-            return "This kind of work item is not reviewed by the AI reviewer."
-        default:
-            return "AI review state"
-        }
-    }
-
-    private var accessibilityLabel: String {
-        switch state {
-        case "reviewing": return "AI reviewing"
-        case "review_queued": return "AI review queued"
-        case "not_reviewed": return "AI review: current head not reviewed"
-        case "reviewed_clean_pending": return "AI review passed; PR not ready"
-        case "reviewed_with_findings": return "AI review found issues"
-        case "reviewed_all_clear": return "AI review: all clear"
-        case "review_not_required": return "AI review not required"
-        default: return "AI review state unknown"
-        }
-    }
-
     var body: some View {
-        let icon = Label("AI review", systemImage: systemImage)
+        let label = Label(presentation.label, systemImage: presentation.systemImage)
             .font(.caption2.weight(.semibold))
             .foregroundStyle(tint)
 
         Group {
             if state == "reviewed_with_findings", let onRevealFindings {
-                Button(action: onRevealFindings) { icon }
+                Button(action: onRevealFindings) { label }
                     .buttonStyle(.plain)
                     .pointerStyle(.link)
             } else {
-                icon
+                label
             }
         }
-        .help(tooltip)
-        .accessibilityLabel(accessibilityLabel)
+        .help(presentation.tooltip)
+        .accessibilityLabel(presentation.label)
+        .accessibilityValue(presentation.tooltip)
     }
 }
 

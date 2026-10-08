@@ -307,6 +307,7 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         ai_reviewing: false,
         // Derived; populated after mapping by attach_ai_review_state.
         ai_review_state: None,
+        ai_review_badge: None,
         ai_review_findings_revision_id: None,
         // Derived; populated after mapping by attach_ready_for_review_flag.
         ready_for_review: false,
