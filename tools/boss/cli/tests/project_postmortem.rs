@@ -48,6 +48,10 @@ async fn postmortem_command_refuses_open_work_then_starts_once() -> Result<()> {
             .build(),
     )?;
     let args = ["project", "postmortem", &project.id];
+    let shown = run_boss(engine.socket_str(), &["project", "show", &project.id])?;
+    assert_eq!(shown["tasks"][0]["id"], task.id);
+    let shown = run_boss_human(engine.socket_str(), &["project", "show", &project.id])?;
+    assert!(shown.contains("Open work"), "{shown}");
     let error = run_boss_expect_failure(engine.socket_str(), &args)?;
     assert!(error.contains("1 open task(s) remain"), "{error}");
     assert!(db.last_design_postmortem_for_project(&project.id)?.is_none());

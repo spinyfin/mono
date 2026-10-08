@@ -247,6 +247,21 @@ pub(crate) fn apply_create_time_dependencies(
 }
 
 pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task> {
+    insert_chore_with_project_in_tx(conn, input, None)
+}
+
+/// Review follow-ups may inherit project membership at creation time.
+pub(crate) fn insert_chore_with_project_in_tx(
+    conn: &Connection,
+    input: CreateChoreInput,
+    project_id: Option<&str>,
+) -> Result<Task> {
+    let ordinal = project_id
+        .map(|project_id| {
+            ensure_project_belongs_to_product(conn, project_id, &input.product_id)?;
+            next_task_ordinal(conn, project_id)
+        })
+        .transpose()?;
     ensure_product_exists(conn, &input.product_id)?;
 
     if !input.force_duplicate
@@ -284,8 +299,8 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
 
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, origin_task_short_id, origin_pr_number, deferred, human_driven, effort_matched_rule, effort_reasons)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-        params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, input.origin_task_short_id, input.origin_pr_number, deferred_value, human_driven_value, effort_matched_rule, effort_reasons],
+         VALUES (?1, ?2, ?22, ?3, ?4, ?5, 'todo', ?23, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, input.origin_task_short_id, input.origin_pr_number, deferred_value, human_driven_value, effort_matched_rule, effort_reasons, project_id, ordinal],
     )?;
 
     apply_create_time_dependencies(conn, &id, &input.depends_on, &now)?;

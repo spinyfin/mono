@@ -1092,16 +1092,15 @@ impl WorkDb {
 
         let t = Instant::now();
         let tasks = {
-            // `kind IN ('project_task', 'design')` — the design task
-            // auto-created at project birth lives in the same lane as
-            // every other project task. Sorting on `ordinal` ASC puts
+            // Project-owned chores and review follow-ups share the project
+            // lane instead of appearing in the product backlog. Sorting on `ordinal` ASC puts
             // the design task (ordinal = 0) at the head of the
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                  FROM tasks
-                 WHERE product_id = ?1 AND (kind IN ('project_task', 'design', 'investigation', 'revision', 'design_postmortem') OR (kind = 'followup' AND project_id IS NOT NULL)) AND deleted_at IS NULL AND status != 'archived'
+                 WHERE product_id = ?1 AND (kind IN ('project_task', 'design', 'investigation', 'revision', 'design_postmortem') OR (kind IN ('chore', 'followup') AND project_id IS NOT NULL)) AND deleted_at IS NULL AND status != 'archived'
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_source_and_provenance)?;
@@ -1118,7 +1117,7 @@ impl WorkDb {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                  FROM tasks
-                 WHERE product_id = ?1 AND (kind = 'chore' OR (kind = 'followup' AND project_id IS NULL)) AND deleted_at IS NULL AND status != 'archived'
+                 WHERE product_id = ?1 AND kind IN ('chore', 'followup') AND project_id IS NULL AND deleted_at IS NULL AND status != 'archived'
                  ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_source_and_provenance)?;

@@ -26,6 +26,7 @@ pub(crate) const REVIEW_FINDINGS_FOLLOWUP_CLOSE_SENTENCE: &str = "Address ALL fi
 #[derive(Debug, Clone)]
 pub(crate) struct ReviewFindingsFollowupPlan {
     pub kind: TaskKind,
+    pub project_id: Option<String>,
     pub origin_task_short_id: Option<i64>,
     pub origin_pr_number: Option<i64>,
     pub description: String,
@@ -62,6 +63,7 @@ pub(crate) fn plan_review_findings_followup(
     );
     Ok(ReviewFindingsFollowupPlan {
         kind,
+        project_id: root.and_then(|r| r.project_id),
         origin_task_short_id,
         origin_pr_number,
         description,
@@ -204,7 +206,7 @@ pub(crate) fn insert_review_findings_followup(conn: &Connection, input: ReviewFi
         return Ok(existing);
     }
     let plan = plan_review_findings_followup(conn, &input.chain_root_id, &input.description)?;
-    insert_chore_in_tx(
+    super::insert_helpers::insert_chore_with_project_in_tx(
         conn,
         CreateChoreInput::builder()
             .product_id(input.product_id)
@@ -218,6 +220,7 @@ pub(crate) fn insert_review_findings_followup(conn: &Connection, input: ReviewFi
             .maybe_origin_pr_number(plan.origin_pr_number)
             .maybe_reasoning(input.reasoning)
             .build(),
+        plan.project_id.as_deref(),
     )
 }
 
