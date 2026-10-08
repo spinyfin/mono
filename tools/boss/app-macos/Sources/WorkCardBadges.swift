@@ -201,18 +201,13 @@ enum PrMergeability {
 /// ("we haven't checked yet") and keeps the icon slot occupied so it
 /// doesn't pop in later.
 ///
-/// A known conflict pre-empts all four: see `prMergeableState`.
+/// This reflects required-CI state only. Merge conflicts are a separate
+/// signal rendered by `PrConflictIndicator` beside it, so a conflicting PR
+/// with passing CI shows a green CI marker plus a conflict badge.
 
 struct PrCiIndicator: View {
     let state: String
     var detail: String? = nil
-    /// Raw GitHub mergeability (`WorkTask.prMergeableState`). CI alone
-    /// (`state`) says nothing about whether the PR's head actually merges
-    /// cleanly — a PR can have `state == "success"` while GitHub reports it
-    /// `CONFLICTING` (mono#2366, Review-lane counterpart of mono#2303's
-    /// `MergeQueueBadge` fix), so this must be checked ahead of the
-    /// CI-only rendering rather than inferred from CI passing.
-    var prMergeableState: String? = nil
 
     var body: some View {
         if let icon = systemImage {
@@ -224,17 +219,9 @@ struct PrCiIndicator: View {
         }
     }
 
-    // `isConflicting` and the three rendering properties below are
-    // deliberately not `private`: `PrCiIndicatorConflictTests` pins the
-    // conflict-pre-emption behavior by reading them directly, which asserts
-    // on what actually gets rendered (icon, tint, tooltip) rather than on a
-    // predicate that a future edit could leave correct while reordering the
-    // switches underneath it. `@testable import` reaches `internal`, not
-    // `private`.
-    var isConflicting: Bool { PrMergeability.isConflicting(prMergeableState) }
-
+    // The rendering properties below are deliberately not `private`: tests
+    // assert on what actually gets rendered (icon, tint, tooltip).
     var systemImage: String? {
-        if isConflicting { return "xmark.circle.fill" }
         switch state {
         case "success": return "checkmark.circle.fill"
         case "fail":    return "xmark.circle.fill"
@@ -243,7 +230,6 @@ struct PrCiIndicator: View {
     }
 
     var tint: Color {
-        if isConflicting { return .red }
         switch state {
         case "success": return .green
         case "fail":    return .red
@@ -252,9 +238,6 @@ struct PrCiIndicator: View {
     }
 
     var tooltipText: String {
-        if isConflicting {
-            return "PR has merge conflicts"
-        }
         switch state {
         case "success":
             return "All required CI checks passed"
@@ -273,6 +256,29 @@ struct PrCiIndicator: View {
               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
         else { return nil }
         return arr.compactMap { $0["name"] as? String }
+    }
+}
+
+/// "conflicts" chip shown beside the CI marker when GitHub reports the PR
+/// as `CONFLICTING`. CI state says nothing about whether the head merges
+/// cleanly, so a conflict is surfaced on its own rather than recolouring
+/// the CI marker; a conflicting PR therefore never looks ready.
+struct PrConflictIndicator: View {
+    var prMergeableState: String?
+
+    var isVisible: Bool { PrMergeability.isConflicting(prMergeableState) }
+
+    var tooltipText: String { "PR has merge conflicts" }
+
+    var body: some View {
+        if isVisible {
+            Label("conflicts", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.red)
+                .lineLimit(1)
+                .help(tooltipText)
+                .accessibilityLabel(tooltipText)
+        }
     }
 }
 

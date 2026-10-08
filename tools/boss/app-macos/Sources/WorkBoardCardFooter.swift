@@ -89,10 +89,10 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                     } else if let ciState = slice.ciRequiredState {
                         PrCiIndicator(
                             state: ciState,
-                            detail: slice.ciRequiredDetail,
-                            prMergeableState: slice.prMergeableState
+                            detail: slice.ciRequiredDetail
                         )
                     }
+                    PrConflictIndicator(prMergeableState: slice.prMergeableState)
                     PRURLLink(
                         urlString: prURL,
                         font: .caption,
