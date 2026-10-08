@@ -300,6 +300,28 @@ final class WorkCacheInvalidationTests: XCTestCase {
 
     // MARK: - Predicate helpers
 
+    func testFollowupMovesRouteToProjectAndBackWithoutChangingKind() {
+        let model = makeModel()
+        seedWorkTree(model, tasks: [])
+        for projectID: String? in [nil, "proj_a", "proj_b", nil] {
+            let task = makeTask(id: "followup", projectID: projectID, kind: "followup")
+            XCTAssertEqual(task.isChore, projectID == nil)
+            let item: WorkItemPayload = projectID == nil ? .chore(task) : .task(task)
+            model.applyEventForTest(.workItemUpdated(item: item))
+            XCTAssertEqual(model.task(withID: task.id)?.kind, "followup")
+            for project in ["proj_a", "proj_b"] {
+                XCTAssertEqual(
+                    model.tasksByProjectID[project]?.contains { $0.id == task.id } ?? false,
+                    projectID == project
+                )
+            }
+            XCTAssertEqual(
+                model.choresByProductID[task.productID]?.contains { $0.id == task.id } ?? false,
+                projectID == nil
+            )
+        }
+    }
+
     func testIncrementalUpdateRequiresFullInvalidationPredicate() {
         let base = makeTask(id: "t", projectID: "proj_a", kind: "task")
         XCTAssertTrue(

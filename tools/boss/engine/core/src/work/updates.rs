@@ -83,20 +83,13 @@ fn explicit_project_status_basis(
     }
 }
 
-/// Whether `kind` may be moved between project membership states via
-/// `WorkItemPatch::project_id`. `Chore` and `ProjectTask` differ *only*
-/// by project membership (see `TaskKind` docs), so they are the only
-/// kinds a plain reassignment can express. Every other kind owns its
-/// membership through a different relationship that a project_id swap
-/// would corrupt: `design` / `design_postmortem` are a project's seed
-/// task, `investigation` and `followup` are intentionally project-less,
-/// and `revision` belongs to its parent chain, not a project directly.
-/// `Task` — the legacy generic kind kept only for exhaustive matches
-/// (no production code path creates it today) — is refused too, since
-/// its intended membership semantics are undefined until it is actually
-/// wired into a create path.
+/// Chores and project tasks change kind with membership. Follow-ups keep
+/// their kind and origin provenance independently of project membership.
+/// Design seeds belong to their project, investigations remain project-less,
+/// and revisions inherit membership from their parent chain. The legacy
+/// generic task kind has no defined reassignment semantics.
 fn is_movable_project_membership_kind(kind: &TaskKind) -> bool {
-    matches!(kind, TaskKind::Chore | TaskKind::ProjectTask)
+    matches!(kind, TaskKind::Chore | TaskKind::ProjectTask | TaskKind::Followup)
 }
 
 /// Stamp mechanism / time / reason when `update_task` first moves a row
@@ -422,7 +415,7 @@ impl WorkDb {
             bail!(
                 "cannot move {id}: kind `{}` has its own project-membership semantics \
                  and cannot be reassigned between projects or the no-project state \
-                 (only `chore` and `project_task` rows are movable)",
+                 (only `chore`, `project_task`, and `followup` rows are movable)",
                 task.kind
             );
         }
@@ -559,14 +552,10 @@ impl WorkDb {
         if let Some(ordinal) = patch.ordinal {
             task.ordinal = Some(ordinal);
         }
-        // Movable-kind check already ran above; here `task.kind` is
-        // guaranteed to be `Chore` or `ProjectTask`. `project_id`,
-        // `kind`, and `ordinal` must move together (design §Required
-        // behaviour) or the row becomes incoherent — a `chore` with a
-        // `project_id`, or a `project_task` with no ordinal. This
-        // deliberately overrides any explicit `patch.ordinal` handled
-        // above: a project move always needs a fresh ordinal scoped to
-        // the target project, so a stale explicit value can't survive it.
+        // A project move allocates an ordinal in the destination (or clears
+        // it outside projects), overriding any explicit patch.ordinal above.
+        // Only chores/project tasks change kind; follow-up identity and
+        // origin/review provenance are independent of membership.
         // Whether to cascade the (possibly unchanged) project assignment onto
         // this task's revision chain after the write below. Set whenever a
         // `project_id` patch is present at all — including a no-op
@@ -592,11 +581,13 @@ impl WorkDb {
                     Some(target) => Some(next_task_ordinal(&tx, target)?),
                     None => None,
                 };
-                task.kind = if target_project_id.is_some() {
-                    TaskKind::ProjectTask
-                } else {
-                    TaskKind::Chore
-                };
+                if task.kind != TaskKind::Followup {
+                    task.kind = if target_project_id.is_some() {
+                        TaskKind::ProjectTask
+                    } else {
+                        TaskKind::Chore
+                    };
+                }
                 task.project_id = target_project_id;
             }
             cascade_project_to_revisions = true;
