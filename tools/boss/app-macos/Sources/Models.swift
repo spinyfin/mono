@@ -297,7 +297,7 @@ struct WorkTask: Identifiable, Hashable {
     var operatorQuestion: OperatorQuestion? = nil
 
     var isChore: Bool {
-        kind == "chore" || kind == "followup"
+        kind == "chore" || (kind == "followup" && projectID == nil)
     }
 
     /// Human-readable label for the work item's kind, shown in the card

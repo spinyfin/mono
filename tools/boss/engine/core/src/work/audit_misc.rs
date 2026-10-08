@@ -326,8 +326,14 @@ pub(crate) fn apply_optional_string_patch(target: &mut Option<String>, patch: Op
     }
 }
 
+/// Chores, and followups not (yet) moved into a project, are chore-side
+/// rows; a followup with a `project_id` is a project member.
+pub(crate) fn is_chore_like(task: &Task) -> bool {
+    task.kind == TaskKind::Chore || (task.kind == TaskKind::Followup && task.project_id.is_none())
+}
+
 pub(crate) fn task_to_item(task: Task) -> WorkItem {
-    if task.kind == TaskKind::Chore || task.kind == TaskKind::Followup {
+    if is_chore_like(&task) {
         WorkItem::Chore(task)
     } else {
         WorkItem::Task(task)

@@ -10,7 +10,7 @@ pub(crate) struct TaskUpdateArgs {
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 
-    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// Resolve a friendly short id (`42`, `#42`) against this product
     /// (slug or id). Optional when the short id is globally unique.
     /// Ignored when the selector already embeds a product slug
     /// (`boss/42`) or when the selector is a primary id.
@@ -25,7 +25,8 @@ pub(crate) struct TaskUpdateArgs {
     pub(crate) project: Option<String>,
 
     /// Move into this project (resolved against the item's own product): `chore` becomes `project_task` with a
-    /// fresh ordinal. Refused for other kinds. Mutates membership, unlike `--project` above. Conflicts with `--unset-project`.
+    /// fresh ordinal; project tasks and followups receive a fresh ordinal when moved between projects.
+    /// Followups keep their kind and origin provenance. Refused for other kinds. Mutates membership, unlike `--project` above. Conflicts with `--unset-project`.
     #[arg(
         long = "set-project",
         value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME,
@@ -33,7 +34,8 @@ pub(crate) struct TaskUpdateArgs {
     )]
     pub(crate) set_project: Option<String>,
 
-    /// Move out to the no-project state: `project_task` becomes `chore`, ordinal cleared. Conflicts with `--set-project`.
+    /// Move out to the no-project state: `project_task` becomes `chore`, ordinal cleared.
+    /// Followups keep their kind and origin provenance, with ordinal cleared. Conflicts with `--set-project`.
     #[arg(long = "unset-project", conflicts_with = "set_project")]
     pub(crate) unset_project: bool,
 
