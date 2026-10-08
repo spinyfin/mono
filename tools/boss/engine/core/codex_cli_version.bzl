@@ -21,7 +21,12 @@ Bump procedure:
    --test_env=BOSS_CODEX_AUTH_SOURCE=<auth.json>`; the ordinary test targets
    do not execute its live model probes.
 4. Drive the bare TUI live (the driver screen-scrapes it) and re-measure the
-   pane-monitor markers, the interrupt path and the hook block path; see
+   pane-monitor markers, the interrupt path and the hook block path; also
+   confirm the TUI prints `Running without the shared background server` and
+   that no `codex app-server` process or `app-server-daemon/` directory
+   appears for the run's CODEX_HOME (`--strict-config` forcing embedded mode
+   is what keeps the daemon away; see build_codex_command in
+   driver/src/codex.rs); see
    tools/boss/docs/investigations/codex-0.160.1-qualification-2026-10-06.md
    for the harness and the checklist.
 Do not bump only one consumer — a version pin that isn't reflected everywhere

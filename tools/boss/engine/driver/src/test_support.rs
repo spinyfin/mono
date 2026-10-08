@@ -308,6 +308,11 @@ impl Drop for CodexAuthSourceOverride {
 /// runtime directory, so a cross-crate test that must attest guards against
 /// the pinned release has to supply one. `PATH` is restored on drop while the
 /// shared homes lock (held by the inner override) is still owned.
+///
+/// Mutating `PATH` is not synchronized with other threads that read it, and
+/// the homes lock only gates `CODEX_HOMES_ROOT` / `CODEX_AUTH_SOURCE`. It may
+/// therefore only be used from a process that runs a single test and has not
+/// yet spawned other threads that spawn processes or read `PATH`.
 pub struct CodexAuthSourcePathOverride {
     path_prior: Option<std::ffi::OsString>,
     _auth: CodexAuthSourceOverride,
@@ -328,8 +333,9 @@ pub fn codex_auth_source_and_path_override(
         dirs.extend(std::env::split_paths(prior));
     }
     let joined = std::env::join_paths(dirs).expect("join PATH entries");
-    // SAFETY: `auth` holds the process-wide homes lock for the lifetime of
-    // the returned guard; `PATH` is restored in `Drop` before it is released.
+    // SAFETY: the homes lock does NOT guard `PATH`. The precondition (see the
+    // type docs) is that the process runs a single test, so no other thread
+    // reads or spawns with `PATH` concurrently; `PATH` is restored in `Drop`.
     unsafe { std::env::set_var("PATH", joined) };
     CodexAuthSourcePathOverride {
         path_prior,
@@ -339,7 +345,7 @@ pub fn codex_auth_source_and_path_override(
 
 impl Drop for CodexAuthSourcePathOverride {
     fn drop(&mut self) {
-        // SAFETY: the inner override still owns the shared environment lock.
+        // SAFETY: same single-test-process precondition as the setter.
         match self.path_prior.take() {
             Some(value) => unsafe { std::env::set_var("PATH", value) },
             None => unsafe { std::env::remove_var("PATH") },

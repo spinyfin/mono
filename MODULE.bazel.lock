@@ -263,7 +263,7 @@
   "moduleExtensions": {
     "//tools/boss/engine/core:codex_test_archives.bzl%codex_test_archives": {
       "general": {
-        "bzlTransitiveDigest": "+h1H4D1StTDBfwDJ8IXV0+mFfoY5tS5bvCZFRLCIk3Q=",
+        "bzlTransitiveDigest": "i8lOzSeA4jTRJKF5ZKJozHb5+RPgW0MahNuH3oPWQqs=",
         "usagesDigest": "QmWeV3Me4wHQnuSR7xGrIVbHYc1t0vbRtZn2lCk2/F4=",
         "recordedInputs": [],
         "generatedRepoSpecs": {
