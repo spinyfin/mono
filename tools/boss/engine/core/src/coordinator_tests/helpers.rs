@@ -111,6 +111,10 @@ pub(super) struct FakeCubeClient {
     pub(super) real_bookmarks: bool,
     pub(super) bookmark_calls: Mutex<Vec<String>>,
     pub(super) fail_goto: bool,
+    /// Make `recovery_pr_base` fail, as for a non-GitHub origin or a deleted PR base.
+    pub(super) fail_pr_base: AtomicBool,
+    /// Base branch `recovery_pr_base` reports; defaults to `main`.
+    pub(super) pr_base: Mutex<Option<String>>,
     pub(super) dirty_verified: Option<bool>,
     pub(super) recovery_status: Option<CubeWorkspaceStatus>,
     pub(super) workspace_root: Option<PathBuf>,
@@ -144,6 +148,18 @@ impl FakeCubeClient {
     pub(super) fn with_workspace_id_queue(self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
         *self.workspace_id_queue.try_lock().expect("uncontended") = ids.into_iter().map(|s| s.into()).collect();
         self
+    }
+
+    pub(super) fn with_recovery_repo(self) -> Self {
+        self.with_repos(vec![
+            CubeRepoSummary::builder()
+                .repo_id("mono")
+                .origin(crate::test_support::TEST_REPO_REMOTE_URL)
+                .main_branch("main")
+                .workspace_root(PathBuf::from("/tmp"))
+                .workspace_prefix("test")
+                .build(),
+        ])
     }
 
     pub(super) fn with_repos(self, repos: Vec<CubeRepoSummary>) -> Self {
@@ -326,7 +342,23 @@ crate::stub_cube_client! { FakeCubeClient {
 
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
         *self.list_repos_calls.lock().await += 1;
-        Ok(self.repos.lock().await.clone())
+        let repos = self.repos.lock().await.clone();
+        if repos.is_empty() && self.real_bookmarks {
+            return Ok(vec![CubeRepoSummary::builder()
+                .repo_id("mono")
+                .origin(crate::test_support::TEST_REPO_REMOTE_URL)
+                .main_branch("main")
+                .workspace_root(self.workspace_root.clone().unwrap())
+                .workspace_prefix("test")
+                .build()]);
+        }
+        Ok(repos)
+    }
+    async fn recovery_pr_base(&self, _origin: &str, _pr: u64) -> Result<String> {
+        if self.fail_pr_base.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(boss_engine_recovery::execution_bookmark::base_unresolvable_error("PR base unavailable"));
+        }
+        Ok(self.pr_base.lock().await.clone().unwrap_or_else(|| "main".into()))
     }
     async fn create_execution_bookmark(&self, workspace: &std::path::Path, execution_id: &str, predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>, inherited_base: Option<&str>) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
         self.bookmark_calls.lock().await.push(execution_id.to_owned());

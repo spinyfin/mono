@@ -18,4 +18,5 @@ mod review_batch_dispatch;
 mod review_pause;
 mod revision_gating;
 mod spawn_failures;
+mod stacked_restore_retry;
 mod unit;

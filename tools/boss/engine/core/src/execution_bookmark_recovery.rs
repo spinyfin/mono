@@ -20,7 +20,13 @@ pub(crate) fn worker_instructions(execution: &WorkExecution) -> String {
     text
 }
 
-pub(crate) fn recovery_instructions(recovery: Option<&(String, bool)>) -> String {
+pub(crate) fn recovery_instructions(
+    recovery: Option<&(String, bool)>,
+    report: Option<&boss_engine_recovery::execution_bookmark::RestoreReport>,
+) -> String {
+    if let Some(report) = report {
+        return report.instructions();
+    }
     let Some((predecessor, has_work)) = recovery else {
         return String::new();
     };

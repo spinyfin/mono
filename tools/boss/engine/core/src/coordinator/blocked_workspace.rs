@@ -1,14 +1,18 @@
 use super::*;
-use boss_engine_recovery::execution_bookmark::pointer_integrity_error;
+use boss_engine_recovery::execution_bookmark::{is_base_unresolvable_error, pointer_integrity_error};
 
 impl ExecutionCoordinator {
     /// Restore the predecessor's engine-created reference into the new lease.
     /// No read of its old workspace or lease history occurs.
     ///
-    /// A started predecessor must have a durable pointer. Missing or unreadable
+    /// A recorded predecessor must have a durable pointer. Missing or unreadable
     /// pointers fail dispatch rather than silently discarding preserved work;
     /// those failures are typed (`PointerIntegrityError`) so the caller can tell
     /// them apart from transient fetch/goto/SSH failures, which stay retryable.
+    ///
+    /// `repo_id` is the handle `ensure_repo` returned for this execution; the
+    /// registered repo is selected by it because `execution.repo_remote_url`
+    /// may be a shorthand, resolver slug, or alternate URL spelling.
     ///
     /// `pr_for_goto` is the bound PR number already resolved by
     /// `pr_number_for_workspace_goto` (including the chain-root fallback), since
@@ -18,6 +22,7 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         lease: &CubeWorkspaceLease,
         adapter: &Arc<dyn HostAdapter>,
+        repo_id: &str,
         pr_for_goto: Option<u64>,
     ) -> Result<Option<(String, bool)>> {
         let prior = if self.work_db.execution_bookmark_optional(&execution.id)?.is_some() {
@@ -27,12 +32,10 @@ impl ExecutionCoordinator {
         } else {
             return Ok(None);
         };
-        let record = self.work_db.execution_bookmark_optional(&prior.id)?.ok_or_else(|| {
-            pointer_integrity_error(format!(
-                "expected engine-created recovery pointer for prior execution {}; no bookmark record exists",
-                prior.id
-            ))
-        })?;
+        let Some(record) = self.work_db.execution_bookmark_optional(&prior.id)? else {
+            self.warn_missing_execution_bookmark(execution, Some(&prior.id)).await;
+            return Ok(None);
+        };
         if record.host_id != adapter.host_id() {
             return Err(pointer_integrity_error(format!(
                 "execution {} recovery store is on host {}; dispatch selected {}",
@@ -41,12 +44,44 @@ impl ExecutionCoordinator {
                 adapter.host_id()
             )));
         }
-        let has_work = if matches!(
+        let is_implementation = matches!(
             execution.kind,
             ExecutionKind::ChoreImplementation
                 | ExecutionKind::TaskImplementation
                 | ExecutionKind::RevisionImplementation
-        ) {
+        );
+        let has_work = if prior.id != execution.id && is_implementation {
+            let has_work = !adapter.execution_bookmark_diff(&record).await?.trim().is_empty();
+            if execution.kind == ExecutionKind::RevisionImplementation && pr_for_goto.is_none() && !has_work {
+                return Ok(None);
+            }
+            let repos = adapter.list_repos().await?;
+            let repo = repos
+                .iter()
+                .find(|repo| repo.repo_id == repo_id)
+                .ok_or_else(|| anyhow!("recovery repository {repo_id} is absent from cube repo list"))?;
+            let mut base_fallback = None;
+            let base_branch = if execution.kind == ExecutionKind::RevisionImplementation {
+                let pr = pr_for_goto
+                    .ok_or_else(|| pointer_integrity_error("revision recovery requires its bound PR URL"))?;
+                match adapter.recovery_pr_base(&repo.origin, pr).await {
+                    Ok(base) => base,
+                    // Only a base that can never be resolved (e.g. a non-GitHub
+                    // origin) falls back; transient gh/network errors propagate to
+                    // the pre-start retry path with the base unchanged.
+                    Err(err) if is_base_unresolvable_error(&err) => {
+                        tracing::warn!(execution_id = %execution.id, ?err, fallback = %repo.main_branch, "PR base branch is unresolvable; restaging recovery onto the main branch");
+                        base_fallback = Some(format!(
+                            "its base branch could not be determined: {err:#}; used `{}`",
+                            repo.main_branch
+                        ));
+                        repo.main_branch.clone()
+                    }
+                    Err(err) => return Err(err),
+                }
+            } else {
+                repo.main_branch.clone()
+            };
             let pr_bookmark = if execution.kind == ExecutionKind::RevisionImplementation {
                 let pr = pr_for_goto
                     .ok_or_else(|| pointer_integrity_error("revision recovery requires its bound PR URL"))?;
@@ -57,15 +92,50 @@ impl ExecutionCoordinator {
             } else {
                 None
             };
-            let has_work = !adapter.execution_bookmark_diff(&record).await?.trim().is_empty();
-            let report = adapter
-                .restore_rebased_execution_bookmark(&record, &lease.workspace_path, pr_bookmark.as_deref())
-                .await?;
+            let restore = adapter
+                .restore_rebased_execution_bookmark(
+                    &record,
+                    &lease.workspace_path,
+                    pr_bookmark.as_deref(),
+                    &base_branch,
+                )
+                .await;
+            let mut report = match restore {
+                Ok(report) => report,
+                Err(err)
+                    if execution.kind == ExecutionKind::RevisionImplementation
+                        && base_branch != repo.main_branch
+                        && is_base_unresolvable_error(&err) =>
+                {
+                    // The PR base resolved but its remote bookmark is gone (e.g. a
+                    // stacked parent deleted after merge). Any other failure is
+                    // transient and must not silently change the base.
+                    tracing::warn!(execution_id = %execution.id, ?err, "PR base has no remote commit; retrying on the main branch");
+                    base_fallback = Some(format!(
+                        "requested base `{base_branch}`: {err:#}; used `{}`",
+                        repo.main_branch
+                    ));
+                    adapter
+                        .restore_rebased_execution_bookmark(
+                            &record,
+                            &lease.workspace_path,
+                            pr_bookmark.as_deref(),
+                            &repo.main_branch,
+                        )
+                        .await?
+                }
+                Err(err) => return Err(err),
+            };
+            report.base_fallback = base_fallback;
             self.work_db.record_execution_restore_report(&execution.id, &report)?;
             has_work
         } else {
             adapter
-                .restore_execution_bookmark(&record, &lease.workspace_path)
+                .restore_execution_bookmark(
+                    &record,
+                    &lease.workspace_path,
+                    is_implementation && prior.id == execution.id,
+                )
                 .await?
         };
         self.dispatch_events

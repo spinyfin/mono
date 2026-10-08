@@ -722,6 +722,7 @@ pub(crate) async fn compose_worker_spawn(
     let mut embedded_output_path = designated_output_kind(execution, work_item)
         .map(|kind| crate::structured_output::default_path_string(&execution.id, kind));
     let bookmark_recovery = work_db.bookmark_recovery(&execution.id)?;
+    let restore_report = work_db.execution_restore_report(&execution.id)?;
     let prompt_text = if execution.kind == ExecutionKind::AutomationTriage {
         match work_db.get_automation(&execution.work_item_id) {
             Ok(Some(automation)) => {
@@ -787,6 +788,7 @@ pub(crate) async fn compose_worker_spawn(
                         .work_item(work_item)
                         .workspace_path(workspace_path)
                         .maybe_bookmark_recovery(bookmark_recovery.as_ref())
+                        .maybe_restore_report(restore_report.as_ref())
                         .maybe_parent_project(parent_project.as_ref())
                         .maybe_cube_change_id(cube_change_id)
                         .maybe_conflict_attempt(conflict_attempt.as_ref())
@@ -819,6 +821,7 @@ pub(crate) async fn compose_worker_spawn(
                     .work_item(work_item)
                     .workspace_path(workspace_path)
                     .maybe_bookmark_recovery(bookmark_recovery.as_ref())
+                    .maybe_restore_report(restore_report.as_ref())
                     .maybe_parent_project(parent_project.as_ref())
                     .maybe_cube_change_id(cube_change_id)
                     .maybe_conflict_attempt(conflict_attempt.as_ref())
@@ -1085,6 +1088,7 @@ pub(crate) async fn compose_worker_spawn(
                 .work_item(work_item)
                 .workspace_path(workspace_path)
                 .maybe_bookmark_recovery(bookmark_recovery.as_ref())
+                .maybe_restore_report(restore_report.as_ref())
                 .maybe_parent_project(parent_project.as_ref())
                 .maybe_cube_change_id(cube_change_id)
                 .maybe_conflict_attempt(conflict_attempt.as_ref())
@@ -1104,10 +1108,7 @@ pub(crate) async fn compose_worker_spawn(
     let prompt_text = if execution.kind == ExecutionKind::PrReviewGuide {
         prompt_text
     } else {
-        let mut bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions(execution);
-        if let Some(report) = work_db.execution_restore_report(&execution.id)? {
-            bookmark_instructions.push_str(&report.instructions());
-        }
+        let bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions(execution);
         let (opening, rest) = prompt_text.split_once('\n').unwrap_or((&prompt_text, ""));
         format!("{opening}\n\n{bookmark_instructions}{rest}")
     };
@@ -2804,22 +2805,31 @@ mod compose_worker_spawn_tests {
         };
 
         let without = compose().await;
-        assert!(!without.contains("## Restored work rebased onto main"), "{without}");
+        assert!(!without.contains("## EXECUTION BOOKMARK RECOVERY"), "{without}");
+
+        db.record_execution_bookmark(&boss_engine_recovery::execution_bookmark::ExecutionBookmark {
+            execution_id: execution.id.clone(),
+            repo_path: workspace.path().to_path_buf(),
+            host_id: "local".into(),
+        })
+        .unwrap();
+        db.record_bookmark_recovery(&execution.id, "exec_prior", false).unwrap();
 
         for (conflicts, first_task) in [("", false), ("Commit abc:\nbase.txt\n", true)] {
             db.record_execution_restore_report(
                 &execution.id,
-                &RestoreReport {
-                    inherited_base: None,
-                    pointer: "boss-recovery/exec_prior + pr/99".into(),
-                    commits: "abc1234 Preserved work\n".into(),
-                    base_sha: "0123456789abcdef".into(),
-                    conflicts: conflicts.into(),
-                },
+                &RestoreReport::builder()
+                    .pointer("boss-recovery/exec_prior + pr/99")
+                    .commits("abc1234 Preserved work\n")
+                    .base_sha("0123456789abcdef")
+                    .conflicts(conflicts)
+                    .pr_bound(true)
+                    .build(),
             )
             .unwrap();
             let prompt = compose().await;
-            assert!(prompt.contains("## Restored work rebased onto main"), "{prompt}");
+            assert_eq!(prompt.matches("## EXECUTION BOOKMARK RECOVERY").count(), 1, "{prompt}");
+            assert!(!prompt.contains("positioned this lease normally"));
             assert!(prompt.contains("boss-recovery/exec_prior + pr/99"), "{prompt}");
             assert!(prompt.contains("0123456789abcdef"), "{prompt}");
             assert!(prompt.contains("abc1234 Preserved work"), "{prompt}");

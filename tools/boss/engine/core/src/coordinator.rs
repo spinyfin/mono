@@ -617,6 +617,10 @@ pub struct CubeRepoSummary {
 
 #[async_trait]
 pub trait CubeClient: Send + Sync {
+    async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
+        crate::host_adapter::fetch_recovery_pr_base(origin, pr).await
+    }
+
     async fn create_execution_bookmark(
         &self,
         workspace: &Path,

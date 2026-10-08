@@ -41,6 +41,30 @@ pub fn is_pointer_integrity_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<PointerIntegrityError>())
 }
 
+/// The requested PR base branch cannot be resolved to a commit (no such remote
+/// bookmark, or a non-GitHub origin). Unlike a failed fetch or SSH hop, retrying
+/// cannot fix it, so it is the only failure that may justify restaging onto a
+/// substitute base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseUnresolvableError(pub String);
+
+impl std::fmt::Display for BaseUnresolvableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BaseUnresolvableError {}
+
+pub fn base_unresolvable_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(BaseUnresolvableError(message.into()))
+}
+
+/// True when `error` (or any cause in its chain) is a base-unresolvable failure.
+pub fn is_base_unresolvable_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<BaseUnresolvableError>())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionBookmark {
     pub execution_id: String,
@@ -309,12 +333,23 @@ pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
 
 /// Fork from the reference so later edits cannot rewrite the predecessor's work.
 pub async fn restore(jj: &dyn Jj, record: &ExecutionBookmark, workspace: &Path) -> Result<bool> {
+    restore_for_retry(jj, record, workspace, false).await
+}
+
+/// A retry must keep its own baseline and pointers in the working history,
+/// even when that execution has no unpublished diff.
+pub async fn restore_for_retry(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    workspace: &Path,
+    self_retry: bool,
+) -> Result<bool> {
     ensure!(
         jj.shared_repo(workspace).await? == record.repo_path,
         "recovery destination belongs to a different shared repository"
     );
     let has_work = !unpublished_diff(jj, record).await?.trim().is_empty();
-    if !has_work {
+    if !has_work && !self_retry {
         return Ok(false);
     }
     jj.run(
