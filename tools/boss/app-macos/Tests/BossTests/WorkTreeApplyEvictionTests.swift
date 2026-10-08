@@ -127,7 +127,7 @@ final class WorkTreeApplyEvictionTests: XCTestCase {
         XCTAssertEqual(model.tasksByProjectID["proj_a"]?.map(\.id), [followup.id])
     }
 
-    func testMoveOrdinaryTaskInProjectWithFollowupOnlyReordersOrdinaryTasks() {
+    func testMoveTaskInProjectIncludesFollowupsInReorder() {
         let model = makeModel()
         var first = makeTask(id: "first", projectID: "proj_a", kind: "project_task")
         first.ordinal = 1
@@ -147,7 +147,7 @@ final class WorkTreeApplyEvictionTests: XCTestCase {
         XCTAssertEqual(sent.count, 1)
         XCTAssertEqual(sent.first?["type"] as? String, "reorder_project_tasks")
         XCTAssertEqual(sent.first?["project_id"] as? String, "proj_a")
-        XCTAssertEqual(sent.first?["task_ids"] as? [String], [second.id, first.id])
+        XCTAssertEqual(sent.first?["task_ids"] as? [String], [followup.id, first.id, second.id])
     }
 
     // MARK: - Helpers
