@@ -12,7 +12,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 35;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 36;
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -73,6 +73,8 @@ impl WorkDb {
             tx.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)")?;
         }
         if version < CURRENT_SCHEMA_VERSION {
+            // Schema 36 refreshes existing question views with the declaring run's summary.
+            pr_flow::migrate_operator_questions(&tx)?;
             tx.execute(
                 "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
                 [CURRENT_SCHEMA_VERSION.to_string()],
@@ -499,7 +501,7 @@ mod floor_tests {
 
     #[test]
     fn supported_databases_apply_post_floor_migrations_without_losing_data() {
-        for version in [32, 33, 34, CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1] {
+        for version in [32, 33, 34, 35, CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
             let conn = Connection::open(&path).unwrap();

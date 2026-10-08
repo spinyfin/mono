@@ -173,7 +173,7 @@ struct WorkTask: Identifiable, Hashable {
     /// the automation-provenance badge on the card and to route execution
     /// to the automations worker pool. Cards with this set DO appear on
     /// the kanban — the purple wand icon distinguishes them from human-filed
-    /// work so the operator can still review and merge their PRs.
+    /// work so the user can still review and merge their PRs.
     var sourceAutomationId: String? = nil
     /// `true` while an independent `pr_review` reviewer execution is running
     /// for this task. The task is held in the Doing column until the reviewer
@@ -194,7 +194,7 @@ struct WorkTask: Identifiable, Hashable {
     /// — there is nothing to reveal in that case. Mirrors
     /// `Task.ai_review_findings_revision_id` on the wire.
     var aiReviewFindingsRevisionId: String? = nil
-    /// `true` when this is a Review-lane card waiting on the operator and
+    /// `true` when this is a Review-lane card waiting on the user and
     /// nothing else: an open PR with no blocked pill, no `in revision`
     /// badge, all required CI checks green, and no merge conflict with the
     /// base branch. Engine-computed (not derived in the view layer) so the
@@ -276,7 +276,7 @@ struct WorkTask: Identifiable, Hashable {
     var dispatchFailedReason: String? = nil
     /// Human-readable error text for `dispatchFailedReason` (e.g. the
     /// underlying cube lease error message). Rendered directly on the
-    /// kanban card so the operator can see why without digging into
+    /// kanban card so the user can see why without digging into
     /// dispatch logs. Mirrors `Task.dispatch_failed_error` on the wire.
     var dispatchFailedError: String? = nil
     /// RFC 3339 timestamp of the dispatch failure recorded in
@@ -284,12 +284,17 @@ struct WorkTask: Identifiable, Hashable {
     /// Mirrors `Task.dispatch_failed_at` on the wire.
     var dispatchFailedAt: String? = nil
 
-    /// Free-form operator/agent labels on this leaf work item. Empty when
+    /// Free-form user/agent labels on this leaf work item. Empty when
     /// none are set. Mirrors `Task.tags` on the wire. Owned by the leaf
     /// card row — revisions do not inherit parent tags. Caps enforced by
     /// the engine (24 chars / 5 tags); the card truncates display further
     /// if needed and collapses entirely when empty.
     var tags: [String] = []
+
+    /// The open question a blocked worker asked the user, or `nil` when
+    /// there is none (never asked, answered, withdrawn, or of an answer type
+    /// this build cannot render). Mirrors `Task.operator_question`.
+    var operatorQuestion: OperatorQuestion? = nil
 
     var isChore: Bool {
         kind == "chore" || kind == "followup"
@@ -371,6 +376,7 @@ enum WorkBlockedBadge {
         case "ci_failure": return "CI Failure"
         case "ci_failure_exhausted": return "CI Failed"
         case "review_feedback": return "Review"
+        case "awaiting_operator_answer": return "Needs Answer"
         default: return reason.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
@@ -383,6 +389,7 @@ enum WorkBlockedBadge {
     /// exactly the case that can be truncated prose).
     private static let knownReasons: Set<String> = [
         "dependency", "merge_conflict", "ci_failure", "ci_failure_exhausted", "review_feedback",
+        "awaiting_operator_answer",
     ]
 
     /// Whether the blocked pill has meaningfully more to say than its
@@ -464,6 +471,9 @@ extension WorkTask {
     ///     `ci_failure_exhausted`, `review_feedback`) → Review. The item
     ///     has an open PR; the block is transient and in-flight. The card
     ///     shows the reason badge so the state is legible.
+    ///   • `awaiting_operator_answer` with an open question
+    ///     (`isAwaitingOperatorAnswer`) → Doing's "Needs Attention"
+    ///     section: the task is work in progress waiting on an answer.
     ///   • Everything else (dependency, nil, unknown) → Backlog: the item
     ///     can't start yet, so from the user's perspective it sits with
     ///     the not-yet-active pile.
@@ -508,6 +518,8 @@ extension WorkTask {
             return .doing
         case "blocked" where isReviewPhaseBlocked:
             return .review
+        case "blocked" where isAwaitingOperatorAnswer:
+            return .doing
         default:
             return .backlog
         }
@@ -523,6 +535,24 @@ extension WorkTask {
         default:
             return false
         }
+    }
+
+    /// `true` when a worker ended its run by asking the user a question
+    /// and nobody has answered yet: the task is `blocked` for
+    /// `awaiting_operator_answer` *and* the engine projected an open question
+    /// onto it. Routes the card into Doing's "Needs Attention" section
+    /// (`boardColumn`).
+    ///
+    /// Gated on `status`, for the same stale-scalar reason `WorkBlockedBadge`
+    /// is: a `blocked_reason` or question that outlives the status must not
+    /// route a card. Gated on the question too: a parked task with the
+    /// reason but nothing to answer (an answer type this build cannot render,
+    /// or a payload racing the question's withdrawal) stays a plain blocked
+    /// card in Backlog rather than a Needs Attention card with no buttons.
+    var isAwaitingOperatorAnswer: Bool {
+        status == "blocked"
+            && blockedReason == "awaiting_operator_answer"
+            && operatorQuestion != nil
     }
 
     /// `true` when the task's PR is either in GitHub's merge queue or has

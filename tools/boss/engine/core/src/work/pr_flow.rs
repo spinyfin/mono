@@ -1877,9 +1877,12 @@ pub(super) fn migrate_operator_questions(conn: &Connection) -> Result<()> {
             ON operator_questions(work_item_id) WHERE status = 'open';
         CREATE INDEX IF NOT EXISTS operator_questions_by_item
             ON operator_questions(work_item_id, created_at);
-        CREATE VIEW IF NOT EXISTS open_operator_questions AS
+        DROP VIEW IF EXISTS open_operator_questions;
+        CREATE VIEW open_operator_questions AS
             SELECT work_item_id, json_patch(question_json,
-                json_object('id', id, 'asked_at', created_at, 'execution_id', execution_id)) AS view_json
+                json_object('id', id, 'asked_at', created_at, 'execution_id', execution_id,
+                    'run_summary', (SELECT json_extract(payload_json, '$.summary') FROM worker_proposals
+                        WHERE worker_proposals.id = operator_questions.proposal_id))) AS view_json
             FROM operator_questions WHERE status = 'open';
         CREATE TRIGGER IF NOT EXISTS operator_questions_task_override
         AFTER UPDATE OF status, blocked_reason, deleted_at ON tasks
@@ -1963,6 +1966,7 @@ fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRecord> {
                 .explanation(question.explanation)
                 .asked_at(row.get::<_, String>("created_at")?)
                 .execution_id(row.get::<_, String>("execution_id")?)
+                .maybe_run_summary(row.get::<_, Option<String>>("run_summary")?)
                 .build(),
         )
         .work_item_id(row.get::<_, String>("work_item_id")?)
@@ -1981,8 +1985,11 @@ fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRecord> {
 impl WorkDb {
     pub fn list_operator_questions(&self, work_item_id: &str) -> Result<Vec<OperatorQuestionRecord>> {
         let conn = self.connect()?;
-        let mut stmt =
-            conn.prepare("SELECT * FROM operator_questions WHERE work_item_id = ?1 ORDER BY created_at, id")?;
+        let mut stmt = conn.prepare(
+            "SELECT *, (SELECT json_extract(payload_json, '$.summary') FROM worker_proposals
+             WHERE worker_proposals.id = operator_questions.proposal_id) AS run_summary
+             FROM operator_questions WHERE work_item_id = ?1 ORDER BY created_at, id",
+        )?;
         collect_rows(stmt.query_map([work_item_id], map_question)?)
     }
 
@@ -2017,7 +2024,9 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let question = tx
             .query_row(
-                "SELECT * FROM operator_questions WHERE id = ?1 OR work_item_id = ?1
+                "SELECT *, (SELECT json_extract(payload_json, '$.summary') FROM worker_proposals
+                 WHERE worker_proposals.id = operator_questions.proposal_id) AS run_summary
+                 FROM operator_questions WHERE id = ?1 OR work_item_id = ?1
              ORDER BY (status = 'open') DESC, created_at DESC, id DESC LIMIT 1",
                 [id],
                 map_question,

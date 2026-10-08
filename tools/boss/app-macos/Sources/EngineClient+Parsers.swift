@@ -265,7 +265,8 @@ extension EngineClient {
             dispatchFailedReason: payload["dispatch_failed_reason"] as? String,
             dispatchFailedError: payload["dispatch_failed_error"] as? String,
             dispatchFailedAt: payload["dispatch_failed_at"] as? String,
-            tags: parseWorkItemTags(payload["tags"])
+            tags: parseWorkItemTags(payload["tags"]),
+            operatorQuestion: OperatorQuestion.parse(payload["operator_question"])
         )
     }
 

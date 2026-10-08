@@ -68,6 +68,7 @@ extension ChatViewModel {
     /// and the engine treats it as such.
     func attemptDrop(_ taskID: String, onColumn column: WorkBoardColumnKey, group: WorkBoardGroupKey?) -> Bool {
         guard let task = task(withID: taskID) else { return false }
+        let group = group.flatMap { $0.isEngineBoardGroup ? $0 : nil }
 
         // Whether the card visibly moved. This is a *rendering* fact the
         // client already owns (it is how the board lays sections out), not a
@@ -227,12 +228,18 @@ extension ChatViewModel {
     }
 
     /// Which of its column's named groups `task` currently renders in, or
-    /// `nil` for a column with no groups. Mirrors the Done-column split in
-    /// `computeWorkSections`; kept here so the drop path and the section
-    /// builder cannot drift.
+    /// `nil` for a column with no groups. Mirrors the Doing- and Done-column
+    /// splits in `computeWorkSections`; kept here so the drop path and the
+    /// section builder cannot drift.
     func boardGroup(for task: WorkTask) -> WorkBoardGroupKey? {
-        guard effectiveBoardColumn(for: task) == .done else { return nil }
-        return task.isInMergingSection ? .merging : .completed
+        switch effectiveBoardColumn(for: task) {
+        case .doing:
+            return task.isAwaitingOperatorAnswer ? .needsAttention : nil
+        case .done:
+            return task.isInMergingSection ? .merging : .completed
+        default:
+            return nil
+        }
     }
 
     func clearDragRefusal() {

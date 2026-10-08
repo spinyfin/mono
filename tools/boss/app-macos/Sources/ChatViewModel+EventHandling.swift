@@ -93,6 +93,7 @@ extension ChatViewModel {
             // without this, a disconnect mid-request leaves the row
             // permanently disabled since no work_error will ever arrive.
             deferredScopeActionInFlightIDs.removeAll()
+            operatorAnswerInFlightByTaskID.removeAll()
             // Same reasoning for a review-guide retry in flight: no
             // `review_guide_retry_queued` or `work_error` reply is ever
             // coming for a request the disconnect killed in transit, so
@@ -196,6 +197,8 @@ extension ChatViewModel {
             if let productID = deletedTask?.productID ?? currentSelectedProductID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
+        case .operatorQuestionError(let message, let requestId):
+            handleOperatorQuestionError(message: message, requestId: requestId)
         case .workError(let message, let requestId):
             abandonBackgroundWorkRequest(requestId: requestId)
             // The engine's WorkError reply carries no request context, so we
@@ -214,6 +217,7 @@ extension ChatViewModel {
             // case: one viewer window open, nothing else in flight) do we
             // attribute the error to the waiting viewer(s).
             let otherRequestInFlight = hasOtherTrackedAppRequestInFlight()
+            clearOperatorAnswerInFlight(requestId: requestId)
             if let attemptID = engineAttemptDetailRequestID {
                 engineAttemptDetailErrors[attemptID] = message
                 engineAttemptDetailRequestID = nil
@@ -838,6 +842,7 @@ extension ChatViewModel {
         if !retryingReviewGuideRootTaskIDs.isEmpty { return true }
         if !plannerActionInFlightProjectIDs.isEmpty { return true }
         if !deferredScopeActionInFlightIDs.isEmpty { return true }
+        if !operatorAnswerInFlightByTaskID.isEmpty { return true }
         if !pendingMoveOriginByTaskID.isEmpty { return true }
         if pendingDragAdmissionCheck != nil { return true }
         if engineAttemptDetailRequestID != nil { return true }

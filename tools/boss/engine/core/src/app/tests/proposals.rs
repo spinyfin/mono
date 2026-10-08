@@ -91,6 +91,10 @@ async fn question_finalize_preserves_workspace_and_never_auto_dispatches() {
     assert!(!task.autostart);
     let question = task.operator_question.as_ref().unwrap();
     assert_eq!(question.execution_id, execution_id);
+    assert_eq!(question.run_summary.as_deref(), Some("The scope needs authorization"));
+    assert_ne!(question.run_summary.as_deref(), Some(question.explanation.as_str()));
+    let history = db.list_operator_questions(&task_id).unwrap();
+    assert_eq!(history[0].question.run_summary, question.run_summary);
     assert_eq!(question.text, task.blocked_detail.as_deref().unwrap());
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(execution.status, boss_protocol::ExecutionStatus::Failed);
@@ -121,6 +125,37 @@ async fn question_finalize_preserves_workspace_and_never_auto_dispatches() {
             .operator_question,
         task.operator_question
     );
+}
+
+#[tokio::test]
+async fn question_summary_survives_upgrade_of_existing_projection() {
+    let (state, dir, _, task_id) = parked_question_task().await;
+    let expected = question_task(&state, &task_id).operator_question.unwrap();
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "DROP VIEW open_operator_questions;
+         CREATE VIEW open_operator_questions AS
+         SELECT work_item_id, json_patch(question_json,
+             json_object('id', id, 'asked_at', created_at, 'execution_id', execution_id)) AS view_json
+         FROM operator_questions WHERE status = 'open';
+         UPDATE metadata SET value = '35' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    assert!(
+        question_task(&state, &task_id)
+            .operator_question
+            .unwrap()
+            .run_summary
+            .is_none()
+    );
+    let reopened = crate::work::WorkDb::open(dir.path().join("state.db")).unwrap();
+    let crate::work::WorkItem::Task(task) = reopened.get_work_item(&task_id).unwrap() else {
+        panic!("expected task");
+    };
+    assert_eq!(task.operator_question, Some(expected));
 }
 
 #[tokio::test]

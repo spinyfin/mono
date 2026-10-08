@@ -384,6 +384,11 @@ final class EngineClient: @unchecked Sendable {
             case "work_error":
                 let message = payload["message"] as? String ?? "unknown work error"
                 emit(.workError(message: message, requestId: envelopeRequestId))
+            case "operator_question_error":
+                emit(.operatorQuestionError(
+                    message: OperatorQuestionFailure.message(from: payload["error"]),
+                    requestId: envelopeRequestId
+                ))
             case "error":
                 let message = payload["message"] as? String ?? "unknown engine error"
                 emit(.error(message: message))

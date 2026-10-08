@@ -52,6 +52,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "autostart",
         "blockedReason",
         "blockedDetail",
+        "operatorQuestion",
         "aiReviewing",
         "aiReviewState",
         "aiReviewFindingsRevisionId",
@@ -504,6 +505,27 @@ final class WorkCardSnapshotTests: XCTestCase {
                 },
                 mutate: {
                     var t = $0; t.blockedDetail = "waiting on parent PR"; return t
+                }
+            ),
+            Case(
+                name: "operatorQuestion",
+                context: doing,
+                base: {
+                    var t = Self.makeTask(id: "task_1", status: "blocked")
+                    t.blockedReason = "awaiting_operator_answer"
+                    t.operatorQuestion = OperatorQuestion(
+                        id: "oq_1", text: "Approve the bypass?", answerType: .yesNo,
+                        explanation: "why", askedAt: "1791158400", executionID: "exec_1"
+                    )
+                    return t
+                },
+                mutate: {
+                    var t = $0
+                    t.operatorQuestion = OperatorQuestion(
+                        id: "oq_1", text: "Approve a different bypass?", answerType: .yesNo,
+                        explanation: "why", askedAt: "1791158400", executionID: "exec_1"
+                    )
+                    return t
                 }
             ),
             Case(

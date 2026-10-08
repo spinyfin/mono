@@ -22,12 +22,16 @@ enum EngineEvent {
     /// Populator staging a design's task breakdown — design
     /// auto-populate-project-tasks-on-design-pr-merge.md §"Surfacing").
     /// Unlike `workItemCreated`, applying this must not steal the
-    /// operator's current selection/filters — it's a passive data refresh.
+    /// user's current selection/filters — it's a passive data refresh.
     case workItemsCreated(items: [WorkItemPayload])
     case workItemUpdated(item: WorkItemPayload)
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
     case workError(message: String, requestId: String?)
+    /// Typed refusal of an `answer_operator_question` request (`not_found`,
+    /// `conflict`, `validation_failed`). `message` is user-readable;
+    /// `requestId` is the envelope id of the answer request it refuses.
+    case operatorQuestionError(message: String, requestId: String?)
     case error(message: String)
     /// Snapshot of every allocated worker slot's live runtime state.
     /// Delivered both as a one-shot reply to
@@ -72,7 +76,7 @@ enum EngineEvent {
     /// Engine reply to `GetProductDesignDoc` — one document's body, or
     /// the reason it could not be read. The `(repo, path, ref)` triple
     /// is echoed so the reader pane can drop a late reply that arrived
-    /// after the operator moved to a different document.
+    /// after the user moved to a different document.
     case productDesignDocContent(ref: DesignDocRef, content: DesignDocContent)
     /// Response to `list_conflict_resolutions` — the filtered set of
     /// rows for the Engine tab. Phase 5 #13/#14 of the merge-conflict
