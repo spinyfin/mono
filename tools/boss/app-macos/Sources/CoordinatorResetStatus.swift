@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Shared by Settings and the main window; each surface presents its own
-/// confirmation only when the operator clicks its timeout action.
+/// confirmation only after its timeout action is selected.
 struct CoordinatorResetStatus: ViewModifier {
     @ObservedObject var model: ChatViewModel
     @State private var confirmForce = false
