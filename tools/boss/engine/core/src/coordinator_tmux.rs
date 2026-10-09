@@ -24,6 +24,8 @@ use crate::spawn_flow::TMUX_SESSION_SCHEMA;
 use crate::tmux_session_options::insert_color_environment;
 use crate::work::{CoordinatorTmuxRecord, WorkDb};
 
+pub(crate) mod reset_handoff;
+
 pub const COORDINATOR_SESSION_NAME: &str = "boss-coordinator";
 const SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 const SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
@@ -485,6 +487,7 @@ pub(crate) async fn recreate_after_confirmation(
     spawn: &CoordinatorSpawn<'_>,
     expected_spawn_token: &str,
     reason: CoordinatorRecreateReason,
+    force_without_handoff: bool,
 ) -> Result<CoordinatorTmuxRecord> {
     let mut record = spawn
         .work_db
@@ -537,7 +540,11 @@ pub(crate) async fn recreate_after_confirmation(
             },
             supervisor_restart_churn_before: None,
         },
-        CoordinatorStartReason::Recreate(reason),
+        if force_without_handoff {
+            CoordinatorStartReason::RecreateWithoutHandoff(reason)
+        } else {
+            CoordinatorStartReason::Recreate(reason)
+        },
     )
     .await
 }
@@ -1270,6 +1277,7 @@ pub(crate) fn coordinator_working_directory() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    mod reset_handoff_tests;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::Path;
@@ -2199,6 +2207,7 @@ mod tests {
                 &spawn_ctx(&db, &tmux, &tmux, "sonnet", dir.path(), &NoneProbe),
                 "stale",
                 CoordinatorRecreateReason::OperatorReset,
+                false,
             )
             .await
             .is_err()
@@ -2238,6 +2247,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &FixedProbe("2.1.238")),
             "token",
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap();
@@ -2317,6 +2327,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "sonnet", dir.path(), &NoneProbe),
             "token",
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap();
@@ -2363,6 +2374,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe),
             "token",
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap();
@@ -2387,6 +2399,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe),
             "token",
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap();
@@ -2416,6 +2429,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "opus", &missing, &NoneProbe),
             "token",
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap_err();
@@ -2780,6 +2794,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe),
             &created.spawn_token,
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap();

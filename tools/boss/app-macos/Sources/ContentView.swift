@@ -141,7 +141,7 @@ struct ContentView: View {
             }
         } message: {
             if let confirmation = model.coordinatorModelRecreateConfirmation {
-                Text("Picard is running \(confirmation.currentModel). Restarting replaces its tmux session and permanently discards the current conversation.")
+                Text("Picard is running \(confirmation.currentModel). Boss will request a fresh handoff first, then replace its session. The full conversation is permanently discarded.")
             }
         }
         // Same confirmed flow as the "Reset Coordinator Session…" control in
@@ -159,6 +159,7 @@ struct ContentView: View {
         } message: {
             Text(CoordinatorResetCopy.message)
         }
+        .modifier(CoordinatorResetStatus(model: model))
         #if canImport(GhosttyKit)
         .task {
             // Wire the SwiftPM-only pane allocator into ChatViewModel
