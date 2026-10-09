@@ -74,6 +74,15 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
         lhs.slice == rhs.slice
     }
 
+    private func shortIDLabel(_ id: Int) -> some View {
+        Text("T" + String(id))
+            .font(.system(.caption2, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("T" + String(id))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if slice.hasPRRow, let prURL = slice.prURL {
@@ -102,20 +111,23 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                     )
                     .layoutPriority(1)
                     Spacer(minLength: 0)
-                    if let id = slice.shortID {
-                        Text("T" + String(id))
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .accessibilityLabel("T" + String(id))
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
+                    // With a revision badge the id moves to that (bottom) row so
+                    // it stays anchored bottom-right.
+                    if let id = slice.shortID, !slice.hasInProgressRevision {
+                        shortIDLabel(id)
                     }
                 }
                 if slice.hasInProgressRevision {
-                    PrInRevisionIndicator(onTap: onRevisionBadgeTap)
-                        .onHover { hovering in
-                            onRevisionBadgeHover?(hovering)
+                    HStack(alignment: .center, spacing: 6) {
+                        PrInRevisionIndicator(onTap: onRevisionBadgeTap)
+                            .onHover { hovering in
+                                onRevisionBadgeHover?(hovering)
+                            }
+                        Spacer(minLength: 0)
+                        if let id = slice.shortID {
+                            shortIDLabel(id)
                         }
+                    }
                 }
             }
 
@@ -143,12 +155,7 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
             if slice.hasStandaloneShortID, let id = slice.shortID {
                 HStack {
                     Spacer(minLength: 0)
-                    Text("T" + String(id))
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("T" + String(id))
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
+                    shortIDLabel(id)
                 }
             }
 
