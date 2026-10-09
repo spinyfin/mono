@@ -33,7 +33,9 @@ use crate::work::WorkDb;
 /// Reads run concurrently, so this is also (roughly) the most the
 /// session launch can be delayed by GitHub. A product that overruns it is
 /// reported as `Failed` naming the budget, never silently skipped.
-pub(crate) const SESSION_START_FETCH_BUDGET: Duration = Duration::from_secs(15);
+/// Recreate holds coordinator_tmux_lock after killing the old session here;
+/// keep this short and use the on-demand command for a longer retry.
+pub(crate) const SESSION_START_FETCH_BUDGET: Duration = Duration::from_secs(3);
 
 /// Per-product bound for an on-demand `boss guidance show`. More generous
 /// than the launch budget: a CLI caller is waiting for exactly this.
@@ -171,7 +173,7 @@ pub(crate) fn audit_summary(guidance: &[CoordinatorGuidanceView]) -> serde_json:
 
 /// Render the "Product coordinator guidance" section of the session-start
 /// brief. Pure over its input.
-pub(crate) fn render_brief_section(guidance: &[CoordinatorGuidanceView]) -> String {
+pub(crate) fn render_brief_section(guidance: &[CoordinatorGuidanceView], error: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str("\n## Product coordinator guidance (BOSS_COORDINATOR.md)\n\n");
     out.push_str(
@@ -180,6 +182,12 @@ pub(crate) fn render_brief_section(guidance: &[CoordinatorGuidanceView]) -> Stri
          is the version you are acting on. These rules bind you for work on that product, alongside your generic \
          instructions. `boss guidance show [--product <id>]` re-reads at the current HEAD at any time.\n",
     );
+    if let Some(error) = error {
+        out.push_str(&format!(
+            "\nProduct list unreadable: {error}. This is NOT \"no guidance\"; run `boss guidance show` before product-scoped work and report the result in your first reply.\n"
+        ));
+        return out;
+    }
     if guidance.is_empty() {
         out.push_str("\nNo products are registered, so there is no product guidance to load.\n");
         return out;
@@ -300,14 +308,17 @@ mod tests {
     #[test]
     fn brief_section_inlines_a_loaded_body_with_its_sha() {
         let boss = product("prod_boss", "Boss", Some("git@github.com:spinyfin/mono.git"));
-        let text = render_brief_section(&[view(
-            &boss,
-            CoordinatorGuidanceState::Loaded {
-                git_ref: SHA.to_owned(),
-                bytes: 20,
-                markdown: "# Boss rules\n- rule one\n".to_owned(),
-            },
-        )]);
+        let text = render_brief_section(
+            &[view(
+                &boss,
+                CoordinatorGuidanceState::Loaded {
+                    git_ref: SHA.to_owned(),
+                    bytes: 20,
+                    markdown: "# Boss rules\n- rule one\n".to_owned(),
+                },
+            )],
+            None,
+        );
         assert!(
             text.contains("## Product coordinator guidance (BOSS_COORDINATOR.md)"),
             "{text}"
@@ -347,7 +358,7 @@ mod tests {
                 reason: "could not reach GitHub".to_owned(),
             },
         );
-        let text = render_brief_section(&[missing, over, failed]);
+        let text = render_brief_section(&[missing, over, failed], None);
         assert!(
             text.contains(&format!("MISSING: spinyfin/mono @ {SHA} has no `BOSS_COORDINATOR.md`")),
             "{text}"
@@ -372,7 +383,7 @@ mod tests {
 
     #[test]
     fn brief_section_with_no_products_says_so() {
-        let text = render_brief_section(&[]);
+        let text = render_brief_section(&[], None);
         assert!(text.contains("No products are registered"), "{text}");
     }
 

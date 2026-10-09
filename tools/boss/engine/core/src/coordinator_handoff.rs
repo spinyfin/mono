@@ -259,6 +259,8 @@ pub(crate) struct StartBriefInputs<'a> {
     /// Rendered in full after the handoff so the incoming session is bound
     /// by product rules from its first turn.
     pub(crate) guidance: &'a [CoordinatorGuidanceView],
+    /// A failed product query must not look like a successful empty list.
+    pub(crate) guidance_error: Option<&'a str>,
 }
 
 fn when(epoch: i64, now: i64) -> String {
@@ -278,6 +280,7 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
         now_epoch_secs: now,
         transcript_dir,
         guidance,
+        guidance_error,
     } = inputs;
     let mut out = String::new();
     out.push_str("[Boss coordinator session start: automatic handoff brief from the engine]\n\n");
@@ -363,7 +366,10 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
         ));
     }
 
-    out.push_str(&crate::coordinator_guidance::render_brief_section(guidance));
+    out.push_str(&crate::coordinator_guidance::render_brief_section(
+        guidance,
+        guidance_error,
+    ));
 
     out.push_str(
         "\nDo this now, before anything else:\n\
@@ -418,6 +424,23 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_756_800_000;
+
+    #[test]
+    fn product_list_failure_is_not_rendered_as_no_products() {
+        let text = compose_start_brief(
+            StartBriefInputs::builder()
+                .state(&HandoffState::Missing)
+                .reason(CoordinatorStartReason::FirstCreation)
+                .now_epoch_secs(NOW)
+                .guidance(&[])
+                .guidance_error("database unreadable")
+                .build(),
+        );
+        assert!(text.contains("Product list unreadable: database unreadable"), "{text}");
+        assert!(text.contains("NOT \"no guidance\""), "{text}");
+        assert!(text.contains("boss guidance show"), "{text}");
+        assert!(!text.contains("No products are registered"), "{text}");
+    }
 
     fn present(written_at: i64, writer: &str) -> HandoffState {
         HandoffState::Present(CoordinatorHandoff {
