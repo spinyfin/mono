@@ -751,6 +751,8 @@ pub(super) async fn handle_probe_status(ctx: Dispatch, req: FrontendRequest) {
                     state: record.state,
                     urgent: record.urgent,
                     detail: record.detail,
+                    submitted: record.submitted,
+                    resumed: record.resumed,
                 },
             ),
             // Probe ids are minted per engine process and never persisted, so

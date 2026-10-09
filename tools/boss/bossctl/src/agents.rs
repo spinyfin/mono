@@ -1094,15 +1094,9 @@ pub(crate) async fn open_document(socket_path: &Option<String>, json: bool, path
     }
 }
 
-/// Inject `text` into the worker pane referenced by `agent`, as if
-/// the user had typed it and pressed Return. The submit step is the
-/// app-side writer's responsibility: after pasting the body via
-/// libghostty's text path it synthesises a Return keystroke, which
-/// is what makes the prompt land. Earlier revisions of this CLI
-/// appended a trailing `\n` here in the hope that the paste path
-/// would treat it as Enter; it does not (the `\n` lands as a literal
-/// newline character in the input field), so the writer owns
-/// submission now and the CLI ships the text verbatim.
+/// Send a nudge through the engine's pane delivery path. Busy interactive
+/// workers are interrupted before submission; parked workers receive the
+/// text directly. The engine owns the submit keystroke.
 pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent: String, text: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
@@ -1118,18 +1112,14 @@ pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent:
         FrontendEvent::WorkerInputSent {
             run_id: returned,
             slot_id,
+            probe_id,
         } => {
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "status": "sent",
-                        "run_id": returned,
-                        "slot_id": slot_id,
-                    })
-                );
+                println!("{}", worker_input_sent_json(&returned, slot_id, probe_id.as_deref()));
             } else {
-                println!("sent input to slot {slot_id} (run {returned})");
+                for line in worker_input_sent_lines(&returned, slot_id, probe_id.as_deref()) {
+                    println!("{line}");
+                }
             }
             Ok(())
         }
@@ -1138,6 +1128,26 @@ pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent:
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }
+}
+
+/// `--json` body of a successful `agents send`. `probe_id` is the receipt for
+/// a busy-worker (interrupting) send and `null` otherwise.
+fn worker_input_sent_json(run_id: &str, slot_id: u8, probe_id: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "status": "sent",
+        "run_id": run_id,
+        "slot_id": slot_id,
+        "probe_id": probe_id,
+    })
+}
+
+/// Human output of a successful `agents send`, one entry per line.
+fn worker_input_sent_lines(run_id: &str, slot_id: u8, probe_id: Option<&str>) -> Vec<String> {
+    let mut lines = vec![format!("sent input to slot {slot_id} (run {run_id})")];
+    if let Some(probe_id) = probe_id {
+        lines.push(format!("check delivery with: bossctl probe-status {probe_id}"));
+    }
+    lines
 }
 
 /// Interrupt the worker referenced by `agent` — equivalent to the
@@ -1954,6 +1964,19 @@ fn tmux_adoption_state_label(state: TmuxAdoptionState) -> &'static str {
 mod tests {
     use super::*;
     use boss_protocol::{Product, Project, ProjectStatus, Task, TaskKind, TaskStatus};
+
+    #[test]
+    fn agents_send_output_surfaces_the_probe_receipt() {
+        let json = worker_input_sent_json("run-1", 4, Some("probe-9"));
+        assert_eq!(json["probe_id"], "probe-9");
+        assert_eq!(json["slot_id"], 4);
+        assert!(worker_input_sent_json("run-1", 4, None)["probe_id"].is_null());
+
+        let lines = worker_input_sent_lines("run-1", 4, Some("probe-9"));
+        assert_eq!(lines[0], "sent input to slot 4 (run run-1)");
+        assert_eq!(lines[1], "check delivery with: bossctl probe-status probe-9");
+        assert_eq!(worker_input_sent_lines("run-1", 4, None).len(), 1);
+    }
 
     /// Build a live-worker fixture with a caller-chosen slot id, run id, and
     /// crew name. Setting `name` explicitly (rather than deriving it from
