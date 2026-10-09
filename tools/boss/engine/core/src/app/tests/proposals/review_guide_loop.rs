@@ -190,14 +190,18 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
         .await,
     );
     assert_eq!(proposal.state, ProposalState::Applied);
+    assert_eq!(
+        db.get_execution(guide_execution).unwrap().status,
+        ExecutionStatus::Completed
+    );
     let ready = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
     assert_eq!(ready.lifecycle, "ready");
     let new_id = ready.readable_version_id.unwrap();
     assert_ne!(new_id, old_id);
-    assert_eq!(
-        db.get_pr_review_guide_version(&new_id).unwrap().unwrap().markdown,
-        guide
-    );
+    let new_version = db.get_pr_review_guide_version(&new_id).unwrap().unwrap();
+    assert_eq!(new_version.markdown, guide);
+    assert_eq!(new_version.comparison_id, attempts[0].comparison_id);
+    assert_ne!(new_version.comparison_id, old_version.comparison_id);
     assert_eq!(db.get_pr_review_guide_version(&old_id).unwrap().unwrap(), old_version);
     let preserved = db.get_comment(&comment.id).unwrap().unwrap();
     assert_eq!(preserved.status, boss_protocol::COMMENT_STATUS_RESOLVED);
