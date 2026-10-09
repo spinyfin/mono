@@ -490,6 +490,13 @@ impl WorkerPaneReleaser for ServerStatePaneReleaser {
         server.release_worker_pane(run_id).await
     }
 
+    async fn forget_persona_name(&self, run_id: &str) {
+        if let Some(server) = self.server.get().and_then(Weak::upgrade) {
+            server.live_worker_states.forget_persona_name(run_id);
+            server.broadcast_live_worker_states().await;
+        }
+    }
+
     async fn release_proven_dead_remote_pane(&self, run_id: &str) -> PaneReleaseOutcome {
         let Some(server) = self.server.get().and_then(Weak::upgrade) else {
             return PaneReleaseOutcome::NoLiveWorker;

@@ -167,6 +167,9 @@ impl WorkerCompletionHandler {
         let started = Instant::now();
 
         let pane_started = Instant::now();
+        // A Stop can precede remote process exit. Keep the virtual slot and
+        // persona until the shared release guard proves death; remote lease
+        // reconciliation retries this release after the process exits.
         let pane_outcome = self.pane_releaser.release_pane(execution_id).await;
         let pane_ms = pane_started.elapsed().as_millis();
 

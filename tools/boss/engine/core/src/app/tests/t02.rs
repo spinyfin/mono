@@ -727,6 +727,7 @@ enum RemoteProbe {
     Alive,
     Inconclusive,
     Dead,
+    DeadOnce,
 }
 
 struct ProbeAdapter {
@@ -741,9 +742,14 @@ crate::stub_host_adapter! { ProbeAdapter {
         Ok(())
     }
     async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> anyhow::Result<Option<bool>> {
-        match *self.probe.lock().unwrap() {
+        let mut probe = self.probe.lock().unwrap();
+        match *probe {
             RemoteProbe::Alive => Ok(Some(true)),
             RemoteProbe::Dead => Ok(Some(false)),
+            RemoteProbe::DeadOnce => {
+                *probe = RemoteProbe::Inconclusive;
+                Ok(Some(false))
+            }
             RemoteProbe::Inconclusive => anyhow::bail!("host unreachable"),
         }
     }
@@ -769,6 +775,15 @@ impl crate::host_adapter::HostAdapterProvider for ProbeProvider {
 /// releases the remaining resources.
 #[tokio::test]
 async fn cancelled_remote_worker_release_is_guarded_by_pid_probe() {
+    retained_remote_worker_release(false).await;
+}
+
+#[tokio::test]
+async fn completed_remote_worker_releases_after_exit_and_reuses_persona_without_collision() {
+    retained_remote_worker_release(true).await;
+}
+
+async fn retained_remote_worker_release(completed: bool) {
     use crate::completion::ForceReleaseOutcome;
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
@@ -781,16 +796,17 @@ async fn cancelled_remote_worker_release_is_guarded_by_pid_probe() {
     let execution = db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
-    db.start_execution_run_on_host(
-        &execution.id,
-        "worker-1",
-        "repo-1",
-        "lease-1",
-        "ws-1",
-        "/tmp/ws-1",
-        "zakalwe",
-    )
-    .unwrap();
+    let (_, run) = db
+        .start_execution_run_on_host(
+            &execution.id,
+            "worker-1",
+            "repo-1",
+            "lease-1",
+            "ws-1",
+            "/tmp/ws-1",
+            "zakalwe",
+        )
+        .unwrap();
     db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
     let event = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::PostToolUse {
@@ -805,7 +821,20 @@ async fn cancelled_remote_worker_release_is_guarded_by_pid_probe() {
     dispatch_live_worker_state(&server_state, &event).await;
     let slot = server_state.worker_registry.slot_for_run(&execution.id).unwrap();
     let name = db.persona_display_name(&execution.id).unwrap();
-    db.cancel_running_execution(&execution.id).unwrap();
+    if completed {
+        db.finish_execution_run(
+            crate::work::FinishExecutionRunInput::builder()
+                .execution_id(&execution.id)
+                .run_id(&run.id)
+                .execution_status(crate::work::ExecutionStatus::Completed)
+                .run_status("completed")
+                .clear_workspace_lease(false)
+                .build(),
+        )
+        .unwrap();
+    } else {
+        db.cancel_running_execution(&execution.id).unwrap();
+    }
 
     let adapter = Arc::new(ProbeAdapter {
         probe: std::sync::Mutex::new(RemoteProbe::Alive),
@@ -864,7 +893,11 @@ async fn cancelled_remote_worker_release_is_guarded_by_pid_probe() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_runs SET remote_pid = NULL WHERE execution_id = ?1",
+            if completed {
+                "UPDATE work_executions SET finished_at = '1' WHERE id = ?1"
+            } else {
+                "UPDATE work_runs SET remote_pid = NULL WHERE execution_id = ?1"
+            },
             [&execution.id],
         )
         .unwrap();
@@ -880,14 +913,57 @@ async fn cancelled_remote_worker_release_is_guarded_by_pid_probe() {
     assert_eq!(server_state.worker_registry.slot_for_run(&execution.id), Some(slot));
     assert!(server_state.live_worker_states.get(slot).is_some());
     assert!(!persona_held());
-    assert!(db.terminal_remote_cleanup_runs().unwrap().is_empty());
+    if !completed {
+        assert!(db.terminal_remote_cleanup_runs().unwrap().is_empty());
+    }
     assert_eq!(
         db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
         Some("lease-1")
     );
     db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
 
-    *adapter.probe.lock().unwrap() = RemoteProbe::Dead;
+    assert_eq!(
+        server_state.live_worker_states.get(slot).unwrap().name,
+        boss_protocol::placeholder_worker_name(&execution.id)
+    );
+    let replacement = create_test_chore_manual(db, product.id, "replacement remote chore");
+    let next = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(replacement.id).build())
+        .unwrap();
+    db.start_execution_run_on_host(
+        &next.id,
+        "worker-2",
+        "repo-1",
+        "lease-2",
+        "ws-2",
+        "/tmp/ws-2",
+        "zakalwe",
+    )
+    .unwrap();
+    let next_event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "claude-sess-2".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+        Some(next.id.clone()),
+        None,
+    );
+    dispatch_live_worker_state(&server_state, &next_event).await;
+    assert_eq!(db.persona_display_name(&next.id).unwrap(), name);
+    // bossctl resolves crew names by case-insensitive equality over this snapshot.
+    let matches: Vec<_> = server_state
+        .live_worker_states
+        .snapshot()
+        .into_iter()
+        .filter(|state| state.name.eq_ignore_ascii_case(name.as_deref().unwrap()))
+        .collect();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].run_id, next.id);
+
+    // A second probe would fail: force_release must carry its first verdict.
+    *adapter.probe.lock().unwrap() = RemoteProbe::DeadOnce;
     assert!(matches!(
         server_state.completion_handler.force_release(&execution.id).await,
         ForceReleaseOutcome::Released { .. }

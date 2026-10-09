@@ -49,7 +49,7 @@ impl WorkerCompletionHandler {
             return ForceReleaseOutcome::HeldForRemoteWorker;
         }
         if matches!(
-            self.pane_releaser.release_pane(execution_id).await,
+            self.pane_releaser.release_proven_dead_remote_pane(execution_id).await,
             PaneReleaseOutcome::NoLiveWorker
         ) {
             tracing::info!(

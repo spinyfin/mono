@@ -478,7 +478,7 @@ async fn release_terminal_remote_resources(
         // lease cannot be proven stale. The persona has no TTL fallback
         // (the cube lease does), so free its roster name rather than
         // leaking it permanently; the cube TTL reclaims the lease.
-        release_persona_only(work_db, &handle.execution_id);
+        release_persona_only(work_db, pane_releaser, &handle.execution_id).await;
         return;
     };
     // Persona names have no TTL. Bound their retention independently of the
@@ -501,7 +501,7 @@ async fn release_terminal_remote_resources(
                 >= retention_secs.min(i64::MAX as u64) as i64
         });
     if expired || matches!(work_db.get_host(&handle.host_id), Ok(None)) {
-        release_persona_only(work_db, &handle.execution_id);
+        release_persona_only(work_db, pane_releaser, &handle.execution_id).await;
     }
     let Ok(adapter) = crate::host_adapter::resolve_host_adapter(work_db, provider, &handle.host_id).await else {
         return;
@@ -534,7 +534,15 @@ async fn release_terminal_remote_resources(
     }
 }
 
-fn release_persona_only(work_db: &WorkDb, execution_id: &str) {
+async fn release_persona_only(
+    work_db: &WorkDb,
+    pane_releaser: Option<&dyn crate::completion::WorkerPaneReleaser>,
+    execution_id: &str,
+) {
+    // Rename before making the name available to a concurrent dispatch.
+    if let Some(releaser) = pane_releaser {
+        releaser.forget_persona_name(execution_id).await;
+    }
     if let Err(err) = work_db.release_persona(execution_id) {
         tracing::warn!(execution_id, ?err, "remote-lease reconcile: persona release failed");
     }

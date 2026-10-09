@@ -384,6 +384,9 @@ pub enum PaneReleaseOutcome {
 pub trait WorkerPaneReleaser: Send + Sync {
     async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome;
 
+    /// Remove a retained live entry's roster name before its persona becomes reusable.
+    async fn forget_persona_name(&self, _run_id: &str) {}
+
     /// The owning host has positively confirmed this remote worker is gone.
     async fn release_proven_dead_remote_pane(&self, run_id: &str) -> PaneReleaseOutcome {
         self.release_pane(run_id).await
