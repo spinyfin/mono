@@ -40,6 +40,7 @@ async fn get_summary(state: &Arc<ServerState>, root_task_id: &str) -> FrontendEv
         ctx,
         FrontendRequest::GetReviewGuideSummary {
             root_task_id: root_task_id.to_owned(),
+            series_id: None,
         },
     )
     .await;
@@ -79,6 +80,13 @@ fn seed_ready_guide(server_state: &ServerState) -> (String, String, String) {
     let db = &server_state.work_db;
     let product = create_product(db);
     let root = create_active_chore(db, &product, "viewer seam root");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget' WHERE id = ?1",
+            [&root],
+        )
+        .unwrap();
     let (series_id, comparison_id) = seed_review_guide_series(db, &root);
     let attempt = db
         .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
@@ -165,7 +173,7 @@ async fn retry_without_a_captured_comparison_is_a_work_error() {
 #[tokio::test]
 async fn retry_creates_a_fresh_attempt_and_repeats_idempotently() {
     let (server_state, _dir) = test_server_state();
-    let (root, series_id, _version_id) = seed_ready_guide(&server_state);
+    let (root, series_id, version_id) = seed_ready_guide(&server_state);
 
     let first = retry(&server_state, &root, Some("tok-1")).await;
     let FrontendEvent::ReviewGuideRetryQueued {
@@ -178,6 +186,14 @@ async fn retry_creates_a_fresh_attempt_and_repeats_idempotently() {
     };
     assert!(!first_already);
     assert_eq!(first_attempt.series_id, series_id);
+    let bound = server_state
+        .work_db
+        .live_pr_review_guide_attempts_for_series(&series_id)
+        .unwrap();
+    assert_eq!(bound.len(), 1);
+    assert_eq!(bound[0].id, first_attempt.id);
+    let execution_id = bound[0].execution_id.clone().expect("retry must bind an execution");
+    assert_eq!(first_attempt.status, "running");
 
     // A repeated call with the SAME idempotency token must return the
     // original attempt, not create a second one.
@@ -192,18 +208,21 @@ async fn retry_creates_a_fresh_attempt_and_repeats_idempotently() {
     };
     assert!(second_already);
     assert_eq!(second_attempt.id, first_attempt.id);
+    let repeated = server_state
+        .work_db
+        .live_pr_review_guide_attempts_for_series(&series_id)
+        .unwrap();
+    assert_eq!(repeated.len(), 1);
+    assert_eq!(repeated[0].execution_id.as_deref(), Some(execution_id.as_str()));
 
     // The now-current summary must reflect the new (unpublished) attempt,
-    // not the earlier readable version — a queued refresh does not clobber
+    // not the earlier readable version — a running refresh does not clobber
     // the still-visible older content.
     let event = get_summary(&server_state, &root).await;
     let FrontendEvent::ReviewGuideSummary { summary } = event else {
         panic!("expected ReviewGuideSummary, got {event:?}");
     };
     let summary = summary.unwrap();
-    assert_eq!(summary.lifecycle, "queued");
-    assert!(
-        summary.readable_version_id.is_some(),
-        "a queued refresh must not clear the previously published version"
-    );
+    assert_eq!(summary.lifecycle, "generating");
+    assert_eq!(summary.readable_version_id.as_deref(), Some(version_id.as_str()));
 }
