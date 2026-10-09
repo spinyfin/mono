@@ -346,6 +346,15 @@ pub enum FrontendEvent {
         /// speaks for itself.
         #[serde(default)]
         detail: Option<String>,
+        /// Structured form of the interrupting-delivery evidence: whether the
+        /// text was submitted into the pane. `None` for probes that did not
+        /// go through the interrupting path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submitted: Option<bool>,
+        /// Whether the worker was seen resuming on the submitted text. `None`
+        /// when nothing was submitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumed: Option<ProbeResumeEvidence>,
     },
     /// Push: the worker for `run_id` has replied to a previously
     /// dispatched probe. Emitted on the Stop boundary that follows

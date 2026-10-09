@@ -611,7 +611,7 @@ async fn send_input_to_worker_refuses_when_worker_not_accepting_input() {
 /// for Stop/idle delivery — never silently discarded. As above, the refusal
 /// here comes from an unresolvable driver failing closed rather than from
 /// `Working` alone; the delivered-mid-turn counterpart is
-/// `chore_update_notify_delivers_mid_turn_on_a_buffering_driver`.
+/// `chore_update_notify_interrupts_before_delivering`.
 #[tokio::test]
 async fn chore_update_notify_requeues_when_worker_not_accepting_input() {
     use boss_protocol::WorkerActivity;
@@ -818,4 +818,267 @@ async fn send_input_fails_visibly_when_the_long_tool_call_does_not_stop() {
     assert_eq!(runner.escape_presses(), 2);
     assert!(!runner.wrote_text());
     assert!(server_state.pop_pending_probe(&run_id).is_none());
+}
+
+/// Put a parked worker back mid-turn, the way a long tool call does: a
+/// `PreToolUse` with no balancing `Stop`.
+fn resume_into_long_tool_call(server_state: &ServerState, slot_id: u8) {
+    use boss_protocol::{WorkerActivity, WorkerEvent};
+    server_state.live_worker_states.apply_event(
+        slot_id,
+        &WorkerEvent::PreToolUse {
+            session_id: "test-sess".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+        },
+    );
+    assert_eq!(
+        server_state.live_worker_states.get(slot_id).unwrap().activity,
+        WorkerActivity::Working,
+        "precondition: the slot must be mid-turn",
+    );
+}
+
+/// Park `slot_id` (as the driver's turn-boundary signal would) once at least
+/// `escapes` Escape presses have been sent — unlike
+/// `park_once_interrupted`, which fires on the first one.
+fn park_after_escapes(
+    server_state: &Arc<ServerState>,
+    runner: &Arc<super::tmux_stub::RecordingPaneRunner>,
+    slot_id: u8,
+    escapes: usize,
+) -> tokio::task::JoinHandle<()> {
+    use boss_protocol::WorkerEvent;
+    let server_state = server_state.clone();
+    let runner = runner.clone();
+    tokio::spawn(async move {
+        for _ in 0..2000 {
+            if runner.escape_presses() >= escapes {
+                server_state.live_worker_states.apply_event(
+                    slot_id,
+                    &WorkerEvent::Stop {
+                        session_id: "test-sess".into(),
+                        stop_hook_active: false,
+                        stop_reason: crate::protocol::StopReason::Interrupted,
+                    },
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("engine never sent Escape press #{escapes}");
+    })
+}
+
+/// Confirm the `index`th text write the way the worker's CLI does, by firing
+/// `UserPromptSubmit` with what actually reached tmux.
+fn confirm_nth_write(
+    server_state: &Arc<ServerState>,
+    runner: &Arc<super::tmux_stub::RecordingPaneRunner>,
+    run_id: &str,
+    index: usize,
+) -> tokio::task::JoinHandle<()> {
+    use boss_protocol::WorkerEvent;
+    let server_state = server_state.clone();
+    let runner = runner.clone();
+    let run_id = run_id.to_owned();
+    tokio::spawn(async move {
+        for _ in 0..4000 {
+            if let Some(written) = runner.stdin().get(index) {
+                let prompt = String::from_utf8_lossy(written).into_owned();
+                dispatch_live_worker_state(
+                    &server_state,
+                    &crate::events_socket::IncomingHookEvent::for_test(
+                        WorkerEvent::UserPromptSubmit {
+                            session_id: "test-sess".into(),
+                            prompt,
+                        },
+                        Some(run_id.clone()),
+                        None,
+                    ),
+                )
+                .await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("engine never wrote text write #{index} into the pane");
+    })
+}
+
+/// A submitted nudge keeps the run's in-flight slot until its reply boundary.
+/// If it resumes the worker into *another* long tool call there is no boundary
+/// coming, so the next nudge must still interrupt — and be submitted exactly
+/// once — rather than queueing behind the slot and reporting a failure that
+/// invites a duplicate retry.
+#[tokio::test(start_paused = true)]
+async fn second_nudge_interrupts_a_worker_that_resumed_into_another_long_tool_call() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 6, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+
+    let parker = super::probe_interrupt::park_once_interrupted(&server_state, &runner, 6);
+    let confirmer = super::probe_interrupt::confirm_write_when_it_lands(&server_state, &runner, &run_id);
+    let (_, first) = server_state
+        .send_input_to_worker_with_receipt(&run_id, "first nudge".into())
+        .await
+        .unwrap();
+    parker.await.unwrap();
+    confirmer.await.unwrap();
+    let first = first.expect("busy send must return a receipt");
+    assert_eq!(server_state.probe_lifecycle_state(&first), Some(ProbeDeliveryState::Consumed));
+    assert_eq!(runner.escape_presses(), 1);
+    assert_eq!(
+        server_state.in_flight_probe_id(&run_id).as_deref(),
+        Some(first.as_str()),
+        "precondition: the submitted probe still holds the slot awaiting its reply boundary",
+    );
+
+    // The first nudge sent the worker into another long tool call: no Stop.
+    resume_into_long_tool_call(&server_state, 6);
+    let parker = park_after_escapes(&server_state, &runner, 6, 2);
+    let confirmer = confirm_nth_write(&server_state, &runner, &run_id, 1);
+    let (_, second) = server_state
+        .send_input_to_worker_with_receipt(&run_id, "second nudge".into())
+        .await
+        .expect("the second nudge must interrupt, not fail behind the first one's slot");
+    parker.await.unwrap();
+    confirmer.await.unwrap();
+    let second = second.expect("busy send must return a receipt");
+
+    assert_ne!(first, second);
+    assert_eq!(runner.escape_presses(), 2, "the second nudge must send its own Escape");
+    assert_eq!(runner.stdin().len(), 2, "each nudge is submitted exactly once");
+    let pasted = String::from_utf8(runner.stdin()[1].clone()).unwrap();
+    assert!(pasted.ends_with("second nudge"));
+    assert_eq!(
+        server_state.probe_lifecycle_state(&second),
+        Some(ProbeDeliveryState::Consumed)
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&first),
+        Some(ProbeDeliveryState::Consumed),
+        "the superseded probe was already delivered; only its reply slot moved on",
+    );
+    assert!(server_state.pop_pending_probe(&run_id).is_none());
+}
+
+/// Duplicate-delivery protection: a sibling probe whose write is still in
+/// progress holds the slot, so a nudge must not interrupt or write. It is
+/// reported as a `NudgeDelivery` error carrying the probe's real (still
+/// queued) state instead of being claimed delivered.
+#[tokio::test(start_paused = true)]
+async fn nudge_reports_its_state_when_a_sibling_probe_holds_the_slot() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 6, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+    let sibling = server_state.queue_probe(run_id.clone(), "sibling".into(), false);
+    let claimed = server_state
+        .try_reserve_probe_for_delivery(&run_id, None, 0)
+        .expect("sibling claims the slot");
+    assert_eq!(claimed.probe_id, sibling);
+    server_state.set_probe_lifecycle(&sibling, ProbeDeliveryState::Injected);
+
+    let err = server_state
+        .send_input_to_worker_with_receipt(&run_id, "nudge".into())
+        .await
+        .unwrap_err();
+    let SendInputError::NudgeDelivery {
+        probe_id,
+        state,
+        detail,
+    } = err
+    else {
+        panic!("expected NudgeDelivery, got {err:?}");
+    };
+    assert_eq!(state, "queued");
+    assert!(detail.contains("another delivery path"), "detail: {detail}");
+    assert_eq!(server_state.probe_lifecycle_state(&probe_id), Some(ProbeDeliveryState::Queued));
+    assert_eq!(runner.escape_presses(), 0, "must not interrupt behind a write in progress");
+    assert!(!runner.wrote_text());
+    assert_eq!(
+        server_state.in_flight_probe_id(&run_id).as_deref(),
+        Some(sibling.as_str()),
+        "the sibling keeps its claim",
+    );
+}
+
+/// A driver that reads no mid-turn input (Grok) is unchanged by the
+/// interrupting send: the send is refused with the typed error, with no
+/// Escape, no text, and no probe left queued or claimed as a side effect.
+#[tokio::test(start_paused = true)]
+async fn send_to_a_rejecting_driver_is_refused_without_side_effects() {
+    use boss_protocol::WorkerActivity;
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 4, Some("grok"));
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 4, "boss-4");
+
+    let err = server_state
+        .send_input_to_worker_with_receipt(&run_id, "nudge".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SendInputError::NotAcceptingInput {
+                activity: Some(WorkerActivity::Working)
+            }
+        ),
+        "expected NotAcceptingInput(Working), got {err:?}",
+    );
+    assert_eq!(runner.escape_presses(), 0);
+    assert!(!runner.wrote_text());
+    assert_eq!(server_state.pending_probe_count(&run_id), 0);
+    assert!(!server_state.has_in_flight_probe(&run_id));
+}
+
+/// The engine-nudge adapter on a rejecting driver keeps its queued-boundary
+/// behaviour: the nudge waits for the worker's own boundary, with no
+/// interrupt, no composer write, and no claim on the in-flight slot.
+#[tokio::test(start_paused = true)]
+async fn engine_nudge_to_a_rejecting_driver_waits_for_its_boundary() {
+    use crate::completion::ProbeQueuer;
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 4, Some("grok"));
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 4, "boss-4");
+    let queuer = crate::app::probes::ServerStateProbeQueuer::default();
+    queuer.set_server_state(Arc::downgrade(&server_state));
+
+    queuer.queue_probe(&run_id, "act now");
+    queuer.deliver_queued_probes_now(&run_id);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert_eq!(runner.escape_presses(), 0);
+    assert!(!runner.wrote_text());
+    assert_eq!(server_state.pending_probe_count(&run_id), 1, "still queued for its boundary");
+    assert!(!server_state.has_in_flight_probe(&run_id));
+}
+
+/// A nudge queued while the worker was parked must still interrupt if the
+/// worker has started a turn by the time the sweep delivery runs, rather than
+/// being skipped on the assumption that an interrupt was scheduled.
+#[tokio::test(start_paused = true)]
+async fn engine_nudge_queued_while_parked_interrupts_if_the_worker_went_busy() {
+    use crate::completion::ProbeQueuer;
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 6, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+    let queuer = crate::app::probes::ServerStateProbeQueuer::default();
+    queuer.set_server_state(Arc::downgrade(&server_state));
+
+    queuer.queue_probe(&run_id, "act now");
+    assert_eq!(runner.escape_presses(), 0, "parked at queue time: nothing to interrupt yet");
+
+    // The worker starts a long tool call before the delivery task runs.
+    resume_into_long_tool_call(&server_state, 6);
+    let parker = super::probe_interrupt::park_once_interrupted(&server_state, &runner, 6);
+    let confirmer = super::probe_interrupt::confirm_write_when_it_lands(&server_state, &runner, &run_id);
+    queuer.deliver_queued_probes_now(&run_id);
+    parker.await.unwrap();
+    confirmer.await.unwrap();
+
+    assert_eq!(runner.escape_presses(), 1);
+    let pasted = String::from_utf8(runner.stdin().first().unwrap().clone()).unwrap();
+    assert!(pasted.contains("act now"));
+    assert_eq!(server_state.pending_probe_count(&run_id), 0);
 }

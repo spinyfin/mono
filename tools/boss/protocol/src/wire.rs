@@ -20,7 +20,7 @@ use crate::types::{
     DesignDocContent, DesignDocTreeState, DispatchAdmission, DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction,
     EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, GuideCommentDisposition, Idea,
     IdeaGraduationKind, IdeaPatch, LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView,
-    PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, ProbeInterruptOutcome, Product, Project,
+    PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, ProbeInterruptOutcome, ProbeResumeEvidence, Product, Project,
     ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
     ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt, ReviewGuideSummary, ReviewGuideVersion,
     ReviseDocInput, ReviseDocOutcome, SelectedProductState, SetProductEditorialRulesInput,

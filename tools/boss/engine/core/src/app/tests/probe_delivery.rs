@@ -618,7 +618,11 @@ async fn probe_status_reports_the_recorded_delivery_state() {
             state,
             urgent,
             detail,
+            submitted,
+            resumed,
         } => {
+            assert_eq!(submitted, None);
+            assert_eq!(resumed, None);
             assert_eq!(reported_run, run_id);
             assert_eq!(reported_id, probe_id);
             assert_eq!(state, ProbeDeliveryState::Queued);

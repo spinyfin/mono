@@ -1115,19 +1115,10 @@ pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent:
             probe_id,
         } => {
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "status": "sent",
-                        "run_id": returned,
-                        "slot_id": slot_id,
-                        "probe_id": probe_id,
-                    })
-                );
+                println!("{}", worker_input_sent_json(&returned, slot_id, probe_id.as_deref()));
             } else {
-                println!("sent input to slot {slot_id} (run {returned})");
-                if let Some(probe_id) = probe_id {
-                    println!("check delivery with: bossctl probe-status {probe_id}");
+                for line in worker_input_sent_lines(&returned, slot_id, probe_id.as_deref()) {
+                    println!("{line}");
                 }
             }
             Ok(())
@@ -1137,6 +1128,26 @@ pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent:
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }
+}
+
+/// `--json` body of a successful `agents send`. `probe_id` is the receipt for
+/// a busy-worker (interrupting) send and `null` otherwise.
+fn worker_input_sent_json(run_id: &str, slot_id: u8, probe_id: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "status": "sent",
+        "run_id": run_id,
+        "slot_id": slot_id,
+        "probe_id": probe_id,
+    })
+}
+
+/// Human output of a successful `agents send`, one entry per line.
+fn worker_input_sent_lines(run_id: &str, slot_id: u8, probe_id: Option<&str>) -> Vec<String> {
+    let mut lines = vec![format!("sent input to slot {slot_id} (run {run_id})")];
+    if let Some(probe_id) = probe_id {
+        lines.push(format!("check delivery with: bossctl probe-status {probe_id}"));
+    }
+    lines
 }
 
 /// Interrupt the worker referenced by `agent` — equivalent to the
@@ -1953,6 +1964,19 @@ fn tmux_adoption_state_label(state: TmuxAdoptionState) -> &'static str {
 mod tests {
     use super::*;
     use boss_protocol::{Product, Project, ProjectStatus, Task, TaskKind, TaskStatus};
+
+    #[test]
+    fn agents_send_output_surfaces_the_probe_receipt() {
+        let json = worker_input_sent_json("run-1", 4, Some("probe-9"));
+        assert_eq!(json["probe_id"], "probe-9");
+        assert_eq!(json["slot_id"], 4);
+        assert!(worker_input_sent_json("run-1", 4, None)["probe_id"].is_null());
+
+        let lines = worker_input_sent_lines("run-1", 4, Some("probe-9"));
+        assert_eq!(lines[0], "sent input to slot 4 (run run-1)");
+        assert_eq!(lines[1], "check delivery with: bossctl probe-status probe-9");
+        assert_eq!(worker_input_sent_lines("run-1", 4, None).len(), 1);
+    }
 
     /// Build a live-worker fixture with a caller-chosen slot id, run id, and
     /// crew name. Setting `name` explicitly (rather than deriving it from

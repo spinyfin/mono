@@ -181,7 +181,9 @@ pub use trust::{PeerClass, RpcTier};
 // functions over the wire types — see the crate docs for why they live
 // outside `boss-engine`.
 use boss_engine_worker_policy::{sanitize_event_for_worker, variant_name, worker_verb_decision};
-use boss_protocol::{ProbeDeliveryExpectation, ProbeDeliveryState, WorkerTierDenial, WorkerTierDenialReason};
+use boss_protocol::{
+    ProbeDeliveryExpectation, ProbeDeliveryState, ProbeResumeEvidence, WorkerTierDenial, WorkerTierDenialReason,
+};
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
