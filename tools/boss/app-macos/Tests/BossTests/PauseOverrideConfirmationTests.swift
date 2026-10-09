@@ -248,7 +248,7 @@ final class PauseOverrideConfirmationTests: XCTestCase {
         XCTAssertNotNil(model.pendingDragAdmissionCheck)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
 
-        model.applyEventForTest(.error(message: "socket waiting: Connection refused"))
+        model.applyEventForTest(.transportError(message: "socket waiting: Connection refused"))
 
         XCTAssertNotNil(model.pendingDragAdmissionCheck,
                         "a transport error must leave the pending admission check in place")

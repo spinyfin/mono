@@ -265,26 +265,31 @@ extension ChatViewModel {
             } else {
                 workErrorMessage = message
             }
-        case .error(let message):
-            if Self.isSocketTransportError(message) {
-                // Transport errors fire continuously while the engine
-                // is unreachable (every reconnect attempt re-emits a
-                // `socket waiting:` line). Routing them through the
-                // work-error modal makes the app unusable: dismissing
-                // re-opens it on the next retry. The disconnected
-                // banner in the main chrome is the user-facing signal
-                // for this state — see `showConnectionLostBanner` in
-                // ContentView.
-                //
-                // Must run BEFORE the pending-admission bounce below:
-                // an unrelated `socket waiting:` line while an
-                // EvaluateDispatchAdmission is in flight must not kill
-                // a still-valid drag. Disconnect (`.disconnected`)
-                // already clears `pendingDragAdmissionCheck` when the
-                // link actually drops and no reply can arrive.
-                appendSystemMessage(message)
+        case .transportError(let message):
+            // Transport errors fire continuously while the engine is
+            // unreachable (every reconnect attempt re-emits one). The
+            // debounced banner (`showConnectionLostBanner`) is the
+            // user-facing signal; never a modal.
+            appendSystemMessage(message)
+        case .notConnected(let requestKind):
+            // A send while disconnected is a transport condition. Fail a
+            // pending optimistic drag back with a non-modal notice; any
+            // other user action is surfaced in the transcript while the
+            // debounced connection banner covers a sustained outage.
+            if pendingDragAdmissionCheck != nil {
+                pendingDragAdmissionCheck = nil
+            }
+            if requestKind.hasPrefix("list_") || requestKind.hasPrefix("get_") {
+                // Refreshes and polls retry on their own cadence/reconnect;
+                // nothing user-initiated was lost.
                 return
             }
+            if !pendingMoveOriginByTaskID.isEmpty {
+                bounceBackOptimisticMoves(message: "Not connected to the engine — reconnecting…")
+            } else {
+                appendSystemMessage("Not connected to the engine; \(requestKind) was not sent.")
+            }
+        case .error(let message):
             if pendingDragAdmissionCheck != nil {
                 // A malformed/undecodable `dispatch_admission_evaluated`
                 // reply (EngineClient emits `.error`, never
@@ -293,8 +298,7 @@ extension ChatViewModel {
                 // rendered in Doing forever — nothing else ever clears
                 // `pendingDragAdmissionCheck` for a reply that never
                 // arrives in the expected shape. Bounce it back exactly as
-                // a hard-blocker refusal would. Transport errors are
-                // handled above so they never reach this arm.
+                // a hard-blocker refusal would.
                 pendingDragAdmissionCheck = nil
                 bounceBackOptimisticMoves(message: message)
                 return
@@ -887,18 +891,6 @@ extension ChatViewModel {
                 self.openReviewGuide(for: task)
             }
         }
-    }
-
-    /// Whether an `.error` message is a transport-level signal from
-    /// `EngineClient` rather than a real engine-reported error.
-    /// Transport errors are emitted on every reconnect attempt while
-    /// the socket can't be opened, so they must not drive any modal
-    /// UI — see the `.error` arm of `handle(_:)` for context.
-    private static func isSocketTransportError(_ message: String) -> Bool {
-        return message.hasPrefix("socket failed:")
-            || message.hasPrefix("socket waiting:")
-            || message.hasPrefix("socket send failed:")
-            || message.hasPrefix("socket receive failed:")
     }
 
     // MARK: - Merge When Ready confirmation
