@@ -171,11 +171,11 @@ final class EngineClient: @unchecked Sendable {
     // Not `private`: called from the `EngineClient+PaneResponses.swift`
     // extension, which needs file-scoped-`private` loosened to `internal`
     // to reach it.
-    /// Returns the envelope id after a socket write. `nil` when nothing
-    /// was sent (`connection == nil` or the payload failed to encode) so
-    /// callers do not register a pending reply that can never arrive.
+    /// Returns the envelope id for a socket write or queued read. Only
+    /// self-retrying background polls may opt out of disconnected reports;
+    /// user actions must either queue or report a visible failure.
     @discardableResult
-    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false) -> String? {
+    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true) -> String? {
         let envelopeRequestId = UUID().uuidString
         outboundRecorder?(payload)
 
@@ -216,6 +216,10 @@ final class EngineClient: @unchecked Sendable {
                 }
                 return envelopeRequestId
             }
+            if !reportIfDisconnected {
+                Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
+                return nil
+            }
             Self.log.info("dropped \(kind, privacy: .public) while disconnected; reporting not-connected")
             emit(.notConnected(requestKind: kind))
             return nil
@@ -231,6 +235,10 @@ final class EngineClient: @unchecked Sendable {
 
     /// Number of reads waiting for a connection. Test hook.
     var queuedReadCountForTesting: Int { queuedReads.withLock { $0.count } }
+
+    func isReadQueued(requestId: String) -> Bool {
+        queuedReads.withLock { $0.contains { $0.id == requestId } }
+    }
 
     private func flushQueuedReads() {
         let drained = queuedReads.withLock { state -> [(id: String, data: Data)] in

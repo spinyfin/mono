@@ -20,7 +20,7 @@ extension ChatViewModel {
     func acceptDeferredScopeAttention(id: String) {
         guard !deferredScopeActionInFlightIDs.contains(id) else { return }
         guard isConnected else {
-            workErrorMessage = "Not connected to the engine — reconnect and try again."
+            showDisconnectedActionNotice()
             return
         }
         deferredScopeActionInFlightIDs.insert(id)
@@ -33,7 +33,7 @@ extension ChatViewModel {
     func createTaskFromDeferredScopeAttention(attentionID: String) {
         guard !deferredScopeActionInFlightIDs.contains(attentionID) else { return }
         guard isConnected else {
-            workErrorMessage = "Not connected to the engine — reconnect and try again."
+            showDisconnectedActionNotice()
             return
         }
         deferredScopeActionInFlightIDs.insert(attentionID)

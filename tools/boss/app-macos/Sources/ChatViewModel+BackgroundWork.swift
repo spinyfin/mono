@@ -20,7 +20,9 @@ extension ChatViewModel {
     /// then every `backgroundWorkPollInterval` while connected. Restarts
     /// an existing timer so reconnect cannot leak a second loop.
     func startBackgroundWorkPolling() {
-        stopBackgroundWorkPolling(clearSnapshot: false)
+        // Disconnect already invalidated sent requests. Preserve history
+        // reads queued during backoff: their replies arrive after .connected.
+        backgroundWorkPollTask?.cancel()
         sendBackgroundWorkPoll()
         let interval = backgroundWorkPollInterval
         backgroundWorkPollTask = Task { @MainActor [weak self] in
@@ -41,10 +43,16 @@ extension ChatViewModel {
     func stopBackgroundWorkPolling(clearSnapshot: Bool) {
         backgroundWorkPollTask?.cancel()
         backgroundWorkPollTask = nil
+        let queued = backgroundWorkPending.filter { engine.isReadQueued(requestId: $0.key) }
         backgroundWorkPending.removeAll()
         backgroundWorkSendGeneration += 1
         backgroundWorkAppliedGeneration = backgroundWorkSendGeneration
         attemptsAppliedGeneration = backgroundWorkSendGeneration
+        // Repeated failed reconnect attempts must not orphan queued history
+        // reads or make their generations older than the disconnect barrier.
+        for (requestId, pending) in queued.sorted(by: { $0.value.generation < $1.value.generation }) {
+            registerBackgroundWorkRequest(requestId: requestId, replacesAttempts: pending.replacesAttempts)
+        }
         if clearSnapshot {
             backgroundWork = []
         }

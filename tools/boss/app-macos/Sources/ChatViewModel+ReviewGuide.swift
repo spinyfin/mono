@@ -78,7 +78,7 @@ extension ChatViewModel {
         retryingReviewGuideRootTaskIDs.insert(task.id)
         if engine.sendGenerateReviewGuide(rootTaskID: task.id, idempotencyToken: UUID().uuidString) == nil {
             retryingReviewGuideRootTaskIDs.remove(task.id)
-            workErrorMessage = "Not connected to the engine — reconnect and try again."
+            showDisconnectedActionNotice()
         }
     }
 
@@ -87,7 +87,10 @@ extension ChatViewModel {
     func retryReviewGuide(for task: WorkTask) {
         guard !retryingReviewGuideRootTaskIDs.contains(task.id) else { return }
         retryingReviewGuideRootTaskIDs.insert(task.id)
-        engine.sendRetryReviewGuide(rootTaskID: task.id, idempotencyToken: UUID().uuidString)
+        if engine.sendRetryReviewGuide(rootTaskID: task.id, idempotencyToken: UUID().uuidString) == nil {
+            retryingReviewGuideRootTaskIDs.remove(task.id)
+            showDisconnectedActionNotice()
+        }
     }
 
     /// Apply a `review_guide_retry_queued` reply — clears the in-flight
