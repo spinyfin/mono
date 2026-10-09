@@ -1,0 +1,8 @@
+[package]
+name = "boss-backoff"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+fastrand = { workspace = true }

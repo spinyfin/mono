@@ -170,7 +170,15 @@ pub(crate) enum CliError {
 
 impl CliError {
     pub(crate) fn internal(err: impl Into<anyhow::Error>) -> Self {
-        Self::Internal(err.into())
+        let err = err.into();
+        // A transport failure that survived the client's retry policy is an
+        // availability problem, not an internal bug: exit 5, message intact.
+        if err.downcast_ref::<boss_client::EngineUnreachable>().is_some()
+            || err.downcast_ref::<boss_client::OutcomeUnknown>().is_some()
+        {
+            return Self::EngineUnavailable(format!("{err:#}"));
+        }
+        Self::Internal(err)
     }
 
     pub(crate) fn usage(message: impl Into<String>) -> Self {
@@ -460,7 +468,8 @@ impl RunContext {
         let allow_input = !flags.no_input && io::stdin().is_terminal() && io::stdout().is_terminal();
         let discovery = Discovery::from_env(flags.socket_path.as_deref())
             .map_err(CliError::internal)?
-            .with_autostart(!flags.no_engine_autostart);
+            .with_autostart(!flags.no_engine_autostart)
+            .with_retry_overrides(flags.no_retry, flags.engine_max_wait);
 
         Ok(Self {
             output_mode: if flags.json {

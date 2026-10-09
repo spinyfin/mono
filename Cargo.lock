@@ -262,6 +262,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-backoff"
+version = "0.1.0"
+dependencies = [
+ "fastrand 2.4.1",
+]
+
+[[package]]
 name = "boss-build-info"
 version = "0.1.0"
 
@@ -301,6 +308,7 @@ name = "boss-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boss-backoff",
  "boss-log-files",
  "boss-protocol",
  "serde",
@@ -905,7 +913,7 @@ dependencies = [
 name = "boss-http-retry"
 version = "0.1.0"
 dependencies = [
- "fastrand 2.4.1",
+ "boss-backoff",
  "reqwest",
  "rustls",
 ]

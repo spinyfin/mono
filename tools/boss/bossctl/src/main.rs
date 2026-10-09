@@ -64,6 +64,18 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Fail immediately when the engine is unreachable instead of retrying
+    /// with exponential backoff (default: retry for up to 10 minutes,
+    /// printing progress to stderr). Equivalent to
+    /// `BOSS_ENGINE_MAX_WAIT_SECS=0`.
+    #[arg(long, global = true, conflicts_with = "engine_max_wait")]
+    no_retry: bool,
+
+    /// Maximum seconds to keep retrying an unreachable engine before
+    /// failing (default 600). Overrides `BOSS_ENGINE_MAX_WAIT_SECS`.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    engine_max_wait: Option<u64>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -1186,6 +1198,7 @@ fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    let _ = RETRY_OVERRIDES.set((cli.no_retry, cli.engine_max_wait));
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(err) => {
@@ -1920,8 +1933,15 @@ fn print_dispatch_event_short(event: &DispatchEvent) {
     }
 }
 
+/// `--no-retry` / `--engine-max-wait`, recorded once at startup so the many
+/// `connect(&cli.socket_path)` call sites need not each thread them through.
+static RETRY_OVERRIDES: std::sync::OnceLock<(bool, Option<u64>)> = std::sync::OnceLock::new();
+
 pub(crate) async fn connect(socket_path: &Option<String>) -> Result<BossClient> {
-    let discovery = Discovery::from_env(socket_path.as_deref()).context("resolving engine discovery profile")?;
+    let (no_retry, max_wait) = RETRY_OVERRIDES.get().copied().unwrap_or_default();
+    let discovery = Discovery::from_env(socket_path.as_deref())
+        .context("resolving engine discovery profile")?
+        .with_retry_overrides(no_retry, max_wait);
     BossClient::connect(&discovery).await.context("connecting to engine")
 }
 

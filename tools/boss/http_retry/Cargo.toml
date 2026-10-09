@@ -5,6 +5,6 @@ edition.workspace = true
 workspace = "../../.."
 
 [dependencies]
-fastrand = { workspace = true }
+boss-backoff = { path = "../backoff" }
 reqwest = { workspace = true, features = ["json"] }
 rustls = { workspace = true }

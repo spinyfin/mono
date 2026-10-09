@@ -47,7 +47,10 @@ fn boss_under_home(
         .env_remove("TEST_TMPDIR")
         .env_remove("TEST_SRCDIR")
         .env_remove("BAZEL_TEST")
-        .env_remove("TESTBRIDGE_TEST_ONLY");
+        .env_remove("TESTBRIDGE_TEST_ONLY")
+        // The "misses the engine" case expects a prompt exit 5; without this
+        // the default 10-minute retry budget would wait out the whole test.
+        .env("BOSS_ENGINE_MAX_WAIT_SECS", "0");
     match socket {
         Some(path) => {
             cmd.env("BOSS_SOCKET_PATH", path);

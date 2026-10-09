@@ -1030,6 +1030,30 @@ fn no_autostart_leaves_engine_autostart_enabled() {
     assert!(ctx.discovery.autostart);
 }
 
+/// `--no-retry` / `--engine-max-wait` override the retry budget; they are
+/// mutually exclusive and default to the client's built-in budget.
+#[test]
+fn retry_flags_override_the_engine_wait_budget() {
+    let ctx = |args: &[&str]| RunContext::from_flags(&Cli::parse_from(args).global).expect("from_flags");
+    let default = ctx(&["boss", "engine", "status"]).discovery.retry.max_wait;
+    assert!(default > std::time::Duration::ZERO);
+    assert_eq!(
+        ctx(&["boss", "--no-retry", "engine", "status"])
+            .discovery
+            .retry
+            .max_wait,
+        std::time::Duration::ZERO
+    );
+    assert_eq!(
+        ctx(&["boss", "--engine-max-wait", "7", "engine", "status"])
+            .discovery
+            .retry
+            .max_wait,
+        std::time::Duration::from_secs(7)
+    );
+    assert!(Cli::try_parse_from(["boss", "--no-retry", "--engine-max-wait", "7", "engine", "status"]).is_err());
+}
+
 fn dummy_task(id: &str, kind: TaskKind) -> Task {
     Task::builder()
         .id(id)

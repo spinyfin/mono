@@ -154,6 +154,32 @@ rust_test(
     ),
 )
 
+# `boss` waits out a briefly unavailable engine (retry with backoff, notices
+# on stderr only, exit 5 after the budget). Drives the compiled binary against
+# a fake socket server; no engine library needed.
+rust_test(
+    name = "engine_retry_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = [
+        "tests/engine_retry.rs",
+    ],
+    crate_root = "tests/engine_retry.rs",
+    data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":common",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 # End-to-end coverage for the `boss` CLI's typed-id → product inference.
 # Spawns an in-process engine and drives the `boss` binary as a real
 # subprocess; the data dep stages it into the test's runfiles tree at
