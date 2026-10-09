@@ -169,7 +169,7 @@ impl WorkerCompletionHandler {
         // InReview only with an explicit associated change (head SHA moved
         // attributably, or observed PR metadata mutation) or an explicit
         // nothing-to-do outcome. Silence after a mid-turn reap — no push,
-        // no metadata marker, no NO_CHANGES_NEEDED — must not read as
+        // no metadata marker, no no-changes-needed — must not read as
         // review-ready. Couples the existing `sha_unchanged` observation
         // (reviewer noop skip) to status success; runs before mid-turn
         // reap accounting so a refused finalize never looks like a reap.
@@ -211,7 +211,7 @@ impl WorkerCompletionHandler {
                         refuse_reason = reason,
                         "revision contribution gate: refusing InReview / PendingReview \
                          terminalization — no head movement, no metadata-fix confirmation, and \
-                         no explicit NO_CHANGES_NEEDED (couples sha_unchanged to status success; \
+                         no explicit no-changes-needed (couples sha_unchanged to status success; \
                          incident-004 AI-3)",
                     );
                     return StopOutcome::AwaitingInput;

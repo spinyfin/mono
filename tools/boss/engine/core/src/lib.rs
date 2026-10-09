@@ -126,7 +126,6 @@ pub use boss_metrics as metrics;
 pub use boss_metrics::{register_counter, register_gauge};
 pub mod metrics_init;
 pub mod metrics_store;
-pub mod no_op_signal;
 pub mod nudge_breaker;
 pub mod orphan_sweep;
 pub mod pane_summary;

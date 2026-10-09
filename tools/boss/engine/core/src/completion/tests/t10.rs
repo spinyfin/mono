@@ -16,9 +16,8 @@
 //! 1. **The engine asked in a language it cannot read.** The re-prompt
 //!    (`probe_push_to_existing_pr`) ended *"there is nothing left to do,
 //!    say so — explain your status"*, inviting prose; the engine's only
-//!    terminal for that state is an own-line
-//!    [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
-//!    match, which explicitly rejects prose. Compliance was unparseable.
+//!    terminal for that state is the typed `run_done` `no-changes-needed`
+//!    declaration, which prose can never satisfy. Compliance was unparseable.
 //! 2. **The nudge ladder had an absorbing state.** The reply landed inside
 //!    [`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`], so the boundary
 //!    produced `NudgeDebounced` — a decision to wait for "the next Stop".
@@ -54,21 +53,21 @@ impl ManualClock {
     }
 }
 
-/// The engine's own probe text must name the exact marker its own parser
-/// accepts.
+/// The engine's own probe text must name the exact typed declaration its
+/// own no-op terminal reads.
 ///
 /// This is the incident's first defect as a one-line invariant: a probe
 /// that says "say so" and nothing more gets prose, and
-/// [`crate::no_op_signal::transcript_signals_no_op`] deliberately does not
-/// match prose (`marker_mentioned_in_prose_does_not_match`). The two ends
-/// of that exchange must not be allowed to drift apart again.
+/// `worker_signalled_no_op` deliberately reads only the `run_done`
+/// declaration. The two ends of that exchange must not be allowed to drift
+/// apart again.
 ///
-/// Also asserts the converse for each probe: the engine's *own* text must
-/// not itself satisfy the own-line match, or a transcript that merely
-/// echoed the probe back would read as a worker terminal.
+/// Also asserts the retired `NO_CHANGES_NEEDED` text marker is gone from
+/// both probes: a worker told to emit it would be answering in a language
+/// the engine no longer reads.
 #[test]
-fn probe_texts_name_the_no_op_marker() {
-    let marker = crate::no_op_signal::NO_CHANGES_NEEDED_MARKER;
+fn probe_texts_name_the_no_op_declaration() {
+    let declaration = "propose done --outcome no-changes-needed";
     let bound = probe_push_to_existing_pr("https://github.com/spinyfin/mono/pull/2622");
 
     for (label, text) in [
@@ -76,14 +75,13 @@ fn probe_texts_name_the_no_op_marker() {
         ("probe_push_to_existing_pr", bound.as_str()),
     ] {
         assert!(
-            text.contains(marker),
-            "{label} must name the `{marker}` marker verbatim — a probe that only invites prose \
+            text.contains(declaration),
+            "{label} must name `{declaration}` verbatim — a probe that only invites prose \
              asks for an answer no engine path can act on:\n{text}",
         );
         assert!(
-            !crate::no_op_signal::transcript_signals_no_op(text),
-            "{label} must keep the marker inline (backticked), never on a line of its own — the \
-             engine's question must not be mistakable for the worker's answer:\n{text}",
+            !text.contains("NO_CHANGES_NEEDED"),
+            "{label} must not teach the retired NO_CHANGES_NEEDED text marker:\n{text}",
         );
     }
 }
@@ -168,8 +166,8 @@ async fn debounced_nudge_survives_trailing_tool_activity_and_the_sweep_advances_
 ///
 /// Sequenced exactly as the incident ran, with the fix in place: prose
 /// conclusion → nudge → prose again inside the debounce → sweep re-drives
-/// the ladder and delivers the (now marker-naming) probe → the worker
-/// answers with the sanctioned marker → clean terminal. The row lands on
+/// the ladder and delivers the (now declaration-naming) probe → the worker
+/// declares `no-changes-needed` → clean terminal. The row lands on
 /// `done`, not back on `todo`, so it is not re-dispatched to redo work that
 /// is already complete.
 #[tokio::test]
@@ -177,7 +175,7 @@ async fn worker_that_finishes_with_no_commit_and_no_pr_terminalizes_and_settles_
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
     // What the incident worker actually wrote: a correct conclusion, in
-    // prose, with no marker.
+    // prose, with no declaration.
     write_assistant_transcript(
         &db,
         workspace.path(),
@@ -221,15 +219,9 @@ async fn worker_that_finishes_with_no_commit_and_no_pr_terminalizes_and_settles_
         "the re-driven probe must actually reach the parked worker",
     );
 
-    // The worker reads a probe that now names the marker, and answers in
-    // the language the engine can read.
-    write_assistant_transcript(
-        &db,
-        workspace.path(),
-        &execution_id,
-        "## Summary\nNo local changes or commits remain to push; the bound PR is already \
-         green.\n\nNO_CHANGES_NEEDED\n",
-    );
+    // The worker reads a probe that now names the typed declaration, and
+    // answers in the language the engine can read.
+    declare_no_changes_needed(&db, &execution_id);
 
     let outcome = handler.on_stop(&execution_id).await;
     assert!(

@@ -16,7 +16,7 @@
 //!
 //! The only guard on that Stop was the generic SHA-delta gate, whose
 //! nudge text (`probe_push_to_existing_pr`) ends by offering the sanctioned
-//! `NO_CHANGES_NEEDED` terminal for a run with nothing left to push. For
+//! `propose done --outcome no-changes-needed` terminal for a run with nothing left to push. For
 //! a conflict revision that is the wrong contract — "is there still a
 //! conflict" is objectively checkable and the engine already holds the
 //! bound PR URL, so it must check rather than take the worker's word.
@@ -202,7 +202,7 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
 /// Probe text for a merge-conflict revision that stopped without pushing
 /// while GitHub still reports the PR conflicting.
 ///
-/// Deliberately does NOT offer the sanctioned `NO_CHANGES_NEEDED` terminal
+/// Deliberately does NOT offer the sanctioned `propose done --outcome no-changes-needed` terminal
 /// that [`crate::completion::probe_push_to_existing_pr`] ends with: for this
 /// execution kind the question is settled, and the answer is that there IS
 /// something left to do. It quotes the live GitHub values and names the one

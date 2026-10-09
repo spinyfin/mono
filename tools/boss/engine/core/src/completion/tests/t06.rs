@@ -101,12 +101,7 @@ async fn finalize_no_op_completion_tears_down_driver_workspace() {
 
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
-    write_assistant_transcript(
-        &db,
-        workspace.path(),
-        &execution_id,
-        "## Summary\nNothing left to do; the working copy has no diff.\n\nNO_CHANGES_NEEDED\n",
-    );
+    declare_no_changes_needed(&db, &execution_id);
     let detector = StubPrDetector::ok(None);
 
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
@@ -174,4 +169,31 @@ async fn finalize_worker_failure_tears_down_driver_workspace() {
         1,
         "a re-fired Stop on an already-abandoned execution must not tear down driver workspace again",
     );
+}
+
+#[tokio::test]
+async fn legacy_marker_text_is_not_a_no_op_signal() {
+    // The `NO_CHANGES_NEEDED` text marker is retired: a final response whose
+    // own line is exactly the old marker must NOT close the task. Only the
+    // typed `propose done --outcome no-changes-needed` declaration does.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "## Summary\nNothing left to do; the working copy has no diff.\n\nNO_CHANGES_NEEDED\n",
+    );
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::AwaitingInput),
+        "the retired marker text must not terminalize the run; got {outcome:?}",
+    );
+    assert_eq!(probes.snapshot().len(), 1, "the produce-a-PR nudge still fires");
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+        other => panic!("expected chore, got {other:?}"),
+    }
 }

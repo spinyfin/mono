@@ -80,7 +80,7 @@ use super::{
 ///
 /// The engine's `codex_unobserved_command` module matches on this literal
 /// prefix to stage the signal for `WorkerCompletionHandler`, which files an
-/// attention item and refuses the worker's `NO_CHANGES_NEEDED` claim for the
+/// attention item and refuses the worker's `no-changes-needed` claim for the
 /// rest of the run.
 pub const UNOBSERVED_COMMAND_MARKER: &str = "[codex-unobserved-command]";
 

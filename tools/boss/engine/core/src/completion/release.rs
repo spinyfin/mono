@@ -333,7 +333,7 @@ impl WorkerCompletionHandler {
     /// reached a Stop boundary without moving the bound PR's head.
     ///
     /// The generic [`probe_push_to_existing_pr`] nudge ends by offering the
-    /// sanctioned `NO_CHANGES_NEEDED` terminal for a run with nothing left
+    /// sanctioned `propose done --outcome no-changes-needed` terminal for a run with nothing left
     /// to push. For a conflict revision that is the wrong contract — whether
     /// a conflict remains is objectively checkable and the engine already
     /// holds the bound PR URL, so it must check rather than take the

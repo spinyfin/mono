@@ -89,15 +89,19 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// prompt half of the terminal-declaration migration:
     /// [`run_done_directive`], and the sentence
     /// [`pr_terminal_directive`] adds about declaring before the terminal
-    /// push. `false` (the flag's registry default) renders today's prompt
-    /// verbatim, with no mention of `boss propose done`; `true` teaches the
-    /// verb. This is the OTHER half of the flag: the engine's
-    /// `evaluate_satisfied_deliverable_on_stop` gate and the
-    /// `NO_CHANGES_NEEDED` proposals-first read are gated by the same flag
+    /// push. `false` (the flag's registry default) omits the general
+    /// "Declaring your run finished" section (the no-op prompts still teach
+    /// `boss propose done --outcome no-changes-needed`); `true` teaches the
+    /// verb for every outcome. This is the OTHER half of the flag: the engine's
+    /// `evaluate_satisfied_deliverable_on_stop` gate is gated by the same flag
     /// name read directly from `FeatureFlagsStore`. Teaching the verb while
     /// the engine still infers would be harmless but pointless; gating the
     /// engine while the worker is never told the verb would hold every run
-    /// to the backstop, so the two must move together.
+    /// to the backstop, so the two must move together. The no-op prompts
+    /// ([`no_op_completion_directive`], [`revision_no_op_completion_directive`])
+    /// are deliberately NOT behind this flag: `propose done --outcome
+    /// no-changes-needed` is the only no-op channel, and the engine reads its
+    /// durable stamp regardless of the flag.
     #[builder(default)]
     run_done_proposals_seam_enabled: bool,
     /// Already-merged `merge_order` siblings whose surfaces this forward-port
@@ -1096,8 +1100,7 @@ pub(crate) fn run_done_directive(
      Pick the outcome that is true:\n\n\
      - `delivered` — the deliverable exists (you opened or pushed to the PR, wrote the review, \
      posted the reply).\n\
-     - `no-changes-needed` — you verified there was nothing to produce. This replaces the \
-     `NO_CHANGES_NEEDED` marker; you do not need both.\n\
+     - `no-changes-needed` — you verified there was nothing to produce.\n\
      - `blocked` — a genuine external blocker or mandated approval stop prevents delivery. This fails \
      the execution, releases its resources, and records the explanation on the task; it does not \
      park a live worker or automatically retry the same attempt. Fix recoverable failures first. \
@@ -1236,16 +1239,21 @@ pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
 /// the worker churned against the nudge until the breaker parked it.
 ///
 /// This block reframes the already-done empty-diff case as a success and
-/// gives the worker an unambiguous terminal signal: emit the
-/// [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER) marker
-/// on its own line and stop. The engine accepts that marker (combined with a
-/// genuinely empty contribution — no PR pushed, none bound) as a clean
-/// terminal and closes the task as done WITHOUT a PR, sending no nudge. The
-/// marker is the *only* sanctioned way to signal this; a worker that simply
-/// stops without it is still nudged, so this must NOT be used to bail out of
-/// work that is merely hard or blocked.
+/// gives the worker an unambiguous terminal signal: declare
+/// `propose done --outcome no-changes-needed` and stop. The engine accepts
+/// that declaration (combined with a genuinely empty contribution — no PR
+/// pushed, none bound) as a clean terminal and closes the task as done
+/// WITHOUT a PR, sending no nudge. The typed declaration is the *only*
+/// sanctioned way to signal this; a worker that simply stops without it is
+/// still nudged, so this must NOT be used to bail out of work that is merely
+/// hard or blocked.
+///
+/// Emitted regardless of `run_done_proposals_seam`: that flag gates the
+/// broader "Declaring your run finished" section, but the engine reads the
+/// no-op declaration's durable stamp unconditionally, so the verb must always
+/// be taught here.
 fn no_op_completion_directive(seam_enabled: bool) -> String {
-    let marker = crate::no_op_signal::NO_CHANGES_NEEDED_MARKER;
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let blocked_pointer = if seam_enabled {
         "call `\"$BOSS_BIN\" propose blocked --reason \"...\"` instead"
     } else {
@@ -1261,16 +1269,20 @@ fn no_op_completion_directive(seam_enabled: bool) -> String {
     );
     out.push_str(&format!(
         "In that case, do NOT commit, push, or open a PR, and do NOT push an empty/no-op PR to \
-         manufacture a deliverable. Instead, emit a line containing exactly `{marker}` as the \
-         final line of your response, then stop. The engine recognizes this marker and closes the \
-         task as already-done — no PR is required and you will not be nudged to produce one.\n\n"
+         manufacture a deliverable. Instead, declare the no-op as the very last thing you do:\n\n\
+         ```\n\
+         {boss} propose done --outcome no-changes-needed --summary \"<what you verified>\"\n\
+         ```\n\n\
+         The engine closes the task as already-done — no PR is required and you will not be \
+         nudged to produce one. Prose alone (a final message saying the work is done) is not a \
+         signal the engine can act on.\n\n"
     ));
     out.push_str(&format!(
         "This replaces the generic \"stop and explain what went wrong\" for the already-done case: \
-         an empty diff because the work is done is a success terminal, not an error. Do NOT emit \
-         `{marker}` to abandon work you simply found hard or are blocked on — if you are blocked, \
-         {blocked_pointer} (see \"If you are blocked or the work is bigger than estimated\" above), \
-         and the engine will route it to the coordinator without nudging you to produce a PR.\n"
+         an empty diff because the work is done is a success terminal, not an error. Do NOT declare \
+         `no-changes-needed` to abandon work you simply found hard or are blocked on — if you are \
+         blocked, {blocked_pointer} (see \"If you are blocked or the work is bigger than estimated\" \
+         above), and the engine will route it to the coordinator without nudging you to produce a PR.\n"
     ));
     out
 }
@@ -1280,25 +1292,22 @@ fn no_op_completion_directive(seam_enabled: bool) -> String {
 /// review finding on an already-open PR, not to produce a fresh diff
 /// against `main` — so the primary-implementation directive's "if `jj diff`
 /// is empty because the work is already on `main`" framing does not apply
-/// here, and until this directive existed no revision prompt taught the
-/// [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
-/// marker at all: `on_stop_inner`'s revision no-op terminal
-/// (`worker_signalled_no_op`) was reachable in the engine but no worker was
-/// ever told the marker existed, so a revision that genuinely concluded the
-/// finding needed no code change had no honest way to say so — it could
-/// only decline and stop, which the Stop-boundary handler then read as "did
-/// not contribute" and nudged forever.
+/// here. A revision that genuinely concluded the finding needed no code
+/// change must have an honest, typed way to say so; otherwise it could only
+/// decline and stop, which the Stop-boundary handler then read as "did not
+/// contribute" and nudged forever.
 ///
-/// This directive keys the marker on the DISPATCHED FINDING, not on an
+/// This directive keys the declaration on the DISPATCHED FINDING, not on an
 /// empty `jj diff`: after actually investigating, if the finding this
 /// revision was dispatched for turns out to need no code change (e.g. it
 /// was already fixed by a sibling commit, or the finding was itself
-/// mistaken), emitting the marker is the sanctioned way to say so. Always
-/// appended for every revision, independent of conflict/CI-remediation
-/// framing, because the engine's `worker_signalled_no_op` check is itself
-/// unconditional on `revision_implementation` executions.
+/// mistaken), `propose done --outcome no-changes-needed` is the sanctioned
+/// way to say so. Always appended for every revision, independent of
+/// conflict/CI-remediation framing, because the engine's
+/// `worker_signalled_no_op` check is itself unconditional on
+/// `revision_implementation` executions.
 fn revision_no_op_completion_directive(seam_enabled: bool) -> String {
-    let marker = crate::no_op_signal::NO_CHANGES_NEEDED_MARKER;
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let blocked_pointer = if seam_enabled {
         "call `\"$BOSS_BIN\" propose blocked --reason \"...\"` instead"
     } else {
@@ -1314,17 +1323,21 @@ fn revision_no_op_completion_directive(seam_enabled: bool) -> String {
     );
     out.push_str(&format!(
         "In that case, do NOT push an empty or cosmetic commit to manufacture a diff. Instead, \
-         explain in your final response exactly why the finding needs no change, then emit a line \
-         containing exactly `{marker}` as the final line of your response, and stop. The engine \
-         recognizes this marker (combined with no new commit on the parent PR) as a declared no-op: \
-         it closes this revision without a nudge loop, and files a human-visible record that the \
-         finding was declined rather than fixed, so a human can judge whether that was right.\n\n",
+         explain in your final response exactly why the finding needs no change, then declare the \
+         no-op as the very last thing you do:\n\n\
+         ```\n\
+         {boss} propose done --outcome no-changes-needed --summary \"<why the finding needs no change>\"\n\
+         ```\n\n\
+         The engine recognizes this declaration (combined with no new commit on the parent PR) as \
+         a declared no-op: it closes this revision without a nudge loop, and files a human-visible \
+         record that the finding was declined rather than fixed, so a human can judge whether that \
+         was right.\n\n",
     ));
     out.push_str(&format!(
-        "Do NOT emit `{marker}` to abandon a finding you simply find hard, ambiguous, or are \
-         blocked on — if you are blocked, {blocked_pointer} (see \"If you are blocked or the work \
-         is bigger than estimated\" above). This marker is specifically for a finding you have \
-         determined, after investigation, requires no code change.\n",
+        "Do NOT declare `no-changes-needed` to abandon a finding you simply find hard, ambiguous, \
+         or are blocked on — if you are blocked, {blocked_pointer} (see \"If you are blocked or the \
+         work is bigger than estimated\" above). This declaration is specifically for a finding you \
+         have determined, after investigation, requires no code change.\n",
     ));
     out
 }

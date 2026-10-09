@@ -235,7 +235,7 @@ impl CodexRolloutProgressSession {
     /// prefers and mirroring the stdout dialect, which only tracks
     /// `command_execution`. A pending non-shell call (`apply_patch`, file
     /// reads, MCP tools) is dropped from tracking without a notification;
-    /// it never gates `NO_CHANGES_NEEDED`. Called immediately before a
+    /// it never gates a `no-changes-needed` claim. Called immediately before a
     /// `Stop` is emitted so a later, unrelated turn never re-flags the same
     /// call.
     ///
@@ -942,7 +942,7 @@ fn cell_still_running_note(cell_id: Option<&str>) -> String {
 /// [`super::UNOBSERVED_COMMAND_MARKER`] is the right channel because it says
 /// precisely what happened: Boss watched a command's records go past and
 /// could not confirm its outcome. The engine files an attention item and
-/// stops treating the run's `NO_CHANGES_NEEDED` claim as confirmed.
+/// stops treating the run's `no-changes-needed` claim as confirmed.
 fn correlation_failure_notification(session_id: &str, err: &CorrelationError) -> WorkerEvent {
     tracing::warn!(%err, "codex rollout: correlation failure surfaced as an unobserved command");
     WorkerEvent::Notification {

@@ -10,6 +10,24 @@ use crate::work::Task;
 mod blocked_recovery;
 mod invocation;
 
+/// `prompt` with the sanctioned-no-op sections removed. Those sections teach
+/// `"$BOSS_BIN" propose done --outcome no-changes-needed` regardless of every
+/// seam flag (it is the only no-op channel), so assertions that a flag-off
+/// prompt names no `propose` verb must look past them.
+fn without_no_op_sections(prompt: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in prompt.split_inclusive('\n') {
+        if line.starts_with("## ") {
+            skipping = line.contains("signal a sanctioned no-op");
+        }
+        if !skipping {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 #[test]
 fn execution_prompts_include_bazel_caching_rule_once() {
     let mut postmortem = design_task();
@@ -471,7 +489,7 @@ fn ci_monitoring_directive_omits_human_gated_names_for_plain_org() {
 fn no_op_directive_present_for_fresh_chore_without_pr() {
     // A fresh chore_implementation worker (no existing PR) must
     // be told the sanctioned way to terminate when the work is already
-    // done — emit NO_CHANGES_NEEDED — instead of only "stop and explain".
+    // done — `propose done --outcome no-changes-needed` — instead of only "stop and explain".
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
             .execution(&base_execution())
@@ -481,8 +499,12 @@ fn no_op_directive_present_for_fresh_chore_without_pr() {
             .build(),
     );
     assert!(
-        prompt.contains(crate::no_op_signal::NO_CHANGES_NEEDED_MARKER),
-        "fresh-chore prompt must name the NO_CHANGES_NEEDED marker:\n{prompt}",
+        prompt.contains("propose done --outcome no-changes-needed --summary"),
+        "fresh-chore prompt must teach the typed no-op declaration:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("NO_CHANGES_NEEDED"),
+        "fresh-chore prompt must not teach the retired text marker:\n{prompt}",
     );
     assert!(
         prompt.contains("signal a sanctioned no-op"),
@@ -504,8 +526,12 @@ fn no_op_directive_absent_when_pr_already_exists() {
             .build(),
     );
     assert!(
-        !prompt.contains(crate::no_op_signal::NO_CHANGES_NEEDED_MARKER),
-        "existing-PR prompt must NOT carry the no-op marker directive:\n{prompt}",
+        !prompt.contains("signal a sanctioned no-op"),
+        "existing-PR prompt must NOT carry the no-op directive:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("NO_CHANGES_NEEDED"),
+        "existing-PR prompt must not teach the retired text marker:\n{prompt}",
     );
 }
 
@@ -765,7 +791,7 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_off() {
         "bazel pre-push gate must fire for code chores on a Bazel workspace:\n{prompt}",
     );
     assert!(
-        !prompt.contains("\"$BOSS_BIN\" propose"),
+        !without_no_op_sections(&prompt).contains("\"$BOSS_BIN\" propose"),
         "with the seam flag off, the gate must not mention $BOSS_BIN propose at all:\n{prompt}",
     );
     assert!(
@@ -822,7 +848,7 @@ fn worker_escalation_directive_teaches_legacy_markers_when_seam_is_off() {
             .build(),
     );
     assert!(
-        !prompt.contains("\"$BOSS_BIN\" propose"),
+        !without_no_op_sections(&prompt).contains("\"$BOSS_BIN\" propose"),
         "seam off: the directive must not mention $BOSS_BIN propose at all:\n{prompt}",
     );
     assert!(
@@ -1272,7 +1298,7 @@ fn conflict_revision_gate_points_at_legacy_marker_when_seam_is_off() {
              sentence must direct a wedged build to the legacy [blocked] marker:\n{prompt}",
     );
     assert!(
-        !prompt.contains("\"$BOSS_BIN\" propose"),
+        !without_no_op_sections(&prompt).contains("\"$BOSS_BIN\" propose"),
         "seam off: conflict-resolution gate must not mention $BOSS_BIN propose at all:\n{prompt}",
     );
 }
@@ -1905,13 +1931,13 @@ fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on_for_revisi
 }
 
 #[test]
-fn revision_no_op_directive_teaches_no_changes_needed_marker() {
+fn revision_no_op_directive_teaches_no_changes_needed_declaration() {
     // Before this directive existed, no revision prompt ever taught the
-    // NO_CHANGES_NEEDED marker: `no_op_completion_directive` is gated to
+    // no-changes-needed declaration: `no_op_completion_directive` is gated to
     // `TaskImplementation | ChoreImplementation` with no existing PR, and a
     // revision always has a bound parent PR — so `on_stop_inner`'s revision
     // no-op terminal (`worker_signalled_no_op`) was unreachable in
-    // production. Assert the marker and its revision-specific framing (keyed
+    // production. Assert the declaration and its revision-specific framing (keyed
     // on the dispatched finding, not on an empty `jj diff`) are present.
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
@@ -1923,8 +1949,12 @@ fn revision_no_op_directive_teaches_no_changes_needed_marker() {
             .build(),
     );
     assert!(
-        prompt.contains(crate::no_op_signal::NO_CHANGES_NEEDED_MARKER),
-        "revision prompt must name the NO_CHANGES_NEEDED marker:\n{prompt}",
+        prompt.contains("propose done --outcome no-changes-needed --summary"),
+        "revision prompt must teach the typed no-op declaration:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("NO_CHANGES_NEEDED"),
+        "revision prompt must not teach the retired text marker:\n{prompt}",
     );
     assert!(
         prompt.contains("If the finding needs no code change"),
@@ -1965,7 +1995,7 @@ fn escalation_protocol_directive_present_for_revision_implementation_seam_off() 
         "revision prompt, seam off: escalation section must teach the legacy [blocked] marker:\n{prompt}",
     );
     assert!(
-        !prompt.contains("\"$BOSS_BIN\" propose"),
+        !without_no_op_sections(&prompt).contains("\"$BOSS_BIN\" propose"),
         "revision prompt, seam off: escalation section must not mention $BOSS_BIN propose at all:\n{prompt}",
     );
 }

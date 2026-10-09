@@ -28,7 +28,7 @@ impl WorkerCompletionHandler {
     ) -> Option<StopOutcome> {
         tracing::info!(execution_id = %execution.id, ?contribution,
             "stop event: checking revision no-op before waiting for completion evidence");
-        if !self.worker_signalled_no_op(&execution.id).await {
+        if !self.worker_signalled_no_op(&execution.id) {
             return None;
         }
         if self.staged_unobserved_commands.consume_unresolved(&execution.id) {
@@ -231,7 +231,7 @@ impl WorkerCompletionHandler {
         };
         let body = format!(
             "This revision worker declared that it needed no code change, through the sanctioned \
-             `NO_CHANGES_NEEDED` marker or its run-done declaration. {evidence}\n\n\
+             `boss propose done --outcome no-changes-needed` declaration. {evidence}\n\n\
              This is the worker's explicit claim that the review finding \
              needs no code change.\n\n\
              The revision has been closed as a declared no-op against {bound_pr_url}. \

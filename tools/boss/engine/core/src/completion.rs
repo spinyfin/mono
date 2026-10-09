@@ -245,16 +245,6 @@ crate::register_counter!(
      (automation_outcome_proposals_seam on).",
 );
 
-// Worker-proposal seam: fallback-hit counter for the `NO_CHANGES_NEEDED`
-// transcript marker, incremented only when `run_done_proposals_seam` is on
-// and no `run_done` declaration covered the no-op claim — mirrors the
-// counters above. Same remote-worker caveat applies.
-crate::register_counter!(
-    RUN_DONE_FALLBACK_HIT,
-    "worker_proposals.fallback_hit.run_done",
-    "A no-op terminal fell back to the legacy NO_CHANGES_NEEDED transcript marker because the \
-     execution carried no run_done declaration (run_done_proposals_seam on).",
-);
 // The run-done gate and its backstop. Together these are the soak
 // instrumentation for the declaration: `GATE_HELD` counts runs the health-alone
 // inference would have finalized and the declaration requirement did not,
@@ -313,7 +303,6 @@ pub const RUN_DONE_BLOCKED_ATTENTION_KIND: &str = "run_done_declared_blocked";
 /// [`crate::metrics_init::init_all`] at engine startup so duplicate-name panics
 /// surface at boot rather than at the first counter increment.
 pub fn register_metrics(registry: &Registry) {
-    registry.register_counter(&RUN_DONE_FALLBACK_HIT);
     registry.register_counter(&RUN_DONE_GATE_HELD);
     registry.register_counter(&RUN_DONE_BACKSTOP_ASKED);
     registry.register_counter(&RUN_DONE_BACKSTOP_PARKED);
@@ -1180,7 +1169,7 @@ pub trait ProbeQueuer: Send + Sync {
     /// anything. This is the seam that lets a sweep-driven nudge reach a
     /// parked pane, so a re-driven ladder is honest: the worker really does
     /// get the probe, and really does get the chance to answer with the
-    /// sanctioned terminal marker.
+    /// sanctioned terminal declaration.
     ///
     /// Fail-closed and best-effort, exactly like the hook-driven paths it
     /// shares an implementation with: a pane whose `(activity, driver)`
@@ -1418,7 +1407,7 @@ pub struct WorkerCompletionHandler {
     /// matching `item.completed` before the turn boundary. Populated by the
     /// worker-event dispatcher in `app/worker_events.rs`; consulted by
     /// [`Self::detect_and_file_unobserved_command_signal`] (files an
-    /// attention item) and by `on_stop_inner`'s `NO_CHANGES_NEEDED` gate,
+    /// attention item) and by `on_stop_inner`'s no-op gate,
     /// which refuses the worker's no-op claim when this is non-empty for the
     /// execution. See [`crate::codex_unobserved_command`].
     staged_unobserved_commands: Arc<crate::codex_unobserved_command::UnobservedCommandTracker>,
@@ -1876,9 +1865,9 @@ pub const REVIEW_RESULT_GIVEUP_ATTENTION_KIND: &str = "review_result_missing";
 pub const DRIVER_TERMINAL_ERROR_ATTENTION_KIND: &str = "driver_terminal_error";
 
 /// Attention-item kind filed when a `revision_implementation` worker ends
-/// on the sanctioned [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
-/// marker: it pushed nothing, and declared explicitly that the review
-/// finding it was dispatched for needs no code change.
+/// on a `boss propose done --outcome no-changes-needed` declaration: it
+/// pushed nothing, and declared explicitly that the review finding it was
+/// dispatched for needs no code change.
 ///
 /// Distinct kind, and always filed, because that terminal closes a
 /// revision without the finding ever being addressed. Unlike a primary
@@ -1917,16 +1906,14 @@ pub const REMOTE_COLLECTION_FAILED_ATTENTION_KIND: &str = "remote_collection_fai
 /// will simply push and open one, but a worker that's blocked has an
 /// out to explain itself rather than churning.
 ///
-/// The final sentence names the [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
-/// marker verbatim rather than inviting free prose. A probe that asks the
-/// worker to "explain your status" gets exactly that — prose — and prose is
-/// not a terminal signal any engine path can read: `worker_signalled_no_op`
-/// requires an own-line exact match of the marker. Asking in a language the
-/// engine cannot parse is what stranded the 2026-08-12 revision worker on
-/// mono#2622 for 2h40m (see [`probe_push_to_existing_pr`]). Pinned against
-/// the marker const by `probe_texts_name_the_no_op_marker`; the mention here
-/// is inline and backticked, so it can never itself satisfy the own-line
-/// match.
+/// The final sentence names the typed `boss propose done --outcome
+/// no-changes-needed` declaration rather than inviting free prose. A probe
+/// that asks the worker to "explain your status" gets exactly that — prose —
+/// and prose is not a terminal signal any engine path can read:
+/// `worker_signalled_no_op` reads only the `run_done` declaration. Asking in
+/// a language the engine cannot parse is what stranded the 2026-08-12
+/// revision worker on mono#2622 for 2h40m (see [`probe_push_to_existing_pr`]).
+/// Pinned by `probe_texts_name_the_no_op_declaration`.
 pub const PROBE_NO_PR: &str = "You stopped without producing a PR for this work. \
 If the work is complete, open the PR with `cube pr create --branch <bookmark>` (pushes the \
 branch and opens the PR in one step, jj-aware, no GIT_DIR needed). If a PR already exists \
@@ -1934,8 +1921,8 @@ for this branch, push any new commits with `cube pr update --branch <bookmark>` 
 do not open a duplicate. If you're blocked, explain what you need. If instead you have \
 verified there is genuinely nothing left to change (`jj diff -r @` is empty because the work \
 is already done), do NOT answer in prose alone — prose is not a signal the engine can act on. \
-End your response with a line containing exactly `NO_CHANGES_NEEDED` and stop; that is the \
-sanctioned way to close this run with no PR.";
+Declare it with `\"$BOSS_BIN\" propose done --outcome no-changes-needed --summary \"<what you \
+verified>\"`; that is the sanctioned way to close this run with no PR.";
 
 /// Extract the set of required-check names a `ci_remediations` attempt
 /// was opened to fix, parsed from its `failed_checks` JSON snapshot
@@ -2027,28 +2014,25 @@ fn mergeability_satisfies_deliverable(mergeability: OpenPrMergeability, merge_co
 /// PR's branch. Phrased so a worker with nothing left to do can say so
 /// rather than churning; the circuit breaker bounds repeats.
 ///
-/// **"Say so" must name the marker.** This probe used to end *"there is
-/// nothing left to do, say so — explain your status instead of
+/// **"Say so" must name the typed declaration.** This probe used to end
+/// *"there is nothing left to do, say so — explain your status instead of
 /// re-running."* A worker that complied answered in prose, and prose is
 /// unreadable to every terminal the engine owns: `worker_signalled_no_op`
-/// matches [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
-/// on an own line and *deliberately* rejects prose that merely mentions the
-/// protocol. So the engine asked a question in a language it cannot read,
-/// scored the honest answer as "no progress", and re-entered the nudge
-/// ladder — where the debounce then swallowed the boundary and the run sat
-/// idle holding its slot for 2h40m. Naming the marker is what turns a
-/// correct "nothing to do" conclusion into an actual terminal on the
-/// worker's very next turn. Pinned by `probe_texts_name_the_no_op_marker`;
-/// the mention is inline and backticked, so the probe text can never itself
-/// satisfy the own-line match.
+/// reads only the `run_done` declaration. So the engine asked a question in a
+/// language it cannot read, scored the honest answer as "no progress", and
+/// re-entered the nudge ladder — where the debounce then swallowed the
+/// boundary and the run sat idle holding its slot for 2h40m. Naming
+/// `boss propose done --outcome no-changes-needed` is what turns a correct
+/// "nothing to do" conclusion into an actual terminal on the worker's very
+/// next turn. Pinned by `probe_texts_name_the_no_op_declaration`.
 pub fn probe_push_to_existing_pr(pr_url: &str) -> String {
     format!(
         "A PR already exists for this work: {pr_url}. Do NOT open a new PR. If you have local \
 commits, push them to the existing PR's branch with `cube pr update --branch <bookmark>`. If your \
 changes are already pushed, or you have verified this work needs no further code change, do NOT \
 answer in prose alone — prose is not a signal the engine can act on, and it will re-prompt you. \
-End your response with a line containing exactly `NO_CHANGES_NEEDED` and stop; that is the \
-sanctioned way to close this run without another push."
+Declare it with `\"$BOSS_BIN\" propose done --outcome no-changes-needed --summary \"<what you \
+verified>\"`; that is the sanctioned way to close this run without another push."
     )
 }
 
@@ -2308,8 +2292,7 @@ pub enum StopOutcome {
     /// `task_implementation`) verified its assigned work was already done —
     /// the change is already on `main`, the diff is empty, and there is
     /// genuinely nothing to commit/push/open a PR for — and emitted the
-    /// sanctioned [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
-    /// marker. The task is closed as `done` WITHOUT a PR and the execution is
+    /// `boss propose done --outcome no-changes-needed` declaration. The task is closed as `done` WITHOUT a PR and the execution is
     /// finalised. No nudge is sent. This is the fix for the produce-a-PR nudge
     /// loop on a worker that correctly found nothing to do. `work_item_id` is
     /// the closed task/chore.
