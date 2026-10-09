@@ -415,6 +415,11 @@ struct TestHarness {
     probes: Arc<RecordingProbeQueuer>,
 }
 
+/// Reuse the deterministic completion providers in cross-handler integration tests.
+pub(crate) fn integration_handler(db: Arc<WorkDb>, pr_url: &str) -> WorkerCompletionHandler {
+    TestHarness::new(db, StubPrDetector::ok(Some(pr_url))).handler
+}
+
 impl TestHarness {
     /// Build the harness with a default (`Reaped`) pane releaser.
     fn new(db: Arc<WorkDb>, detector: Arc<dyn PrDetector>) -> Self {
@@ -1942,3 +1947,5 @@ async fn disabled_finalize_does_not_allocate_a_source_observation() {
         .await;
     assert_eq!(db.allocate_pr_review_guide_source_observation_sequence().unwrap(), 1);
 }
+
+mod review_guide;

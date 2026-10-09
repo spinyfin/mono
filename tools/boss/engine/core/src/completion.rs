@@ -2611,4 +2611,4 @@ pub(crate) fn worker_owns_turn_loop(execution: &crate::work::WorkExecution) -> b
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
