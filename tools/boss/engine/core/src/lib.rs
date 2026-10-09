@@ -40,7 +40,7 @@ pub mod conflict_remediation;
 pub mod conflict_stop_gate;
 pub mod conflict_watch;
 pub mod coordinator;
-pub mod coordinator_guidance;
+pub(crate) mod coordinator_guidance;
 pub(crate) mod coordinator_handoff;
 pub(crate) mod coordinator_tmux;
 pub mod cost_pricing;

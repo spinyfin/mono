@@ -69,15 +69,10 @@ impl DesignDocsService {
     }
 
     async fn resolve_guidance(&self, owner: &str, repo: &str, owner_repo: &str) -> CoordinatorGuidanceState {
-        // The default branch is memoised by the listing cache when the
-        // Designs tab has already looked at this repo; otherwise one
-        // request. It changes far more rarely than HEAD does.
-        let default_branch = match self.peek(owner_repo).map(|listing| listing.default_branch) {
-            Some(branch) => branch,
-            None => match self.source.default_branch(owner, repo).await {
-                Ok(branch) => branch,
-                Err(err) => return failed(owner_repo, "resolve the default branch", &err),
-            },
+        // Observe branch renames independently of the Designs listing cache.
+        let default_branch = match self.source.default_branch(owner, repo).await {
+            Ok(branch) => branch,
+            Err(err) => return failed(owner_repo, "resolve the default branch", &err),
         };
         let head_sha = match self.source.head_sha(owner, repo, &default_branch).await {
             Ok(sha) => sha,
@@ -173,6 +168,7 @@ mod tests {
     /// Scriptable source: successive HEAD shas, and a blob outcome. Counts
     /// blob fetches so the sha-keyed cache can be proven to short-circuit.
     struct FakeSource {
+        default_branch: Mutex<String>,
         shas: Mutex<Vec<&'static str>>,
         blob: Mutex<Result<String, TreeApiError>>,
         head_error: Mutex<Option<TreeApiError>>,
@@ -183,6 +179,7 @@ mod tests {
     impl FakeSource {
         fn new(blob: Result<String, TreeApiError>) -> std::sync::Arc<Self> {
             std::sync::Arc::new(Self {
+                default_branch: Mutex::new("main".to_owned()),
                 shas: Mutex::new(vec![SHA_A]),
                 blob: Mutex::new(blob),
                 head_error: Mutex::new(None),
@@ -211,12 +208,16 @@ mod tests {
     #[async_trait]
     impl GitHubTreeSource for FakeSource {
         async fn default_branch(&self, _owner: &str, _repo: &str) -> Result<String, TreeApiError> {
-            Ok("main".to_owned())
+            Ok(self.default_branch.lock().unwrap().clone())
         }
 
         async fn head_sha(&self, _owner: &str, _repo: &str, git_ref: &str) -> Result<String, TreeApiError> {
             self.head_calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(git_ref, "main", "HEAD must be probed on the default branch");
+            assert_eq!(
+                git_ref,
+                *self.default_branch.lock().unwrap(),
+                "HEAD must use the current default branch"
+            );
             if let Some(err) = self.head_error.lock().unwrap().clone() {
                 return Err(err);
             }
@@ -224,7 +225,11 @@ mod tests {
         }
 
         async fn markdown_tree(&self, _owner: &str, _repo: &str, _sha: &str) -> Result<RepoTree, TreeApiError> {
-            unreachable!("guidance reads never list the tree")
+            Ok(RepoTree {
+                sha: _sha.to_owned(),
+                blobs: vec![],
+                truncated: false,
+            })
         }
 
         async fn fetch_blob(
@@ -251,6 +256,24 @@ mod tests {
     }
 
     const REPO: &str = "git@github.com:spinyfin/mono.git";
+
+    #[tokio::test]
+    async fn refresh_observes_a_changed_default_branch_despite_cached_listing() {
+        let source = FakeSource::with_body("# old rules");
+        let service = DesignDocsService::with_source(source.clone());
+        service.list_markdown_docs(Some(REPO), false).await;
+        assert_eq!(service.peek("spinyfin/mono").unwrap().default_branch, "main");
+        service.fetch_coordinator_guidance(Some(REPO)).await;
+        *source.default_branch.lock().unwrap() = "trunk".to_owned();
+        *source.shas.lock().unwrap() = vec![SHA_B];
+        *source.blob.lock().unwrap() = Ok("# new rules".to_owned());
+        let refreshed = service.fetch_coordinator_guidance(Some(REPO)).await;
+        assert_eq!(refreshed.state.git_ref(), Some(SHA_B));
+        assert!(
+            matches!(refreshed.state, CoordinatorGuidanceState::Loaded { markdown, .. } if markdown == "# new rules")
+        );
+        assert_eq!(source.blob_calls.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn loaded_carries_the_sha_body_and_size() {
