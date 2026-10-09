@@ -393,6 +393,8 @@ private let bossFilingGuidanceDirect = """
     1. Draft the report in markdown; write to `./shake-draft.md`.
     2. Confirm with `boss shake ./shake-draft.md --dry-run` and show the resolved title.
     3. File with `boss shake ./shake-draft.md`.
+
+    **Bulk engine data for investigations.** When a delegated investigation needs bulk engine history (executions, runs, attentions across many rows), take one consistent read-only copy of the state DB yourself before briefing the agent (`sqlite3 -readonly "<state root>/state.db" ".backup '<scratchpad>/<unique-name>.db'"`) and pass the agent that path, with an instruction to open it with `?immutable=1`. Subagents cannot take the copy (the Boss data directory is fenced from them); when denied they fall back to loops of per-item `boss`/`bossctl` calls or log sweeps, which hammers the live engine. Briefs must forbid that workaround explicitly.
     """
 
 private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
