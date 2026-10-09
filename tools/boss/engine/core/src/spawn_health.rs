@@ -789,7 +789,7 @@ pub async fn maybe_admit_recovery_probe(
             );
         }
         Err(err) => {
-            // Nothing actually reached the app — the row raced out of
+            // Nothing actually reached the spawn path — the row raced out of
             // `ready`, or the pool is at its hard cap — so there's no
             // evidence either way. Don't touch backoff; just retry on the
             // next tick.
@@ -797,7 +797,7 @@ pub async fn maybe_admit_recovery_probe(
                 ?err,
                 execution_id = %candidate.id,
                 "spawn-capability breaker: recovery probe dispatch attempt did not reach the \
-                 app; will retry",
+                 spawn path; will retry",
             );
         }
     }

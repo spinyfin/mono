@@ -526,7 +526,7 @@ async fn operator_pause_holds_main_pool_row_until_resume() {
 
 /// A breaker-originated pause (the spawn-capability circuit breaker —
 /// see `spawn_health.rs`) must hold `pr_review` executions too: the
-/// app's spawn path itself is broken, so exempting reviews would just
+/// engine's tmux spawn path itself is broken, so exempting reviews would just
 /// burn another spawn attempt against the same dead path.
 #[tokio::test]
 async fn breaker_pause_holds_pr_review_execution_too() {

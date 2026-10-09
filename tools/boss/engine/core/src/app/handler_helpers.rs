@@ -191,7 +191,7 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         } else {
             "The engine is not dispatching new executions from any source, including PR \
              reviews — the spawn-capability circuit breaker tripped, so review dispatch is held \
-             too until the app's spawn path is confirmed healthy. Currently-running workers \
+             too until the engine's tmux spawn path is confirmed healthy. Currently-running workers \
              continue to completion. Run `bossctl dispatch resume` to restore normal dispatch."
         };
         let reason = server_state
