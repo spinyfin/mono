@@ -17,6 +17,9 @@ pub struct AiReviewBadge {
     pub label: String,
     pub system_image: String,
     pub tooltip: String,
+    /// Findings from the selected persisted verdict, independent of its fix task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_markdown: Option<String>,
 }
 
 /// Discriminator for the `tasks.status` column. Exhaustive match enforces

@@ -156,11 +156,13 @@ struct WorkBoardCardItem: View {
             staleSource: task.reviewGuideStaleSource ?? false,
             error: task.reviewGuideError
         )
-        let onRevealAIReviewFindings: (() -> Void)? = snapshot.aiReviewFindingsRevisionId.map { revisionID in
-            {
-                model.openAIReviewFindings(revisionID: revisionID)
+        let onRevealAIReviewFindings: (() -> Void)? = snapshot.aiReviewState == "reviewed_with_findings"
+            ? {
+                model.openAIReviewFindings(
+                    revisionID: snapshot.aiReviewFindingsRevisionId,
+                    findingsMarkdown: snapshot.aiReviewBadge?.findingsMarkdown)
             }
-        }
+            : nil
         let onOpenDesignDoc: (() -> Void)? = {
             guard snapshot.showsDesignDocAffordance else { return nil }
             return { model.openWorkItemDoc(task) }
@@ -201,6 +203,9 @@ struct WorkBoardCardItem: View {
                     onRetryReviewGuide: onRetryReviewGuide,
                     onOpenAttachments: onOpenAttachments,
                     onRevealAIReviewFindings: onRevealAIReviewFindings,
+                    aiReviewFindingsTooltipNote: snapshot.aiReviewState == "reviewed_with_findings"
+                        ? model.aiReviewFindingsTooltipNote(revisionID: snapshot.aiReviewFindingsRevisionId)
+                        : nil,
                     onAcceptDeferredScope: { id in model.acceptDeferredScopeAttention(id: id) },
                     onCreateTaskFromDeferredScope: { id in
                         model.createTaskFromDeferredScopeAttention(attentionID: id)
@@ -426,10 +431,13 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// the button (also gated by `snapshot.showsAttachmentsAffordance`).
     var onOpenAttachments: (() -> Void)? = nil
     /// Invoked when the user taps the `reviewed_with_findings` AI-review
-    /// badge — opens the revision's findings description.
-    /// Only called when `snapshot.aiReviewFindingsRevisionId`
-    /// is non-nil.
+    /// badge — opens the revision's findings description and reveals the
+    /// revision's card (or its parent's card once it is rolled up).
+    /// Supplied for every findings badge; with no findings revision the
+    /// click opens the task's PR instead and reveals nothing.
     var onRevealAIReviewFindings: (() -> Void)? = nil
+    /// Tooltip sentence for the findings badge; see `AIReviewStateBadge`.
+    var aiReviewFindingsTooltipNote: String? = nil
     /// Invoked with an attention item id when the popup's "Accept" button
     /// is tapped.
     var onAcceptDeferredScope: ((String) -> Void)? = nil
@@ -445,6 +453,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.snapshot == rhs.snapshot
             && lhs.isRevisionHighlighted == rhs.isRevisionHighlighted
+            && lhs.aiReviewFindingsTooltipNote == rhs.aiReviewFindingsTooltipNote
     }
 
     var body: some View {
@@ -482,6 +491,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 onOpenReviewGuide: onOpenReviewGuide,
                 onRetryReviewGuide: onRetryReviewGuide,
                 onRevealAIReviewFindings: onRevealAIReviewFindings,
+                aiReviewFindingsTooltipNote: aiReviewFindingsTooltipNote,
                 onAcceptDeferredScope: onAcceptDeferredScope,
                 onCreateTaskFromDeferredScope: onCreateTaskFromDeferredScope
             )

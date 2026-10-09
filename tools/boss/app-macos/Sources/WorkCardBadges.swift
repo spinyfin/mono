@@ -759,13 +759,17 @@ struct AIReviewBadgePresentation: Hashable {
     let label: String
     let systemImage: String
     let tooltip: String
+    var findingsMarkdown: String? = nil
 
     static func parse(_ value: Any?) -> Self? {
         guard let value = value as? [String: Any],
               let label = value["label"] as? String,
               let systemImage = value["system_image"] as? String,
               let tooltip = value["tooltip"] as? String else { return nil }
-        return Self(label: label, systemImage: systemImage, tooltip: tooltip)
+        return Self(
+            label: label, systemImage: systemImage, tooltip: tooltip,
+            findingsMarkdown: value["findings_markdown"] as? String
+        )
     }
 }
 
@@ -774,6 +778,14 @@ struct AIReviewStateBadge: View {
     let state: String
     let presentation: AIReviewBadgePresentation
     var onRevealFindings: (() -> Void)? = nil
+    /// Sentence appended to the engine tooltip describing what a click
+    /// on a findings badge reveals.
+    var findingsTooltipNote: String? = nil
+
+    var tooltip: String {
+        guard state == "reviewed_with_findings", let findingsTooltipNote else { return presentation.tooltip }
+        return presentation.tooltip + "\n" + findingsTooltipNote
+    }
 
     var tint: Color {
         switch state {
@@ -798,9 +810,9 @@ struct AIReviewStateBadge: View {
                 label
             }
         }
-        .help(presentation.tooltip)
+        .help(tooltip)
         .accessibilityLabel(presentation.label)
-        .accessibilityValue(presentation.tooltip)
+        .accessibilityValue(tooltip)
     }
 }
 

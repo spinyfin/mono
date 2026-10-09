@@ -116,14 +116,17 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
     /// `slice.reviewGuidePresentation.showsRetry`.
     var onRetryReviewGuide: (() -> Void)? = nil
     /// Invoked when the user taps the `reviewed_with_findings` badge —
-    /// opens the follow-up revision's findings description.
-    /// Only called when `slice.aiReviewFindingsRevisionId` is non-nil.
+    /// opens the follow-up revision's findings description and reveals the
+    /// revision's card (or its parent's card once it is rolled up).
+    /// Supplied for every findings badge, with or without a findings revision.
     var onRevealAIReviewFindings: (() -> Void)? = nil
+    /// Tooltip sentence for the findings badge; see `AIReviewStateBadge`.
+    var aiReviewFindingsTooltipNote: String? = nil
     var onAcceptDeferredScope: ((String) -> Void)? = nil
     var onCreateTaskFromDeferredScope: ((String) -> Void)? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.slice == rhs.slice
+        lhs.slice == rhs.slice && lhs.aiReviewFindingsTooltipNote == rhs.aiReviewFindingsTooltipNote
     }
 
     var body: some View {
@@ -153,7 +156,8 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 AIReviewStateBadge(
                     state: aiReviewState,
                     presentation: presentation,
-                    onRevealFindings: slice.aiReviewFindingsRevisionId != nil ? onRevealAIReviewFindings : nil
+                    onRevealFindings: onRevealAIReviewFindings,
+                    findingsTooltipNote: aiReviewFindingsTooltipNote
                 )
             }
             if slice.showsResolvingConflictsBadge {

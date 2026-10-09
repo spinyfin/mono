@@ -3,6 +3,8 @@ use super::*;
 #[test]
 fn review_badge_labels_and_icons_cover_every_state() {
     let history = ReviewBadgeHistory {
+        verdict_payload: None,
+        revision_description: None,
         is_findings_revision: false,
         head: Some("abcdef12345".into()),
         reviewed_sha: Some("abcdef12345".into()),
@@ -36,6 +38,8 @@ fn review_badge_labels_and_icons_cover_every_state() {
 #[test]
 fn review_badge_head_moved_preserves_findings_and_revision_history() {
     let mut history = ReviewBadgeHistory {
+        verdict_payload: None,
+        revision_description: None,
         is_findings_revision: false,
         head: Some("newhead123".into()),
         reviewed_sha: Some("oldhead456".into()),
@@ -65,6 +69,8 @@ fn review_badge_head_moved_preserves_findings_and_revision_history() {
 #[test]
 fn review_badge_missing_history_is_explicit() {
     let history = ReviewBadgeHistory {
+        verdict_payload: None,
+        revision_description: None,
         is_findings_revision: false,
         head: None,
         reviewed_sha: None,

@@ -635,7 +635,7 @@ fn qualifying_findings_on_an_open_origin_create_a_revision() {
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
     bind_open_pr(&db, &cycle_root.id);
-    let (batch_id, proposal_id, _) = {
+    let (batch_id, proposal_id, supervisor_id) = {
         let supervisor = db
             .create_execution(
                 CreateExecutionInput::builder()
@@ -699,6 +699,46 @@ fn qualifying_findings_on_an_open_origin_create_a_revision() {
     );
     let (cycle, _) = db.get_task_review_cycle_state(&cycle_root.id).unwrap();
     assert_eq!(cycle, 1);
+
+    // Model the supervisor finishing before the completed review is displayed.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            [&supervisor_id],
+        )
+        .unwrap();
+
+    // Losing the fix-task link must not lose the accepted supervisor findings.
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE pr_review_verdicts SET revision_task_id = NULL WHERE proposal_id = ?1",
+        [&proposal_id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET pr_head_sha = 'head-sha' WHERE id = ?1",
+        [&cycle_root.id],
+    )
+    .unwrap();
+    let mut cards = vec![query_task(&conn, &cycle_root.id).unwrap().unwrap()];
+    attach_ai_review_state(&conn, &mut cards, &mut []).unwrap();
+    assert_eq!(cards[0].ai_review_state.as_deref(), Some("reviewed_with_findings"));
+    assert!(cards[0].ai_review_findings_revision_id.is_none());
+    let badge = cards[0].ai_review_badge.as_ref().unwrap();
+    let markdown = badge.findings_markdown.as_deref().unwrap();
+    assert!(markdown.contains("Unchecked index"));
+    assert!(markdown.contains("Out of bounds read."));
+    assert!(markdown.contains("One high-severity defect."));
+    // A new observed head must not expose these as its current findings.
+    conn.execute(
+        "UPDATE tasks SET pr_head_sha = 'new-head' WHERE id = ?1",
+        [&cycle_root.id],
+    )
+    .unwrap();
+    attach_ai_review_state(&conn, &mut cards, &mut []).unwrap();
+    assert!(cards[0].ai_review_badge.as_ref().unwrap().findings_markdown.is_none());
+    drop(conn);
 
     let replay = db
         .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))

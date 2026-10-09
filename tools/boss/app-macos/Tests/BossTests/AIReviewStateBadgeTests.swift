@@ -3,15 +3,21 @@ import XCTest
 
 @MainActor
 final class AIReviewStateBadgeTests: XCTestCase {
+    /// The click opens the findings brief AND reveals the findings revision.
+    /// A queued/active revision has its own card, so the reveal targets it;
+    /// an in-review/done one is only a rollup line on the parent, so the
+    /// reveal lands on the parent and the tooltip says so.
     @MainActor
-    func testFindingsClickOpensRevisionBriefWithoutRevealingParentCard() {
+    func testFindingsClickOpensBriefAndRevealsRevisionCard() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         let parent = makeTask(id: "parent", kind: "chore")
         var revision = makeTask(id: "revision", kind: "revision")
         revision.parentTaskId = parent.id
         var openCount = 0
         model.asyncMarkdownViewerOpener = { openCount += 1 }
+        model.selectWorkProduct(parent.productID)
 
+        let expectedCard = ["todo": "revision", "active": "revision", "in_review": "parent", "done": "parent"]
         for status in ["todo", "active", "in_review", "done"] {
             revision.status = status
             model.choresByProductID = [parent.productID: [parent, revision]]
@@ -23,10 +29,65 @@ final class AIReviewStateBadgeTests: XCTestCase {
             XCTAssertEqual(title, revision.name)
             XCTAssertEqual(markdown, revision.description)
             XCTAssertEqual(artifact, .workItem(id: revision.id))
-            XCTAssertNil(model.pendingRevealScrollID)
-            XCTAssertNil(model.revealHighlightID)
+            XCTAssertEqual(model.selectedWorkCardID, expectedCard[status], status)
+            XCTAssertEqual(model.revealCardTarget(for: revision.id), .revealed(cardID: expectedCard[status]!), status)
+
+            let note = model.aiReviewFindingsTooltipNote(revisionID: revision.id)
+            XCTAssertEqual(note.contains("rather than as its own card"), expectedCard[status] == "parent", status)
         }
         XCTAssertEqual(openCount, 4)
+    }
+
+    @MainActor
+    func testTooltipSaysNoFixTaskYetWithoutRevision() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        XCTAssertTrue(model.aiReviewFindingsTooltipNote(revisionID: nil).contains("No fix task yet"))
+        let badge = AIReviewStateBadge(
+            state: "reviewed_with_findings", presentation: presentation,
+            findingsTooltipNote: "No fix task yet."
+        )
+        XCTAssertTrue(badge.tooltip.hasSuffix("No fix task yet."))
+    }
+
+    @MainActor
+    func testNoRevisionClickOpensFindingsAndRequestsNoReveal() throws {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        let markdown = "## Findings\nFix the incorrect click target."
+        let badge = try XCTUnwrap(AIReviewBadgePresentation.parse([
+            "label": "AI review: findings", "system_image": "exclamationmark.circle.fill",
+            "tooltip": "Review found issues.", "findings_markdown": markdown
+        ]))
+        var openCount = 0
+        model.urlOpener = { _ in XCTFail("Findings must open in the markdown viewer") }
+        model.asyncMarkdownViewerOpener = { openCount += 1 }
+        model.openAIReviewFindings(revisionID: nil, findingsMarkdown: badge.findingsMarkdown)
+        guard case .loaded(let title, let content, let artifact) = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("Expected the persisted findings document")
+        }
+        XCTAssertEqual(title, "AI review findings")
+        XCTAssertEqual(content, markdown)
+        XCTAssertNil(artifact)
+        XCTAssertEqual(openCount, 1)
+        XCTAssertNil(model.pendingRevealScrollID)
+        XCTAssertNil(model.revealHighlightID)
+        XCTAssertNil(model.workErrorMessage)
+        let view = AIReviewStateBadge(
+            state: "reviewed_with_findings", presentation: badge,
+            findingsTooltipNote: model.aiReviewFindingsTooltipNote(revisionID: nil)
+        )
+        XCTAssertTrue(view.tooltip.hasSuffix("No fix task yet."))
+    }
+
+    @MainActor
+    func testCardEqualityIncludesFindingsTooltipNote() {
+        let task = makeTask(kind: "chore")
+        let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .review))
+        var a = WorkBoardCardView(snapshot: snapshot, isRevisionHighlighted: false)
+        var b = a
+        XCTAssertEqual(a, b)
+        a.aiReviewFindingsTooltipNote = "No fix task yet."
+        b.aiReviewFindingsTooltipNote = "Click to open the findings."
+        XCTAssertNotEqual(a, b)
     }
 
     @MainActor
@@ -107,6 +168,13 @@ final class AIReviewStateBadgeTests: XCTestCase {
             "tooltip": presentation.tooltip
         ]
         XCTAssertEqual(try XCTUnwrap(client.parseTask(payload)).aiReviewBadge, presentation)
+        payload["ai_review_badge"] = [
+            "label": presentation.label, "system_image": presentation.systemImage,
+            "tooltip": presentation.tooltip, "findings_markdown": "Persisted findings"
+        ]
+        let parsed = try XCTUnwrap(client.parseTask(payload)).aiReviewBadge
+        XCTAssertEqual(parsed?.findingsMarkdown, "Persisted findings")
+        XCTAssertNotEqual(parsed, presentation)
     }
 
     private func makeTask(kind: String) -> WorkTask {

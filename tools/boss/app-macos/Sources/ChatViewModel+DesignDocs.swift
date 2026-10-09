@@ -312,6 +312,10 @@ extension ChatViewModel {
     /// scoped to the design-doc click-to-first-paint journey.
     @MainActor
     func openTaskDescription(_ task: WorkTask) {
+        openLoadedMarkdown(title: task.name, markdown: task.description, artifact: .workItem(id: task.id))
+    }
+
+    func openLoadedMarkdown(title: String, markdown: String, artifact: CommentArtifactRef? = nil) {
         pendingReviewGuideVersionId = nil
         pendingReviewGuideRootTaskId = nil
         pendingReviewGuideRequestId = nil
@@ -349,11 +353,11 @@ extension ChatViewModel {
         // that Rust function's doc comment for the cross-language contract
         // this string must stay in sync with).
         asyncMarkdownViewerVM.collapsedByDefaultHeadings =
-            RevisionBriefCollapsibleHeadings.collapsedByDefault(in: task.description)
+            RevisionBriefCollapsibleHeadings.collapsedByDefault(in: markdown)
         asyncMarkdownViewerVM.state = .loaded(
-            title: task.name,
-            markdown: task.description,
-            artifact: .workItem(id: task.id)
+            title: title,
+            markdown: markdown,
+            artifact: artifact
         )
         asyncMarkdownViewerOpener?()
     }

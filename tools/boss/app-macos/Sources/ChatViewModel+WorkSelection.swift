@@ -154,14 +154,51 @@ extension ChatViewModel {
         selectedWorkProductID = task.productID
     }
 
-    /// Findings live in the revision brief. Open that document directly;
-    /// revealing a rolled-up revision would redirect to the originating card.
-    func openAIReviewFindings(revisionID: String) {
+    /// One click on the findings badge does both jobs: open the findings
+    /// brief, and reveal the card of the revision that will fix them to show
+    /// where that work lives and its state.
+    /// `revealWorkCard` targets the revision's own card whenever it has one
+    /// (queued / active); only a revision that reached `in_review`/`done`
+    /// is rolled up onto its parent's card, and
+    /// `aiReviewFindingsTooltipNote(revisionID:)` says so on the badge.
+    ///
+    /// Without a fix task, open the persisted verdict supplied with the badge
+    /// and leave the board's reveal state untouched.
+    func openAIReviewFindings(revisionID: String?, findingsMarkdown: String? = nil) {
+        guard let revisionID else {
+            guard let findingsMarkdown else {
+                workErrorMessage = "Couldn't open the review findings: the recorded findings are unavailable."
+                return
+            }
+            openLoadedMarkdown(title: "AI review findings", markdown: findingsMarkdown)
+            return
+        }
         guard let revision = task(withID: revisionID) else {
             workErrorMessage = "Couldn't open the review findings: the revision is no longer available."
             return
         }
         openTaskDescription(revision)
+        switch revealWorkCard(revision.id, productID: revision.productID) {
+        case .revealed, .deferred:
+            break
+        case .unreachable(let reason):
+            workErrorMessage = "Couldn't reveal the fix for the review findings: \(reason)"
+        }
+    }
+
+    /// Extra badge-tooltip sentence describing where the click reveals the
+    /// findings revision.
+    func aiReviewFindingsTooltipNote(revisionID: String?) -> String {
+        guard let revisionID else { return "No fix task yet." }
+        guard let revision = task(withID: revisionID) else {
+            return "Click to open the findings. The fix task is not loaded on this board."
+        }
+        switch revealCardTarget(for: revision.id) {
+        case .revealed(let cardID) where cardID != revision.id:
+            return "Click to open the findings. The fix is already in review or done, so it is shown as a line on this card rather than as its own card."
+        default:
+            return "Click to open the findings and reveal the fix task's card."
+        }
     }
 
     /// Navigate the kanban to `taskID` and play a 1.5 s highlight.
