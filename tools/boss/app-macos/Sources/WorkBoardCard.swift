@@ -159,7 +159,8 @@ struct WorkBoardCardItem: View {
         let onRevealAIReviewFindings: (() -> Void)? = snapshot.aiReviewState == "reviewed_with_findings"
             ? {
                 model.openAIReviewFindings(
-                    revisionID: snapshot.aiReviewFindingsRevisionId, fallbackPRURL: task.prURL)
+                    revisionID: snapshot.aiReviewFindingsRevisionId,
+                    findingsMarkdown: snapshot.aiReviewBadge?.findingsMarkdown)
             }
             : nil
         let onOpenDesignDoc: (() -> Void)? = {

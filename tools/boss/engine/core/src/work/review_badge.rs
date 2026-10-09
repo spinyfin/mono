@@ -132,10 +132,12 @@ pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores
                 r.status IN ('in_review', 'done') AND r.deleted_at IS NULL AND EXISTS(
                     SELECT 1 FROM work_executions e WHERE e.work_item_id = r.id
                     AND e.kind = 'revision_implementation' AND e.status = 'completed'),
-                COALESCE(r.id = o.card, 0)
+                COALESCE(r.id = o.card, 0), p.payload_json, r.description
          FROM owners o JOIN tasks root ON root.id = o.id
          LEFT JOIN ranked v ON v.card = o.card AND v.rank = 1
-         LEFT JOIN tasks r ON r.id = v.revision_task_id"
+         LEFT JOIN tasks r ON r.id = v.revision_task_id
+         LEFT JOIN worker_proposals p ON p.id = v.proposal_id
+             AND p.kind = 'review_verdict' AND p.state = 'applied'"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(&ids), |row| {
@@ -143,6 +145,8 @@ pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores
             row.get::<_, String>(0)?,
             ReviewBadgeHistory {
                 is_findings_revision: row.get(9)?,
+                verdict_payload: row.get(10)?,
+                revision_description: row.get(11)?,
                 head: row.get(1)?,
                 reviewed_sha: row.get(2)?,
                 verdict: row
@@ -168,6 +172,9 @@ pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores
         if row.ai_review_state.as_deref() == Some(AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS)
             && let Some(badge) = &mut row.ai_review_badge
         {
+            if let Some(history) = history.get(&row.id) {
+                badge.findings_markdown = findings_markdown(history)?;
+            }
             badge.tooltip.push_str(if row.ai_review_findings_revision_id.is_some() {
                 "\nClick to read the findings in the follow-up revision."
             } else {
@@ -178,7 +185,29 @@ pub(super) fn attach_review_badges(conn: &Connection, tasks: &mut [Task], chores
     Ok(())
 }
 
+fn findings_markdown(history: &ReviewBadgeHistory) -> Result<Option<String>> {
+    if let Some(payload) = &history.verdict_payload {
+        let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(payload)?;
+        let verdict: crate::pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
+        let origin = crate::pr_review::ReviewOrigin {
+            task_short_id: None,
+            pr_number: verdict.pr_url.rsplit('/').next().and_then(|value| value.parse().ok()),
+        };
+        return Ok(Some(crate::pr_review::render_revision_instructions(
+            &verdict.to_review_result(),
+            origin,
+        )));
+    }
+    // Legacy verdicts predate proposals; their existing brief remains readable
+    // even on the findings revision itself, where the self-link is suppressed.
+    Ok(history.revision_description.clone())
+}
+
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 struct ReviewBadgeHistory {
+    verdict_payload: Option<String>,
+    revision_description: Option<String>,
     is_findings_revision: bool,
     head: Option<String>,
     reviewed_sha: Option<String>,
@@ -221,6 +250,7 @@ fn badge_presentation(state: &str, history: Option<&ReviewBadgeHistory>) -> AiRe
         label,
         system_image: icon.into(),
         tooltip: explanation.into(),
+        findings_markdown: None,
     };
     let Some(history) = history else { return badge };
     let short = |sha: &str| sha.chars().take(7).collect::<String>();

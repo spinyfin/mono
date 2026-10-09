@@ -162,18 +162,15 @@ extension ChatViewModel {
     /// is rolled up onto its parent's card, and
     /// `aiReviewFindingsTooltipNote(revisionID:)` says so on the badge.
     ///
-    /// With no findings revision (`revisionID == nil`) there is no findings
-    /// brief to open and no card to reveal: the findings text is not stored
-    /// anywhere revision-independent, so the click falls back to opening the
-    /// reviewed task's PR (`fallbackPRURL`), where the review was run, and
-    /// never touches the board's reveal state.
-    func openAIReviewFindings(revisionID: String?, fallbackPRURL: String? = nil) {
+    /// Without a fix task, open the persisted verdict supplied with the badge
+    /// and leave the board's reveal state untouched.
+    func openAIReviewFindings(revisionID: String?, findingsMarkdown: String? = nil) {
         guard let revisionID else {
-            if let fallbackPRURL, let url = URL(string: fallbackPRURL) {
-                urlOpener(url)
-            } else {
-                workErrorMessage = "No fix task exists for these review findings yet, and the task has no PR to open."
+            guard let findingsMarkdown else {
+                workErrorMessage = "Couldn't open the review findings: the recorded findings are unavailable."
+                return
             }
+            openLoadedMarkdown(title: "AI review findings", markdown: findingsMarkdown)
             return
         }
         guard let revision = task(withID: revisionID) else {

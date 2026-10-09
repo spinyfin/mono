@@ -50,21 +50,32 @@ final class AIReviewStateBadgeTests: XCTestCase {
     }
 
     @MainActor
-    func testNoRevisionClickOpensPRAndRequestsNoReveal() {
+    func testNoRevisionClickOpensFindingsAndRequestsNoReveal() throws {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
-        var opened: [URL] = []
-        model.urlOpener = { opened.append($0) }
-        model.asyncMarkdownViewerOpener = { XCTFail("No revision means no findings brief to open") }
-        model.openAIReviewFindings(revisionID: nil, fallbackPRURL: "https://github.com/o/r/pull/1")
-        XCTAssertEqual(opened.map(\.absoluteString), ["https://github.com/o/r/pull/1"])
+        let markdown = "## Findings\nFix the incorrect click target."
+        let badge = try XCTUnwrap(AIReviewBadgePresentation.parse([
+            "label": "AI review: findings", "system_image": "exclamationmark.circle.fill",
+            "tooltip": "Review found issues.", "findings_markdown": markdown
+        ]))
+        var openCount = 0
+        model.urlOpener = { _ in XCTFail("Findings must open in the markdown viewer") }
+        model.asyncMarkdownViewerOpener = { openCount += 1 }
+        model.openAIReviewFindings(revisionID: nil, findingsMarkdown: badge.findingsMarkdown)
+        guard case .loaded(let title, let content, let artifact) = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("Expected the persisted findings document")
+        }
+        XCTAssertEqual(title, "AI review findings")
+        XCTAssertEqual(content, markdown)
+        XCTAssertNil(artifact)
+        XCTAssertEqual(openCount, 1)
         XCTAssertNil(model.pendingRevealScrollID)
         XCTAssertNil(model.revealHighlightID)
         XCTAssertNil(model.workErrorMessage)
-        XCTAssertEqual(model.aiReviewFindingsTooltipNote(revisionID: nil), "No fix task yet.")
-
-        model.openAIReviewFindings(revisionID: nil, fallbackPRURL: nil)
-        XCTAssertEqual(opened.count, 1)
-        XCTAssertNotNil(model.workErrorMessage)
+        let view = AIReviewStateBadge(
+            state: "reviewed_with_findings", presentation: badge,
+            findingsTooltipNote: model.aiReviewFindingsTooltipNote(revisionID: nil)
+        )
+        XCTAssertTrue(view.tooltip.hasSuffix("No fix task yet."))
     }
 
     @MainActor
@@ -157,6 +168,13 @@ final class AIReviewStateBadgeTests: XCTestCase {
             "tooltip": presentation.tooltip
         ]
         XCTAssertEqual(try XCTUnwrap(client.parseTask(payload)).aiReviewBadge, presentation)
+        payload["ai_review_badge"] = [
+            "label": presentation.label, "system_image": presentation.systemImage,
+            "tooltip": presentation.tooltip, "findings_markdown": "Persisted findings"
+        ]
+        let parsed = try XCTUnwrap(client.parseTask(payload)).aiReviewBadge
+        XCTAssertEqual(parsed?.findingsMarkdown, "Persisted findings")
+        XCTAssertNotEqual(parsed, presentation)
     }
 
     private func makeTask(kind: String) -> WorkTask {
