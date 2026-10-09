@@ -1,8 +1,8 @@
 //! Driver-aware transcript reads.
 //!
 //! Every post-hoc read of a finished worker's transcript — the Stop-boundary
-//! marker scans (`[blocked]`, `[effort-escalation]`, `[deferred-scope]`,
-//! `NO_CHANGES_NEEDED`), the triage-decision fallback, the PR-URL prose
+//! marker scans (`[blocked]`, `[effort-escalation]`, `[deferred-scope]`),
+//! the triage-decision fallback, the PR-URL prose
 //! fallback — parses `work_runs.transcript_path` into
 //! [`crate::transcript_markdown`] events. That file is written by the agent,
 //! in the agent's own dialect: Claude Code writes its `message`-enveloped

@@ -765,7 +765,7 @@ struct ServerState {
     /// worker-event dispatcher from a `WorkerEvent::Notification` carrying
     /// [`crate::driver::codex::UNOBSERVED_COMMAND_MARKER`]; shared with the
     /// completion handler so `on_stop`'s unobserved-command pass and its
-    /// `NO_CHANGES_NEEDED` refusal gate see the same state. See
+    /// `no-changes-needed` refusal gate see the same state. See
     /// [`crate::codex_unobserved_command`].
     staged_unobserved_commands: Arc<crate::codex_unobserved_command::UnobservedCommandTracker>,
     /// Per-execution deny counter for the editorial PreToolUse loop guard

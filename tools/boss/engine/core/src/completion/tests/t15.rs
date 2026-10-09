@@ -71,28 +71,14 @@ async fn guide_no_op_attention_matches_outstanding_dispositions() {
 }
 
 #[tokio::test]
-async fn revision_no_op_survives_unavailable_proposals_and_github_for_every_driver() {
+async fn revision_no_op_survives_unavailable_github_for_every_driver() {
     for slug in ["claude", "codex", "grok"] {
         let workspace = tempdir().unwrap();
         let pr = "https://github.com/spinyfin/mono/pull/1613";
         let (_dir, db, product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), pr, "unchanged-head");
         set_work_item_driver(&db, &revision_id, slug);
-        let text = "The finding needs no change.\nNO_CHANGES_NEEDED";
-        let value = match slug {
-            "claude" => serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
-            "codex" => {
-                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}})
-            }
-            "grok" => {
-                serde_json::json!({"method":"session/update","params":{"sessionId":"fixture","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}})
-            }
-            _ => unreachable!(),
-        };
-        let transcript = workspace.path().join("updates.jsonl");
-        std::fs::write(&transcript, format!("{value}\n")).unwrap();
-        db.set_run_transcript_path_if_unset(&execution_id, transcript.to_str().unwrap())
-            .unwrap();
+        declare_no_changes_needed(&db, &execution_id);
         // Clear the fixture's placeholder run summary so the assertion below
         // can tell whether `finalize_no_op_completion` actually wrote its
         // own detail text, rather than `record_worker_no_op_completion`'s
@@ -116,22 +102,15 @@ async fn revision_no_op_survives_unavailable_proposals_and_github_for_every_driv
             probes,
             publisher,
         } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
-        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
-            workspace.path().join("flags.toml"),
-        ));
-        flags.load().unwrap();
-        flags.set("worker_proposals", true).unwrap();
-        flags.set("run_done_proposals_seam", true).unwrap();
-        let handler = handler.with_branch_verifier(verifier).with_feature_flags(flags);
+        let handler = handler.with_branch_verifier(verifier);
 
-        // No proposal is submitted, and no merge probe can rescue this Stop.
-        assert_eq!(db.execution_run_done_outcome(&execution_id).unwrap(), None);
+        // The declaration alone carries the claim: no merge probe can rescue
+        // this Stop, and the feature flags are at their defaults (off).
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
             matches!(outcome, StopOutcome::NoChangesNeeded { .. }),
             "{slug}: {outcome:?}"
         );
-        assert_eq!(db.execution_run_done_outcome(&execution_id).unwrap(), None);
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Completed
@@ -244,7 +223,7 @@ async fn inconclusive_revision_no_op_keeps_contradiction_and_validation_guards()
         let workspace = tempdir().unwrap();
         let (_dir, db, _, _, execution_id) =
             revision_fixture(workspace.path(), "https://github.com/spinyfin/mono/pull/1613", "before");
-        write_assistant_transcript(&db, workspace.path(), &execution_id, "NO_CHANGES_NEEDED");
+        declare_no_changes_needed(&db, &execution_id);
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Err("network unavailable".into())).await;
         let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
@@ -273,7 +252,7 @@ async fn revision_no_op_requires_durable_declined_finding_record() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _, _, execution_id) =
         revision_fixture(workspace.path(), "https://github.com/spinyfin/mono/pull/1613", "before");
-    write_assistant_transcript(&db, workspace.path(), &execution_id, "NO_CHANGES_NEEDED");
+    declare_no_changes_needed(&db, &execution_id);
     db.connect()
         .unwrap()
         .execute_batch(

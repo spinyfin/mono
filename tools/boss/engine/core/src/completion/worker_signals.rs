@@ -705,9 +705,9 @@ impl WorkerCompletionHandler {
                  - work item: `{work_item_id}`\n\n\
                  Command:\n\n```\n{command}\n```\n\n\
                  Boss cannot confirm this command's outcome (exit code, output). Any claim in this \
-                 run that depends on it — tests passing, a build succeeding, `NO_CHANGES_NEEDED` — \
-                 is treated as unconfirmed: the next `NO_CHANGES_NEEDED` claim after this abandonment \
-                 is refused and the worker gets the normal produce-a-PR nudge instead.",
+                 run that depends on it — tests passing, a build succeeding, a `no-changes-needed` \
+                 declaration — is treated as unconfirmed: the next no-changes-needed claim after this \
+                 abandonment is refused and the worker gets the normal produce-a-PR nudge instead.",
                 execution_id = execution.id,
                 work_item_id = execution.work_item_id,
             );
@@ -754,7 +754,7 @@ impl WorkerCompletionHandler {
              audit trail stopped recording further ones by name.\n\n\
              - execution: `{execution_id}`\n\
              - work item: `{work_item_id}`\n\n\
-             This does not weaken the `NO_CHANGES_NEEDED` refusal gate, which does not depend on \
+             This does not weaken the no-changes-needed refusal gate, which does not depend on \
              this trail — but it does mean the list of abandoned commands surfaced as attention \
              items on this run is incomplete. Treat this run's completion claims with extra \
              scrutiny.",
@@ -811,110 +811,35 @@ impl WorkerCompletionHandler {
     /// the "verified already done, nothing to commit/push/open a PR for"
     /// claim that closes a task without a PR.
     ///
-    /// Read proposals-first when `run_done_proposals_seam` is on: a
-    /// `run_done` proposal carrying
-    /// [`boss_protocol::RunDoneOutcome::NoChangesNeeded`] is the declaration
-    /// channel for this claim, and it is what makes the declaration cover
-    /// the execution kinds that never open a PR — the ones whose completion
-    /// the engine could otherwise only infer. When no such declaration
-    /// exists, the legacy [`NO_CHANGES_NEEDED`
-    /// marker](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER) scan still
-    /// runs exactly as before, and every time it carries the claim
-    /// `worker_proposals.fallback_hit.run_done` increments and a WARN logs
-    /// — this seam's exit criterion for eventually deleting the scan. With
-    /// the flag off the marker scan runs unconditionally and nothing is
-    /// counted.
+    /// The only channel is the typed declaration: a `run_done` proposal
+    /// carrying [`boss_protocol::RunDoneOutcome::NoChangesNeeded`]
+    /// (`boss propose done --outcome no-changes-needed`), read from the
+    /// durable stamp `apply_run_done` writes unconditionally — so this does
+    /// not depend on the `run_done_proposals_seam` flag, which only governs
+    /// whether the declaration additionally finalizes the run synchronously
+    /// at submit. The worker's prose is never consulted: a run that stops
+    /// without declaring is "gave up / not done" and falls through to the
+    /// normal produce-a-PR nudge (and, if the worker cannot reach the
+    /// engine at all, to the nudge breaker's visible failure — never to a
+    /// no-op close inferred from silence).
     ///
-    /// A `run_done` declaration with any *other* outcome is deliberately
-    /// not treated as a no-op claim, and does not suppress the marker
-    /// scan either: `delivered` and `blocked` say the opposite thing, and a
-    /// worker that declared one of those while also emitting the marker has
-    /// contradicted itself — in which case the marker (the narrower, more
-    /// specific claim) is still what this answers on, and the caller's own
-    /// evidence checks decide what to do with it.
+    /// A `run_done` declaration with any *other* outcome is not a no-op
+    /// claim: `delivered` and `blocked` say the opposite thing.
     ///
-    /// Returns `false` on any read failure or when no transcript is recorded
-    /// — absence of the signal must never be guessed at: a worker that
-    /// stopped without it is treated as "gave up / not done" and falls
-    /// through to the normal produce-a-PR nudge.
-    pub(super) async fn worker_signalled_no_op(&self, execution_id: &str) -> bool {
-        let proposals_first = self.feature_flags.is_enabled("worker_proposals")
-            && self.feature_flags.is_enabled("run_done_proposals_seam");
-        tracing::info!(
-            execution_id,
-            proposals_first,
-            "no-op claim: reading declaration before transcript fallback"
-        );
-        if proposals_first {
-            match self.work_db.execution_run_done_outcome(execution_id) {
-                Ok(Some(boss_protocol::RunDoneOutcome::NoChangesNeeded)) => return true,
-                Ok(_) => {}
-                Err(err) => {
-                    // Fails open onto the legacy scan, like every other
-                    // proposals-first read here: a storage error must not
-                    // silently discard a real no-op claim.
-                    tracing::warn!(
-                        execution_id,
-                        ?err,
-                        seam = "run_done_proposals_seam",
-                        "failed to read the run_done declaration; falling back to the \
-                         NO_CHANGES_NEEDED marker scan for this claim",
-                    );
-                }
-            }
-        }
-        let signalled = match self.read_final_triage_message(execution_id).await {
-            TriageTranscript::FinalMessage(text) => {
-                let signalled = crate::no_op_signal::transcript_signals_no_op(&text);
-                let tail: String = text
-                    .chars()
-                    .rev()
-                    .take(160)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                tracing::info!(
-                    execution_id,
-                    proposals_first,
-                    transcript_bytes = text.len(),
-                    ?tail,
-                    signalled,
-                    "no-op claim: transcript scan completed"
-                );
-                signalled
-            }
-            unavailable => {
+    /// Returns `false` on any read failure — absence of the signal must
+    /// never be guessed at.
+    pub(super) fn worker_signalled_no_op(&self, execution_id: &str) -> bool {
+        match self.work_db.execution_run_done_outcome(execution_id) {
+            Ok(Some(boss_protocol::RunDoneOutcome::NoChangesNeeded)) => true,
+            Ok(_) => false,
+            Err(err) => {
                 tracing::warn!(
                     execution_id,
-                    proposals_first,
-                    ?unavailable,
-                    "no-op claim: transcript scan unavailable"
+                    ?err,
+                    "no-op claim: failed to read the run_done declaration; treating the run as undeclared",
                 );
                 false
             }
-        };
-        if proposals_first && signalled {
-            // Count once per Stop that the marker actually carried the
-            // claim. Unlike the marker-based seams above there is no
-            // "already filed" state to dedup against — this function is a
-            // pure predicate — so a long multi-turn run whose transcript
-            // keeps the marker can increment on several Stops. That
-            // over-counts rather than under-counts, which is the safe
-            // direction for a counter whose job is to say "the fallback is
-            // not quiet yet".
-            self.record_proposal_fallback_hit(
-                &match self.work_db.get_execution(execution_id) {
-                    Ok(execution) => execution,
-                    Err(_) => return signalled,
-                },
-                &RUN_DONE_FALLBACK_HIT,
-                "run_done_proposals_seam",
-                "run_done",
-                crate::no_op_signal::NO_CHANGES_NEEDED_MARKER,
-                "no run_done proposal declared no_changes_needed; falling back to the legacy transcript marker",
-            );
         }
-        signalled
     }
 }

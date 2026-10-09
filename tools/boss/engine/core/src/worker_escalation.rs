@@ -26,8 +26,7 @@
 //! a parse warning) rather than being silently dropped — an operator
 //! reading a garbled escalation is much better than the engine pretending
 //! nothing happened, which is exactly the failure mode this module fixes.
-//! The matching discipline mirrors [`crate::no_op_signal`] and
-//! [`crate::automation_triage`]'s marker parsers: a line whose trimmed
+//! The matching discipline mirrors [`crate::automation_triage`]'s marker parsers: a line whose trimmed
 //! content starts with the marker prefix (case-sensitive, brackets
 //! included), not a substring scan — prose that merely *mentions* the
 //! protocol must not trip it.

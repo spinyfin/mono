@@ -394,7 +394,8 @@ pub enum RunDoneOutcome {
     /// The run verified there was nothing to produce — the change is
     /// already on the base branch, the reviewer finding needs no code
     /// change, the automation found a clean repo. The same claim the
-    /// `NO_CHANGES_NEEDED` marker makes, on the declaration channel.
+    /// retired `NO_CHANGES_NEEDED` text marker used to make, on the typed
+    /// declaration channel.
     NoChangesNeeded,
     /// The run is over without delivering: the worker cannot proceed. This
     /// is a *terminal* declaration, distinct from

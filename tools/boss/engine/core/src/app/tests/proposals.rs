@@ -1416,6 +1416,68 @@ async fn accepted_run_done_no_changes_needed_immediately_closes_the_task() {
     );
 }
 
+/// The seam-on submit-time finalize must run the same no-op guard as the
+/// Stop boundary: a `no-changes-needed` declaration made while a Codex
+/// command is unobserved is refused (run stays live, declaration consumed),
+/// and an identical fresh declaration afterwards is accepted.
+#[tokio::test]
+async fn run_done_no_changes_needed_is_refused_at_submit_after_an_unobserved_command() {
+    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
+    let peer_pid = std::process::id() as libc::pid_t;
+    server_state
+        .staged_unobserved_commands
+        .record(&execution_id, "bazel test //tools/boss/...");
+    let payload = json!({"outcome": "no_changes_needed", "summary": "Already fixed on main"});
+
+    submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(&execution_id, ProposalKind::RunDone, payload.clone()),
+        )
+        .await,
+    );
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_live(),
+        "a refused no-op declaration must leave the run live"
+    );
+    assert_ne!(
+        task_status(&server_state, &work_item_id),
+        boss_protocol::TaskStatus::Done
+    );
+    assert_eq!(
+        server_state.work_db.execution_run_done_outcome(&execution_id).unwrap(),
+        None,
+        "the refused declaration must be consumed"
+    );
+
+    // Declaring again (identical payload) is a fresh submission, and the
+    // unobserved flag was consumed by the refusal, so it is accepted.
+    let (proposal, already_submitted) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(&execution_id, ProposalKind::RunDone, payload),
+        )
+        .await,
+    );
+    assert!(!already_submitted);
+    assert_eq!(proposal.state, ProposalState::Applied);
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        boss_protocol::ExecutionStatus::Completed
+    );
+    assert_eq!(
+        task_status(&server_state, &work_item_id),
+        boss_protocol::TaskStatus::Done
+    );
+}
+
 /// A mandated stop fails visibly, without bypassing a check or cycling workers.
 #[tokio::test]
 async fn mandated_check_approval_stop_fails_visibly_without_replacement_workers() {

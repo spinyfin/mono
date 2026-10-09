@@ -1785,7 +1785,7 @@ impl WorkerCompletionHandler {
     /// Every entry is normalized through the run's own driver before parsing
     /// (see [`crate::driver_transcript`]) — this reader is what the
     /// Stop-boundary marker scans (`[blocked]`, `[effort-escalation]`,
-    /// `[deferred-scope]`, `NO_CHANGES_NEEDED`), the triage-decision fallback
+    /// `[deferred-scope]`), the triage-decision fallback
     /// and the PR-URL prose fallback all read through, so parsing the file as
     /// if every agent wrote Claude's dialect made all of them silently
     /// Claude-only. For Claude the normalization is the identity.

@@ -32,7 +32,7 @@
 //! (see `boss_engine::driver_transcript`) gets the same events regardless of
 //! which agent produced the file. Accepting only the `message` envelope is
 //! what made the marker scans — `[blocked]`, `[effort-escalation]`,
-//! `[deferred-scope]`, `NO_CHANGES_NEEDED` — silently Claude-only.
+//! `[deferred-scope]` — silently Claude-only.
 
 use boss_engine_codex_rollout::{
     canonical_rollout_tool_call, canonical_rollout_tool_output, extract_text_blocks as extract_codex_text_blocks,

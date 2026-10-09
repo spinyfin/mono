@@ -15,7 +15,7 @@
 //!   skips the reviewer; now also blocks false-success terminalization.
 //! - Metadata-only finalize (`metadata_gate.rs`, issue #1252) — positive
 //!   evidence via `metadata_fix_confirmed_at`.
-//! - `NO_CHANGES_NEEDED` / `worker_signalled_no_op` — explicit worker
+//! - `no-changes-needed` run-done declaration / `worker_signalled_no_op` — explicit worker
 //!   outcome; silence after a mid-turn reap is not this.
 //! - `health_alone_satisfies_deliverable` — Stop-path refuse for the
 //!   satisfied-deliverable gate; this module covers the same class of
@@ -37,7 +37,7 @@ pub(super) enum RevisionContributionReason {
     /// `on_stop` stamped `metadata_fix_confirmed_at` after observing a
     /// PR title/body delta (metadata-only revisions are legitimate).
     MetadataFixConfirmed,
-    /// Worker emitted the sanctioned `NO_CHANGES_NEEDED` marker.
+    /// Worker declared `boss propose done --outcome no-changes-needed`.
     ExplicitNoOp,
     /// Merge-conflict-provenance revision whose bound PR is now mergeable
     /// (conflict cleared — by this run or elsewhere). Matches the
@@ -118,7 +118,7 @@ impl WorkerCompletionHandler {
     ///    satisfied-deliverable, SHA-delta, metadata_only_fix).
     /// 1. `metadata_fix_confirmed_at` — observed PR metadata mutation.
     /// 2. `revision_stop_contributed_head` differing from baseline.
-    /// 3. Explicit `NO_CHANGES_NEEDED` on the worker transcript.
+    /// 3. Explicit `no-changes-needed` run-done declaration.
     /// 4. SHA-delta: head moved → allow; inapplicable → indeterminate.
     /// 5. Non-push deliverable side-states (conflict cleared / merge queue).
     /// 6. Else refuse (`sha_unchanged`).
@@ -182,7 +182,7 @@ impl WorkerCompletionHandler {
         }
 
         // 3. Explicit worker outcome — never inferred from silence.
-        if self.worker_signalled_no_op(execution_id).await {
+        if self.worker_signalled_no_op(execution_id) {
             return RevisionReviewGate::Allow(RevisionContributionReason::ExplicitNoOp);
         }
 

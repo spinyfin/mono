@@ -219,7 +219,7 @@ pub(super) async fn dispatch_worker_event_fanout(
     dispatch_live_worker_state(server_state, incoming).await;
     // Codex unobserved-command detection: stage any abandoned-command
     // Notification the progress session emitted ahead of its Stop, so
-    // `on_stop`'s NO_CHANGES_NEEDED gate (dispatched later in this same
+    // `on_stop`'s no-changes-needed gate (dispatched later in this same
     // fan-out chain, on the following Stop event) sees it.
     dispatch_codex_unobserved_command_on_notification(server_state, incoming);
     // Codex guard-trace observation: record whether this turn's PreToolUse
@@ -445,7 +445,7 @@ pub(super) fn dispatch_codex_unobserved_command_on_notification(
         RecordOutcome::Duplicate => {}
         RecordOutcome::CapExceeded => {
             // Loud by design: the audit trail stopped growing, but the
-            // NO_CHANGES_NEEDED refusal gate (`consume_unresolved`) does not
+            // no-changes-needed refusal gate (`consume_unresolved`) does not
             // depend on this cap and still fires — see
             // `codex_unobserved_command::MAX_COMMANDS_PER_EXECUTION`.
             crate::codex_unobserved_command::CODEX_UNOBSERVED_COMMAND_OVERFLOW.inc(&server_state.metrics);
@@ -454,7 +454,7 @@ pub(super) fn dispatch_codex_unobserved_command_on_notification(
                 command = command.trim(),
                 "codex_unobserved_command: audit trail exceeded MAX_COMMANDS_PER_EXECUTION distinct \
                  abandoned commands for this execution; this command was not added to the trail (the \
-                 NO_CHANGES_NEEDED refusal gate still fires)",
+                 no-changes-needed refusal gate still fires)",
             );
         }
     }
