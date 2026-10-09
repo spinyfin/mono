@@ -336,6 +336,25 @@ pub async fn create_from(
     Ok(record)
 }
 
+/// Clean reinitialisation for a self-retry whose own heads are both gone: drop
+/// the surviving baseline so fresh pointers can be created for the same
+/// execution. Refuses unless both heads are confirmed absent, so it can never
+/// discard provenance that a live pointer still depends on.
+pub async fn discard_orphaned_baseline(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<()> {
+    for head in [record.head(), record.publication()] {
+        ensure!(
+            resolve_optional(jj, &record.repo_path, &head).await?.is_none(),
+            "refusing to discard baseline {}: pointer {head} still exists",
+            record.base()
+        );
+    }
+    if resolve_optional(jj, &record.repo_path, &record.base()).await?.is_some() {
+        jj.run(&record.repo_path, &["bookmark", "delete", &record.base()])
+            .await?;
+    }
+    Ok(())
+}
+
 /// A successful empty diff proves an empty run. Missing/conflicted references,
 /// unavailable jj, and unrelated targets are errors, never empty results.
 pub async fn diff(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {

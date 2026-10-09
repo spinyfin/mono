@@ -765,12 +765,16 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
         slot_id: Some(1),
         ..FakeExecutionRunner::default()
     });
-    let coordinator = Arc::new(ExecutionCoordinator::new(
-        db.clone(),
-        WorkerPool::new(2),
-        Arc::new(FakeCubeClient::default()),
-        runner.clone(),
-    ));
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(2),
+            Arc::new(FakeCubeClient::default()),
+            runner.clone(),
+        )
+        .with_dispatch_events(recording.clone()),
+    );
 
     coordinator
         .resume_pane_spawn_for_running_execution(&exec)
@@ -782,6 +786,16 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
             .iter()
             .any(|a| a.kind == crate::execution_bookmark_recovery::RECOVERY_FAILED),
         "missing bookmark on resume is loud in logs, not an attention failure"
+    );
+    let events = recording.events_for(&exec.id).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.stage == crate::dispatch_events::Stage::WorkspaceRecovery.as_str()
+                && e.outcome == crate::dispatch_events::Outcome::Skipped.as_str())
+            .count(),
+        1,
+        "a resume with no bookmark row must emit the skipped-recovery event once"
     );
 
     let mut saw_call = false;

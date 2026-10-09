@@ -155,7 +155,10 @@ impl ExecutionCoordinator {
                     if prior.id == execution.id {
                         // The row names heads that no longer exist; keeping it
                         // would make dispatch treat the run as already recovered
-                        // and skip creating fresh pointers.
+                        // and skip creating fresh pointers. The surviving
+                        // baseline would also make fresh creation fail, so drop
+                        // it first (it refuses unless both heads are absent).
+                        adapter.discard_orphaned_execution_baseline(&record).await?;
                         self.work_db.delete_execution_bookmark(&execution.id)?;
                     }
                     return Ok(None);

@@ -224,7 +224,15 @@ async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
     let dir = tempdir().unwrap();
     let (db, _prior, next) = blocked_pair(&dir.path().join("boss.db"));
     let repo = record_then_delete_heads(&db, dir.path(), &next.id).await;
-    let coordinator = recovery_coordinator_for(db.clone());
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient {
+            real_bookmarks: true,
+            ..FakeCubeClient::default()
+        }),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
     let lease = CubeWorkspaceLease {
         lease_id: "lease-new".into(),
         workspace_id: "workspace-old".into(),
@@ -240,6 +248,16 @@ async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
         db.execution_bookmark_optional(&next.id).unwrap().is_none(),
         "a stale row would make dispatch skip creating fresh pointers"
     );
+    // Dispatch now creates fresh pointers for the same execution id; the
+    // surviving baseline must not make that fail.
+    let fresh = coordinator
+        .host_adapter
+        .create_execution_bookmark(&repo.worker, &next.id, None, None)
+        .await
+        .expect("fresh creation must succeed after the orphaned baseline is discarded");
+    boss_engine_recovery::execution_bookmark::diff(&boss_engine_recovery::execution_bookmark::LocalJj, &fresh)
+        .await
+        .expect("fresh bookmarks must validate");
 }
 
 #[tokio::test]

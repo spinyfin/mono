@@ -1087,6 +1087,7 @@ impl ExecutionCoordinator {
         // wedge a live worker.
         let inspection = async {
             let Some(record) = self.work_db.execution_bookmark_optional(&execution.id)? else {
+                self.warn_missing_execution_bookmark(execution, None).await;
                 return Ok(None);
             };
             match self.inspect_execution_bookmark(&record).await {

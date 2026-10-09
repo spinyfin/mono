@@ -150,6 +150,12 @@ pub trait HostAdapter: Send + Sync {
         let _ = (record, workspace, self_retry);
         bail!("execution bookmark recovery is not supported by this host adapter")
     }
+    /// Drop the baseline left behind when both of an execution's heads are
+    /// gone, so a self-retry can create fresh pointers.
+    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
+        let _ = record;
+        bail!("execution bookmark cleanup is not supported by this host adapter")
+    }
     async fn restore_rebased_execution_bookmark(
         &self,
         record: &ExecutionBookmark,
@@ -423,6 +429,14 @@ impl HostAdapter for LocalHostAdapter {
             record.host_id
         );
         execution_bookmark::restore_for_retry(&LocalJj, record, workspace, self_retry).await
+    }
+    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
+        anyhow::ensure!(
+            record.host_id == "local",
+            "recovery bookmark belongs to host {}",
+            record.host_id
+        );
+        execution_bookmark::discard_orphaned_baseline(&LocalJj, record).await
     }
     async fn restore_rebased_execution_bookmark(
         &self,
@@ -897,6 +911,14 @@ impl HostAdapter for SshHostAdapter {
             record.host_id
         );
         execution_bookmark::restore_for_retry(self, record, workspace, self_retry).await
+    }
+    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery bookmark belongs to host {}",
+            record.host_id
+        );
+        execution_bookmark::discard_orphaned_baseline(self, record).await
     }
     async fn restore_rebased_execution_bookmark(
         &self,
