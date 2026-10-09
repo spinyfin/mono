@@ -118,7 +118,7 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
     /// Invoked when the user taps the `reviewed_with_findings` badge —
     /// opens the follow-up revision's findings description and reveals the
     /// revision's card (or its parent's card once it is rolled up).
-    /// Only called when `slice.aiReviewFindingsRevisionId` is non-nil.
+    /// Supplied for every findings badge, with or without a findings revision.
     var onRevealAIReviewFindings: (() -> Void)? = nil
     /// Tooltip sentence for the findings badge; see `AIReviewStateBadge`.
     var aiReviewFindingsTooltipNote: String? = nil
@@ -156,7 +156,7 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 AIReviewStateBadge(
                     state: aiReviewState,
                     presentation: presentation,
-                    onRevealFindings: slice.aiReviewFindingsRevisionId != nil ? onRevealAIReviewFindings : nil,
+                    onRevealFindings: onRevealAIReviewFindings,
                     findingsTooltipNote: aiReviewFindingsTooltipNote
                 )
             }

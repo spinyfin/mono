@@ -156,11 +156,12 @@ struct WorkBoardCardItem: View {
             staleSource: task.reviewGuideStaleSource ?? false,
             error: task.reviewGuideError
         )
-        let onRevealAIReviewFindings: (() -> Void)? = snapshot.aiReviewFindingsRevisionId.map { revisionID in
-            {
-                model.openAIReviewFindings(revisionID: revisionID)
+        let onRevealAIReviewFindings: (() -> Void)? = snapshot.aiReviewState == "reviewed_with_findings"
+            ? {
+                model.openAIReviewFindings(
+                    revisionID: snapshot.aiReviewFindingsRevisionId, fallbackPRURL: task.prURL)
             }
-        }
+            : nil
         let onOpenDesignDoc: (() -> Void)? = {
             guard snapshot.showsDesignDocAffordance else { return nil }
             return { model.openWorkItemDoc(task) }
@@ -431,8 +432,8 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Invoked when the user taps the `reviewed_with_findings` AI-review
     /// badge — opens the revision's findings description and reveals the
     /// revision's card (or its parent's card once it is rolled up).
-    /// Only called when `snapshot.aiReviewFindingsRevisionId`
-    /// is non-nil.
+    /// Supplied for every findings badge; with no findings revision the
+    /// click opens the task's PR instead and reveals nothing.
     var onRevealAIReviewFindings: (() -> Void)? = nil
     /// Tooltip sentence for the findings badge; see `AIReviewStateBadge`.
     var aiReviewFindingsTooltipNote: String? = nil

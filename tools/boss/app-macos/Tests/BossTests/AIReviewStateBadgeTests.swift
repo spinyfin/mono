@@ -50,6 +50,24 @@ final class AIReviewStateBadgeTests: XCTestCase {
     }
 
     @MainActor
+    func testNoRevisionClickOpensPRAndRequestsNoReveal() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var opened: [URL] = []
+        model.urlOpener = { opened.append($0) }
+        model.asyncMarkdownViewerOpener = { XCTFail("No revision means no findings brief to open") }
+        model.openAIReviewFindings(revisionID: nil, fallbackPRURL: "https://github.com/o/r/pull/1")
+        XCTAssertEqual(opened.map(\.absoluteString), ["https://github.com/o/r/pull/1"])
+        XCTAssertNil(model.pendingRevealScrollID)
+        XCTAssertNil(model.revealHighlightID)
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertEqual(model.aiReviewFindingsTooltipNote(revisionID: nil), "No fix task yet.")
+
+        model.openAIReviewFindings(revisionID: nil, fallbackPRURL: nil)
+        XCTAssertEqual(opened.count, 1)
+        XCTAssertNotNil(model.workErrorMessage)
+    }
+
+    @MainActor
     func testCardEqualityIncludesFindingsTooltipNote() {
         let task = makeTask(kind: "chore")
         let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .review))
