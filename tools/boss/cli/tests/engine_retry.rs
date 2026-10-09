@@ -6,7 +6,8 @@
 //! request with an empty product list; the point is the CLI's transport
 //! behaviour, not engine semantics.
 
-use std::process::{Command, Output};
+use std::io::{BufRead, BufReader as StdBufReader, Read};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -17,21 +18,54 @@ use tokio::net::UnixListener;
 
 use common::boss_binary;
 
-fn run_boss(socket: &str, extra: &[&str], max_wait_secs: &str) -> Output {
-    Command::new(boss_binary())
+fn boss_command(socket: &str, extra: &[&str], max_wait_secs: &str) -> Command {
+    let mut command = Command::new(boss_binary());
+    command
         .args(["--json", "--no-input", "--no-engine-autostart", "--socket-path", socket])
         .args(extra)
         .args(["product", "list"])
         .env("BOSS_ENGINE_MAX_WAIT_SECS", max_wait_secs)
-        .env_remove("BOSS_RUN_ID")
-        .output()
-        .expect("spawn boss")
+        .env_remove("BOSS_RUN_ID");
+    command
 }
 
-/// Bind `socket` after `delay` and serve empty product lists forever.
-fn serve_after(socket: String, delay: Duration) -> tokio::task::JoinHandle<()> {
+fn run_boss(socket: &str, extra: &[&str], max_wait_secs: &str) -> Output {
+    boss_command(socket, extra, max_wait_secs).output().expect("spawn boss")
+}
+
+/// Run `boss`, calling `on_first_notice` as soon as it prints its first
+/// "engine not reachable" progress line. That ties the engine's appearance to
+/// the CLI's own progress (at least one connect has failed) instead of to a
+/// wall-clock delay that a slow process start could overtake.
+fn run_boss_until_first_notice(socket: &str, max_wait_secs: &str, on_first_notice: impl FnOnce()) -> Output {
+    let mut child = boss_command(socket, &[], max_wait_secs)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn boss");
+    let mut stderr = StdBufReader::new(child.stderr.take().expect("piped stderr"));
+    let mut seen = String::new();
+    let mut on_first_notice = Some(on_first_notice);
+    let mut line = String::new();
+    while stderr.read_line(&mut line).expect("read boss stderr") > 0 {
+        seen.push_str(&line);
+        if line.contains("engine not reachable")
+            && let Some(callback) = on_first_notice.take()
+        {
+            callback();
+        }
+        line.clear();
+    }
+    let mut rest = String::new();
+    stderr.read_to_string(&mut rest).ok();
+    let mut output = child.wait_with_output().expect("wait for boss");
+    output.stderr = seen.into_bytes();
+    output
+}
+
+/// Bind `socket` and serve empty product lists forever.
+fn serve(socket: String) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
         let listener = UnixListener::bind(&socket).unwrap();
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -59,11 +93,18 @@ fn serve_after(socket: String, delay: Duration) -> tokio::task::JoinHandle<()> {
 async fn command_succeeds_when_the_engine_appears_after_a_few_failed_connects() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let socket = dir.path().join("engine.sock").to_string_lossy().into_owned();
-    let engine = serve_after(socket.clone(), Duration::from_millis(1500));
+    let handle = tokio::runtime::Handle::current();
 
-    let output = tokio::task::spawn_blocking({
+    let (output, engine) = tokio::task::spawn_blocking({
         let socket = socket.clone();
-        move || run_boss(&socket, &[], "60")
+        move || {
+            let mut engine = None;
+            let output = run_boss_until_first_notice(&socket, "60", || {
+                let _guard = handle.enter();
+                engine = Some(serve(socket.clone()));
+            });
+            (output, engine.expect("boss never reported the engine as unreachable"))
+        }
     })
     .await?;
 
@@ -117,11 +158,13 @@ fn no_retry_fails_fast_without_a_progress_notice() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("missing.sock").to_string_lossy().into_owned();
 
+    // A budget far larger than the bound below: finishing well inside it
+    // proves `--no-retry` overrides the budget, however slow process start is.
     let started = Instant::now();
-    let output = run_boss(&socket, &["--no-retry"], "600");
+    let output = run_boss(&socket, &["--no-retry"], "3600");
 
     assert_eq!(output.status.code(), Some(5));
-    assert!(started.elapsed() < Duration::from_secs(5), "fast failure");
+    assert!(started.elapsed() < Duration::from_secs(60), "fast failure");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("retry disabled"), "{stderr}");
     assert!(!stderr.contains("retrying"), "no retry notice when disabled: {stderr}");
