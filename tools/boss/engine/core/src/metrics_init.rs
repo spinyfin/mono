@@ -305,7 +305,7 @@ mod tests {
         assert!(names.contains(&"persona_roster_exhausted".to_owned()));
         assert_eq!(
             names.len(),
-            113,
+            114,
             "expected 6 answer_agent + 6 pr_url_capture + 6 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 15 merge_poller + 3 review_pool + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
