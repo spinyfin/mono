@@ -820,6 +820,7 @@ pub async fn serve_with_overrides(
                                 model: &coordinator_supervisor_state.coordinator_model,
                                 working_directory: &working_directory,
                                 version_probe: &crate::coordinator_tmux::RealClaudeVersionProbe,
+                                design_docs: &coordinator_supervisor_state.design_docs,
                             },
                             restart_failures.restart_churn(),
                         )

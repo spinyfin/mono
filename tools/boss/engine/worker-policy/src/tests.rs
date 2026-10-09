@@ -353,6 +353,7 @@ fn coordinator_verbs_stay_closed() {
         FrontendRequest::SetCoordinatorHandoff {
             body: "- greyarea is down".into(),
         },
+        FrontendRequest::ListCoordinatorGuidance { product_id: None },
     ] {
         let denial = assert_denied(request);
         assert_eq!(denial.reason, WorkerTierDenialReason::CoordinatorOnly);

@@ -74,6 +74,7 @@ mod ci_remediation;
 mod comments;
 mod conflict_resolution;
 mod context;
+mod coordinator_guidance;
 mod coordinator_handoff;
 mod cost;
 mod decisions;
@@ -2575,6 +2576,9 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::ListConflictResolutions { .. } => {
                 Box::pin(conflict_resolution::handle_list_conflict_resolutions(ctx, r))
+            }
+            r @ FrontendRequest::ListCoordinatorGuidance { .. } => {
+                Box::pin(coordinator_guidance::handle_list_coordinator_guidance(ctx, r))
             }
             r @ FrontendRequest::ListDecisions { .. } => Box::pin(decisions::handle_list_decisions(ctx, r)),
             r @ FrontendRequest::ListDeferredScopeAttentions { .. } => {

@@ -13,21 +13,21 @@ use crate::types::{
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation,
     AutomationDedupSuppression, AutomationPatch, AutomationRun, BackgroundWorkItem, BoardDropTarget, CiBudgetSnapshot,
     CiRemediation, CommentAnchor, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
-    ConflictResolution, CoordinatorHandoffView, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
-    CreateChoreInput, CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateIdeaInput,
-    CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision, DeferredScopeAttention, DependencyFilter,
-    DesignDocContent, DesignDocTreeState, DispatchAdmission, DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction,
-    EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, GuideCommentDisposition, Idea,
-    IdeaGraduationKind, IdeaPatch, LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView,
-    PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, ProbeInterruptOutcome, Product, Project,
-    ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt, ReviewGuideSummary, ReviewGuideVersion,
-    ReviseDocInput, ReviseDocOutcome, SelectedProductState, SetProductEditorialRulesInput,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskRuntime,
-    TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
-    WorkerTierDenial,
+    ConflictResolution, CoordinatorGuidanceView, CoordinatorHandoffView, CreateAttentionInput,
+    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateDecisionInput,
+    CreateExecutionInput, CreateIdeaInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision,
+    DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission,
+    DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
+    GitHubAuthStateDto, GuideCommentDisposition, Idea, IdeaGraduationKind, IdeaPatch, LinkExternalRefInput,
+    ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState,
+    ProbeInterruptOutcome, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt,
+    ReviewGuideSummary, ReviewGuideVersion, ReviseDocInput, ReviseDocOutcome, SelectedProductState,
+    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,
+    Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle,
+    WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -1373,6 +1373,20 @@ pub enum FrontendRequest {
         work_item_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
+    },
+
+    /// Read-only, coordinator-only: each product's `BOSS_COORDINATOR.md`
+    /// (see [`CoordinatorGuidanceView`]) read from GitHub at the default
+    /// branch's current HEAD. Backs `boss guidance show`. `product_id`
+    /// narrows to one product; `None` covers every non-archived product.
+    /// Every outcome — loaded, missing, over the size cap, fetch failed,
+    /// no repo — is reported per product; a GitHub failure is a
+    /// [`crate::CoordinatorGuidanceState::Failed`] entry, never an omission.
+    /// Replies with [`FrontendEvent::CoordinatorGuidanceList`]; an unknown
+    /// `product_id` is a [`FrontendEvent::WorkError`].
+    ListCoordinatorGuidance {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        product_id: Option<String>,
     },
 
     /// List product-scoped decision records, newest first. By default
