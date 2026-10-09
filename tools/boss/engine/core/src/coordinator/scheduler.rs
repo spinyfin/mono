@@ -719,9 +719,32 @@ impl ExecutionCoordinator {
     /// the currently-live one.
     /// Persist the operator-facing `dispatch_wait_reason` for an execution,
     /// logging a warning (rather than failing dispatch) if the DB write errors.
-    fn record_dispatch_wait_reason(&self, execution_id: &str, reason: &str) {
-        if let Err(err) = self.work_db.set_dispatch_wait_reason(execution_id, reason) {
-            tracing::warn!(execution_id = %execution_id, ?err, "failed to record dispatch_wait_reason");
+    fn record_dispatch_wait_reason(
+        &self,
+        execution: &WorkExecution,
+        reason: &str,
+        blocker_id: Option<&str>,
+    ) -> Option<WorkExecution> {
+        match self
+            .work_db
+            .set_dispatch_wait_with_blocker(&execution.id, reason, blocker_id)
+        {
+            Ok(true) => Some(execution.clone()),
+            Ok(false) => None,
+            Err(err) => {
+                tracing::warn!(execution_id = %execution.id, ?err, "failed to record dispatch wait");
+                None
+            }
+        }
+    }
+
+    async fn publish_dispatch_runtime_changed(&self, executions: &[WorkExecution], reason: &str) {
+        for execution in executions {
+            if let Ok(item) = self.resolve_execution_work_item(execution) {
+                self.publisher
+                    .publish_work_item_changed(item.product_id(), item.primary_id(), reason)
+                    .await;
+            }
         }
     }
 
@@ -955,6 +978,7 @@ impl ExecutionCoordinator {
             return DrainOutcome::QueueEmpty;
         }
 
+        let mut changed_waits = Vec::new();
         if paused {
             let review_count = executions
                 .iter()
@@ -969,11 +993,16 @@ impl ExecutionCoordinator {
                      draining review-pool exemptions",
                 );
             } else {
+                for execution in &executions {
+                    changed_waits.extend(self.record_dispatch_wait_reason(execution, "dispatch_paused", None));
+                }
                 tracing::debug!(
                     held_count,
                     review_exempt_count = 0,
                     "drain_ready_queue: dispatch is globally paused — skipping (breaker pause, no exemptions)",
                 );
+                self.publish_dispatch_runtime_changed(&changed_waits, "dispatch_wait_changed")
+                    .await;
                 return DrainOutcome::QueueEmpty;
             }
         }
@@ -1074,6 +1103,7 @@ impl ExecutionCoordinator {
                 if self.take_dispatch_pause_bypass(&execution.id) {
                     pause_bypass_admitted.insert(execution.id.clone());
                 } else {
+                    changed_waits.extend(self.record_dispatch_wait_reason(&execution, "dispatch_paused", None));
                     continue;
                 }
             }
@@ -1084,6 +1114,7 @@ impl ExecutionCoordinator {
             // candidate queue below — an automation-paused row must not
             // claim ANY slot, home or spilled.
             if automation_paused && is_automation {
+                changed_waits.extend(self.record_dispatch_wait_reason(&execution, "automation_paused", None));
                 continue;
             }
 
@@ -1100,9 +1131,11 @@ impl ExecutionCoordinator {
             // leave the rest of Lower Decks idle. The redundant home claim
             // this costs is one in-memory mutex acquisition per row.
             if is_review && review_pool_exhausted {
+                changed_waits.extend(self.record_dispatch_wait_reason(&execution, "pool_exhausted", None));
                 continue;
             }
             if is_main && main_pool_exhausted {
+                changed_waits.extend(self.record_dispatch_wait_reason(&execution, "pool_exhausted", None));
                 continue;
             }
 
@@ -1180,13 +1213,14 @@ impl ExecutionCoordinator {
                                 })),
                         )
                         .await;
-                    self.record_dispatch_wait_reason(
-                        &execution.id,
+                    changed_waits.extend(self.record_dispatch_wait_reason(
+                        &execution,
                         &format!(
                             "Held by the interactive concurrency cap ({live_workers}/{cap} \
                              workers live) — dispatches as workers finish"
                         ),
-                    );
+                        None,
+                    ));
                     continue;
                 };
                 let admission = if pause_bypass_admitted.contains(&execution.id) {
@@ -1346,7 +1380,11 @@ impl ExecutionCoordinator {
                     // this is the string persisted into `dispatch_wait_reason`
                     // and rendered verbatim on the kanban card.
                     let wait_reason = self.chain_serialized_wait_reason(&sibling, review_held, queue_len);
-                    self.record_dispatch_wait_reason(&execution.id, &wait_reason);
+                    changed_waits.extend(self.record_dispatch_wait_reason(
+                        &execution,
+                        &wait_reason,
+                        Some(&sibling.work_item_id),
+                    ));
                     self.surface_chain_serialized_stall_if_overdue(&execution, &sibling);
                     // Leave the row `ready`; do NOT mark any pool exhausted —
                     // other executions in this pass may still dispatch.
@@ -1442,6 +1480,7 @@ impl ExecutionCoordinator {
                     self.merge_order_stagger_secs,
                 ) {
                     Ok(Some(not_before)) => {
+                        changed_waits.push(execution.clone());
                         tracing::info!(
                             execution_id = %execution.id,
                             work_item_id = %execution.work_item_id,
@@ -1577,7 +1616,7 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
-                self.record_dispatch_wait_reason(&execution.id, "pool_exhausted");
+                changed_waits.extend(self.record_dispatch_wait_reason(&execution, "pool_exhausted", None));
 
                 if is_review {
                     review_pool_exhausted = true;
@@ -1649,7 +1688,7 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
-                self.record_dispatch_wait_reason(&execution.id, "pool_exhausted");
+                changed_waits.extend(self.record_dispatch_wait_reason(&execution, "pool_exhausted", None));
 
                 // Keep the Automations tab honest: "Queued", not a failure
                 // badge. Same treatment the pre-spillover exhaustion path
@@ -1688,6 +1727,9 @@ impl ExecutionCoordinator {
                 .await;
         }
 
+        // All deferred pickup claims have dropped before clients refetch their runtime.
+        self.publish_dispatch_runtime_changed(&changed_waits, "dispatch_wait_changed")
+            .await;
         if main_pool_exhausted || auto_pool_exhausted || review_pool_exhausted {
             DrainOutcome::PoolExhausted
         } else {
@@ -2106,6 +2148,9 @@ impl ExecutionCoordinator {
         if let Err(err) = self.work_db.clear_dispatch_wait_reason(&execution.id) {
             tracing::warn!(execution_id = %execution.id, ?err, "failed to clear dispatch_wait_reason");
         }
+
+        self.publish_dispatch_runtime_changed(std::slice::from_ref(execution), "dispatch_claimed")
+            .await;
 
         // Hand the slow tail off and return to the caller's loop.
         //

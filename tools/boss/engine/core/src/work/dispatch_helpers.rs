@@ -332,36 +332,36 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries:
             None => latest,
         }
     };
-    let (
-        execution_status,
-        run_status,
-        execution_id,
-        current_run_id,
-        dispatch_retry_at,
-        dispatch_wait_reason,
-        dispatch_wait_since,
-    ) = if let Some(execution) = execution {
-        *queries += 1;
-        let latest_run = query_latest_run(conn, &execution.id)?;
-        let (run_status, run_id) = match latest_run {
-            Some((id, status)) => (Some(status), Some(id)),
-            None => (None, None),
+    let wait = super::queued_wait::for_execution(conn, execution.as_ref())?;
+    let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at, dispatch_wait_since) =
+        if let Some(execution) = execution {
+            *queries += 1;
+            let latest_run = query_latest_run(conn, &execution.id)?;
+            let (run_status, run_id) = match latest_run {
+                Some((id, status)) => (Some(status), Some(id)),
+                None => (None, None),
+            };
+            let dispatch_retry_at =
+                dispatch_retry_at_for_execution(&execution, boss_engine_utils::epoch_time::now_epoch_secs());
+            let dispatch_wait_since = if wait.reason.is_some()
+                && wait.reason == execution.dispatch_wait_reason
+                && execution.status == ExecutionStatus::Ready
+            {
+                execution.dispatch_wait_since.clone()
+            } else {
+                None
+            };
+            (
+                Some(execution.status),
+                run_status,
+                Some(execution.id),
+                run_id,
+                dispatch_retry_at,
+                dispatch_wait_since,
+            )
+        } else {
+            (None, None, None, None, None, None)
         };
-        let dispatch_retry_at =
-            dispatch_retry_at_for_execution(&execution, boss_engine_utils::epoch_time::now_epoch_secs());
-        let (dispatch_wait_reason, dispatch_wait_since) = dispatch_wait_for_execution(&execution);
-        (
-            Some(execution.status),
-            run_status,
-            Some(execution.id),
-            run_id,
-            dispatch_retry_at,
-            dispatch_wait_reason,
-            dispatch_wait_since,
-        )
-    } else {
-        (None, None, None, None, None, None, None)
-    };
     Ok(TaskRuntime::builder()
         .work_item_id(work_item_id)
         .maybe_execution_status(execution_status)
@@ -369,24 +369,11 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries:
         .maybe_execution_id(execution_id)
         .maybe_current_run_id(current_run_id)
         .maybe_dispatch_retry_at(dispatch_retry_at)
-        .maybe_dispatch_wait_reason(dispatch_wait_reason)
+        .maybe_dispatch_wait_reason(wait.reason)
         .maybe_dispatch_wait_since(dispatch_wait_since)
+        .maybe_dispatch_not_before(wait.not_before)
+        .maybe_dispatch_wait_blocker(wait.blocker)
         .build())
-}
-
-/// `TaskRuntime.dispatch_wait_reason` / `dispatch_wait_since` for one
-/// execution: passes `WorkExecution::dispatch_wait_reason` /
-/// `dispatch_wait_since` straight through while the execution is still
-/// `ready` (a claimed/running/terminal execution's stale wait reason,
-/// if any lingers, is not a "currently waiting" state worth surfacing).
-fn dispatch_wait_for_execution(execution: &WorkExecution) -> (Option<String>, Option<String>) {
-    if execution.status != ExecutionStatus::Ready {
-        return (None, None);
-    }
-    (
-        execution.dispatch_wait_reason.clone(),
-        execution.dispatch_wait_since.clone(),
-    )
 }
 
 /// `TaskRuntime.dispatch_retry_at` for one execution: `Some(epoch_secs)`

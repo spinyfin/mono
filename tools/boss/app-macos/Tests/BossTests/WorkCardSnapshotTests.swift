@@ -1910,7 +1910,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         ))
     }
 
-    func testLiveStatusDispatchPendingReadyIsWaitingForSlot() {
+    func testLiveStatusDispatchPendingWithoutReasonIsUnknown() {
         let task = Self.makeTask(status: "todo", autostart: true)
         let runtime = WorkTaskRuntime(
             workItemID: task.id,
@@ -1925,7 +1925,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            "Waiting for a slot"
+            "Queued — reason unknown"
         )
     }
 
@@ -1963,7 +1963,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            "Queued"
+            "Queued — reason unknown"
         )
     }
 
@@ -1982,7 +1982,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            "Waiting — worker pool full"
+            "Queued — worker pool full"
         )
     }
 

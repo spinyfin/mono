@@ -182,6 +182,11 @@ async fn breaker_pause_holds_every_enqueue_entry_point_then_drains_on_resume() {
     );
     for execution_id in &expected_ready {
         assert_eq!(
+            db.get_execution(execution_id).unwrap().dispatch_wait_reason.as_deref(),
+            Some("dispatch_paused"),
+            "paused queue rows must carry the scheduler's reason"
+        );
+        assert_eq!(
             db.get_execution(execution_id).unwrap().status,
             ExecutionStatus::Ready,
             "execution {execution_id} must still be queued, not dispatched, while paused"

@@ -516,6 +516,9 @@ extension ChatViewModel {
                 isSelected: isSelected,
                 runtime: runtime,
                 liveState: liveState,
+                dispatchWaitBlocker: WorkCardLiveStatus.isQueued(task: task, runtime: runtime)
+                    && WorkCardLiveStatus.isPendingExecution(runtime)
+                    ? runtime?.dispatchWaitBlocker : nil,
                 liveStatus: liveStatus,
                 blockedBy: blockedBy,
                 isAutoBlocked: isAutoBlocked,
