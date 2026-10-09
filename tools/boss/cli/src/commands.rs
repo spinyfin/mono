@@ -59,6 +59,23 @@ pub(crate) struct GlobalFlags {
     #[arg(long, global = true)]
     pub(crate) no_engine_autostart: bool,
 
+    /// Fail immediately when the engine is unreachable instead of
+    /// retrying with backoff.
+    ///
+    /// By default a command that cannot reach the engine (socket
+    /// missing, connection refused, engine restarting) keeps retrying
+    /// with exponential backoff for up to 10 minutes, printing a
+    /// progress line to stderr, so a brief engine restart does not fail
+    /// the command. Pass this for callers that need a fast failure.
+    /// Equivalent to `BOSS_ENGINE_MAX_WAIT_SECS=0`.
+    #[arg(long, global = true, conflicts_with = "engine_max_wait")]
+    pub(crate) no_retry: bool,
+
+    /// Maximum seconds to keep retrying an unreachable engine before
+    /// failing (default 600). Overrides `BOSS_ENGINE_MAX_WAIT_SECS`.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    pub(crate) engine_max_wait: Option<u64>,
+
     #[arg(long, global = true)]
     pub(crate) socket_path: Option<String>,
 }

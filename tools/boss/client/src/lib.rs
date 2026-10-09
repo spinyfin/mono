@@ -6,21 +6,37 @@
 //! autostart of the engine binary) lives behind [`Discovery`] so the CLI, tests,
 //! and future TUI/web frontends share one set of rules.
 
+mod replay;
+mod retry;
+#[cfg(test)]
+mod retry_tests;
+
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use boss_protocol::{FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
+
+pub use replay::{DUPLICATE_GUARD_WINDOW, ReplaySafety, replay_safety, request_name};
+pub use retry::{DEFAULT_MAX_WAIT, EngineUnreachable, MAX_WAIT_ENV, NoticeSink, OutcomeUnknown, RetryPolicy};
+use retry::{RetryState, is_unreachable_kind};
 
 pub const LEGACY_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 pub const LEGACY_PID_PATH: &str = "/tmp/boss-engine.pid";
 pub const DEFAULT_ENGINE_START_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on one connect attempt. A Unix-socket connect either succeeds
+/// or fails promptly unless the listener's backlog is wedged; this keeps a
+/// wedged engine from hanging a single attempt past the retry budget.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Set in every Boss worker session (by the engine, at spawn).
+const WORKER_RUN_ENV: &str = "BOSS_RUN_ID";
 
 #[derive(Debug, Clone)]
 pub struct EngineCommand {
@@ -60,6 +76,11 @@ pub struct Discovery {
     pub engine: EngineCommand,
     pub launch_directory: PathBuf,
     pub start_timeout: Duration,
+    /// How long, and how patiently, to wait for an unreachable engine.
+    pub retry: RetryPolicy,
+    /// This process is a Boss worker session. Workers must never start an
+    /// engine, so [`Self::with_autostart`] cannot turn autostart on for one.
+    pub worker_environment: bool,
 }
 
 impl Discovery {
@@ -96,6 +117,7 @@ impl Discovery {
         };
         let launch_directory = resolve_launch_directory()?;
         let engine = resolve_engine_command(&socket_path)?;
+        let worker_environment = non_empty_env(WORKER_RUN_ENV).is_some();
 
         Ok(Self {
             socket_path,
@@ -103,15 +125,36 @@ impl Discovery {
             legacy_socket_path,
             legacy_pid_file_path,
             control_token_path,
-            autostart: true,
+            autostart: !worker_environment,
             engine,
             launch_directory,
             start_timeout: DEFAULT_ENGINE_START_TIMEOUT,
+            retry: RetryPolicy::from_env(),
+            worker_environment,
         })
     }
 
+    /// Allow or forbid transparently starting the engine. Ignored (stays
+    /// off) in a worker environment.
     pub fn with_autostart(mut self, autostart: bool) -> Self {
-        self.autostart = autostart;
+        self.autostart = autostart && !self.worker_environment;
+        self
+    }
+
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Apply the CLI's explicit retry opt-outs on top of the env-derived
+    /// policy: `no_retry` fails on the first unreachable attempt, otherwise
+    /// `max_wait_secs` (if given) replaces the budget.
+    pub fn with_retry_overrides(mut self, no_retry: bool, max_wait_secs: Option<u64>) -> Self {
+        if no_retry {
+            self.retry.max_wait = Duration::ZERO;
+        } else if let Some(secs) = max_wait_secs {
+            self.retry.max_wait = Duration::from_secs(secs);
+        }
         self
     }
 
@@ -148,67 +191,240 @@ pub enum EngineStopOutcome {
 }
 
 /// Single-connection client over the engine's frontend socket.
+///
+/// A client made by [`BossClient::connect`] survives a brief engine outage:
+/// the connect itself backs off until the engine appears, and
+/// [`send_request`](Self::send_request) reconnects and resends when that is
+/// provably safe (see [`replay_safety`]). One made by
+/// [`connect_socket`](Self::connect_socket) is a bare single connection with
+/// no recovery, for callers (engine control, tests) that want exact control.
+#[derive(Debug)]
 pub struct BossClient {
     reader: Lines<BufReader<OwnedReadHalf>>,
     writer: OwnedWriteHalf,
     next_request_id: AtomicU64,
+    /// Endpoint this connection is on, for error messages.
+    socket_path: String,
+    /// How to get a fresh connection; `None` disables recovery.
+    reconnect: Option<Discovery>,
+}
+
+/// Why one send/receive exchange failed, split by what that proves about
+/// whether the engine saw the request.
+enum Exchange {
+    /// The request was provably not delivered (the write failed). A
+    /// partially written line never carries a request: the engine frames on
+    /// newlines and the whole line is written in one buffer.
+    NotSent(anyhow::Error),
+    /// The write succeeded but no response arrived (EOF or read error): the
+    /// engine may have applied the request before it went away.
+    Dropped(anyhow::Error),
+    /// Not a transport problem (e.g. an undecodable reply); never retried.
+    Fatal(anyhow::Error),
 }
 
 impl BossClient {
-    /// Connect to the engine, optionally autostarting it per the discovery profile.
+    /// Connect to the engine, optionally autostarting it per the discovery
+    /// profile, waiting out a briefly unavailable engine per
+    /// [`Discovery::retry`].
+    ///
+    /// Unreachable means: socket file missing, connection refused, connect
+    /// timeout, or the engine closing the connection. Those are retried with
+    /// exponential backoff and jitter until the budget is spent, then fail
+    /// with [`EngineUnreachable`] naming the socket and the time waited.
+    /// With autostart on, the engine is started at most once per call; if one
+    /// is already starting or restarting (live pid file) it is waited for
+    /// rather than racing a second. Autostart is always off in a worker.
     pub async fn connect(discovery: &Discovery) -> Result<Self> {
-        if let Some(running) = discover_running_engine(discovery).await {
-            return Self::connect_socket(&running.socket_path).await;
-        }
-
-        if !discovery.autostart {
-            bail!("boss engine is not reachable at {}", discovery.socket_path);
-        }
-
-        ensure_engine_running(discovery).await?;
-        let running = discover_running_engine(discovery)
-            .await
-            .context("engine reported ready but no discovery socket is reachable")?;
-        Self::connect_socket(&running.socket_path).await
+        let mut retry = RetryState::new(&discovery.retry);
+        Self::connect_within(discovery, &mut retry).await
     }
 
-    /// Connect directly to a socket path without autostart logic.
+    async fn connect_within(discovery: &Discovery, retry: &mut RetryState) -> Result<Self> {
+        let mut spawned = false;
+        loop {
+            let mut attempt = connect_any_endpoint(discovery).await;
+            if attempt.is_err() && discovery.autostart {
+                // Start (or wait for) the engine, then look again at once.
+                match ensure_engine_for_connect(discovery, retry, &mut spawned).await {
+                    Ok(()) => attempt = connect_any_endpoint(discovery).await,
+                    Err(err) => {
+                        tracing::debug!(%err, "engine autostart did not produce a reachable engine yet");
+                    }
+                }
+            }
+            let err = match attempt {
+                Ok((stream, socket_path)) => {
+                    return Ok(Self::from_stream(stream, socket_path, Some(discovery.clone())));
+                }
+                Err(err) => err,
+            };
+            if !is_unreachable_kind(err.kind()) {
+                return Err(anyhow::Error::new(err)
+                    .context(format!("failed to connect to engine socket {}", discovery.socket_path)));
+            }
+            let last_error = err.to_string();
+            if !retry.backoff(&discovery.socket_path, "connect", &last_error).await {
+                return Err(anyhow::Error::new(
+                    retry.unreachable(&discovery.socket_path, &last_error),
+                ));
+            }
+        }
+    }
+
+    /// Connect directly to a socket path without autostart or retry logic.
     pub async fn connect_socket(socket_path: &str) -> Result<Self> {
         let stream = UnixStream::connect(socket_path)
             .await
             .with_context(|| format!("failed to connect to engine socket {socket_path}"))?;
+        Ok(Self::from_stream(stream, socket_path.to_owned(), None))
+    }
+
+    fn from_stream(stream: UnixStream, socket_path: String, reconnect: Option<Discovery>) -> Self {
         let (read_half, write_half) = stream.into_split();
-        Ok(Self {
+        Self {
             reader: BufReader::new(read_half).lines(),
             writer: write_half,
             next_request_id: AtomicU64::new(1),
-        })
+            socket_path,
+            reconnect,
+        }
     }
 
     /// Send a request and wait for the matching response by `request_id`.
+    ///
+    /// If the connection fails, a client from [`connect`](Self::connect)
+    /// recovers per the policy in [`Discovery::retry`]:
+    ///
+    /// * the request was never delivered (the write failed) → reconnect and
+    ///   send it again, whatever the request is;
+    /// * it was sent but no reply came → resend only if
+    ///   [`replay_safety`] says a second delivery is harmless; otherwise
+    ///   fail with [`OutcomeUnknown`] without retrying.
     pub async fn send_request(&mut self, request: &FrontendRequest) -> Result<FrontendEvent> {
+        let first_attempt = Instant::now();
+        let mut retry: Option<RetryState> = None;
+        loop {
+            let (delivered, error) = match self.exchange(request).await {
+                Ok(event) => return Ok(event),
+                Err(Exchange::Fatal(err)) => return Err(err),
+                Err(Exchange::NotSent(err)) => (false, err),
+                Err(Exchange::Dropped(err)) => (true, err),
+            };
+
+            let recoverable = self.reconnect.as_ref().filter(|d| d.retry.is_enabled());
+            let Some(discovery) = recoverable.cloned() else {
+                // No recovery configured: report what happened. A drop
+                // after send is still an unknown outcome, never a bare I/O
+                // error that reads like "nothing happened".
+                return Err(if delivered {
+                    self.outcome_unknown(request, &error)
+                } else {
+                    error
+                });
+            };
+            if delivered && !replay_safety(request).allows_replay_after(first_attempt.elapsed()) {
+                return Err(self.outcome_unknown(request, &error));
+            }
+
+            let retry = retry.get_or_insert_with(|| RetryState::new(&discovery.retry));
+            let detail = format!("{error:#}");
+            if !retry.backoff(&self.socket_path, "connection dropped", &detail).await {
+                return Err(anyhow::Error::new(retry.unreachable(&self.socket_path, &detail)));
+            }
+            let fresh = Self::connect_within(&discovery, retry).await?;
+            self.reader = fresh.reader;
+            self.writer = fresh.writer;
+            self.socket_path = fresh.socket_path;
+        }
+    }
+
+    fn outcome_unknown(&self, request: &FrontendRequest, error: &anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(OutcomeUnknown {
+            request: request_name(request),
+            socket_path: self.socket_path.clone(),
+            detail: format!("{error:#}"),
+        })
+    }
+
+    async fn exchange(&mut self, request: &FrontendRequest) -> Result<FrontendEvent, Exchange> {
         let request_id = format!("client-{}", self.next_request_id.fetch_add(1, Ordering::Relaxed));
-        let payload = serde_json::to_string(&FrontendRequestEnvelope {
+        let mut payload = serde_json::to_string(&FrontendRequestEnvelope {
             request_id: request_id.clone(),
             payload: request.clone(),
-        })?;
-        self.writer.write_all(payload.as_bytes()).await?;
-        self.writer.write_all(b"\n").await?;
-        self.writer.flush().await?;
+        })
+        .map_err(|err| Exchange::Fatal(err.into()))?;
+        payload.push('\n');
+        self.writer
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|err| Exchange::NotSent(anyhow::Error::new(err).context("failed to write request to engine")))?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|err| Exchange::NotSent(anyhow::Error::new(err).context("failed to flush request to engine")))?;
 
-        while let Some(line) = self.reader.next_line().await? {
+        loop {
+            let line = match self.reader.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    return Err(Exchange::Dropped(anyhow::anyhow!(
+                        "engine closed the socket before returning a response"
+                    )));
+                }
+                Err(err) => {
+                    return Err(Exchange::Dropped(
+                        anyhow::Error::new(err).context("failed to read engine response"),
+                    ));
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
-            let envelope: FrontendEventEnvelope =
-                serde_json::from_str(&line).with_context(|| format!("failed to decode engine event: {line}"))?;
+            let envelope: FrontendEventEnvelope = serde_json::from_str(&line)
+                .with_context(|| format!("failed to decode engine event: {line}"))
+                .map_err(Exchange::Fatal)?;
             if envelope.request_id.as_deref() == Some(request_id.as_str()) {
                 return Ok(envelope.payload);
             }
         }
-
-        bail!("engine closed the socket before returning a response")
     }
+}
+
+/// One connect attempt across the discovery endpoints (primary, then the
+/// legacy fallback). On failure returns the *primary* endpoint's error, the
+/// one the user can act on.
+async fn connect_any_endpoint(discovery: &Discovery) -> io::Result<(UnixStream, String)> {
+    let mut primary_error = None;
+    for (socket_path, _) in discovery.endpoint_candidates() {
+        match timeout(CONNECT_ATTEMPT_TIMEOUT, UnixStream::connect(socket_path)).await {
+            Ok(Ok(stream)) => return Ok((stream, socket_path.to_owned())),
+            Ok(Err(err)) => primary_error.get_or_insert(err),
+            Err(_) => primary_error.get_or_insert_with(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "connect to {socket_path} timed out after {}s",
+                        CONNECT_ATTEMPT_TIMEOUT.as_secs()
+                    ),
+                )
+            }),
+        };
+    }
+    Err(primary_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no engine endpoint configured")))
+}
+
+/// Autostart step inside the connect loop: wait for an engine that is
+/// already starting/restarting, or start one — but start at most one per
+/// `connect` call (`spawned`), so a slow start is waited on, not duplicated.
+async fn ensure_engine_for_connect(discovery: &Discovery, retry: &RetryState, spawned: &mut bool) -> Result<()> {
+    let wait = if retry.policy().is_enabled() {
+        let remaining = retry.policy().max_wait.saturating_sub(retry.elapsed());
+        discovery.start_timeout.min(remaining.max(Duration::from_millis(250)))
+    } else {
+        discovery.start_timeout
+    };
+    ensure_engine_running_with(discovery, !*spawned, wait, spawned).await
 }
 
 impl BossClient {
@@ -296,6 +512,20 @@ pub fn read_pid_file(pid_file_path: &str) -> Option<u32> {
 }
 
 pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
+    ensure_engine_running_with(discovery, true, discovery.start_timeout, &mut false).await
+}
+
+/// [`ensure_engine_running`] with the pieces `BossClient::connect` needs to
+/// call it repeatedly inside a backoff loop: `allow_spawn` says whether this
+/// call may start an engine process (the loop passes `false` once it has
+/// already started one), `wait` bounds each readiness wait, and `spawned` is
+/// set when this call starts a process.
+async fn ensure_engine_running_with(
+    discovery: &Discovery,
+    allow_spawn: bool,
+    wait: Duration,
+    spawned: &mut bool,
+) -> Result<()> {
     if discover_running_engine(discovery).await.is_some() {
         return Ok(());
     }
@@ -314,7 +544,7 @@ pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
         .find_map(|(_, pid_path)| running_engine_pid(pid_path).map(|pid| (pid, pid_path)))
         .filter(|(pid, _)| is_likely_engine_process(*pid))
     {
-        if wait_for_discovered_engine(discovery, discovery.start_timeout).await {
+        if wait_for_discovered_engine(discovery, wait).await {
             return Ok(());
         }
         bail!(
@@ -323,15 +553,28 @@ pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
         );
     }
 
+    if !allow_spawn {
+        // We already started an engine for this call and it has not
+        // published its socket yet: keep waiting, do not start another.
+        if wait_for_discovered_engine(discovery, wait).await {
+            return Ok(());
+        }
+        bail!(
+            "the engine started for this command has not yet published socket {}",
+            discovery.socket_path
+        );
+    }
+
     start_engine_process(discovery)?;
-    if wait_for_discovered_engine(discovery, discovery.start_timeout).await {
+    *spawned = true;
+    if wait_for_discovered_engine(discovery, wait).await {
         return Ok(());
     }
 
     bail!(
         "boss engine did not become ready at {} within {} seconds",
         discovery.socket_path,
-        discovery.start_timeout.as_secs()
+        wait.as_secs()
     )
 }
 
@@ -966,6 +1209,8 @@ mod tests {
             },
             launch_directory: tmp.path().to_path_buf(),
             start_timeout: Duration::from_secs(1),
+            retry: RetryPolicy::disabled(),
+            worker_environment: false,
         };
 
         let running = discover_running_engine(&discovery)
@@ -997,6 +1242,8 @@ mod tests {
             },
             launch_directory: tmp.path().to_path_buf(),
             start_timeout: Duration::from_secs(1),
+            retry: RetryPolicy::disabled(),
+            worker_environment: false,
         };
 
         assert_eq!(

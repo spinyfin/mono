@@ -36,6 +36,37 @@ authority the macOS app uses — and falls back to `SIGTERM` only when the RPC
 path is unavailable, giving a developer a recoverable kill switch for a
 wedged engine on a non-standard layout.
 
+## Riding out an engine restart
+
+An engine restart (an update, a crash-and-relaunch) leaves the socket
+missing or refusing connections for a few seconds. `BossClient::connect`
+waits that out instead of failing: connect-phase failures (socket missing,
+connection refused, connect timeout) are retried with exponential backoff
+(250ms doubling to a 5s cap, with jitter) for up to **10 minutes**, printing
+a one-line notice to stderr on the first retry and every 15s after — never
+to stdout, so `--json` output stays clean. After the budget it fails with
+`EngineUnreachable`, naming the socket path and the time waited (`boss`
+exits 5). Opt out with `--no-retry`, `--engine-max-wait <secs>`, or
+`BOSS_ENGINE_MAX_WAIT_SECS` (`0` disables). `connect_socket` is a bare
+single connection with no retry, for engine control and tests.
+
+`send_request` also recovers from a dropped connection, but only when that
+cannot apply a request twice. A failed _write_ means nothing was delivered,
+so any request is resent on a fresh connection. If the write succeeded and
+the reply never came, the request is resent only if `replay_safety` marks it
+idempotent or guarded by an engine-side check (reads, `Set*` setters,
+`SubmitProposal`, `SubmitAttachment`, guarded `CreateTask`/`CreateChore`
+within the duplicate-guard window, …); anything else fails with
+`OutcomeUnknown` — "check state before retrying" — and is never resent. The
+full classification table is in `src/replay.rs`; unclassified requests
+default to _not_ resendable.
+
+Autostart keeps its meaning (`--no-engine-autostart` still forbids it). When
+it applies, the client starts at most one engine per call and waits for an
+engine that is already starting or restarting (live pid file) rather than
+racing a second. A Boss worker (`BOSS_RUN_ID` set) never autostarts an
+engine, whatever the flags say.
+
 ## Consumers
 
 `boss-engine`, `bossctl`, and the `boss` CLI all depend on this crate to
