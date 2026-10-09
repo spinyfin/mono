@@ -1932,13 +1932,13 @@ fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on_for_revisi
 
 #[test]
 fn revision_no_op_directive_teaches_no_changes_needed_declaration() {
-    // Before this directive existed, no revision prompt ever taught the
-    // no-changes-needed declaration: `no_op_completion_directive` is gated to
-    // `TaskImplementation | ChoreImplementation` with no existing PR, and a
-    // revision always has a bound parent PR — so `on_stop_inner`'s revision
-    // no-op terminal (`worker_signalled_no_op`) was unreachable in
-    // production. Assert the declaration and its revision-specific framing (keyed
-    // on the dispatched finding, not on an empty `jj diff`) are present.
+    // `no_op_completion_directive` is gated to `TaskImplementation |
+    // ChoreImplementation` with no existing PR, and a revision always has a
+    // bound parent PR — so a revision needs its own directive teaching the
+    // declaration, or `on_stop_inner`'s revision no-op terminal
+    // (`worker_signalled_no_op`, which reads only the typed declaration) is
+    // unreachable. Assert the declaration and its revision-specific framing
+    // (keyed on the dispatched finding, not on an empty `jj diff`) are present.
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()

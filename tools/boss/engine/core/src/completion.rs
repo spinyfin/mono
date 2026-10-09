@@ -1907,13 +1907,11 @@ pub const REMOTE_COLLECTION_FAILED_ATTENTION_KIND: &str = "remote_collection_fai
 /// out to explain itself rather than churning.
 ///
 /// The final sentence names the typed `boss propose done --outcome
-/// no-changes-needed` declaration rather than inviting free prose. A probe
-/// that asks the worker to "explain your status" gets exactly that — prose —
-/// and prose is not a terminal signal any engine path can read:
-/// `worker_signalled_no_op` reads only the `run_done` declaration. Asking in
-/// a language the engine cannot parse is what stranded the 2026-08-12
-/// revision worker on mono#2622 for 2h40m (see [`probe_push_to_existing_pr`]).
-/// Pinned by `probe_texts_name_the_no_op_declaration`.
+/// no-changes-needed` declaration rather than inviting free prose. Invariant:
+/// `worker_signalled_no_op` reads only that declaration, so a probe that
+/// merely invites prose cannot be acted on (the mono#2622 stall — see
+/// [`probe_push_to_existing_pr`]). Pinned by
+/// `probe_texts_name_the_no_op_declaration`.
 pub const PROBE_NO_PR: &str = "You stopped without producing a PR for this work. \
 If the work is complete, open the PR with `cube pr create --branch <bookmark>` (pushes the \
 branch and opens the PR in one step, jj-aware, no GIT_DIR needed). If a PR already exists \
@@ -2014,17 +2012,14 @@ fn mergeability_satisfies_deliverable(mergeability: OpenPrMergeability, merge_co
 /// PR's branch. Phrased so a worker with nothing left to do can say so
 /// rather than churning; the circuit breaker bounds repeats.
 ///
-/// **"Say so" must name the typed declaration.** This probe used to end
-/// *"there is nothing left to do, say so — explain your status instead of
-/// re-running."* A worker that complied answered in prose, and prose is
-/// unreadable to every terminal the engine owns: `worker_signalled_no_op`
-/// reads only the `run_done` declaration. So the engine asked a question in a
-/// language it cannot read, scored the honest answer as "no progress", and
-/// re-entered the nudge ladder — where the debounce then swallowed the
-/// boundary and the run sat idle holding its slot for 2h40m. Naming
-/// `boss propose done --outcome no-changes-needed` is what turns a correct
-/// "nothing to do" conclusion into an actual terminal on the worker's very
-/// next turn. Pinned by `probe_texts_name_the_no_op_declaration`.
+/// **"Say so" must name the typed declaration.** Invariant:
+/// `worker_signalled_no_op` reads only the `boss propose done --outcome
+/// no-changes-needed` declaration, so a probe that only invites a prose
+/// answer ("explain your status") cannot be acted on — the honest answer is
+/// scored as "no progress" and the run idles in the nudge ladder holding its
+/// slot (the mono#2622 stall). Naming the declaration turns a correct
+/// "nothing to do" conclusion into a terminal on the worker's next turn.
+/// Pinned by `probe_texts_name_the_no_op_declaration`.
 pub fn probe_push_to_existing_pr(pr_url: &str) -> String {
     format!(
         "A PR already exists for this work: {pr_url}. Do NOT open a new PR. If you have local \
@@ -2035,6 +2030,16 @@ Declare it with `\"$BOSS_BIN\" propose done --outcome no-changes-needed --summar
 verified>\"`; that is the sanctioned way to close this run without another push."
     )
 }
+
+/// Probe queued when the no-op guard refuses a `no-changes-needed`
+/// declaration at submit. The declaration is consumed on refusal, so the
+/// worker must re-verify and declare again for the claim to count.
+pub const NO_OP_DECLARATION_REFUSED_PROBE: &str = "Your `no-changes-needed` declaration was refused: \
+the engine could not trust the verification behind it (a command ran without a confirmed \
+result, or an observed contribution contradicts the claim). The declaration has been discarded. \
+Re-run the verification and confirm the outcome. If the work is genuinely complete with nothing \
+to change, declare it again with `\"$BOSS_BIN\" propose done --outcome no-changes-needed --summary \
+\"<what you verified>\"`; otherwise finish the work and open or update the PR.";
 
 /// Probe text dispatched when a PR exists but the worker has local
 /// commits that haven't been pushed yet — the PR is stale.

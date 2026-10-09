@@ -13,11 +13,12 @@
 //!
 //! Two independent defects had to line up:
 //!
-//! 1. **The engine asked in a language it cannot read.** The re-prompt
+//! 1. **The re-prompt invited prose the engine cannot act on.** The re-prompt
 //!    (`probe_push_to_existing_pr`) ended *"there is nothing left to do,
-//!    say so — explain your status"*, inviting prose; the engine's only
-//!    terminal for that state is the typed `run_done` `no-changes-needed`
-//!    declaration, which prose can never satisfy. Compliance was unparseable.
+//!    say so — explain your status"*. The invariant is that
+//!    `worker_signalled_no_op` reads only the typed `run_done`
+//!    `no-changes-needed` declaration, which prose can never satisfy, so
+//!    compliance with that wording was unreadable.
 //! 2. **The nudge ladder had an absorbing state.** The reply landed inside
 //!    [`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`], so the boundary
 //!    produced `NudgeDebounced` — a decision to wait for "the next Stop".

@@ -33,6 +33,35 @@ use boss_protocol::{
     RequestExecutionInput, Task, WorkComment, WorkExecution,
 };
 
+/// Declare `no-changes-needed` the way a worker does: submit a real `run_done`
+/// proposal through [`WorkDb::submit_worker_proposal`] (validation, derived
+/// idempotency key, auto-apply), which stamps `run_done_outcome` /
+/// `run_done_declared_at` with a realistic timestamp. Re-declaring after a
+/// refusal consumed the earlier declaration is a fresh submission.
+pub fn declare_no_changes_needed(db: &WorkDb, execution_id: &str) {
+    use boss_engine_proposal_validation::{derive_idempotency_key, validate_payload};
+    let execution = db.get_execution(execution_id).unwrap();
+    let kind = boss_protocol::ProposalKind::RunDone;
+    let validated = validate_payload(
+        kind,
+        &serde_json::json!({"outcome": "no_changes_needed", "summary": "verified: nothing left to change"}),
+    )
+    .expect("run_done payload validates");
+    let key = derive_idempotency_key(execution_id, kind, &validated.canonical_json);
+    let outcome = db
+        .submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id,
+            work_item_id: &execution.work_item_id,
+            kind,
+            payload_json: &validated.canonical_json,
+            idempotency_key: &key,
+        })
+        .unwrap()
+        .expect("run_done submission accepted");
+    assert!(!outcome.already_submitted, "declaration must be a fresh submission");
+    assert_eq!(outcome.proposal.state, boss_protocol::ProposalState::Applied);
+}
+
 /// Direct-DB fixtures must model the bookmark that dispatch creates before spawn.
 /// Retain the returned directory for the duration of the test.
 pub async fn seed_empty_execution_bookmark(db: &WorkDb, execution_id: &str) -> TempDir {

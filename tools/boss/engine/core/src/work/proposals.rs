@@ -657,6 +657,45 @@ impl WorkDb {
         }
     }
 
+    /// Consume a refused `no-changes-needed` declaration: clear the durable
+    /// stamp so a later Stop boundary cannot re-accept it without the worker
+    /// declaring again, and supersede the applied `run_done` proposal that
+    /// made it. Superseding also renames the proposal's idempotency key, so
+    /// a fresh declaration with an identical payload is a new submission
+    /// that re-stamps, not a replay that returns the dead row. Only a
+    /// `no_changes_needed` stamp is touched — a `delivered`/`blocked`
+    /// declaration never is. Returns whether a stamp was cleared.
+    pub fn clear_no_changes_needed_declaration(&self, execution_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cleared = tx.execute(
+            "UPDATE work_executions SET run_done_declared_at = NULL, run_done_outcome = NULL \
+             WHERE id = ?1 AND run_done_outcome = ?2",
+            params![execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded.as_str()],
+        )? > 0;
+        if cleared {
+            tx.execute(
+                "UPDATE worker_proposals
+                 SET state = ?2, decided_by = ?3, decided_at = ?4,
+                     decision_reason = 'no-changes-needed declaration refused by the no-op guard; declare again',
+                     idempotency_key = idempotency_key || '#refused-' || id
+                 WHERE id = (SELECT id FROM worker_proposals
+                             WHERE execution_id = ?1 AND kind = ?5 AND state = ?6
+                             ORDER BY rowid DESC LIMIT 1)",
+                params![
+                    execution_id,
+                    ProposalState::Superseded.as_str(),
+                    boss_protocol::ProposalDecider::Policy.as_str(),
+                    now_string(),
+                    ProposalKind::RunDone.as_str(),
+                    ProposalState::Applied.as_str(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(cleared)
+    }
+
     /// Stamp the backstop's "this run ended without ever declaring" marker.
     pub fn mark_execution_run_undeclared(&self, execution_id: &str) -> Result<()> {
         let conn = self.connect()?;

@@ -796,20 +796,6 @@ fn write_assistant_transcript(db: &WorkDb, workspace_path: &Path, execution_id: 
         .unwrap();
 }
 
-/// Stamp the durable `run_done` declaration a worker's
-/// `boss propose done --outcome no-changes-needed` leaves on the execution
-/// row (what `apply_run_done` writes), which is the only channel the engine's
-/// no-op terminal reads.
-fn declare_no_changes_needed(db: &WorkDb, execution_id: &str) {
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE work_executions SET run_done_outcome = 'no_changes_needed', run_done_declared_at = '1' WHERE id = ?1",
-            [execution_id],
-        )
-        .unwrap();
-}
-
 /// Point `work_item_id`'s driver at `slug`, so
 /// `WorkDb::get_execution_driver_slug` — and therefore every driver-aware
 /// read of its executions' transcripts — resolves to that driver.
