@@ -273,6 +273,7 @@ struct SlotMeta {
     /// pid as evidence of a working worker is what the 2026-07-30
     /// incident walked through untouched.
     driver_signal_at: Option<i64>,
+    first_hook_event: Option<String>,
     /// Whether this registration is a newly spawned pane or an adopted
     /// existing worker. [`DriverStartExpectation::Readopted`] still subjects
     /// the slot to the driver-start timeout
@@ -1087,6 +1088,25 @@ impl LiveWorkerStateRegistry {
             "driver-start verified: first driver-originated signal received for this run",
         );
         Some(slot_id)
+    }
+
+    pub fn record_hook_event_kind(&self, run_id: &str, kind: &str) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id)
+            && entry.meta.first_hook_event.is_none()
+        {
+            entry.meta.first_hook_event = Some(kind.to_owned());
+            tracing::info!(run_id, first_hook_event = kind, "first driver hook received");
+        }
+    }
+
+    pub fn first_hook_event_for_run(&self, run_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .values()
+            .find(|entry| entry.state.run_id == run_id)
+            .and_then(|entry| entry.meta.first_hook_event.clone())
     }
 
     /// Whether a driver-originated signal has been recorded for `slot_id`.

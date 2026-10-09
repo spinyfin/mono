@@ -6,7 +6,7 @@
 //! evidence before treating the spawn as successful:
 //!
 //! 1. **Composer readiness** — driver-specific PTY evidence that the CLI
-//!    is actually up (`PaneMonitorSpec` agent markers).
+//!    is actually up (`PaneMonitorSpec` agent markers), or a fresh driver signal.
 //!    For argv delivery this is the analog of "the composer can accept
 //!    input": the CLI has exec'd and rendered its surface, which is what
 //!    proves the sourced script did not die at `execve()`.
@@ -103,16 +103,16 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let start = tokio::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if ready().await {
+        if tokio::time::timeout_at(deadline, ready()).await.unwrap_or(false) {
             return true;
         }
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             return false;
         }
-        let remaining = timeout.saturating_sub(elapsed);
+        let remaining = deadline - now;
         tokio::time::sleep(poll.min(remaining)).await;
     }
 }
@@ -120,7 +120,7 @@ where
 pub(crate) fn composer_not_ready_error(driver_name: &str, run_id: &str, timeout: Duration) -> anyhow::Error {
     anyhow!(
         "refusing to complete {driver_name} spawn for {run_id}: driver composer never became ready within {}s \
-         (no pane marker from the driver's monitor spec after prompt delivery); recording a failed spawn",
+         (no driver signal or pane marker after prompt delivery); recording a failed spawn",
         timeout.as_secs()
     )
 }
@@ -142,7 +142,7 @@ pub(crate) async fn confirm_spawn_started<Ready, ReadyFut, Started, StartedFut>(
     turn_timeout: Duration,
     poll: Duration,
     composer_ready: Ready,
-    turn_started: Started,
+    mut turn_started: Started,
 ) -> anyhow::Result<()>
 where
     Ready: FnMut() -> ReadyFut,
@@ -150,7 +150,20 @@ where
     Started: FnMut() -> StartedFut,
     StartedFut: std::future::Future<Output = bool>,
 {
-    if !wait_until(composer_timeout, poll, composer_ready).await {
+    // Poll signals independently: a stuck tmux capture must not hide a hook.
+    let composer_ready = tokio::select! {
+        biased;
+        started = wait_until(composer_timeout, poll, &mut turn_started) => {
+            if started { return Ok(()); }
+            false
+        }
+        ready = wait_until(composer_timeout, poll, composer_ready) => ready,
+    };
+    if !composer_ready {
+        // Recheck evidence at the deadline before classifying a dead exec.
+        if tokio::time::timeout(poll, turn_started()).await.unwrap_or(false) {
+            return Ok(());
+        }
         return Err(composer_not_ready_error(driver_name, run_id, composer_timeout));
     }
     if !wait_until(turn_timeout, poll, turn_started).await {
@@ -263,6 +276,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_capture_cannot_extend_dead_exec_deadline() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            confirm_spawn_started(
+                "claude",
+                "dead-exec",
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+                Duration::from_millis(5),
+                std::future::pending::<bool>,
+                || async { false },
+            ),
+        )
+        .await
+        .expect("capture must be cancelled at the deadline");
+        assert!(result.unwrap_err().to_string().contains("composer never became ready"));
+    }
+
+    #[tokio::test]
+    async fn hook_without_any_visible_marker_passes() {
+        confirm_spawn_started(
+            "claude",
+            "hook-only",
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            || async { false },
+            || async { true },
+        )
+        .await
+        .expect("driver evidence proves both readiness and turn start");
+    }
+
+    #[test]
+    fn banner_in_scrollback_survives_prompt_and_tool_output() {
+        let text = format!("Claude Code\n{}\n❯ ", "long prompt or tool output\n".repeat(200));
+        assert!(pane_shows_driver_ready(&text, &claude_spec()));
+    }
+
+    #[tokio::test]
     async fn wait_until_returns_true_when_predicate_flips() {
         let ready = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&ready);
@@ -292,7 +345,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(5),
             || async { false },
-            || async { true },
+            || async { false },
         )
         .await
         .expect_err("must fail the spawn");
@@ -353,7 +406,7 @@ mod tests {
             Duration::from_millis(100),
             Duration::from_millis(200),
             Duration::from_millis(5),
-            || async { pane_shows_driver_ready("Claude Code", &claude_spec()) },
+            std::future::pending::<bool>,
             || async { registry.has_driver_signal_for_run("exec-hook") },
         )
         .await

@@ -1276,7 +1276,14 @@ impl ExecutionRunner for PaneSpawnRunner {
             {
                 return Ok(cancelled);
             }
-            if let Err(err) = confirm {
+            if let Err(err) = confirm
+                && !spawner.live_worker_state_registry().is_some_and(|registry| {
+                    matches!(
+                        registry.confirm_never_started_reap(started.slot_id, &execution.id),
+                        crate::live_worker_state::NeverStartedReapCommit::DriverSignalled
+                    )
+                })
+            {
                 tracing::warn!(
                     worker_id,
                     execution_id = %execution.id,
@@ -1373,24 +1380,48 @@ async fn confirm_local_spawn(
 
     let driver_name = driver.descriptor().name;
     let spec = driver.pane_monitor_spec();
-    confirm_spawn_started(
+    let started_at = boss_engine_utils::epoch_time::now_epoch_secs();
+    let started = std::time::Instant::now();
+    let last_capture = std::sync::Mutex::new(String::new());
+    tracing::info!(run_id, %started_at, "composer readiness wait started");
+    let result = confirm_spawn_started(
         driver_name,
         run_id,
         composer_timeout,
         turn_timeout,
         SPAWN_CONFIRM_POLL,
         || async {
-            let Ok(pane_text) = tmux_host.tmux().capture_pane(tmux_host.session_name()).await else {
+            let Ok(pane_text) = tmux_host
+                .tmux()
+                .capture_pane_with_history(tmux_host.session_name())
+                .await
+            else {
                 return false;
             };
+            // Bound diagnostic text without splitting UTF-8 characters.
+            *last_capture.lock().expect("capture mutex poisoned") = pane_text
+                .chars()
+                .rev()
+                .take(4096)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
             match spec.as_ref() {
                 Some(spec) => pane_shows_driver_ready(&pane_text, spec),
-                None => !pane_text.trim().is_empty(),
+                None => false,
             }
         },
         || async { live_states.is_some_and(|registry| registry.has_driver_signal_for_run(run_id)) },
     )
-    .await
+    .await;
+    if result.is_err() {
+        tracing::warn!(run_id, %started_at, elapsed_ms = started.elapsed().as_millis() as u64,
+            first_hook_event = ?live_states.and_then(|registry| registry.first_hook_event_for_run(run_id)),
+            last_pane_text = %last_capture.lock().expect("capture mutex poisoned"),
+            "spawn confirmation evidence at failure");
+    }
+    result
 }
 
 /// The shell's background tier is inherited by drivers and build tools,

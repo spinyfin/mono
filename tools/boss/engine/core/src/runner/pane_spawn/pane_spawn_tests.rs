@@ -2290,6 +2290,35 @@ async fn spawn_confirmation_passes_when_driver_chrome_and_hook_arrive() {
 }
 
 #[tokio::test]
+async fn spawn_confirmation_passes_when_hook_arrives_without_chrome() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.pane_chrome.store(false, std::sync::atomic::Ordering::SeqCst);
+    spawner
+        .auto_confirm_turn
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(200));
+
+    runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .expect("a recorded hook without composer chrome must complete spawn");
+    assert!(spawner.reaped_run_ids().is_empty());
+}
+
+#[tokio::test]
 async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);

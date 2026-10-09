@@ -1047,3 +1047,27 @@ fn unlink_stale_socket_leaves_a_regular_file_alone() {
     assert!(path.exists());
     std::fs::remove_file(&path).unwrap();
 }
+
+#[tokio::test]
+async fn readiness_capture_includes_bounded_scrollback() {
+    let (tmux, runner) = tmux([success("Claude Code\nold prompt\ncurrent output\n")]);
+    assert!(
+        tmux.capture_pane_with_history("boss-1")
+            .await
+            .unwrap()
+            .starts_with("Claude Code")
+    );
+    assert_eq!(
+        runner.calls(),
+        vec![vec![
+            "-S",
+            TEST_SOCKET_PATH,
+            "capture-pane",
+            "-p",
+            "-S",
+            "-2000",
+            "-t",
+            "boss-1"
+        ]]
+    );
+}
