@@ -429,7 +429,8 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// the button (also gated by `snapshot.showsAttachmentsAffordance`).
     var onOpenAttachments: (() -> Void)? = nil
     /// Invoked when the user taps the `reviewed_with_findings` AI-review
-    /// badge — opens the revision's findings description.
+    /// badge — opens the revision's findings description and reveals the
+    /// revision's card (or its parent's card once it is rolled up).
     /// Only called when `snapshot.aiReviewFindingsRevisionId`
     /// is non-nil.
     var onRevealAIReviewFindings: (() -> Void)? = nil
@@ -450,6 +451,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.snapshot == rhs.snapshot
             && lhs.isRevisionHighlighted == rhs.isRevisionHighlighted
+            && lhs.aiReviewFindingsTooltipNote == rhs.aiReviewFindingsTooltipNote
     }
 
     var body: some View {

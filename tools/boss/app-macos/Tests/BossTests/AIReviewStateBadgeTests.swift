@@ -50,6 +50,18 @@ final class AIReviewStateBadgeTests: XCTestCase {
     }
 
     @MainActor
+    func testCardEqualityIncludesFindingsTooltipNote() {
+        let task = makeTask(kind: "chore")
+        let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .review))
+        var a = WorkBoardCardView(snapshot: snapshot, isRevisionHighlighted: false)
+        var b = a
+        XCTAssertEqual(a, b)
+        a.aiReviewFindingsTooltipNote = "No fix task yet."
+        b.aiReviewFindingsTooltipNote = "Click to open the findings."
+        XCTAssertNotEqual(a, b)
+    }
+
+    @MainActor
     func testMissingFindingsRevisionReportsErrorWithoutNavigating() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         model.asyncMarkdownViewerOpener = { XCTFail("Missing revision must not open a document") }

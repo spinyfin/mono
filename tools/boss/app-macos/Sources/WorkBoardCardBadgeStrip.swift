@@ -116,7 +116,8 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
     /// `slice.reviewGuidePresentation.showsRetry`.
     var onRetryReviewGuide: (() -> Void)? = nil
     /// Invoked when the user taps the `reviewed_with_findings` badge —
-    /// opens the follow-up revision's findings description.
+    /// opens the follow-up revision's findings description and reveals the
+    /// revision's card (or its parent's card once it is rolled up).
     /// Only called when `slice.aiReviewFindingsRevisionId` is non-nil.
     var onRevealAIReviewFindings: (() -> Void)? = nil
     /// Tooltip sentence for the findings badge; see `AIReviewStateBadge`.

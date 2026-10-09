@@ -155,8 +155,8 @@ extension ChatViewModel {
     }
 
     /// One click on the findings badge does both jobs: open the findings
-    /// brief, and reveal the card of the revision that will fix them so the
-    /// operator can see where that work is and what state it is in.
+    /// brief, and reveal the card of the revision that will fix them to show
+    /// where that work lives and its state.
     /// `revealWorkCard` targets the revision's own card whenever it has one
     /// (queued / active); only a revision that reached `in_review`/`done`
     /// is rolled up onto its parent's card, and
