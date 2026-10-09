@@ -42,11 +42,28 @@ fn project_attribution(work_db: &WorkDb, work_item_id: &str) -> (Option<String>,
 
 /// Build the metadata for `execution` running on `host_id` (`"local"` or a
 /// registered remote host id).
+///
+/// Looks up whether the work item has a source automation. Registration paths
+/// that already computed that flag for the pool label should call
+/// [`resolve_with_automation`] instead of paying for a second query.
+#[cfg(test)]
 pub(crate) fn resolve(work_db: &WorkDb, execution: &WorkExecution, host_id: &str) -> LiveWorkerMetadata {
     let has_source_automation = matches!(
         work_db.source_automation_id_for_work_item(&execution.work_item_id),
         Ok(Some(_))
     );
+    resolve_with_automation(work_db, execution, host_id, has_source_automation)
+}
+
+/// Like [`resolve`], but takes the caller's already-computed
+/// `has_source_automation` (the same flag fed to `attributed_pool_label`), so
+/// the badge type and the stamped pool derive from one lookup.
+pub(crate) fn resolve_with_automation(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    host_id: &str,
+    has_source_automation: bool,
+) -> LiveWorkerMetadata {
     let (project_id, project_name) = project_attribution(work_db, &execution.work_item_id);
     LiveWorkerMetadata {
         agent_type: Some(

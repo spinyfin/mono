@@ -153,6 +153,61 @@ fn attributed_pool_label_matches_coordinator_routing() {
     );
 }
 
+/// The badge type (`AgentType::for_execution`) and the pool stamped on the same
+/// `LiveWorkerState` (`attributed_pool_label`) encode the same
+/// review > automation precedence; this fails if either drifts.
+#[test]
+fn agent_type_agrees_with_attributed_pool_label_for_every_kind() {
+    use boss_protocol::AgentType;
+    let kinds = [
+        ExecutionKind::AnswerAgent,
+        ExecutionKind::AutomationTriage,
+        ExecutionKind::ChoreImplementation,
+        ExecutionKind::CiRemediation,
+        ExecutionKind::ConflictResolution,
+        ExecutionKind::InvestigationImplementation,
+        ExecutionKind::PrReview,
+        ExecutionKind::PrReviewGuide,
+        ExecutionKind::ProductDesign,
+        ExecutionKind::ProjectDesign,
+        ExecutionKind::RevisionImplementation,
+        ExecutionKind::TaskImplementation,
+    ];
+    // Exhaustiveness guard: a new kind must be added to the list above.
+    for kind in &kinds {
+        match kind {
+            ExecutionKind::AnswerAgent
+            | ExecutionKind::AutomationTriage
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::CiRemediation
+            | ExecutionKind::ConflictResolution
+            | ExecutionKind::InvestigationImplementation
+            | ExecutionKind::PrReview
+            | ExecutionKind::PrReviewGuide
+            | ExecutionKind::ProductDesign
+            | ExecutionKind::ProjectDesign
+            | ExecutionKind::RevisionImplementation
+            | ExecutionKind::TaskImplementation => {}
+        }
+    }
+    for kind in kinds {
+        for has_source_automation in [false, true] {
+            let pool = attributed_pool_label(kind.clone(), has_source_automation);
+            let agent_type = AgentType::for_execution(&kind, has_source_automation);
+            assert_eq!(
+                agent_type == AgentType::Review,
+                pool == "review",
+                "review split diverged for {kind:?} (automation={has_source_automation})"
+            );
+            assert_eq!(
+                agent_type == AgentType::Automation,
+                pool == "automation",
+                "automation split diverged for {kind:?} (automation={has_source_automation})"
+            );
+        }
+    }
+}
+
 #[test]
 fn release_slot_clears_entry() {
     let reg = LiveWorkerStateRegistry::new();

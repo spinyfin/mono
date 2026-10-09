@@ -63,7 +63,12 @@ pub(crate) async fn register_adopted_live_state<S>(
         binding,
         awaiting_input_capable,
         LiveSpawnRouting::new_with_hosting(Some(pool.to_owned()), execution.kind.as_str(), true).with_metadata(
-            crate::live_worker_metadata::resolve(work_db, execution, boss_protocol::LOCAL_HOST_ID),
+            crate::live_worker_metadata::resolve_with_automation(
+                work_db,
+                execution,
+                boss_protocol::LOCAL_HOST_ID,
+                has_source_automation,
+            ),
         ),
         ReadoptionEvidence::LiveShellPid,
     );

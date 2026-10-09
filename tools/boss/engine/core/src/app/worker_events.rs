@@ -1082,7 +1082,12 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
             binding,
             ClaudeDriver.capabilities().provides(Capability::AwaitingInputSignal),
             crate::live_worker_state::LiveSpawnRouting::new(pool, execution.kind.as_str()).with_metadata(
-                crate::live_worker_metadata::resolve(&server_state.work_db, &execution, &host),
+                crate::live_worker_metadata::resolve_with_automation(
+                    &server_state.work_db,
+                    &execution,
+                    &host,
+                    has_source_automation,
+                ),
             ),
         );
         tracing::info!(

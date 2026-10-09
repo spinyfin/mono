@@ -563,10 +563,11 @@ impl ServerState {
                     restored.kind.as_str(),
                     tmux_hosted,
                 )
-                .with_metadata(crate::live_worker_metadata::resolve(
+                .with_metadata(crate::live_worker_metadata::resolve_with_automation(
                     &self.work_db,
                     &restored,
                     &readoption_host_id,
+                    has_source_automation,
                 )),
                 evidence,
             );
