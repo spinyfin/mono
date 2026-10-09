@@ -657,6 +657,7 @@ pub(crate) mod personas;
 mod project_postmortem;
 #[cfg(test)]
 mod project_postmortem_tests;
+mod queued_wait;
 pub(crate) use feedback_target::FeedbackTarget;
 mod description_guard;
 mod guide_comments;

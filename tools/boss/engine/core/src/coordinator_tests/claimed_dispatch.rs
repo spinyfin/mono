@@ -5,6 +5,53 @@
 use super::helpers::*;
 use boss_protocol::ExecutionKind;
 
+#[tokio::test]
+async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_notifications() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Waiting for capacity");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let publisher = Arc::new(crate::test_support::RecordingPublisher::default());
+    let coordinator = Arc::new(ExecutionCoordinator::with_publisher(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..Default::default()
+        }),
+        publisher.clone(),
+    ));
+    let worker = coordinator.worker_pool().claim_worker("exec_busy", None).await.unwrap();
+    coordinator.drain_ready_queue().await;
+    let runtime = db.get_task_runtime(&chore.id).unwrap();
+    assert_eq!(runtime.execution_status, Some(ExecutionStatus::Ready));
+    assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some("pool_exhausted"));
+    assert_eq!(
+        *publisher.events.lock().await,
+        vec![(product.id.clone(), chore.id.clone(), "dispatch_wait_changed".into())]
+    );
+    coordinator.drain_ready_queue().await;
+    assert_eq!(
+        publisher.events.lock().await.len(),
+        1,
+        "unchanged holds must not refetch the board every pass"
+    );
+
+    coordinator.worker_pool().release_worker(&worker, None).await;
+    coordinator.drain_ready_queue().await;
+    assert!(
+        publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .any(|(pid, id, reason)| { pid == &product.id && id == &chore.id && reason == "dispatch_claimed" })
+    );
+    assert!(db.get_task_runtime(&chore.id).unwrap().dispatch_wait_reason.is_none());
+}
+
 /// Drain-loop chain hold must revert the pickup claim so a serialized row
 /// stays `ready` rather than stranding in `claimed`.
 #[tokio::test]

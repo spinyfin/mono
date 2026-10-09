@@ -37,9 +37,28 @@ enum BossRevealCapture {
             )
         }
         if state == "missing" { rows.removeLast() }
+        var runtimes: [WorkTaskRuntime] = []
+        if state == "queued" {
+            rows = Array(rows.suffix(2))
+            rows[0].status = "active"
+            rows[0].name = "Earlier review revision"
+            rows[0].shortID = 41
+            rows[1].status = "todo"
+            rows[1].autostart = true
+            rows[1].name = "Apply the next review findings"
+            rows[1].shortID = 42
+            runtimes = [WorkTaskRuntime(
+                workItemID: rows[1].id, executionStatus: "waiting_dependency", runStatus: nil,
+                executionID: "capture-pending", dispatchRetryAt: nil,
+                dispatchWaitReason: "waiting_dependency", dispatchWaitSince: nil,
+                dispatchWaitBlocker: DispatchWaitBlocker(
+                    workItemID: rows[0].id, productID: product.id, shortID: rows[0].shortID
+                )
+            )]
+        }
         model.applyEventForTest(.workTree(
             product: product, projects: [], tasks: [], chores: rows,
-            taskRuntimes: [], dependencies: [], ideas: []
+            taskRuntimes: runtimes, dependencies: [], ideas: []
         ))
         for column in WorkBoardColumnKey.allCases {
             for section in model.workSections(in: column) where section.isCollapsible {

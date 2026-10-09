@@ -1232,13 +1232,10 @@ pub struct TaskRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_retry_at: Option<String>,
 
-    /// The dispatcher's current defer reason for this `ready` execution
-    /// (`chain_serialized`, `pool_exhausted`, ...) — mirrors
-    /// `WorkExecution::dispatch_wait_reason`. `None` when the execution
-    /// isn't currently deferred (never attempted yet, or already claimed
-    /// a slot). Distinct from [`Self::dispatch_retry_at`], which is the
-    /// post-failure in-process backoff window, not a capacity/serialization
-    /// wait.
+    /// The current pending execution's wait reason: recorded scheduler hold,
+    /// dependency gating, or future dispatch deadline. Absent after claiming
+    /// a slot, when a recorded blocker has stopped running, or when no reason
+    /// is known. Consumers must not infer capacity from an absent reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_wait_reason: Option<String>,
 
@@ -1246,6 +1243,24 @@ pub struct TaskRuntime {
     /// its current value. `None` whenever `dispatch_wait_reason` is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_wait_since: Option<String>,
+
+    /// Future dispatch deadline, including non-failure scheduling delays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_not_before: Option<String>,
+
+    /// Currently gating work item, resolved by the engine's dispatch rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_wait_blocker: Option<DispatchWaitBlocker>,
+}
+
+/// A prerequisite selected by the same gating rules used for dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchWaitBlocker {
+    pub work_item_id: String,
+    pub product_id: String,
+    pub short_id: Option<i64>,
+    /// `"task"` or `"project"`, so clients render `T<n>` vs `P<n>` correctly.
+    pub kind: String,
 }
 
 /// Input to the `SetTaskDocPointer` RPC: point a work item at its

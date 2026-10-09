@@ -1670,19 +1670,30 @@ impl WorkDb {
     /// module docs on [`Self::live_execution_elsewhere_in_chain`] for the
     /// `chain_serialized` incident this surfaces).
     pub fn set_dispatch_wait_reason(&self, execution_id: &str, reason: &str) -> Result<()> {
+        self.set_dispatch_wait_with_blocker(execution_id, reason, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn set_dispatch_wait_with_blocker(
+        &self,
+        execution_id: &str,
+        reason: &str,
+        blocker_id: Option<&str>,
+    ) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE work_executions
              SET dispatch_wait_since = CASE
-                     WHEN dispatch_wait_reason IS ?2 THEN dispatch_wait_since
+                     WHEN dispatch_wait_reason IS ?2 AND dispatch_wait_blocker_id IS ?4 THEN dispatch_wait_since
                      ELSE ?3
                  END,
-                 dispatch_wait_reason = ?2
-             WHERE id = ?1",
-            rusqlite::params![execution_id, reason, now],
+                 dispatch_wait_reason = ?2,
+                 dispatch_wait_blocker_id = ?4
+             WHERE id = ?1 AND (dispatch_wait_reason IS NOT ?2 OR dispatch_wait_blocker_id IS NOT ?4)",
+            rusqlite::params![execution_id, reason, now, blocker_id],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     /// Clear `dispatch_wait_reason` / `dispatch_wait_since` — called the
@@ -1694,7 +1705,8 @@ impl WorkDb {
         conn.execute(
             "UPDATE work_executions
              SET dispatch_wait_reason = NULL,
-                 dispatch_wait_since = NULL
+                 dispatch_wait_since = NULL,
+                 dispatch_wait_blocker_id = NULL
              WHERE id = ?1",
             rusqlite::params![execution_id],
         )?;

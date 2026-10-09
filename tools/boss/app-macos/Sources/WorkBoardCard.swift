@@ -177,6 +177,11 @@ struct WorkBoardCardItem: View {
             } label: {
                 WorkBoardCardView(
                     snapshot: snapshot,
+                    onRevealQueueBlocker: { blocker in
+                        if case .unreachable(let reason) = model.revealWorkCard(blocker.workItemID, productID: blocker.productID) {
+                            model.workErrorMessage = "Couldn't reveal \(blocker.label): \(reason)"
+                        }
+                    },
                     isRevisionHighlighted: revisionHighlight.isHighlighted,
                     onOpenDesignDoc: onOpenDesignDoc,
                     onDepBadgeHover: { hovering in
@@ -400,6 +405,7 @@ struct WorkBoardCardItem: View {
 /// every sub-region.
 struct WorkBoardCardView: View, @MainActor Equatable {
     let snapshot: WorkCardSnapshot
+    var onRevealQueueBlocker: ((DispatchWaitBlocker) -> Void)? = nil
     /// Keyed revision-hover input, kept outside the snapshot so changing it
     /// does not require rebuilding every card snapshot in the column.
     var isRevisionHighlighted: Bool = false
@@ -474,7 +480,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
             WorkBoardCardTitleRow(slice: WorkBoardCardTitleRowSlice(snapshot: snap))
                 .equatable()
             if let liveStatus = WorkBoardCardLiveStatusRowSlice(snapshot: snap) {
-                WorkBoardCardLiveStatusRow(slice: liveStatus)
+                WorkBoardCardLiveStatusRow(slice: liveStatus, onRevealBlocker: onRevealQueueBlocker)
                     .equatable()
             }
             if let operatorQuestion = WorkBoardCardOperatorQuestionSlice(snapshot: snap) {

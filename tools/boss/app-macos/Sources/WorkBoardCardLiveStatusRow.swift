@@ -14,6 +14,7 @@ struct WorkBoardCardLiveStatusRowSlice: Equatable {
     let liveStatus: String
     let liveStatusActivity: WorkerActivity?
     let liveStatusLastEventAt: String?
+    let blocker: DispatchWaitBlocker?
 
     init?(snapshot: WorkCardSnapshot) {
         guard snapshot.hasLiveStatus, let liveStatus = snapshot.liveStatus else {
@@ -22,12 +23,14 @@ struct WorkBoardCardLiveStatusRowSlice: Equatable {
         self.liveStatus = liveStatus
         self.liveStatusActivity = snapshot.liveStatusActivity
         self.liveStatusLastEventAt = snapshot.liveStatusLastEventAt
+        self.blocker = snapshot.dispatchWaitBlocker
     }
 }
 
 /// Waiting indicator + caption under the title.
 struct WorkBoardCardLiveStatusRow: View, @MainActor Equatable {
     let slice: WorkBoardCardLiveStatusRowSlice
+    var onRevealBlocker: ((DispatchWaitBlocker) -> Void)? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slice == rhs.slice
@@ -39,7 +42,17 @@ struct WorkBoardCardLiveStatusRow: View, @MainActor Equatable {
                 activity: slice.liveStatusActivity,
                 lastEventAt: slice.liveStatusLastEventAt
             )
-            Text(slice.liveStatus)
+            Group {
+                if let blocker = slice.blocker {
+                    Button { onRevealBlocker?(blocker) } label: {
+                        statusText
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reveal \(blocker.label)")
+                } else {
+                    statusText
+                }
+            }
                 .font(.caption)
                 .foregroundStyle(liveStatusColor)
                 .lineLimit(2)
@@ -48,6 +61,15 @@ struct WorkBoardCardLiveStatusRow: View, @MainActor Equatable {
                 .accessibilityLabel("Live status: \(slice.liveStatus)")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var statusText: Text {
+        var text = AttributedString(slice.liveStatus)
+        if let blocker = slice.blocker, let range = text.range(of: blocker.label) {
+            text[range].foregroundColor = .accentColor
+            text[range].underlineStyle = .single
+        }
+        return Text(text)
     }
 
     /// Tint for the live-status subtitle. Red for errored runs, a dimmer
