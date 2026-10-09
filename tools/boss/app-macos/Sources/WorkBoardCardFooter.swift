@@ -63,9 +63,9 @@ struct WorkBoardCardFooterSlice: Equatable {
 
 /// Frame (global space) of the rendered short id; lets tests assert its anchor.
 struct ShortIDFramePreferenceKey: PreferenceKey {
-    static let defaultValue: CGRect? = nil
-    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
-        value = nextValue() ?? value
+    static let defaultValue: [CGRect] = []
+    static func reduce(value: inout [CGRect], nextValue: () -> [CGRect]) {
+        value.append(contentsOf: nextValue())
     }
 }
 
@@ -103,7 +103,7 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                 GeometryReader { proxy in
                     Color.clear.preference(
                         key: ShortIDFramePreferenceKey.self,
-                        value: proxy.frame(in: .global)
+                        value: [proxy.frame(in: .global)]
                     )
                 }
             )

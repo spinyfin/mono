@@ -11,17 +11,24 @@ final class RevisionFooterRenderTests: XCTestCase {
         let inRevision: Bool
         let review: Bool
         let rollups: Bool
+        var parentPR = false
+        var ownPR = true
     }
 
-    private func render(_ fixture: Fixture) throws -> (height: CGFloat, idFrame: CGRect?, png: Data) {
+    private func render(_ fixture: Fixture) throws -> (height: CGFloat, idFrames: [CGRect], png: Data) {
         var task = WorkTask(
-            id: "footer-fixture", productID: "fixture", projectID: nil, kind: "chore",
+            id: "footer-fixture", productID: "fixture", projectID: nil,
+            kind: fixture.parentPR ? "revision" : "chore",
             name: "Review card footer", description: "", status: "in_review",
             priority: "medium", ordinal: nil,
             prURL: "https://github.com/spinyfin/mono/pull/3040",
             deletedAt: nil, createdAt: "", updatedAt: ""
         )
         task.shortID = 1234
+        if !fixture.ownPR { task.prURL = nil }
+        if fixture.parentPR {
+            task.revisionParentPrUrl = "https://github.com/spinyfin/mono/pull/3000"
+        }
         task.ciRequiredState = "in_progress"
         task.prMergeableState = "conflicting"
         task.hasInProgressRevision = fixture.inRevision
@@ -38,12 +45,12 @@ final class RevisionFooterRenderTests: XCTestCase {
             ]
         }
         let snapshot = WorkCardSnapshot.build(task: task, context: context)
-        var idFrame: CGRect?
+        var idFrames: [CGRect] = []
         let card = WorkBoardCardView(snapshot: snapshot, onRevisionBadgeTap: {})
             .frame(width: 252)
             .padding(14)
             .background(Color(nsColor: .windowBackgroundColor))
-            .onPreferenceChange(ShortIDFramePreferenceKey.self) { idFrame = $0 }
+            .onPreferenceChange(ShortIDFramePreferenceKey.self) { idFrames = $0 }
         let host = NSHostingView(rootView: card)
         host.appearance = NSAppearance(named: .aqua)
         host.frame = NSRect(origin: .zero, size: host.fittingSize)
@@ -55,7 +62,7 @@ final class RevisionFooterRenderTests: XCTestCase {
         if let output = ProcessInfo.processInfo.environment["TEST_UNDECLARED_OUTPUTS_DIR"] {
             try data.write(to: URL(fileURLWithPath: output).appendingPathComponent(fixture.name + ".png"))
         }
-        return (host.bounds.height, idFrame, data)
+        return (host.bounds.height, idFrames, data)
     }
 
     func testReviewCardsRender() throws {
@@ -67,20 +74,39 @@ final class RevisionFooterRenderTests: XCTestCase {
 
     func testShortIDStaysBottomRight() throws {
         let width: CGFloat = 252 + 28
+        var fixtures: [Fixture] = []
         for inRevision in [false, true] {
             for review in [false, true] {
                 for rollups in [false, true] {
-                    let fixture = Fixture(
-                        name: "anchor-\(inRevision)-\(review)-\(rollups)",
-                        inRevision: inRevision, review: review, rollups: rollups
-                    )
-                    let result = try render(fixture)
-                    let frame = try XCTUnwrap(result.idFrame, fixture.name)
-                    // Card insets: 14pt padding here plus the card's own inner padding.
-                    XCTAssertGreaterThan(frame.maxX, width - 50, "\(fixture.name): id not at trailing edge")
-                    XCTAssertGreaterThan(frame.maxY, result.height - 50, "\(fixture.name): id not in bottom row")
+                    for parentPR in [false, true] {
+                        fixtures.append(Fixture(
+                            name: "anchor-\(inRevision)-\(review)-\(rollups)-\(parentPR)",
+                            inRevision: inRevision, review: review, rollups: rollups,
+                            parentPR: parentPR
+                        ))
+                    }
                 }
             }
+        }
+        fixtures.append(Fixture(
+            name: "standalone-with-parent-and-rollup", inRevision: false,
+            review: false, rollups: true, parentPR: true, ownPR: false
+        ))
+        let plain = try render(Fixture(
+            name: "single-line-reference", inRevision: false, review: false, rollups: false
+        ))
+        let lineHeight = try XCTUnwrap(plain.idFrames.first).height
+        XCTAssertGreaterThan(lineHeight, 0)
+        for fixture in fixtures {
+            let result = try render(fixture)
+            XCTAssertEqual(result.idFrames.count, 1, "\(fixture.name): duplicate or missing id")
+            let frame = try XCTUnwrap(result.idFrames.first, fixture.name)
+            // Outer padding is 14pt; card padding is 12pt horizontal / 10pt vertical.
+            XCTAssertEqual(frame.maxX, width - 26, accuracy: 1, "\(fixture.name): trailing edge")
+            // Inline labels are centered in a slightly taller badge/PR row;
+            // the tolerance is smaller than any subsequent footer row.
+            XCTAssertEqual(frame.maxY, result.height - 24, accuracy: 6, "\(fixture.name): final row")
+            XCTAssertEqual(frame.height, lineHeight, accuracy: 0.5, "\(fixture.name): single line")
         }
     }
 }
