@@ -288,24 +288,8 @@ impl ExecutionCubes for HostRoutedCubes {
             }
             Some(host_id) => host_id.to_owned(),
         };
-        let host = self
-            .work_db
-            .get_host(&host_id)
-            .with_context(|| format!("looking up host '{host_id}' to heartbeat execution {execution_id}"))?
-            .with_context(|| {
-                format!(
-                    "execution {execution_id} is bound to host '{host_id}', which is no longer in the host registry; \
-                     its lease lives on that host's cube and cannot be reached from here"
-                )
-            })?;
-        let adapter = self.provider.adapter_for(&host).await.with_context(|| {
-            format!("building the host adapter for '{host_id}' to heartbeat execution {execution_id}")
-        })?;
-        anyhow::ensure!(
-            adapter.host_id() == host_id,
-            "host adapter for '{host_id}' reports host '{}' (execution {execution_id})",
-            adapter.host_id()
-        );
+        let adapter =
+            crate::host_adapter::resolve_host_adapter(&self.work_db, self.provider.as_ref(), &host_id).await?;
         Ok(ResolvedExecutionCube {
             cube: Arc::new(HostAdapterCubeClient::new(adapter)),
             host_id,

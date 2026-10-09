@@ -640,6 +640,20 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
         Some(slot),
         "subsequent hooks must reuse the same virtual slot",
     );
+    server_state
+        .work_db
+        .add_host("zakalwe", "user@zakalwe", 4, &[])
+        .unwrap();
+    server_state
+        .work_db
+        .set_run_remote_pid_for_execution(&execution.id, 4242)
+        .unwrap();
+    server_state
+        .completion_handler
+        .set_host_adapter_provider(Arc::new(ProbeProvider(Arc::new(ProbeAdapter {
+            probe: std::sync::Mutex::new(RemoteProbe::Dead),
+            released_leases: Default::default(),
+        }))));
     let name = server_state.work_db.persona_display_name(&execution.id).unwrap();
     server_state.work_db.cancel_running_execution(&execution.id).unwrap();
     assert_eq!(
@@ -683,7 +697,11 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
         )
         .unwrap();
     assert_eq!(server_state.work_db.persona_display_name(&next.id).unwrap(), name);
-    // A terminal remote execution must release even before any hook allocated
+    server_state
+        .work_db
+        .set_run_remote_pid_for_execution(&next.id, 4243)
+        .unwrap();
+    // A proven-dead terminal remote execution releases before any hook allocated
     // its virtual slot (also the state immediately after an engine restart).
     server_state.work_db.cancel_running_execution(&next.id).unwrap();
     assert_eq!(
@@ -746,10 +764,9 @@ impl crate::host_adapter::HostAdapterProvider for ProbeProvider {
 /// Cancelling a running remote worker does not stop its process, so the real
 /// teardown (`force_release` → `ServerState::release_worker_pane`) must keep
 /// the lease, virtual slot, live state and persona held while the pid probe
-/// reports the worker alive or cannot answer, and release all of them only
-/// after a positive death verdict. `release_worker_pane` itself stays the
-/// unconditional primitive: its remote branch only runs once a caller (this
-/// guard, or the remote-lease reconciler) has proven the worker gone.
+/// reports the worker alive or cannot answer, including during terminal-work
+/// sweeps. No-pid reconciliation frees only the persona; positive death
+/// releases the remaining resources.
 #[tokio::test]
 async fn cancelled_remote_worker_release_is_guarded_by_pid_probe() {
     use crate::completion::ForceReleaseOutcome;
@@ -815,6 +832,25 @@ async fn cancelled_remote_worker_release_is_guarded_by_pid_probe() {
             server_state.completion_handler.force_release(&execution.id).await,
             ForceReleaseOutcome::HeldForRemoteWorker
         );
+        let mut seen = std::collections::HashSet::new();
+        for pass in 0..2 {
+            let outcome = crate::terminal_work_sweep::run_one_pass(
+                db,
+                &server_state.live_worker_states,
+                server_state.as_ref(),
+                server_state.cube_client.as_ref(),
+                server_state.dispatch_events.as_ref(),
+                &server_state.teardown_registry,
+                &mut seen,
+            )
+            .await;
+            assert_eq!(outcome.pending_confirmation, usize::from(pass == 0));
+            assert_eq!(outcome.reaped, usize::from(pass == 1));
+        }
+        assert_eq!(
+            server_state.release_worker_pane(&execution.id).await,
+            PaneReleaseOutcome::NoLiveWorker
+        );
         assert_eq!(server_state.worker_registry.slot_for_run(&execution.id), Some(slot));
         assert!(server_state.live_worker_states.get(slot).is_some());
         assert!(persona_held());
@@ -824,6 +860,32 @@ async fn cancelled_remote_worker_release_is_guarded_by_pid_probe() {
         );
         assert!(adapter.released_leases.lock().unwrap().is_empty());
     }
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET remote_pid = NULL WHERE execution_id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    let releaser = ServerStatePaneReleaser::default();
+    releaser.set_server_state(Arc::downgrade(&server_state));
+    crate::remote_lease_reconcile::reconcile_remote_leases(
+        db,
+        &ProbeProvider(adapter.clone()),
+        server_state.dispatch_events.as_ref(),
+        Some(&releaser),
+    )
+    .await;
+    assert_eq!(server_state.worker_registry.slot_for_run(&execution.id), Some(slot));
+    assert!(server_state.live_worker_states.get(slot).is_some());
+    assert!(!persona_held());
+    assert!(db.terminal_remote_cleanup_runs().unwrap().is_empty());
+    assert_eq!(
+        db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
+        Some("lease-1")
+    );
+    db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
 
     *adapter.probe.lock().unwrap() = RemoteProbe::Dead;
     assert!(matches!(

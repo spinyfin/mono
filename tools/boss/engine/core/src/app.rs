@@ -489,6 +489,13 @@ impl WorkerPaneReleaser for ServerStatePaneReleaser {
         };
         server.release_worker_pane(run_id).await
     }
+
+    async fn release_proven_dead_remote_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        let Some(server) = self.server.get().and_then(Weak::upgrade) else {
+            return PaneReleaseOutcome::NoLiveWorker;
+        };
+        server.release_worker_pane_with_remote_proof(run_id, true).await
+    }
 }
 
 /// One outstanding waiter for a `UserPromptSubmit` hook that would
@@ -1839,14 +1846,21 @@ impl ServerState {
     /// mapping has already been removed, so a future release can't
     /// retry without a fresh registration.
     ///
-    /// Remote executions release their virtual slot once terminal. For local workers,
+    /// Remote executions release their virtual slot once terminal and proven dead. For local workers,
     /// durable tmux identity and verified teardown are required before removing
     /// the registry entry or returning the workspace lease. Missing identity
     /// or unavailable tmux evidence preserves the worker for rollback/drain.
     /// A verified teardown also clears live-state and detaches its app viewer.
     pub async fn release_worker_pane(&self, run_id: &str) -> PaneReleaseOutcome {
-        // Remote workers have no durable tmux identity. Their terminal
-        // execution is the completion authority, including after a restart.
+        self.release_worker_pane_with_remote_proof(run_id, false).await
+    }
+
+    async fn release_worker_pane_with_remote_proof(
+        &self,
+        run_id: &str,
+        remote_proven_dead: bool,
+    ) -> PaneReleaseOutcome {
+        // Terminal status alone does not prove a remote worker has stopped.
         if self.execution_is_terminal(run_id)
             && self
                 .work_db
@@ -1856,6 +1870,9 @@ impl ServerState {
                 .is_some_and(|host| host != "local")
             && matches!(self.work_db.tmux_identity_for_execution(run_id), Ok(None))
         {
+            if !remote_proven_dead && !self.completion_handler.remote_worker_proven_gone(run_id).await {
+                return PaneReleaseOutcome::NoLiveWorker;
+            }
             self.worker_registry.take_slot_for_run(run_id);
             if let Some(slot_id) = self.live_worker_states.release_slot_for_run(run_id) {
                 self.live_status_manager.stop_slot_for_run(slot_id, run_id);

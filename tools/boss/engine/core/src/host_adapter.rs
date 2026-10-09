@@ -1886,6 +1886,24 @@ fn reject_unobservable_remote_driver(
     )
 }
 
+/// Resolve a durable host identity once, validating the provider's routing.
+pub(crate) async fn resolve_host_adapter(
+    work_db: &WorkDb,
+    provider: &dyn HostAdapterProvider,
+    host_id: &str,
+) -> Result<Arc<dyn HostAdapter>> {
+    let host = work_db
+        .get_host(host_id)?
+        .with_context(|| format!("host '{host_id}' is no longer in the host registry"))?;
+    let adapter = provider.adapter_for(&host).await?;
+    anyhow::ensure!(
+        adapter.host_id() == host_id,
+        "host adapter for '{host_id}' reports host '{}'",
+        adapter.host_id()
+    );
+    Ok(adapter)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

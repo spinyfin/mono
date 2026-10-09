@@ -383,6 +383,11 @@ pub enum PaneReleaseOutcome {
 #[async_trait]
 pub trait WorkerPaneReleaser: Send + Sync {
     async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome;
+
+    /// The owning host has positively confirmed this remote worker is gone.
+    async fn release_proven_dead_remote_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        self.release_pane(run_id).await
+    }
 }
 
 /// `WorkerPaneReleaser` that does nothing — used when no app session

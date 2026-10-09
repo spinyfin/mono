@@ -127,7 +127,8 @@ pub async fn reconcile_remote_leases(
     // Terminal remote executions that still hold a persona or cube lease
     // (cancelled while the worker ran, or a crash between terminalization
     // and cleanup). A terminal status is not proof the process exited, so
-    // release only on a positive pid-probe death verdict. Runs at startup
+    // release slots and leases only on a positive pid-probe death verdict.
+    // Persona-only fallback bounds retention when probing cannot prove death. Runs at startup
     // too, reclaiming leases stranded by a crash or older engine.
     match work_db.terminal_remote_cleanup_runs() {
         Ok(handles) => {
@@ -200,38 +201,10 @@ pub async fn reconcile_remote_leases(
             }
         }
 
-        let host = match work_db.get_host(&handle.host_id) {
-            Ok(Some(host)) => host,
-            Ok(None) => {
-                tracing::warn!(
-                    execution_id = %handle.execution_id,
-                    host_id = %handle.host_id,
-                    "remote-lease reconcile: run references a host no longer in the registry; skipping",
-                );
-                outcome.skipped += 1;
-                continue;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    execution_id = %handle.execution_id,
-                    host_id = %handle.host_id,
-                    ?err,
-                    "remote-lease reconcile: host lookup failed; skipping run",
-                );
-                outcome.skipped += 1;
-                continue;
-            }
-        };
-
-        let adapter = match provider.adapter_for(&host).await {
+        let adapter = match crate::host_adapter::resolve_host_adapter(work_db, provider, &handle.host_id).await {
             Ok(adapter) => adapter,
             Err(err) => {
-                tracing::warn!(
-                    execution_id = %handle.execution_id,
-                    host_id = %handle.host_id,
-                    error = %format!("{err:#}"),
-                    "remote-lease reconcile: could not build host adapter; skipping run",
-                );
+                tracing::warn!(execution_id = %handle.execution_id, ?err, "remote host resolution failed");
                 outcome.skipped += 1;
                 continue;
             }
@@ -323,7 +296,7 @@ async fn reap_dead_remote_execution(
     // candidate loop (terminal statuses are a subset of `!is_live()`).
     if !execution.status.is_live() {
         if execution.status.is_terminal() {
-            release_remote_persona(work_db, pane_releaser, &execution.id).await;
+            release_dead_remote_slot_and_persona(work_db, pane_releaser, &execution.id).await;
         }
         return false;
     }
@@ -363,7 +336,7 @@ async fn reap_dead_remote_execution(
                 .map(|cur| cur.status.is_terminal())
                 .unwrap_or(false);
             if already_terminal {
-                release_remote_persona(work_db, pane_releaser, &execution.id).await;
+                release_dead_remote_slot_and_persona(work_db, pane_releaser, &execution.id).await;
                 return true;
             }
             tracing::warn!(
@@ -375,7 +348,7 @@ async fn reap_dead_remote_execution(
         }
     }
 
-    release_remote_persona(work_db, pane_releaser, &execution.id).await;
+    release_dead_remote_slot_and_persona(work_db, pane_releaser, &execution.id).await;
 
     // Automation-run bookkeeping parity with `lost_workspace_sweep`: a
     // triage that created a task before its worker died is recorded as
@@ -488,7 +461,10 @@ async fn reap_dead_remote_execution(
 
 /// Release a terminal remote execution's persona, live state and cube lease
 /// once its worker process is provably gone. An inconclusive probe
-/// (unreachable host, `Ok(None)`) is left held for a later pass. A run with
+/// (unreachable host, `Ok(None)`) leaves the slot and lease held for a later
+/// pass; persona retention is bounded to one day by default, configurable via
+/// `BOSS_TERMINAL_REMOTE_PERSONA_RETENTION_SECS`. Missing hosts release the
+/// persona immediately. A run with
 /// no recorded pid can never be probed, so only its persona is released and
 /// the cube lease is left to its TTL.
 async fn release_terminal_remote_resources(
@@ -502,19 +478,38 @@ async fn release_terminal_remote_resources(
         // lease cannot be proven stale. The persona has no TTL fallback
         // (the cube lease does), so free its roster name rather than
         // leaking it permanently; the cube TTL reclaims the lease.
-        release_remote_persona(work_db, pane_releaser, &handle.execution_id).await;
+        release_persona_only(work_db, &handle.execution_id);
         return;
     };
-    let Ok(Some(host)) = work_db.get_host(&handle.host_id) else {
-        return;
-    };
-    let Ok(adapter) = provider.adapter_for(&host).await else {
+    // Persona names have no TTL. Bound their retention independently of the
+    // worker slot and cube lease, which still require positive death evidence.
+    let retention_secs = std::env::var("BOSS_TERMINAL_REMOTE_PERSONA_RETENTION_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(86400);
+    let expired = work_db
+        .get_execution(&handle.execution_id)
+        .ok()
+        .and_then(|e| e.finished_at)
+        .and_then(|s| s.parse::<i64>().ok())
+        .is_some_and(|finished| {
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64)
+                .saturating_sub(finished)
+                >= retention_secs.min(i64::MAX as u64) as i64
+        });
+    if expired || matches!(work_db.get_host(&handle.host_id), Ok(None)) {
+        release_persona_only(work_db, &handle.execution_id);
+    }
+    let Ok(adapter) = crate::host_adapter::resolve_host_adapter(work_db, provider, &handle.host_id).await else {
         return;
     };
     if !matches!(adapter.probe_remote_worker_alive(remote_pid).await, Ok(Some(false))) {
         return;
     }
-    release_remote_persona(work_db, pane_releaser, &handle.execution_id).await;
+    release_dead_remote_slot_and_persona(work_db, pane_releaser, &handle.execution_id).await;
     let Ok(execution) = work_db.get_execution(&handle.execution_id) else {
         return;
     };
@@ -539,13 +534,19 @@ async fn release_terminal_remote_resources(
     }
 }
 
-async fn release_remote_persona(
+fn release_persona_only(work_db: &WorkDb, execution_id: &str) {
+    if let Err(err) = work_db.release_persona(execution_id) {
+        tracing::warn!(execution_id, ?err, "remote-lease reconcile: persona release failed");
+    }
+}
+
+async fn release_dead_remote_slot_and_persona(
     work_db: &WorkDb,
     pane_releaser: Option<&dyn crate::completion::WorkerPaneReleaser>,
     execution_id: &str,
 ) {
     if let Some(releaser) = pane_releaser {
-        releaser.release_pane(execution_id).await;
+        releaser.release_proven_dead_remote_pane(execution_id).await;
     } else if let Err(err) = work_db.release_persona(execution_id) {
         tracing::warn!(execution_id, ?err, "remote-lease reconcile: persona release failed");
     }

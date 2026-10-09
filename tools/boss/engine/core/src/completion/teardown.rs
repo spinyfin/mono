@@ -89,9 +89,10 @@ impl WorkerCompletionHandler {
     /// process). A terminal status is NOT that proof: a cancelled remote
     /// worker keeps running, and `HostAdapter` has no stop capability. A
     /// missing pid, an unreachable host, or an unavailable adapter is
-    /// inconclusive and returns `false` so the lease, persona and live state
-    /// stay held until [`crate::remote_lease_reconcile`] sees positive death.
-    pub(super) async fn remote_worker_proven_gone(&self, execution_id: &str) -> bool {
+    /// inconclusive and returns `false`, preserving the lease and live state
+    /// until [`crate::remote_lease_reconcile`] sees positive death. That
+    /// reconciler separately bounds terminal persona retention.
+    pub(crate) async fn remote_worker_proven_gone(&self, execution_id: &str) -> bool {
         let handle = match self.work_db.latest_remote_run_for_execution(execution_id) {
             Ok(None) => return true,
             Ok(Some(handle)) => handle,
@@ -112,10 +113,12 @@ impl WorkerCompletionHandler {
             .read()
             .expect("host adapter provider lock poisoned")
             .clone();
-        let (Some(provider), Ok(Some(host))) = (provider, self.work_db.get_host(&handle.host_id)) else {
+        let Some(provider) = provider else {
             return false;
         };
-        let Ok(adapter) = provider.adapter_for(&host).await else {
+        let Ok(adapter) =
+            crate::host_adapter::resolve_host_adapter(&self.work_db, provider.as_ref(), &handle.host_id).await
+        else {
             return false;
         };
         matches!(adapter.probe_remote_worker_alive(remote_pid).await, Ok(Some(false)))

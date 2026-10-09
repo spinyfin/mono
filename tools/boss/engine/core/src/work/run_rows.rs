@@ -1194,19 +1194,22 @@ impl WorkDb {
     }
 
     /// Latest remote run of every terminal execution that still holds remote
-    /// resources — an active persona lease or a cube lease. Teardown refuses
-    /// to release these without proof the remote process is gone (a terminal
-    /// status such as `cancelled` is not that proof), so this is the
-    /// candidate set for [`crate::remote_lease_reconcile`] to release once a
-    /// pid probe proves death. Tmux-owned executions are excluded.
+    /// resources — an active persona lease or a cube lease with a recorded
+    /// pid. Slot and cube cleanup require positive death evidence; persona
+    /// cleanup also has a bounded fallback. No-pid rows stop matching after
+    /// persona release. Tmux-owned executions are excluded.
     pub fn terminal_remote_cleanup_runs(&self) -> Result<Vec<RemoteRunHandle>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT r.execution_id FROM work_runs r
              JOIN work_executions e ON e.id = r.execution_id
              WHERE r.host_id != 'local'
+               AND r.id = (SELECT latest.id FROM work_runs latest
+                   WHERE latest.execution_id = e.id
+                   ORDER BY CASE WHEN latest.finished_at IS NULL THEN 0 ELSE 1 END,
+                       latest.created_at DESC, latest.id DESC LIMIT 1)
                AND e.status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
-               AND (r.persona_lease_active = 1 OR e.cube_lease_id IS NOT NULL)
+               AND (r.persona_lease_active = 1 OR (e.cube_lease_id IS NOT NULL AND r.remote_pid IS NOT NULL))
                AND NOT EXISTS (SELECT 1 FROM work_runs t
                    WHERE t.execution_id = r.execution_id AND t.tmux_spawn_token IS NOT NULL)
              ORDER BY r.created_at ASC, r.id ASC",
