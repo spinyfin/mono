@@ -481,3 +481,20 @@ async fn cancelled_remote_worker_still_alive_keeps_lease_and_persona() {
     assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease"));
     assert_eq!(db.terminal_remote_cleanup_runs().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn terminal_remote_run_without_pid_releases_persona_but_leaves_lease_to_ttl() {
+    let (_d, db) = open_db_arc();
+    db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+    let id = start_remote_run(&db, &create_chore(&db), "anaplian", "lease", None);
+    let name = db.persona_display_name(&id).unwrap();
+    db.cancel_running_execution(&id).unwrap();
+    let (adapter, provider) = provider("anaplian", Probe::Dead);
+    reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
+    // No pid → nothing to probe: the cube lease is left to its TTL, but the
+    // persona (which has no TTL) is freed for reuse.
+    assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease"));
+    let next = start_remote_run(&db, &create_chore(&db), "anaplian", "next", Some(3));
+    assert_eq!(db.persona_display_name(&next).unwrap(), name);
+}

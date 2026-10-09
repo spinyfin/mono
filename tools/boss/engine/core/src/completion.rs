@@ -1664,10 +1664,15 @@ struct ConflictSignalPrefetch {
 /// scattered across this function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForceReleaseOutcome {
-    /// No live worker pane was mapped (mid-spawn or already released), or a
-    /// remote worker was not proven gone. The cube lease is deliberately left held for the in-flight
-    /// `run_execution` to reap and release once its spawn settles.
+    /// No live worker pane was mapped (mid-spawn or already released). The
+    /// cube lease is deliberately left held for the in-flight `run_execution`
+    /// to reap and release once its spawn settles.
     HeldForInFlightSpawn,
+    /// A remote worker was not proven gone (alive, or its pid probe was
+    /// inconclusive or impossible). The cube lease, persona and live state
+    /// are deliberately left held; `remote_lease_reconcile` releases them
+    /// once a pid probe reports positive death.
+    HeldForRemoteWorker,
     /// The pane was reaped but the execution held no lease columns —
     /// already released by a prior call, or never leased.
     NoLeaseHeld,
@@ -1687,6 +1692,7 @@ impl ForceReleaseOutcome {
     fn label(&self) -> &'static str {
         match self {
             Self::HeldForInFlightSpawn => "held_for_in_flight_spawn",
+            Self::HeldForRemoteWorker => "held_for_remote_worker",
             Self::NoLeaseHeld => "no_lease_held",
             Self::Released { .. } => "released",
             Self::WorkspaceColumnClearFailed => "workspace_column_clear_failed",
@@ -1726,7 +1732,12 @@ impl crate::coordinator::AutomationPreemptor for WorkerCompletionHandler {
     async fn preempt_worker(&self, execution_id: &str) -> PreemptOutcome {
         match self.force_release(execution_id).await {
             ForceReleaseOutcome::Released { .. } | ForceReleaseOutcome::NoLeaseHeld => PreemptOutcome::Released,
-            ForceReleaseOutcome::HeldForInFlightSpawn => PreemptOutcome::MidSpawn,
+            // A remote worker that is not proven gone is still running, so
+            // like a mid-spawn worker nothing was torn down: the caller must
+            // abandon the preemption rather than requeue its work.
+            ForceReleaseOutcome::HeldForInFlightSpawn | ForceReleaseOutcome::HeldForRemoteWorker => {
+                PreemptOutcome::MidSpawn
+            }
             outcome @ (ForceReleaseOutcome::LeaseReleaseFailed { .. }
             | ForceReleaseOutcome::WorkspaceColumnClearFailed) => {
                 tracing::warn!(

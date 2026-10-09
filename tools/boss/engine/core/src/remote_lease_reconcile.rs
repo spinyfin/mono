@@ -487,8 +487,10 @@ async fn reap_dead_remote_execution(
 }
 
 /// Release a terminal remote execution's persona, live state and cube lease
-/// once its worker process is provably gone. Anything inconclusive (no pid,
-/// unreachable host, `Ok(None)`) is left held for a later pass.
+/// once its worker process is provably gone. An inconclusive probe
+/// (unreachable host, `Ok(None)`) is left held for a later pass. A run with
+/// no recorded pid can never be probed, so only its persona is released and
+/// the cube lease is left to its TTL.
 async fn release_terminal_remote_resources(
     work_db: &WorkDb,
     provider: &dyn HostAdapterProvider,
@@ -496,6 +498,11 @@ async fn release_terminal_remote_resources(
     handle: &RemoteRunHandle,
 ) {
     let Some(remote_pid) = handle.remote_pid else {
+        // The pid was never persisted, so there is nothing to probe and the
+        // lease cannot be proven stale. The persona has no TTL fallback
+        // (the cube lease does), so free its roster name rather than
+        // leaking it permanently; the cube TTL reclaims the lease.
+        release_remote_persona(work_db, pane_releaser, &handle.execution_id).await;
         return;
     };
     let Ok(Some(host)) = work_db.get_host(&handle.host_id) else {

@@ -128,7 +128,7 @@ async fn missing_remote_adapter_never_falls_back_to_local_cube() {
     let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
     assert!(matches!(
         handler.force_release(&id).await,
-        ForceReleaseOutcome::HeldForInFlightSpawn
+        ForceReleaseOutcome::HeldForRemoteWorker
     ));
     assert_eq!(
         db.get_execution(&id).unwrap().cube_lease_id.as_deref(),
@@ -149,7 +149,7 @@ async fn cancelling_a_running_remote_worker_holds_its_lease() {
     handler.set_host_adapter_provider(Arc::new(Provider(adapter.clone())));
     assert!(matches!(
         handler.force_release(&id).await,
-        ForceReleaseOutcome::HeldForInFlightSpawn
+        ForceReleaseOutcome::HeldForRemoteWorker
     ));
     assert!(adapter.calls.lock().unwrap().is_empty());
     assert!(cube.release_calls.lock().await.is_empty());

@@ -638,6 +638,37 @@ mod tests {
         assert!(!held(&db), "the reconciled run's persona lease must be released");
     }
 
+    /// The persona release shares the cube lease's gate: a run the live
+    /// registry still tracks as non-terminal may be alive, and freeing its
+    /// roster name would let a second worker take it.
+    #[tokio::test]
+    async fn reconciled_pane_still_tracked_live_keeps_its_persona_lease() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/tmp/ws-tracked", "local", Some(dead_pid()));
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+        db.lease_persona_for_execution(&exec.id).unwrap();
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, &exec.id, "claude-opus-4-7", 424242, None);
+
+        let sink = NoopDispatchEventSink;
+        assert!(
+            reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), Some(&live_states), None).await,
+            "precondition: the dead pid with no corroborating activity is reconciled",
+        );
+        let held: bool = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1 AND persona_lease_active = 1)",
+                [&exec.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(held, "a registry-tracked run must keep its persona lease");
+    }
+
     /// The double-finalize bug this closes: a triage execution whose Stop
     /// hook already finalized it (via `complete_pane_parked_execution`, the
     /// production finalizer's completion write) must be `completed` —

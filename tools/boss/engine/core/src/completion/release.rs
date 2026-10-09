@@ -46,7 +46,7 @@ impl WorkerCompletionHandler {
                 "force_release: remote worker not proven gone; leaving the lease, persona and live state held \
                  for remote-lease reconcile",
             );
-            return ForceReleaseOutcome::HeldForInFlightSpawn;
+            return ForceReleaseOutcome::HeldForRemoteWorker;
         }
         if matches!(
             self.pane_releaser.release_pane(execution_id).await,
