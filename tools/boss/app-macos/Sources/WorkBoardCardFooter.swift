@@ -101,12 +101,6 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                         ambiguousRepoNames: slice.ambiguousRepoNames
                     )
                     .layoutPriority(1)
-                    if slice.hasInProgressRevision {
-                        PrInRevisionIndicator(onTap: onRevisionBadgeTap)
-                            .onHover { hovering in
-                                onRevisionBadgeHover?(hovering)
-                            }
-                    }
                     Spacer(minLength: 0)
                     if let id = slice.shortID {
                         Text("T" + String(id))
@@ -116,6 +110,12 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
                     }
+                }
+                if slice.hasInProgressRevision {
+                    PrInRevisionIndicator(onTap: onRevisionBadgeTap)
+                        .onHover { hovering in
+                            onRevisionBadgeHover?(hovering)
+                        }
                 }
             }
 
