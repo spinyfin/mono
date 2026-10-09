@@ -400,6 +400,16 @@ pub(super) struct FakeExecutionRunner {
     /// genuine spawn failure. Takes priority over `fail`.
     pub(super) slot_busy: bool,
     pub(super) viewer_abort_failed: bool,
+    /// When `Some`, the runner fails the way the codex-driver outage of
+    /// 2026-08-06/07 did: a real
+    /// [`StartWorkerError::ProgressIngress`] carrying the precondition text
+    /// the ingress preparer rejected, wrapped in the same
+    /// `spawning worker pane for run <id>` context `pane_spawn.rs` applies.
+    /// Reproducing the concrete error type (rather than a bare `anyhow!`)
+    /// is what exercises the classification the dispatch event, the
+    /// attention body, and `bossctl dispatch diagnose` all read. Takes
+    /// priority over `fail`.
+    pub(super) progress_ingress_failure: Option<String>,
     pub(super) pending: bool,
     /// If `Some`, the runner reports this slot id back to the
     /// coordinator in the `RunOutcome`, simulating a successful
@@ -438,6 +448,7 @@ impl Default for FakeExecutionRunner {
             fail_context: None,
             slot_busy: false,
             viewer_abort_failed: false,
+            progress_ingress_failure: None,
             pending: false,
             slot_id: None,
             spawn_config: None,
@@ -483,6 +494,10 @@ impl ExecutionRunner for FakeExecutionRunner {
                 occupying_run_id: Some("exec_other_occupant".to_owned()),
             };
             return Err(anyhow::Error::new(root).context("failed to spawn worker pane"));
+        }
+        if let Some(detail) = &self.progress_ingress_failure {
+            let root = StartWorkerError::ProgressIngress(detail.clone());
+            return Err(anyhow::Error::new(root).context(format!("spawning worker pane for run {}", execution.id)));
         }
         if self.fail {
             let err = anyhow!("{}", self.fail_message.as_deref().unwrap_or("worker prompt failed"));
