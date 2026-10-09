@@ -1227,6 +1227,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         .await
         .with_context(|| format!("spawning worker pane for run {}", execution.id))?;
 
+        let spawned_at = std::time::Instant::now();
         tracing::info!(
             worker_id,
             execution_id = %execution.id,
@@ -1260,6 +1261,17 @@ impl ExecutionRunner for PaneSpawnRunner {
         }
 
         if !self.skip_spawn_confirm() {
+            // Attribute late-firing deadlines: everything between the pane
+            // returning from `start_worker` and confirmation starting (the
+            // cancel re-check above included) is logged so a deadline that
+            // fires long after its nominal timeout can be pinned on this
+            // gap or on the confirmation itself.
+            tracing::info!(
+                worker_id,
+                execution_id = %execution.id,
+                spawn_to_confirm_gap_ms = spawned_at.elapsed().as_millis() as u64,
+                "starting spawn confirmation",
+            );
             let (composer_timeout, turn_timeout) = self.spawn_confirm_timeouts(driver.as_ref());
             let confirm = confirm_local_spawn(
                 &tmux_host,
@@ -1391,13 +1403,18 @@ async fn confirm_local_spawn(
         turn_timeout,
         SPAWN_CONFIRM_POLL,
         || async {
-            let Ok(pane_text) = tmux_host
-                .tmux()
-                .capture_pane_with_history(tmux_host.session_name())
-                .await
-            else {
-                return false;
-            };
+            // Visible screen first: it is cheap and is the common hit. The
+            // 2000-line history capture only runs when the screen misses
+            // (banner scrolled off by a long prompt or early tool output).
+            let tmux = tmux_host.tmux();
+            let session = tmux_host.session_name();
+            let mut pane_text = tmux.capture_pane(session).await.unwrap_or_default();
+            let ready = |text: &str| spec.as_ref().is_some_and(|spec| pane_shows_driver_ready(text, spec));
+            let mut shows_ready = ready(&pane_text);
+            if !shows_ready && let Ok(history) = tmux.capture_pane_with_history(session).await {
+                shows_ready = ready(&history);
+                pane_text = history;
+            }
             // Bound diagnostic text without splitting UTF-8 characters.
             *last_capture.lock().expect("capture mutex poisoned") = pane_text
                 .chars()
@@ -1407,10 +1424,7 @@ async fn confirm_local_spawn(
                 .chars()
                 .rev()
                 .collect();
-            match spec.as_ref() {
-                Some(spec) => pane_shows_driver_ready(&pane_text, spec),
-                None => false,
-            }
+            shows_ready
         },
         || async { live_states.is_some_and(|registry| registry.has_driver_signal_for_run(run_id)) },
     )

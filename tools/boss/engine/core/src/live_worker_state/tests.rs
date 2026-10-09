@@ -1184,3 +1184,53 @@ mod driver_signal_tests;
 
 #[path = "tests/live_worker_state_semantic_progress_tests.rs"]
 mod semantic_progress_tests;
+
+#[test]
+fn hooks_before_registration_transfer_to_the_slot() {
+    let registry = LiveWorkerStateRegistry::new();
+    registry.arm_pending_hooks("run-pre");
+    assert_eq!(
+        registry.record_driver_signal("run-pre", DriverSignalKind::HookEvent),
+        None
+    );
+    registry.record_hook_event_kind("run-pre", "SessionStart");
+    registry.record_hook_event_kind("run-pre", "PreToolUse");
+    assert!(!registry.has_driver_signal_for_run("run-pre"), "no entry yet");
+
+    registry.register_spawn(3, "run-pre", "opus", 42, None);
+
+    assert!(registry.has_driver_signal_for_run("run-pre"));
+    assert!(registry.driver_signal_at(3).is_some());
+    assert_eq!(
+        registry.first_hook_event_for_run("run-pre").as_deref(),
+        Some("SessionStart")
+    );
+}
+
+#[test]
+fn rearming_discards_evidence_from_an_earlier_attempt() {
+    let registry = LiveWorkerStateRegistry::new();
+    registry.arm_pending_hooks("run-retry");
+    registry.record_driver_signal("run-retry", DriverSignalKind::HookEvent);
+    registry.record_hook_event_kind("run-retry", "SessionStart");
+    // Retry of the same run: launch re-arms before the new CLI starts.
+    registry.arm_pending_hooks("run-retry");
+    registry.register_spawn(4, "run-retry", "opus", 42, None);
+
+    assert!(!registry.has_driver_signal_for_run("run-retry"));
+    assert_eq!(registry.first_hook_event_for_run("run-retry"), None);
+}
+
+#[test]
+fn unarmed_or_disarmed_runs_buffer_nothing() {
+    let registry = LiveWorkerStateRegistry::new();
+    registry.record_driver_signal("run-unarmed", DriverSignalKind::HookEvent);
+    registry.register_spawn(1, "run-unarmed", "opus", 42, None);
+    assert!(!registry.has_driver_signal_for_run("run-unarmed"));
+
+    registry.arm_pending_hooks("run-failed");
+    registry.record_driver_signal("run-failed", DriverSignalKind::HookEvent);
+    registry.disarm_pending_hooks("run-failed");
+    registry.register_spawn(2, "run-failed", "opus", 42, None);
+    assert!(!registry.has_driver_signal_for_run("run-failed"));
+}

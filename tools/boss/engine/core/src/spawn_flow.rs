@@ -688,6 +688,27 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     input: StartWorkerInput,
     spawn_timeout: StdDuration,
 ) -> Result<StartedWorker, StartWorkerError> {
+    // Buffer hooks that race the live-state registration below (the CLI is
+    // running, and its hooks can land, before the pane-attach await returns).
+    // Re-arming here also drops evidence left over from an earlier attempt.
+    let run_id = input.run_id.clone();
+    if let Some(live_states) = spawner.live_worker_state_registry() {
+        live_states.arm_pending_hooks(&run_id);
+    }
+    let result = start_worker_armed(spawner, input, spawn_timeout).await;
+    if result.is_err()
+        && let Some(live_states) = spawner.live_worker_state_registry()
+    {
+        live_states.disarm_pending_hooks(&run_id);
+    }
+    result
+}
+
+async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
+    spawner: &S,
+    input: StartWorkerInput,
+    spawn_timeout: StdDuration,
+) -> Result<StartedWorker, StartWorkerError> {
     // Local dispatch is only recoverable when the driver supplies Rich
     // per-tool progress boundaries. A Coarse/Minimal driver would silently
     // lose automatic wedge recovery, so refuse before writing files or

@@ -310,9 +310,32 @@ mod tests {
     }
 
     #[test]
-    fn banner_in_scrollback_survives_prompt_and_tool_output() {
-        let text = format!("Claude Code\n{}\n❯ ", "long prompt or tool output\n".repeat(200));
-        assert!(pane_shows_driver_ready(&text, &claude_spec()));
+    fn claude_composer_ready_for_each_permission_mode_footer() {
+        // Banner scrolled off: only the mode footer / effort line remains.
+        // Auto mode, bypass-permissions mode and a bare effort indicator
+        // must each be enough on their own.
+        for screen in [
+            "❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)",
+            "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            "❯ \n  /effort",
+            "Claude Code v2.1.283",
+        ] {
+            assert!(pane_shows_driver_ready(screen, &claude_spec()), "{screen:?}");
+        }
+        // A bypass-mode screen with neither banner nor a known footer is a
+        // genuine miss; capture depth, not this predicate, must cover it.
+        assert!(!pane_shows_driver_ready("❯ \n  ? for shortcuts", &claude_spec()));
+    }
+
+    #[test]
+    fn shell_and_error_output_is_not_claude_ready() {
+        for screen in [
+            "bash: claude: command not found",
+            "zsh: exec format error: claude\n❯ ",
+            "Accessing workspace: /tmp/ws\nQuick safety check: trust this folder?",
+        ] {
+            assert!(!pane_shows_driver_ready(screen, &claude_spec()), "{screen:?}");
+        }
     }
 
     #[tokio::test]

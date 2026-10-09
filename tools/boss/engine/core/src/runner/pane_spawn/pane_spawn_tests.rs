@@ -52,6 +52,12 @@ struct CapturingSpawner {
     /// When true, `capture-pane` stamps a driver-signal so the turn-start
     /// wait can succeed in tests.
     auto_confirm_turn: std::sync::atomic::AtomicBool,
+    /// When set, `capture-pane -S` (history) returns this text while the
+    /// visible-screen capture stays empty: the banner has scrolled off.
+    history_only_text: StdMutex<Option<String>>,
+    /// When true, `new-session` delivers a hook for every registered or
+    /// pending run, i.e. before the live-state slot is registered.
+    hook_before_registration: std::sync::atomic::AtomicBool,
     /// Cancel exactly when confirmation first observes the pane.
     cancel_on_capture: StdMutex<Option<(Arc<WorkDb>, String)>>,
 }
@@ -65,6 +71,8 @@ impl CapturingSpawner {
             reaped: StdMutex::new(Vec::new()),
             pane_chrome: std::sync::atomic::AtomicBool::new(false),
             auto_confirm_turn: std::sync::atomic::AtomicBool::new(false),
+            history_only_text: StdMutex::new(None),
+            hook_before_registration: std::sync::atomic::AtomicBool::new(false),
             cancel_on_capture: StdMutex::new(None),
         }
     }
@@ -146,6 +154,11 @@ impl CommandRunner for CapturingSpawner {
                     env,
                     initial_input: args.last().unwrap().clone(),
                 });
+                if self.hook_before_registration.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.live_states.record_hook_event_kind("exec-test-1", "SessionStart");
+                    self.live_states
+                        .record_driver_signal("exec-test-1", crate::live_worker_state::DriverSignalKind::HookEvent);
+                }
                 ""
             }
             Some("display-message") => "4242",
@@ -159,7 +172,18 @@ impl CommandRunner for CapturingSpawner {
                             .record_driver_signal(&state.run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
                     }
                 }
-                if self.pane_chrome.load(std::sync::atomic::Ordering::SeqCst) {
+                let history_only = self.history_only_text.lock().unwrap().clone();
+                if let Some(text) = history_only {
+                    if args.iter().any(|arg| arg == "-S") {
+                        return Ok(CommandOutput {
+                            success: true,
+                            code: Some(0),
+                            stdout: text,
+                            stderr: String::new(),
+                        });
+                    }
+                    ""
+                } else if self.pane_chrome.load(std::sync::atomic::Ordering::SeqCst) {
                     "Claude Code\n"
                 } else {
                     ""
@@ -2367,4 +2391,83 @@ async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
         "confirmation must observe the pane and trigger cancellation",
     );
     assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
+}
+
+/// Run a confirming spawn against a pane whose visible screen is empty and
+/// whose scrollback holds `history`; returns the spawn result and spawner.
+async fn confirm_with_history_only(history: &str) -> (Result<RunOutcome>, Arc<CapturingSpawner>) {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    *spawner.history_only_text.lock().unwrap() = Some(history.to_owned());
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(60));
+    let result = runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await;
+    (result, spawner)
+}
+
+#[tokio::test]
+async fn spawn_confirmation_finds_banner_that_only_exists_in_scrollback() {
+    // Composer readiness is satisfied by history alone; with no hook the
+    // failure is therefore the turn-start one, not "composer never ready".
+    let (result, spawner) = confirm_with_history_only("Claude Code 2.1.283\n").await;
+    let msg = result.expect_err("no hook, so turn start must fail").to_string();
+    assert!(msg.contains("no driver hook or session event"), "{msg}");
+    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+}
+
+#[tokio::test]
+async fn spawn_confirmation_scrollback_without_a_marker_still_fails() {
+    let (result, spawner) = confirm_with_history_only("bash: exec: claude: not found\nlogin: \n❯ \n").await;
+    let msg = result
+        .expect_err("shell/error scrollback is not driver evidence")
+        .to_string();
+    assert!(msg.contains("composer never became ready"), "{msg}");
+    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+}
+
+#[tokio::test]
+async fn spawn_confirmation_passes_on_a_hook_delivered_before_registration() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner
+        .hook_before_registration
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(60));
+
+    // No pane marker and no hook after registration: the only evidence is
+    // the one delivered while the run had no live-state entry.
+    runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .expect("a pre-registration hook must count as driver evidence");
+    assert!(spawner.reaped_run_ids().is_empty());
+    assert_eq!(
+        spawner.live_states.first_hook_event_for_run("exec-test-1").as_deref(),
+        Some("SessionStart")
+    );
 }
