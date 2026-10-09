@@ -333,6 +333,7 @@ async fn reconcile_if_execution_dead_at(
                 workspace_path = %workspace_path,
                 "lost-workspace reconcile: finalized execution whose workspace directory is gone",
             );
+            release_reconciled_persona(work_db, execution);
             maybe_force_release_reconciled_lease(execution, cube_client).await;
         }
 
@@ -430,10 +431,23 @@ async fn reconcile_if_execution_dead_at(
             age_in_status_secs = ?age_in_status_secs,
             "execution-liveness reconcile: finalized execution whose worker pane never attached",
         );
+        release_reconciled_persona(work_db, execution);
         maybe_force_release_reconciled_lease(execution, cube_client).await;
     }
 
     reconciled
+}
+
+/// Free the roster name of an execution reconciled as gone. The worker has no
+/// live registry entry to release it through (this sweep is DB-only, and the
+/// run may have died while the engine was down), so without this the
+/// `persona_lease_active` row would outlive the run permanently. The
+/// workspace is gone or the pane never came up, so no live worker can still
+/// be using the name.
+fn release_reconciled_persona(work_db: &WorkDb, execution: &WorkExecution) {
+    if let Err(err) = work_db.release_persona(&execution.id) {
+        tracing::warn!(execution_id = %execution.id, ?err, "lost-workspace reconcile: persona release failed");
+    }
 }
 
 /// Best-effort cube lease release after a successful lost-workspace /

@@ -56,6 +56,7 @@ impl WorkerCompletionHandler {
             pr_state_checker: Arc::new(crate::work::GhPrStateChecker),
             structured_output_dir: crate::structured_output::default_dir(),
             host_adapter_provider: Arc::new(std::sync::RwLock::new(None)),
+            execution_cubes: Arc::new(std::sync::RwLock::new(None)),
             now_fn: Arc::new(std::time::Instant::now),
             review_batch_enqueuer: Arc::new(GhReviewBatchEnqueuer),
             review_pool_size: crate::coordinator::DEFAULT_REVIEW_POOL_SIZE,
@@ -107,7 +108,14 @@ impl WorkerCompletionHandler {
         *self
             .host_adapter_provider
             .write()
-            .expect("host adapter provider lock poisoned") = Some(provider);
+            .expect("host adapter provider lock poisoned") = Some(Arc::clone(&provider));
+        let cubes: Arc<dyn crate::cube_lease_heartbeat::ExecutionCubes> =
+            Arc::new(crate::cube_lease_heartbeat::HostRoutedCubes::new(
+                Arc::clone(&self.work_db),
+                provider,
+                Arc::clone(&self.cube_client),
+            ));
+        *self.execution_cubes.write().expect("execution cubes lock poisoned") = Some(cubes);
     }
 
     /// Wire an externally-owned [`StagedRevisionPushCache`] into this handler.

@@ -301,6 +301,11 @@ impl ExecutionCubes for HostRoutedCubes {
         let adapter = self.provider.adapter_for(&host).await.with_context(|| {
             format!("building the host adapter for '{host_id}' to heartbeat execution {execution_id}")
         })?;
+        anyhow::ensure!(
+            adapter.host_id() == host_id,
+            "host adapter for '{host_id}' reports host '{}' (execution {execution_id})",
+            adapter.host_id()
+        );
         Ok(ResolvedExecutionCube {
             cube: Arc::new(HostAdapterCubeClient::new(adapter)),
             host_id,

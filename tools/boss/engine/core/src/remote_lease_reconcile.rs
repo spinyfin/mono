@@ -124,15 +124,18 @@ pub async fn reconcile_remote_leases(
 ) -> RemoteLeaseReconcileOutcome {
     let mut outcome = RemoteLeaseReconcileOutcome::default();
 
-    // Runs at startup too: reclaim leases stranded by a crash or older engine
-    // even when the worker never registered a live-state entry.
-    match work_db.terminal_remote_persona_executions() {
-        Ok(ids) => {
-            for id in ids {
-                release_remote_persona(work_db, pane_releaser, &id).await;
+    // Terminal remote executions that still hold a persona or cube lease
+    // (cancelled while the worker ran, or a crash between terminalization
+    // and cleanup). A terminal status is not proof the process exited, so
+    // release only on a positive pid-probe death verdict. Runs at startup
+    // too, reclaiming leases stranded by a crash or older engine.
+    match work_db.terminal_remote_cleanup_runs() {
+        Ok(handles) => {
+            for handle in handles {
+                release_terminal_remote_resources(work_db, provider, pane_releaser, &handle).await;
             }
         }
-        Err(err) => tracing::warn!(?err, "remote-lease reconcile: persona backstop query failed"),
+        Err(err) => tracing::warn!(?err, "remote-lease reconcile: terminal cleanup query failed"),
     }
 
     let candidates = match work_db.list_live_remote_runs() {
@@ -481,6 +484,52 @@ async fn reap_dead_remote_execution(
     );
 
     true
+}
+
+/// Release a terminal remote execution's persona, live state and cube lease
+/// once its worker process is provably gone. Anything inconclusive (no pid,
+/// unreachable host, `Ok(None)`) is left held for a later pass.
+async fn release_terminal_remote_resources(
+    work_db: &WorkDb,
+    provider: &dyn HostAdapterProvider,
+    pane_releaser: Option<&dyn crate::completion::WorkerPaneReleaser>,
+    handle: &RemoteRunHandle,
+) {
+    let Some(remote_pid) = handle.remote_pid else {
+        return;
+    };
+    let Ok(Some(host)) = work_db.get_host(&handle.host_id) else {
+        return;
+    };
+    let Ok(adapter) = provider.adapter_for(&host).await else {
+        return;
+    };
+    if !matches!(adapter.probe_remote_worker_alive(remote_pid).await, Ok(Some(false))) {
+        return;
+    }
+    release_remote_persona(work_db, pane_releaser, &handle.execution_id).await;
+    let Ok(execution) = work_db.get_execution(&handle.execution_id) else {
+        return;
+    };
+    let Some(lease_id) = execution.cube_lease_id.as_deref() else {
+        return;
+    };
+    match adapter
+        .force_release_lease(lease_id, Some("remote-lease reconcile: worker process gone"))
+        .await
+    {
+        Ok(()) => {
+            if let Err(err) = work_db.clear_execution_workspace(&execution.id) {
+                tracing::warn!(execution_id = %execution.id, ?err, "remote-lease reconcile: clearing lease columns failed");
+            }
+        }
+        Err(err) => tracing::warn!(
+            execution_id = %execution.id,
+            lease_id,
+            error = %format!("{err:#}"),
+            "remote-lease reconcile: terminal remote lease release failed; will retry",
+        ),
+    }
 }
 
 async fn release_remote_persona(

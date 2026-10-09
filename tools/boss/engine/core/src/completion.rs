@@ -1591,6 +1591,11 @@ pub struct WorkerCompletionHandler {
     /// Resolves remote adapters for structured-output collection at the read
     /// site. Kept optional for local-only tests and installations.
     host_adapter_provider: Arc<std::sync::RwLock<Option<Arc<dyn crate::host_adapter::HostAdapterProvider>>>>,
+    /// Owning-cube resolver shared with the lease heartbeat
+    /// ([`crate::cube_lease_heartbeat::HostRoutedCubes`]); installed together
+    /// with the adapter provider. Until then a remote run fails to resolve
+    /// rather than falling back to the local cube.
+    execution_cubes: Arc<std::sync::RwLock<Option<Arc<dyn crate::cube_lease_heartbeat::ExecutionCubes>>>>,
     /// Clock the auto-nudge debounce guard reads from
     /// ([`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`]). Defaults to the
     /// real wall clock (`Instant::now`) — correct for production, where
@@ -1659,8 +1664,8 @@ struct ConflictSignalPrefetch {
 /// scattered across this function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForceReleaseOutcome {
-    /// No live worker pane was mapped (mid-spawn or already released).
-    /// The cube lease is deliberately left held for the in-flight
+    /// No live worker pane was mapped (mid-spawn or already released), or a
+    /// remote worker was not proven gone. The cube lease is deliberately left held for the in-flight
     /// `run_execution` to reap and release once its spawn settles.
     HeldForInFlightSpawn,
     /// The pane was reaped but the execution held no lease columns —

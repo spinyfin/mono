@@ -718,7 +718,17 @@ where
         }
     };
 
-    if let Err(error) = work_db.restore_tmux_personas(&adoptable) {
+    // Allocate personas only for runs that will be adopted (live session, schema
+    // ok): a name given to any other row would never be released.
+    let restorable: Vec<_> = adoptable
+        .iter()
+        .filter(|h| {
+            let session = live_sessions.iter().find(|s| s.spawn_token == h.tmux_spawn_token);
+            session.is_some_and(|s| matches!(session_schemas.get(&s.session_name), Some(Some(Ok(_)))))
+        })
+        .cloned()
+        .collect();
+    if let Err(error) = work_db.restore_tmux_personas(&restorable) {
         // Failed metadata writes must not discard positively observed workers.
         // Registration can still read an existing lease, or use the execution
         // identity until a later pass can durably allocate an older row.

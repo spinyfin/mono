@@ -55,32 +55,70 @@ use crate::teardown_registry::TeardownGuard;
 pub(super) const CUBE_RELEASE_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl WorkerCompletionHandler {
-    /// Resolve ownership from the durable run before touching any host's files
-    /// or cube. A missing remote adapter must never fall back to local cleanup.
-    pub(super) async fn remote_cleanup_adapter(
+    /// Resolve the cube that owns `execution_id`'s lease through the shared
+    /// [`crate::cube_lease_heartbeat::ExecutionCubes`] seam. A remote run with
+    /// no resolver installed is an error — it must never fall back to the
+    /// local cube.
+    pub(super) async fn owning_cube(
         &self,
         execution_id: &str,
-    ) -> anyhow::Result<Option<Arc<dyn crate::host_adapter::HostAdapter>>> {
-        let Some(host_id) = self
-            .work_db
-            .latest_run_host_for_execution(execution_id)?
-            .filter(|host| host != "local")
-        else {
-            return Ok(None);
+    ) -> anyhow::Result<crate::cube_lease_heartbeat::ResolvedExecutionCube> {
+        let cubes = self
+            .execution_cubes
+            .read()
+            .expect("execution cubes lock poisoned")
+            .clone();
+        match cubes {
+            Some(cubes) => cubes.cube_for_execution(execution_id).await,
+            None => {
+                let host = self.work_db.latest_run_host_for_execution(execution_id)?;
+                anyhow::ensure!(
+                    matches!(host.as_deref(), None | Some("local")),
+                    "remote cleanup adapter provider is unavailable"
+                );
+                Ok(crate::cube_lease_heartbeat::ResolvedExecutionCube {
+                    cube: Arc::clone(&self.cube_client),
+                    host_id: "local".to_owned(),
+                })
+            }
+        }
+    }
+
+    /// True when `execution_id` is not a remote run, or its remote worker
+    /// process is provably gone (`kill -0` on the owning host reports no such
+    /// process). A terminal status is NOT that proof: a cancelled remote
+    /// worker keeps running, and `HostAdapter` has no stop capability. A
+    /// missing pid, an unreachable host, or an unavailable adapter is
+    /// inconclusive and returns `false` so the lease, persona and live state
+    /// stay held until [`crate::remote_lease_reconcile`] sees positive death.
+    pub(super) async fn remote_worker_proven_gone(&self, execution_id: &str) -> bool {
+        let handle = match self.work_db.latest_remote_run_for_execution(execution_id) {
+            Ok(None) => return true,
+            Ok(Some(handle)) => handle,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "remote worker liveness: run lookup failed; assuming alive"
+                );
+                return false;
+            }
         };
-        let host = self
-            .work_db
-            .get_host(&host_id)?
-            .ok_or_else(|| anyhow::anyhow!("remote cleanup host {host_id} is unavailable"))?;
+        let Some(remote_pid) = handle.remote_pid else {
+            return false;
+        };
         let provider = self
             .host_adapter_provider
             .read()
             .expect("host adapter provider lock poisoned")
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("remote cleanup adapter provider is unavailable"))?;
-        let adapter = provider.adapter_for(&host).await?;
-        anyhow::ensure!(adapter.host_id() == host_id, "remote cleanup adapter host mismatch");
-        Ok(Some(adapter))
+            .clone();
+        let (Some(provider), Ok(Some(host))) = (provider, self.work_db.get_host(&handle.host_id)) else {
+            return false;
+        };
+        let Ok(adapter) = provider.adapter_for(&host).await else {
+            return false;
+        };
+        matches!(adapter.probe_remote_worker_alive(remote_pid).await, Ok(Some(false)))
     }
 
     /// Mark `execution_id` as tearing down. Call this **before** the write
@@ -130,8 +168,8 @@ impl WorkerCompletionHandler {
         let pane_ms = pane_started.elapsed().as_millis();
 
         let driver_started = Instant::now();
-        let remote_adapter = self.remote_cleanup_adapter(execution_id).await;
-        if matches!(remote_adapter, Ok(None)) {
+        let owning_cube = self.owning_cube(execution_id).await;
+        if matches!(&owning_cube, Ok(resolved) if resolved.is_local()) {
             crate::driver_teardown::teardown_driver_workspace(
                 &self.work_db,
                 execution_id,
@@ -146,9 +184,9 @@ impl WorkerCompletionHandler {
         let mut cube_timed_out = false;
         if let Some(lease_id) = lease_id {
             let release = async {
-                match remote_adapter {
-                    Ok(Some(adapter)) => adapter.force_release_lease(lease_id, Some(path)).await,
-                    Ok(None) => self.cube_client.release_workspace(lease_id).await,
+                match owning_cube {
+                    Ok(resolved) if resolved.is_local() => self.cube_client.release_workspace(lease_id).await,
+                    Ok(resolved) => resolved.cube.force_release_lease(lease_id, Some(path)).await,
                     Err(err) => Err(err),
                 }
             };
