@@ -46,13 +46,13 @@ If the feature is enabled but the destination is unset, relative, missing, not a
 
 Destination validation, copying, and pruning run on a separate single-flight worker. Startup and the local snapshot loop never wait for destination I/O; local retention runs before dispatch. If a previous destination operation is still running, the next copy is skipped, logged at WARN, and counted.
 
-| Metric                                          | Meaning                                                                                                                                        |
-| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `database_backup.offsite.copies_succeeded`      | counter of completed copies                                                                                                                    |
-| `database_backup.offsite.copies_failed`         | counter of failed copies                                                                                                                       |
-| `database_backup.offsite.config_invalid`        | counter of unusable-config detections                                                                                                          |
-| `database_backup.offsite.copies_skipped` | counter of cycles skipped while a previous destination operation is running |
-| `database_backup.offsite.retention_failed` | counter of retention enumeration/deletion failures (also logged at ERROR) |
+| Metric                                          | Meaning                                                                                                                                                                                                   |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `database_backup.offsite.copies_succeeded`      | counter of completed copies                                                                                                                                                                               |
+| `database_backup.offsite.copies_failed`         | counter of failed copies                                                                                                                                                                                  |
+| `database_backup.offsite.config_invalid`        | counter of unusable-config detections                                                                                                                                                                     |
+| `database_backup.offsite.copies_skipped`        | counter of cycles skipped while a previous destination operation is running                                                                                                                               |
+| `database_backup.offsite.retention_failed`      | counter of retention enumeration/deletion failures (also logged at ERROR)                                                                                                                                 |
 | `database_backup.offsite.last_success_age_secs` | gauge, refreshed every 60s: seconds since the last good copy, persisted locally across restarts for this destination; -1 means no durable success is known. Alert on -1 or when this exceeds a few hours. |
 
 ### Why a synced folder rather than a cloud bucket
@@ -92,3 +92,5 @@ Built `//tools/boss/engine/core:engine` with Bazel, then launched that binary wi
 Created the product `offsite-restore-proof` through the scratch engine's socket. A 1,024,000-byte snapshot containing that product appeared under `destination/brians-laptop/`; the next cycle replaced it under the retention policy. A seeded year-2000 backup and a partial file with an mtime older than 24 hours were removed. Before stopping, the live metrics reported two successful copies, zero failed copies, zero retention failures, and success age zero.
 
 Stopped the scratch engine, moved its database and any WAL/SHM files aside, and replaced `state.db` with the copied snapshot `state.db.bak-20261009-214920`. SQLite integrity checking returned `ok`. Restarting the engine on the same isolated socket succeeded, and `list_products` returned `offsite-restore-proof`. After restart, local retention kept two snapshots and offsite retention kept one. This verifies settings/startup wiring, copying, pruning, and restore into a running engine; it does not verify upload by a cloud sync provider.
+
+Repeated the full check after integrating `main`, using `/tmp/boss-offsite-922whc5n` and snapshot `state.db.bak-20261009-232214`: copies appeared, old and prior-cycle snapshots and the stale partial were pruned, integrity checking returned `ok`, and the restarted engine returned the restored product through `list_products`.

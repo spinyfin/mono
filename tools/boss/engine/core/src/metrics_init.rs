@@ -313,7 +313,10 @@ mod tests {
             "database_backup.offsite.copies_succeeded",
             "database_backup.offsite.retention_failed",
         ] {
-            assert!(names.contains(&expected.to_owned()), "init_all must register {expected}");
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
         }
         assert_eq!(
             names.len(),
