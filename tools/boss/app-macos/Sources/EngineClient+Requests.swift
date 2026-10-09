@@ -270,7 +270,7 @@ extension EngineClient {
             "type": "get_work_tree",
             "product_id": productId,
             "fetch_seq": fetchSeq,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     func sendListAttentionItemsForWorkItem(workItemID: String) {

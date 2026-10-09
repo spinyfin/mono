@@ -33,6 +33,12 @@ enum EngineEvent {
     /// `requestId` is the envelope id of the answer request it refuses.
     case operatorQuestionError(message: String, requestId: String?)
     case error(message: String)
+    /// Socket-level failure (connect/send/receive). Never drives a modal:
+    /// the debounced connection-lost banner is the user-facing signal.
+    case transportError(message: String)
+    /// A request was issued while the socket was down and could not be
+    /// queued (non-idempotent). `requestKind` is the wire `type`.
+    case notConnected(requestKind: String)
     /// Snapshot of every allocated worker slot's live runtime state.
     /// Delivered both as a one-shot reply to
     /// `list_worker_live_states` and as a topic push on

@@ -307,6 +307,19 @@ final class OptimisticKanbanMoveTests: XCTestCase {
 
     // MARK: - Helpers
 
+    func testDragWhileDisconnectedBouncesBackWithoutModal() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
+
+        model.applyEventForTest(.notConnected(requestKind: "update_work_item"))
+
+        XCTAssertNil(model.workErrorMessage, "disconnect must not raise the modal")
+        XCTAssertNotNil(model.dragRefusalNotice, "bounce shows the inline notice")
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
+    }
+
     private func makeTask(
         status: String,
         autostart: Bool = false,
