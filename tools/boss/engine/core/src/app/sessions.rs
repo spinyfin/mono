@@ -103,10 +103,6 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         tokio::spawn(async move {
             pane_reconcile_state.retry_startup_pane_reconcile().await;
         });
-        // No spawn-capability breaker reset here: workers are hosted in
-        // engine-owned tmux sessions, so an app relaunch cannot repair (or
-        // break) spawning. The breaker recovers via its half-open probe or
-        // an operator `bossctl dispatch resume`.
         // Push pool sizes immediately after registration so the app's
         // WorkersWorkspaceModel can configure its slot ranges before the
         // engine dispatches any AttachWorkerPane. This is the single source

@@ -450,8 +450,7 @@ pub enum Stage {
     /// `boss_engine::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER` for the
     /// 2026-07-15 incident that briefly defaulted it off and why it is safe
     /// to default on again). When enabled, dispatch stays paused
-    /// until either the half-open recovery probe or a fresh app session
-    /// registering auto-resumes it (see
+    /// until the half-open recovery probe auto-resumes it (see
     /// [`Stage::SpawnCapabilityRecovered`] and
     /// `boss_engine::spawn_health::maybe_admit_recovery_probe`); when disabled,
     /// this event fires as observability only. The `details` object carries
@@ -461,8 +460,7 @@ pub enum Stage {
     /// Dispatch auto-resumed after Breaker-origin evidence that the app's
     /// spawn path recovered — either the half-open recovery probe's canary
     /// (see `boss_engine::spawn_health::maybe_admit_recovery_probe`) reported a
-    /// driver-originated signal, or a fresh app session registered (including
-    /// after an app relaunch). Never fired for an
+    /// driver-originated signal. Never fired for an
     /// operator-originated pause, which stays manual-resume-only. The
     /// `details` object carries the human-readable `reason`; the event's
     /// `execution_id` is the canary's id when the probe succeeded, or the
@@ -519,7 +517,7 @@ pub enum Stage {
     DispatchPaused,
     /// Dispatch resumed after a [`Stage::DispatchPaused`] — either an
     /// operator toggled dispatch back on, or the spawn-capability breaker's
-    /// half-open recovery probe / a fresh app session cleared a
+    /// half-open recovery probe cleared a
     /// Breaker-origin pause (see
     /// `boss_engine::spawn_health::resume_dispatch_after_breaker_recovery`). The
     /// `details` object carries `origin`, `actor` (`"operator"` for a human

@@ -574,8 +574,9 @@ interrupt, launch, stop, transcript}`, `probe <run_id> <text>`,
 
 - `bossctl agents focus` — needs an engine→app RPC to bring a
   specific worker pane to the front.
-- `bossctl agents send` — needs an engine→app RPC that injects
-  user-typed input into a worker pane.
+- `bossctl agents send` — the engine delivers user-typed input
+  straight to the worker's tmux pane (`app/pane_ops.rs`); no
+  engine→app round trip is involved.
 - ~~`bossctl agents interrupt`~~ — landed. Verb resolves
   agent → run id via `WorkerRegistry` and has the engine send the
   Esc keystroke straight to the worker's tmux pane, so Claude

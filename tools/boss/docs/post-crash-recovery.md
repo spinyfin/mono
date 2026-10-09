@@ -56,9 +56,14 @@ not yet expired; the verdict is one of:
   identity matched), startup recovery re-issues the pane spawn against
   the already-leased workspace instead of waiting for the 300 s
   never-attached reaper. Presence is decided from the durable tmux
-  identity (`EnginePaneOracle`), not from the app; if it cannot be
-  determined, that is a loud `startup_pane_respawn` error, retried on
-  the next pass — never a silent pass.
+  identity (`EnginePaneOracle`), not from the app. A recorded tmux
+  identity with no adopted or live worker is `Absent` and permits the
+  respawn. A missing or unreadable identity is `Undetermined`: the
+  engine logs a loud `startup_pane_respawn` error and deliberately does
+  not respawn. Those undetermined rows are saved and retried when an app
+  session registers (`retry_startup_pane_reconcile`); a headless engine
+  never retries them. The app is only the retry trigger there, never a
+  presence oracle.
 - `Dead` — cube says the workspace is free, the lease id has changed,
   or the lease has logically expired (TTL passed). The engine marks
   the execution `orphaned` immediately and inherits the workspace_id

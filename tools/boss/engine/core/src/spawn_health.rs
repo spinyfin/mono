@@ -34,15 +34,15 @@
 //! see [`SpawnHealthTracker::breaker_enabled`] /
 //! [`crate::config::WorkConfig::enable_spawn_capability_breaker`]. The
 //! breaker tripped for the first time ever on 2026-07-15 on what turned out
-//! to be a benign cause — display sleep + App Nap throttling the app's
-//! MainActor, making spawn acks late — and latched the entire fleet's
+//! to be a benign cause — display sleep throttling spawn acknowledgements
+//! — and latched the entire fleet's
 //! dispatch — `pr_review` included — for ~40 minutes until a human noticed
 //! and manually resumed it. That incident drove the flag to default off
 //! between PR #2041 and the fix below. Since then, the App Nap opt-out
 //! (display sleep no longer degrades spawn acks) and the half-open
 //! auto-recovery probe (a transient blip self-heals instead of latching)
 //! have landed, so the flag now defaults back **on** for the genuine
-//! app-dead/ghost-pane incident class it was designed for.
+//! dead-spawn-path incident class it was designed for.
 //!
 //! - **Enabled (default):** trip-side behavior pauses dispatch (review
 //!   exemption stripped), PLUS automatic recovery — see below. Operators can
@@ -60,7 +60,7 @@
 //! A Breaker-origin pause is NOT human-in-the-loop only. Once tripped,
 //! normal dispatch stays fully blocked — [`ExecutionCoordinator::drain_ready_queue`]'s
 //! pause gate holds every row, `pr_review` included — which means no
-//! execution could ever run to prove the app's spawn path recovered:
+//! execution could ever run to prove the engine's tmux spawn path recovered:
 //! passive recovery is impossible by construction. Instead
 //! [`maybe_admit_recovery_probe`], driven off the existing 60s
 //! [`crate::spawn_ack_sweep`] tick, periodically force-dispatches exactly
@@ -227,9 +227,9 @@ struct FailureWindowConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpawnFailureClass {
-    /// No shell ever came up for the pane: a dispatch-level spawn timeout, an app
-    /// NACK, or a pane death before any proof of life. The app's
-    /// pane-spawn path is the thing to look at.
+    /// No shell ever came up for the pane: a dispatch-level spawn timeout or a pane
+    /// death before any proof of life. The engine's tmux pane-spawn path is
+    /// the thing to look at.
     NoShell,
     /// A pane and a shell came up and no driver-originated signal (hook
     /// event, transcript path, transcript on disk) was observed within the
@@ -669,7 +669,7 @@ impl SpawnHealthTracker {
 /// says a probe is due, force-dispatch exactly one ready execution as a
 /// canary and mark it in flight. This is the breaker's only way out of the
 /// latch: normal dispatch stays fully blocked while paused, so without this
-/// no execution could ever run to prove the app's spawn path recovered.
+/// no execution could ever run to prove the engine's tmux spawn path recovered.
 ///
 /// The canary goes through [`ExecutionCoordinator::force_dispatch`] with
 /// [`DispatchAdmission::BreakerRecoveryProbe`], so the coordinator's pause
@@ -804,8 +804,8 @@ pub async fn maybe_admit_recovery_probe(
     }
 }
 
-/// Auto-resume dispatch after Breaker-origin evidence that the app's spawn
-/// path is healthy again — either the half-open recovery probe's canary
+/// Auto-resume dispatch after Breaker-origin evidence that the engine's tmux
+/// spawn path is healthy again — the half-open recovery probe's canary
 /// reported a driver-originated signal.
 ///
 /// No-ops when dispatch isn't currently paused, and — critically — when the
@@ -953,7 +953,7 @@ pub struct TripSignal<'a> {
 /// (`handle_set_dispatch_paused`) uses, so an engine restart mid-outage does
 /// not resume churning. Pauses with [`DispatchPauseOrigin::Breaker`], which —
 /// unlike an operator pause — does NOT exempt `pr_review` executions: the
-/// app's spawn path itself is broken here, so dispatching a review would
+/// engine's spawn path itself is broken here, so dispatching a review would
 /// just burn another attempt against the same dead path.
 pub async fn trip_spawn_capability_circuit(
     work_db: &WorkDb,
@@ -1097,8 +1097,7 @@ pub async fn trip_spawn_capability_circuit(
              **Recovery is automatic:** the engine periodically force-dispatches a single queued \
              execution as a recovery probe (backing off between attempts) and auto-resumes dispatch \
              the moment one reports a real shell pid — see `spawn_capability_recovered` in \
-             `dispatch-events/current.jsonl`. Relaunching the Boss app also clears the breaker \
-             immediately on reconnect. No manual action is required, but you can force it with \
+             `dispatch-events/current.jsonl`. No manual action is required, but you can force it with \
              `bossctl dispatch resume` / the app's dispatch toggle if recovery is taking longer than \
              expected."
         )
