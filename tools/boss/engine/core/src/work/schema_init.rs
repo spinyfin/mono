@@ -517,7 +517,16 @@ mod floor_tests {
 
     #[test]
     fn supported_databases_apply_post_floor_migrations_without_losing_data() {
-        for version in [32, 33, 34, 35, 36, CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1] {
+        for version in [
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            CURRENT_SCHEMA_VERSION,
+            CURRENT_SCHEMA_VERSION + 1,
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
             let conn = Connection::open(&path).unwrap();
