@@ -17,9 +17,8 @@ pub struct CopyOutcome {
 
 /// Copy the finished backup `src` into `host_dir` under its own file name.
 ///
-/// Writes to a `.<name>.partial` temp file in `host_dir`, fsyncs, then
-/// renames, so a sync agent never sees a half-written backup under the final
-/// name. A leftover `.partial` from a crashed earlier attempt is overwritten.
+/// Streams through the shared atomic publisher's exclusive staging sibling.
+/// Retention removes crash-orphaned staging files after 24 hours.
 pub fn copy_to_offsite(src: &Path, host_dir: &Path) -> Result<CopyOutcome> {
     let name = src
         .file_name()
@@ -31,28 +30,13 @@ pub fn copy_to_offsite(src: &Path, host_dir: &Path) -> Result<CopyOutcome> {
         bail!("refusing to copy {name}: not a finished `{BACKUP_FILE_PREFIX}*` backup");
     }
     let final_path = host_dir.join(name);
-    let tmp_path = host_dir.join(format!(".{name}.partial"));
-
-    let result = (|| -> Result<u64> {
-        let bytes = std::fs::copy(src, &tmp_path)
-            .with_context(|| format!("copy {} to {}", src.display(), tmp_path.display()))?;
-        File::open(&tmp_path)
-            .and_then(|f| f.sync_all())
-            .with_context(|| format!("fsync {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, &final_path)
-            .with_context(|| format!("rename {} to {}", tmp_path.display(), final_path.display()))?;
-        Ok(bytes)
-    })();
-    match result {
-        Ok(bytes) => Ok(CopyOutcome {
-            copied_path: final_path,
-            bytes,
-        }),
-        Err(err) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            Err(err)
-        }
-    }
+    let mut source = File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let bytes = boss_engine_utils::atomic_blob::write_stream_atomic(&final_path, &mut source)
+        .with_context(|| format!("copy {} to {}", src.display(), final_path.display()))?;
+    Ok(CopyOutcome {
+        copied_path: final_path,
+        bytes,
+    })
 }
 
 #[cfg(test)]
@@ -79,7 +63,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_partial_is_overwritten_and_final_name_never_partial() {
+    fn existing_partial_is_not_used_as_staging() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("state.db.bak-20260101-120000");
         std::fs::write(&src, b"good").unwrap();
@@ -88,7 +72,10 @@ mod tests {
         std::fs::write(host.join(".state.db.bak-20260101-120000.partial"), b"half").unwrap();
         let out = copy_to_offsite(&src, &host).unwrap();
         assert_eq!(std::fs::read(out.copied_path).unwrap(), b"good");
-        assert!(!host.join(".state.db.bak-20260101-120000.partial").exists());
+        assert_eq!(
+            std::fs::read(host.join(".state.db.bak-20260101-120000.partial")).unwrap(),
+            b"half"
+        );
     }
 
     #[test]
@@ -102,11 +89,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_destination_dir_fails() {
+    fn non_directory_destination_fails() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("state.db.bak-20260101-120000");
         std::fs::write(&src, b"x").unwrap();
-        assert!(copy_to_offsite(&src, &tmp.path().join("gone")).is_err());
+        let blocked = tmp.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        assert!(copy_to_offsite(&src, &blocked).is_err());
     }
 
     #[test]

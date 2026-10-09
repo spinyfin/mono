@@ -34,22 +34,26 @@ The settings are read once at engine start; restart the engine after editing. Th
 
 Copies land in `<destination>/<hostname>/state.db.bak-YYYYMMDD-HHMMSS`, so several machines can share one destination. The destination directory itself must already exist (Boss only creates the per-host subfolder); a missing destination usually means the sync folder is not mounted.
 
-Retention is the union of both windows, measured over the copies that exist (not wall-clock), so an engine that was off for a week does not prune its only copies. Files in the host folder that do not look like `state.db.bak-YYYYMMDD-HHMMSS` are never touched.
+Retention is the union of both windows, measured over the copies that exist (not wall-clock), so an engine that was off for a week does not prune its only copies. Retention also removes recognized crash staging files older than 24 hours: legacy `.state.db.bak-YYYYMMDD-HHMMSS.partial` files and atomic-publisher `state.db.bak-YYYYMMDD-HHMMSS.<pid>.<sequence>.tmp` files. Recent staging files and unrelated files are left alone.
 
 ### How a copy is made
 
-Only the already-consistent local snapshot is copied, never the live `state.db`/`-wal`/`-shm`. The copy is written to `.state.db.bak-….partial` in the host folder, fsynced, and renamed into place, so the sync agent only ever sees a complete file under the final name. (The `.partial` file is briefly visible to the agent; that is unavoidable for a same-directory atomic rename.)
+Only the already-consistent local snapshot is copied, never the live `state.db`/`-wal`/`-shm`. The shared atomic publisher streams the copy into an exclusively created `state.db.bak-….<pid>.<sequence>.tmp` sibling in the host folder, fsyncs it, and renames it into place, so the sync agent only ever sees a complete file under the final name. The staging file is briefly visible to the agent.
 
 ### Failures are loud, never fatal
 
-If the feature is enabled but the destination is unset, relative, missing, not a directory, or not writable, the engine logs at ERROR at startup naming `[backup.offsite]` and increments `database_backup.offsite.config_invalid`. It keeps running and re-validates on every cycle, so a folder that mounts late recovers on its own. A failed copy (destination unmounted, disk full, macOS privacy denial, ...) logs at ERROR, increments `database_backup.offsite.copies_failed`, and never affects the local backup.
+If the feature is enabled but the destination is unset, relative, missing, not a directory, or not writable, the engine logs at ERROR during the first copy attempt naming `[backup.offsite]` and increments `database_backup.offsite.config_invalid`. It keeps running and re-validates on every cycle, so a folder that mounts late recovers on its own. A failed copy (destination unmounted, disk full, macOS privacy denial, ...) logs at ERROR, increments `database_backup.offsite.copies_failed`, and never affects the local backup.
+
+Destination validation, copying, and pruning run on a separate single-flight worker. Startup and the local snapshot loop never wait for destination I/O; local retention runs before dispatch. If a previous destination operation is still running, the next copy is skipped, logged at WARN, and counted.
 
 | Metric                                          | Meaning                                                                                                                                        |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `database_backup.offsite.copies_succeeded`      | counter of completed copies                                                                                                                    |
 | `database_backup.offsite.copies_failed`         | counter of failed copies                                                                                                                       |
 | `database_backup.offsite.config_invalid`        | counter of unusable-config detections                                                                                                          |
-| `database_backup.offsite.last_success_age_secs` | gauge, refreshed every 60s: seconds since the last good copy (since engine start if there has been none). Alert when this exceeds a few hours. |
+| `database_backup.offsite.copies_skipped` | counter of cycles skipped while a previous destination operation is running |
+| `database_backup.offsite.retention_failed` | counter of retention enumeration/deletion failures (also logged at ERROR) |
+| `database_backup.offsite.last_success_age_secs` | gauge, refreshed every 60s: seconds since the last good copy, persisted locally across restarts for this destination; -1 means no durable success is known. Alert on -1 or when this exceeds a few hours. |
 
 ### Why a synced folder rather than a cloud bucket
 
@@ -61,7 +65,7 @@ If the feature is enabled but the destination is unset, relative, missing, not a
 
 - **Streaming vs mirroring:** in _stream_ mode files are fetched on demand and the folder lives under `~/Library/CloudStorage/`; uploads still happen but local disk is only a cache. In _mirror_ mode a full local copy also exists. Either works; verify in the Drive menu that uploads complete.
 - **Online-only files:** copies Boss wrote can be evicted locally after upload. That is fine for backups, but restoring requires the file to be downloaded first (open it in Finder or `cp` it, which triggers a download).
-- **Partial uploads:** the agent may upload the `.partial` name or a half-synced file during a sync; only trust files that the agent shows as fully synced.
+- **Partial uploads:** the agent may upload a staging name or a half-synced file during a sync; only trust files that the agent shows as fully synced.
 - **macOS privacy:** the engine process needs permission to write under `~/Library/CloudStorage` (Files and Folders / Full Disk Access). A denial surfaces as `copies_failed` plus an ERROR log with `Operation not permitted`.
 - **Account state:** signing out of the sync agent leaves the folder present but stale. `last_success_age_secs` only proves the copy into the folder, not the upload; check the agent's status occasionally.
 - **Sensitive data:** `state.db` contains your work metadata. Point the destination at an account/folder you are comfortable storing it in.
@@ -75,10 +79,16 @@ If the feature is enabled but the destination is unset, relative, missing, not a
 5. Copy the backup to `<state_root>/state.db`.
 6. Start the engine.
 
-Verified on a scratch state root (never the production one):
+An integrity check is useful, but does not prove the restored database opens in the engine. Complete steps 1–6 and confirm restored data through the engine as well:
 
 ```sh
-scratch=$(mktemp -d)
-cp "<destination>/<hostname>/state.db.bak-20260101-120000" "$scratch/state.db"
-sqlite3 "$scratch/state.db" 'pragma integrity_check'                  # -> ok
+sqlite3 "<scratch-state-root>/state.db" 'pragma integrity_check'
 ```
+
+### Scratch-engine verification (2026-10-09)
+
+Built `//tools/boss/engine/core:engine` with Bazel, then launched that binary with `--socket-path /tmp/boss-offsite-6fzsumu7/fixture.sock` and `BOSS_DB_PATH=/tmp/boss-offsite-6fzsumu7/state.db`. Inherited `BOSS_*` variables were removed first. The scratch root's `settings.toml` enabled `[backup.offsite]`, with destination `/tmp/boss-offsite-6fzsumu7/destination`, `keep_hourly = 1`, and `keep_daily = 1`; `BOSS_BACKUP_INTERVAL_SECS=2` and `BOSS_BACKUP_RETENTION=2` accelerated the check.
+
+Created the product `offsite-restore-proof` through the scratch engine's socket. A 1,024,000-byte snapshot containing that product appeared under `destination/brians-laptop/`; the next cycle replaced it under the retention policy. A seeded year-2000 backup and a partial file with an mtime older than 24 hours were removed. Before stopping, the live metrics reported two successful copies, zero failed copies, zero retention failures, and success age zero.
+
+Stopped the scratch engine, moved its database and any WAL/SHM files aside, and replaced `state.db` with the copied snapshot `state.db.bak-20261009-214920`. SQLite integrity checking returned `ok`. Restarting the engine on the same isolated socket succeeded, and `list_products` returned `offsite-restore-proof`. After restart, local retention kept two snapshots and offsite retention kept one. This verifies settings/startup wiring, copying, pruning, and restore into a running engine; it does not verify upload by a cloud sync provider.

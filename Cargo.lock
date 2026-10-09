@@ -724,11 +724,11 @@ name = "boss-engine-offsite-backup"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boss-engine-utils",
  "libc",
  "serde",
  "tempfile",
  "toml",
- "tracing",
 ]
 
 [[package]]
@@ -821,6 +821,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "tempfile",
 ]
 
 [[package]]
