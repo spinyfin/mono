@@ -119,7 +119,8 @@ const NUDGE_NOTICE: &str = "[coordinator-nudge]";
 /// structurally on the probe record (`submitted` / `resumed`); these strings
 /// are only the human-readable rendering, shared so the stored lifecycle
 /// record and the synchronous reply cannot drift apart.
-const DETAIL_SUBMITTED_RESUMED_CONFIRMED: &str = "submitted=true; resumed=confirmed by matching prompt hook or transcript";
+const DETAIL_SUBMITTED_RESUMED_CONFIRMED: &str =
+    "submitted=true; resumed=confirmed by matching prompt hook or transcript";
 const DETAIL_SUBMITTED_PANE_ECHO_ONLY: &str = "submitted=true; resumed=unconfirmed (only the pane echo was observed)";
 const DETAIL_SUBMITTED_UNCONFIRMED: &str =
     "submitted=true; resumed=unconfirmed (no matching prompt hook or transcript yet)";
