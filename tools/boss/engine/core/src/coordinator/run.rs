@@ -1089,13 +1089,18 @@ impl ExecutionCoordinator {
             let Some(record) = self.work_db.execution_bookmark_optional(&execution.id)? else {
                 return Ok(None);
             };
-            self.inspect_execution_bookmark(&record).await.map(Some)
+            match self.inspect_execution_bookmark(&record).await {
+                Ok(patch) => Ok(Some(patch)),
+                Err(err) if boss_engine_recovery::execution_bookmark::is_missing_pointer_error(&err) => {
+                    self.degrade_missing_pointers(execution, None, &record, &err).await;
+                    Ok(None)
+                }
+                Err(err) => Err(err),
+            }
         }
         .await;
         match inspection {
-            Ok(None) => {
-                self.warn_missing_execution_bookmark(execution, None).await;
-            }
+            Ok(None) => {}
             Ok(Some(_)) => {
                 self.work_db.resolve_attention_kind_for_execution(
                     &execution.id,

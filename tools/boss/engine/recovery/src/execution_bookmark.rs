@@ -211,15 +211,21 @@ async fn resolve(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<String> {
     })
 }
 
+fn missing_heads_error(record: &ExecutionBookmark) -> anyhow::Error {
+    anyhow::Error::new(MissingPointerError(format!(
+        "expected recovery pointer {} or {} to resolve to exactly one change; both are missing",
+        record.head(),
+        record.publication()
+    )))
+}
+
 async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
     let recovery = resolve_optional(jj, &record.repo_path, &record.head()).await?;
     let publication = resolve_optional(jj, &record.repo_path, &record.publication()).await?;
     if recovery.is_none() && publication.is_none() {
-        return Err(anyhow::Error::new(MissingPointerError(format!(
-            "expected recovery pointer {} or {} to resolve to exactly one change; both are missing",
-            record.head(),
-            record.publication()
-        ))));
+        // Checked before the baseline so a fully deleted record reports as
+        // missing rather than as a baseline integrity failure.
+        return Err(missing_heads_error(record));
     }
     let base = resolve(jj, &record.repo_path, &record.base()).await?;
     for head in [&recovery, &publication].into_iter().flatten() {
@@ -245,6 +251,7 @@ async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String
         }
     }
     match (recovery, publication) {
+        (None, None) => Err(missing_heads_error(record)),
         (Some(recovery), Some(publication)) if recovery != publication => {
             for (ancestor, descendant, bookmark) in [
                 (&publication, &recovery, record.head()),
@@ -276,7 +283,6 @@ async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String
         }
         (Some(_), _) => Ok(record.head()),
         (None, Some(_)) => Ok(record.publication()),
-        (None, None) => unreachable!("missing heads were checked before baseline validation"),
     }
 }
 

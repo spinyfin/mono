@@ -67,6 +67,14 @@ impl WorkDb {
         Ok(())
     }
 
+    pub(crate) fn delete_execution_bookmark(&self, execution_id: &str) -> Result<()> {
+        self.connect()?.execute(
+            "DELETE FROM execution_bookmarks WHERE execution_id = ?1",
+            [execution_id],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn execution_bookmark(&self, execution_id: &str) -> Result<ExecutionBookmark> {
         self.execution_bookmark_optional(execution_id)?
             .with_context(|| format!("no engine-created recovery bookmark recorded for execution {execution_id}"))

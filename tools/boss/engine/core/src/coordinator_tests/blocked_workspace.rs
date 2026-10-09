@@ -191,6 +191,84 @@ async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
     }
 }
 
+/// Records `execution_id`'s pointers in `db`, then deletes both heads so only
+/// the baseline survives. Returns the repo holding them.
+async fn record_then_delete_heads(
+    db: &WorkDb,
+    dir: &std::path::Path,
+    execution_id: &str,
+) -> boss_engine_test_git::jj::JjRepo {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_test_git::jj::JjRepo;
+    let repo = JjRepo::new(dir);
+    let record = create(&LocalJj, &repo.worker, execution_id, "local").await.unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "delete", &record.head(), &record.publication()],
+    );
+    repo
+}
+
+fn recovery_coordinator_for(db: Arc<WorkDb>) -> Arc<ExecutionCoordinator> {
+    Arc::new(ExecutionCoordinator::new(
+        db,
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ))
+}
+
+#[tokio::test]
+async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
+    let dir = tempdir().unwrap();
+    let (db, _prior, next) = blocked_pair(&dir.path().join("boss.db"));
+    let repo = record_then_delete_heads(&db, dir.path(), &next.id).await;
+    let coordinator = recovery_coordinator_for(db.clone());
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-new".into(),
+        workspace_id: "workspace-old".into(),
+        workspace_path: repo.worker.clone(),
+        dirty_verified: None,
+    };
+    let recovered = coordinator
+        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None)
+        .await
+        .unwrap();
+    assert!(recovered.is_none());
+    assert!(
+        db.execution_bookmark_optional(&next.id).unwrap().is_none(),
+        "a stale row would make dispatch skip creating fresh pointers"
+    );
+}
+
+#[tokio::test]
+async fn non_implementation_with_deleted_predecessor_heads_continues_without_recovery() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let (db, prior, next) = blocked_pair(&path);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE work_executions SET kind = 'pr_review'", [])
+        .unwrap();
+    let next = db.get_execution(&next.id).unwrap();
+    assert_eq!(next.kind, ExecutionKind::PrReview);
+    let repo = record_then_delete_heads(&db, dir.path(), &prior.id).await;
+    let coordinator = recovery_coordinator_for(db.clone());
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-new".into(),
+        workspace_id: "workspace-old".into(),
+        workspace_path: repo.worker.clone(),
+        dirty_verified: None,
+    };
+    let recovered = coordinator
+        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None)
+        .await
+        .unwrap();
+    assert!(recovered.is_none());
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+}
+
 #[tokio::test]
 async fn missing_predecessor_bookmark_dispatches_into_a_clean_workspace() {
     let dir = tempdir().unwrap();

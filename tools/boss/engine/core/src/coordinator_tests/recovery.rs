@@ -804,6 +804,60 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
 }
 
 #[tokio::test]
+async fn resume_pane_spawn_continues_when_the_recorded_heads_are_missing() {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_test_git::jj::JjRepo;
+    let (_dir, db) = open_db_arc();
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "stranded-missing-heads");
+    db.reconcile_product_executions(&product.id).unwrap();
+    db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let exec = db.list_executions(Some(&chore.id)).unwrap().into_iter().next().unwrap();
+    let (exec, _run) = db
+        .start_execution_run(
+            &exec.id,
+            "worker-1",
+            "mono",
+            "lease-stranded",
+            "ws-stranded",
+            "/tmp/ws-stranded",
+        )
+        .unwrap();
+    let root = tempdir().unwrap();
+    let repo = JjRepo::new(root.path());
+    let record = create(&LocalJj, &repo.worker, &exec.id, "local").await.unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "delete", &record.head(), &record.publication()],
+    );
+
+    let runner = Arc::new(FakeExecutionRunner {
+        slot_id: Some(1),
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(2),
+        Arc::new(FakeCubeClient::default()),
+        runner.clone(),
+    ));
+    coordinator
+        .resume_pane_spawn_for_running_execution(&exec)
+        .await
+        .expect("missing recorded heads must not wedge a live worker");
+    assert!(
+        !db.list_attention_items(&exec.id)
+            .unwrap()
+            .iter()
+            .any(|a| a.kind == crate::execution_bookmark_recovery::RECOVERY_FAILED)
+    );
+    assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Running);
+}
+
+#[tokio::test]
 async fn resume_pane_spawn_still_reenters_when_the_bookmark_is_present() {
     let (_dir, db) = open_db_arc();
     seed_local_claude_driver(&db);
