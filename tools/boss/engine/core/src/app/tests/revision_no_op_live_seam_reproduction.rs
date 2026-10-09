@@ -3,9 +3,9 @@
 //! calling a completion-handler method directly.
 //!
 //! The unit tests in `completion::tests::t15` cover the same scenario
-//! (`revision_no_op_survives_unavailable_proposals_and_github_for_every_driver`)
-//! but call `WorkerCompletionHandler::on_stop` on a bare handler wired to
-//! test doubles. That leaves the actual integration boundary the original
+//! (`revision_no_op_survives_unavailable_github_for_every_driver`) but call
+//! `WorkerCompletionHandler::on_stop` on a bare handler wired to test
+//! doubles. That leaves the actual integration boundary the original
 //! incident occurred at unverified: a real driver's final response is
 //! captured by the `boss-event` shim, sent over the engine's Unix events
 //! socket, resolved to a driver and fanned out by the production dispatch
@@ -13,23 +13,24 @@
 //! `worker_events::dispatch_worker_event_fanout`), and only THEN reaches
 //! `WorkerCompletionHandler::on_stop`.
 //!
-//! This test exercises that whole path against a real, in-process
+//! These tests exercise that whole path against a real, in-process
 //! `ServerState` (mirroring `answer_agent_lifecycle.rs`'s
 //! `stop_hook_through_the_events_socket` pattern): a real `UnixListener`
 //! decodes a real Stop hook payload, real per-connection driver resolution
 //! runs, and the real fan-out drives the real completion handler. The
-//! run-done proposal seam is "unavailable" in the most literal sense
-//! available to a hermetic test: no proposal is ever submitted over it (the
-//! worker's `boss propose done` call is exactly what a genuinely
-//! unreachable engine socket would also produce — no proposal record, no
-//! `run_done_outcome` — so the only evidence of the worker's conclusion is
-//! the transcript's `NO_CHANGES_NEEDED` marker), and the GitHub branch
-//! verifier is stubbed to fail every call, standing in for the same
+//! GitHub branch verifier is stubbed to fail every call, standing in for the
 //! incident evidence (`error connecting to api.github.com`) the original
 //! coordinator trace recorded. Everything else — socket wiring, driver
 //! resolution, event fan-out, the completion handler, the DB, the cube
 //! lease release, the attention-item recording — is the real production
 //! code.
+//!
+//! There are two halves. With the worker's `boss propose done --outcome
+//! no-changes-needed` declaration recorded, the run terminalizes. Without
+//! it — which is exactly what a genuinely unreachable engine socket
+//! produces: no proposal record, no `run_done_outcome` — the run is NEVER
+//! closed as a no-op by inference, even when the transcript carries the
+//! retired `NO_CHANGES_NEEDED` text marker.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -137,9 +138,10 @@ fn seed_parked_revision(server_state: &Arc<ServerState>, pr_url: &str, slot_id: 
     execution.id
 }
 
-/// Write the driver's final message the way a real Claude session leaves it
-/// on disk, and register the path the way `PaneSpawnRunner` does.
-fn write_no_changes_needed_transcript(db: &WorkDb, workspace_path: &Path, execution_id: &str) {
+/// Write a final message carrying the retired `NO_CHANGES_NEEDED` text
+/// marker the way a real Claude session leaves it on disk, and register the
+/// path the way `PaneSpawnRunner` does.
+fn write_legacy_marker_transcript(db: &WorkDb, workspace_path: &Path, execution_id: &str) {
     let obj = serde_json::json!({
         "type": "assistant",
         "message": { "content": [{"type": "text", "text": "The finding needs no change.\nNO_CHANGES_NEEDED"}] }
@@ -185,25 +187,23 @@ async fn stop_hook_through_the_events_socket(
     incoming
 }
 
-/// A revision worker that declared `NO_CHANGES_NEEDED` in its transcript,
-/// with the run-done proposal seam enabled but never actually used (the
-/// worker's `boss propose done` never reached the engine) and GitHub
-/// unreachable for the SHA-delta gate, must still reach a terminal state,
-/// release its cube lease, free its worker slot, and leave a durable
-/// declined-finding attention record — driven through the real events
-/// socket and the real production fan-out, not through a direct call to
-/// `WorkerCompletionHandler::on_stop`.
+/// A revision worker whose `boss propose done --outcome no-changes-needed`
+/// declaration was recorded, with GitHub unreachable for the SHA-delta gate,
+/// must reach a terminal state, release its cube lease, free its worker
+/// slot, and leave a durable declined-finding attention record — driven
+/// through the real events socket and the real production fan-out, not
+/// through a direct call to `WorkerCompletionHandler::on_stop`. The
+/// `run_done_proposals_seam` flag is left off: the no-op declaration is read
+/// from its durable stamp regardless of it.
 #[tokio::test]
-async fn revision_no_op_survives_unavailable_seam_through_the_real_dispatch_path() {
+async fn revision_no_op_declaration_terminalizes_through_the_real_dispatch_path() {
     let (server_state, _dir) = test_server_state_with_fakes_and_branch_verifier(Arc::new(UnreachableBranchVerifier));
-    server_state.feature_flags.set("worker_proposals", true).unwrap();
-    server_state.feature_flags.set("run_done_proposals_seam", true).unwrap();
 
     let pr = "https://github.com/spinyfin/mono/pull/1613";
     let slot_id = 5;
     let execution_id = seed_parked_revision(&server_state, pr, slot_id);
     super::tmux_stub::install_teardown(&server_state, &execution_id, 4_194_303);
-    write_no_changes_needed_transcript(&server_state.work_db, &std::env::temp_dir(), &execution_id);
+    declare_no_changes_needed(&server_state.work_db, &execution_id);
 
     // Before: the row says live and the pool says claimed.
     assert!(
@@ -215,13 +215,6 @@ async fn revision_no_op_survives_unavailable_seam_through_the_real_dispatch_path
             .is_live()
     );
     assert!(server_state.live_worker_states.get(slot_id).is_some());
-    // No proposal was ever submitted — the seam is "unavailable" from the
-    // worker's perspective exactly as it would be if the engine socket
-    // itself were unreachable.
-    assert_eq!(
-        server_state.work_db.execution_run_done_outcome(&execution_id).unwrap(),
-        None
-    );
 
     // The driver's turn boundary, carried the whole production way: the
     // shim's JSON over the events socket, through per-connection driver
@@ -233,8 +226,7 @@ async fn revision_no_op_survives_unavailable_seam_through_the_real_dispatch_path
     assert_eq!(
         execution.status,
         ExecutionStatus::Completed,
-        "a declared no-op must reach a terminal state even with the proposal seam unavailable \
-         and GitHub unreachable",
+        "a declared no-op must reach a terminal state even with GitHub unreachable",
     );
     assert!(
         execution.cube_lease_id.is_none(),
@@ -251,4 +243,59 @@ async fn revision_no_op_survives_unavailable_seam_through_the_real_dispatch_path
         .find(|item| item.kind == REVISION_NO_OP_ATTENTION_KIND)
         .expect("declined-finding record must be filed through the real dispatch path");
     assert!(declined.body_markdown.contains("not independently verified"));
+}
+
+/// The converse, and the retirement guard: when `boss propose done` never
+/// reached the engine (no proposal record, no `run_done_outcome`), a
+/// transcript that ends with the retired `NO_CHANGES_NEEDED` line must NOT
+/// close the revision. The run stays live, holding its lease and slot, with
+/// no declined-finding record — the failure stays visible to the existing
+/// stale-worker / run-done-missing handling instead of being inferred as a
+/// quiet success.
+#[tokio::test]
+async fn revision_without_declaration_is_never_closed_as_a_no_op_by_inference() {
+    let (server_state, _dir) = test_server_state_with_fakes_and_branch_verifier(Arc::new(UnreachableBranchVerifier));
+
+    let pr = "https://github.com/spinyfin/mono/pull/1613";
+    let slot_id = 6;
+    let execution_id = seed_parked_revision(&server_state, pr, slot_id);
+    super::tmux_stub::install_teardown(&server_state, &execution_id, 4_194_304);
+    write_legacy_marker_transcript(&server_state.work_db, &std::env::temp_dir(), &execution_id);
+    assert_eq!(
+        server_state.work_db.execution_run_done_outcome(&execution_id).unwrap(),
+        None
+    );
+
+    let stop = stop_hook_through_the_events_socket(&server_state, &execution_id).await;
+    dispatch_worker_event_fanout(&server_state, &stop).await;
+
+    let execution = server_state.work_db.get_execution(&execution_id).unwrap();
+    assert!(
+        execution.status.is_live(),
+        "the retired marker must not terminalize a run; got {:?}",
+        execution.status,
+    );
+    assert!(execution.cube_lease_id.is_some(), "the lease stays held");
+    assert!(
+        server_state
+            .work_db
+            .list_attention_items(&execution_id)
+            .unwrap()
+            .iter()
+            .all(|item| item.kind != REVISION_NO_OP_ATTENTION_KIND),
+        "no declined-finding record may be filed for an undeclared run",
+    );
+}
+
+/// Stamp the durable declaration `boss propose done --outcome
+/// no-changes-needed` leaves on the execution row (what `apply_run_done`
+/// writes).
+fn declare_no_changes_needed(db: &WorkDb, execution_id: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET run_done_outcome = 'no_changes_needed', run_done_declared_at = '1' WHERE id = ?1",
+            [execution_id],
+        )
+        .unwrap();
 }

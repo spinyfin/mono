@@ -724,8 +724,8 @@ async fn genuine_no_pr_chore_still_nudges_then_breaker_parks() {
     // to keep the test short.
     //
     // `exec_18b932df99d17658_475` incident: a worker that concludes
-    // there's nothing left to do (whether or not it emits the sanctioned
-    // NO_CHANGES_NEEDED marker) must not be left parked holding its cube
+    // there's nothing left to do (whether or not it declares the sanctioned
+    // `no-changes-needed` outcome) must not be left parked holding its cube
     // lease and worker slot forever once the breaker gives up on it —
     // the auto-remediation this test now also proves.
     let workspace = tempdir().unwrap();
@@ -825,27 +825,22 @@ async fn genuine_no_pr_chore_still_nudges_then_breaker_parks() {
 //
 // A fresh chore_implementation worker whose work is already done on
 // main (empty diff, no PR) must be able to terminate cleanly. When it
-// emits the NO_CHANGES_NEEDED marker the engine closes the task as
-// done WITHOUT a PR and sends NO nudge — replacing the produce-a-PR
-// nudge loop. A worker that stops with no marker is still nudged.
+// declares `propose done --outcome no-changes-needed` the engine closes
+// the task as done WITHOUT a PR and sends NO nudge — replacing the
+// produce-a-PR nudge loop. A worker that stops with no declaration is
+// still nudged.
 // -----------------------------------------------------------
 
 #[tokio::test]
-async fn no_op_marker_closes_task_as_done_without_nudge() {
+async fn no_op_declaration_closes_task_as_done_without_nudge() {
     // The incident path: a chore_implementation worker verified the
-    // work was already done (empty diff, no PR) and emitted
-    // NO_CHANGES_NEEDED. It must terminate ONCE as a clean no-op: task
+    // work was already done (empty diff, no PR) and declared
+    // `no-changes-needed`. It must terminate ONCE as a clean no-op: task
     // → done (no pr_url), NO probe queued, lease + pane released, NO
     // breaker attention item.
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-    write_assistant_transcript(
-        &db,
-        workspace.path(),
-        &execution_id,
-        "## Summary\nPRs #1559 and #1561 already cleaned all three breadcrumb patterns on \
-         main; the working copy has no diff.\n\nNO_CHANGES_NEEDED\n",
-    );
+    declare_no_changes_needed(&db, &execution_id);
     let detector = StubPrDetector::ok(None);
 
     let TestHarness {
@@ -916,14 +911,14 @@ async fn no_op_marker_closes_task_as_done_without_nudge() {
 }
 
 #[tokio::test]
-async fn no_op_without_marker_still_nudges_to_produce_pr() {
-    // Guardrail: a worker that stopped with NO PR and did NOT emit the
-    // NO_CHANGES_NEEDED marker is "gave up / not done", not "verified
+async fn no_op_without_declaration_still_nudges_to_produce_pr() {
+    // Guardrail: a worker that stopped with NO PR and did NOT declare
+    // `no-changes-needed` is "gave up / not done", not "verified
     // already done". The legitimate produce-a-PR nudge must still fire —
     // the no-op gate must NOT globally suppress it.
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-    // A real transcript exists, but it does NOT contain the marker.
+    // A real transcript exists, but the run never declared anything.
     write_assistant_transcript(
         &db,
         workspace.path(),
@@ -937,13 +932,13 @@ async fn no_op_without_marker_still_nudges_to_produce_pr() {
     let outcome = handler.on_stop(&execution_id).await;
     assert!(
         matches!(outcome, StopOutcome::AwaitingInput),
-        "no marker → normal produce-a-PR nudge; got {outcome:?}",
+        "no declaration → normal produce-a-PR nudge; got {outcome:?}",
     );
     let queued = probes.snapshot();
     assert_eq!(
         queued.len(),
         1,
-        "the no-PR worker without a marker is still nudged once"
+        "the no-PR worker without a declaration is still nudged once"
     );
     assert_eq!(queued[0].1, PROBE_NO_PR, "the nudge is the produce-a-PR probe");
     match db.get_work_item(&chore_id).unwrap() {
@@ -951,7 +946,7 @@ async fn no_op_without_marker_still_nudges_to_produce_pr() {
             assert_eq!(
                 t.status,
                 TaskStatus::Active,
-                "no marker → task is NOT closed as a no-op"
+                "no declaration → task is NOT closed as a no-op"
             );
             assert!(t.pr_url.is_none());
         }

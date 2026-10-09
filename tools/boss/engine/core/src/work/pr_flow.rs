@@ -206,8 +206,9 @@ impl WorkDb {
     /// / `task_implementation`) verified its assigned work is **already
     /// done** — the change is already present on `main`, the working-copy
     /// diff is empty, and there is genuinely nothing to commit, push, or
-    /// open a PR for. This is the sanctioned no-op terminal (see
-    /// [`crate::no_op_signal`]). In a single transaction:
+    /// open a PR for. This is the sanctioned no-op terminal (the
+    /// worker's `boss propose done --outcome no-changes-needed` declaration).
+    /// In a single transaction:
     ///   - the linked task/chore moves to `done`, unless already terminal.
     ///     A nonterminal PR owner instead stays in `in_review` with a
     ///     contradiction attention; revisions do not own their stamped PR;

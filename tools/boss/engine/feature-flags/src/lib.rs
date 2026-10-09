@@ -345,11 +345,11 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              is why revisions were being finalized 78s in with nothing pushed; without a declaration the \
              run is now held by run_done_backstop rather than terminalized. The merged / merge-queue / \
              conflict-cleared arms are untouched: each is a real delta or proof the deliverable has left \
-             the worker's hands. (2) The NO_CHANGES_NEEDED terminal reads `run_done --outcome \
-             no_changes_needed` first, with the transcript marker demoted to a counted fallback \
-             (worker_proposals.fallback_hit.run_done), so the declaration also covers the kinds that never \
-             open a PR. DEFAULT OFF: enable per operator once the proposal path is validated in staging. \
-             Kill switch: set false to restore today's inference exactly — the gate stops asking for a \
+             the worker's hands. (2) The no-op terminal reads the `run_done --outcome \
+             no_changes_needed` declaration (the only no-op channel; the legacy NO_CHANGES_NEEDED text \
+             marker is retired and not consulted, with or without this flag), so the declaration also \
+             covers the kinds that never open a PR. DEFAULT OFF: enable per operator once the proposal \
+             path is validated in staging. Kill switch: set false to restore today's inference exactly — the gate stops asking for a \
              declaration and the backstop never runs.",
         category: "completion",
         default_enabled: false,

@@ -471,7 +471,7 @@ fn ci_monitoring_directive_omits_human_gated_names_for_plain_org() {
 fn no_op_directive_present_for_fresh_chore_without_pr() {
     // A fresh chore_implementation worker (no existing PR) must
     // be told the sanctioned way to terminate when the work is already
-    // done — emit NO_CHANGES_NEEDED — instead of only "stop and explain".
+    // done — `propose done --outcome no-changes-needed` — instead of only "stop and explain".
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
             .execution(&base_execution())
@@ -481,8 +481,12 @@ fn no_op_directive_present_for_fresh_chore_without_pr() {
             .build(),
     );
     assert!(
-        prompt.contains(crate::no_op_signal::NO_CHANGES_NEEDED_MARKER),
-        "fresh-chore prompt must name the NO_CHANGES_NEEDED marker:\n{prompt}",
+        prompt.contains("propose done --outcome no-changes-needed --summary"),
+        "fresh-chore prompt must teach the typed no-op declaration:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("NO_CHANGES_NEEDED"),
+        "fresh-chore prompt must not teach the retired text marker:\n{prompt}",
     );
     assert!(
         prompt.contains("signal a sanctioned no-op"),
@@ -504,8 +508,12 @@ fn no_op_directive_absent_when_pr_already_exists() {
             .build(),
     );
     assert!(
-        !prompt.contains(crate::no_op_signal::NO_CHANGES_NEEDED_MARKER),
-        "existing-PR prompt must NOT carry the no-op marker directive:\n{prompt}",
+        !prompt.contains("signal a sanctioned no-op"),
+        "existing-PR prompt must NOT carry the no-op directive:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("NO_CHANGES_NEEDED"),
+        "existing-PR prompt must not teach the retired text marker:\n{prompt}",
     );
 }
 
@@ -1945,13 +1953,13 @@ fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on_for_revisi
 }
 
 #[test]
-fn revision_no_op_directive_teaches_no_changes_needed_marker() {
+fn revision_no_op_directive_teaches_no_changes_needed_declaration() {
     // Before this directive existed, no revision prompt ever taught the
-    // NO_CHANGES_NEEDED marker: `no_op_completion_directive` is gated to
+    // no-changes-needed declaration: `no_op_completion_directive` is gated to
     // `TaskImplementation | ChoreImplementation` with no existing PR, and a
     // revision always has a bound parent PR — so `on_stop_inner`'s revision
     // no-op terminal (`worker_signalled_no_op`) was unreachable in
-    // production. Assert the marker and its revision-specific framing (keyed
+    // production. Assert the declaration and its revision-specific framing (keyed
     // on the dispatched finding, not on an empty `jj diff`) are present.
     let work_item = revision_task_with_created_via(None, "operator");
     let prompt = compose_execution_prompt(
@@ -1963,8 +1971,12 @@ fn revision_no_op_directive_teaches_no_changes_needed_marker() {
             .build(),
     );
     assert!(
-        prompt.contains(crate::no_op_signal::NO_CHANGES_NEEDED_MARKER),
-        "revision prompt must name the NO_CHANGES_NEEDED marker:\n{prompt}",
+        prompt.contains("propose done --outcome no-changes-needed --summary"),
+        "revision prompt must teach the typed no-op declaration:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("NO_CHANGES_NEEDED"),
+        "revision prompt must not teach the retired text marker:\n{prompt}",
     );
     assert!(
         prompt.contains("If the finding needs no code change"),

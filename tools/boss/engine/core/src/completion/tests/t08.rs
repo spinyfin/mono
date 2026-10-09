@@ -13,7 +13,7 @@
 //! the resulting rule: a revision the SHA-delta gate proved did not move
 //! the head must not terminalize as delivered, while the states that are
 //! genuine evidence — a merged PR, a merge-queue acceptance, a cleared
-//! conflict, or the worker's own `NO_CHANGES_NEEDED` declaration — must
+//! conflict, or the worker's own `no-changes-needed` declaration — must
 //! keep working. See `super::super::health_alone_satisfies_deliverable`.
 //!
 //! The second half of the file covers the same gate's *declaration*
@@ -178,7 +178,7 @@ async fn revision_that_contributed_nothing_is_left_alone_while_background_work_i
 async fn revision_declaring_no_changes_needed_closes_without_claiming_delivery() {
     // The honest terminal for a revision that genuinely has nothing to
     // do. It is the WORKER's explicit claim (the sanctioned
-    // NO_CHANGES_NEEDED marker), not an inference the engine draws from a
+    // `no-changes-needed` declaration), not an inference the engine draws from a
     // PR whose health predates the run — and it closes the revision
     // without stamping a pr_url, while filing the attention item that
     // makes the unaddressed finding visible to a human.
@@ -188,12 +188,7 @@ async fn revision_declaring_no_changes_needed_closes_without_claiming_delivery()
     let parent_pr_url = "https://github.com/spinyfin/mono/pull/1493";
     let head = "abcdef3333333333333333333333333333333333";
     let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
-    write_assistant_transcript(
-        &db,
-        workspace.path(),
-        &execution_id,
-        "## Summary\nThe finding is already handled by the existing guard clause.\n\nNO_CHANGES_NEEDED\n",
-    );
+    declare_no_changes_needed(&db, &execution_id);
     let verifier = StubBranchVerifier::ok("boss/exec_parent");
     verifier.set_head_oid(Ok(head.into())).await;
     let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
@@ -215,7 +210,7 @@ async fn revision_declaring_no_changes_needed_closes_without_claiming_delivery()
     let outcome = handler.on_stop(&execution_id).await;
     assert!(
         matches!(outcome, StopOutcome::NoChangesNeeded { ref work_item_id } if work_item_id == &revision_id),
-        "an explicit NO_CHANGES_NEEDED from a revision must close it as a declared no-op; \
+        "an explicit no-changes-needed declaration from a revision must close it as a declared no-op; \
          got {outcome:?}",
     );
     // The dispatch timeline must observe this terminal directly: the
@@ -566,7 +561,7 @@ async fn on_stop_binding_only_url_does_not_finalize_revision() {
 // engine can name which signal allowed it:
 //   1. head SHA moved (pass)
 //   2. metadata-only confirmation (pass)
-//   3. explicit NO_CHANGES_NEEDED (pass — here via finalize_pr_transition)
+//   3. explicit no-changes-needed declaration (pass — here via finalize_pr_transition)
 //   4. silence after mid-turn reap (no push, no metadata, no noop) → refuse
 // -----------------------------------------------------------
 
@@ -642,7 +637,7 @@ async fn revision_contribution_gate_allows_metadata_fix_confirmed() {
     assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
 }
 
-/// Case 3: explicit NO_CHANGES_NEEDED, head unchanged → allowed through the
+/// Case 3: explicit no-changes-needed declaration, head unchanged → allowed through the
 /// finalize chokepoint (the Stop path normally uses finalize_no_op instead).
 #[tokio::test]
 async fn revision_contribution_gate_allows_explicit_no_op() {
@@ -650,12 +645,7 @@ async fn revision_contribution_gate_allows_explicit_no_op() {
     let parent_pr_url = "https://github.com/spinyfin/mono/pull/2603";
     let head = "dddddddddddddddddddddddddddddddddddddddd";
     let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
-    write_assistant_transcript(
-        &db,
-        workspace.path(),
-        &execution_id,
-        "## Summary\nFinding already fixed on main.\n\nNO_CHANGES_NEEDED\n",
-    );
+    declare_no_changes_needed(&db, &execution_id);
 
     let verifier = StubBranchVerifier::ok("boss/parent");
     verifier.set_head_oid(Ok(head.to_owned())).await;
@@ -672,7 +662,7 @@ async fn revision_contribution_gate_allows_explicit_no_op() {
         .await;
     assert!(
         matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
-        "explicit NO_CHANGES_NEEDED must allow terminalization; got {outcome:?}",
+        "explicit no-changes-needed must allow terminalization; got {outcome:?}",
     );
     match db.get_work_item(&revision_id).unwrap() {
         WorkItem::Task(t) | WorkItem::Chore(t) => {

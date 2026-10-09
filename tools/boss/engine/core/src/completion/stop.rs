@@ -1125,7 +1125,7 @@ impl WorkerCompletionHandler {
                 };
                 // Sanctioned no-op terminal for a revision (the honest exit
                 // the gate above deliberately no longer manufactures). A
-                // revision that pushed nothing and emitted NO_CHANGES_NEEDED
+                // revision that pushed nothing and declared no-changes-needed
                 // is making an explicit, checkable claim — "the finding I
                 // was dispatched for needs no code change" — rather than
                 // having that conclusion inferred for it from a PR whose
@@ -1414,19 +1414,17 @@ must not be asked to open one",
                 // boundary (`waiting_human`), there is no PR on this branch
                 // (PrStatus::None) and none bound to the chore (the
                 // resolve_bound_pr_url branch above returned), so the structural
-                // state confirms an empty contribution. If the worker emitted the
-                // sanctioned NO_CHANGES_NEEDED marker, this is a SUCCESS, not a
+                // state confirms an empty contribution. If the worker declared
+                // `propose done --outcome no-changes-needed`, this is a SUCCESS, not a
                 // failure to be nudged: close the task as done without a PR.
                 //
-                // Requiring the explicit marker is what distinguishes "verified
+                // Requiring the explicit declaration is what distinguishes "verified
                 // already done" from "gave up without trying": a worker that
-                // stopped with no marker still falls through to the legitimate
+                // stopped with no declaration still falls through to the legitimate
                 // produce-a-PR nudge below (and the breaker that bounds it). We
                 // must NOT globally suppress that nudge, and we must NOT push an
                 // empty PR — both are the band-aids the incident forbids.
-                if should_enqueue_reviewer_for_primary(&execution.kind)
-                    && self.worker_signalled_no_op(execution_id).await
-                {
+                if should_enqueue_reviewer_for_primary(&execution.kind) && self.worker_signalled_no_op(execution_id) {
                     // "validation passed / nothing to do" is exactly the
                     // claim an unobserved command undermines: Boss never saw
                     // whether that command actually succeeded, so it cannot
@@ -1444,13 +1442,13 @@ must not be asked to open one",
                     // times, would refuse every later no-op claim for the
                     // rest of the run over one abandoned command from turns
                     // ago. This read also clears the flag, so a clean turn
-                    // that follows gets a fair NO_CHANGES_NEEDED evaluation.
+                    // that follows gets a fair no-changes-needed evaluation.
                     if self.staged_unobserved_commands.consume_unresolved(execution_id) {
                         tracing::warn!(
                             execution_id,
                             expected_branch = %expected_branch,
                             kind = %execution.kind,
-                            "stop event: worker emitted NO_CHANGES_NEEDED but this run left at least \
+                            "stop event: worker declared no-changes-needed but this run left at least \
                              one Codex command_execution unobserved since the gate last checked \
                              (item.started with no item.completed) — refusing the no-op claim; \
                              falling through to the produce-a-PR nudge instead",
@@ -1460,7 +1458,7 @@ must not be asked to open one",
                             execution_id,
                             expected_branch = %expected_branch,
                             kind = %execution.kind,
-                            "stop event: worker emitted NO_CHANGES_NEEDED with no PR produced — \
+                            "stop event: worker declared no-changes-needed with no PR produced — \
                              work already done; closing task as a no-op (no PR, no nudge)"
                         );
                         return self.finalize_no_op_completion(&execution, None, None).await;
