@@ -790,7 +790,16 @@ impl AgentDriver for ClaudeDriver {
         // app's Claude-default fallback and the engine-supplied path
         // behaviour-identical for Claude workers.
         Some(PaneMonitorSpec {
-            agent_markers: vec!["Claude Code".into(), "auto mode on".into(), "/effort".into()],
+            // "auto mode on" is the footer under `--permission-mode auto`;
+            // "bypass permissions on" is its counterpart under
+            // `--dangerously-skip-permissions`. Without it a bypass-mode
+            // worker whose banner has scrolled off shows no marker at all.
+            agent_markers: vec![
+                "Claude Code".into(),
+                "auto mode on".into(),
+                "bypass permissions on".into(),
+                "/effort".into(),
+            ],
             busy_markers: vec!["esc to interrupt".into()],
             starting_markers: vec!["Accessing workspace:".into(), "Quick safety check:".into()],
             prompt_prefixes: vec!["❯".into()],
@@ -1532,7 +1541,10 @@ mod tests {
         let spec = ClaudeDriver
             .pane_monitor_spec()
             .expect("ClaudeDriver supplies pane-monitor markers");
-        assert_eq!(spec.agent_markers, vec!["Claude Code", "auto mode on", "/effort"]);
+        assert_eq!(
+            spec.agent_markers,
+            vec!["Claude Code", "auto mode on", "bypass permissions on", "/effort"]
+        );
         assert_eq!(spec.busy_markers, vec!["esc to interrupt"]);
         assert_eq!(
             spec.starting_markers,

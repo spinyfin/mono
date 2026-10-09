@@ -354,3 +354,17 @@ fn apply_event_alone_does_not_stamp_the_driver_signal() {
     assert!(reg.get(1).unwrap().last_event_at.is_some());
     assert!(reg.driver_signal_at(1).is_none());
 }
+
+#[test]
+fn first_hook_kind_is_retained_and_reset_for_a_new_run() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "first-run", "opus", 42, None);
+    reg.record_hook_event_kind("first-run", "SessionStart");
+    reg.record_hook_event_kind("first-run", "PreToolUse");
+    assert_eq!(
+        reg.first_hook_event_for_run("first-run").as_deref(),
+        Some("SessionStart")
+    );
+    reg.register_spawn(1, "next-run", "opus", 43, None);
+    assert_eq!(reg.first_hook_event_for_run("next-run"), None);
+}

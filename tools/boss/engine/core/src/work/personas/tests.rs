@@ -310,7 +310,7 @@ fn spawn_registration_does_not_hold_registry_lock_while_waiting_for_db() {
     let (execution, _) = start(&db, "local");
     let conn = db.connect().unwrap();
     let (boundary_tx, boundary_rx) = std::sync::mpsc::channel();
-    *states.persona_boundary.lock().unwrap() = Some(Box::new(move || {
+    *states.test_hooks.persona_boundary.lock().unwrap() = Some(Box::new(move || {
         let _ = boundary_tx.send(());
     }));
     let spawner = {
@@ -347,7 +347,7 @@ fn same_run_readoption_waits_for_removed_entry_persona_release() {
     states.register_spawn(8, &execution.id, "model", 123, None);
     let (removed_tx, removed_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-    *states.persona_boundary.lock().unwrap() = Some(Box::new(move || {
+    *states.test_hooks.persona_boundary.lock().unwrap() = Some(Box::new(move || {
         let _ = removed_tx.send(());
         let _ = resume_rx.recv_timeout(std::time::Duration::from_secs(5));
     }));
@@ -359,7 +359,7 @@ fn same_run_readoption_waits_for_removed_entry_persona_release() {
     let removed = removed_rx.recv_timeout(std::time::Duration::from_secs(5));
     let absent = states.get(8).is_none();
     let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
-    *states.lifecycle_waiter.lock().unwrap() = Some(waiting_tx);
+    *states.test_hooks.lifecycle_waiter.lock().unwrap() = Some(waiting_tx);
     let readopter = {
         let states = states.clone();
         let id = execution.id.clone();

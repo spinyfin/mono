@@ -595,6 +595,22 @@ impl Tmux {
         Ok(self.invoke(args).await?.stdout)
     }
 
+    /// Capture recent history as well as the screen, so startup chrome is
+    /// retained after a long prompt or early tool output scrolls it away.
+    pub async fn capture_pane_with_history(&self, session: &str) -> Result<String> {
+        validate_value("session name", session)?;
+        let mut args = self.server_args();
+        args.extend([
+            "capture-pane".into(),
+            "-p".into(),
+            "-S".into(),
+            "-2000".into(),
+            "-t".into(),
+            session.into(),
+        ]);
+        Ok(self.invoke(args).await?.stdout)
+    }
+
     /// Destroys `session` only after confirming its live `BOSS_SPAWN_TOKEN`
     /// matches `expected_token` exactly — the sole sanctioned way to kill a
     /// Boss-owned tmux session. This crate deliberately exposes no "kill by

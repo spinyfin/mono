@@ -688,6 +688,39 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     input: StartWorkerInput,
     spawn_timeout: StdDuration,
 ) -> Result<StartedWorker, StartWorkerError> {
+    // Buffer hooks that race the live-state registration below (the CLI is
+    // running, and its hooks can land, before the pane-attach await returns).
+    // Re-arming here also drops evidence left over from an earlier attempt.
+    // The guard disarms on every exit that did not consume the entry —
+    // errors and a dropped (cancelled / timed-out) future alike. Disarming
+    // after a successful registration is a no-op: registration drained it.
+    let _pending_hooks = spawner.live_worker_state_registry().map(|live_states| {
+        live_states.arm_pending_hooks(&input.run_id);
+        PendingHooksGuard {
+            live_states,
+            run_id: input.run_id.clone(),
+        }
+    });
+    start_worker_armed(spawner, input, spawn_timeout).await
+}
+
+/// Disarms a run's pre-registration hook buffer on drop.
+struct PendingHooksGuard<'a> {
+    live_states: &'a crate::live_worker_state::LiveWorkerStateRegistry,
+    run_id: String,
+}
+
+impl Drop for PendingHooksGuard<'_> {
+    fn drop(&mut self) {
+        self.live_states.disarm_pending_hooks(&self.run_id);
+    }
+}
+
+async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
+    spawner: &S,
+    input: StartWorkerInput,
+    spawn_timeout: StdDuration,
+) -> Result<StartedWorker, StartWorkerError> {
     // Local dispatch is only recoverable when the driver supplies Rich
     // per-tool progress boundaries. A Coarse/Minimal driver would silently
     // lose automatic wedge recovery, so refuse before writing files or

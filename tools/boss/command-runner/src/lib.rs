@@ -195,6 +195,7 @@ impl CommandRunner for RealCommandRunner {
 
     async fn run(&self, program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
         let mut command = tokio::process::Command::new(program);
+        command.kill_on_drop(true);
         command.args(args);
         if let Some((name, value)) = forced_locale() {
             command.env(name, value);
@@ -222,6 +223,7 @@ impl CommandRunner for RealCommandRunner {
         use tokio::io::AsyncWriteExt;
 
         let mut command = tokio::process::Command::new(program);
+        command.kill_on_drop(true);
         // Match `run`: capture stdout/stderr so callers get diagnostics in
         // CommandOutput and the child does not inherit (and pollute) the
         // engine process's descriptors.

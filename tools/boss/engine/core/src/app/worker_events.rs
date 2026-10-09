@@ -522,6 +522,9 @@ pub(super) async fn dispatch_live_worker_state(
     // hosting nothing but an idle login shell. See
     // `LiveWorkerStateRegistry::unverified_driver_starts`.
     server_state
+        .live_worker_states
+        .record_hook_event_kind(run_id, event_kind);
+    server_state
         .record_driver_signal(run_id, DriverSignalKind::HookEvent)
         .await;
     // Resolve any outstanding pane-injection delivery waiter for this
@@ -775,6 +778,9 @@ pub(super) async fn dispatch_live_worker_state(
     // judged as never having started a driver. Repeating the call here —
     // idempotent and first-write-wins — makes the record land for local and
     // remote runs alike, whichever side of registration the hook fell on.
+    server_state
+        .live_worker_states
+        .record_hook_event_kind(run_id, event_kind);
     server_state
         .record_driver_signal(run_id, DriverSignalKind::HookEvent)
         .await;

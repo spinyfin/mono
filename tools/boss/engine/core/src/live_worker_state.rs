@@ -162,11 +162,35 @@ pub struct LiveWorkerStateRegistry {
     inner: Mutex<HashMap<u8, SlotEntry>>,
     // Serialize lifecycle mutations independently of dispatch registry reads.
     lifecycle: Mutex<()>,
+    /// Driver-hook evidence for runs whose pane is launching but whose slot
+    /// entry is not registered yet, keyed by run id. Armed by
+    /// [`Self::arm_pending_hooks`] before the CLI starts and drained into
+    /// the slot's [`SlotMeta`] atomically by registration, so a hook that
+    /// wins the race against registration is not lost. Always locked
+    /// *after* `inner` when both are held.
+    pending_hooks: Mutex<HashMap<String, PendingHooks>>,
     #[cfg(test)]
-    pub(crate) persona_boundary: Mutex<Option<Box<dyn Fn() + Send>>>,
-    #[cfg(test)]
-    pub(crate) lifecycle_waiter: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    pub(crate) test_hooks: TestHooks,
     persona_store: Option<std::sync::Arc<crate::work::WorkDb>>,
+}
+
+/// Test-only synchronization points for lifecycle/persona race tests.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestHooks {
+    pub(crate) persona_boundary: Mutex<Option<Box<dyn Fn() + Send>>>,
+    pub(crate) lifecycle_waiter: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+/// Hook evidence buffered for a run before its slot entry exists.
+#[derive(Default)]
+struct PendingHooks {
+    driver_signal_at: Option<i64>,
+    /// First driver hook event kind seen before the slot was registered.
+    /// Buffered here while the run is armed, then transferred into
+    /// `SlotMeta::first_hook_event` (and removed from this buffer) at
+    /// registration. First-write-wins; diagnostic-only.
+    first_hook_event: Option<String>,
 }
 
 /// One slot's full record: the wire-format state the app and `bossctl`
@@ -273,6 +297,12 @@ struct SlotMeta {
     /// pid as evidence of a working worker is what the 2026-07-30
     /// incident walked through untouched.
     driver_signal_at: Option<i64>,
+    /// Event kind of the first driver hook received for this registration's
+    /// run. Diagnostic-only (it appears in spawn-confirmation failure logs):
+    /// first-write-wins, keyed by `run_id`, and reset whenever the slot is
+    /// re-registered. It is independent of `driver_signal_at` and plays no
+    /// part in reap fencing — never use it as proof the driver started.
+    first_hook_event: Option<String>,
     /// Whether this registration is a newly spawned pane or an adopted
     /// existing worker. [`DriverStartExpectation::Readopted`] still subjects
     /// the slot to the driver-start timeout
@@ -454,7 +484,7 @@ impl LiveWorkerStateRegistry {
     fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
         #[cfg(test)]
         if matches!(self.lifecycle.try_lock(), Err(std::sync::TryLockError::WouldBlock))
-            && let Some(waiter) = self.lifecycle_waiter.lock().unwrap().take()
+            && let Some(waiter) = self.test_hooks.lifecycle_waiter.lock().unwrap().take()
         {
             let _ = waiter.send(());
         }
@@ -463,7 +493,7 @@ impl LiveWorkerStateRegistry {
 
     #[cfg(test)]
     fn notify_persona_boundary(&self) {
-        let hook = self.persona_boundary.lock().unwrap().take();
+        let hook = self.test_hooks.persona_boundary.lock().unwrap().take();
         if let Some(hook) = hook {
             hook();
         }
@@ -628,10 +658,29 @@ impl LiveWorkerStateRegistry {
         // driver must never vouch for a new run whose driver never
         // exec'd, which is precisely the "one process stands in for
         // another" confusion that signal exists to remove.
-        let meta = SlotMeta::builder()
+        let mut meta = SlotMeta::builder()
             .spawned_at(boss_engine_utils::epoch_time::now_epoch_secs())
             .awaiting_input_capable(awaiting_input_capable)
             .build();
+        // Hand over hooks that arrived between CLI launch and now, under the
+        // same `inner` lock as the insert so a concurrent hook either lands
+        // in the pending buffer before this drain or sees the new entry.
+        let pending = self
+            .pending_hooks
+            .lock()
+            .expect("pending hooks mutex poisoned")
+            .remove(&run_id);
+        if let Some(pending) = pending {
+            if pending.driver_signal_at.is_some() {
+                tracing::info!(
+                    slot_id,
+                    run_id = %run_id,
+                    "driver-start verified: hook received before live-state registration",
+                );
+            }
+            meta.driver_signal_at = pending.driver_signal_at;
+            meta.first_hook_event = pending.first_hook_event;
+        }
         let displaced = guard
             .insert(slot_id, SlotEntry { state, meta })
             .map(|prior| prior.state);
@@ -1066,7 +1115,22 @@ impl LiveWorkerStateRegistry {
     /// (a hook for a released or unknown run — a benign no-op).
     pub fn record_driver_signal(&self, run_id: &str, kind: DriverSignalKind) -> Option<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        let entry = guard.values_mut().find(|entry| entry.state.run_id == run_id)?;
+        let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id) else {
+            // No entry yet: buffer the proof if registration is pending for
+            // this run (see `arm_pending_hooks`), else a benign no-op.
+            // `guard` stays held so registration cannot interleave.
+            if let Some(pending) = self
+                .pending_hooks
+                .lock()
+                .expect("pending hooks mutex poisoned")
+                .get_mut(run_id)
+            {
+                pending
+                    .driver_signal_at
+                    .get_or_insert_with(boss_engine_utils::epoch_time::now_epoch_secs);
+            }
+            return None;
+        };
         let slot_id = entry.state.slot_id;
         if entry.meta.reap_committed {
             // The never-started reap already committed under this same
@@ -1087,6 +1151,61 @@ impl LiveWorkerStateRegistry {
             "driver-start verified: first driver-originated signal received for this run",
         );
         Some(slot_id)
+    }
+
+    /// Arm hook buffering for `run_id` before its CLI is launched, discarding
+    /// any evidence buffered for an earlier attempt of the same run so a
+    /// retry cannot inherit it. Hooks that arrive before the slot is
+    /// registered are held and moved into the slot by registration; see
+    /// [`Self::disarm_pending_hooks`] for the failure path.
+    pub fn arm_pending_hooks(&self, run_id: &str) {
+        self.pending_hooks
+            .lock()
+            .expect("pending hooks mutex poisoned")
+            .insert(run_id.to_owned(), PendingHooks::default());
+    }
+
+    /// Drop buffered pre-registration evidence for `run_id` (the launch
+    /// failed before registration, so nothing will ever drain it).
+    pub fn disarm_pending_hooks(&self, run_id: &str) {
+        self.pending_hooks
+            .lock()
+            .expect("pending hooks mutex poisoned")
+            .remove(run_id);
+    }
+
+    /// Record the event kind of the first driver hook seen for `run_id`.
+    ///
+    /// Diagnostic-only and first-write-wins; the value is reset when the slot
+    /// is re-registered and is independent of `driver_signal_at` and reap
+    /// fencing. Buffers into the pending slot when registration has not
+    /// happened yet (see [`Self::arm_pending_hooks`]).
+    pub fn record_hook_event_kind(&self, run_id: &str, kind: &str) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id) {
+            if entry.meta.first_hook_event.is_none() {
+                entry.meta.first_hook_event = Some(kind.to_owned());
+                tracing::info!(run_id, first_hook_event = kind, "first driver hook received");
+            }
+        } else if let Some(pending) = self
+            .pending_hooks
+            .lock()
+            .expect("pending hooks mutex poisoned")
+            .get_mut(run_id)
+        {
+            pending.first_hook_event.get_or_insert_with(|| kind.to_owned());
+        }
+    }
+
+    /// The first hook event kind recorded for `run_id`'s live slot, if any.
+    /// Diagnostic-only: see [`Self::record_hook_event_kind`].
+    pub fn first_hook_event_for_run(&self, run_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .values()
+            .find(|entry| entry.state.run_id == run_id)
+            .and_then(|entry| entry.meta.first_hook_event.clone())
     }
 
     /// Whether a driver-originated signal has been recorded for `slot_id`.

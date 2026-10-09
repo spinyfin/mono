@@ -1227,6 +1227,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         .await
         .with_context(|| format!("spawning worker pane for run {}", execution.id))?;
 
+        let spawned_at = std::time::Instant::now();
         tracing::info!(
             worker_id,
             execution_id = %execution.id,
@@ -1260,6 +1261,17 @@ impl ExecutionRunner for PaneSpawnRunner {
         }
 
         if !self.skip_spawn_confirm() {
+            // Attribute late-firing deadlines: everything between the pane
+            // returning from `start_worker` and confirmation starting (the
+            // cancel re-check above included) is logged so a deadline that
+            // fires long after its nominal timeout can be pinned on this
+            // gap or on the confirmation itself.
+            tracing::info!(
+                worker_id,
+                execution_id = %execution.id,
+                spawn_to_confirm_gap_ms = spawned_at.elapsed().as_millis() as u64,
+                "starting spawn confirmation",
+            );
             let (composer_timeout, turn_timeout) = self.spawn_confirm_timeouts(driver.as_ref());
             let confirm = confirm_local_spawn(
                 &tmux_host,
@@ -1276,7 +1288,14 @@ impl ExecutionRunner for PaneSpawnRunner {
             {
                 return Ok(cancelled);
             }
-            if let Err(err) = confirm {
+            if let Err(err) = confirm
+                && !spawner.live_worker_state_registry().is_some_and(|registry| {
+                    matches!(
+                        registry.confirm_never_started_reap(started.slot_id, &execution.id),
+                        crate::live_worker_state::NeverStartedReapCommit::DriverSignalled
+                    )
+                })
+            {
                 tracing::warn!(
                     worker_id,
                     execution_id = %execution.id,
@@ -1369,28 +1388,74 @@ async fn confirm_local_spawn(
     composer_timeout: StdDuration,
     turn_timeout: StdDuration,
 ) -> Result<()> {
-    use super::spawn_confirmation::{SPAWN_CONFIRM_POLL, confirm_spawn_started, pane_shows_driver_ready};
+    use super::spawn_confirmation::{SPAWN_CONFIRM_POLL, confirm_spawn_started};
 
     let driver_name = driver.descriptor().name;
     let spec = driver.pane_monitor_spec();
-    confirm_spawn_started(
+    let started_at = boss_engine_utils::epoch_time::now_epoch_secs();
+    let started = std::time::Instant::now();
+    let last_capture = std::sync::Mutex::new(String::new());
+    tracing::info!(run_id, %started_at, "composer readiness wait started");
+    let result = confirm_spawn_started(
         driver_name,
         run_id,
         composer_timeout,
         turn_timeout,
         SPAWN_CONFIRM_POLL,
         || async {
-            let Ok(pane_text) = tmux_host.tmux().capture_pane(tmux_host.session_name()).await else {
-                return false;
-            };
-            match spec.as_ref() {
-                Some(spec) => pane_shows_driver_ready(&pane_text, spec),
-                None => !pane_text.trim().is_empty(),
-            }
+            capture_shows_driver_ready(tmux_host.tmux(), tmux_host.session_name(), spec.as_ref(), &last_capture).await
         },
         || async { live_states.is_some_and(|registry| registry.has_driver_signal_for_run(run_id)) },
     )
-    .await
+    .await;
+    if result.is_err() {
+        tracing::warn!(run_id, %started_at, elapsed_ms = started.elapsed().as_millis() as u64,
+            first_hook_event = ?live_states.and_then(|registry| registry.first_hook_event_for_run(run_id)),
+            last_pane_text = %last_capture.lock().expect("capture mutex poisoned"),
+            "spawn confirmation evidence at failure");
+    }
+    result
+}
+
+/// Keep the last `4096` characters of `text` as the failure-diagnostics
+/// snapshot, without splitting UTF-8 characters.
+fn store_capture_snapshot(snapshot: &std::sync::Mutex<String>, text: &str) {
+    let bounded: String = text
+        .chars()
+        .rev()
+        .take(4096)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    *snapshot.lock().expect("capture mutex poisoned") = bounded;
+}
+
+/// One composer-readiness probe. The visible screen is read first (cheap,
+/// the common hit); the 2000-line history capture runs only when the screen
+/// misses (banner scrolled off by a long prompt or early tool output).
+/// `snapshot` is updated right after each *successful* capture, before the
+/// next command is awaited, so a stalled history read cannot lose the visible
+/// text, and a failed capture never erases an earlier good snapshot.
+async fn capture_shows_driver_ready(
+    tmux: &boss_tmux::Tmux,
+    session: &str,
+    spec: Option<&boss_protocol::PaneMonitorSpec>,
+    snapshot: &std::sync::Mutex<String>,
+) -> bool {
+    use super::spawn_confirmation::pane_shows_driver_ready;
+    let ready = |text: &str| spec.is_some_and(|spec| pane_shows_driver_ready(text, spec));
+    if let Ok(visible) = tmux.capture_pane(session).await {
+        store_capture_snapshot(snapshot, &visible);
+        if ready(&visible) {
+            return true;
+        }
+    }
+    if let Ok(history) = tmux.capture_pane_with_history(session).await {
+        store_capture_snapshot(snapshot, &history);
+        return ready(&history);
+    }
+    false
 }
 
 /// The shell's background tier is inherited by drivers and build tools,
