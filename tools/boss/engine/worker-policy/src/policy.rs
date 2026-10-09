@@ -355,6 +355,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::MoveWorkItemOnBoard { .. }
         | FrontendRequest::RemoveDependency { .. }
         | FrontendRequest::ReorderProjectTasks { .. }
+        | FrontendRequest::ResolveWorkerRecoveryAttention { .. }
         | FrontendRequest::RestoreWorkItem { .. }
         | FrontendRequest::SetProductDefaultDriver { .. }
         | FrontendRequest::SetProductDefaultModel { .. }

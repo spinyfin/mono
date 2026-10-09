@@ -887,6 +887,18 @@ pub(crate) async fn dismiss_attention_rpc(
     )
 }
 
+pub(crate) async fn resolve_worker_recovery_attention_rpc(
+    client: &mut BossClient,
+    id: &str,
+) -> Result<WorkAttentionItem, CliError> {
+    rpc_call!(
+        client,
+        FrontendRequest::ResolveWorkerRecoveryAttention { id: id.to_owned() },
+        "attention resolve-gate",
+        FrontendEvent::AttentionItemUpdated { item, .. } => item,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Attention display helpers
 // ---------------------------------------------------------------------------
@@ -1155,6 +1167,20 @@ pub(crate) async fn run_attention_command(command: AttentionCommand, ctx: &RunCo
                     }
                 },
             )
+        }
+
+        AttentionCommand::ResolveGate(args) => {
+            let item = resolve_worker_recovery_attention_rpc(&mut client, &args.id).await?;
+            print_entity(ctx, &serde_json::json!({ "attention_item": item }), || {
+                if !ctx.quiet {
+                    println!(
+                        "Resolved {} ({}); {} is a candidate for auto-redispatch again.",
+                        item.id,
+                        item.kind,
+                        item.work_item_id.as_deref().unwrap_or("its work item")
+                    );
+                }
+            })
         }
     }
 }
