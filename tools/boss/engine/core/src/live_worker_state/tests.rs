@@ -1184,3 +1184,69 @@ mod driver_signal_tests;
 
 #[path = "tests/live_worker_state_semantic_progress_tests.rs"]
 mod semantic_progress_tests;
+
+#[test]
+fn readoption_of_a_tracked_run_backfills_missing_metadata_without_overwriting() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn_with_capabilities(
+        1,
+        "run-1",
+        "claude-opus-4-7",
+        7,
+        None,
+        false,
+        LiveSpawnRouting::none().with_metadata(LiveWorkerMetadata {
+            agent_type: Some("coding".to_owned()),
+            ..LiveWorkerMetadata::default()
+        }),
+    );
+    reg.register_readoption(
+        1,
+        "run-1",
+        "claude-opus-4-7",
+        7,
+        None,
+        false,
+        LiveSpawnRouting::none().with_metadata(LiveWorkerMetadata {
+            agent_type: Some("review".to_owned()),
+            project_id: Some("proj_1".to_owned()),
+            project_name: Some("One".to_owned()),
+            host_id: Some("local".to_owned()),
+            started_at: Some("2026-10-09T00:00:00Z".to_owned()),
+        }),
+        ReadoptionEvidence::LiveShellPid,
+    );
+
+    let state = reg.get(1).unwrap();
+    assert_eq!(
+        state.agent_type.as_deref(),
+        Some("coding"),
+        "stamped value is never overwritten"
+    );
+    assert_eq!(state.project_id.as_deref(), Some("proj_1"));
+    assert_eq!(state.project_name.as_deref(), Some("One"));
+    assert_eq!(state.host_id.as_deref(), Some("local"));
+    assert_eq!(state.started_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+}
+
+#[test]
+fn spawn_registration_stamps_routing_metadata_on_the_state() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn_with_capabilities(
+        2,
+        "run-2",
+        "claude-opus-4-7",
+        0,
+        None,
+        false,
+        LiveSpawnRouting::new("review", "pr_review").with_metadata(LiveWorkerMetadata {
+            agent_type: Some("review".to_owned()),
+            host_id: Some("zakalwe".to_owned()),
+            ..LiveWorkerMetadata::default()
+        }),
+    );
+    let state = reg.get(2).unwrap();
+    assert_eq!(state.agent_type.as_deref(), Some("review"));
+    assert_eq!(state.host_id.as_deref(), Some("zakalwe"));
+    assert_eq!(state.project_id, None);
+}

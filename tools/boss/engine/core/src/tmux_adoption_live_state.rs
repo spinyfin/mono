@@ -62,7 +62,9 @@ pub(crate) async fn register_adopted_live_state<S>(
         shell_pid,
         binding,
         awaiting_input_capable,
-        LiveSpawnRouting::new_with_hosting(Some(pool.to_owned()), execution.kind.as_str(), true),
+        LiveSpawnRouting::new_with_hosting(Some(pool.to_owned()), execution.kind.as_str(), true).with_metadata(
+            crate::live_worker_metadata::resolve(work_db, execution, boss_protocol::LOCAL_HOST_ID),
+        ),
         ReadoptionEvidence::LiveShellPid,
     );
     match work_db.get_run_semantic_progress_checkpoint(execution_id) {
@@ -164,6 +166,51 @@ mod tests {
             state.tmux_hosted,
             Some(true),
             "a live tmux session survives quit; a shadowed or false newest-row bit must not reclassify it as legacy"
+        );
+    }
+    #[tokio::test]
+    async fn adopted_run_restores_the_metadata_a_fresh_spawn_stamped() {
+        let (_dir, db) = open_db();
+        let execution = seed_running(&db, true);
+
+        // Spawn: the registration the local spawn path performs.
+        let spawned = LiveWorkerStateRegistry::default();
+        spawned.register_spawn_with_capabilities(
+            1,
+            execution.id.clone(),
+            "opus",
+            4321,
+            None,
+            false,
+            LiveSpawnRouting::new_with_hosting(Some("main".to_owned()), execution.kind.as_str(), true)
+                .with_metadata(crate::live_worker_metadata::resolve(&db, &execution, "local")),
+        );
+
+        // Engine restart: a brand-new registry rebuilt from durable rows.
+        let spawner = LiveStateSpawner::default();
+        register_adopted_live_state(&db, &spawner, &execution, &execution.id, 1, 4321, None).await;
+
+        let before = spawned.get(1).expect("spawned");
+        let after = spawner.live_states.get(1).expect("adopted");
+        assert_eq!(after.agent_type.as_deref(), Some("coding"));
+        assert_eq!(after.host_id.as_deref(), Some("local"));
+        assert_eq!(after.project_id, None, "an unfiled chore stays Unfiled across restart");
+        assert!(after.started_at.is_some(), "the original execution start survives");
+        assert_eq!(
+            (
+                &after.agent_type,
+                &after.project_id,
+                &after.project_name,
+                &after.host_id,
+                &after.started_at
+            ),
+            (
+                &before.agent_type,
+                &before.project_id,
+                &before.project_name,
+                &before.host_id,
+                &before.started_at
+            ),
         );
     }
 }

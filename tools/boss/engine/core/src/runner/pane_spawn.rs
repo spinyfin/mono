@@ -1206,6 +1206,11 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .draft_pr_mode(spawner.draft_pr_mode())
                 .execution_kind(execution.kind.as_str().to_owned())
                 .pool(pool.to_owned())
+                .live_metadata(crate::live_worker_metadata::resolve(
+                    &self.work_db,
+                    execution,
+                    boss_protocol::LOCAL_HOST_ID,
+                ))
                 .maybe_task_kind(work_item_task_kind(work_item).map(str::to_owned))
                 // Per-kind worker posture (reviewer/triage/answer-agent are
                 // restricted; everything else is a Standard implementer),

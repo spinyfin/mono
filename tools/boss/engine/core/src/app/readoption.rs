@@ -514,6 +514,20 @@ impl ServerState {
                     false
                 }
             };
+            // Explicit locality from the durable run row; a run without a
+            // recorded host predates remote dispatch and is local.
+            let readoption_host_id = match self.work_db.latest_run_host_for_execution(run_id) {
+                Ok(Some(host)) => host,
+                Ok(None) => boss_protocol::LOCAL_HOST_ID.to_owned(),
+                Err(err) => {
+                    tracing::warn!(
+                        run_id,
+                        error = %format!("{err:#}"),
+                        "readopt: could not read the durable run host; treating as local",
+                    );
+                    boss_protocol::LOCAL_HOST_ID.to_owned()
+                }
+            };
             self.live_worker_states.register_readoption(
                 slot_id,
                 run_id.to_owned(),
@@ -525,7 +539,12 @@ impl ServerState {
                     Some(pool.to_owned()),
                     restored.kind.as_str(),
                     tmux_hosted,
-                ),
+                )
+                .with_metadata(crate::live_worker_metadata::resolve(
+                    &self.work_db,
+                    &restored,
+                    &readoption_host_id,
+                )),
                 evidence,
             );
             if evidence == crate::live_worker_state::ReadoptionEvidence::DriverHook {

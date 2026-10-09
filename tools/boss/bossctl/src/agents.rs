@@ -1772,6 +1772,18 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
     if let Some(kind) = &state.kind {
         println!("  kind:          {kind}");
     }
+    if let Some(agent_type) = &state.agent_type {
+        println!("  type:          {agent_type}");
+    }
+    if let Some(project) = project_status_label(state) {
+        println!("  project:       {project}");
+    }
+    if let Some(host) = &state.host_id {
+        println!("  host:          {host}");
+    }
+    if let Some(ts) = &state.started_at {
+        println!("  started_at:    {ts}");
+    }
     if let Some(tool) = &state.current_tool {
         println!("  current_tool:  {tool}");
     }
@@ -1780,6 +1792,19 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
     }
     if let Some(ts) = &state.last_tool_ended_at {
         println!("  last_tool_end: {ts}");
+    }
+}
+
+/// `agents status` project line. An absent project means the work is
+/// Unfiled, but only once the engine reports metadata at all (it stamps
+/// `host_id` on every dispatched worker); an older engine reports neither,
+/// and claiming "Unfiled" for it would be a guess.
+fn project_status_label(state: &LiveWorkerState) -> Option<String> {
+    match (&state.project_name, &state.project_id) {
+        (Some(name), Some(id)) => Some(format!("{name} ({id})")),
+        (None, Some(id)) => Some(id.clone()),
+        (_, None) if state.host_id.is_some() => Some("Unfiled".to_owned()),
+        (_, None) => None,
     }
 }
 
@@ -1895,8 +1920,14 @@ fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) 
     // and e.g. `"task_implementation"` / `"pr_review"`.
     let pool = state.pool.as_deref().unwrap_or("-");
     let kind = state.kind.as_deref().unwrap_or("-");
+    let agent_type = state.agent_type.as_deref().unwrap_or("-");
+    let host = state.host_id.as_deref().unwrap_or("-");
+    // Unfiled (no project) prints as `-`; the id, not the free-text name,
+    // keeps the column single-token and unambiguous.
+    let project = state.project_id.as_deref().unwrap_or("-");
+    let started_at = state.started_at.as_deref().unwrap_or("-");
     let mut line = format!(
-        "slot {}  name={}  run={}  model={}  activity={}  pool={}  kind={}  tool={}  work_item={}  work_item_name=\"{}\"",
+        "slot {}  name={}  run={}  model={}  activity={}  pool={}  kind={}  type={}  project={}  host={}  started_at={}  tool={}  work_item={}  work_item_name=\"{}\"",
         state.slot_id,
         state.name,
         state.run_id,
@@ -1904,6 +1935,10 @@ fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) 
         state.activity.as_str(),
         pool,
         kind,
+        agent_type,
+        project,
+        host,
+        started_at,
         tool,
         work_item,
         work_item_name,
@@ -1978,6 +2013,39 @@ mod tests {
             line.starts_with("slot 3  name=Riker  run=run_a  model=opus  activity=spawning  pool=-  kind=-"),
             "unexpected column order: {line}"
         );
+    }
+
+    #[test]
+    fn format_live_state_short_renders_type_project_host_and_start() {
+        let mut state = worker(2, "run_c", "Worf");
+        state.agent_type = Some("coding".to_owned());
+        state.project_id = Some("proj_1".to_owned());
+        state.project_name = Some("Dynamic Agents pane layout".to_owned());
+        state.host_id = Some("local".to_owned());
+        state.started_at = Some("2026-10-09T01:02:03Z".to_owned());
+        let line = format_live_state_short(&state, TmuxListEvidence::Missing);
+        assert!(
+            line.contains("kind=-  type=coding  project=proj_1  host=local  started_at=2026-10-09T01:02:03Z  tool="),
+            "expected metadata columns after kind: {line}"
+        );
+        // Unfiled and older-engine rows print dashes rather than dropping columns.
+        let bare = format_live_state_short(&worker(3, "run_d", "Riker"), TmuxListEvidence::Missing);
+        assert!(
+            bare.contains("type=-  project=-  host=-  started_at=-"),
+            "expected placeholder metadata columns: {bare}"
+        );
+    }
+
+    #[test]
+    fn project_status_label_distinguishes_unfiled_from_unreported() {
+        let mut state = worker(1, "run_e", "Data");
+        assert_eq!(project_status_label(&state), None, "older engine: no claim");
+        state.host_id = Some("local".to_owned());
+        assert_eq!(project_status_label(&state).as_deref(), Some("Unfiled"));
+        state.project_id = Some("proj_9".to_owned());
+        assert_eq!(project_status_label(&state).as_deref(), Some("proj_9"));
+        state.project_name = Some("Nine".to_owned());
+        assert_eq!(project_status_label(&state).as_deref(), Some("Nine (proj_9)"));
     }
 
     #[test]
