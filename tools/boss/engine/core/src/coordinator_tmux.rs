@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -82,6 +83,9 @@ pub(crate) struct CoordinatorSpawn<'a> {
     pub(crate) model: &'a str,
     pub(crate) working_directory: &'a Path,
     pub(crate) version_probe: &'a dyn ClaudeVersionProbe,
+    /// GitHub reader for each product's `BOSS_COORDINATOR.md`, injected
+    /// into the session-start brief of a fresh session.
+    pub(crate) design_docs: &'a Arc<boss_engine_design_docs::DesignDocsService>,
 }
 
 /// A completed spawn carries the exact command line that tmux received. It
@@ -958,6 +962,7 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         model,
         working_directory,
         version_probe,
+        design_docs,
         ..
     } = *spawn;
     let model = model.trim();
@@ -985,7 +990,28 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         model,
         claude_version.as_deref(),
     )?;
-    let initial_prompt = prepare_session_start_brief(work_db, working_directory, previous.as_ref(), reason);
+    // Product guidance is read from GitHub before the brief is composed
+    // (concurrently per product, each within SESSION_START_FETCH_BUDGET), so
+    // the incoming session is bound by product rules on its first turn.
+    let guidance = match crate::coordinator_guidance::guidance_products(work_db) {
+        Ok(products) => {
+            crate::coordinator_guidance::load_product_guidance(
+                design_docs,
+                &products,
+                crate::coordinator_guidance::SESSION_START_FETCH_BUDGET,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            )
+            .await
+        }
+        Err(error) => {
+            // No product list means no guidance can be reported per
+            // product; the brief's section then says the list itself
+            // could not be read, which is still not "no guidance".
+            tracing::error!(error = %format!("{error:#}"), "coordinator guidance: could not list products");
+            Vec::new()
+        }
+    };
+    let initial_prompt = prepare_session_start_brief(work_db, working_directory, previous.as_ref(), reason, &guidance);
 
     let mut environment = BTreeMap::from([
         (SPAWN_TOKEN_ENV.to_owned(), spawn_token.clone()),
@@ -1066,17 +1092,28 @@ fn prepare_session_start_brief(
     working_directory: &Path,
     previous: Option<&PreviousSession>,
     reason: CoordinatorStartReason,
+    guidance: &[boss_protocol::CoordinatorGuidanceView],
 ) -> String {
     let state = work_db.coordinator_handoff_state();
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let transcript_dir = coordinator_handoff::existing_transcript_dir(working_directory);
-    let brief = coordinator_handoff::compose_start_brief(StartBriefInputs {
-        state: &state,
-        previous,
-        reason,
-        now_epoch_secs: now,
-        transcript_dir: transcript_dir.as_deref(),
-    });
+    let brief = coordinator_handoff::compose_start_brief(
+        StartBriefInputs::builder()
+            .state(&state)
+            .maybe_previous(previous)
+            .reason(reason)
+            .now_epoch_secs(now)
+            .maybe_transcript_dir(transcript_dir.as_deref())
+            .guidance(guidance)
+            .build(),
+    );
+    audit::record_event(
+        "coordinator_guidance_brief",
+        &json!({
+            "start_reason": reason.audit_label(),
+            "products": crate::coordinator_guidance::audit_summary(guidance),
+        }),
+    );
     let (handoff_written_at, written_by_previous) = match &state {
         HandoffState::Present(handoff) => (
             Some(handoff.written_at),
@@ -1549,6 +1586,62 @@ mod tests {
             model,
             working_directory,
             version_probe,
+            design_docs: offline_design_docs(),
+        }
+    }
+
+    /// A GitHub reader that answers every call with "unreachable". The
+    /// tests here run against an empty products table, so no read happens;
+    /// this guards against one ever escaping to the network.
+    fn offline_design_docs() -> &'static Arc<boss_engine_design_docs::DesignDocsService> {
+        static OFFLINE: std::sync::OnceLock<Arc<boss_engine_design_docs::DesignDocsService>> =
+            std::sync::OnceLock::new();
+        OFFLINE.get_or_init(|| {
+            Arc::new(boss_engine_design_docs::DesignDocsService::with_source(Arc::new(
+                OfflineGitHub,
+            )))
+        })
+    }
+
+    struct OfflineGitHub;
+
+    #[async_trait::async_trait]
+    impl boss_engine_design_docs::GitHubTreeSource for OfflineGitHub {
+        async fn default_branch(&self, _owner: &str, _repo: &str) -> Result<String, boss_github::trees::TreeApiError> {
+            Err(offline_error())
+        }
+        async fn head_sha(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _git_ref: &str,
+        ) -> Result<String, boss_github::trees::TreeApiError> {
+            Err(offline_error())
+        }
+        async fn markdown_tree(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _sha: &str,
+        ) -> Result<boss_github::trees::RepoTree, boss_github::trees::TreeApiError> {
+            Err(offline_error())
+        }
+        async fn fetch_blob(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _path: &str,
+            _git_ref: &str,
+            _etag: Option<&str>,
+        ) -> Result<boss_github::trees::BlobFetch, boss_github::trees::TreeApiError> {
+            Err(offline_error())
+        }
+    }
+
+    fn offline_error() -> boss_github::trees::TreeApiError {
+        boss_github::trees::TreeApiError {
+            kind: boss_github::trees::TreeApiErrorKind::Unreachable,
+            message: "tests run offline".to_owned(),
         }
     }
 

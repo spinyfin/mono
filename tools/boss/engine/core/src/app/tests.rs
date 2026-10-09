@@ -353,6 +353,7 @@ mod attachments;
 mod awaiting_input_status;
 mod board_drag_gated_revision;
 mod context;
+mod coordinator_guidance;
 mod coordinator_handoff;
 mod dispatch_pause;
 mod driver_start_signal;

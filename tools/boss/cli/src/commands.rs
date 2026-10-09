@@ -223,6 +223,17 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: crate::handoff::HandoffCommand,
     },
+    /// Per-product coordinator guidance: each product repo's
+    /// `BOSS_COORDINATOR.md`, read from GitHub at the default branch's
+    /// current HEAD and shown with the commit sha it came from. The engine
+    /// injects the same content into every fresh coordinator session's
+    /// start brief; this is the on-demand re-read. Coordinator-only.
+    ///
+    /// See `tools/boss/docs/coordinator-product-guidance.md`.
+    Guidance {
+        #[command(subcommand)]
+        command: crate::guidance::GuidanceCommand,
+    },
     Engine {
         #[command(subcommand)]
         command: EngineCommand,

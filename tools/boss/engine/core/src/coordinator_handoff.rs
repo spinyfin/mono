@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use boss_engine_utils::iso8601::{format_elapsed_ago, format_epoch_iso8601};
-use boss_protocol::{CoordinatorHandoffView, CoordinatorRecreateReason};
+use boss_protocol::{CoordinatorGuidanceView, CoordinatorHandoffView, CoordinatorRecreateReason};
 use serde::{Deserialize, Serialize};
 
 use crate::work::{CoordinatorTmuxRecord, WorkDb};
@@ -244,6 +244,8 @@ pub(crate) fn handoff_view(
 
 /// Everything [`compose_start_brief`] needs; kept as a struct so the
 /// composer stays pure and directly testable.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub(crate) struct StartBriefInputs<'a> {
     pub(crate) state: &'a HandoffState,
     pub(crate) previous: Option<&'a PreviousSession>,
@@ -252,6 +254,11 @@ pub(crate) struct StartBriefInputs<'a> {
     /// Directory holding prior sessions' Claude Code transcripts, when the
     /// caller verified it exists. Mentioned as a slow last resort only.
     pub(crate) transcript_dir: Option<&'a Path>,
+    /// Every non-archived product's `BOSS_COORDINATOR.md` state, as read
+    /// from GitHub for this launch (see [`crate::coordinator_guidance`]).
+    /// Rendered in full after the handoff so the incoming session is bound
+    /// by product rules from its first turn.
+    pub(crate) guidance: &'a [CoordinatorGuidanceView],
 }
 
 fn when(epoch: i64, now: i64) -> String {
@@ -270,6 +277,7 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
         reason,
         now_epoch_secs: now,
         transcript_dir,
+        guidance,
     } = inputs;
     let mut out = String::new();
     out.push_str("[Boss coordinator session start: automatic handoff brief from the engine]\n\n");
@@ -355,10 +363,15 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
         ));
     }
 
+    out.push_str(&crate::coordinator_guidance::render_brief_section(guidance));
+
     out.push_str(
         "\nDo this now, before anything else:\n\
          1. Your first reply states which handoff state applies (present / stale / missing / unreadable) in one \
-         line, then summarizes the handoff in a few lines if there is one.\n\
+         line, then summarizes the handoff in a few lines if there is one. In the same reply, list each product's \
+         guidance state from the section above in one line per product (loaded @ sha / missing / over cap / fetch \
+         failed / no repo) — a fetch failure is something the operator needs to hear, not something to work around \
+         silently.\n\
          2. Treat every infrastructure, host, flag, tmux, or pause fact from the handoff as \"as of the time it was \
          written\". Before filing work, briefing an agent, or raising an alarm that depends on such a fact, \
          confirm it is still true (a fresh read, or ask the operator).\n\
@@ -422,13 +435,15 @@ mod tests {
     }
 
     fn brief(state: &HandoffState, previous: Option<&PreviousSession>, reason: CoordinatorStartReason) -> String {
-        compose_start_brief(StartBriefInputs {
-            state,
-            previous,
-            reason,
-            now_epoch_secs: NOW,
-            transcript_dir: None,
-        })
+        compose_start_brief(
+            StartBriefInputs::builder()
+                .state(state)
+                .maybe_previous(previous)
+                .reason(reason)
+                .now_epoch_secs(NOW)
+                .guidance(&[])
+                .build(),
+        )
     }
 
     #[test]
@@ -558,18 +573,53 @@ mod tests {
     #[test]
     fn brief_always_ends_with_the_consumption_steps_and_names_the_transcript_fallback() {
         let dir = PathBuf::from("/home/op/.claude/projects/-x-boss-session");
-        let text = compose_start_brief(StartBriefInputs {
-            state: &HandoffState::Missing,
-            previous: None,
-            reason: CoordinatorStartReason::SessionMissing,
-            now_epoch_secs: NOW,
-            transcript_dir: Some(&dir),
-        });
+        let text = compose_start_brief(
+            StartBriefInputs::builder()
+                .state(&HandoffState::Missing)
+                .reason(CoordinatorStartReason::SessionMissing)
+                .now_epoch_secs(NOW)
+                .transcript_dir(&dir)
+                .guidance(&[])
+                .build(),
+        );
         assert!(text.contains("boss handoff write"), "{text}");
         assert!(text.contains("Last resort only"), "{text}");
         assert!(text.contains(&dir.display().to_string()), "{text}");
         let without = brief(&HandoffState::Missing, None, CoordinatorStartReason::SessionMissing);
         assert!(!without.contains("Last resort only"), "{without}");
+    }
+
+    #[test]
+    fn brief_carries_product_guidance_between_the_handoff_and_the_steps() {
+        let guidance = [CoordinatorGuidanceView::builder()
+            .product_id("prod_boss")
+            .fetched_at("2026-10-09T00:00:00Z")
+            .path(boss_protocol::COORDINATOR_GUIDANCE_PATH)
+            .product_name("Boss")
+            .state(boss_protocol::CoordinatorGuidanceState::Loaded {
+                git_ref: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                bytes: 12,
+                markdown: "# Boss rules".to_owned(),
+            })
+            .owner_repo("spinyfin/mono")
+            .build()];
+        let state = present(NOW - 60, "token-a");
+        let text = compose_start_brief(
+            StartBriefInputs::builder()
+                .state(&state)
+                .reason(CoordinatorStartReason::FirstCreation)
+                .now_epoch_secs(NOW)
+                .guidance(&guidance)
+                .build(),
+        );
+        let handoff_at = text.find("--- handoff ends ---").expect("handoff block");
+        let guidance_at = text
+            .find("## Product coordinator guidance (BOSS_COORDINATOR.md)")
+            .expect("guidance section");
+        let steps_at = text.find("Do this now, before anything else").expect("steps");
+        assert!(handoff_at < guidance_at && guidance_at < steps_at, "{text}");
+        assert!(text.contains("# Boss rules"), "{text}");
+        assert!(text.contains("list each product's guidance state"), "{text}");
     }
 
     #[test]
