@@ -251,6 +251,8 @@ async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String
         }
     }
     match (recovery, publication) {
+        // Unreachable while the early return above holds; typed so an edit
+        // that moves it degrades instead of panicking the engine.
         (None, None) => Err(missing_heads_error(record)),
         (Some(recovery), Some(publication)) if recovery != publication => {
             for (ancestor, descendant, bookmark) in [
