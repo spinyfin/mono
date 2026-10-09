@@ -5,6 +5,11 @@ import Foundation
 /// banner scheduling. See `showConnectionLostBanner` in `ChatViewModel.swift`
 /// for why the banner is debounced rather than tied directly to `isConnected`.
 extension ChatViewModel {
+    /// Persists until dismissed: reconnecting does not replay a mutation.
+    func showDisconnectedActionNotice() {
+        disconnectedActionNotice = "Action not sent: the engine was disconnected. Reconnect and try again."
+    }
+
     /// The engine dropped pending invalidations for our session while
     /// riding out a publish burst instead of disconnecting us (see
     /// `EngineEvent.resyncRequired`). The socket never went down, so

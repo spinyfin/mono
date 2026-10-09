@@ -272,23 +272,13 @@ extension ChatViewModel {
             // user-facing signal; never a modal.
             appendSystemMessage(message)
         case .notConnected(let requestKind):
-            // A send while disconnected is a transport condition. Fail a
-            // pending optimistic drag back with a non-modal notice; any
-            // other user action is surfaced in the transcript while the
-            // debounced connection banner covers a sustained outage.
-            if pendingDragAdmissionCheck != nil {
+            // Only the drag's own requests may clear admission/optimistic state.
+            if requestKind == "evaluate_dispatch_admission" || requestKind == "move_work_item_on_board" {
                 pendingDragAdmissionCheck = nil
+                bounceBackOptimisticMoves(message: "Not connected to the engine — reconnect and try again.")
             }
-            if requestKind.hasPrefix("list_") || requestKind.hasPrefix("get_") {
-                // Refreshes and polls retry on their own cadence/reconnect;
-                // nothing user-initiated was lost.
-                return
-            }
-            if !pendingMoveOriginByTaskID.isEmpty {
-                bounceBackOptimisticMoves(message: "Not connected to the engine — reconnecting…")
-            } else {
-                appendSystemMessage("Not connected to the engine; \(requestKind) was not sent.")
-            }
+            showDisconnectedActionNotice()
+            appendSystemMessage("Not connected to the engine; \(requestKind) was not sent.", alwaysShow: true)
         case .error(let message):
             if pendingDragAdmissionCheck != nil {
                 // A malformed/undecodable `dispatch_admission_evaluated`

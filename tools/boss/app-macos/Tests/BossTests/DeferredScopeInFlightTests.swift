@@ -14,8 +14,17 @@ final class DeferredScopeInFlightTests: XCTestCase {
 
         model.acceptDeferredScopeAttention(id: "attn_1")
 
-        XCTAssertEqual(model.workErrorMessage, "Not connected to the engine — reconnect and try again.")
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("try again") == true)
         XCTAssertFalse(model.deferredScopeActionInFlightIDs.contains("attn_1"))
+    }
+
+    func testCreateTaskWhileDisconnectedShowsRetryNotice() {
+        let model = makeModel()
+        model.createTaskFromDeferredScopeAttention(attentionID: "attn_1")
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("try again") == true)
+        XCTAssertTrue(model.deferredScopeActionInFlightIDs.isEmpty)
     }
 
     func testCreateTaskWhileAlreadyInFlightIsANoOp() {

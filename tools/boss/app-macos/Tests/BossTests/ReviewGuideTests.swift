@@ -11,6 +11,20 @@ import XCTest
 @MainActor
 final class ReviewGuideTests: XCTestCase {
 
+    func testDisconnectedGenerationAndRetryShowNonModalNotice() {
+        let model = makeModel()
+        let task = Self.makeTask(id: "root", readableVersionId: nil)
+        model.generateReviewGuide(for: task)
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("try again") == true)
+        XCTAssertTrue(model.retryingReviewGuideRootTaskIDs.isEmpty)
+        model.disconnectedActionNotice = nil
+        model.retryReviewGuide(for: task)
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("try again") == true)
+        XCTAssertTrue(model.retryingReviewGuideRootTaskIDs.isEmpty)
+    }
+
     // MARK: - Opening
 
     func testGenerateMenuVisibilityAndLabelIncludingDoneWork() {
@@ -154,7 +168,8 @@ final class ReviewGuideTests: XCTestCase {
         XCTAssertEqual(sent[0]["type"] as? String, "generate_review_guide")
         XCTAssertEqual(sent[0]["root_task_id"] as? String, task.id)
         XCTAssertNotNil(UUID(uuidString: sent[0]["idempotency_token"] as? String ?? ""))
-        XCTAssertNotNil(model.workErrorMessage)
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertNotNil(model.disconnectedActionNotice)
         XCTAssertFalse(model.retryingReviewGuideRootTaskIDs.contains(task.id))
     }
 
@@ -192,7 +207,7 @@ final class ReviewGuideTests: XCTestCase {
 
         XCTAssertEqual(model.pendingReviewGuideVersionId, "prgv_1")
         XCTAssertEqual(model.pendingReviewGuideRootTaskId, "task_1")
-        XCTAssertNil(model.pendingReviewGuideRequestId, "headless tests have no engine connection, so sendLine returns nil")
+        XCTAssertNotNil(model.pendingReviewGuideRequestId, "disconnected reads retain their queued envelope identity")
         XCTAssertEqual(model.asyncMarkdownViewerVM.reviewGuideRootTaskId, "task_1")
         guard case .loading = model.asyncMarkdownViewerVM.state else {
             return XCTFail("expected .loading immediately on open")
@@ -293,8 +308,11 @@ final class ReviewGuideTests: XCTestCase {
     func testRetryReviewGuideSetsInFlightGuard() {
         let model = makeModel()
         let task = Self.makeTask(id: "task_1", readableVersionId: nil)
+        model.outboundRecorder = { _ in
+            XCTAssertTrue(model.retryingReviewGuideRootTaskIDs.contains("task_1"))
+        }
         model.retryReviewGuide(for: task)
-        XCTAssertTrue(model.retryingReviewGuideRootTaskIDs.contains("task_1"))
+        XCTAssertFalse(model.retryingReviewGuideRootTaskIDs.contains("task_1"), "a dropped send clears the guard")
     }
 
     func testApplyReviewGuideRetryQueuedClearsGuardForEchoedTask() {
