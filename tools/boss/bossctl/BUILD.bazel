@@ -17,6 +17,7 @@ rust_library(
         "src/enrollment_tests.rs",
         "src/focus.rs",
         "src/homes.rs",
+        "src/host_load.rs",
         "src/hosts.rs",
         "src/lib.rs",
         "src/logs.rs",

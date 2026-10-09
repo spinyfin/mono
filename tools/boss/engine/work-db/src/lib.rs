@@ -940,6 +940,7 @@ pub mod db_diagnostics;
 mod description_guard;
 mod guide_comments;
 mod guide_feedback;
+mod host_load_db;
 mod host_reconcile_queries;
 mod host_storage;
 mod local_worker_quarantine_store;

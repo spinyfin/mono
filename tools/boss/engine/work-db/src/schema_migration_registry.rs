@@ -403,6 +403,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: spoke_hub::migrate_legacy_destinations,
         },
         Migration {
+            id: host_load_db::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: host_load_db::migrate,
+        },
+        Migration {
             id: legacy_store_cleanup::MIGRATION_ID.into(),
             legacy_version: None,
             apply: legacy_store_cleanup::migrate,

@@ -27,6 +27,7 @@ boss-engine-utils = { path = "../utils" }
 boss-event-bus = { path = "../event-bus" }
 boss-gh-telemetry = { path = "../../gh_telemetry" }
 boss-github = { path = "../../github" }
+boss-engine-host-load = { path = "../host-load" }
 boss-host-execution = { path = "../host-execution" }
 boss-metrics = { path = "../metrics" }
 boss-pr-review = { path = "../pr-review" }

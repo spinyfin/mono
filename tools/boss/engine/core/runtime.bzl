@@ -159,6 +159,7 @@ def runtime_libraries():
             "//tools/boss/engine/event-bus",
             "//tools/boss/engine/feature-flags",
             "//tools/boss/engine/gh-invocation",
+            "//tools/boss/engine/host-load",
             "//tools/boss/engine/host-enrollment",
             "//tools/boss/engine/live-worker-state",
             "//tools/boss/engine/agy-home-retention",
