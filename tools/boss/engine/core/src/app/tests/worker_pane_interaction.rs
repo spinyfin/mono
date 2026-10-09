@@ -926,7 +926,10 @@ async fn second_nudge_interrupts_a_worker_that_resumed_into_another_long_tool_ca
     parker.await.unwrap();
     confirmer.await.unwrap();
     let first = first.expect("busy send must return a receipt");
-    assert_eq!(server_state.probe_lifecycle_state(&first), Some(ProbeDeliveryState::Consumed));
+    assert_eq!(
+        server_state.probe_lifecycle_state(&first),
+        Some(ProbeDeliveryState::Consumed)
+    );
     assert_eq!(runner.escape_presses(), 1);
     assert_eq!(
         server_state.in_flight_probe_id(&run_id).as_deref(),
@@ -993,8 +996,15 @@ async fn nudge_reports_its_state_when_a_sibling_probe_holds_the_slot() {
     };
     assert_eq!(state, "queued");
     assert!(detail.contains("another delivery path"), "detail: {detail}");
-    assert_eq!(server_state.probe_lifecycle_state(&probe_id), Some(ProbeDeliveryState::Queued));
-    assert_eq!(runner.escape_presses(), 0, "must not interrupt behind a write in progress");
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Queued)
+    );
+    assert_eq!(
+        runner.escape_presses(),
+        0,
+        "must not interrupt behind a write in progress"
+    );
     assert!(!runner.wrote_text());
     assert_eq!(
         server_state.in_flight_probe_id(&run_id).as_deref(),
@@ -1050,7 +1060,11 @@ async fn engine_nudge_to_a_rejecting_driver_waits_for_its_boundary() {
 
     assert_eq!(runner.escape_presses(), 0);
     assert!(!runner.wrote_text());
-    assert_eq!(server_state.pending_probe_count(&run_id), 1, "still queued for its boundary");
+    assert_eq!(
+        server_state.pending_probe_count(&run_id),
+        1,
+        "still queued for its boundary"
+    );
     assert!(!server_state.has_in_flight_probe(&run_id));
 }
 
@@ -1067,7 +1081,11 @@ async fn engine_nudge_queued_while_parked_interrupts_if_the_worker_went_busy() {
     queuer.set_server_state(Arc::downgrade(&server_state));
 
     queuer.queue_probe(&run_id, "act now");
-    assert_eq!(runner.escape_presses(), 0, "parked at queue time: nothing to interrupt yet");
+    assert_eq!(
+        runner.escape_presses(),
+        0,
+        "parked at queue time: nothing to interrupt yet"
+    );
 
     // The worker starts a long tool call before the delivery task runs.
     resume_into_long_tool_call(&server_state, 6);

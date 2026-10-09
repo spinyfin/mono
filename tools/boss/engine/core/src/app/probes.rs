@@ -184,7 +184,10 @@ impl ProbeQueuer for ServerStateProbeQueuer {
                 match guard.get_mut(&run_id) {
                     Some(nudge) if nudge.interrupt_owned => {
                         // queue_probe's interrupt task owns this nudge.
-                        tracing::debug!(run_id, "probe queuer: nudge is owned by its scheduled interrupt delivery");
+                        tracing::debug!(
+                            run_id,
+                            "probe queuer: nudge is owned by its scheduled interrupt delivery"
+                        );
                         return;
                     }
                     Some(nudge)
@@ -337,7 +340,8 @@ pub(super) struct InFlightProbe {
 /// The state itself is [`boss_protocol::ProbeDeliveryState`] — the same enum
 /// the wire uses — so `bossctl probe-status` reports exactly what the engine
 /// recorded, with no second vocabulary to keep in sync.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub(super) struct ProbeRecord {
     pub(super) run_id: String,
     pub(super) urgent: bool,
@@ -430,14 +434,11 @@ impl ServerState {
             .expect("probe_lifecycle mutex poisoned")
             .insert(
                 probe_id.clone(),
-                ProbeRecord {
-                    run_id: run_id.clone(),
-                    urgent,
-                    state: ProbeDeliveryState::Queued,
-                    detail: None,
-                    submitted: None,
-                    resumed: None,
-                },
+                ProbeRecord::builder()
+                    .run_id(run_id.clone())
+                    .urgent(urgent)
+                    .state(ProbeDeliveryState::Queued)
+                    .build(),
             );
         // Tag for worker-signal resolution BEFORE the probe is inserted into
         // `pending_probes` below — i.e. before any concurrent dispatcher can
@@ -636,9 +637,10 @@ impl ServerState {
         // turn, so the reply it was waiting for will never be produced as
         // such. Read the lifecycle before taking the slot lock and re-verify
         // the holder under it.
-        let submitted_holder = self
-            .in_flight_probe_id(run_id)
-            .filter(|held| self.probe_lifecycle_state(held).is_some_and(awaits_reply_after_submission));
+        let submitted_holder = self.in_flight_probe_id(run_id).filter(|held| {
+            self.probe_lifecycle_state(held)
+                .is_some_and(awaits_reply_after_submission)
+        });
         let mut in_flight = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
         let superseded = match in_flight.get(run_id) {
             None => None,
