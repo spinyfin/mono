@@ -264,8 +264,8 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     // operations use execution.id, not run.id.
     let probe_id = server_state.queue_probe(execution.id.clone(), "what now?".into(), false);
 
-    // Fire the first Stop boundary. This dispatches the probe to
-    // the (fake) app session and records the in-flight entry.
+    // Fire the first Stop boundary. This dispatches the probe into
+    // the worker's tmux pane and records the in-flight entry.
     let first_stop = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::Stop {
             session_id: "claude-sess-1".into(),
