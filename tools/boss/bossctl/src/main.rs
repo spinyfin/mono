@@ -27,6 +27,7 @@ mod command_types;
 mod comments;
 mod dispatch_stats;
 mod doctor;
+mod host_load;
 mod hosts;
 mod logs;
 mod pause;
@@ -1026,6 +1027,19 @@ enum MetricsAction {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Current host-load sample (load average, CPU, memory, swap) and the
+    /// retained series over a time window. Reads `state.db` directly, so
+    /// it works even when the engine is wedged. Text output is in local
+    /// time; `--json` carries UTC epoch milliseconds.
+    Host {
+        /// Look back this far: a number plus s/m/h/d (e.g. `30m`, `6h`,
+        /// `2d`).
+        #[arg(long, default_value = "1h")]
+        window: String,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Reset one or all metrics to zero (both in-memory and in
     /// `state.db`) via engine RPC. Counters are truly monotonic
     /// across the framework's lifetime unless reset explicitly; this
@@ -1441,6 +1455,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Metrics {
             action: MetricsAction::Github { hours, state_root },
         } => metrics_github(cli.json, state_root, hours),
+        Command::Metrics {
+            action: MetricsAction::Host { window, state_root },
+        } => host_load::host_load(cli.json, state_root, &window),
         Command::Metrics {
             action: MetricsAction::Reset { name, all },
         } => {

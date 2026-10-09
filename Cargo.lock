@@ -591,6 +591,7 @@ dependencies = [
  "boss-engine-effort",
  "boss-engine-gh-invocation",
  "boss-engine-grok-home-retention",
+ "boss-engine-host-load",
  "boss-engine-live-status-redact",
  "boss-engine-offsite-backup",
  "boss-engine-planner-validation",
@@ -832,6 +833,18 @@ dependencies = [
  "tempfile",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "boss-engine-host-load"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "libc",
+ "serde",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

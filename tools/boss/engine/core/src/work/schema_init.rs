@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 52;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 53;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -252,6 +252,9 @@ impl WorkDb {
         }
         if version < 52 && !table_has_column(&tx, "work_executions", "progression_neighbourhood")? {
             tx.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")?;
+        }
+        if version < 53 {
+            host_load_db::migrate(&tx)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -773,6 +776,7 @@ mod floor_tests {
             44,
             45,
             51,
+            52,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -846,6 +850,9 @@ mod floor_tests {
                 conn.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
                     .unwrap();
             }
+            if version >= 53 {
+                host_load_db::migrate(&conn).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -864,6 +871,7 @@ mod floor_tests {
             pr_flow::migrate_operator_questions(&expected).unwrap();
             expected.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
             personas::migrate(&expected).unwrap();
+            host_load_db::migrate(&expected).unwrap();
             expected.execute_batch("CREATE TABLE sentinel (value TEXT)").unwrap();
             expected
                 .execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")
