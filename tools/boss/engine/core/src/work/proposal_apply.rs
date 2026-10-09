@@ -583,19 +583,6 @@ fn apply_effort_escalation(tx: &Transaction<'_>, execution_id: &str, payload_jso
 /// `blocked` proposals auto-apply the same as the legacy `[blocked]` marker
 /// path: a `worker_blocked`-kind attention item, pausing the auto-nudge loop
 /// the same reactive way `effort_escalation` does.
-/// Persist the wait proposal as applied. The time-bounded hold itself lives
-/// in [`crate::wait_registry::WaitRegistry`], which the submit handler
-/// updates after attribution — the proposal row is the durable audit.
-fn apply_wait(payload_json: &str) -> Result<ApplyOutcome> {
-    let _: WaitProposalPayload =
-        serde_json::from_str(payload_json).context("wait proposal payload_json did not deserialize")?;
-    Ok(ApplyOutcome {
-        applied_ref: None,
-        post_commit_audit_line: None,
-        review_batch_quorum_outcome: None,
-    })
-}
-
 fn apply_blocked(tx: &Transaction<'_>, execution_id: &str, payload_json: &str) -> Result<ApplyOutcome> {
     let payload: BlockedProposalPayload =
         serde_json::from_str(payload_json).context("blocked proposal payload_json did not deserialize")?;
@@ -615,6 +602,19 @@ fn apply_blocked(tx: &Transaction<'_>, execution_id: &str, payload_json: &str) -
         "Worker reported a blocker",
         body,
     )
+}
+
+/// Persist the wait proposal as applied. The time-bounded hold itself lives
+/// in [`crate::wait_registry::WaitRegistry`], which the submit handler
+/// updates after attribution — the proposal row is the durable audit.
+fn apply_wait(payload_json: &str) -> Result<ApplyOutcome> {
+    let _: WaitProposalPayload =
+        serde_json::from_str(payload_json).context("wait proposal payload_json did not deserialize")?;
+    Ok(ApplyOutcome {
+        applied_ref: None,
+        post_commit_audit_line: None,
+        review_batch_quorum_outcome: None,
+    })
 }
 
 /// `deferred_scope` proposals auto-apply the same two effects

@@ -2848,3 +2848,37 @@ async fn review_guide_submission_cannot_bind_to_another_execution_or_a_chore() {
             .contains("no running review-guide attempt")
     );
 }
+
+/// A declared wait must reach every consumer of the live-state snapshot
+/// (`bossctl agents`, the app's agent status) with its reason and an ISO-8601
+/// expiry, and the overlay must drop away once the wait has lapsed.
+#[tokio::test]
+async fn a_declared_wait_is_overlaid_on_the_live_worker_state_until_it_expires() {
+    let fx = WorkerFixture::new();
+    fx.server_state
+        .live_worker_states
+        .register_spawn(1, fx.execution_id.clone(), "claude-opus-4-7", 4242, None);
+
+    let before = fx.server_state.live_worker_states_snapshot();
+    assert_eq!(before.len(), 1);
+    assert!(before[0].wait_reason.is_none() && before[0].wait_expires_at.is_none());
+
+    submitted(submit(&fx, ProposalKind::Wait, wait_payload("bazel test")).await);
+
+    let during = fx.server_state.live_worker_states_snapshot();
+    assert_eq!(during[0].wait_reason.as_deref(), Some("bazel test"));
+    let expiry = during[0].wait_expires_at.as_deref().expect("wait expiry is surfaced");
+    assert!(
+        expiry.len() == 20 && expiry.ends_with('Z') && expiry.as_bytes()[10] == b'T',
+        "expiry must be ISO-8601 UTC; got {expiry}",
+    );
+
+    // Replace the grant with one that lapsed in the past.
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    fx.server_state
+        .wait_registry
+        .declare(&fx.execution_id, "bazel test".to_owned(), None, 1, now - 100)
+        .unwrap();
+    let after = fx.server_state.live_worker_states_snapshot();
+    assert!(after[0].wait_reason.is_none() && after[0].wait_expires_at.is_none());
+}

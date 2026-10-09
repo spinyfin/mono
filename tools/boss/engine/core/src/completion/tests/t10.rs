@@ -556,8 +556,8 @@ async fn expired_worker_wait_resumes_normal_nudging() {
     assert_eq!(probes.snapshot().len(), 1);
 }
 
-/// The production path from the incident: Stop under an active wait, then the
-/// worker goes idle and only the sweep can act. While the wait is unexpired
+/// A worker that declares a wait and then ends its turn emits no further
+/// Stop, so only the recurring sweep can act. While the wait is unexpired
 /// the sweep must hold without probing or counting; once it lapses the sweep
 /// must resume the ladder — and keep driving it to the breaker terminal,
 /// rather than dropping the intent after the first post-expiry probe.
