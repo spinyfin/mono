@@ -2855,7 +2855,7 @@ async fn no_op_declaration_is_refused_when_a_command_was_left_unobserved() {
 }
 
 #[tokio::test]
-async fn no_op_declaration_is_accepted_on_a_later_clean_turn_after_an_earlier_unobserved_command() {
+async fn no_op_declaration_requires_a_fresh_declaration_on_a_later_clean_turn_after_an_unobserved_command() {
     // A long-lived, multi-turn Codex session fires a Stop at every turn
     // boundary, not once at process exit. A command abandoned on an early
     // turn must refuse the no-op claim it actually undermines (the Stop
@@ -2885,13 +2885,22 @@ async fn no_op_declaration_is_accepted_on_a_later_clean_turn_after_an_earlier_un
         "turn N's refusal must still get the normal produce-a-PR nudge",
     );
 
-    // Turn N+1: no new command went unobserved. The same claim must now be
-    // trusted — the gate must not still be latched from turn N.
+    // Turn N+1: the refusal consumed the declaration, so a Stop WITHOUT a
+    // fresh declaration must not close the task as a no-op.
     let second = handler.on_stop(&execution_id).await;
     assert!(
-        matches!(&second, StopOutcome::NoChangesNeeded { work_item_id } if work_item_id == &chore_id),
-        "a clean later turn must not inherit an earlier turn's unobserved-command refusal forever; \
-         got {second:?}",
+        !matches!(second, StopOutcome::NoChangesNeeded { .. }),
+        "a refused declaration must not be re-accepted without being re-declared; got {second:?}",
+    );
+
+    // Turn N+2: the worker declares again and no new command went unobserved,
+    // so the claim is trusted — the gate must not still be latched.
+    declare_no_changes_needed(&db, &execution_id);
+    let third = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(&third, StopOutcome::NoChangesNeeded { work_item_id } if work_item_id == &chore_id),
+        "a fresh declaration on a clean later turn must not inherit an earlier turn's refusal forever; \
+         got {third:?}",
     );
     match db.get_work_item(&chore_id).unwrap() {
         WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Done, "the later clean no-op must close the task"),

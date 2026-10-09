@@ -217,9 +217,10 @@ impl UnobservedCommandTracker {
     /// notification (`WorkerEvent::Notification` carrying
     /// `UNOBSERVED_COMMAND_MARKER`), not an ongoing per-turn health signal —
     /// there is no "this turn's commands all completed cleanly" fact
-    /// available to gate the clear on. The consequence: a worker only has to
-    /// re-emit the identical `no-changes-needed` claim at the next `Stop` to
-    /// get it accepted, with Boss no better informed about the original
+    /// available to gate the clear on. The consequence: a refusal also
+    /// consumes the worker's `no-changes-needed` declaration, so the worker
+    /// only has to declare again (a fresh `propose done`) to get the claim
+    /// accepted, with Boss no better informed about the original
     /// abandoned command's outcome than at the first refusal. That is a
     /// weaker guarantee than "the run demonstrated it recovered," but it is
     /// still strictly better than the permanent latch this replaced (see

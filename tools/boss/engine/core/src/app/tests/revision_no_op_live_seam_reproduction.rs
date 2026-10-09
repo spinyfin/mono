@@ -42,6 +42,7 @@ use boss_protocol::{CreateExecutionInput, CreateRevisionInput, ExecutionKind, Ex
 use super::*;
 use crate::app::worker_events::dispatch_worker_event_fanout;
 use crate::completion::{BranchVerifier, REVISION_NO_OP_ATTENTION_KIND};
+use crate::test_support::declare_no_changes_needed;
 use crate::work::{FakePrStateChecker, PrOpenState};
 
 /// Always fails every call — standing in for a genuinely unreachable
@@ -285,17 +286,4 @@ async fn revision_without_declaration_is_never_closed_as_a_no_op_by_inference() 
             .all(|item| item.kind != REVISION_NO_OP_ATTENTION_KIND),
         "no declined-finding record may be filed for an undeclared run",
     );
-}
-
-/// Stamp the durable declaration `boss propose done --outcome
-/// no-changes-needed` leaves on the execution row (what `apply_run_done`
-/// writes).
-fn declare_no_changes_needed(db: &WorkDb, execution_id: &str) {
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE work_executions SET run_done_outcome = 'no_changes_needed', run_done_declared_at = '1' WHERE id = ?1",
-            [execution_id],
-        )
-        .unwrap();
 }

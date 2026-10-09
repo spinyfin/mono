@@ -109,6 +109,14 @@ impl WorkerCompletionHandler {
 
         match outcome {
             boss_protocol::RunDoneOutcome::NoChangesNeeded => {
+                // Same guard the Stop-boundary paths run. On refusal the run
+                // stays live (the declaration is consumed) and the worker is
+                // told, visibly, to re-verify and declare again.
+                if self.refuse_no_op_declaration(&execution) {
+                    self.probe_queuer
+                        .queue_probe(&execution.id, NO_OP_DECLARATION_REFUSED_PROBE);
+                    return StopOutcome::AwaitingInput;
+                }
                 let (contribution, attention) = self.declared_run_done_no_op_inputs(&execution);
                 self.finalize_no_op_completion(&execution, contribution, attention)
                     .await

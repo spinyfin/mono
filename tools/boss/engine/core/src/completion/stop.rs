@@ -1443,15 +1443,14 @@ must not be asked to open one",
                     // rest of the run over one abandoned command from turns
                     // ago. This read also clears the flag, so a clean turn
                     // that follows gets a fair no-changes-needed evaluation.
-                    if self.staged_unobserved_commands.consume_unresolved(execution_id) {
+                    if self.refuse_no_op_declaration(&execution) {
                         tracing::warn!(
                             execution_id,
                             expected_branch = %expected_branch,
                             kind = %execution.kind,
-                            "stop event: worker declared no-changes-needed but this run left at least \
-                             one Codex command_execution unobserved since the gate last checked \
-                             (item.started with no item.completed) — refusing the no-op claim; \
-                             falling through to the produce-a-PR nudge instead",
+                            "stop event: worker declared no-changes-needed but the no-op guard \
+                             refused it (declaration consumed); falling through to the \
+                             produce-a-PR nudge instead",
                         );
                     } else {
                         tracing::info!(
