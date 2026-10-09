@@ -201,6 +201,9 @@ struct WorkBoardCardItem: View {
                     onRetryReviewGuide: onRetryReviewGuide,
                     onOpenAttachments: onOpenAttachments,
                     onRevealAIReviewFindings: onRevealAIReviewFindings,
+                    aiReviewFindingsTooltipNote: snapshot.aiReviewState == "reviewed_with_findings"
+                        ? model.aiReviewFindingsTooltipNote(revisionID: snapshot.aiReviewFindingsRevisionId)
+                        : nil,
                     onAcceptDeferredScope: { id in model.acceptDeferredScopeAttention(id: id) },
                     onCreateTaskFromDeferredScope: { id in
                         model.createTaskFromDeferredScopeAttention(attentionID: id)
@@ -430,6 +433,8 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Only called when `snapshot.aiReviewFindingsRevisionId`
     /// is non-nil.
     var onRevealAIReviewFindings: (() -> Void)? = nil
+    /// Tooltip sentence for the findings badge; see `AIReviewStateBadge`.
+    var aiReviewFindingsTooltipNote: String? = nil
     /// Invoked with an attention item id when the popup's "Accept" button
     /// is tapped.
     var onAcceptDeferredScope: ((String) -> Void)? = nil
@@ -482,6 +487,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 onOpenReviewGuide: onOpenReviewGuide,
                 onRetryReviewGuide: onRetryReviewGuide,
                 onRevealAIReviewFindings: onRevealAIReviewFindings,
+                aiReviewFindingsTooltipNote: aiReviewFindingsTooltipNote,
                 onAcceptDeferredScope: onAcceptDeferredScope,
                 onCreateTaskFromDeferredScope: onCreateTaskFromDeferredScope
             )

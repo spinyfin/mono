@@ -774,6 +774,14 @@ struct AIReviewStateBadge: View {
     let state: String
     let presentation: AIReviewBadgePresentation
     var onRevealFindings: (() -> Void)? = nil
+    /// Sentence appended to the engine tooltip describing what a click
+    /// on a findings badge reveals.
+    var findingsTooltipNote: String? = nil
+
+    var tooltip: String {
+        guard state == "reviewed_with_findings", let findingsTooltipNote else { return presentation.tooltip }
+        return presentation.tooltip + "\n" + findingsTooltipNote
+    }
 
     var tint: Color {
         switch state {
@@ -798,9 +806,9 @@ struct AIReviewStateBadge: View {
                 label
             }
         }
-        .help(presentation.tooltip)
+        .help(tooltip)
         .accessibilityLabel(presentation.label)
-        .accessibilityValue(presentation.tooltip)
+        .accessibilityValue(tooltip)
     }
 }
 

@@ -119,11 +119,13 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
     /// opens the follow-up revision's findings description.
     /// Only called when `slice.aiReviewFindingsRevisionId` is non-nil.
     var onRevealAIReviewFindings: (() -> Void)? = nil
+    /// Tooltip sentence for the findings badge; see `AIReviewStateBadge`.
+    var aiReviewFindingsTooltipNote: String? = nil
     var onAcceptDeferredScope: ((String) -> Void)? = nil
     var onCreateTaskFromDeferredScope: ((String) -> Void)? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.slice == rhs.slice
+        lhs.slice == rhs.slice && lhs.aiReviewFindingsTooltipNote == rhs.aiReviewFindingsTooltipNote
     }
 
     var body: some View {
@@ -153,7 +155,8 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 AIReviewStateBadge(
                     state: aiReviewState,
                     presentation: presentation,
-                    onRevealFindings: slice.aiReviewFindingsRevisionId != nil ? onRevealAIReviewFindings : nil
+                    onRevealFindings: slice.aiReviewFindingsRevisionId != nil ? onRevealAIReviewFindings : nil,
+                    findingsTooltipNote: aiReviewFindingsTooltipNote
                 )
             }
             if slice.showsResolvingConflictsBadge {
