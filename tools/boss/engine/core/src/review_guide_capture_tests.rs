@@ -459,6 +459,16 @@ async fn revision_of_design_task_is_not_auto_captured_or_generated() {
 }
 
 #[tokio::test]
+async fn investigation_task_pr_is_not_auto_captured_or_generated() {
+    assert_eq!(auto_run("investigation", false).await, (false, 0));
+}
+
+#[tokio::test]
+async fn revision_of_investigation_task_is_not_auto_captured_or_generated() {
+    assert_eq!(auto_run("investigation", true).await, (false, 0));
+}
+
+#[tokio::test]
 async fn chore_pr_is_still_auto_captured_and_generated() {
     assert_eq!(auto_run("chore", false).await, (true, 1));
 }

@@ -247,9 +247,13 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
         expected_head_branch,
         observation_sequence,
     } = request;
-    match work_db.review_guide_root_is_design(&root_task_id) {
+    match work_db.review_guide_root_is_doc_only(&root_task_id) {
         Ok(true) => {
-            tracing::info!(root_task_id, pr_url, "review guide not auto-generated: design task",);
+            tracing::info!(
+                root_task_id,
+                pr_url,
+                "review guide not auto-generated: doc-only (design/investigation) task",
+            );
             return None;
         }
         Ok(false) => {}
