@@ -11,6 +11,7 @@ async fn reset(
     request_and_wait(
         spawn.work_db,
         spawn.tmux,
+        &tokio::sync::Mutex::new(()),
         written,
         "token",
         force,
@@ -155,9 +156,17 @@ async fn stale_confirmation_and_mismatched_live_token_never_prompt_or_kill() {
         record(&db);
         let expected = if token == "token" { "stale" } else { "token" };
         assert!(
-            request_and_wait(&db, &tmux, &Notify::new(), expected, false, Duration::from_millis(30))
-                .await
-                .is_err()
+            request_and_wait(
+                &db,
+                &tmux,
+                &tokio::sync::Mutex::new(()),
+                &Notify::new(),
+                expected,
+                false,
+                Duration::from_millis(30),
+            )
+            .await
+            .is_err()
         );
         assert!(send_keys_calls(&server.calls()).is_empty());
         assert!(
@@ -167,4 +176,35 @@ async fn stale_confirmation_and_mismatched_live_token_never_prompt_or_kill() {
                 .any(|c| c.get(2).map(String::as_str) == Some("kill-session"))
         );
     }
+}
+
+#[tokio::test]
+async fn validate_and_send_wait_for_the_lifecycle_lock_so_a_replacement_never_gets_the_prompt() {
+    let (db, tmux, server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let lock = tokio::sync::Mutex::new(());
+    let written = Notify::new();
+    // The supervisor's restart path holds the lock while it replaces the session.
+    let supervisor = lock.lock().await;
+    let request = request_and_wait(&db, &tmux, &lock, &written, "token", false, Duration::from_millis(50));
+    tokio::pin!(request);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), &mut request)
+            .await
+            .is_err(),
+        "the request must block on the lifecycle lock"
+    );
+    assert!(
+        server.calls().is_empty(),
+        "no tmux call may happen before the lock is held: {:?}",
+        server.calls()
+    );
+    // The replacement lands under the lock; the stale confirmation must then
+    // be refused without prompting it.
+    db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "replacement", "opus", None)
+        .unwrap();
+    db.record_coordinator_tmux_session_created("replacement").unwrap();
+    drop(supervisor);
+    assert!(request.await.is_err());
+    assert!(send_keys_calls(&server.calls()).is_empty());
 }

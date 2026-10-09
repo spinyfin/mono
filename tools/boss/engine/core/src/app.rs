@@ -549,6 +549,8 @@ struct ServerStateOverrides {
     /// Test-injected source-packet collector. `None` uses the GitHub-backed
     /// default on the completion handler.
     source_packet_collector: Option<crate::review_guide_capture::SourcePacketCollector>,
+    /// Coordinator-reset handoff wait. `None` uses the production timeout.
+    coordinator_handoff_timeout: Option<std::time::Duration>,
 }
 
 #[derive(bon::Builder)]
@@ -676,6 +678,14 @@ struct ServerState {
     coordinator_tmux_lock: Arc<Mutex<()>>,
     #[builder(default)]
     coordinator_handoff_written: Arc<Notify>,
+    /// How long a UI-confirmed coordinator reset waits for the fresh handoff.
+    /// Tests inject a short value.
+    #[builder(default = crate::coordinator_tmux::reset_handoff::HANDOFF_TIMEOUT)]
+    coordinator_handoff_timeout: std::time::Duration,
+    /// Set while a detached coordinator reset is running, so a repeated
+    /// request is refused instead of stacking a second handoff wait.
+    #[builder(default)]
+    coordinator_reset_in_flight: Arc<AtomicBool>,
     /// Spawn token for which the current app session has acknowledged a
     /// coordinator viewer. Cleared with the app session so a reconnect gets a
     /// fresh attach request.
@@ -1075,6 +1085,15 @@ impl ServerState {
     }
 
     fn tmux_from_program(&self, program: PathBuf) -> anyhow::Result<boss_tmux::Tmux> {
+        // Test seam: production leaves the override unset.
+        if let Some(tmux) = self
+            .pane_delivery_tmux_override
+            .read()
+            .expect("pane delivery tmux override lock poisoned")
+            .clone()
+        {
+            return Ok(tmux);
+        }
         boss_tmux::Tmux::from_path_with_socket(program, self.tmux_socket_path.clone())
     }
 
@@ -1140,6 +1159,7 @@ impl ServerState {
             worker_registry: worker_registry_override,
             branch_verifier: branch_verifier_override,
             source_packet_collector: source_packet_collector_override,
+            coordinator_handoff_timeout: coordinator_handoff_timeout_override,
         } = overrides;
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
@@ -1591,6 +1611,7 @@ impl ServerState {
 
             ServerState::builder()
                 .work_db(work_db)
+                .maybe_coordinator_handoff_timeout(coordinator_handoff_timeout_override)
                 .tmux_socket_path(cfg.work.resolved_tmux_socket_path())
                 .execution_coordinator(execution_coordinator)
                 .completion_handler(completion_handler)

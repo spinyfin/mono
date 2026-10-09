@@ -2034,7 +2034,7 @@ pub enum FrontendRequest {
         expected_spawn_token: String,
         #[serde(default)]
         reason: CoordinatorRecreateReason,
-        /// Explicit operator override when no fresh handoff is available.
+        /// Explicit override when no fresh handoff is available.
         #[serde(default)]
         force_without_handoff: bool,
     },

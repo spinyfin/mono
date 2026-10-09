@@ -36,9 +36,9 @@
 //! natural boundaries — whenever the operator states a fact that changed
 //! the world, a decision, or a prohibition — so a handoff always exists
 //! as of the last such boundary, and the brief's writer/age stamps make
-//! any gap visible. Operator-confirmed resets additionally request a fresh
+//! any gap visible. UI-confirmed resets additionally request a fresh
 //! handoff and wait up to 120 seconds before replacing a live session. A
-//! timeout leaves it running unless the operator explicitly forces a reset.
+//! timeout leaves it running unless a forced reset is confirmed.
 //! See `tools/boss/docs/coordinator-session-handoff.md`.
 
 use std::path::{Path, PathBuf};
@@ -116,7 +116,7 @@ pub(crate) enum CoordinatorStartReason {
     /// An explicit UI-confirmed recreate (model mismatch or operator reset,
     /// the latter also being how a `claude` update is picked up).
     Recreate(CoordinatorRecreateReason),
-    /// Operator explicitly skipped refreshing the handoff.
+    /// Refreshing the handoff was explicitly skipped.
     RecreateWithoutHandoff(CoordinatorRecreateReason),
 }
 

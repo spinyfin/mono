@@ -1,18 +1,22 @@
-//! Fresh handoff gate for operator-confirmed coordinator replacement.
+//! Fresh handoff gate for UI-confirmed coordinator replacement.
 use super::*;
 
 pub(crate) const HANDOFF_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Called outside the lifecycle lock; recreation must recheck the token under
-/// that lock after this returns. Errors leave the session untouched.
+/// Validates and sends the request under `lifecycle_lock`, so the supervisor
+/// cannot replace the session between the token check and the prompt, then
+/// releases it for the (long) wait. Recreation must recheck the token under
+/// the lock after this returns. Errors leave the session untouched.
 pub(crate) async fn request_and_wait(
     work_db: &WorkDb,
     tmux: &Tmux,
+    lifecycle_lock: &tokio::sync::Mutex<()>,
     written: &tokio::sync::Notify,
     expected_token: &str,
     force: bool,
     timeout: Duration,
 ) -> Result<()> {
+    let guard = lifecycle_lock.lock().await;
     let record = work_db
         .coordinator_tmux_record()?
         .ok_or_else(|| anyhow!("no coordinator tmux record exists"))?;
@@ -62,6 +66,7 @@ pub(crate) async fn request_and_wait(
             "spawn_token": expected_token, "requested_at": requested_at,
         }),
     );
+    drop(guard);
     let result = tokio::time::timeout(timeout, async {
         loop {
             // Register before checking storage so a write between the check

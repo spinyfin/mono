@@ -354,6 +354,7 @@ mod awaiting_input_status;
 mod board_drag_gated_revision;
 mod context;
 mod coordinator_handoff;
+mod coordinator_reset;
 mod dispatch_pause;
 mod driver_start_signal;
 mod engine_health_report;
