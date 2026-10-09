@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use boss_protocol::{FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope};
+use boss_protocol::{
+    FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, Task, TaskKind, TaskStatus,
+    WorkItem,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -39,6 +42,7 @@ fn discovery(dir: &Path, retry: RetryPolicy) -> Discovery {
         start_timeout: Duration::from_millis(50),
         retry,
         worker_environment: false,
+        duplicate_guard_window: DUPLICATE_GUARD_WINDOW,
     }
 }
 
@@ -283,4 +287,156 @@ fn worker_environment_cannot_enable_autostart() {
 
     let human = discovery(dir.path(), RetryPolicy::disabled());
     assert!(human.with_autostart(true).autostart);
+}
+
+fn guarded_create() -> FrontendRequest {
+    FrontendRequest::CreateTask {
+        input: boss_protocol::CreateTaskInput::builder()
+            .product_id("prod_1")
+            .project_id("proj_1")
+            .name("a task")
+            .build(),
+    }
+}
+
+#[tokio::test]
+async fn guarded_create_is_not_resent_after_the_window_closes_during_the_outage() {
+    let dir = tempfile::tempdir().unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    // A shrunk guard window: replay is allowed for ~250ms after the send.
+    let mut discovery = discovery(dir.path(), fast_policy(Duration::from_secs(30), &notices));
+    discovery.duplicate_guard_window = Duration::from_millis(300);
+    let listener = UnixListener::bind(&discovery.socket_path).unwrap();
+
+    let mut client = BossClient::connect(&discovery).await.unwrap();
+    // The engine takes the create, then goes away and stays away.
+    let socket = discovery.socket_path.clone();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let engine_accepted = Arc::clone(&accepted);
+    let engine = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        engine_accepted.fetch_add(1, Ordering::SeqCst);
+        let mut stream = BufReader::new(stream);
+        read_request(&mut stream).await.expect("create delivered");
+        drop(stream);
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+    });
+
+    let started = Instant::now();
+    let err = client
+        .send_request(&guarded_create())
+        .await
+        .expect_err("the window closes before the engine is back");
+    engine.await.unwrap();
+
+    let unknown = err.downcast_ref::<OutcomeUnknown>().expect("typed error");
+    assert_eq!(unknown.request, "create_task");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "exactly one delivery");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the reconnect wait is capped to the window, not the 30s budget: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn replayed_guarded_create_blocked_by_the_guard_is_reported_as_the_created_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let discovery = discovery(dir.path(), fast_policy(Duration::from_secs(10), &notices));
+    let listener = UnixListener::bind(&discovery.socket_path).unwrap();
+    let item = WorkItem::Task(
+        Task::builder()
+            .id("task_1")
+            .product_id("prod_1")
+            .kind(TaskKind::Task)
+            .name("a task")
+            .description("")
+            .status(TaskStatus::Todo)
+            .created_at("")
+            .updated_at("")
+            .build(),
+    );
+    let engine_item = item.clone();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let engine_accepted = Arc::clone(&accepted);
+    let engine = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = engine_accepted.fetch_add(1, Ordering::SeqCst);
+            let item = engine_item.clone();
+            tokio::spawn(async move {
+                let mut stream = BufReader::new(stream);
+                while let Some(request) = read_request(&mut stream).await {
+                    if seen == 0 {
+                        return; // applied, then died before replying
+                    }
+                    let event = match request.payload {
+                        FrontendRequest::GetWorkItem { .. } => FrontendEvent::WorkItemResult { item: item.clone() },
+                        _ => FrontendEvent::WorkItemDuplicateBlocked {
+                            existing_id: "task_1".into(),
+                            existing_short_id: 7,
+                            name: "a task".into(),
+                            age_secs: 0,
+                        },
+                    };
+                    reply(&mut stream, &request, event).await;
+                }
+            });
+        }
+    });
+
+    let mut client = BossClient::connect(&discovery).await.unwrap();
+    let event = client.send_request(&guarded_create()).await.expect("resent");
+    assert!(
+        matches!(&event, FrontendEvent::WorkItemCreated { item } if item.primary_id() == "task_1"),
+        "{event:?}"
+    );
+    engine.abort();
+}
+
+#[tokio::test]
+async fn duplicate_blocked_without_a_replay_is_left_for_the_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let discovery = discovery(dir.path(), fast_policy(Duration::from_secs(10), &notices));
+    let listener = UnixListener::bind(&discovery.socket_path).unwrap();
+    let blocked = FrontendEvent::WorkItemDuplicateBlocked {
+        existing_id: "task_1".into(),
+        existing_short_id: 7,
+        name: "a task".into(),
+        age_secs: 3,
+    };
+    let engine = spawn_engine(listener, 0, Arc::new(AtomicUsize::new(0)), blocked);
+
+    let mut client = BossClient::connect(&discovery).await.unwrap();
+    let event = client.send_request(&guarded_create()).await.unwrap();
+    assert!(
+        matches!(event, FrontendEvent::WorkItemDuplicateBlocked { .. }),
+        "{event:?}"
+    );
+    engine.abort();
+}
+
+#[tokio::test]
+async fn worker_environment_never_launches_an_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("spawns");
+    let mut worker = discovery(dir.path(), RetryPolicy::disabled());
+    worker.worker_environment = true;
+    worker.engine = EngineCommand {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), format!("echo x >> '{}'", counter.display())],
+        source: "test".into(),
+        attempted: Vec::new(),
+    };
+
+    let err = ensure_engine_running(&worker)
+        .await
+        .expect_err("workers cannot start an engine");
+    assert!(format!("{err:#}").contains("worker session"), "{err:#}");
+    assert!(!counter.exists(), "no process was launched");
 }

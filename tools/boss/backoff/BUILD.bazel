@@ -4,32 +4,29 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "http_retry",
+    name = "backoff",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_http_retry",
+    crate_name = "boss_backoff",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
-        "//tools/boss:__subpackages__",
+        "//tools/boss/client:__pkg__",
+        "//tools/boss/http_retry:__pkg__",
     ],
-    deps = [
-        "//tools/boss/backoff",
-    ] + all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "http_retry_test",
+    name = "backoff_test",
     size = "small",
-    crate = ":http_retry",
+    crate = ":backoff",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = [
-        "//tools/boss/backoff",
-    ] + all_crate_deps(
+    deps = all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

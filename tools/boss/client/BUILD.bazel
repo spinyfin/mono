@@ -25,6 +25,7 @@ rust_library(
         "//tools/boss:__subpackages__",
     ],
     deps = [
+        "//tools/boss/backoff",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -40,6 +41,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/backoff",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(

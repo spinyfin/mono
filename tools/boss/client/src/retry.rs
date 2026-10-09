@@ -1,11 +1,11 @@
 //! Retry policy for reaching an engine that is briefly unavailable.
 //!
-//! The engine is restarted routinely (an update, a crash-and-relaunch), and
-//! a `boss propose done` or coordinator command that lands in that window
-//! used to fail outright. [`BossClient`](crate::BossClient) now rides the
-//! window out: connect-phase failures are retried with exponential backoff
-//! and jitter until a total budget ([`RetryPolicy::max_wait`]) is spent,
-//! then the call fails loudly with [`EngineUnreachable`].
+//! The engine is restarted routinely (an update, a crash-and-relaunch), so a
+//! call can land while it is briefly unavailable.
+//! [`BossClient`](crate::BossClient) rides that window out: connect-phase
+//! failures are retried with exponential backoff and jitter until
+//! [`RetryPolicy::max_wait`] is spent, then the call fails loudly with
+//! [`EngineUnreachable`].
 //!
 //! This module owns the *schedule* and the *errors*; whether a request that
 //! was already sent may be sent again lives in [`crate::replay`].
@@ -23,7 +23,7 @@
 use std::fmt;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
 
@@ -143,24 +143,12 @@ impl RetryPolicy {
     /// `[base/2, base]` chosen by `jitter_unit` (`0.0..=1.0`) — so a herd of
     /// workers released by the same restart does not reconnect in lockstep.
     pub fn delay_for_attempt(&self, attempt: u32, jitter_unit: f64) -> Duration {
-        let doublings = attempt.min(30);
-        let base = self.initial_delay.saturating_mul(1u32 << doublings).min(self.max_delay);
-        let unit = jitter_unit.clamp(0.0, 1.0);
-        base.mul_f64(0.5 + 0.5 * unit)
+        boss_backoff::equal_jitter_at(self.base_delay(attempt), jitter_unit)
     }
-}
 
-/// Cheap process-local jitter source in `0.0..1.0`. Not cryptographic; it
-/// only needs to differ between concurrently launched CLI processes, so the
-/// pid and sub-second clock are mixed through a multiplicative hash rather
-/// than pulling a randomness dependency into this crate.
-fn jitter_unit() -> f64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::from(d.subsec_nanos()))
-        .unwrap_or(0);
-    let mixed = (nanos ^ (u64::from(std::process::id()) << 20)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (mixed >> 11) as f64 / (1u64 << 53) as f64
+    fn base_delay(&self, attempt: u32) -> Duration {
+        boss_backoff::exponential_delay(self.initial_delay, self.max_delay, attempt)
+    }
 }
 
 /// The engine could not be reached within the retry budget (or retry was
@@ -268,6 +256,32 @@ impl RetryState {
         self.started.elapsed()
     }
 
+    /// Time left in the budget (the whole per-attempt bound when retry is
+    /// disabled, so the single attempt still gets a real connect timeout).
+    pub(crate) fn remaining(&self) -> Duration {
+        self.policy.max_wait.saturating_sub(self.started.elapsed())
+    }
+
+    /// Absolute deadline for one connect attempt: the remaining budget
+    /// (floored so a nearly spent budget still gets a real attempt), or
+    /// `single_attempt` when retry is disabled and there is no budget.
+    pub(crate) fn connect_deadline(&self, single_attempt: Duration) -> Instant {
+        let span = if self.policy.is_enabled() {
+            self.remaining().max(Duration::from_millis(50))
+        } else {
+            single_attempt
+        };
+        Instant::now() + span
+    }
+
+    /// Never wait past `total` (measured from this call's start). Used to
+    /// keep a guarded create's reconnect inside the duplicate-guard window.
+    pub(crate) fn limit_total(&mut self, total: Duration) {
+        if self.policy.max_wait > total {
+            self.policy.max_wait = total;
+        }
+    }
+
     /// Record a failed attempt. Returns `true` after sleeping if another
     /// attempt is allowed, `false` when the budget is spent (or retry is
     /// disabled) and the caller must give up.
@@ -278,10 +292,7 @@ impl RetryState {
             return false;
         }
         let remaining = self.policy.max_wait - elapsed;
-        let delay = self
-            .policy
-            .delay_for_attempt(self.attempts - 1, jitter_unit())
-            .min(remaining);
+        let delay = boss_backoff::equal_jitter(self.policy.base_delay(self.attempts - 1)).min(remaining);
 
         let due = match self.last_notice {
             None => true,
@@ -344,14 +355,6 @@ mod tests {
         // Out-of-range jitter is clamped, not extrapolated.
         assert_eq!(p.delay_for_attempt(1, 7.0), Duration::from_millis(500));
         assert_eq!(p.delay_for_attempt(1, -3.0), Duration::from_millis(250));
-    }
-
-    #[test]
-    fn jitter_unit_is_in_range() {
-        for _ in 0..1000 {
-            let u = jitter_unit();
-            assert!((0.0..1.0).contains(&u), "{u}");
-        }
     }
 
     #[test]

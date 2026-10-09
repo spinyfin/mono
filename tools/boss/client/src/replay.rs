@@ -1,8 +1,10 @@
 //! Which requests may be sent a second time after the connection dropped.
 //!
 //! A connect-phase failure means nothing was sent, so *every* request is
-//! safe to retry then. The hard case is a drop **after** the request was
-//! written: the engine may have applied it before dying, and sending it
+//! safe to retry then. A failed write is the same only when zero bytes
+//! reached the socket; a partial write or a failed flush may have delivered
+//! the request, and is treated like a drop after send. The hard case is a
+//! drop **after** (or possibly after) the request was written: the engine may have applied it before dying, and sending it
 //! again could apply it twice. [`replay_safety`] decides, per request, whether
 //! that second send is safe. The default is [`ReplaySafety::Never`]: a new
 //! `FrontendRequest` variant fails closed (“outcome unknown, check state”)
@@ -33,11 +35,13 @@
 //! * **Within(window)** — protected by the engine's duplicate-create guard,
 //!   which refuses a same-named task/chore/investigation in the same product
 //!   created in the last [`DUPLICATE_GUARD_WINDOW`]. A replay inside the
-//!   window is refused (the CLI reports the existing item) instead of
-//!   creating a twin. The guard only looks back that far, so a replay after
-//!   a long outage could miss an original that *was* created; the client
-//!   therefore only replays while the original send is still inside the
-//!   window (minus a safety margin) and otherwise reports “outcome unknown”.
+//!   window is refused instead of creating a twin, and the client turns that
+//!   refusal into the existing item (see `BossClient::send_request`). The
+//!   guard only looks back that far, so a replay after a long outage could
+//!   miss an original that *was* created; the client therefore only replays
+//!   while the original send is still inside the window (minus a safety
+//!   margin), re-checks that at the moment of each resend, caps the reconnect
+//!   wait to the remaining window, and otherwise reports “outcome unknown”.
 //!   Applies to `CreateTask`, `CreateChore` and `CreateInvestigation`,
 //!   and only when `force_duplicate` is false — with it set the guard is off.
 //! * **Never** — everything else: creates without a guard (`CreateProject`,
@@ -57,10 +61,10 @@ use boss_protocol::FrontendRequest;
 /// does not depend on the engine crate; the engine constant is the source of
 /// truth and this one is deliberately conservative to stay valid if it grows.
 pub const DUPLICATE_GUARD_WINDOW: Duration = Duration::from_secs(60);
-/// Replay a guarded create only while at least this much of the guard window
-/// remains, so clock skew and the reconnect itself cannot push the replay
-/// past the guard's horizon.
-const DUPLICATE_GUARD_MARGIN: Duration = Duration::from_secs(10);
+/// Replay a guarded create only while at least this fraction (1/N) of the
+/// guard window remains, so clock skew and the reconnect itself cannot push
+/// the replay past the guard's horizon (10s of the default 60s).
+const DUPLICATE_GUARD_MARGIN_DIVISOR: u32 = 6;
 
 /// Whether a request that was already sent may be sent again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +100,13 @@ pub fn request_name(request: &FrontendRequest) -> String {
 
 /// Classify `request`; see the module docs for the full table.
 pub fn replay_safety(request: &FrontendRequest) -> ReplaySafety {
-    let guarded = ReplaySafety::Within(DUPLICATE_GUARD_WINDOW.saturating_sub(DUPLICATE_GUARD_MARGIN));
+    replay_safety_with(request, DUPLICATE_GUARD_WINDOW)
+}
+
+/// [`replay_safety`] for an engine whose duplicate guard looks back
+/// `guard_window` (injectable so tests can shrink it).
+pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> ReplaySafety {
+    let guarded = ReplaySafety::Within(guard_window - guard_window / DUPLICATE_GUARD_MARGIN_DIVISOR);
     match request {
         FrontendRequest::CreateTask { input } if !input.force_duplicate => guarded,
         FrontendRequest::CreateChore { input } if !input.force_duplicate => guarded,

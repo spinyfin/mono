@@ -51,21 +51,37 @@ exits 5). Opt out with `--no-retry`, `--engine-max-wait <secs>`, or
 single connection with no retry, for engine control and tests.
 
 `send_request` also recovers from a dropped connection, but only when that
-cannot apply a request twice. A failed _write_ means nothing was delivered,
-so any request is resent on a fresh connection. If the write succeeded and
-the reply never came, the request is resent only if `replay_safety` marks it
+cannot apply a request twice. Only a first write that fails with zero bytes
+written proves nothing was delivered; then any request is resent on a fresh
+connection. Everything else — a reply that never came, a partial write, a
+failed flush — _may_ have been delivered, and that suspicion is sticky across
+attempts. Such a request is resent only if `replay_safety` marks it
 idempotent or guarded by an engine-side check (reads, `Set*` setters,
-`SubmitProposal`, `SubmitAttachment`, guarded `CreateTask`/`CreateChore`
-within the duplicate-guard window, …); anything else fails with
-`OutcomeUnknown` — "check state before retrying" — and is never resent. The
-full classification table is in `src/replay.rs`; unclassified requests
-default to _not_ resendable.
+`SubmitProposal`, `SubmitAttachment`, guarded `CreateTask`/`CreateChore`/
+`CreateInvestigation` within the duplicate-guard window, …); anything else
+fails with `OutcomeUnknown` — "check state before retrying" — and is never
+resent. For a guarded create the window is re-checked after the reconnect,
+immediately before the resend, and the reconnect wait is capped to what is
+left of it; if the window closes the call fails with `OutcomeUnknown`. If
+the engine's duplicate guard refuses a replayed create, the client reports
+the existing item as the created one (it was almost certainly this
+request's first delivery) instead of a conflict. The full classification
+table is in `src/replay.rs`; unclassified requests default to _not_
+resendable.
+
+Every connect (including autostart and readiness probes) is bounded by the
+remaining retry budget and a 5s per-attempt cap, so a stalled listener
+cannot hold a call past `--engine-max-wait`.
 
 Autostart keeps its meaning (`--no-engine-autostart` still forbids it). When
 it applies, the client starts at most one engine per call and waits for an
 engine that is already starting or restarting (live pid file) rather than
-racing a second. A Boss worker (`BOSS_RUN_ID` set) never autostarts an
-engine, whatever the flags say.
+racing a second. A Boss worker (`BOSS_RUN_ID` set) never starts an engine:
+the spawn itself refuses, so `boss engine start` fails there too.
+
+The backoff and jitter arithmetic lives in `tools/boss/backoff`, shared with
+`boss-http-retry`; this crate adds the IPC-specific budget, notices and
+replay rules.
 
 ## Consumers
 

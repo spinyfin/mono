@@ -52,20 +52,13 @@ impl RetryPolicy {
 /// jitter (to keep concurrent retriers from lockstepping) apply [`jitter`]
 /// on top; callers that don't (a single best-effort retry) use this as-is.
 pub fn backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
-    // attempt is always >= 1 here; cap the exponent so the shift can't
-    // overflow even if a caller sets an unreasonable attempt count.
-    let factor = 1u32.checked_shl(attempt - 1).unwrap_or(u32::MAX).max(1);
-    policy.base_backoff.saturating_mul(factor).min(policy.max_backoff)
+    boss_backoff::exponential_delay(policy.base_backoff, policy.max_backoff, attempt.saturating_sub(1))
 }
 
 /// Jitter `delay` by +/-25%. A zero delay is never jittered into a nonzero
 /// wait, so [`RetryPolicy::NONE`] stays instant.
 pub fn jitter(delay: Duration) -> Duration {
-    if delay.is_zero() {
-        return delay;
-    }
-    let factor = 0.75 + fastrand::f64() * 0.5;
-    Duration::from_millis((delay.as_millis() as f64 * factor).round() as u64)
+    boss_backoff::jitter(delay, 0.75, 1.25)
 }
 
 /// The process-wide reqwest client shared by every outbound HTTP call in the

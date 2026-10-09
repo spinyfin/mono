@@ -24,7 +24,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{sleep, timeout};
 
-pub use replay::{DUPLICATE_GUARD_WINDOW, ReplaySafety, replay_safety, request_name};
+pub use replay::{DUPLICATE_GUARD_WINDOW, ReplaySafety, replay_safety, replay_safety_with, request_name};
 pub use retry::{DEFAULT_MAX_WAIT, EngineUnreachable, MAX_WAIT_ENV, NoticeSink, OutcomeUnknown, RetryPolicy};
 use retry::{RetryState, is_unreachable_kind};
 
@@ -35,6 +35,8 @@ pub const DEFAULT_ENGINE_START_TIMEOUT: Duration = Duration::from_secs(5);
 /// or fails promptly unless the listener's backlog is wedged; this keeps a
 /// wedged engine from hanging a single attempt past the retry budget.
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Floor for a connect attempt whose budget is nearly spent.
+const MIN_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 /// Set in every Boss worker session (by the engine, at spawn).
 const WORKER_RUN_ENV: &str = "BOSS_RUN_ID";
 
@@ -81,6 +83,10 @@ pub struct Discovery {
     /// This process is a Boss worker session. Workers must never start an
     /// engine, so [`Self::with_autostart`] cannot turn autostart on for one.
     pub worker_environment: bool,
+    /// How far back the engine's duplicate-create guard looks. A guarded
+    /// create is only resent while this window (minus a margin) is open; see
+    /// [`replay_safety_with`]. Injectable so tests need not wait a real minute.
+    pub duplicate_guard_window: Duration,
 }
 
 impl Discovery {
@@ -131,6 +137,7 @@ impl Discovery {
             start_timeout: DEFAULT_ENGINE_START_TIMEOUT,
             retry: RetryPolicy::from_env(),
             worker_environment,
+            duplicate_guard_window: DUPLICATE_GUARD_WINDOW,
         })
     }
 
@@ -212,12 +219,15 @@ pub struct BossClient {
 /// Why one send/receive exchange failed, split by what that proves about
 /// whether the engine saw the request.
 enum Exchange {
-    /// The request was provably not delivered (the write failed). A
-    /// partially written line never carries a request: the engine frames on
-    /// newlines and the whole line is written in one buffer.
+    /// The request was provably not delivered: the very first write failed,
+    /// so zero bytes reached the socket. Anything short of that proof is
+    /// [`Exchange::Dropped`] — a partial write may still leave a complete
+    /// JSON line the engine parses at EOF, and a flush error can follow a
+    /// fully written line.
     NotSent(anyhow::Error),
-    /// The write succeeded but no response arrived (EOF or read error): the
-    /// engine may have applied the request before it went away.
+    /// The request may have been delivered but no response arrived (EOF or
+    /// read error, a partial write, or a flush error): the engine may have
+    /// applied it before it went away.
     Dropped(anyhow::Error),
     /// Not a transport problem (e.g. an undecodable reply); never retried.
     Fatal(anyhow::Error),
@@ -243,11 +253,14 @@ impl BossClient {
     async fn connect_within(discovery: &Discovery, retry: &mut RetryState) -> Result<Self> {
         let mut spawned = false;
         loop {
-            let mut attempt = connect_any_endpoint(discovery).await;
+            let mut attempt = connect_any_endpoint(discovery, retry.connect_deadline(CONNECT_ATTEMPT_TIMEOUT)).await;
             if attempt.is_err() && discovery.autostart {
                 // Start (or wait for) the engine, then look again at once.
                 match ensure_engine_for_connect(discovery, retry, &mut spawned).await {
-                    Ok(()) => attempt = connect_any_endpoint(discovery).await,
+                    Ok(()) => {
+                        attempt =
+                            connect_any_endpoint(discovery, retry.connect_deadline(CONNECT_ATTEMPT_TIMEOUT)).await;
+                    }
                     Err(err) => {
                         tracing::debug!(%err, "engine autostart did not produce a reachable engine yet");
                     }
@@ -296,20 +309,39 @@ impl BossClient {
     /// If the connection fails, a client from [`connect`](Self::connect)
     /// recovers per the policy in [`Discovery::retry`]:
     ///
-    /// * the request was never delivered (the write failed) → reconnect and
-    ///   send it again, whatever the request is;
-    /// * it was sent but no reply came → resend only if
-    ///   [`replay_safety`] says a second delivery is harmless; otherwise
-    ///   fail with [`OutcomeUnknown`] without retrying.
+    /// * the request provably never reached the socket (the first write
+    ///   failed with zero bytes written) → reconnect and send it again,
+    ///   whatever the request is;
+    /// * it may have been delivered (a reply never came, or a write was
+    ///   partial or its flush failed) → resend only if [`replay_safety_with`]
+    ///   says a second delivery is harmless *at the moment of the resend*,
+    ///   i.e. after the reconnect wait; otherwise fail with
+    ///   [`OutcomeUnknown`]. "May have been delivered" is sticky across
+    ///   attempts.
+    ///
+    /// A replayed guarded create that the engine's duplicate guard refuses
+    /// was in all likelihood applied by the earlier delivery; it is reported
+    /// as the existing item (`WorkItemCreated`) rather than as a conflict.
     pub async fn send_request(&mut self, request: &FrontendRequest) -> Result<FrontendEvent> {
-        let first_attempt = Instant::now();
         let mut retry: Option<RetryState> = None;
+        // Sticky across attempts: when the first attempt that may have
+        // reached the engine started. A later `NotSent` must not forget it.
+        let mut first_possible_delivery: Option<Instant> = None;
+        let mut replayed = false;
         loop {
-            let (delivered, error) = match self.exchange(request).await {
-                Ok(event) => return Ok(event),
+            let attempt_started = Instant::now();
+            let error = match self.exchange(request).await {
+                Ok(event) => {
+                    return self
+                        .settle_reply(request, event, first_possible_delivery, replayed)
+                        .await;
+                }
                 Err(Exchange::Fatal(err)) => return Err(err),
-                Err(Exchange::NotSent(err)) => (false, err),
-                Err(Exchange::Dropped(err)) => (true, err),
+                Err(Exchange::NotSent(err)) => err,
+                Err(Exchange::Dropped(err)) => {
+                    first_possible_delivery.get_or_insert(attempt_started);
+                    err
+                }
             };
 
             let recoverable = self.reconnect.as_ref().filter(|d| d.retry.is_enabled());
@@ -317,25 +349,93 @@ impl BossClient {
                 // No recovery configured: report what happened. A drop
                 // after send is still an unknown outcome, never a bare I/O
                 // error that reads like "nothing happened".
-                return Err(if delivered {
+                return Err(if first_possible_delivery.is_some() {
                     self.outcome_unknown(request, &error)
                 } else {
                     error
                 });
             };
-            if delivered && !replay_safety(request).allows_replay_after(first_attempt.elapsed()) {
+            let safety = replay_safety_with(request, discovery.duplicate_guard_window);
+            let window_closed = |at: Option<Instant>| at.is_some_and(|at| !safety.allows_replay_after(at.elapsed()));
+            if window_closed(first_possible_delivery) {
                 return Err(self.outcome_unknown(request, &error));
             }
+            // Giving up on a possibly-delivered guarded create is an unknown
+            // outcome, not "nothing was sent".
+            let gave_up = |this: &Self, err: anyhow::Error| {
+                if first_possible_delivery.is_some() && matches!(safety, ReplaySafety::Within(_)) {
+                    this.outcome_unknown(request, &error)
+                } else {
+                    err
+                }
+            };
 
             let retry = retry.get_or_insert_with(|| RetryState::new(&discovery.retry));
+            if let (Some(at), ReplaySafety::Within(window)) = (first_possible_delivery, safety) {
+                // The reconnect wait must not outlast the duplicate guard.
+                retry.limit_total(retry.elapsed() + window.saturating_sub(at.elapsed()));
+            }
             let detail = format!("{error:#}");
             if !retry.backoff(&self.socket_path, "connection dropped", &detail).await {
-                return Err(anyhow::Error::new(retry.unreachable(&self.socket_path, &detail)));
+                let unreachable = anyhow::Error::new(retry.unreachable(&self.socket_path, &detail));
+                return Err(gave_up(self, unreachable));
             }
-            let fresh = Self::connect_within(&discovery, retry).await?;
+            let fresh = match Self::connect_within(&discovery, retry).await {
+                Ok(fresh) => fresh,
+                Err(err) if err.is::<EngineUnreachable>() => return Err(gave_up(self, err)),
+                Err(err) => return Err(err),
+            };
             self.reader = fresh.reader;
             self.writer = fresh.writer;
             self.socket_path = fresh.socket_path;
+            // Re-evaluate at resend time: the reconnect may have taken long
+            // enough to close the replay window.
+            if window_closed(first_possible_delivery) {
+                return Err(self.outcome_unknown(request, &error));
+            }
+            replayed = first_possible_delivery.is_some();
+        }
+    }
+
+    /// Turn the reply to a possibly-replayed request into the caller's
+    /// result. A replayed create that the duplicate guard refuses almost
+    /// certainly found its own earlier delivery; fetch that item and report
+    /// it as created instead of a conflict whose `--force-duplicate` hint
+    /// would invite exactly the twin the replay guard exists to prevent.
+    async fn settle_reply(
+        &mut self,
+        request: &FrontendRequest,
+        event: FrontendEvent,
+        first_possible_delivery: Option<Instant>,
+        replayed: bool,
+    ) -> Result<FrontendEvent> {
+        let (true, Some(sent_at)) = (replayed, first_possible_delivery) else {
+            return Ok(event);
+        };
+        let FrontendEvent::WorkItemDuplicateBlocked {
+            existing_id, age_secs, ..
+        } = &event
+        else {
+            return Ok(event);
+        };
+        // An item older than our first delivery predates this request: a
+        // genuine duplicate of someone else's create, reported as usual.
+        let age = u64::try_from(*age_secs).unwrap_or(0);
+        if age > sent_at.elapsed().as_secs() + 2 {
+            return Ok(event);
+        }
+        let existing_id = existing_id.clone();
+        let lookup = FrontendRequest::GetWorkItem {
+            id: existing_id.clone(),
+        };
+        match self.exchange(&lookup).await {
+            Ok(FrontendEvent::WorkItemResult { item }) => Ok(FrontendEvent::WorkItemCreated { item }),
+            _ => Err(anyhow::anyhow!(
+                "the `{}` request was resent after the connection dropped, and the engine reports the item \
+                 already exists as {existing_id} (created {age}s ago), most likely from the first delivery. \
+                 Look it up with that id; do not create it again.",
+                request_name(request),
+            )),
         }
     }
 
@@ -355,14 +455,31 @@ impl BossClient {
         })
         .map_err(|err| Exchange::Fatal(err.into()))?;
         payload.push('\n');
-        self.writer
-            .write_all(payload.as_bytes())
-            .await
-            .map_err(|err| Exchange::NotSent(anyhow::Error::new(err).context("failed to write request to engine")))?;
+        // Write by hand rather than `write_all` so a failure reports how many
+        // bytes got out: only a first write that fails with nothing written
+        // proves the engine saw none of the request.
+        let bytes = payload.as_bytes();
+        let mut written = 0;
+        while written < bytes.len() {
+            let failure = match self.writer.write(&bytes[written..]).await {
+                Ok(0) => io::Error::new(io::ErrorKind::WriteZero, "wrote zero bytes to the engine socket"),
+                Ok(n) => {
+                    written += n;
+                    continue;
+                }
+                Err(err) => err,
+            };
+            let err = anyhow::Error::new(failure).context("failed to write request to engine");
+            return Err(if written == 0 {
+                Exchange::NotSent(err)
+            } else {
+                Exchange::Dropped(err)
+            });
+        }
         self.writer
             .flush()
             .await
-            .map_err(|err| Exchange::NotSent(anyhow::Error::new(err).context("failed to flush request to engine")))?;
+            .map_err(|err| Exchange::Dropped(anyhow::Error::new(err).context("failed to flush request to engine")))?;
 
         loop {
             let line = match self.reader.next_line().await {
@@ -394,24 +511,36 @@ impl BossClient {
 /// One connect attempt across the discovery endpoints (primary, then the
 /// legacy fallback). On failure returns the *primary* endpoint's error, the
 /// one the user can act on.
-async fn connect_any_endpoint(discovery: &Discovery) -> io::Result<(UnixStream, String)> {
+/// Every endpoint's connect is bounded by `deadline` (and by
+/// [`CONNECT_ATTEMPT_TIMEOUT`]); once it passes, remaining endpoints are skipped.
+async fn connect_any_endpoint(discovery: &Discovery, deadline: Instant) -> io::Result<(UnixStream, String)> {
     let mut primary_error = None;
     for (socket_path, _) in discovery.endpoint_candidates() {
-        match timeout(CONNECT_ATTEMPT_TIMEOUT, UnixStream::connect(socket_path)).await {
-            Ok(Ok(stream)) => return Ok((stream, socket_path.to_owned())),
-            Ok(Err(err)) => primary_error.get_or_insert(err),
-            Err(_) => primary_error.get_or_insert_with(|| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "connect to {socket_path} timed out after {}s",
-                        CONNECT_ATTEMPT_TIMEOUT.as_secs()
-                    ),
-                )
-            }),
+        if primary_error.is_some() && Instant::now() >= deadline {
+            break;
+        }
+        match connect_until(socket_path, deadline).await {
+            Ok(stream) => return Ok((stream, socket_path.to_owned())),
+            Err(err) => primary_error.get_or_insert(err),
         };
     }
     Err(primary_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no engine endpoint configured")))
+}
+
+/// `UnixStream::connect` that cannot outlive `deadline` or the per-attempt
+/// cap. A listener whose accept is stalled would otherwise hold a bare
+/// connect forever.
+async fn connect_until(socket_path: &str, deadline: Instant) -> io::Result<UnixStream> {
+    let budget = deadline
+        .saturating_duration_since(Instant::now())
+        .clamp(MIN_CONNECT_TIMEOUT, CONNECT_ATTEMPT_TIMEOUT);
+    match timeout(budget, UnixStream::connect(socket_path)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("connect to {socket_path} timed out after {:.1}s", budget.as_secs_f64()),
+        )),
+    }
 }
 
 /// Autostart step inside the connect loop: wait for an engine that is
@@ -450,12 +579,18 @@ impl BossClient {
 }
 
 pub async fn engine_socket_reachable(socket_path: &str) -> bool {
-    UnixStream::connect(socket_path).await.is_ok()
+    connect_until(socket_path, Instant::now() + CONNECT_ATTEMPT_TIMEOUT)
+        .await
+        .is_ok()
 }
 
 pub async fn discover_running_engine(discovery: &Discovery) -> Option<RunningEngine> {
+    discover_running_engine_until(discovery, Instant::now() + CONNECT_ATTEMPT_TIMEOUT).await
+}
+
+async fn discover_running_engine_until(discovery: &Discovery, deadline: Instant) -> Option<RunningEngine> {
     for (socket_path, pid_file_path) in discovery.endpoint_candidates() {
-        let Ok(stream) = UnixStream::connect(socket_path).await else {
+        let Ok(stream) = connect_until(socket_path, deadline).await else {
             continue;
         };
         let peer_pid = stream
@@ -526,7 +661,8 @@ async fn ensure_engine_running_with(
     wait: Duration,
     spawned: &mut bool,
 ) -> Result<()> {
-    if discover_running_engine(discovery).await.is_some() {
+    let deadline = Instant::now() + wait;
+    if discover_running_engine_until(discovery, deadline).await.is_some() {
         return Ok(());
     }
 
@@ -544,7 +680,7 @@ async fn ensure_engine_running_with(
         .find_map(|(_, pid_path)| running_engine_pid(pid_path).map(|pid| (pid, pid_path)))
         .filter(|(pid, _)| is_likely_engine_process(*pid))
     {
-        if wait_for_discovered_engine(discovery, wait).await {
+        if wait_for_discovered_engine_until(discovery, deadline).await {
             return Ok(());
         }
         bail!(
@@ -556,7 +692,7 @@ async fn ensure_engine_running_with(
     if !allow_spawn {
         // We already started an engine for this call and it has not
         // published its socket yet: keep waiting, do not start another.
-        if wait_for_discovered_engine(discovery, wait).await {
+        if wait_for_discovered_engine_until(discovery, deadline).await {
             return Ok(());
         }
         bail!(
@@ -579,9 +715,12 @@ async fn ensure_engine_running_with(
 }
 
 async fn wait_for_discovered_engine(discovery: &Discovery, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if discover_running_engine(discovery).await.is_some() {
+    wait_for_discovered_engine_until(discovery, Instant::now() + timeout).await
+}
+
+async fn wait_for_discovered_engine_until(discovery: &Discovery, deadline: Instant) -> bool {
+    while Instant::now() < deadline {
+        if discover_running_engine_until(discovery, deadline).await.is_some() {
             return true;
         }
         sleep(Duration::from_millis(100)).await;
@@ -813,6 +952,14 @@ pub fn default_control_token_path() -> Option<PathBuf> {
 }
 
 fn start_engine_process(discovery: &Discovery) -> Result<()> {
+    // The spawn boundary: no caller (autostart, `boss engine start`, a
+    // future one) can launch an engine from a worker session.
+    if discovery.worker_environment {
+        bail!(
+            "refusing to start a Boss engine from a worker session ({WORKER_RUN_ENV} is set); \
+             workers must never start an engine"
+        );
+    }
     Command::new(&discovery.engine.program)
         .args(&discovery.engine.args)
         .current_dir(&discovery.launch_directory)
@@ -1211,6 +1358,7 @@ mod tests {
             start_timeout: Duration::from_secs(1),
             retry: RetryPolicy::disabled(),
             worker_environment: false,
+            duplicate_guard_window: DUPLICATE_GUARD_WINDOW,
         };
 
         let running = discover_running_engine(&discovery)
@@ -1244,6 +1392,7 @@ mod tests {
             start_timeout: Duration::from_secs(1),
             retry: RetryPolicy::disabled(),
             worker_environment: false,
+            duplicate_guard_window: DUPLICATE_GUARD_WINDOW,
         };
 
         assert_eq!(
