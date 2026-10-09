@@ -817,6 +817,10 @@ async fn automation_pause_does_not_hold_pr_review_guide_but_holds_automation_row
         1,
         "only the review-guide execution should have dispatched while automation is paused"
     );
+    assert_eq!(
+        calls[0].1, guide_execution.id,
+        "the runner must receive the execution bound to the guide attempt"
+    );
     assert!(
         calls[0].0.starts_with(REVIEW_WORKER_ID_PREFIX),
         "pr_review_guide must claim a review-pool worker id, got {:?}",
