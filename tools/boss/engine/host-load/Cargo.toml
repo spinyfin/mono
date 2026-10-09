@@ -1,0 +1,16 @@
+[package]
+name = "boss-engine-host-load"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+bon = { workspace = true }
+libc = "0.2"
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["rt", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
