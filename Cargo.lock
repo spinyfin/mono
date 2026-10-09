@@ -458,6 +458,7 @@ dependencies = [
  "boss-engine-gh-invocation",
  "boss-engine-grok-home-retention",
  "boss-engine-live-status-redact",
+ "boss-engine-offsite-backup",
  "boss-engine-planner-validation",
  "boss-engine-proposal-validation",
  "boss-engine-recovery",
@@ -716,6 +717,18 @@ name = "boss-engine-metrics-registry"
 version = "0.1.0"
 dependencies = [
  "boss-engine-utils",
+]
+
+[[package]]
+name = "boss-engine-offsite-backup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "tempfile",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

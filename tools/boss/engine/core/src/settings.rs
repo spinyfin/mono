@@ -71,6 +71,9 @@ fn reject_removed_tmux_hosting_key(settings: &HashMap<String, toml::Value>) -> R
     Ok(())
 }
 
+/// Top-level table preserved verbatim across writes (`[backup.offsite]`).
+const BACKUP_TABLE_KEY: &str = "backup";
+
 /// Static registry. Append here, read with `SettingsStore::is_enabled`.
 pub const REGISTRY: &[SettingSpec] = &[
     SettingSpec {
@@ -120,6 +123,10 @@ struct FileShape {
 #[derive(Debug, Default)]
 struct SettingsState {
     booleans: HashMap<String, bool>,
+    /// The `[backup]` table. Not a boolean setting (it is read straight from
+    /// the file by `database_backup::OffsiteRuntime`), but carried through
+    /// so that toggling a boolean setting never erases it from disk.
+    backup: Option<toml::Value>,
 }
 
 /// Thread-safe store. In-memory overrides keyed by setting key;
@@ -163,7 +170,10 @@ impl SettingsStore {
         let parsed: FileShape =
             toml::from_str(&contents).with_context(|| format!("parse settings file: {}", self.path.display()))?;
         reject_removed_tmux_hosting_key(&parsed.settings)?;
-        let mut next = SettingsState::default();
+        let mut next = SettingsState {
+            backup: parsed.settings.get(BACKUP_TABLE_KEY).cloned(),
+            ..SettingsState::default()
+        };
         for (key, value) in parsed.settings {
             // `workers.always_use_opus` was replaced by
             // `workers.non_opus_permission_mode`. If the old key is still in the
@@ -235,6 +245,10 @@ impl SettingsStore {
                 .iter()
                 .map(|(key, value)| (key.clone(), toml::Value::Boolean(*value)))
                 .collect::<HashMap<_, _>>();
+            let mut settings = settings;
+            if let Some(backup) = &guard.backup {
+                settings.insert(BACKUP_TABLE_KEY.to_owned(), backup.clone());
+            }
             let shape = FileShape { settings };
             toml::to_string_pretty(&shape).context("serialize settings to TOML")?
         };
@@ -289,6 +303,20 @@ mod tests {
         let store = make_store(&tmp);
         let err = store.set("not_a_real_setting", true).unwrap_err();
         assert!(err.to_string().contains("not_a_real_setting"));
+    }
+
+    #[test]
+    fn backup_table_survives_a_boolean_toggle() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "[backup.offsite]\nenabled = true\ndestination = \"/mnt/sync\"\n").unwrap();
+        let store = SettingsStore::new(path.clone());
+        store.load().unwrap();
+        store.set("default_pr_draft_mode", true).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("/mnt/sync"), "backup table lost: {on_disk}");
+        let cfg = boss_engine_offsite_backup::OffsiteConfig::from_toml_str(&on_disk).unwrap();
+        assert!(cfg.enabled);
     }
 
     #[test]

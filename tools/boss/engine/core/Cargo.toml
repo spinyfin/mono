@@ -38,6 +38,7 @@ boss-engine-driver = { path = "../driver" }
 boss-engine-driver-quota = { path = "../driver-quota" }
 boss-engine-attachments = { path = "../attachments" }
 boss-engine-grok-home-retention = { path = "../grok-home-retention" }
+boss-engine-offsite-backup = { path = "../offsite-backup" }
 boss-engine-effort = { path = "../effort" }
 boss-feature-flags = { path = "../feature-flags" }
 boss-engine-gh-invocation = { path = "../gh-invocation" }
