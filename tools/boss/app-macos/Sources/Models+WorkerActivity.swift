@@ -65,6 +65,7 @@ struct WorkerLiveState {
     let waitExpiresAt: String?
 
     init(
+        name: String? = nil,
         slotId: Int,
         runId: String,
         model: String,
@@ -80,6 +81,7 @@ struct WorkerLiveState {
         waitReason: String? = nil,
         waitExpiresAt: String? = nil
     ) {
+        self.name = name
         self.slotId = slotId
         self.runId = runId
         self.model = model
