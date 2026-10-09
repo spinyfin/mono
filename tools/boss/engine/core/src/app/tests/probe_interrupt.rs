@@ -205,10 +205,15 @@ async fn interrupting_probe_cuts_the_turn_short_before_writing() {
             .await;
             match sole_response(&status_sink).await {
                 FrontendEvent::ProbeStatusResult {
-                    detail: Some(detail), ..
+                    detail: Some(detail),
+                    submitted,
+                    resumed,
+                    ..
                 } => {
                     assert!(detail.contains("submitted=true"));
                     assert!(detail.contains("resumed=confirmed"));
+                    assert_eq!(submitted, Some(true));
+                    assert_eq!(resumed, Some(boss_protocol::ProbeResumeEvidence::Confirmed));
                 }
                 other => panic!("status must report submission evidence: {other:?}"),
             }

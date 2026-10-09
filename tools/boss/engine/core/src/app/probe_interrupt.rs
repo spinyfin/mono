@@ -114,6 +114,18 @@ pub(super) const INTERRUPT_NOTICE: &str = "[coordinator-interrupt] The coordinat
 /// worker is not told its work was discarded when it was not.
 const NUDGE_NOTICE: &str = "[coordinator-nudge]";
 
+/// Probe `detail` for an interrupting delivery whose prompt hook or transcript
+/// entry confirmed the worker took the text. The same facts are recorded
+/// structurally on the probe record (`submitted` / `resumed`); these strings
+/// are only the human-readable rendering, shared so the stored lifecycle
+/// record and the synchronous reply cannot drift apart.
+const DETAIL_SUBMITTED_RESUMED_CONFIRMED: &str = "submitted=true; resumed=confirmed by matching prompt hook or transcript";
+const DETAIL_SUBMITTED_PANE_ECHO_ONLY: &str = "submitted=true; resumed=unconfirmed (only the pane echo was observed)";
+const DETAIL_SUBMITTED_UNCONFIRMED: &str =
+    "submitted=true; resumed=unconfirmed (no matching prompt hook or transcript yet)";
+const DETAIL_WRITTEN_BUT_MID_TURN_AGAIN: &str = "submitted=false; the worker was mid-turn again when the text was \
+     written, so it sits in the agent's composer until the next turn boundary";
+
 /// Everything the interrupting delivery path settled, for the caller to
 /// report back over the wire.
 ///
@@ -543,31 +555,30 @@ async fn inject_after_interrupt(
                 attempts,
                 "probe delivered after interrupting the worker's turn (delivery confirmed)",
             );
-            let detail = "submitted=true; resumed=confirmed by matching prompt hook or transcript".to_owned();
-            server_state.set_probe_lifecycle_detail(&probe_id, ProbeDeliveryState::Consumed, Some(detail.clone()));
+            server_state.set_probe_lifecycle_detail(
+                &probe_id,
+                ProbeDeliveryState::Consumed,
+                Some(DETAIL_SUBMITTED_RESUMED_CONFIRMED.to_owned()),
+            );
+            server_state.set_probe_submission(&probe_id, true, Some(ProbeResumeEvidence::Confirmed));
             InterruptingDelivery {
                 state: ProbeDeliveryState::Consumed,
                 interrupt,
                 attempts,
-                detail: Some(detail),
+                detail: server_state.probe_record(&probe_id).and_then(|record| record.detail),
             }
         }
         PaneInjectOutcome::PaneEcho => {
-            let state = super::worker_events::record_pane_write_outcome(
+            settle_unconfirmed_write(
                 server_state,
                 run_id,
                 slot_id,
                 &probe_id,
-                ProbeDeliveryState::Consumed,
-                "submitted=true; resumed=unconfirmed (only the pane echo was observed)",
-            )
-            .await;
-            InterruptingDelivery {
-                state,
+                DETAIL_SUBMITTED_PANE_ECHO_ONLY,
                 interrupt,
                 attempts,
-                detail: None,
-            }
+            )
+            .await
         }
         // A parked worker submitting nothing is not the mid-turn `Buffered`
         // shape — it is the same "wrote it, could not prove it" the parked
@@ -583,12 +594,17 @@ async fn inject_after_interrupt(
                 "probe written after an interrupt but the worker was mid-turn again by then; \
                  recorded buffered",
             );
-            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Buffered);
+            server_state.set_probe_lifecycle_detail(
+                &probe_id,
+                ProbeDeliveryState::Buffered,
+                Some(DETAIL_WRITTEN_BUT_MID_TURN_AGAIN.to_owned()),
+            );
+            server_state.set_probe_submission(&probe_id, false, None);
             InterruptingDelivery {
                 state: ProbeDeliveryState::Buffered,
                 interrupt,
                 attempts,
-                detail: None,
+                detail: server_state.probe_record(&probe_id).and_then(|record| record.detail),
             }
         }
         PaneInjectOutcome::Unconfirmed => {
@@ -610,21 +626,16 @@ async fn inject_after_interrupt(
                 "probe written into a parked pane after interrupt; UserPromptSubmit/transcript did \
                  not confirm within the window — recording parked-write consumption",
             );
-            let state = super::worker_events::record_pane_write_outcome(
+            settle_unconfirmed_write(
                 server_state,
                 run_id,
                 slot_id,
                 &probe_id,
-                ProbeDeliveryState::Consumed,
-                "submitted=true; resumed=unconfirmed (no matching prompt hook or transcript yet)",
-            )
-            .await;
-            InterruptingDelivery {
-                state,
+                DETAIL_SUBMITTED_UNCONFIRMED,
                 interrupt,
                 attempts,
-                detail: None,
-            }
+            )
+            .await
         }
         PaneInjectOutcome::NotAcceptingInput { activity } => {
             requeue_after_write_declined(
@@ -658,6 +669,39 @@ async fn inject_after_interrupt(
             )
             .await
         }
+    }
+}
+
+/// Settle a post-interrupt write that was issued but not positively confirmed
+/// as a prompt. The text did reach the pane, so `submitted` is recorded true
+/// with `resumed=unconfirmed` regardless of whether the liveness recheck in
+/// [`super::worker_events::record_pane_write_outcome`] then downgrades the
+/// state to `Orphaned`. The returned `detail` is read back from the stored
+/// record, so the synchronous reply always matches `probe-status`.
+async fn settle_unconfirmed_write(
+    server_state: &ServerState,
+    run_id: &str,
+    slot_id: u8,
+    probe_id: &str,
+    success_message: &'static str,
+    interrupt: ProbeInterruptOutcome,
+    attempts: u8,
+) -> InterruptingDelivery {
+    let state = super::worker_events::record_pane_write_outcome(
+        server_state,
+        run_id,
+        slot_id,
+        probe_id,
+        ProbeDeliveryState::Consumed,
+        success_message,
+    )
+    .await;
+    server_state.set_probe_submission(probe_id, true, Some(ProbeResumeEvidence::Unconfirmed));
+    InterruptingDelivery {
+        state,
+        interrupt,
+        attempts,
+        detail: server_state.probe_record(probe_id).and_then(|record| record.detail),
     }
 }
 

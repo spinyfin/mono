@@ -310,6 +310,27 @@ pub async fn probe_run(
 ///
 /// The loud-failure requirement for undeliverable probes is met up front by
 /// [`probe_run`], which refuses before a probe id is ever minted.
+fn probe_status_json(
+    probe_id: &str,
+    run_id: &str,
+    state: ProbeDeliveryState,
+    urgent: bool,
+    detail: Option<&str>,
+    submitted: Option<bool>,
+    resumed: Option<boss_protocol::ProbeResumeEvidence>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "probe_id": probe_id,
+        "run_id": run_id,
+        "state": state.as_str(),
+        "urgent": urgent,
+        "delivered": state.is_delivered(),
+        "detail": detail,
+        "submitted": submitted,
+        "resumed": resumed.map(boss_protocol::ProbeResumeEvidence::as_str),
+    })
+}
+
 pub async fn probe_status(socket_path: &Option<String>, json: bool, probe_id: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
@@ -325,24 +346,25 @@ pub async fn probe_status(socket_path: &Option<String>, json: bool, probe_id: St
             state,
             urgent,
             detail,
+            submitted,
+            resumed,
         } => {
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({
-                        "probe_id": returned,
-                        "run_id": run_id,
-                        "state": state.as_str(),
-                        "urgent": urgent,
-                        "delivered": state.is_delivered(),
-                        "detail": detail,
-                    })
+                    probe_status_json(&returned, &run_id, state, urgent, detail.as_deref(), submitted, resumed)
                 );
             } else {
                 let urgency = if urgent { " urgent" } else { "" };
                 println!("{returned}:{urgency} run={run_id} state={}", state.as_str());
                 if let Some(detail) = detail.as_deref() {
                     println!("  {detail}");
+                }
+                if let Some(submitted) = submitted {
+                    println!(
+                        "  submitted={submitted} resumed={}",
+                        resumed.map(boss_protocol::ProbeResumeEvidence::as_str).unwrap_or("n/a"),
+                    );
                 }
             }
             // The read succeeded, so this exits 0 whatever the state is —
@@ -393,6 +415,27 @@ pub async fn probe_status(socket_path: &Option<String>, json: bool, probe_id: St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_status_json_carries_structured_submission_evidence() {
+        let json = probe_status_json(
+            "probe-3",
+            "run-1",
+            ProbeDeliveryState::Consumed,
+            false,
+            Some("submitted=true; resumed=confirmed"),
+            Some(true),
+            Some(boss_protocol::ProbeResumeEvidence::Confirmed),
+        );
+        assert_eq!(json["probe_id"], "probe-3");
+        assert_eq!(json["submitted"], true);
+        assert_eq!(json["resumed"], "confirmed");
+        assert_eq!(json["delivered"], true);
+
+        let plain = probe_status_json("probe-4", "run-1", ProbeDeliveryState::Queued, false, None, None, None);
+        assert!(plain["submitted"].is_null());
+        assert!(plain["resumed"].is_null());
+    }
 
     #[test]
     fn interrupting_status_does_not_call_unconfirmed_or_queued_not_delivered() {

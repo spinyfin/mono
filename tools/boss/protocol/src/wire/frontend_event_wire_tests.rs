@@ -823,6 +823,8 @@ fn tag_cases() -> Vec<TagCase> {
                 state: ProbeDeliveryState::Buffered,
                 urgent: true,
                 detail: None,
+                submitted: None,
+                resumed: None,
             },
             expected_tag: "probe_status_result",
         },

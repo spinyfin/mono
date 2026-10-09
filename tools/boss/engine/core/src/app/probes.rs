@@ -62,11 +62,54 @@ pub const PROBE_UNDELIVERED_ATTENTION_KIND: &str = "probe_undelivered";
 #[derive(Default)]
 pub(super) struct ServerStateProbeQueuer {
     server: std::sync::OnceLock<Weak<ServerState>>,
+    /// The most recent engine nudge per run and whether an interrupting
+    /// delivery task currently owns it. `deliver_queued_probes_now` consults
+    /// this instead of inferring ownership from the worker's posture at the
+    /// moment it runs, which can differ from the posture `queue_probe` saw.
+    nudges: Arc<StdMutex<HashMap<String, QueuedNudge>>>,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedNudge {
+    probe_id: String,
+    /// True while a spawned `deliver_probe_interrupting` task is responsible
+    /// for delivering `probe_id`.
+    interrupt_owned: bool,
 }
 
 impl ServerStateProbeQueuer {
     pub(super) fn set_server_state(&self, weak: Weak<ServerState>) {
         let _ = self.server.set(weak);
+    }
+
+    fn worker_is_busy(server: &ServerState, run_id: &str) -> bool {
+        server
+            .worker_registry
+            .slot_for_run(run_id)
+            .is_some_and(|slot| server.pane_input_posture_for_run(run_id, slot) == PaneInputPosture::MidTurnBuffered)
+    }
+
+    /// Run the interrupting delivery for `probe_id` on a detached task, and
+    /// release the nudge's ownership when it finishes. The caller must already
+    /// have marked the nudge `interrupt_owned`.
+    fn spawn_interrupting_delivery(&self, server: Arc<ServerState>, run_id: String, probe_id: String) {
+        let nudges = self.nudges.clone();
+        tokio::spawn(async move { deliver_owned_nudge(&nudges, &server, &run_id, &probe_id).await });
+    }
+}
+
+/// Run the interrupting delivery for a nudge this caller owns, then release
+/// the ownership record (unless a newer nudge has replaced it meanwhile).
+async fn deliver_owned_nudge(
+    nudges: &StdMutex<HashMap<String, QueuedNudge>>,
+    server: &ServerState,
+    run_id: &str,
+    probe_id: &str,
+) {
+    super::probe_interrupt::deliver_probe_interrupting(server, run_id, probe_id).await;
+    let mut guard = nudges.lock().expect("queuer nudges mutex poisoned");
+    if guard.get(run_id).is_some_and(|nudge| nudge.probe_id == probe_id) {
+        guard.remove(run_id);
     }
 }
 
@@ -83,15 +126,16 @@ impl ProbeQueuer for ServerStateProbeQueuer {
         // Keep the specific id: an older --no-interrupt probe must not be
         // substituted for this nudge when the worker is busy.
         let probe_id = server.queue_probe(run_id.to_owned(), text.to_owned(), false);
-        let busy = server
-            .worker_registry
-            .slot_for_run(run_id)
-            .is_some_and(|slot| server.pane_input_posture_for_run(run_id, slot) == PaneInputPosture::MidTurnBuffered);
+        let busy = Self::worker_is_busy(&server, run_id);
+        self.nudges.lock().expect("queuer nudges mutex poisoned").insert(
+            run_id.to_owned(),
+            QueuedNudge {
+                probe_id: probe_id.clone(),
+                interrupt_owned: busy,
+            },
+        );
         if busy {
-            let run_id = run_id.to_owned();
-            tokio::spawn(async move {
-                super::probe_interrupt::deliver_probe_interrupting(&server, &run_id, &probe_id).await;
-            });
+            self.spawn_interrupting_delivery(server, run_id.to_owned(), probe_id);
         }
     }
 
@@ -107,10 +151,13 @@ impl ProbeQueuer for ServerStateProbeQueuer {
         server.clear_pending_probes(run_id, reason);
     }
 
-    /// Deliver parked workers through the ordinary immediate path. Busy
-    /// interactive workers already have their specific nudge scheduled by
-    /// `queue_probe`; do not race that interrupt with a composer write.
-    /// Drivers that reject mid-turn input keep waiting for their boundary.
+    /// Deliver parked workers through the ordinary immediate path. A nudge
+    /// whose interrupting delivery task already owns it is left to that task
+    /// rather than raced with a composer write. A nudge queued while the
+    /// worker was parked that finds the worker busy by the time this runs
+    /// takes over the interrupt itself, so it is not left waiting behind a
+    /// long tool call. Drivers that reject mid-turn input keep waiting for
+    /// their boundary.
     ///
     /// Spawned rather than awaited because [`ProbeQueuer`] is a sync trait
     /// and this is fire-and-forget by contract: the caller has already
@@ -129,17 +176,37 @@ impl ProbeQueuer for ServerStateProbeQueuer {
             return;
         };
         let run_id = run_id.to_owned();
+        let nudges = self.nudges.clone();
         tokio::spawn(async move {
-            let busy = server.worker_registry.slot_for_run(&run_id).is_some_and(|slot| {
-                server.pane_input_posture_for_run(&run_id, slot) == PaneInputPosture::MidTurnBuffered
-            });
-            if busy {
-                // queue_probe already scheduled this nudge's interrupt.
-                // Do not race it with an unverified composer write or
-                // interrupt an older explicitly non-interrupting probe.
-                tracing::debug!(run_id, "probe queuer: busy nudge uses its scheduled interrupt delivery");
+            // Decide under one lock so exactly one task owns the nudge.
+            let takeover = {
+                let mut guard = nudges.lock().expect("queuer nudges mutex poisoned");
+                match guard.get_mut(&run_id) {
+                    Some(nudge) if nudge.interrupt_owned => {
+                        // queue_probe's interrupt task owns this nudge.
+                        tracing::debug!(run_id, "probe queuer: nudge is owned by its scheduled interrupt delivery");
+                        return;
+                    }
+                    Some(nudge)
+                        if Self::worker_is_busy(&server, &run_id)
+                            && server.probe_lifecycle_state(&nudge.probe_id) == Some(ProbeDeliveryState::Queued) =>
+                    {
+                        nudge.interrupt_owned = true;
+                        Some(nudge.probe_id.clone())
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(probe_id) = takeover {
+                tracing::debug!(
+                    run_id,
+                    probe_id,
+                    "probe queuer: worker went busy after the nudge was queued; interrupting"
+                );
+                deliver_owned_nudge(&nudges, &server, &run_id, &probe_id).await;
                 return;
             }
+            nudges.lock().expect("queuer nudges mutex poisoned").remove(&run_id);
             let outcome = super::worker_events::dispatch_probe_now(&server, &run_id).await;
             tracing::debug!(
                 run_id,
@@ -276,9 +343,41 @@ pub(super) struct ProbeRecord {
     pub(super) urgent: bool,
     pub(super) state: ProbeDeliveryState,
     pub(super) detail: Option<String>,
+    /// Structured evidence from the interrupting path: whether the text was
+    /// written into the pane. `None` for probes that never went through it.
+    pub(super) submitted: Option<bool>,
+    /// Whether the worker was seen resuming on the submitted text.
+    pub(super) resumed: Option<ProbeResumeEvidence>,
+}
+
+/// States of a probe whose text was written into the pane and which only
+/// awaits its reply (as opposed to `Queued`/`Injected`, where the write itself
+/// is still in progress).
+fn awaits_reply_after_submission(state: ProbeDeliveryState) -> bool {
+    matches!(
+        state,
+        ProbeDeliveryState::Consumed
+            | ProbeDeliveryState::Buffered
+            | ProbeDeliveryState::Unconfirmed
+            | ProbeDeliveryState::Orphaned
+    )
 }
 
 impl ServerState {
+    /// Record the structured submission evidence for an interrupting delivery
+    /// on `probe_id`'s status record (see [`ProbeRecord::submitted`]).
+    pub(super) fn set_probe_submission(&self, probe_id: &str, submitted: bool, resumed: Option<ProbeResumeEvidence>) {
+        if let Some(record) = self
+            .probe_lifecycle
+            .lock()
+            .expect("probe_lifecycle mutex poisoned")
+            .get_mut(probe_id)
+        {
+            record.submitted = Some(submitted);
+            record.resumed = resumed;
+        }
+    }
+
     /// Push probe text onto the queue for `run_id`, mint a fresh
     /// `probe_id`, and return it so the caller can correlate the
     /// queued probe with the eventual `FrontendEvent::ProbeReplied`
@@ -336,6 +435,8 @@ impl ServerState {
                     urgent,
                     state: ProbeDeliveryState::Queued,
                     detail: None,
+                    submitted: None,
+                    resumed: None,
                 },
             );
         // Tag for worker-signal resolution BEFORE the probe is inserted into
@@ -510,6 +611,12 @@ impl ServerState {
     /// dispatch, so this searches the whole queue rather than only the front
     /// — the probes behind it keep their relative order.
     ///
+    /// A slot held by an already-*submitted* probe (one that only awaits its
+    /// reply at the next boundary) does not block this claim: the interrupt
+    /// cuts that reply turn short, so the slot passes to the new probe. A slot
+    /// held by a probe still `Queued`/`Injected` does block it, which is what
+    /// keeps a write in progress from being delivered twice.
+    ///
     /// Returns `None` — routing the caller to
     /// [`super::probe_interrupt::raced_to_another_dispatcher`] — both when
     /// the run's slot is already claimed and when `probe_id` is not present
@@ -522,10 +629,22 @@ impl ServerState {
         transcript_path: Option<String>,
         offset_bytes: u64,
     ) -> Option<PendingProbe> {
+        // A held slot only blocks this claim while its write is still in
+        // progress (`Queued`/`Injected`) — that is the duplicate-delivery
+        // protection. A probe already *submitted* merely awaits its reply at
+        // the next turn boundary, and this claim interrupts that very reply
+        // turn, so the reply it was waiting for will never be produced as
+        // such. Read the lifecycle before taking the slot lock and re-verify
+        // the holder under it.
+        let submitted_holder = self
+            .in_flight_probe_id(run_id)
+            .filter(|held| self.probe_lifecycle_state(held).is_some_and(awaits_reply_after_submission));
         let mut in_flight = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
-        if in_flight.contains_key(run_id) {
-            return None;
-        }
+        let superseded = match in_flight.get(run_id) {
+            None => None,
+            Some(held) if submitted_holder.as_deref() == Some(held.probe_id.as_str()) => Some(held.probe_id.clone()),
+            Some(_) => return None,
+        };
         let mut pending = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = pending.get_mut(run_id)?;
         let position = queue.iter().position(|probe| probe.probe_id == probe_id)?;
@@ -541,6 +660,17 @@ impl ServerState {
                 offset_bytes,
             },
         );
+        drop(pending);
+        drop(in_flight);
+        if let Some(previous) = superseded {
+            tracing::info!(
+                run_id,
+                previous_probe_id = %previous,
+                probe_id,
+                "interrupting delivery superseded a submitted probe still awaiting its reply; its \
+                 reply turn is being cut short, so the in-flight slot passes to the new probe",
+            );
+        }
         Some(probe)
     }
 
