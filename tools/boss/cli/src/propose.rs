@@ -177,8 +177,9 @@ pub(crate) struct ReviewGuideArgs {
 /// retried/resumed command would derive, so replays are automatically
 /// safe. Exception: a keyless `wait` is never replayed — each call is a new
 /// declaration that renews the wait and charges the wait budget again; pass
-/// an explicit key to make a `wait` retry replay instead. Set it explicitly only if you need a caller-chosen replay scope
-/// narrower or wider than "this exact payload".
+/// an explicit key to make a `wait` retry replay instead. Set it explicitly
+/// only if you need a caller-chosen replay scope narrower or wider than
+/// "this exact payload".
 #[derive(Debug, Clone, Args)]
 struct IdempotencyArgs {
     #[arg(long = "idempotency-key", value_name = "KEY")]
