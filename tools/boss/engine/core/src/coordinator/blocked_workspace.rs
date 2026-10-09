@@ -1,14 +1,15 @@
 use super::*;
-use boss_engine_recovery::execution_bookmark::{is_base_unresolvable_error, pointer_integrity_error};
+use boss_engine_recovery::execution_bookmark::{
+    is_base_unresolvable_error, is_missing_pointer_error, pointer_integrity_error,
+};
 
 impl ExecutionCoordinator {
     /// Restore the predecessor's engine-created reference into the new lease.
     /// No read of its old workspace or lease history occurs.
     ///
-    /// A recorded predecessor must have a durable pointer. Missing or unreadable
-    /// pointers fail dispatch rather than silently discarding preserved work;
-    /// those failures are typed (`PointerIntegrityError`) so the caller can tell
-    /// them apart from transient fetch/goto/SSH failures, which stay retryable.
+    /// Missing predecessor heads degrade to clean dispatch with a warning.
+    /// Invalid pointers still fail with `PointerIntegrityError`; transient
+    /// fetch/goto/SSH failures stay retryable.
     ///
     /// `repo_id` is the handle `ensure_repo` returned for this execution; the
     /// registered repo is selected by it because `execution.repo_remote_url`
@@ -51,7 +52,18 @@ impl ExecutionCoordinator {
                 | ExecutionKind::RevisionImplementation
         );
         let has_work = if prior.id != execution.id && is_implementation {
-            let has_work = !adapter.execution_bookmark_diff(&record).await?.trim().is_empty();
+            let patch = match adapter.execution_bookmark_diff(&record).await {
+                Ok(patch) => patch,
+                Err(err) if is_missing_pointer_error(&err) => {
+                    tracing::warn!(execution_id = %execution.id, predecessor = %prior.id,
+                        recovery_pointer = %record.head(), publication_pointer = %record.publication(),
+                        error = %err, "predecessor recovery pointers are missing; dispatching cleanly");
+                    self.warn_missing_execution_bookmark(execution, Some(&prior.id)).await;
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
+            };
+            let has_work = !patch.trim().is_empty();
             if execution.kind == ExecutionKind::RevisionImplementation && pr_for_goto.is_none() && !has_work {
                 return Ok(None);
             }
@@ -160,7 +172,7 @@ impl ExecutionCoordinator {
         tracing::warn!(
             execution_id = %execution.id,
             predecessor,
-            "no engine-created recovery bookmark recorded; continuing without recovery"
+            "engine-created recovery bookmark unavailable; continuing without recovery"
         );
         self.dispatch_events
             .emit(

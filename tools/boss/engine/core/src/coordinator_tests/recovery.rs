@@ -264,22 +264,14 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
 }
 
 #[tokio::test]
-async fn a_failed_bookmark_recovery_is_loud_and_legacy_evidence_is_kept() {
+async fn missing_baseline_recovery_is_loud_and_legacy_evidence_is_kept() {
     use boss_engine_test_git::jj::JjRepo;
     let dir = tempdir().unwrap();
     let repo = JjRepo::new(dir.path());
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let (dead_id, resume) = seed_resume_pair(&db);
     record_recovery_work(&db, &dead_id, &repo.worker).await;
-    JjRepo::run(
-        &repo.repo,
-        &[
-            "bookmark",
-            "delete",
-            &format!("boss-recovery/{dead_id}"),
-            &format!("boss/{dead_id}"),
-        ],
-    );
+    JjRepo::run(&repo.repo, &["bookmark", "delete", &format!("boss-base/{dead_id}")]);
     let patch = dir.path().join(format!("{dead_id}.patch"));
     std::fs::write(&patch, "legacy evidence").unwrap();
     let coordinator = recovery_coordinator(db);
@@ -294,6 +286,9 @@ async fn a_failed_bookmark_recovery_is_loud_and_legacy_evidence_is_kept() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("exactly one"), "{error:#}");
+    assert!(boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(
+        &error
+    ));
     assert!(patch.exists());
     assert!(!repo.replacement.join("hello.txt").exists());
 }

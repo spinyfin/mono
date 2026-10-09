@@ -18,7 +18,7 @@ pub use redispatch::{RestoreReport, restore_rebased};
 #[cfg(test)]
 mod redispatch_tests;
 
-/// The preserved pointer itself is missing, ambiguous, divergent or aimed at
+/// The preserved pointer itself is ambiguous, divergent or aimed at
 /// the wrong repository. Retrying cannot repair it, unlike a failed `jj`
 /// invocation (network, SSH, unavailable host), which stays an ordinary error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +39,23 @@ pub fn pointer_integrity_error(message: impl Into<String>) -> anyhow::Error {
 /// True when `error` (or any cause in its chain) is a pointer-integrity failure.
 pub fn is_pointer_integrity_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<PointerIntegrityError>())
+}
+
+/// Neither execution head exists. Dispatch can start cleanly; inspection and
+/// crash backups still report this as missing, never as a verified empty run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingPointerError(pub String);
+
+impl std::fmt::Display for MissingPointerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MissingPointerError {}
+
+pub fn is_missing_pointer_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<MissingPointerError>())
 }
 
 /// The requested PR base branch cannot be resolved to a commit (no such remote
@@ -197,6 +214,13 @@ async fn resolve(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<String> {
 async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String> {
     let recovery = resolve_optional(jj, &record.repo_path, &record.head()).await?;
     let publication = resolve_optional(jj, &record.repo_path, &record.publication()).await?;
+    if recovery.is_none() && publication.is_none() {
+        return Err(anyhow::Error::new(MissingPointerError(format!(
+            "expected recovery pointer {} or {} to resolve to exactly one change; both are missing",
+            record.head(),
+            record.publication()
+        ))));
+    }
     let base = resolve(jj, &record.repo_path, &record.base()).await?;
     for head in [&recovery, &publication].into_iter().flatten() {
         let connected = jj
@@ -252,11 +276,7 @@ async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String
         }
         (Some(_), _) => Ok(record.head()),
         (None, Some(_)) => Ok(record.publication()),
-        (None, None) => Err(pointer_integrity_error(format!(
-            "expected recovery pointer {} or {} to resolve to exactly one change; both are missing",
-            record.head(),
-            record.publication()
-        ))),
+        (None, None) => unreachable!("missing heads were checked before baseline validation"),
     }
 }
 

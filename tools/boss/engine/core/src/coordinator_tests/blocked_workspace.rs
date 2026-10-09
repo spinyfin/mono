@@ -603,7 +603,7 @@ async fn transient_fetch_failure_keeps_the_item_retryable() {
 }
 
 #[tokio::test]
-async fn recorded_predecessor_with_deleted_refs_blocks_dispatch() {
+async fn orphaned_predecessor_with_no_head_bookmarks_dispatches_cleanly() {
     use boss_engine_test_git::jj::JjRepo;
     let h = chain_harness(true, true, false).await;
     let db = &h.coordinator.work_db;
@@ -613,15 +613,23 @@ async fn recorded_predecessor_with_deleted_refs_blocks_dispatch() {
         &h.repo.repo,
         &["bookmark", "delete", &record.head(), &record.publication()],
     );
-    let error = h.dispatch().await.unwrap_err();
-    assert!(boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(
-        &error
-    ));
+    h.dispatch().await.unwrap();
     let (WorkItem::Task(item) | WorkItem::Chore(item)) = db.get_work_item(&h.next.work_item_id).unwrap() else {
         panic!("expected implementation item")
     };
-    assert_eq!(item.status, TaskStatus::Blocked);
-    assert!(!item.autostart);
+    assert_ne!(item.status, TaskStatus::Blocked);
+    assert!(db.get_execution(&h.next.id).unwrap().started_at.is_some());
+    assert!(db.bookmark_recovery(&h.next.id).unwrap().is_none());
+    assert!(db.execution_restore_report(&h.next.id).unwrap().is_none());
+    assert!(!h.repo.replacement.join("revision.txt").exists());
+    let successor = db.execution_bookmark(&h.next.id).unwrap();
+    assert!(
+        boss_engine_recovery::execution_bookmark::diff(&boss_engine_recovery::execution_bookmark::LocalJj, &successor)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(h.cube.goto_calls.lock().await.len(), 1);
 }
 
 #[tokio::test]

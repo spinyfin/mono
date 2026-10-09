@@ -171,13 +171,10 @@ async fn empty_run_is_distinct_from_a_missing_or_unrelated_pointer() {
         )
         .await
         .unwrap();
-    assert!(
-        diff(&LocalJj, &record)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("baseline")
-    );
+    let error = diff(&LocalJj, &record).await.unwrap_err();
+    assert!(error.to_string().contains("baseline"));
+    assert!(is_pointer_integrity_error(&error));
+    assert!(!is_missing_pointer_error(&error));
     LocalJj
         .run(&f.repo, &["bookmark", "delete", &record.head(), &record.publication()])
         .await
@@ -190,4 +187,46 @@ async fn empty_run_is_distinct_from_a_missing_or_unrelated_pointer() {
             .contains("exactly one")
     );
     assert!(f.root.path().exists());
+}
+
+#[tokio::test]
+async fn missing_heads_are_distinct_from_baseline_and_divergence_failures() {
+    let f = Fixture::new().await;
+    let record = f.record("exec_integrity").await;
+    LocalJj
+        .run(&f.worker, &["new", "@-", "-m", "Divergent publication"])
+        .await
+        .unwrap();
+    LocalJj
+        .run(
+            &f.worker,
+            &["bookmark", "set", &record.publication(), "-r", "@", "--allow-backwards"],
+        )
+        .await
+        .unwrap();
+    let error = diff(&LocalJj, &record).await.unwrap_err();
+    assert!(is_pointer_integrity_error(&error));
+    assert!(!is_missing_pointer_error(&error));
+    assert!(error.to_string().contains("diverged"));
+
+    LocalJj
+        .run(&f.repo, &["bookmark", "delete", &record.base()])
+        .await
+        .unwrap();
+    let error = diff(&LocalJj, &record).await.unwrap_err();
+    assert!(is_pointer_integrity_error(&error));
+    assert!(!is_missing_pointer_error(&error));
+    LocalJj
+        .run(&f.repo, &["bookmark", "delete", &record.head(), &record.publication()])
+        .await
+        .unwrap();
+    let error = diff(&LocalJj, &record)
+        .await
+        .unwrap_err()
+        .context("inspect predecessor");
+    assert!(is_missing_pointer_error(&error));
+    assert!(!is_pointer_integrity_error(&error));
+    assert!(error.to_string().contains("inspect predecessor"));
+    assert!(format!("{error:#}").contains(&record.head()));
+    assert!(format!("{error:#}").contains(&record.publication()));
 }

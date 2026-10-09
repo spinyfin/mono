@@ -158,7 +158,8 @@ async fn missing_preserved_pointer_fails_before_modifying_the_destination() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains(&prior.head()));
-    assert!(is_pointer_integrity_error(&error));
+    assert!(is_missing_pointer_error(&error));
+    assert!(!is_pointer_integrity_error(&error));
     assert_eq!(
         before,
         JjRepo::run(&repo.replacement, &["log", "-r", "@", "--no-graph", "-T", "commit_id"])
