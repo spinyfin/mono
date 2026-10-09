@@ -1588,6 +1588,7 @@ mod trunk_queue_tests {
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
                 work_item_id: chore.id.clone(),
+                confirmed_revisions: vec![],
             },
         )
         .await;

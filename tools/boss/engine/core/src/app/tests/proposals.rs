@@ -24,6 +24,8 @@ use boss_protocol::{
 };
 use serde_json::{Value, json};
 
+mod review_guide_loop;
+
 fn operator_question_payload() -> Value {
     json!({"outcome":"blocked", "summary":"The scope needs authorization", "question":{
         "text":"Approve raising the file limit from 30 to 48?",

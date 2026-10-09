@@ -1504,10 +1504,10 @@ mod tests {
         assert_eq!(original_context.version_id, version1);
 
         // Regeneration targeted the NEW comparison. The old content stays
-        // the readable version while the new attempt is queued —
+        // the readable version while the new attempt is generating —
         // "Refreshing with earlier content" in the design's state table.
         let mid_summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
-        assert_eq!(mid_summary.lifecycle, "queued");
+        assert_eq!(mid_summary.lifecycle, "generating");
         assert_eq!(mid_summary.readable_version_id.as_deref(), Some(version1.as_str()));
         assert_ne!(
             mid_summary.selected_comparison_id.as_deref(),
@@ -1518,6 +1518,7 @@ mod tests {
         let live = db.live_pr_review_guide_attempts_for_series(&series).unwrap();
         assert_eq!(live.len(), 1, "regeneration must create exactly one new attempt");
         let attempt2 = &live[0];
+        assert!(attempt2.execution_id.is_some(), "regeneration must bind an execution");
 
         let published = db
             .publish_pr_review_guide_version(
@@ -1541,5 +1542,4 @@ mod tests {
         assert_eq!(still_there.status, COMMENT_STATUS_RESOLVED);
         assert_eq!(still_there.guide_context, Some(original_context));
     }
-
 }
