@@ -80,6 +80,7 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            clearCoordinatorReset()
             isConnected = false
             stopBackgroundWorkPolling(clearSnapshot: true)
             isAppSessionRegistered = false
@@ -266,6 +267,7 @@ extension ChatViewModel {
                 workErrorMessage = message
             }
         case .error(let message):
+            if handleCoordinatorResetError(message) { return }
             if Self.isSocketTransportError(message) {
                 // Transport errors fire continuously while the engine
                 // is unreachable (every reconnect attempt re-emits a
@@ -713,6 +715,10 @@ extension ChatViewModel {
             let result = paneAttachHandler.map { $0(attach) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendAttachWorkerPaneResponse(requestId: requestId, result: result)
         case .attachCoordinatorPane(let attach):
+            // A replacement exists even if attaching its viewer fails.
+            if attach.spawnToken != pendingCoordinatorReset?.token {
+                clearCoordinatorReset()
+            }
             let result = coordinatorPaneAttachHandler.map { $0(attach) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             if case .success = result {
                 coordinatorPaneAttached(attach)

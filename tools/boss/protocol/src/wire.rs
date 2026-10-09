@@ -2034,6 +2034,9 @@ pub enum FrontendRequest {
         expected_spawn_token: String,
         #[serde(default)]
         reason: CoordinatorRecreateReason,
+        /// Explicit operator override when no fresh handoff is available.
+        #[serde(default)]
+        force_without_handoff: bool,
     },
 
     /// App self-identifies as the singleton app session. The engine
@@ -2860,3 +2863,6 @@ mod topic_and_envelope_tests;
 
 #[cfg(test)]
 mod sorted_request_variants_test;
+
+#[cfg(test)]
+mod coordinator_reset_tests;

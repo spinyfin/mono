@@ -1044,6 +1044,10 @@ final class ChatViewModel: ObservableObject {
     var attachedCoordinatorSpawnToken: String?
     var declinedCoordinatorRecreateToken: String?
     @Published var coordinatorModelRecreateConfirmation: CoordinatorModelRecreateConfirmation?
+    @Published var coordinatorResetWaiting = false
+    @Published var coordinatorResetTimedOut = false
+    @Published var coordinatorResetForced = false
+    var pendingCoordinatorReset: (token: String, reason: CoordinatorRecreateReason)?
 
     /// The installed `claude` version, set only while the engine reports it
     /// as newer than what the running coordinator session actually launched
