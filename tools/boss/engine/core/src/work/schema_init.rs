@@ -226,6 +226,7 @@ impl WorkDb {
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            persona_metrics: super::personas::new_metrics_registry(),
         })
     }
 
@@ -250,6 +251,7 @@ impl WorkDb {
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            persona_metrics: super::personas::new_metrics_registry(),
         })
     }
 
