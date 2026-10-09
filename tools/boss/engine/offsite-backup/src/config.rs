@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-/// Human-readable section name used in every error so the operator knows
-/// which setting to fix.
+/// Human-readable section name included in every error to name the setting to fix.
 pub const CONFIG_SECTION: &str = "[backup.offsite]";
 
 const DEFAULT_KEEP_HOURLY: usize = 24;
@@ -122,7 +121,7 @@ impl OffsiteConfig {
 
     /// Check that an enabled config points at a usable destination, creating
     /// the per-host subfolder. Errors name the offending setting. Call at
-    /// startup and again before each copy: a sync folder can be unmounted
+    /// each copy on the destination worker: a sync folder can be unmounted
     /// and remounted while the engine runs.
     pub fn validate(&self, host: &str) -> Result<ValidatedDestination> {
         let Some(destination) = &self.destination else {

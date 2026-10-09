@@ -33,12 +33,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use boss_engine_offsite_backup::{CONFIG_SECTION, OffsiteConfig};
-use boss_metrics::Registry;
+use boss_engine_offsite_backup::BACKUP_FILE_PREFIX;
 
 use crate::work::WorkDb;
 
@@ -54,155 +52,7 @@ pub const DEFAULT_BACKUP_INTERVAL: Duration = Duration::from_secs(3600);
 /// Default retention: 24 most-recent backups.
 pub const DEFAULT_RETENTION_COUNT: usize = 24;
 
-const BACKUP_FILE_PREFIX: &str = "state.db.bak-";
-
-// ── Off-machine copy metrics ──────────────────────────────────────────────
-
-crate::register_counter!(
-    OFFSITE_COPIES_SUCCEEDED,
-    "database_backup.offsite.copies_succeeded",
-    "Backups copied to the off-machine destination."
-);
-crate::register_counter!(
-    OFFSITE_COPIES_FAILED,
-    "database_backup.offsite.copies_failed",
-    "Off-machine copies that failed (destination missing, not writable, disk full, privacy denial, ...)."
-);
-crate::register_counter!(
-    OFFSITE_CONFIG_INVALID,
-    "database_backup.offsite.config_invalid",
-    "Times [backup.offsite] was enabled but unusable (unset/missing/unwritable destination, parse error)."
-);
-crate::register_gauge!(
-    OFFSITE_LAST_SUCCESS_AGE_SECS,
-    "database_backup.offsite.last_success_age_secs",
-    "Seconds since the last successful off-machine copy (since engine start if none yet). Only updated while off-machine backups are enabled."
-);
-
-/// Register the off-machine backup metrics (called from `metrics_init`).
-pub fn register_metrics(registry: &Registry) {
-    registry.register_counter(&OFFSITE_COPIES_SUCCEEDED);
-    registry.register_counter(&OFFSITE_COPIES_FAILED);
-    registry.register_counter(&OFFSITE_CONFIG_INVALID);
-    registry.register_gauge(&OFFSITE_LAST_SUCCESS_AGE_SECS);
-}
-
-/// Runtime state for off-machine copies. Never fails the caller: every
-/// problem is logged at ERROR/WARN naming the setting and counted.
-pub struct OffsiteRuntime {
-    config: OffsiteConfig,
-    host: String,
-    registry: Arc<Registry>,
-    started_at: i64,
-    /// Epoch seconds of the last successful copy; 0 = none since start.
-    last_success: AtomicI64,
-}
-
-impl OffsiteRuntime {
-    /// Build from `<state_root>/settings.toml`. `None` when the feature is
-    /// disabled (the default) or the section cannot be parsed. An enabled but
-    /// unusable destination still yields a runtime — it is logged loudly now
-    /// and re-validated every cycle, since a sync folder may mount late.
-    pub fn from_settings(settings_path: &Path, registry: Arc<Registry>) -> Option<Arc<Self>> {
-        let config = match OffsiteConfig::load(settings_path) {
-            Ok(config) => config,
-            Err(err) => {
-                tracing::error!(
-                    error = %format!("{err:#}"),
-                    settings = %settings_path.display(),
-                    "database-backup: cannot read {CONFIG_SECTION} settings; off-machine backups are NOT running",
-                );
-                OFFSITE_CONFIG_INVALID.inc(&registry);
-                return None;
-            }
-        };
-        Self::from_config(config, registry)
-    }
-
-    fn from_config(config: OffsiteConfig, registry: Arc<Registry>) -> Option<Arc<Self>> {
-        if !config.enabled {
-            return None;
-        }
-        let host = boss_engine_offsite_backup::host_name();
-        match config.validate(&host) {
-            Ok(dest) => tracing::info!(
-                host_dir = %dest.host_dir.display(),
-                keep_hourly = config.keep_hourly,
-                keep_daily = config.keep_daily,
-                "database-backup: off-machine copies enabled",
-            ),
-            Err(err) => {
-                tracing::error!(
-                    error = %format!("{err:#}"),
-                    "database-backup: {CONFIG_SECTION} is enabled but its destination is unusable; \
-                     off-machine copies will fail until fixed",
-                );
-                OFFSITE_CONFIG_INVALID.inc(&registry);
-            }
-        }
-        let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        Some(Arc::new(Self {
-            config,
-            host,
-            registry,
-            started_at: now,
-            last_success: AtomicI64::new(0),
-        }))
-    }
-
-    /// Copy the finished local backup `snapshot` off-machine, then prune.
-    pub fn copy_and_prune(&self, snapshot: &Path) {
-        let result = self.config.validate(&self.host).and_then(|dest| {
-            let outcome = boss_engine_offsite_backup::copy_to_offsite(snapshot, &dest.host_dir)?;
-            Ok((dest, outcome))
-        });
-        match result {
-            Ok((dest, outcome)) => {
-                self.last_success
-                    .store(boss_engine_utils::epoch_time::now_epoch_secs(), Ordering::Relaxed);
-                OFFSITE_COPIES_SUCCEEDED.inc(&self.registry);
-                tracing::info!(
-                    path = %outcome.copied_path.display(),
-                    bytes = outcome.bytes,
-                    "database-backup: off-machine copy complete",
-                );
-                match boss_engine_offsite_backup::prune(&dest.host_dir, self.config.keep_hourly, self.config.keep_daily)
-                {
-                    Ok(removed) if !removed.is_empty() => tracing::info!(
-                        removed = removed.len(),
-                        "database-backup: pruned old off-machine copies",
-                    ),
-                    Ok(_) => {}
-                    Err(err) => tracing::warn!(
-                        error = %format!("{err:#}"),
-                        "database-backup: off-machine retention failed (non-fatal)",
-                    ),
-                }
-            }
-            Err(err) => {
-                OFFSITE_COPIES_FAILED.inc(&self.registry);
-                tracing::error!(
-                    error = %format!("{err:#}"),
-                    snapshot = %snapshot.display(),
-                    "database-backup: off-machine copy FAILED (local backup is unaffected); \
-                     check the {CONFIG_SECTION} destination setting",
-                );
-            }
-        }
-        self.refresh_age_gauge();
-    }
-
-    /// Seconds since the last successful copy (or since engine start).
-    pub fn age_secs(&self) -> i64 {
-        let last = self.last_success.load(Ordering::Relaxed);
-        let since = if last > 0 { last } else { self.started_at };
-        (boss_engine_utils::epoch_time::now_epoch_secs() - since).max(0)
-    }
-
-    pub fn refresh_age_gauge(&self) {
-        OFFSITE_LAST_SUCCESS_AGE_SECS.set(&self.registry, self.age_secs());
-    }
-}
+pub use crate::offsite_runtime::{OffsiteRuntime, register_metrics};
 
 /// Resolve the backup directory: `BOSS_BACKUP_DIR` override wins, then
 /// `<state_root>/backups`.
@@ -322,7 +172,7 @@ pub fn run_backup_with_offsite(
     work_db: &WorkDb,
     backup_dir: &Path,
     retention: usize,
-    offsite: Option<&OffsiteRuntime>,
+    offsite: Option<&Arc<OffsiteRuntime>>,
 ) {
     if work_db.is_in_memory() {
         return;
@@ -346,14 +196,14 @@ pub fn run_backup_with_offsite(
             return;
         }
     }
-    if let Some(offsite) = offsite {
-        offsite.copy_and_prune(&dest);
-    }
     if let Err(err) = apply_retention(backup_dir, retention) {
         tracing::warn!(
             error = %format!("{err:#}"),
             "database-backup: retention enforcement failed (non-fatal)",
         );
+    }
+    if let Some(offsite) = offsite {
+        offsite.submit(dest);
     }
 }
 
@@ -386,7 +236,7 @@ pub fn spawn_loop(
             let dir = backup_dir.clone();
             let offsite = offsite.clone();
             tokio::task::spawn_blocking(move || {
-                run_backup_with_offsite(db.as_ref(), &dir, retention, offsite.as_deref())
+                run_backup_with_offsite(db.as_ref(), &dir, retention, offsite.as_ref())
             })
             .await
             .ok();
@@ -541,143 +391,6 @@ mod tests {
             None => unsafe { std::env::remove_var(BACKUP_DIR_ENV) },
         }
         assert_eq!(dir, PathBuf::from("/state/root/backups"));
-    }
-
-    // ── off-machine copies ────────────────────────────────────────
-
-    fn offsite_runtime(dest: &Path, keep_hourly: usize, keep_daily: usize) -> (Arc<OffsiteRuntime>, Arc<Registry>) {
-        let registry = Arc::new(Registry::new());
-        register_metrics(&registry);
-        let config = OffsiteConfig {
-            enabled: true,
-            destination: Some(dest.to_path_buf()),
-            keep_hourly,
-            keep_daily,
-        };
-        let rt = OffsiteRuntime::from_config(config, registry.clone()).expect("enabled");
-        (rt, registry)
-    }
-
-    fn host_dir(dest: &Path) -> PathBuf {
-        dest.join(boss_engine_offsite_backup::sanitize_host_component(
-            &boss_engine_offsite_backup::host_name(),
-        ))
-    }
-
-    #[test]
-    fn offsite_disabled_by_default() {
-        let tmp = TempDir::new().unwrap();
-        let registry = Arc::new(Registry::new());
-        assert!(OffsiteRuntime::from_settings(&tmp.path().join("settings.toml"), registry.clone()).is_none());
-        std::fs::write(tmp.path().join("settings.toml"), "default_pr_draft_mode = true\n").unwrap();
-        assert!(OffsiteRuntime::from_settings(&tmp.path().join("settings.toml"), registry).is_none());
-    }
-
-    #[test]
-    fn offsite_enabled_without_destination_fails_loudly() {
-        let tmp = TempDir::new().unwrap();
-        let settings = tmp.path().join("settings.toml");
-        std::fs::write(&settings, "[backup.offsite]\nenabled = true\n").unwrap();
-        let registry = Arc::new(Registry::new());
-        register_metrics(&registry);
-        let rt = OffsiteRuntime::from_settings(&settings, registry.clone()).expect("runtime kept for retries");
-        assert_eq!(
-            registry.counter_value("database_backup.offsite.config_invalid"),
-            Some(1)
-        );
-        // Copies fail (and are counted) rather than guessing a destination.
-        let snap = tmp.path().join("state.db.bak-20260101-000000");
-        std::fs::write(&snap, b"x").unwrap();
-        rt.copy_and_prune(&snap);
-        assert_eq!(registry.counter_value("database_backup.offsite.copies_failed"), Some(1));
-        assert_eq!(
-            registry.counter_value("database_backup.offsite.copies_succeeded"),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn offsite_unparseable_section_is_counted() {
-        let tmp = TempDir::new().unwrap();
-        let settings = tmp.path().join("settings.toml");
-        std::fs::write(&settings, "[backup.offsite]\nenabled = \"yes\"\n").unwrap();
-        let registry = Arc::new(Registry::new());
-        register_metrics(&registry);
-        assert!(OffsiteRuntime::from_settings(&settings, registry.clone()).is_none());
-        assert_eq!(
-            registry.counter_value("database_backup.offsite.config_invalid"),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn run_backup_copies_off_machine_and_prunes() {
-        let tmp = TempDir::new().unwrap();
-        let db = open_file_db(tmp.path());
-        let backup_dir = tmp.path().join("backups");
-        let dest = tmp.path().join("sync");
-        std::fs::create_dir(&dest).unwrap();
-        let (rt, registry) = offsite_runtime(&dest, 1, 1);
-        // An old off-machine copy that retention must remove once a newer one lands.
-        let host = host_dir(&dest);
-        std::fs::create_dir_all(&host).unwrap();
-        std::fs::write(host.join("state.db.bak-20200101-000000"), b"old").unwrap();
-
-        run_backup_with_offsite(&db, &backup_dir, 24, Some(&rt));
-
-        let names: Vec<String> = std::fs::read_dir(&host)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        assert_eq!(names.len(), 1, "old pruned, new kept, no partials: {names:?}");
-        assert!(names[0].starts_with(BACKUP_FILE_PREFIX) && names[0] != "state.db.bak-20200101-000000");
-        // The copy is a valid database, not a live-file artefact.
-        assert!(host.join(&names[0]).metadata().unwrap().len() > 0);
-        assert_eq!(
-            registry.counter_value("database_backup.offsite.copies_succeeded"),
-            Some(1)
-        );
-        assert_eq!(
-            registry.gauge_value("database_backup.offsite.last_success_age_secs"),
-            Some(0)
-        );
-        assert_eq!(std::fs::read_dir(&backup_dir).unwrap().count(), 1, "local backup kept");
-    }
-
-    #[test]
-    fn offsite_failure_never_fails_local_backup() {
-        let tmp = TempDir::new().unwrap();
-        let db = open_file_db(tmp.path());
-        let backup_dir = tmp.path().join("backups");
-        let dest = tmp.path().join("sync");
-        std::fs::create_dir(&dest).unwrap();
-        let (rt, registry) = offsite_runtime(&dest, 24, 14);
-        // Simulate the sync folder vanishing (unmounted) after startup.
-        std::fs::remove_dir_all(&dest).unwrap();
-
-        run_backup_with_offsite(&db, &backup_dir, 24, Some(&rt));
-
-        assert_eq!(
-            std::fs::read_dir(&backup_dir).unwrap().count(),
-            1,
-            "local backup still taken"
-        );
-        assert_eq!(registry.counter_value("database_backup.offsite.copies_failed"), Some(1));
-        assert!(!dest.exists(), "must not recreate a missing destination");
-        assert!(
-            registry
-                .gauge_value("database_backup.offsite.last_success_age_secs")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn age_gauge_uses_last_success_once_present() {
-        let tmp = TempDir::new().unwrap();
-        let (rt, _registry) = offsite_runtime(tmp.path(), 1, 1);
-        rt.last_success
-            .store(boss_engine_utils::epoch_time::now_epoch_secs() - 120, Ordering::Relaxed);
-        assert!((120..=125).contains(&rt.age_secs()));
     }
 
     fn env_lock() -> &'static std::sync::Mutex<()> {

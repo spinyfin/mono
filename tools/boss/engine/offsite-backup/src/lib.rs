@@ -14,7 +14,7 @@
 //!
 //! ## Atomicity
 //!
-//! A copy is written to a `.state.db.bak-….partial` name inside the host
+//! A copy is streamed to an exclusive `state.db.bak-….<pid>.<sequence>.tmp` sibling in the host
 //! directory, fsynced, then renamed into place. The final name therefore
 //! only ever appears fully written.
 //!
@@ -28,4 +28,4 @@ mod retention;
 
 pub use config::{CONFIG_SECTION, OffsiteConfig, ValidatedDestination, host_name, sanitize_host_component};
 pub use copy::{BACKUP_FILE_PREFIX, CopyOutcome, copy_to_offsite};
-pub use retention::prune;
+pub use retention::{PruneOutcome, prune};
