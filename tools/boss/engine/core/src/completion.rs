@@ -2831,4 +2831,11 @@ struct PendingNoOpCompletion {
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;
+
+/// Deterministic-provider handler for cross-module integration tests, so the
+/// private `tests` module's harness need not be widened.
+#[cfg(test)]
+pub(crate) fn integration_handler(db: Arc<crate::work::WorkDb>, pr_url: &str) -> WorkerCompletionHandler {
+    tests::integration_handler(db, pr_url)
+}

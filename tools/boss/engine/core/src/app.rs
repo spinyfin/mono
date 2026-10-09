@@ -601,7 +601,7 @@ struct ServerStateOverrides {
     source_packet_collector: Option<crate::review_guide_capture::SourcePacketCollector>,
     /// Fake PR detector. `None` uses `CommandPrDetector` (shells out to `gh`).
     pr_detector: Option<Arc<dyn PrDetector>>,
-    /// Fake PR lifecycle checker for the completion handler. `None` uses the
+    /// Fake PR lifecycle checker for completion and comment revision handlers. `None` uses the
     /// `gh`-backed default.
     pr_state_checker: Option<Arc<dyn crate::work::PrStateChecker>>,
     /// Coordinator-reset handoff wait. `None` uses the production timeout.
@@ -1088,6 +1088,10 @@ struct ServerState {
     /// features. Consulted by `snapshot_all` to populate
     /// `capability_present` on every `FeatureFlagSnapshot`.
     capability_registry: Arc<crate::feature_flags::CapabilityRegistry>,
+    /// PR-state checker consulted by `handle_comments_revise_doc` to pick
+    /// a same-PR revision vs. a chore. `GhPrStateChecker` in production;
+    /// tests inject a fake through [`ServerStateOverrides`].
+    pr_state_checker: Arc<dyn crate::work::PrStateChecker>,
     /// Per-installation settings (e.g. default_pr_draft_mode). Loaded
     /// from `~/Library/Application Support/Boss/settings.toml` at boot,
     /// mutated by `SetSetting` RPC, consulted by the spawn flow to
@@ -1609,7 +1613,7 @@ impl ServerState {
         if let Some(branch_verifier) = branch_verifier_override {
             completion_handler_builder = completion_handler_builder.with_branch_verifier(branch_verifier);
         }
-        if let Some(checker) = pr_state_checker_override {
+        if let Some(checker) = pr_state_checker_override.clone() {
             completion_handler_builder = completion_handler_builder.with_pr_state_checker(checker);
         }
         if let Some(verifier) = workspace_diff_verifier_override {
@@ -1807,6 +1811,7 @@ impl ServerState {
                 .self_weak(weak_self.clone())
                 .feature_flags(feature_flags_for_state)
                 .capability_registry(Arc::new(crate::feature_flags::CapabilityRegistry::new()))
+                .pr_state_checker(pr_state_checker_override.unwrap_or_else(|| Arc::new(GhPrStateChecker)))
                 .settings(settings_for_state)
                 .metrics(metrics_for_state)
                 .pr_reconciler_kick(pr_reconciler_kick_for_state)

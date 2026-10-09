@@ -104,6 +104,32 @@ pub(super) fn test_server_state_with_fakes() -> (Arc<ServerState>, tempfile::Tem
 /// head-fetch fail deterministically. This reproduces an unreachable
 /// completion seam without a live network call and without relying on the
 /// test sandbox's `gh` process-exec denial to fail the call for us.
+pub(super) fn test_server_state_with_pr_state_checker(
+    checker: Arc<dyn crate::work::PrStateChecker>,
+) -> (Arc<ServerState>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        ServerStateOverrides {
+            cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
+            pr_state_checker: Some(checker),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (state, temp)
+}
+
 pub(super) fn test_server_state_with_source_collector(
     collector: crate::review_guide_capture::SourcePacketCollector,
     branch_verifier: Arc<dyn crate::completion::BranchVerifier>,

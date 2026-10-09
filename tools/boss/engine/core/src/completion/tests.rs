@@ -507,7 +507,7 @@ struct TestHarness {
 }
 
 /// Reuse the deterministic completion providers in cross-handler integration tests.
-pub(crate) fn integration_handler(db: Arc<WorkDb>, pr_url: &str) -> WorkerCompletionHandler {
+pub(super) fn integration_handler(db: Arc<WorkDb>, pr_url: &str) -> WorkerCompletionHandler {
     TestHarness::new(db, StubPrDetector::ok(Some(pr_url))).handler
 }
 

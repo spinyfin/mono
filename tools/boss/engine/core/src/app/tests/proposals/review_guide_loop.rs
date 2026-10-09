@@ -10,6 +10,7 @@ async fn comment_request(state: &Arc<ServerState>, req: FrontendRequest) -> Fron
     let ctx = dispatch_with_peer(state, &sink, None);
     match req {
         r @ FrontendRequest::CommentsCreate { .. } => comments::handle_comments_create(ctx, r).await,
+        r @ FrontendRequest::CommentsReviseDoc { .. } => comments::handle_comments_revise_doc(ctx, r).await,
         r @ FrontendRequest::CommentsRecordGuideOutcome { .. } => {
             comments::handle_comments_record_guide_outcome(ctx, r).await;
         }
@@ -23,7 +24,7 @@ async fn comment_request(state: &Arc<ServerState>, req: FrontendRequest) -> Fron
 
 #[tokio::test]
 async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedback() {
-    let (state, dir) = test_server_state_with_fakes();
+    let (state, dir) = test_server_state_with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)));
     let db = &state.work_db;
     let (root, series) = seed_published_guide(db, 9);
     let pr_url = "https://github.com/acme/widget/pull/9";
@@ -65,23 +66,35 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     };
     let original_context = comment.guide_context.clone().unwrap();
     db.set_comment_intent(&comment.id, "revision", 1.0).unwrap();
-    let ReviseDocOutcome::Created {
-        task_id,
-        pr_url: revision_pr,
-        ..
-    } = db
-        .revise_doc(
-            ReviseDocInput::builder()
+    // Saving the comment alone must not create a revision.
+    assert!(db.get_comment(&comment.id).unwrap().unwrap().revise_task_id.is_none());
+    // Submit through the production Revise PR handler (app authority).
+    let response = comment_request(
+        &state,
+        FrontendRequest::CommentsReviseDoc {
+            input: ReviseDocInput::builder()
                 .artifact_kind("pr_review_guide")
                 .artifact_id(&series)
                 .build(),
-            &FakePrStateChecker::always(PrOpenState::Open),
-        )
-        .unwrap()
+        },
+    )
+    .await;
+    let FrontendEvent::CommentsReviseDocResult {
+        outcome:
+            ReviseDocOutcome::Created {
+                task_id,
+                pr_url: revision_pr,
+                ..
+            },
+    } = response
     else {
-        panic!("expected a same-PR revision")
+        panic!("expected a same-PR revision: {response:?}")
     };
     assert_eq!(revision_pr.as_deref(), Some(pr_url));
+    assert_eq!(
+        db.get_comment(&comment.id).unwrap().unwrap().revise_task_id.as_deref(),
+        Some(task_id.as_str())
+    );
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -118,7 +131,7 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     state.feature_flags.set("review_guide_source_capture", true).unwrap();
     state.feature_flags.set("review_guide_generation", true).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
-    let handler = crate::completion::tests::integration_handler(db.clone(), pr_url)
+    let handler = crate::completion::integration_handler(db.clone(), pr_url)
         .with_feature_flags(state.feature_flags.clone())
         .with_source_packet_collector(counting_source_collector(
             calls.clone(),
