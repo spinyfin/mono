@@ -1,0 +1,22 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Should a monitor probe on a 'self-inflicted block' verdict also ack the worker_blocked attention (resuming the auto-nudge ladder), matching what a human `bossctl probe` does today? 'No' means the monitor's probe is delivered without the resolving tag and a human still has to ack.",
+    "anchor": "4-speaking-the-verdict-to-probe-path"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Default model tier for the hall-monitor judgement call (overridable via BOSS_UTILITY_MODEL_HALL_MONITOR)?",
+    "choices": [
+      "haiku (cheapest; matches live_status)",
+      "sonnet (proposed; matches PaneSummary)",
+      "opus (matches Planner; strongest on the Troi calibration)"
+    ],
+    "anchor": "7-cost-per-firing"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Keep the WaitingForInput trigger (b) in v1 now that AskUserQuestion is disallowed on Claude spawns (mono#2889)? 'No' drops it from PR 1 and leaves only the blocked-state and spinning triggers.",
+    "anchor": "2-the-trigger-set"
+  }
+]
