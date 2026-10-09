@@ -61,6 +61,14 @@ struct WorkBoardCardFooterSlice: Equatable {
     }
 }
 
+/// Frame (global space) of the rendered short id; lets tests assert its anchor.
+struct ShortIDFramePreferenceKey: PreferenceKey {
+    static let defaultValue: CGRect? = nil
+    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
+        value = nextValue() ?? value
+    }
+}
+
 /// PR / review / short-id / revision-rollup footer under the badge strip.
 struct WorkBoardCardFooter: View, @MainActor Equatable {
     let slice: WorkBoardCardFooterSlice
@@ -74,8 +82,31 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
         lhs.slice == rhs.slice
     }
 
+    /// True when a row sits below the PR / badge rows (review status,
+    /// revision-parent PR, or the in-review rollup list).
+    private var hasRowsBelowPRRow: Bool {
+        (slice.hasReviewRow && slice.reviewRequiredState != nil)
+            || (slice.hasRevisionParentPRRow && slice.revisionParentPrUrl != nil)
+            || slice.hasInReviewRevisions
+    }
+
+    /// The id rides on the PR row (or the badge row) only when nothing renders
+    /// below it; otherwise it gets its own trailing row so it always stays the
+    /// bottom-right element of the footer.
+    private var idIsInline: Bool {
+        slice.hasPRRow && slice.prURL != nil && !hasRowsBelowPRRow
+    }
+
     private func shortIDLabel(_ id: Int) -> some View {
         Text("T" + String(id))
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: ShortIDFramePreferenceKey.self,
+                        value: proxy.frame(in: .global)
+                    )
+                }
+            )
             .font(.system(.caption2, design: .monospaced))
             .foregroundStyle(.secondary)
             .accessibilityLabel("T" + String(id))
@@ -113,7 +144,7 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                     Spacer(minLength: 0)
                     // With a revision badge the id moves to that (bottom) row so
                     // it stays anchored bottom-right.
-                    if let id = slice.shortID, !slice.hasInProgressRevision {
+                    if idIsInline, let id = slice.shortID, !slice.hasInProgressRevision {
                         shortIDLabel(id)
                     }
                 }
@@ -124,7 +155,7 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                                 onRevisionBadgeHover?(hovering)
                             }
                         Spacer(minLength: 0)
-                        if let id = slice.shortID {
+                        if idIsInline, let id = slice.shortID {
                             shortIDLabel(id)
                         }
                     }
@@ -152,18 +183,18 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                 }
             }
 
-            if slice.hasStandaloneShortID, let id = slice.shortID {
-                HStack {
-                    Spacer(minLength: 0)
-                    shortIDLabel(id)
-                }
-            }
-
             if slice.hasInReviewRevisions {
                 Divider()
                     .padding(.vertical, 2)
                 ForEach(slice.inReviewRevisions) { revision in
                     RevisionRollupLine(revision: revision)
+                }
+            }
+
+            if !idIsInline, slice.hasPRRow || slice.hasStandaloneShortID, let id = slice.shortID {
+                HStack {
+                    Spacer(minLength: 0)
+                    shortIDLabel(id)
                 }
             }
         }
