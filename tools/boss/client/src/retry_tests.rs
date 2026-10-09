@@ -267,7 +267,7 @@ async fn autostart_spawns_at_most_one_engine_while_waiting_for_it() {
     // A stand-in "engine" that records each launch and never serves.
     discovery.engine = EngineCommand {
         program: "/bin/sh".into(),
-        args: vec!["-c".into(), format!("echo x >> '{}'", counter.display())],
+        args: vec!["-c".into(), format!("echo x >> '{}'; exec sleep 5", counter.display())],
         source: "test".into(),
         attempted: Vec::new(),
     };
@@ -276,6 +276,53 @@ async fn autostart_spawns_at_most_one_engine_while_waiting_for_it() {
     assert!(err.downcast_ref::<EngineUnreachable>().is_some(), "{err:#}");
     let launches = std::fs::read_to_string(&counter).unwrap_or_default().lines().count();
     assert_eq!(launches, 1, "one engine started, then waited on across retries");
+}
+
+#[tokio::test]
+async fn autostart_with_a_missing_engine_binary_fails_promptly_with_the_resolution_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    // A long budget: the failure must come from the spawn error, not from
+    // running the budget out.
+    let mut discovery = discovery(dir.path(), fast_policy(Duration::from_secs(60), &notices));
+    discovery.autostart = true;
+    discovery.engine = EngineCommand {
+        program: dir.path().join("no-such-engine").to_string_lossy().into_owned(),
+        args: Vec::new(),
+        source: "test source".into(),
+        attempted: vec!["BOSS_ENGINE_BIN (unset)".into()],
+    };
+
+    let started = Instant::now();
+    let err = BossClient::connect(&discovery).await.expect_err("engine cannot start");
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(err.downcast_ref::<EngineUnreachable>().is_none(), "{err:#}");
+    let message = format!("{err:#}");
+    assert!(message.contains("failed to start engine"), "{message}");
+    assert!(message.contains("Resolution chain"), "{message}");
+    assert!(message.contains("BOSS_ENGINE_BIN"), "{message}");
+}
+
+#[tokio::test]
+async fn autostart_fails_at_once_when_the_engine_it_started_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = discovery(dir.path(), fast_policy(Duration::from_secs(60), &notices));
+    discovery.autostart = true;
+    discovery.start_timeout = Duration::from_secs(30);
+    discovery.engine = EngineCommand {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "exit 3".into()],
+        source: "test".into(),
+        attempted: Vec::new(),
+    };
+
+    let started = Instant::now();
+    let err = BossClient::connect(&discovery).await.expect_err("engine exits");
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    let message = format!("{err:#}");
+    assert!(message.contains("exited before becoming ready"), "{message}");
+    assert!(message.contains("exit status: 3"), "{message}");
 }
 
 #[test]
@@ -429,7 +476,7 @@ async fn worker_environment_never_launches_an_engine() {
     worker.worker_environment = true;
     worker.engine = EngineCommand {
         program: "/bin/sh".into(),
-        args: vec!["-c".into(), format!("echo x >> '{}'", counter.display())],
+        args: vec!["-c".into(), format!("echo x >> '{}'; exec sleep 5", counter.display())],
         source: "test".into(),
         attempted: Vec::new(),
     };

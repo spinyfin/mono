@@ -13,7 +13,7 @@ mod retry_tests;
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -251,7 +251,8 @@ impl BossClient {
     }
 
     async fn connect_within(discovery: &Discovery, retry: &mut RetryState) -> Result<Self> {
-        let mut spawned = false;
+        let mut spawned: Option<Child> = None;
+        let mut last_autostart_error: Option<String> = None;
         loop {
             let mut attempt = connect_any_endpoint(discovery, retry.connect_deadline(CONNECT_ATTEMPT_TIMEOUT)).await;
             if attempt.is_err() && discovery.autostart {
@@ -261,9 +262,10 @@ impl BossClient {
                         attempt =
                             connect_any_endpoint(discovery, retry.connect_deadline(CONNECT_ATTEMPT_TIMEOUT)).await;
                     }
-                    Err(err) => {
-                        tracing::debug!(%err, "engine autostart did not produce a reachable engine yet");
-                    }
+                    // Spawn failure or an engine that died at startup: waiting
+                    // longer cannot help, so surface it now with its context.
+                    Err(err) if err.is::<AutostartFailed>() => return Err(err),
+                    Err(err) => last_autostart_error = Some(format!("{err:#}")),
                 }
             }
             let err = match attempt {
@@ -276,7 +278,10 @@ impl BossClient {
                 return Err(anyhow::Error::new(err)
                     .context(format!("failed to connect to engine socket {}", discovery.socket_path)));
             }
-            let last_error = err.to_string();
+            let mut last_error = err.to_string();
+            if let Some(autostart) = &last_autostart_error {
+                last_error = format!("{last_error}; engine autostart did not help: {autostart}");
+            }
             if !retry.backoff(&discovery.socket_path, "connect", &last_error).await {
                 return Err(anyhow::Error::new(
                     retry.unreachable(&discovery.socket_path, &last_error),
@@ -546,14 +551,18 @@ async fn connect_until(socket_path: &str, deadline: Instant) -> io::Result<UnixS
 /// Autostart step inside the connect loop: wait for an engine that is
 /// already starting/restarting, or start one — but start at most one per
 /// `connect` call (`spawned`), so a slow start is waited on, not duplicated.
-async fn ensure_engine_for_connect(discovery: &Discovery, retry: &RetryState, spawned: &mut bool) -> Result<()> {
+async fn ensure_engine_for_connect(
+    discovery: &Discovery,
+    retry: &RetryState,
+    spawned: &mut Option<Child>,
+) -> Result<()> {
     let wait = if retry.policy().is_enabled() {
         let remaining = retry.policy().max_wait.saturating_sub(retry.elapsed());
         discovery.start_timeout.min(remaining.max(Duration::from_millis(250)))
     } else {
         discovery.start_timeout
     };
-    ensure_engine_running_with(discovery, !*spawned, wait, spawned).await
+    ensure_engine_running_with(discovery, spawned.is_none(), wait, spawned).await
 }
 
 impl BossClient {
@@ -647,19 +656,19 @@ pub fn read_pid_file(pid_file_path: &str) -> Option<u32> {
 }
 
 pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
-    ensure_engine_running_with(discovery, true, discovery.start_timeout, &mut false).await
+    ensure_engine_running_with(discovery, true, discovery.start_timeout, &mut None).await
 }
 
 /// [`ensure_engine_running`] with the pieces `BossClient::connect` needs to
 /// call it repeatedly inside a backoff loop: `allow_spawn` says whether this
 /// call may start an engine process (the loop passes `false` once it has
 /// already started one), `wait` bounds each readiness wait, and `spawned` is
-/// set when this call starts a process.
+/// holds the process when this call starts one.
 async fn ensure_engine_running_with(
     discovery: &Discovery,
     allow_spawn: bool,
     wait: Duration,
-    spawned: &mut bool,
+    spawned: &mut Option<Child>,
 ) -> Result<()> {
     let deadline = Instant::now() + wait;
     if discover_running_engine_until(discovery, deadline).await.is_some() {
@@ -680,7 +689,7 @@ async fn ensure_engine_running_with(
         .find_map(|(_, pid_path)| running_engine_pid(pid_path).map(|pid| (pid, pid_path)))
         .filter(|(pid, _)| is_likely_engine_process(*pid))
     {
-        if wait_for_discovered_engine_until(discovery, deadline).await {
+        if wait_for_discovered_engine_until(discovery, deadline, &mut None).await? {
             return Ok(());
         }
         bail!(
@@ -692,7 +701,7 @@ async fn ensure_engine_running_with(
     if !allow_spawn {
         // We already started an engine for this call and it has not
         // published its socket yet: keep waiting, do not start another.
-        if wait_for_discovered_engine_until(discovery, deadline).await {
+        if wait_for_discovered_engine_until(discovery, deadline, spawned).await? {
             return Ok(());
         }
         bail!(
@@ -701,9 +710,9 @@ async fn ensure_engine_running_with(
         );
     }
 
-    start_engine_process(discovery)?;
-    *spawned = true;
-    if wait_for_discovered_engine(discovery, wait).await {
+    let child = start_engine_process(discovery).map_err(|err| AutostartFailed(format!("{err:#}")))?;
+    *spawned = Some(child);
+    if wait_for_discovered_engine_until(discovery, Instant::now() + wait, spawned).await? {
         return Ok(());
     }
 
@@ -714,18 +723,42 @@ async fn ensure_engine_running_with(
     )
 }
 
-async fn wait_for_discovered_engine(discovery: &Discovery, timeout: Duration) -> bool {
-    wait_for_discovered_engine_until(discovery, Instant::now() + timeout).await
+/// The engine process this call started failed in a way waiting cannot fix:
+/// it could not be spawned, or it exited before publishing its socket.
+#[derive(Debug)]
+struct AutostartFailed(String);
+
+impl std::fmt::Display for AutostartFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
-async fn wait_for_discovered_engine_until(discovery: &Discovery, deadline: Instant) -> bool {
+impl std::error::Error for AutostartFailed {}
+
+/// Poll for a reachable engine until `deadline`. If `child` is the engine this
+/// call started and it exits first, fail at once with its exit status.
+async fn wait_for_discovered_engine_until(
+    discovery: &Discovery,
+    deadline: Instant,
+    child: &mut Option<Child>,
+) -> Result<bool> {
     while Instant::now() < deadline {
         if discover_running_engine_until(discovery, deadline).await.is_some() {
-            return true;
+            return Ok(true);
+        }
+        if let Some(child) = child
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            return Err(anyhow::Error::new(AutostartFailed(format!(
+                "the engine process started for this command exited before becoming ready ({status}); \
+                 socket {} was never published",
+                discovery.socket_path
+            ))));
         }
         sleep(Duration::from_millis(100)).await;
     }
-    false
+    Ok(false)
 }
 
 /// Stop the running engine. Preferred path is the token-authenticated
@@ -951,7 +984,7 @@ pub fn default_control_token_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Library/Application Support/Boss/engine-control.token"))
 }
 
-fn start_engine_process(discovery: &Discovery) -> Result<()> {
+fn start_engine_process(discovery: &Discovery) -> Result<Child> {
     // The spawn boundary: no caller (autostart, `boss engine start`, a
     // future one) can launch an engine from a worker session.
     if discovery.worker_environment {
@@ -977,7 +1010,6 @@ fn start_engine_process(discovery: &Discovery) -> Result<()> {
                 format_resolution_chain(&discovery.engine.attempted),
             )
         })
-        .map(|_| ())
 }
 
 fn resolve_launch_directory() -> Result<PathBuf> {
