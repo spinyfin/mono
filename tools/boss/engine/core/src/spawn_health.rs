@@ -34,15 +34,15 @@
 //! see [`SpawnHealthTracker::breaker_enabled`] /
 //! [`crate::config::WorkConfig::enable_spawn_capability_breaker`]. The
 //! breaker tripped for the first time ever on 2026-07-15 on what turned out
-//! to be a benign cause — display sleep throttling spawn acknowledgements
-//! — and latched the entire fleet's
+//! to be a benign cause (a transient blip in the spawn path) and latched the entire fleet's
 //! dispatch — `pr_review` included — for ~40 minutes until a human noticed
 //! and manually resumed it. That incident drove the flag to default off
-//! between PR #2041 and the fix below. Since then, the App Nap opt-out
-//! (display sleep no longer degrades spawn acks) and the half-open
+//! between PR #2041 and the fix below. Since then, the half-open
 //! auto-recovery probe (a transient blip self-heals instead of latching)
-//! have landed, so the flag now defaults back **on** for the genuine
-//! dead-spawn-path incident class it was designed for.
+//! has landed, so the flag now defaults back **on** for the genuine
+//! dead-spawn-path incident class it was designed for. (The incident
+//! predates tmux-only hosting; the App Nap opt-out added then was specific
+//! to the retired app-hosted pane path.)
 //!
 //! - **Enabled (default):** trip-side behavior pauses dispatch (review
 //!   exemption stripped), PLUS automatic recovery — see below. Operators can
@@ -408,7 +408,7 @@ struct FailureLog {
     evidence: Mutex<Vec<SpawnFailureEvidence>>,
 }
 
-/// Cross-work-item failure aggregator for the app spawn path.
+/// Cross-work-item failure aggregator for the engine's tmux spawn path.
 ///
 /// Holds a bounded sliding window of `(work_item_id, epoch_secs)` failures and
 /// counts distinct work items in-window. Cheap to share (`Arc`): a
@@ -633,8 +633,7 @@ impl SpawnHealthTracker {
         self.probe.lock().unwrap().consecutive_failures
     }
 
-    /// The in-flight probe failed (reaped by driver-start verification, an
-    /// app NACK, or a synchronous force-dispatch error) — clear it and back
+    /// The in-flight probe failed (reaped by driver-start verification or a synchronous force-dispatch error) — clear it and back
     /// off exponentially before the next attempt. No-op when `execution_id`
     /// isn't the current in-flight probe, so an unrelated reap during the
     /// same outage can't disturb this outage's probe schedule.
@@ -929,9 +928,9 @@ pub struct TripSignal<'a> {
 /// **Enabled:** idempotent once dispatch is already paused with
 /// review-exemption OFF (i.e. a prior breaker trip, or a human pause that
 /// has already been escalated) — that is a no-op, so repeated failures
-/// while the app is wedged never spam attention items. But an *operator*
+/// while the spawn path is wedged never spam attention items. But an *operator*
 /// pause exempts `pr_review` executions
-/// ([`ExecutionCoordinator::dispatch_pause_exempts_reviews`]), so if the app
+/// ([`ExecutionCoordinator::dispatch_pause_exempts_reviews`]), so if the tmux
 /// spawn path is also broken during an operator pause, reviews would
 /// otherwise keep dispatching into the dead path and keep tripping this
 /// function forever. In that case this still escalates: it re-pauses with
@@ -1117,7 +1116,7 @@ pub async fn trip_spawn_capability_circuit(
     };
     let title = match (composition.no_shell, composition.shell_without_driver_signal) {
         (0, n) if n > 0 => "Worker spawns produced panes but no driver signal; dispatch breaker tripped",
-        (n, 0) if n > 0 => "App worker-pane spawn capability is unhealthy",
+        (n, 0) if n > 0 => "Worker-pane spawn capability is unhealthy (no shell came up)",
         _ => "Worker spawn failures (no shell and no driver signal); dispatch breaker tripped",
     };
     if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {

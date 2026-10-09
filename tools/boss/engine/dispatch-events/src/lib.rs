@@ -434,11 +434,11 @@ pub enum Stage {
     /// decoding old logs. Engine-observed tmux driver death now uses the
     /// driver reconciliation path; viewer closure is not worker death.
     PaneDeathBeforeStart,
-    /// The app-spawn-capability circuit breaker tripped: too many worker-pane
+    /// The spawn-capability circuit breaker tripped: too many worker-pane
     /// spawns failed across DIFFERENT work items within a short window
-    /// (`spawn_ack_timeout` reaps),
-    /// proving the app session's spawn path — not any one work item — is
-    /// broken. This is the fix for the 2026-07-05 post-wake wedge, where
+    /// (`driver_start_timeout` reaps; historical logs may name
+    /// `spawn_ack_timeout`), proving the engine's tmux spawn path — not any
+    /// one work item — is broken. This is the fix for the 2026-07-05 post-wake wedge, where
     /// every pane spawn silently produced no shell for 1.5+ hours and the
     /// per-work-item churn guard could not catch it because the failures
     /// were spread across many items. The engine always raises a single
@@ -457,15 +457,13 @@ pub enum Stage {
     /// `distinct_work_items`, `window_secs`, `breaker_enabled`, and
     /// `dispatch_paused` (mirrors `breaker_enabled`).
     SpawnCapabilityUnhealthy,
-    /// Dispatch auto-resumed after Breaker-origin evidence that the app's
-    /// spawn path recovered — either the half-open recovery probe's canary
+    /// Dispatch auto-resumed after Breaker-origin evidence that the engine's
+    /// tmux spawn path recovered: the half-open recovery probe's canary
     /// (see `boss_engine::spawn_health::maybe_admit_recovery_probe`) reported a
     /// driver-originated signal. Never fired for an
     /// operator-originated pause, which stays manual-resume-only. The
     /// `details` object carries the human-readable `reason`; the event's
-    /// `execution_id` is the canary's id when the probe succeeded, or the
-    /// sentinel `"engine"` for a fresh-session recovery with no specific
-    /// execution behind it.
+    /// `execution_id` is the canary's id.
     SpawnCapabilityRecovered,
     /// The periodic husk-pane sweep (`boss_engine::husk_pane_sweep`) found a
     /// Boss-owned tmux session whose durable spawn token has no DB row,
@@ -588,7 +586,7 @@ pub enum Stage {
     /// `boss_engine::spawn_health::maybe_admit_recovery_probe`). This is the
     /// breaker's only route out of the latch — normal dispatch stays fully
     /// held while paused, so without a canary no execution could ever run to
-    /// prove the app's spawn path recovered.
+    /// prove the engine's tmux spawn path recovered.
     ///
     /// It exists as its own stage because the bypass was previously
     /// invisible: a canary produced a complete `worker_claimed` →
