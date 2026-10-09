@@ -518,6 +518,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Idle ticks are free; non-idle flushes emit `ui-update-rates` on
             // the population signposter. See [[UIUpdateCounters]].
             UIUpdateCounters.shared.start()
+            // Keyboard-delivery instrumentation for the terminal panes:
+            // first-responder / key-window changes, keys that reach a
+            // non-terminal responder (AppKit's unhandled-key beep path),
+            // main-thread stalls, and libghostty's own pty write errors.
+            // Started before any window exists so its keyDown monitor is
+            // installed ahead of other local monitors. Always on; writes
+            // only on the events above. See [[TerminalInputMonitor]].
+            TerminalInputMonitor.shared.start()
         }
 
         // Agent-capture path: self-render via cacheDisplay and exit.

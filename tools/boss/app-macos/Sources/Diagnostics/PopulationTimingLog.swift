@@ -192,23 +192,7 @@ final class PopulationTimingLog: @unchecked Sendable {
 
     private let ring = OSAllocatedUnfairLock(initialState: [PopulationTimingRecord]())
     private let capacity: Int
-    private let retainDays: Int
-
-    /// `nil` directory means in-memory only (used by tests — the work item
-    /// forbids touching `~/Library/Application Support/Boss` from tests).
-    private let directory: String?
-    private let queue = DispatchQueue(label: "Boss.PopulationTimingLog")
-    private var currentDate = ""
-    private var fileHandle: FileHandle?
-    /// Throttles the write-failure warning to at most one per rotation —
-    /// see [[DiagnosticWrite]].
-    private var writeFailureWarned = false
-    private let dateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"
-        f.timeZone = TimeZone(identifier: "UTC")
-        return f
-    }()
+    private let writer: DayRotatedJSONLWriter
 
     private static let encoder: JSONEncoder = {
         let e = JSONEncoder()
@@ -217,9 +201,11 @@ final class PopulationTimingLog: @unchecked Sendable {
     }()
 
     init(directory: String?, capacity: Int = 512, retainDays: Int = 7) {
-        self.directory = directory
         self.capacity = max(1, capacity)
-        self.retainDays = retainDays
+        writer = DayRotatedJSONLWriter(
+            directory: directory, filePrefix: "population-timing-", retainDays: retainDays,
+            site: "PopulationTimingLog"
+        )
     }
 
     /// Append to the ring (synchronous, lock-guarded) and queue the JSONL
@@ -232,24 +218,9 @@ final class PopulationTimingLog: @unchecked Sendable {
             }
         }
 
-        guard directory != nil,
-              let json = try? Self.encoder.encode(rec) else { return }
-        let lineData = json + Data([0x0A])
+        guard let json = try? Self.encoder.encode(rec) else { return }
         let when = Date(timeIntervalSince1970: Double(rec.tsEpochMs) / 1000.0)
-        queue.async { [self] in
-            let dateStr = dateFormatter.string(from: when)
-            if dateStr != currentDate || fileHandle == nil {
-                if dateStr != currentDate {
-                    pruneOldFiles()
-                }
-                openFile(dateStr: dateStr)
-            }
-            if let handle = fileHandle {
-                DiagnosticWrite.append(
-                    lineData, to: handle, site: "PopulationTimingLog", warned: &writeFailureWarned
-                )
-            }
-        }
+        writer.append(lineData: json + Data([0x0A]), at: when)
     }
 
     /// Newest-last snapshot of the ring.
@@ -265,47 +236,7 @@ final class PopulationTimingLog: @unchecked Sendable {
 
     /// Block until queued file writes have drained. Test-only helper.
     func flushForTesting() {
-        queue.sync {}
-    }
-
-    private func openFile(dateStr: String) {
-        guard let directory else { return }
-        DiagnosticWrite.closeQuietly(fileHandle)
-        fileHandle = nil
-
-        do {
-            try FileManager.default.createDirectory(
-                atPath: directory,
-                withIntermediateDirectories: true
-            )
-        } catch {
-            return
-        }
-
-        let path = (directory as NSString).appendingPathComponent("population-timing-\(dateStr).jsonl")
-        guard let handle = DiagnosticWrite.openForAppending(atPath: path) else { return }
-        fileHandle = handle
-        currentDate = dateStr
-        writeFailureWarned = false
-    }
-
-    private func pruneOldFiles() {
-        guard let directory else { return }
-        let cutoff = Date().addingTimeInterval(-Double(retainDays) * 86_400)
-        let cutoffStr = dateFormatter.string(from: cutoff)
-
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: directory) else {
-            return
-        }
-        for name in entries {
-            guard name.hasPrefix("population-timing-"), name.hasSuffix(".jsonl") else { continue }
-            // "population-timing-YYYY-MM-DD.jsonl" → "YYYY-MM-DD"
-            let dateStr = String(name.dropFirst("population-timing-".count).dropLast(".jsonl".count))
-            if dateStr < cutoffStr {
-                let fullPath = (directory as NSString).appendingPathComponent(name)
-                try? FileManager.default.removeItem(atPath: fullPath)
-            }
-        }
+        writer.flushForTesting()
     }
 }
 

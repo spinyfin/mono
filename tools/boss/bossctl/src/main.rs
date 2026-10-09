@@ -369,6 +369,9 @@ enum Command {
     /// - `spawn` — `diagnostics/spawn-YYYY-MM-DD.jsonl`
     /// - `population-timing` — `diagnostics/population-timing-*.jsonl` (app)
     ///   and `diagnostics/engine-population-timing-*.jsonl` (engine)
+    /// - `terminal-input` — `diagnostics/terminal-input-YYYY-MM-DD.jsonl`
+    ///   (app: terminal keyboard-delivery diagnostics — dropped keys, beeps,
+    ///   first-responder changes, main-thread stalls, libghostty pty errors)
     Logs {
         /// Which log / diagnostic stream to read.
         #[arg(value_enum, default_value_t = LogSource::Engine)]

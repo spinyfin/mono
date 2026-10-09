@@ -35,6 +35,12 @@ pub(crate) enum LogSource {
     /// App + engine population-timing day files under `diagnostics/`.
     #[value(name = "population-timing")]
     PopulationTiming,
+    /// `diagnostics/terminal-input-YYYY-MM-DD.jsonl` — the macOS app's
+    /// terminal keyboard-input diagnostics (first-responder changes, keys
+    /// that missed the terminal, bells, main-thread stalls, libghostty
+    /// pty write errors).
+    #[value(name = "terminal-input")]
+    TerminalInput,
 }
 
 impl std::fmt::Display for LogSource {
@@ -45,6 +51,7 @@ impl std::fmt::Display for LogSource {
             Self::Dispatch => write!(f, "dispatch"),
             Self::Spawn => write!(f, "spawn"),
             Self::PopulationTiming => write!(f, "population-timing"),
+            Self::TerminalInput => write!(f, "terminal-input"),
         }
     }
 }

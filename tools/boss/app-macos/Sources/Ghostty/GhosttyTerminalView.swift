@@ -569,8 +569,31 @@ final class GhosttyTerminalHostView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
 
+    /// Identity fields every [[TerminalInputLog]] line from this pane
+    /// carries: `pane` (the session id), `role`, and `slot` for workers.
+    private var inputLogPaneFields: [String: Any] {
+        var fields: [String: Any] = ["pane": session.id]
+        switch session.role {
+        case .boss:
+            fields["role"] = "boss"
+        case .worker(let slot):
+            fields["role"] = "worker"
+            fields["slot"] = slot
+        }
+        return fields
+    }
+
+    private func recordInput(_ event: String, _ extra: [String: Any] = [:]) {
+        var fields = inputLogPaneFields
+        for (key, value) in extra {
+            fields[key] = value
+        }
+        TerminalInputLog.shared.record(event: event, fields: fields)
+    }
+
     override func becomeFirstResponder() -> Bool {
         let accepted = super.becomeFirstResponder()
+        recordInput("terminal_focus", ["change": "become", "accepted": accepted, "has_surface": surface != nil])
         if accepted, let surface {
             UISignpost.signposter.emitEvent(UISignpost.Name.focusSwitch, "become")
             // Dispatch off the main thread — see focusQueue doc-comment above.
@@ -584,6 +607,7 @@ final class GhosttyTerminalHostView: NSView {
 
     override func resignFirstResponder() -> Bool {
         let accepted = super.resignFirstResponder()
+        recordInput("terminal_focus", ["change": "resign", "accepted": accepted, "has_surface": surface != nil])
         if accepted, let surface {
             UISignpost.signposter.emitEvent(UISignpost.Name.focusSwitch, "resign")
             // Dispatch off the main thread for symmetry with becomeFirstResponder.
@@ -595,8 +619,48 @@ final class GhosttyTerminalHostView: NSView {
         return accepted
     }
 
+    /// AppKit resets a window's first responder to the window itself when
+    /// the responder's view (or an ancestor) is removed from the window.
+    /// SwiftUI can do that to a representable during a re-render that
+    /// restructures the AppKit hierarchy, with nothing visible to the user
+    /// — so a detach while we hold first responder is the leading
+    /// explanation for "keys stop reaching the terminal until I click".
+    /// Record both directions so the log shows it (see
+    /// [[TerminalInputMonitor]]).
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        guard let current = window, newWindow !== current else { return }
+        recordInput("host_window_detached", [
+            "window": current.windowNumber,
+            "new_window": newWindow?.windowNumber ?? 0,
+            "was_first_responder": current.firstResponder === self,
+        ])
+    }
+
+    /// Same hazard as `viewWillMove(toWindow:)` but for a re-parent inside
+    /// the window: `removeFromSuperview` on the first responder's branch
+    /// also resigns it, even when the view is re-added a moment later.
+    override func viewWillMove(toSuperview newSuperview: NSView?) {
+        super.viewWillMove(toSuperview: newSuperview)
+        guard let window, superview != nil, newSuperview !== superview else { return }
+        recordInput("host_superview_changed", [
+            "window": window.windowNumber,
+            "removed": newSuperview == nil,
+            "was_first_responder": window.firstResponder === self,
+        ])
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+
+        if let window {
+            TerminalInputMonitor.shared.registerTerminalWindow(window)
+            recordInput("host_window_attached", [
+                "window": window.windowNumber,
+                "is_first_responder": window.firstResponder === self,
+                "is_key_window": window.isKeyWindow,
+            ])
+        }
 
         // If surface creation failed earlier (e.g. no active display at
         // init time), gaining a window is a good moment to retry — the
@@ -607,6 +671,25 @@ final class GhosttyTerminalHostView: NSView {
 
         reconcilePaneMonitor()
         syncGeometry()
+    }
+
+    /// We never call `interpretKeyEvents`, so AppKit has no reason to route
+    /// a selector here; if it ever does, the key took the
+    /// `NSTextInputClient` path instead of `keyDown` → `ghostty_surface_key`.
+    /// Log it, then let AppKit do what it would have done (an unhandled
+    /// selector beeps via `noResponder(for:)` — the beep is the signal and
+    /// must stay audible).
+    override func doCommand(by selector: Selector) {
+        recordInput("do_command", ["selector": NSStringFromSelector(selector)])
+        super.doCommand(by: selector)
+    }
+
+    /// Reached only when an event arrives here and no override handles it.
+    /// AppKit's default beeps for `keyDown:`. Log which selector before
+    /// deferring to that default.
+    override func noResponder(for eventSelector: Selector) {
+        recordInput("no_responder", ["selector": NSStringFromSelector(eventSelector)])
+        super.noResponder(for: eventSelector)
     }
 
     override func layout() {
@@ -1150,7 +1233,15 @@ final class GhosttyTerminalHostView: NSView {
         action: ghostty_input_action_e,
         includeText: Bool = true
     ) {
-        guard let surface else { return }
+        guard let surface else {
+            // The pane is first responder but has no live surface (creation
+            // failed, or it is mid-teardown): the key has nowhere to go.
+            // Silent to the user — no beep — so the log is the only trace.
+            if action != GHOSTTY_ACTION_RELEASE {
+                recordInput("key_dropped_no_surface", Self.keyFields(for: event))
+            }
+            return
+        }
 
         let translationMods = ghostty_surface_key_translation_mods(
             surface,
@@ -1174,19 +1265,40 @@ final class GhosttyTerminalHostView: NSView {
             keyEvent.unshifted_codepoint = 0
         }
 
-        guard includeText, let text = ghosttyCharacters(for: event), !text.isEmpty else {
-            _ = ghostty_surface_key(surface, keyEvent)
-            return
-        }
-
-        if let firstByte = text.utf8.first, firstByte >= 0x20 {
-            text.withCString { ptr in
+        let consumed: Bool
+        var hadText = false
+        if includeText, let text = ghosttyCharacters(for: event), !text.isEmpty,
+           let firstByte = text.utf8.first, firstByte >= 0x20
+        {
+            hadText = true
+            consumed = text.withCString { ptr in
                 keyEvent.text = ptr
-                _ = ghostty_surface_key(surface, keyEvent)
+                return ghostty_surface_key(surface, keyEvent)
             }
         } else {
-            _ = ghostty_surface_key(surface, keyEvent)
+            consumed = ghostty_surface_key(surface, keyEvent)
         }
+
+        // libghostty answers "not consumed" when the key produced no
+        // encoding and matched no binding — nothing was queued for the pty.
+        // Releases are routinely unconsumed and are not interesting; a
+        // press/repeat is logged, and `had_text` marks the printable ones.
+        if !consumed, action != GHOSTTY_ACTION_RELEASE {
+            var fields = Self.keyFields(for: event)
+            fields["had_text"] = hadText
+            recordInput("key_not_consumed", fields)
+        }
+    }
+
+    /// Content-free key identity for the input log (see
+    /// `TerminalInputDescribe.keyFields` for the redaction rule).
+    private static func keyFields(for event: NSEvent) -> [String: Any] {
+        var fields = TerminalInputDescribe.keyFields(
+            keyCode: event.keyCode, characters: event.charactersIgnoringModifiers,
+            modifierFlags: event.modifierFlags
+        )
+        fields["is_repeat"] = event.isARepeat
+        return fields
     }
 
     private func ghosttyCharacters(for event: NSEvent) -> String? {
