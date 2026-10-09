@@ -131,7 +131,7 @@ pub(crate) fn query_execution(conn: &Connection, id: &str) -> Result<Option<Work
 pub(crate) fn query_run(conn: &Connection, id: &str) -> Result<Option<WorkRun>> {
     conn.query_row(
         "SELECT id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
-                artifacts_path, created_at, started_at, finished_at
+                artifacts_path, created_at, started_at, finished_at, persona
          FROM work_runs
          WHERE id = ?1",
         [id],

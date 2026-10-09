@@ -640,6 +640,67 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
         Some(slot),
         "subsequent hooks must reuse the same virtual slot",
     );
+    let name = server_state.work_db.persona_display_name(&execution.id).unwrap();
+    server_state.work_db.cancel_running_execution(&execution.id).unwrap();
+    assert_eq!(
+        server_state.release_worker_pane(&execution.id).await,
+        PaneReleaseOutcome::Reaped
+    );
+    assert!(server_state.worker_registry.slot_for_run(&execution.id).is_none());
+    assert!(server_state.live_worker_states.get(slot).is_none());
+    assert_eq!(server_state.work_db.persona_display_name(&execution.id).unwrap(), name);
+    let held: bool = server_state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1 AND persona_lease_active = 1)",
+            [&execution.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!held);
+    // Duplicate cleanup also covers the restart shape with no virtual slot.
+    assert_eq!(
+        server_state.release_worker_pane(&execution.id).await,
+        PaneReleaseOutcome::Reaped
+    );
+    let replacement = create_test_chore_manual(&server_state.work_db, product.id, "replacement remote chore");
+    let next = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(replacement.id).build())
+        .unwrap();
+    server_state
+        .work_db
+        .start_execution_run_on_host(
+            &next.id,
+            "worker-1",
+            "repo-1",
+            "lease-2",
+            "ws-2",
+            "/tmp/ws-2",
+            "zakalwe",
+        )
+        .unwrap();
+    assert_eq!(server_state.work_db.persona_display_name(&next.id).unwrap(), name);
+    // A terminal remote execution must release even before any hook allocated
+    // its virtual slot (also the state immediately after an engine restart).
+    server_state.work_db.cancel_running_execution(&next.id).unwrap();
+    assert_eq!(
+        server_state.release_worker_pane(&next.id).await,
+        PaneReleaseOutcome::Reaped
+    );
+    let active: bool = server_state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1 AND persona_lease_active = 1)",
+            [&next.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!active);
 }
 
 /// A late or duplicate hook for a remote run whose execution has already

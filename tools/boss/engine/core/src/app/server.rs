@@ -1482,16 +1482,10 @@ pub async fn serve_with_overrides(
     // in-flight commits the next worker should resume against.
     //
     // See docs/post-crash-recovery.md for the full flow.
-    let orphan_reason = "engine startup: recovery probe proved worker dead across restart";
     for (execution_id, verdict) in &probe_report.verdicts {
-        if !matches!(verdict, crate::run_reconcile::RunReconcileVerdict::Dead) {
-            continue;
-        }
-        match server_state
-            .work_db
-            .mark_execution_orphaned(execution_id, orphan_reason)
-        {
-            Ok(execution) => {
+        match server_state.work_db.reap_startup_dead_execution(execution_id, verdict) {
+            Ok(None) => continue,
+            Ok(Some(execution)) => {
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,

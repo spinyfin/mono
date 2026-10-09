@@ -1387,3 +1387,80 @@ async fn start_failure_marks_execution_failed_and_releases_worker() {
     assert_eq!(run.error_text.as_deref(), Some("cube workspace lease failed"));
     assert_eq!(coordinator.worker_pool().idle_count().await, 1);
 }
+
+/// Runner double for a successful remote launch: the worker registers its
+/// live state (as remote hooks do) and the outcome is `WorkerPaneAlive` with
+/// no local slot.
+struct RemoteStyleRunner {
+    live_states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>,
+}
+
+#[async_trait]
+impl ExecutionRunner for RemoteStyleRunner {
+    async fn run_execution(
+        &self,
+        _worker_id: &str,
+        execution: &WorkExecution,
+        _work_item: &WorkItem,
+        _workspace_path: &std::path::Path,
+        _cube_change_id: Option<&str>,
+    ) -> Result<RunOutcome> {
+        self.live_states.register_spawn(40, &execution.id, "model", 0, None);
+        Ok(RunOutcome {
+            wait_state: RunWaitState::WorkerPaneAlive,
+            result_summary: Some("remote launched".to_owned()),
+            attention: None,
+            slot_id: None,
+            spawn_config: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn successful_remote_launch_keeps_persona_lease_and_live_state() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Remote work");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::with_work_db(
+        db.clone(),
+    ));
+    let runner = Arc::new(RemoteStyleRunner {
+        live_states: live_states.clone(),
+    });
+    let mut inner = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        runner,
+    );
+    inner.set_live_worker_states(live_states.clone());
+    let coordinator = Arc::new(inner);
+    coordinator.kick();
+
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap().id;
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
+    // The local dispatch-pool claim is returned by the cleanup tail; wait for it.
+    for _ in 0..100 {
+        if coordinator.worker_pool().idle_count().await == 1 {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(coordinator.worker_pool().idle_count().await, 1, "pool claim returned");
+
+    // The remote process is still alive: its persona stays reserved and its
+    // live-state entry survives, so another worker cannot be given its name.
+    let persona = db.persona_display_name(&execution_id).unwrap().expect("persona");
+    assert!(live_states.is_run_live(&execution_id), "live state survives");
+    assert_eq!(live_states.get(40).unwrap().name, persona);
+    let second_chore = create_test_chore(&db, product.id.clone(), "Second");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let second = db.list_executions(Some(&second_chore.id)).unwrap().pop().unwrap();
+    db.start_execution_run(&second.id, "worker-9", "mono", "lease-2", "ws-2", "/tmp/ws-2")
+        .unwrap();
+    let second_persona = db.persona_display_name(&second.id).unwrap().expect("second persona");
+    assert_ne!(second_persona, persona, "reserved persona must not be reallocated");
+}

@@ -310,6 +310,9 @@ struct WorkerSlotView: View, @MainActor Equatable {
             // the old surface is always torn down and a fresh one
             // created before the new run's output ever lands.
             .id(session.id)
+            .onChange(of: snapshot.displayName, initial: true) { _, name in
+                session.setWorkerName(name)
+            }
         } else {
             idlePaneView
         }
@@ -322,7 +325,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
     /// the line never flickers.
     @ViewBuilder
     private var idlePaneView: some View {
-        let character = TrekCharacter.forSlot(snapshot.slotId)
+        let character = TrekCharacter.forPersona(snapshot.live?.name)
         VStack(spacing: 14) {
             Spacer()
             if let character {
@@ -334,7 +337,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
                         .frame(maxWidth: 220, maxHeight: 240)
                         .opacity(0.85)
                 }
-                Text(character.displayName)
+                Text(snapshot.displayName)
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(Color.white.opacity(0.85))
                 Text(TrekIdleFlavor.line(for: character, cycle: snapshot.idleFlavorCycle))
@@ -343,19 +346,8 @@ struct WorkerSlotView: View, @MainActor Equatable {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 24)
                     .lineLimit(3)
-            } else if WorkersWorkspaceModel.lowerDecksSlotRange.contains(snapshot.slotId) {
-                // Lower Decks has no bespoke portrait asset, but it is still a
-                // real crew: show the canonical name (same `WorkerNames` source
-                // as the running-pane title) so the page reads as a roster
-                // rather than bare slot numbers.
-                Text(WorkerNames.name(forSlot: snapshot.slotId))
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(Color.white.opacity(0.85))
-                Text("Free")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(Color.white.opacity(0.7))
             } else {
-                Text("Slot \(snapshot.slotId)")
+                Text(snapshot.displayName)
                     .font(.caption2)
                     .foregroundStyle(Color.white.opacity(0.45))
                 Text("Free")
@@ -370,7 +362,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
 
     private var slotHeader: some View {
         HStack(spacing: 8) {
-            if let character = TrekCharacter.forSlot(snapshot.slotId),
+            if let character = TrekCharacter.forPersona(snapshot.live?.name),
                let nsImage = TrekIconAssets.image(character, size: .small) {
                 Image(nsImage: nsImage)
                     .resizable()
@@ -464,7 +456,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
     /// and identifying the task without the gerund connector.
     @ViewBuilder
     private var slotTaskLine: some View {
-        let name = WorkerNames.name(forSlot: snapshot.slotId)
+        let name = snapshot.displayName
         let text: String = {
             if let summary = snapshot.summary, !summary.isEmpty {
                 // Success path: Claude-generated gerund phrase.

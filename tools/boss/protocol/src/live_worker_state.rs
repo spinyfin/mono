@@ -27,8 +27,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::worker_names::name_for_slot;
-
 /// Where a worker is in its life. The engine derives this from hook
 /// events arriving on the events socket; UI code maps it to a colour
 /// or icon variant. Order is roughly "earlier in the lifecycle" →
@@ -142,13 +140,9 @@ pub struct WorkItemBinding {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveWorkerState {
     pub slot_id: u8,
-    /// Stable display name for the slot, derived from `slot_id` via
-    /// the shared crew roster (`worker_names::name_for_slot`). The
-    /// macOS app renders the same name in the worker pane header and
-    /// on Doing cards; surfacing it on the wire lets the coordinator
-    /// session refer to a worker by name (e.g.
-    /// `bossctl agents focus Riker`) without independently
-    /// re-deriving the roster.
+    /// Engine-assigned durable persona, independent of the capacity slot.
+    /// Remote workers retain a display-only ` (Remote)` host qualifier.
+    /// Constructors use execution identity until the engine supplies a lease.
     #[serde(default)]
     pub name: String,
     pub run_id: String,
@@ -314,10 +308,11 @@ impl LiveWorkerState {
             Some(b) => (Some(b.work_item_id), Some(b.work_item_name), Some(b.execution_id)),
             None => (None, None, None),
         };
+        let run_id = run_id.into();
         Self {
             slot_id,
-            name: name_for_slot(slot_id),
-            run_id: run_id.into(),
+            name: placeholder_worker_name(&run_id),
+            run_id,
             model: model.into(),
             shell_pid,
             last_event_at: None,
@@ -342,6 +337,12 @@ impl LiveWorkerState {
 /// Subscribers receive the whole snapshot via
 /// [`crate::FrontendEvent::WorkerLiveStatesList`].
 pub const TOPIC_WORKER_LIVE_STATES: &str = "worker.live_states";
+
+/// The execution-identity display name used before a durable persona is
+/// known. Single source of truth so callers can detect and repair it.
+pub fn placeholder_worker_name(run_id: &str) -> String {
+    format!("Worker {run_id}")
+}
 
 #[cfg(test)]
 mod tests {
@@ -383,7 +384,7 @@ mod tests {
     fn new_spawning_sets_defaults() {
         let state = LiveWorkerState::new_spawning(3, "run-1", "claude-opus-4-7", 42, None);
         assert_eq!(state.slot_id, 3);
-        assert_eq!(state.name, "Worf");
+        assert_eq!(state.name, "Worker run-1");
         assert_eq!(state.run_id, "run-1");
         assert_eq!(state.model, "claude-opus-4-7");
         assert_eq!(state.shell_pid, 42);
@@ -437,13 +438,13 @@ mod tests {
     }
 
     #[test]
-    fn new_spawning_stamps_name_from_slot_id() {
+    fn new_spawning_placeholder_tracks_identity_instead_of_slot() {
         let s1 = LiveWorkerState::new_spawning(1, "r", "m", 0, None);
-        assert_eq!(s1.name, "Riker");
+        assert_eq!(s1.name, "Worker r");
         let s2 = LiveWorkerState::new_spawning(2, "r", "m", 0, None);
-        assert_eq!(s2.name, "Data");
+        assert_eq!(s2.name, s1.name);
         let s8 = LiveWorkerState::new_spawning(8, "r", "m", 0, None);
-        assert_eq!(s8.name, "O'Brien");
+        assert_eq!(s8.name, s1.name);
     }
 
     #[test]

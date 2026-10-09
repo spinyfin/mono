@@ -1148,7 +1148,18 @@ impl ServerState {
         // event would ever reach a subscriber.
         let mut timeline = crate::startup_timing::StartupTimeline::begin("server_state");
         let event_bus = Arc::new(EventBus::new());
-        let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?.with_event_bus(event_bus.clone()));
+        // Engine counter-metrics registry. Built up front so it can be cloned
+        // into ServerState and handed to WorkDb (persona overflow counter); the
+        // registry is plumbed explicitly rather than stashed in a global per
+        // the framework design. `init_all` runs further down once the
+        // Arc<ServerState> is in hand so a duplicate registration panics
+        // during this boot path instead of inside the first increment.
+        let metrics_registry = Arc::new(crate::metrics::Registry::new());
+        let work_db = Arc::new(
+            WorkDb::open(cfg.work.db_path.clone())?
+                .with_event_bus(event_bus.clone())
+                .with_persona_metrics(metrics_registry.clone()),
+        );
         timeline.mark("work_db_open");
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
         timeline.mark("agent_config");
@@ -1348,15 +1359,6 @@ impl ServerState {
         let dispatch_event_root: PathBuf = state_root.clone();
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
             Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
-
-        // Engine counter-metrics registry. Built up front so it can
-        // be cloned into ServerState; the registry is plumbed
-        // explicitly rather than stashed in a global per the
-        // framework design. `init_all` runs further down once the
-        // Arc<ServerState> is in hand so a duplicate registration
-        // panics during this boot path instead of inside the first
-        // increment.
-        let metrics_registry = Arc::new(crate::metrics::Registry::new());
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();
@@ -1425,7 +1427,7 @@ impl ServerState {
         // completion handler (background-children probe, idle-park hold
         // check), the coordinator's occupancy guard, and `ServerState` all
         // share the SAME instances.
-        let live_worker_states = Arc::new(LiveWorkerStateRegistry::new());
+        let live_worker_states = Arc::new(LiveWorkerStateRegistry::with_work_db(work_db.clone()));
         let live_worker_states_for_coordinator = live_worker_states.clone();
         let live_worker_states_for_completion = live_worker_states.clone();
         let hold_registry = Arc::new(crate::hold_registry::HoldRegistry::new());
@@ -1517,6 +1519,7 @@ impl ServerState {
         // reverse forward at the production engine.
         let provider_events_socket = crate::runner::bound_events_socket_path(&cfg);
         let provider_control_dir = crate::ssh_transport::default_control_socket_dir();
+        let remote_pane_releaser = pane_releaser.clone();
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
                 work_db.clone(),
@@ -1580,6 +1583,7 @@ impl ServerState {
                     ),
                 ));
             }
+            execution_coordinator_inner.set_remote_pane_releaser(remote_pane_releaser);
             let execution_coordinator = Arc::new(execution_coordinator_inner);
             completion_handler.set_host_adapter_provider(execution_coordinator.host_adapter_provider());
 
@@ -1821,11 +1825,35 @@ impl ServerState {
     /// mapping has already been removed, so a future release can't
     /// retry without a fresh registration.
     ///
-    /// Durable tmux identity and verified teardown are required before removing
+    /// Remote executions release their virtual slot once terminal. For local workers,
+    /// durable tmux identity and verified teardown are required before removing
     /// the registry entry or returning the workspace lease. Missing identity
     /// or unavailable tmux evidence preserves the worker for rollback/drain.
     /// A verified teardown also clears live-state and detaches its app viewer.
     pub async fn release_worker_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        // Remote workers have no durable tmux identity. Their terminal
+        // execution is the completion authority, including after a restart.
+        if self.execution_is_terminal(run_id)
+            && self
+                .work_db
+                .latest_run_host_for_execution(run_id)
+                .ok()
+                .flatten()
+                .is_some_and(|host| host != "local")
+            && matches!(self.work_db.tmux_identity_for_execution(run_id), Ok(None))
+        {
+            self.worker_registry.take_slot_for_run(run_id);
+            if let Some(slot_id) = self.live_worker_states.release_slot_for_run(run_id) {
+                self.live_status_manager.stop_slot_for_run(slot_id, run_id);
+            }
+            self.live_worker_states.release_persona_for_run(run_id);
+            self.agent_jsonl_progress_manager.stop_run(run_id);
+            self.transcript_path_cache.forget(run_id);
+            self.run_cost_capture.forget(run_id);
+            crate::stale_worker_sweep::resolve_stale_worker_attention(&self.work_db, run_id);
+            self.broadcast_live_worker_states().await;
+            return PaneReleaseOutcome::Reaped;
+        }
         if self.reap_tmux_worker(run_id).await != tmux_teardown::TmuxTeardownOutcome::Reaped {
             return PaneReleaseOutcome::NoLiveWorker;
         }
@@ -1983,6 +2011,7 @@ impl ServerState {
     /// live-state. Acting unconditionally would tear down a newer occupant's
     /// viewer, pool claim and live state out from under it.
     async fn detach_untracked_worker_viewer(&self, run_id: &str) -> PaneReleaseOutcome {
+        self.live_worker_states.release_persona_for_run(run_id);
         if let Some(slot_id) = self.hosted_pane_slot_for_run(run_id) {
             let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
             let pool_holder = self.execution_coordinator.claim_holder(&worker_id).await;

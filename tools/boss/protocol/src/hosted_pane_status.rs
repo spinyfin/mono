@@ -53,10 +53,8 @@ pub enum HostedPaneState {
 pub struct HostedPaneStatus {
     pub slot_id: u8,
     pub run_id: String,
-    /// Derived from `slot_id` via `worker_names::name_for_slot` — the
-    /// same crew name the app renders in the pane header, recoverable
-    /// purely from the slot number regardless of whether the live
-    /// registry still has an entry.
+    /// Durable persona resolved by run identity, including historical names
+    /// after the live registry has released the worker.
     pub crew_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,

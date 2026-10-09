@@ -197,7 +197,11 @@ async fn question_summary_survives_upgrade_of_existing_projection() {
         .connect()
         .unwrap()
         .execute_batch(
-            "DROP VIEW open_operator_questions;
+            "DROP INDEX work_runs_live_persona;
+         DROP INDEX work_runs_execution_persona_lease;
+         ALTER TABLE work_runs DROP COLUMN persona;
+         ALTER TABLE work_runs DROP COLUMN persona_lease_active;
+         DROP VIEW open_operator_questions;
          CREATE VIEW open_operator_questions AS
          SELECT work_item_id, json_patch(question_json,
              json_object('id', id, 'asked_at', created_at, 'execution_id', execution_id)) AS view_json

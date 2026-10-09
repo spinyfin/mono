@@ -24,6 +24,22 @@ import XCTest
 @MainActor
 final class WorkCardSnapshotTests: XCTestCase {
 
+    func testDoingCardUsesEnginePersonaAndFallback() {
+        var live = Self.makeLiveState(liveStatus: nil)
+        let names: [String?] = ["Worf", "Ensign 41", "Data (Remote)", "", nil]
+        for name in names {
+            live.name = name
+            let snapshot = WorkCardSnapshot.build(
+                task: Self.makeTask(status: "active"),
+                context: WorkCardSnapshotContext(column: .doing, liveState: live)
+            )
+            let slice = WorkBoardCardTitleRowSlice(snapshot: snapshot)
+            let expected = (name == nil || name == "") ? "Worker \(live.runId)" : name
+            XCTAssertEqual(slice.assignedWorkerName, expected)
+            XCTAssertEqual(slice.assignedSlotId, live.slotId)
+        }
+    }
+
     // MARK: - Exhaustive WorkTask stored-property classification
 
     /// `WorkTask` fields the snapshot builder reads (directly or via helpers

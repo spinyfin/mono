@@ -1,36 +1,11 @@
-//! Deterministic mapping from worker slot id → display name.
+//! Shared crew roster and legacy app slot labels.
 //!
-//! Mirrors the Swift `WorkerNames.roster` used by the macOS app
-//! (`tools/boss/app-macos/Sources/Ghostty/WorkerNames.swift`) so the
-//! engine, bossctl, and the UI all agree on which crew member is
-//! occupying which slot. Slot 1 is "Riker", slot 2 is "Data", and so
-//! on.
-//!
-//! Slot ranges are disjoint across pools (interactive 1-16,
-//! automation 17-24, review 25-40), so a name is unique across every
-//! *concurrently live* worker — regardless of pool — as long as the
-//! roster has at least as many entries as the highest live slot id.
-//! The roster is sized to the full 40-slot space precisely so no two
-//! live workers can ever be handed the same name; growing the slot
-//! space requires growing the roster to match, not relying on the
-//! modulo wrap (which only exists as a defensive fallback and would
-//! reintroduce cross-pool collisions if ever exercised).
-//!
-//! Remote runs (see [`REMOTE_SLOT_BASE`]) get a synthetic slot id
-//! from a disjoint high range (`REMOTE_SLOT_BASE..=u8::MAX`) rather
-//! than a pool slot, so they go through the same [`name_for_slot`]
-//! but must never be handed a plain crew name — that would collide
-//! with whichever local pool slot the same `ROSTER` index names. So
-//! `name_for_slot` renders the remote range as `"<crew name>
-//! (Remote)"`, keeping it disjoint from every local-pool name while
-//! still reusing the roster for a stable, recognizable label.
-//!
-//! The names live on the wire alongside `LiveWorkerState` so the
-//! coordinator session can refer to a worker as "Riker" without
-//! independently re-deriving the roster from a slot id. Keep this
-//! list and the Swift list in lock-step — slot ids are a stable,
-//! human-visible label, so reordering or inserting in the middle
-//! would silently rename everyone above the change.
+//! The engine assigns durable persona leases from ROSTER independently of
+//! capacity slots, across local and remote workers. LiveWorkerState carries
+//! the resulting display name. name_for_slot remains for the app migration;
+//! it must not be used to allocate or resolve worker identity. Keep the
+//! roster order synchronized with the legacy Swift roster until that
+//! compatibility implementation is retired.
 
 /// First slot id reserved for remote workers' virtual slots.
 ///

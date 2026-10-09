@@ -903,10 +903,18 @@ impl ServerState {
                 // Viewer with no durable occupancy: leftover Ghostty surface.
                 (_, SlotOccupancy::Absent) => HostedPaneState::Husk,
             };
+            let crew_name = self
+                .work_db
+                .persona_display_name(&display_run_id)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(run_id = %display_run_id, %error, "could not read hosted worker persona");
+                    None
+                })
+                .unwrap_or_else(|| boss_protocol::placeholder_worker_name(&display_run_id));
             statuses.push(HostedPaneStatus {
                 slot_id: pane.slot_id,
                 run_id: display_run_id,
-                crew_name: boss_protocol::name_for_slot(pane.slot_id),
+                crew_name,
                 summary: pane.summary,
                 task_title: pane.task_title,
                 state,

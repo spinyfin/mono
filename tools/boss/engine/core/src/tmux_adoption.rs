@@ -718,6 +718,12 @@ where
         }
     };
 
+    if let Err(error) = work_db.restore_tmux_personas(&adoptable) {
+        // Failed metadata writes must not discard positively observed workers.
+        // Registration can still read an existing lease, or use the execution
+        // identity until a later pass can durably allocate an older row.
+        tracing::warn!(%error, "tmux session sweep: could not backfill persona leases; continuing adoption");
+    }
     let mut claimed_tokens: HashSet<String> = HashSet::new();
     for handle in &adoptable {
         let Some(session) = live_sessions
@@ -1903,6 +1909,9 @@ mod tests {
 
     #[path = "tmux_adoption_dead_pane_tests.rs"]
     mod dead_pane_tests;
+
+    #[path = "tmux_adoption_persona_tests.rs"]
+    mod persona_tests;
 
     /// The cardinal case: engine restarts, the worker's tmux session (and its
     /// non-terminal execution row) survived. The pass must rebuild the slot

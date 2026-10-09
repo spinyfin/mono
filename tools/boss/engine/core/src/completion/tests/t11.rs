@@ -82,17 +82,21 @@ fn remote_pr_review_exec_fixture(
 /// Host adapter whose `collect_structured_output` always returns a fixed
 /// outcome — either a deliberately induced `Failed` (models an invalid
 /// descriptor / failed copy) or `NotAvailable` (models a transient
-/// condition that must fail open). Every other `HostAdapter` method panics
-/// if hit — `finalize_pr_review_pass`'s collection call is the only one
-/// these tests exercise.
+/// condition that must fail open). Records the remote lease release when
+/// collection failure terminalizes the execution.
 struct FixedCollectAdapter {
     host_id: &'static str,
     fail_reason: Option<&'static str>,
+    released: std::sync::Mutex<Vec<String>>,
 }
 
 crate::stub_host_adapter! { FixedCollectAdapter {
     fn host_id(&self) -> &str {
         self.host_id
+    }
+    async fn force_release_lease(&self, lease_id: &str, _: Option<&str>) -> Result<()> {
+        self.released.lock().unwrap().push(lease_id.to_owned());
+        Ok(())
     }
     async fn collect_structured_output(
         &self,
@@ -130,12 +134,15 @@ async fn remote_review_collection_failure_terminalizes_with_named_cause() {
     let (_dir, db, chore_id, pr_review_exec_id, _pr_url) = remote_pr_review_exec_fixture(workspace.path(), "zakalwe");
 
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
-    handler.set_host_adapter_provider(Arc::new(FixedAdapterProvider(Arc::new(FixedCollectAdapter {
+    let adapter = Arc::new(FixedCollectAdapter {
         host_id: "zakalwe",
         fail_reason: Some("boom"),
-    }))));
+        released: Default::default(),
+    });
+    handler.set_host_adapter_provider(Arc::new(FixedAdapterProvider(adapter.clone())));
 
     let outcome = handler.on_stop(&pr_review_exec_id).await;
+    assert_eq!(*adapter.released.lock().unwrap(), ["lease-review-1"]);
     let detail = match &outcome {
         StopOutcome::RemoteCollectionFailed { detail } => detail.clone(),
         other => panic!("expected a terminalizing outcome from an induced collection failure, got {other:?}"),
@@ -184,6 +191,7 @@ async fn remote_review_collection_not_available_falls_through_to_recovery() {
     handler.set_host_adapter_provider(Arc::new(FixedAdapterProvider(Arc::new(FixedCollectAdapter {
         host_id: "zakalwe",
         fail_reason: None,
+        released: Default::default(),
     }))));
 
     let outcome = handler.on_stop(&pr_review_exec_id).await;
@@ -765,3 +773,6 @@ async fn automation_outcome_proposals_first_flag_off_matches_pre_migration_behav
         "with the flag off nothing is counted",
     );
 }
+
+#[path = "remote_release.rs"]
+mod remote_release;

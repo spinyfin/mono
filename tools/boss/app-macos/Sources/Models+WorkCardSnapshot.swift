@@ -129,6 +129,7 @@ struct WorkCardSnapshot: Equatable {
     let isSelected: Bool
     let activityState: AgentActivityState?
     let assignedSlotId: Int?
+    var assignedWorkerName: String? = nil
     let liveStatus: String?
     let liveStatusActivity: WorkerActivity?
     let liveStatusLastEventAt: String?
@@ -390,6 +391,7 @@ struct WorkCardSnapshot: Equatable {
             isSelected: context.isSelected,
             activityState: activityState,
             assignedSlotId: assignedSlotId,
+            assignedWorkerName: assignedSlotId == nil ? nil : context.liveState?.displayName,
             liveStatus: liveStatus,
             liveStatusActivity: liveStatusActivity,
             liveStatusLastEventAt: liveStatusLastEventAt,

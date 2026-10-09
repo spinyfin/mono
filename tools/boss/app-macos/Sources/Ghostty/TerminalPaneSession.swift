@@ -173,7 +173,7 @@ enum PaneRole: Equatable {
     var defaultTitle: String {
         switch self {
         case .boss: "Picard"
-        case .worker(let slot): WorkerNames.name(forSlot: slot)
+        case .worker: "Worker"
         }
     }
 }
@@ -226,12 +226,18 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
         self.launchSpec = launchSpec
         self.paneMonitorSpec = paneMonitorSpec
         self.paneMonitorTracker = PaneMonitorTracker(spec: paneMonitorSpec)
-        self.displayTitle = role.defaultTitle
+        self.displayTitle = role == .boss ? role.defaultTitle : "Worker \(id.hasPrefix("run-") ? String(id.dropFirst(4)) : id)"
         self.workingDirectory = launchSpec.workingDirectory
     }
 
     func setTitle(_ title: String) {
+        guard role == .boss else { return }
         displayTitle = title.isEmpty ? role.defaultTitle : title
+    }
+
+    func setWorkerName(_ name: String) {
+        guard role != .boss else { return }
+        if displayTitle != name { displayTitle = name }
     }
 
     func attach(hostView: GhosttyTerminalHostView) {

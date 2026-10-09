@@ -70,6 +70,16 @@ impl ExecutionCoordinator {
             run_outcome.as_ref(),
             Ok(outcome) if outcome.slot_id.is_some()
         );
+        // A successful remote launch (`WorkerPaneAlive`, no local slot) frees
+        // the local dispatch-pool claim below, but the remote process keeps
+        // running: its persona lease and live-state entry must survive until
+        // terminal remote cleanup in `release_worker_pane`, or the persona could
+        // be handed to another worker while this one is still alive.
+        let remote_worker_alive = matches!(
+            run_outcome.as_ref(),
+            Ok(outcome) if outcome.slot_id.is_none()
+                && outcome.wait_state == RunWaitState::WorkerPaneAlive
+        );
 
         // Set inside the `Err(err)` arm below once a `SlotBusy` pane-spawn
         // rejection has actually been recorded as a terminal `failed`
@@ -754,6 +764,17 @@ impl ExecutionCoordinator {
                 }
                 self.kick();
             } else {
+                // Failed spawns can release immediately. Successful remote
+                // launches retain their lease until terminal remote cleanup;
+                // deferred local panes retain it until verified tmux teardown.
+                if !remote_worker_alive {
+                    if let Some(states) = &self.live_worker_states {
+                        states.release_slot_for_run(&execution.id);
+                        states.release_persona_for_run(&execution.id);
+                    } else if let Err(error) = self.work_db.release_persona(&execution.id) {
+                        tracing::error!(execution_id = %execution.id, %error, "could not release persona after runner cleanup");
+                    }
+                }
                 self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
                     .await;
             }
@@ -904,6 +925,9 @@ impl ExecutionCoordinator {
             .release_worker_if_execution(worker_id, execution_id, None)
             .await;
         if released {
+            if let Err(error) = self.work_db.release_persona(execution_id) {
+                tracing::error!(execution_id, %error, "could not release persona for reconciled pool claim");
+            }
             self.rescan_active_dispatch_after_release();
             self.kick();
         }

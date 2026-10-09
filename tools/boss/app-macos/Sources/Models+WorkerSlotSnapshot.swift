@@ -14,12 +14,14 @@ import Foundation
 /// the whole struct into the snapshot would re-evaluate every slot on
 /// those unused writes.
 struct WorkerSlotLiveSlice: Equatable {
+    let name: String?
     let activity: WorkerActivity
     let liveStatus: String?
     let recoveryStatus: String?
     let lastEventAt: String?
 
     init(_ live: WorkerLiveState) {
+        self.name = live.name
         self.activity = live.activity
         self.liveStatus = live.liveStatus
         self.recoveryStatus = live.recoveryStatus
@@ -44,6 +46,11 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     let session: TerminalPaneSession?
     let liveStatusEnabled: Bool
     let live: WorkerSlotLiveSlice?
+
+    var displayName: String {
+        guard let runId else { return "Slot \(slotId)" }
+        return WorkerLiveState.displayName(name: live?.name, runId: runId)
+    }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slotId == rhs.slotId

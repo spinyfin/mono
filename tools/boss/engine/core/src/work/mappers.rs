@@ -614,6 +614,7 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
 
 pub(crate) fn map_run(row: &Row<'_>) -> rusqlite::Result<WorkRun> {
     Ok(WorkRun {
+        persona: row.get(11)?,
         id: row.get(0)?,
         execution_id: row.get(1)?,
         agent_id: row.get(2)?,

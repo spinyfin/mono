@@ -85,6 +85,7 @@ impl ExecutionCoordinator {
             review_pool: WorkerPool::new_review(DEFAULT_REVIEW_POOL_SIZE),
             host_adapter,
             host_adapter_provider,
+            remote_pane_releaser: None,
             publisher,
             dispatch_events: Arc::new(NoopDispatchEventSink),
             inflight_dispatches: InflightDispatches::new(),
@@ -229,6 +230,11 @@ impl ExecutionCoordinator {
         .await
     }
 
+    /// Share the app's terminal-remote slot and live-state cleanup with the reaper.
+    pub fn set_remote_pane_releaser(&mut self, releaser: Arc<dyn crate::completion::WorkerPaneReleaser>) {
+        self.remote_pane_releaser = Some(releaser);
+    }
+
     /// Run one cross-host remote-lease reconcile pass and kick the
     /// scheduler if anything was reaped (a cleared remote zombie unblocks
     /// the redundant-spawn guard for its work item). Thin binding of the
@@ -242,6 +248,7 @@ impl ExecutionCoordinator {
             &self.work_db,
             self.host_adapter_provider.as_ref(),
             self.dispatch_events.as_ref(),
+            self.remote_pane_releaser.as_deref(),
         )
         .await;
         if outcome.reaped > 0 {

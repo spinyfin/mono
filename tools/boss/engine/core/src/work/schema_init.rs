@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 36;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 37;
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -80,6 +80,9 @@ impl WorkDb {
         if version < 36 {
             // Schema 36 refreshes existing question views with the declaring run's summary.
             pr_flow::migrate_operator_questions(&tx)?;
+        }
+        if version < 37 {
+            personas::migrate(&tx)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -508,7 +511,7 @@ mod floor_tests {
 
     #[test]
     fn supported_databases_apply_post_floor_migrations_without_losing_data() {
-        for version in [32, 33, 34, 35, CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1] {
+        for version in [32, 33, 34, 35, 36, CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
             let conn = Connection::open(&path).unwrap();
@@ -523,6 +526,15 @@ mod floor_tests {
             }
             if version >= 35 {
                 conn.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
+                conn.execute_batch(
+                    "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+                     VALUES ('restored-execution', 'work', 'chore_implementation', 'completed', 'repo', '2026-01-01');
+                     INSERT INTO execution_restore_reports VALUES ('restored-execution', 'retained report');",
+                )
+                .unwrap();
+            }
+            if version >= 37 {
+                personas::migrate(&conn).unwrap();
             }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
@@ -541,6 +553,7 @@ mod floor_tests {
             project_postmortem::migrate_project_postmortem_signals(&expected).unwrap();
             pr_flow::migrate_operator_questions(&expected).unwrap();
             expected.execute_batch("CREATE TABLE execution_restore_reports (execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE, report TEXT NOT NULL)").unwrap();
+            personas::migrate(&expected).unwrap();
             expected.execute_batch("CREATE TABLE sentinel (value TEXT)").unwrap();
             let before = capture(&expected);
             drop(conn);
@@ -548,6 +561,16 @@ mod floor_tests {
                 let db = WorkDb::open(path.clone()).unwrap();
                 let conn = db.connect().unwrap();
                 assert_eq!(capture(&conn), before);
+                if version >= 35 {
+                    let report: String = conn
+                        .query_row(
+                            "SELECT report FROM execution_restore_reports WHERE execution_id = 'restored-execution'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(report, "retained report");
+                }
                 let observed: String = conn
                     .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
                         row.get(0)

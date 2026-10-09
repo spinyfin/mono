@@ -34,6 +34,14 @@ enum TrekCharacter: String, CaseIterable {
         }
     }
 
+    /// Match the engine persona, ignoring only its remote host qualifier.
+    static func forPersona(_ name: String?) -> TrekCharacter? {
+        guard let name else { return nil }
+        let suffix = " (Remote)"
+        let persona = name.hasSuffix(suffix) ? String(name.dropLast(suffix.count)) : name
+        return allCases.first { $0.displayName == persona }
+    }
+
     /// Slot 1..8 → character. The interactive pool is 16 slots (Bridge
     /// Crew 1..8, Lower Decks 9..16), but the icon roster only has 8
     /// named characters, so slots 9..16 get `nil` and the UI falls back

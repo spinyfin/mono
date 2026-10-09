@@ -77,6 +77,7 @@ impl WorkDb {
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            persona_metrics: personas::new_metrics_registry(),
         };
         let init_started = std::time::Instant::now();
         db.init()?;
@@ -105,6 +106,7 @@ impl WorkDb {
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            persona_metrics: personas::new_metrics_registry(),
         };
         db.init()?;
         Ok(db)

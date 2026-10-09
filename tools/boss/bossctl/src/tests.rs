@@ -4,7 +4,7 @@ use boss_protocol::{CreateChoreInput, CreateProductInput, WorkItemPatch, WorkerA
 fn live(slot: u8, run: &str) -> LiveWorkerState {
     LiveWorkerState {
         slot_id: slot,
-        name: boss_protocol::name_for_slot(slot),
+        name: format!("Persona for {run}"),
         run_id: run.into(),
         model: "opus".into(),
         shell_pid: 0,

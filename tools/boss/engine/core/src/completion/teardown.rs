@@ -55,6 +55,34 @@ use crate::teardown_registry::TeardownGuard;
 pub(super) const CUBE_RELEASE_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl WorkerCompletionHandler {
+    /// Resolve ownership from the durable run before touching any host's files
+    /// or cube. A missing remote adapter must never fall back to local cleanup.
+    pub(super) async fn remote_cleanup_adapter(
+        &self,
+        execution_id: &str,
+    ) -> anyhow::Result<Option<Arc<dyn crate::host_adapter::HostAdapter>>> {
+        let Some(host_id) = self
+            .work_db
+            .latest_run_host_for_execution(execution_id)?
+            .filter(|host| host != "local")
+        else {
+            return Ok(None);
+        };
+        let host = self
+            .work_db
+            .get_host(&host_id)?
+            .ok_or_else(|| anyhow::anyhow!("remote cleanup host {host_id} is unavailable"))?;
+        let provider = self
+            .host_adapter_provider
+            .read()
+            .expect("host adapter provider lock poisoned")
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("remote cleanup adapter provider is unavailable"))?;
+        let adapter = provider.adapter_for(&host).await?;
+        anyhow::ensure!(adapter.host_id() == host_id, "remote cleanup adapter host mismatch");
+        Ok(Some(adapter))
+    }
+
     /// Mark `execution_id` as tearing down. Call this **before** the write
     /// that terminalizes the execution: the mark and the terminal status
     /// must never be observable out of order, or a sweep can still catch
@@ -71,9 +99,10 @@ impl WorkerCompletionHandler {
     /// `lease_id` is `None` when the terminalizing write found no lease to
     /// release (already cleared by a racing teardown). `workspace_path` is
     /// the path captured BEFORE the terminalizing write nulled it;
-    /// `teardown_driver_workspace` is still called when it is `None`,
-    /// since a driver may key its state off the recorded runtime state
-    /// alone.
+    /// Local `teardown_driver_workspace` is still called when it is `None`,
+    /// since a driver may key its state off the recorded runtime state alone.
+    /// Remote runs skip local driver teardown and release through their host's
+    /// adapter; their workspace paths are never accessed on this host.
     ///
     /// `path` names the completion path for the log lines (`"stop"`,
     /// `"pr_recheck"`, `"no_op"`, …) so a stall is attributable to a
@@ -99,19 +128,29 @@ impl WorkerCompletionHandler {
         let pane_ms = pane_started.elapsed().as_millis();
 
         let driver_started = Instant::now();
-        crate::driver_teardown::teardown_driver_workspace(
-            &self.work_db,
-            execution_id,
-            workspace_path,
-            crate::driver_teardown::TeardownReason::Completion(path),
-        )
-        .await;
+        let remote_adapter = self.remote_cleanup_adapter(execution_id).await;
+        if matches!(remote_adapter, Ok(None)) {
+            crate::driver_teardown::teardown_driver_workspace(
+                &self.work_db,
+                execution_id,
+                workspace_path,
+                crate::driver_teardown::TeardownReason::Completion(path),
+            )
+            .await;
+        }
         let driver_ms = driver_started.elapsed().as_millis();
 
         let cube_started = Instant::now();
         let mut cube_timed_out = false;
         if let Some(lease_id) = lease_id {
-            match tokio::time::timeout(CUBE_RELEASE_TIMEOUT, self.cube_client.release_workspace(lease_id)).await {
+            let release = async {
+                match remote_adapter {
+                    Ok(Some(adapter)) => adapter.force_release_lease(lease_id, Some(path)).await,
+                    Ok(None) => self.cube_client.release_workspace(lease_id).await,
+                    Err(err) => Err(err),
+                }
+            };
+            match tokio::time::timeout(CUBE_RELEASE_TIMEOUT, release).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => tracing::error!(
                     execution_id,
