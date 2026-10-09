@@ -72,6 +72,7 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
 pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
+        server_state,
         sink,
         request_id,
         ..
@@ -97,6 +98,7 @@ pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendR
     let writer = current.as_deref().unwrap_or_default();
     match work_db.set_coordinator_handoff(&body, writer, now) {
         Ok(handoff) => {
+            server_state.coordinator_handoff_written.notify_waiters();
             crate::audit::record_event(
                 "coordinator_handoff_written",
                 &serde_json::json!({

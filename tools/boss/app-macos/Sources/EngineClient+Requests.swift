@@ -718,11 +718,12 @@ extension EngineClient {
     /// destroying a newer session after recovery. `reason` distinguishes an
     /// operator-initiated reset from the automatic model-mismatch prompt in
     /// the engine's audit log — both paths call the same engine-owned recreate.
-    func sendRecreateCoordinator(expectedSpawnToken: String, reason: CoordinatorRecreateReason) {
+    func sendRecreateCoordinator(expectedSpawnToken: String, reason: CoordinatorRecreateReason, forceWithoutHandoff: Bool = false) {
         sendLine([
             "type": "recreate_coordinator",
             "expected_spawn_token": expectedSpawnToken,
             "reason": reason.rawValue,
+            "force_without_handoff": forceWithoutHandoff,
         ])
     }
 

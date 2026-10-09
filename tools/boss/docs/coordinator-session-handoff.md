@@ -11,13 +11,13 @@ The coordinator is a single long-lived Claude Code session. It is replaced by a 
 - the `claude` process crashes or exits,
 - the engine's coordinator restart supervisor recreates it after a failure streak.
 
-None of these give the outgoing session a chance to run anything. Everything the operator said in it — "I've taken greyarea down", "I re-enabled tmux", "don't file chores about X" — is gone, and the next session acts on stale evidence until the operator notices and repeats themselves. The incident that motivated this: a session filed a chore against a CI host the operator had shut down 40 minutes earlier, then briefed an investigation agent on tmux state the operator had already reversed.
+Unannounced termination gives the outgoing session no chance to run anything. Everything the operator said in it — "I've taken greyarea down", "I re-enabled tmux", "don't file chores about X" — is gone, and the next session acts on stale evidence until the operator notices and repeats themselves. The incident that motivated this: a session filed a chore against a CI host the operator had shut down 40 minutes earlier, then briefed an investigation agent on tmux state the operator had already reversed.
 
 ## Design
 
 ### What triggers the write: a rolling handoff, refreshed at boundaries
 
-A shutdown-time write is the wrong design here, because the cases above kill the session with no chance to run one — a shutdown-only write would silently produce nothing in exactly the case that matters.
+A shutdown-only write cannot protect against unannounced termination. The rolling handoff remains the defence against crashes and updates. Operator-confirmed resets (including model changes) additionally ask the live coordinator to write a fresh handoff, then wait up to 120 seconds for a write stamped with the outgoing spawn token and a timestamp at or after the request. A timeout leaves the session running and offers “Reset anyway (no fresh handoff)”. This explicit override skips the wait and labels any saved handoff STALE in the new brief. Dead or missing sessions skip the request because there is nothing left to ask.
 
 Instead the coordinator keeps a **rolling handoff** and rewrites it at natural boundaries: whenever the operator states a fact that changes the world (a host taken down or brought back, a flag or setting flipped, dispatch paused or resumed), makes a decision, or says not to do something; when an open thread starts or resolves; and before acknowledging a request to restart, update, or reset it. Each write replaces the whole handoff, carrying forward what is still true. The "Session handoff" section of the coordinator prompt (`bossSystemPrompt` in `tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift`) is what binds the coordinator to this.
 

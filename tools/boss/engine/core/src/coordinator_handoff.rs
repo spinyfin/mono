@@ -36,7 +36,10 @@
 //! natural boundaries — whenever the operator states a fact that changed
 //! the world, a decision, or a prohibition — so a handoff always exists
 //! as of the last such boundary, and the brief's writer/age stamps make
-//! any gap visible. See `tools/boss/docs/coordinator-session-handoff.md`.
+//! any gap visible. Operator-confirmed resets additionally request a fresh
+//! handoff and wait up to 120 seconds before replacing a live session. A
+//! timeout leaves it running unless the operator explicitly forces a reset.
+//! See `tools/boss/docs/coordinator-session-handoff.md`.
 
 use std::path::{Path, PathBuf};
 
@@ -113,6 +116,8 @@ pub(crate) enum CoordinatorStartReason {
     /// An explicit UI-confirmed recreate (model mismatch or operator reset,
     /// the latter also being how a `claude` update is picked up).
     Recreate(CoordinatorRecreateReason),
+    /// Operator explicitly skipped refreshing the handoff.
+    RecreateWithoutHandoff(CoordinatorRecreateReason),
 }
 
 impl CoordinatorStartReason {
@@ -127,6 +132,7 @@ impl CoordinatorStartReason {
                 "the previous coordinator's claude process exited (a crash, `/exit`, or a Claude Code update \
                  ending the process) while its tmux session survived"
             }
+            Self::RecreateWithoutHandoff(_) => "the operator reset the coordinator without waiting for a fresh handoff",
             Self::Recreate(CoordinatorRecreateReason::ModelMismatch) => {
                 "the operator confirmed replacing the previous coordinator to change its model"
             }
@@ -139,6 +145,7 @@ impl CoordinatorStartReason {
 
     pub(crate) fn audit_label(self) -> &'static str {
         match self {
+            Self::RecreateWithoutHandoff(_) => "recreate_without_handoff",
             Self::FirstCreation => "first_creation",
             Self::SessionMissing => "session_missing",
             Self::PaneDead => "pane_dead",
@@ -291,7 +298,11 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
             let written = when(handoff.written_at, now);
             let by_previous =
                 previous.is_some_and(|p| !p.spawn_token.is_empty() && p.spawn_token == handoff.writer_spawn_token);
-            if by_previous {
+            if matches!(reason, CoordinatorStartReason::RecreateWithoutHandoff(_)) {
+                out.push_str(&format!(
+                    "HANDOFF STALE: the operator reset without waiting for a fresh handoff. The saved handoff was written {written}; confirm what changed with the operator before relying on it.\n"
+                ));
+            } else if by_previous {
                 out.push_str(&format!(
                     "HANDOFF PRESENT: written by {previous_phrase}, {written}. Facts in it are current as of that \
                      time, not now.\n"

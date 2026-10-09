@@ -575,6 +575,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
     let FrontendRequest::RecreateCoordinator {
         expected_spawn_token,
         reason,
+        force_without_handoff,
     } = req
     else {
         unreachable!()
@@ -648,6 +649,27 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
     };
     let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
     let replacement = {
+        // The supervisor must remain free to recover while we await a write.
+        let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
+        if let Err(error) = crate::coordinator_tmux::reset_handoff::request_and_wait(
+            server_state.work_db.as_ref(),
+            active_tmux,
+            &server_state.coordinator_handoff_written,
+            &expected_spawn_token,
+            force_without_handoff,
+            crate::coordinator_tmux::reset_handoff::HANDOFF_TIMEOUT,
+        )
+        .await
+        {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::Error {
+                    message: format!("recreate_coordinator: {error:#}"),
+                },
+            );
+            return;
+        }
         let _guard = server_state.coordinator_tmux_lock.lock().await;
         let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
         crate::coordinator_tmux::recreate_after_confirmation(
@@ -661,6 +683,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             },
             &expected_spawn_token,
             reason,
+            force_without_handoff,
         )
         .await
     };

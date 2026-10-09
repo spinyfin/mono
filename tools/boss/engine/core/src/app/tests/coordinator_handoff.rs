@@ -93,7 +93,13 @@ async fn write_then_read_round_trips_and_attributes_the_live_coordinator() {
         .record_coordinator_tmux_spawn_intent("boss-coordinator", "token-live", "opus", None)
         .unwrap();
 
+    let notified = state.coordinator_handoff_written.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
     let written = set_view(set(&state, "  - greyarea is shut down\n- tmux re-enabled\n\n").await);
+    tokio::time::timeout(std::time::Duration::from_millis(30), notified)
+        .await
+        .expect("persisting a handoff must wake reset waiters");
     assert_eq!(
         written.body, "- greyarea is shut down\n- tmux re-enabled",
         "body must be trimmed"

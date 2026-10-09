@@ -674,6 +674,8 @@ struct ServerState {
     /// and the independent child-exit supervisor.
     #[builder(default = Arc::new(Mutex::new(())))]
     coordinator_tmux_lock: Arc<Mutex<()>>,
+    #[builder(default)]
+    coordinator_handoff_written: Arc<Notify>,
     /// Spawn token for which the current app session has acknowledged a
     /// coordinator viewer. Cleared with the app session so a reconnect gets a
     /// fresh attach request.

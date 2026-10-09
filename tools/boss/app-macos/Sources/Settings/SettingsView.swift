@@ -422,7 +422,7 @@ private struct WorkerSettingsPane: View {
                     } label: {
                         Text("Reset Coordinator Session…")
                     }
-                    .disabled(chatModel.attachedCoordinatorSpawnToken == nil)
+                    .disabled(chatModel.attachedCoordinatorSpawnToken == nil || chatModel.coordinatorResetWaiting)
                 } header: {
                     Text("Coordinator")
                 } footer: {
@@ -449,6 +449,7 @@ private struct WorkerSettingsPane: View {
         } message: {
             Text(CoordinatorResetCopy.message)
         }
+        .modifier(CoordinatorResetStatus(model: chatModel))
     }
 }
 
@@ -458,9 +459,9 @@ private struct WorkerSettingsPane: View {
 enum CoordinatorResetCopy {
     static let title = "Reset the coordinator?"
     static let message =
-        "This permanently ends the coordinator's current conversation and discards its context — " +
-        "this cannot be undone. A fresh session starts immediately with the current claude binary " +
-        "and instructions."
+        "Boss will ask the coordinator to write a fresh handoff and wait up to 120 seconds. " +
+        "Then its current conversation permanently ends and a new session starts with that handoff, " +
+        "the current claude binary, and instructions. If no handoff arrives, the session stays running."
 }
 
 private struct SettingToggleRow: View {
