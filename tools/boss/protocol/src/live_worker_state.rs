@@ -27,6 +27,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ExecutionKind;
+
 /// Where a worker is in its life. The engine derives this from hook
 /// events arriving on the events socket; UI code maps it to a colour
 /// or icon variant. Order is roughly "earlier in the lifecycle" →
@@ -249,6 +251,126 @@ pub struct LiveWorkerState {
     /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_hosted: Option<bool>,
+    /// Badge type for the run (`"review"`, `"automation"`, `"design"`,
+    /// `"coding"`, `"answer"`), derived by the engine from the execution
+    /// kind via [`AgentType::for_execution`]. Kept a plain string on the
+    /// wire so a client that meets a value it does not know can render an
+    /// Unknown badge instead of failing to decode the whole snapshot —
+    /// parse with [`AgentType::parse`]. `None` for spawns outside the
+    /// work-item dispatch path and for payloads from an older engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// Project the dispatched work item belongs to. `None` means the work
+    /// is Unfiled (no project) — it is never guessed from the pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Display name of [`Self::project_id`]. `None` when the project is
+    /// unfiled or its row could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    /// Host the run executes on: `"local"` for this machine, otherwise the
+    /// registered remote host id. Explicit so membership never infers
+    /// locality from slot ranges or a hosting-mode boolean. `None` only for
+    /// spawns outside the dispatch path and for payloads from an older
+    /// engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    /// ISO-8601 (UTC) time the execution started. Sorts lexicographically,
+    /// so clients order by `(started_at, run_id)`. Re-adopted workers carry
+    /// the original execution start, not the adoption time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+}
+
+/// Host id of workers that run on this machine.
+pub const LOCAL_HOST_ID: &str = "local";
+
+/// Badge type of a live worker. A coarser view of [`ExecutionKind`] for
+/// display and filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentType {
+    Review,
+    Automation,
+    Design,
+    Coding,
+    Answer,
+}
+
+impl AgentType {
+    /// Wire value stamped on [`LiveWorkerState::agent_type`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentType::Review => "review",
+            AgentType::Automation => "automation",
+            AgentType::Design => "design",
+            AgentType::Coding => "coding",
+            AgentType::Answer => "answer",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]; `None` for a value this build does not
+    /// know, which callers surface as Unknown rather than dropping the row.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "review" => AgentType::Review,
+            "automation" => AgentType::Automation,
+            "design" => AgentType::Design,
+            "coding" => AgentType::Coding,
+            "answer" => AgentType::Answer,
+            _ => return None,
+        })
+    }
+
+    /// Map an execution to its badge type. The per-kind match is exhaustive
+    /// on purpose: a new [`ExecutionKind`] fails to compile here until it is
+    /// given a deliberate mapping.
+    ///
+    /// Precedence mirrors the engine's attributed-pool label: review kinds
+    /// win over everything, then `automation_triage`, then any other kind
+    /// whose work item was produced by an automation
+    /// (`has_source_automation`), and only then the kind's own type.
+    pub fn for_execution(kind: &ExecutionKind, has_source_automation: bool) -> Self {
+        let by_kind = match kind {
+            ExecutionKind::PrReview | ExecutionKind::PrReviewGuide => AgentType::Review,
+            ExecutionKind::AutomationTriage => AgentType::Automation,
+            ExecutionKind::ProjectDesign | ExecutionKind::ProductDesign => AgentType::Design,
+            ExecutionKind::TaskImplementation
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::RevisionImplementation
+            | ExecutionKind::InvestigationImplementation
+            | ExecutionKind::CiRemediation
+            | ExecutionKind::ConflictResolution => AgentType::Coding,
+            ExecutionKind::AnswerAgent => AgentType::Answer,
+        };
+        if has_source_automation && by_kind != AgentType::Review {
+            AgentType::Automation
+        } else {
+            by_kind
+        }
+    }
+}
+
+/// Membership and ordering metadata the engine stamps on a [`LiveWorkerState`]
+/// at spawn and again on adoption, carried alongside the pool/kind routing.
+/// Fields mirror the like-named `LiveWorkerState` fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveWorkerMetadata {
+    pub agent_type: Option<String>,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub host_id: Option<String>,
+    pub started_at: Option<String>,
+}
+
+impl LiveWorkerState {
+    /// Stamp the engine-resolved [`LiveWorkerMetadata`] onto this state.
+    pub fn apply_metadata(&mut self, metadata: LiveWorkerMetadata) {
+        self.agent_type = metadata.agent_type;
+        self.project_id = metadata.project_id;
+        self.project_name = metadata.project_name;
+        self.host_id = metadata.host_id;
+        self.started_at = metadata.started_at;
+    }
 }
 
 impl LiveWorkerState {
@@ -329,6 +451,11 @@ impl LiveWorkerState {
             kind,
             held: false,
             tmux_hosted,
+            agent_type: None,
+            project_id: None,
+            project_name: None,
+            host_id: None,
+            started_at: None,
         }
     }
 }
@@ -487,6 +614,11 @@ mod tests {
             kind: Some("task_implementation".into()),
             held: false,
             tmux_hosted: Some(true),
+            agent_type: Some("coding".into()),
+            project_id: Some("proj_1".into()),
+            project_name: Some("Dynamic Agents pane layout".into()),
+            host_id: Some("local".into()),
+            started_at: Some("2026-05-06T11:58:00Z".into()),
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();
@@ -541,6 +673,11 @@ mod tests {
             kind: None,
             held: false,
             tmux_hosted: None,
+            agent_type: None,
+            project_id: None,
+            project_name: None,
+            host_id: None,
+            started_at: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();
@@ -592,5 +729,83 @@ mod tests {
         assert!(state.tmux_hosted.is_none());
         let json = serde_json::to_string(&state).unwrap();
         assert!(!json.contains("tmux_hosted"), "json: {json}");
+    }
+    /// Every execution kind, with the badge type it must map to when the
+    /// work item has no automation source.
+    const KIND_TYPES: [(&str, AgentType); 12] = [
+        ("answer_agent", AgentType::Answer),
+        ("automation_triage", AgentType::Automation),
+        ("chore_implementation", AgentType::Coding),
+        ("ci_remediation", AgentType::Coding),
+        ("conflict_resolution", AgentType::Coding),
+        ("investigation_implementation", AgentType::Coding),
+        ("pr_review", AgentType::Review),
+        ("pr_review_guide", AgentType::Review),
+        ("product_design", AgentType::Design),
+        ("project_design", AgentType::Design),
+        ("revision_implementation", AgentType::Coding),
+        ("task_implementation", AgentType::Coding),
+    ];
+
+    #[test]
+    fn agent_type_maps_all_twelve_execution_kinds() {
+        for (wire, expected) in KIND_TYPES {
+            let kind: ExecutionKind = wire.parse().unwrap();
+            assert_eq!(AgentType::for_execution(&kind, false), expected, "{wire}");
+        }
+    }
+
+    #[test]
+    fn agent_type_automation_source_overrides_all_but_review() {
+        for (wire, plain) in KIND_TYPES {
+            let kind: ExecutionKind = wire.parse().unwrap();
+            let expected = if plain == AgentType::Review {
+                AgentType::Review
+            } else {
+                AgentType::Automation
+            };
+            assert_eq!(AgentType::for_execution(&kind, true), expected, "{wire}");
+        }
+    }
+
+    #[test]
+    fn agent_type_wire_values_round_trip_and_unknown_does_not_parse() {
+        for (_, ty) in KIND_TYPES {
+            assert_eq!(AgentType::parse(ty.as_str()), Some(ty));
+        }
+        assert_eq!(AgentType::parse("hologram"), None);
+    }
+
+    #[test]
+    fn metadata_fields_default_absent_and_are_omitted_from_json() {
+        let state = LiveWorkerState::new_spawning(1, "exec-1", "claude-opus-4-7", 0, None);
+        let json = serde_json::to_string(&state).unwrap();
+        for key in ["agent_type", "project_id", "project_name", "host_id", "started_at"] {
+            assert!(!json.contains(key), "{key} leaked into {json}");
+        }
+        let old: LiveWorkerState = serde_json::from_str(
+            r#"{"slot_id":1,"name":"Riker","run_id":"r","model":"opus","shell_pid":0,"activity":"idle"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.agent_type, None);
+        assert_eq!(old.host_id, None);
+        assert_eq!(old.started_at, None);
+    }
+
+    #[test]
+    fn apply_metadata_stamps_every_field() {
+        let mut state = LiveWorkerState::new_spawning(1, "exec-1", "m", 0, None);
+        state.apply_metadata(LiveWorkerMetadata {
+            agent_type: Some("review".into()),
+            project_id: Some("proj_9".into()),
+            project_name: Some("Nine".into()),
+            host_id: Some(LOCAL_HOST_ID.into()),
+            started_at: Some("2026-10-09T00:00:00Z".into()),
+        });
+        assert_eq!(state.agent_type.as_deref(), Some("review"));
+        assert_eq!(state.project_id.as_deref(), Some("proj_9"));
+        assert_eq!(state.project_name.as_deref(), Some("Nine"));
+        assert_eq!(state.host_id.as_deref(), Some("local"));
+        assert_eq!(state.started_at.as_deref(), Some("2026-10-09T00:00:00Z"));
     }
 }

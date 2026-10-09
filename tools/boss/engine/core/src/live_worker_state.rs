@@ -13,7 +13,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use boss_protocol::{ExecutionKind, LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity, WorkerEvent};
+use boss_protocol::{
+    ExecutionKind, LiveWorkerMetadata, LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity,
+    WorkerEvent,
+};
 
 use crate::driver::ProgressFidelity;
 use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, next_tool_condition};
@@ -59,6 +62,9 @@ pub struct LiveSpawnRouting {
     /// tmux hosting isn't meaningful — e.g. remote workers, which have no
     /// local pane.
     pub tmux_hosted: Option<bool>,
+    /// Badge type, project, host, and start-time stamps. Empty for tests and
+    /// spawn paths without a work item.
+    pub metadata: LiveWorkerMetadata,
 }
 
 impl LiveSpawnRouting {
@@ -75,6 +81,7 @@ impl LiveSpawnRouting {
             pool: Some(pool.into()),
             kind: Some(kind.into()),
             tmux_hosted: None,
+            metadata: LiveWorkerMetadata::default(),
         }
     }
 
@@ -85,7 +92,14 @@ impl LiveSpawnRouting {
             pool,
             kind: Some(kind.into()),
             tmux_hosted: Some(tmux_hosted),
+            metadata: LiveWorkerMetadata::default(),
         }
+    }
+
+    /// Attach the engine-resolved metadata (see `live_worker_metadata`).
+    pub fn with_metadata(mut self, metadata: LiveWorkerMetadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 }
 
@@ -594,6 +608,7 @@ impl LiveWorkerStateRegistry {
             routing.kind,
             routing.tmux_hosted,
         );
+        state.apply_metadata(routing.metadata);
         // Persona DB work stays outside the registry lock: dispatch holds the
         // DB connection while calling `is_run_live`, so the reverse order
         // could deadlock.
@@ -757,6 +772,16 @@ impl LiveWorkerStateRegistry {
                     // every live-state field (including an operator hold) rather
                     // than replacing it with the freshly-spawned fiction.
                     entry.meta.driver_start_expectation = DriverStartExpectation::Readopted;
+                    // Backfill (never overwrite) metadata the retained state
+                    // lacks, so a worker first registered without it still
+                    // gains type/project/host/start once a path can supply it.
+                    let state = &mut entry.state;
+                    let supplied = routing.metadata.clone();
+                    state.agent_type = state.agent_type.take().or(supplied.agent_type);
+                    state.project_id = state.project_id.take().or(supplied.project_id);
+                    state.project_name = state.project_name.take().or(supplied.project_name);
+                    state.host_id = state.host_id.take().or(supplied.host_id);
+                    state.started_at = state.started_at.take().or(supplied.started_at);
                     let repaired_shell_pid = (shell_pid > 0 && shell_pid != entry.state.shell_pid).then(|| {
                         let previous_shell_pid = entry.state.shell_pid;
                         entry.state.shell_pid = shell_pid;

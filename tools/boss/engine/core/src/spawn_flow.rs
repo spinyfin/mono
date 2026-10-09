@@ -565,6 +565,11 @@ pub struct StartWorkerInput {
     /// unless `worker_kind` is [`WorkerKind::AnswerAgent`].
     #[builder(default)]
     pub checkout_positioned_on_pr_head: bool,
+    /// Badge type, project, host, and start-time stamps for the resulting
+    /// `LiveWorkerState`. Production dispatch resolves these from the
+    /// execution; tests may leave them empty.
+    #[builder(default)]
+    pub live_metadata: boss_protocol::LiveWorkerMetadata,
 }
 
 #[derive(Debug)]
@@ -999,7 +1004,8 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             // non-empty snake_case kind, tests that leave the field at a
             // placeholder still surface it on the wire. Pool may be
             // `None` for tests that never set `StartWorkerInput.pool`.
-            crate::live_worker_state::LiveSpawnRouting::new_with_hosting(input.pool, input.execution_kind, true),
+            crate::live_worker_state::LiveSpawnRouting::new_with_hosting(input.pool, input.execution_kind, true)
+                .with_metadata(input.live_metadata),
         );
         // Declare this slot's driver-reported progress fidelity so
         // `stale_worker_sweep` judges cadence-based staleness against the
@@ -1116,6 +1122,7 @@ mod tests {
             is_review_supervisor: false,
             is_post_merge_reviewer: false,
             checkout_positioned_on_pr_head: false,
+            live_metadata: Default::default(),
         }
     }
 

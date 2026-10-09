@@ -104,6 +104,7 @@ pub mod ladder_lease_registry;
 pub(crate) mod libproc;
 pub mod live_status;
 pub mod live_status_loop;
+pub(crate) mod live_worker_metadata;
 pub mod live_worker_state;
 pub mod lost_workspace_sweep;
 pub mod materializer;
