@@ -186,11 +186,10 @@ pub(crate) struct TestHooks {
 #[derive(Default)]
 struct PendingHooks {
     driver_signal_at: Option<i64>,
-    /// Event kind of the first driver hook received for this registration's
-    /// run. Diagnostic-only (it appears in spawn-confirmation failure logs):
-    /// first-write-wins, keyed by `run_id`, and reset whenever the slot is
-    /// re-registered. It is independent of `driver_signal_at` and plays no
-    /// part in reap fencing — never use it as proof the driver started.
+    /// First driver hook event kind seen before the slot was registered.
+    /// Buffered here while the run is armed, then transferred into
+    /// `SlotMeta::first_hook_event` (and removed from this buffer) at
+    /// registration. First-write-wins; diagnostic-only.
     first_hook_event: Option<String>,
 }
 
@@ -298,6 +297,11 @@ struct SlotMeta {
     /// pid as evidence of a working worker is what the 2026-07-30
     /// incident walked through untouched.
     driver_signal_at: Option<i64>,
+    /// Event kind of the first driver hook received for this registration's
+    /// run. Diagnostic-only (it appears in spawn-confirmation failure logs):
+    /// first-write-wins, keyed by `run_id`, and reset whenever the slot is
+    /// re-registered. It is independent of `driver_signal_at` and plays no
+    /// part in reap fencing — never use it as proof the driver started.
     first_hook_event: Option<String>,
     /// Whether this registration is a newly spawned pane or an adopted
     /// existing worker. [`DriverStartExpectation::Readopted`] still subjects

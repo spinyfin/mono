@@ -52,9 +52,18 @@ struct CapturingSpawner {
     /// When true, `capture-pane` stamps a driver-signal so the turn-start
     /// wait can succeed in tests.
     auto_confirm_turn: std::sync::atomic::AtomicBool,
-    /// When set, `capture-pane -S` (history) returns this text while the
-    /// visible-screen capture stays empty: the banner has scrolled off.
+    /// When set, the history capture (`capture-pane -S -2000`) returns this
+    /// text while the visible-screen capture returns `visible_text` (empty by
+    /// default): the banner has scrolled off.
     history_only_text: StdMutex<Option<String>>,
+    /// Text returned by the plain visible `capture-pane` when
+    /// `history_only_text` is set.
+    visible_text: StdMutex<String>,
+    /// When true, the history capture never completes.
+    history_stalls: std::sync::atomic::AtomicBool,
+    /// One entry per `capture-pane`: true for a history read, false for a
+    /// visible read.
+    capture_log: StdMutex<Vec<bool>>,
     /// When true, `new-session` delivers a hook for every registered or
     /// pending run, i.e. before the live-state slot is registered.
     hook_before_registration: std::sync::atomic::AtomicBool,
@@ -72,6 +81,9 @@ impl CapturingSpawner {
             pane_chrome: std::sync::atomic::AtomicBool::new(false),
             auto_confirm_turn: std::sync::atomic::AtomicBool::new(false),
             history_only_text: StdMutex::new(None),
+            visible_text: StdMutex::new(String::new()),
+            history_stalls: std::sync::atomic::AtomicBool::new(false),
+            capture_log: StdMutex::new(Vec::new()),
             hook_before_registration: std::sync::atomic::AtomicBool::new(false),
             cancel_on_capture: StdMutex::new(None),
         }
@@ -173,8 +185,22 @@ impl CommandRunner for CapturingSpawner {
                     }
                 }
                 let history_only = self.history_only_text.lock().unwrap().clone();
+                // Every command carries the explicit `-S <socket>` global, so
+                // history is identified by the `-S -2000` pair that follows
+                // the `capture-pane` subcommand, never a bare `-S`.
+                let after_subcommand = args
+                    .iter()
+                    .position(|arg| arg == "capture-pane")
+                    .map_or(&[][..], |i| &args[i..]);
+                let is_history = after_subcommand
+                    .windows(2)
+                    .any(|pair| pair[0] == "-S" && pair[1] == "-2000");
+                self.capture_log.lock().unwrap().push(is_history);
                 if let Some(text) = history_only {
-                    if args.iter().any(|arg| arg == "-S") {
+                    if is_history {
+                        if self.history_stalls.load(std::sync::atomic::Ordering::SeqCst) {
+                            std::future::pending::<()>().await;
+                        }
                         return Ok(CommandOutput {
                             success: true,
                             code: Some(0),
@@ -182,7 +208,12 @@ impl CommandRunner for CapturingSpawner {
                             stderr: String::new(),
                         });
                     }
-                    ""
+                    return Ok(CommandOutput {
+                        success: true,
+                        code: Some(0),
+                        stdout: self.visible_text.lock().unwrap().clone(),
+                        stderr: String::new(),
+                    });
                 } else if self.pane_chrome.load(std::sync::atomic::Ordering::SeqCst) {
                     "Claude Code\n"
                 } else {
@@ -2426,6 +2457,10 @@ async fn spawn_confirmation_finds_banner_that_only_exists_in_scrollback() {
     let msg = result.expect_err("no hook, so turn start must fail").to_string();
     assert!(msg.contains("no driver hook or session event"), "{msg}");
     assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+    // Banner is absent from the visible screen, so only the history read can
+    // have supplied it; removing the fallback leaves composer never ready.
+    let log = spawner.capture_log.lock().unwrap().clone();
+    assert_eq!(&log[..2], [false, true], "visible read must miss, then history is read");
 }
 
 #[tokio::test]
@@ -2469,5 +2504,23 @@ async fn spawn_confirmation_passes_on_a_hook_delivered_before_registration() {
     assert_eq!(
         spawner.live_states.first_hook_event_for_run("exec-test-1").as_deref(),
         Some("SessionStart")
+    );
+}
+
+#[tokio::test]
+async fn visible_capture_snapshot_survives_a_stalled_history_capture() {
+    let spawner = Arc::new(CapturingSpawner::new());
+    *spawner.history_only_text.lock().unwrap() = Some("never returned".to_owned());
+    *spawner.visible_text.lock().unwrap() = "bash: claude: command not found\n".to_owned();
+    spawner.history_stalls.store(true, std::sync::atomic::Ordering::SeqCst);
+    let tmux = Tmux::with_runner_and_socket("/fake/tmux", spawner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap();
+    let snapshot = std::sync::Mutex::new(String::from("older snapshot"));
+    let probe = capture_shows_driver_ready(&tmux, "boss-test-worker", None, &snapshot);
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(50), probe).await;
+    assert!(outcome.is_err(), "history capture stalls until the deadline");
+    assert_eq!(
+        *snapshot.lock().unwrap(),
+        "bash: claude: command not found\n",
+        "visible text must be retained as failure evidence",
     );
 }

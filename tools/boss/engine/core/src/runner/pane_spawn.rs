@@ -1388,7 +1388,7 @@ async fn confirm_local_spawn(
     composer_timeout: StdDuration,
     turn_timeout: StdDuration,
 ) -> Result<()> {
-    use super::spawn_confirmation::{SPAWN_CONFIRM_POLL, confirm_spawn_started, pane_shows_driver_ready};
+    use super::spawn_confirmation::{SPAWN_CONFIRM_POLL, confirm_spawn_started};
 
     let driver_name = driver.descriptor().name;
     let spec = driver.pane_monitor_spec();
@@ -1403,28 +1403,7 @@ async fn confirm_local_spawn(
         turn_timeout,
         SPAWN_CONFIRM_POLL,
         || async {
-            // Visible screen first: it is cheap and is the common hit. The
-            // 2000-line history capture only runs when the screen misses
-            // (banner scrolled off by a long prompt or early tool output).
-            let tmux = tmux_host.tmux();
-            let session = tmux_host.session_name();
-            let mut pane_text = tmux.capture_pane(session).await.unwrap_or_default();
-            let ready = |text: &str| spec.as_ref().is_some_and(|spec| pane_shows_driver_ready(text, spec));
-            let mut shows_ready = ready(&pane_text);
-            if !shows_ready && let Ok(history) = tmux.capture_pane_with_history(session).await {
-                shows_ready = ready(&history);
-                pane_text = history;
-            }
-            // Bound diagnostic text without splitting UTF-8 characters.
-            *last_capture.lock().expect("capture mutex poisoned") = pane_text
-                .chars()
-                .rev()
-                .take(4096)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            shows_ready
+            capture_shows_driver_ready(tmux_host.tmux(), tmux_host.session_name(), spec.as_ref(), &last_capture).await
         },
         || async { live_states.is_some_and(|registry| registry.has_driver_signal_for_run(run_id)) },
     )
@@ -1436,6 +1415,47 @@ async fn confirm_local_spawn(
             "spawn confirmation evidence at failure");
     }
     result
+}
+
+/// Keep the last `4096` characters of `text` as the failure-diagnostics
+/// snapshot, without splitting UTF-8 characters.
+fn store_capture_snapshot(snapshot: &std::sync::Mutex<String>, text: &str) {
+    let bounded: String = text
+        .chars()
+        .rev()
+        .take(4096)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    *snapshot.lock().expect("capture mutex poisoned") = bounded;
+}
+
+/// One composer-readiness probe. The visible screen is read first (cheap,
+/// the common hit); the 2000-line history capture runs only when the screen
+/// misses (banner scrolled off by a long prompt or early tool output).
+/// `snapshot` is updated right after each *successful* capture, before the
+/// next command is awaited, so a stalled history read cannot lose the visible
+/// text, and a failed capture never erases an earlier good snapshot.
+async fn capture_shows_driver_ready(
+    tmux: &boss_tmux::Tmux,
+    session: &str,
+    spec: Option<&boss_protocol::PaneMonitorSpec>,
+    snapshot: &std::sync::Mutex<String>,
+) -> bool {
+    use super::spawn_confirmation::pane_shows_driver_ready;
+    let ready = |text: &str| spec.is_some_and(|spec| pane_shows_driver_ready(text, spec));
+    if let Ok(visible) = tmux.capture_pane(session).await {
+        store_capture_snapshot(snapshot, &visible);
+        if ready(&visible) {
+            return true;
+        }
+    }
+    if let Ok(history) = tmux.capture_pane_with_history(session).await {
+        store_capture_snapshot(snapshot, &history);
+        return ready(&history);
+    }
+    false
 }
 
 /// The shell's background tier is inherited by drivers and build tools,
