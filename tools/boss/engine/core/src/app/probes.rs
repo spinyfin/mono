@@ -633,7 +633,13 @@ impl ServerState {
         transcript_path: Option<String>,
         offset_bytes: u64,
     ) -> Option<PendingProbe> {
-        // Submitted probes retain their reply snapshots while a new claim owns delivery.
+        // A held slot only blocks this claim while its write is still in
+        // progress (`Queued`/`Injected`) — that is the duplicate-delivery
+        // protection. A probe already *submitted* merely awaits its reply at
+        // the next turn boundary, and this claim interrupts that very reply
+        // turn, so the reply it was waiting for will never be produced as
+        // such. Read the lifecycle before taking the slot lock and re-verify
+        // the holder under it.
         let submitted_holder = self.in_flight_probe_id(run_id).filter(|held| {
             self.probe_lifecycle_state(held)
                 .is_some_and(awaits_reply_after_submission)
