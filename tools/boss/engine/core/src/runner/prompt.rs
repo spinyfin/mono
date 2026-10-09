@@ -475,6 +475,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         prompt.push_str(&worker_escalation_protocol_directive(
             worker_signal_proposals_seam_enabled,
         ));
+        prompt.push_str(&worker_wait_protocol_directive());
         // Teach chore/task workers the `[deferred-scope]` marker so a
         // deliberate scope narrowing is recorded, not just claimed in prose
         // ("filed as a followup") that nothing actually tracks (root cause:
@@ -629,7 +630,7 @@ pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done
          - If a CI workflow file exists (`.github/workflows/*.yml`), open it and mirror the exact bazel target set it builds/tests (these repos typically run `bazel build //...` or a curated rollup). Run that same command locally so your gate matches what CI will enforce.\n\
          {clean_bullet}\
          \n\
-         Run every long-running build-class command (Bazel, checkleft, tests, etc.) in the FOREGROUND and read its exit code directly. For a tool that yields a session, FOREGROUND means keep polling that session until it returns `exit_code`; it does not mean issue one invocation and discard its session handle. Do NOT background one with a trailing shell `&` or a backgrounded/asynchronous invocation and then idle in a self-paced wait-loop \"until the gate is green\". If the command wedges (host contention, a hung toolchain), a self-paced wait-loop never terminates and you strand your slot. {timeout_clause} To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.\n\
+         Prefer to run every long-running build-class command (Bazel, checkleft, tests, etc.) in the FOREGROUND and read its exit code directly. For a tool that yields a session, FOREGROUND means keep polling that session until it returns `exit_code`; it does not mean issue one invocation and discard its session handle. If you instead background one (a trailing shell `&` or a backgrounded/asynchronous invocation), you MUST run `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` before ending your turn, and must not idle in a self-paced wait-loop \"until the gate is green\" without one. A wait-loop with no declared bound never terminates if the command wedges (host contention, a hung toolchain) and strands your slot. {timeout_clause} To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.\n\
          \n\
          {failure_sentence}"
     )
@@ -676,7 +677,7 @@ pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String 
          Required BEFORE you push (step 4):\n\
          - Regenerate any generated/lock artifact the rebase invalidated and include it in your commit. The common one is `MODULE.bazel.lock`: run `bazel mod deps --lockfile_mode=update` (or build any target, which refreshes it) and stage the result.\n\
          - `bazel build` the targets your resolution touched AND the targets the rebased-in upstream change touches. Use `bazel query` to resolve labels if unsure. The merged code MUST COMPILE — a conflict resolution that does not build is wrong and must not be pushed.\n\
-         - Run the build in the FOREGROUND with a timeout (e.g. `timeout 1800 bazel build <targets>`) and read its exit code directly. Do NOT background it and idle in a wait-loop.\n\
+         - Run the build in the FOREGROUND with a timeout (e.g. `timeout 1800 bazel build <targets>`) and read its exit code directly. If you background it instead, declare the wait with `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` before ending your turn; never idle in a wait-loop without one.\n\
          \n\
          Then PUSH (step 4) as soon as the build is clean. Do NOT block the push on a full `bazel test //...`.\n\
          \n\
@@ -978,6 +979,25 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      work when `\"$BOSS_BIN\" propose` itself is down, so it carries both signal kinds rather than teaching \
      a second marker grammar back. Do not use it once `\"$BOSS_BIN\" propose` has already succeeded for this \
      signal; it is a last resort, not a second channel.\n"
+        .to_string()
+}
+
+/// Teach the worker the structured wait verb so a legitimate background
+/// build/test wait is declared instead of narrated in prose. The produce-a-PR
+/// nudge probe repeats the same command; this prompt copy is the earlier
+/// teaching so the worker can declare before the first Stop.
+fn worker_wait_protocol_directive() -> String {
+    "\n## If you are waiting on a long-running job\n\n\
+     If you are legitimately waiting on a background build, test gate, or similar job, \
+     run this command rather than ending the turn in prose:\n\n\
+     ```\n\
+     \"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>\n\
+     ```\n\n\
+     `--duration` is required (for example `30m` or `2h`; the engine caps a single wait at 2 hours). \
+     Optionally pass `--waiting-on <task-id|pid|file>`. Re-running renews the wait. An unexpired \
+     wait holds the produce-a-PR nudge ladder and the nudge circuit breaker; it does not pause \
+     the stale-worker reap or other safety checks. After expiry, normal nudging resumes. Total \
+     wait-extension per execution is also capped.\n"
         .to_string()
 }
 

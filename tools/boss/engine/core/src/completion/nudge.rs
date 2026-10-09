@@ -87,6 +87,47 @@ impl WorkerCompletionHandler {
                 .await;
             return StopOutcome::EscalationPending { reason };
         }
+        // Worker-declared wait (`boss propose wait`): a structured, bounded
+        // "I am deliberately waiting" signal. Holds the produce-a-PR nudge
+        // and the circuit breaker until expiry. Does not pause the stale
+        // worker reap or other safety checks. Checked before the breaker so
+        // a suppressed Stop never burns the cap. The recurring recheck
+        // (NudgeHold::WorkerWait) is what resumes the ladder after expiry
+        // without requiring another unsolicited Stop.
+        if let Some(wait) = self
+            .wait_registry
+            .active(&execution.id, boss_engine_utils::epoch_time::now_epoch_secs())
+        {
+            self.background_children_tracker.record_intent(
+                &execution.id,
+                BackgroundNudgeIntent {
+                    probe_text: probe_text.to_owned(),
+                    fingerprint: fingerprint.to_owned(),
+                    bound_pr_url: bound_pr_url.map(str::to_owned),
+                    proceed_outcome: proceed_outcome.clone(),
+                    activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
+                    hold: NudgeHold::WorkerWait,
+                },
+            );
+            tracing::info!(
+                execution_id = %execution.id,
+                reason = %wait.reason,
+                expires_at_epoch = wait.expires_at_epoch,
+                "auto-nudge: suppressed — worker declared an unexpired wait (breaker not consulted, no probe queued)"
+            );
+            self.publisher
+                .publish(
+                    &execution.id,
+                    &execution.work_item_id,
+                    execution.status.as_str(),
+                    "worker_wait_pending",
+                )
+                .await;
+            return StopOutcome::WorkerWaitPending {
+                reason: wait.reason,
+                expires_at_epoch: wait.expires_at_epoch,
+            };
+        }
         // Build-wait suppression (2026-07-14 log-volume incident): a
         // worker narrating that it is legitimately waiting on a
         // backgrounded build/test gate must not be nudged — each nudge
@@ -333,6 +374,7 @@ impl WorkerCompletionHandler {
                 | StopOutcome::BuildWaitPending { .. }
                 | StopOutcome::EscalationPending { .. }
                 | StopOutcome::Held { .. }
+                | StopOutcome::WorkerWaitPending { .. }
         )
     }
 
@@ -387,10 +429,11 @@ impl WorkerCompletionHandler {
                 // the only thing left that can re-drive it. So re-record
                 // against the CURRENT watermark and defer — activity defers,
                 // quiescence advances.
-                NudgeHold::Debounced => {
+                NudgeHold::Debounced | NudgeHold::WorkerWait => {
                     tracing::debug!(
                         execution_id,
-                        "auto-nudge: debounced nudge deferred another interval — worker ran a tool \
+                        hold = ?intent.hold,
+                        "auto-nudge: held nudge deferred another interval — worker ran a tool \
                          since the hold; re-recording the intent against the new watermark rather \
                          than retiring it",
                     );
@@ -460,6 +503,20 @@ impl WorkerCompletionHandler {
         }
 
         let hold = intent.hold;
+        if hold == NudgeHold::WorkerWait {
+            let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+            if let Some(wait) = self.wait_registry.active(execution_id, now_epoch_secs) {
+                tracing::debug!(
+                    execution_id,
+                    expires_at_epoch = wait.expires_at_epoch,
+                    "auto-nudge: recurring wait recheck unchanged — still suppressed, no republish"
+                );
+                return Some(StopOutcome::WorkerWaitPending {
+                    reason: wait.reason,
+                    expires_at_epoch: wait.expires_at_epoch,
+                });
+            }
+        }
         // A `Debounced` hold re-driven while the worker is mid-turn (e.g. a
         // single long tool call such as `bazel test`) must not advance the
         // ladder. `activity_watermark` only moves on PostToolUse, so it is
@@ -469,7 +526,7 @@ impl WorkerCompletionHandler {
         // that is still genuinely working. Same signal the staged-PR reap
         // path uses; returns false when no registry is wired, so unit tests
         // that do not model live activity are unaffected.
-        if hold == NudgeHold::Debounced && self.observed_mid_turn(execution_id) {
+        if matches!(hold, NudgeHold::Debounced | NudgeHold::WorkerWait) && self.observed_mid_turn(execution_id) {
             tracing::debug!(
                 execution_id,
                 "auto-nudge: debounced nudge deferred another interval — worker is mid-turn \
@@ -500,6 +557,7 @@ impl WorkerCompletionHandler {
                 | StopOutcome::BuildWaitPending { .. }
                 | StopOutcome::EscalationPending { .. }
                 | StopOutcome::Held { .. }
+                | StopOutcome::WorkerWaitPending { .. }
                 | StopOutcome::NudgeDebounced
         ) {
             self.background_children_tracker.forget_intent(execution_id);
@@ -522,7 +580,12 @@ impl WorkerCompletionHandler {
         // clobber that tag. `NudgeDebounced` is already re-recorded by
         // `nudge_or_park` itself. Only a probe that actually advanced the
         // ladder needs the retention re-record.
-        if hold == NudgeHold::Debounced && Self::nudge_queued_a_probe(&outcome) {
+        // An expired `WorkerWait` hold reaches here by the same route (the
+        // wait lapsed while the worker sat idle, so no further Stop is
+        // coming) and needs the same retention; the retained intent keeps its
+        // `WorkerWait` tag, so a fresh declaration still suppresses it.
+        let retained_hold = matches!(hold, NudgeHold::Debounced | NudgeHold::WorkerWait);
+        if retained_hold && Self::nudge_queued_a_probe(&outcome) {
             self.background_children_tracker.record_intent(
                 execution_id,
                 BackgroundNudgeIntent {
@@ -540,7 +603,7 @@ impl WorkerCompletionHandler {
             // breaker counts it as an unproductive nudge the worker was
             // never actually shown.
             self.probe_queuer.deliver_queued_probes_now(execution_id);
-            if hold == NudgeHold::Debounced {
+            if retained_hold {
                 NUDGE_LADDER_SWEEP_ADVANCED.inc(&self.metrics);
                 tracing::warn!(
                     execution_id,

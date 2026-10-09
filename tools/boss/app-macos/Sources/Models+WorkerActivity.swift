@@ -58,6 +58,45 @@ struct WorkerLiveState {
     /// local tmux identity. `false` is a local invariant failure (the
     /// durable tmux stamp is missing), not a supported hosting mode.
     let tmuxHosted: Bool?
+    /// Reason the worker declared via `boss propose wait`, if an unexpired
+    /// wait is currently holding the produce-a-PR nudge ladder.
+    let waitReason: String?
+    /// ISO-8601 expiry of that wait, when one is set.
+    let waitExpiresAt: String?
+
+    init(
+        name: String? = nil,
+        slotId: Int,
+        runId: String,
+        model: String,
+        shellPid: Int32,
+        lastEventAt: String?,
+        currentTool: String?,
+        lastToolEndedAt: String?,
+        activity: WorkerActivity,
+        liveStatus: String?,
+        liveStatusAt: String?,
+        recoveryStatus: String?,
+        tmuxHosted: Bool?,
+        waitReason: String? = nil,
+        waitExpiresAt: String? = nil
+    ) {
+        self.name = name
+        self.slotId = slotId
+        self.runId = runId
+        self.model = model
+        self.shellPid = shellPid
+        self.lastEventAt = lastEventAt
+        self.currentTool = currentTool
+        self.lastToolEndedAt = lastToolEndedAt
+        self.activity = activity
+        self.liveStatus = liveStatus
+        self.liveStatusAt = liveStatusAt
+        self.recoveryStatus = recoveryStatus
+        self.tmuxHosted = tmuxHosted
+        self.waitReason = waitReason
+        self.waitExpiresAt = waitExpiresAt
+    }
 
     /// False when two entries share a `runId` or a `slotId`. A snapshot
     /// that fails this is malformed; callers must reject it rather than
@@ -99,6 +138,8 @@ extension WorkerLiveState: Hashable {
             && lhs.liveStatusAt == rhs.liveStatusAt
             && lhs.recoveryStatus == rhs.recoveryStatus
             && lhs.tmuxHosted == rhs.tmuxHosted
+            && lhs.waitReason == rhs.waitReason
+            && lhs.waitExpiresAt == rhs.waitExpiresAt
     }
 
     func hash(into hasher: inout Hasher) {
@@ -113,6 +154,8 @@ extension WorkerLiveState: Hashable {
         hasher.combine(liveStatusAt)
         hasher.combine(recoveryStatus)
         hasher.combine(tmuxHosted)
+        hasher.combine(waitReason)
+        hasher.combine(waitExpiresAt)
     }
 }
 
@@ -216,7 +259,9 @@ enum AgentActivityState: Equatable {
             case .waitingForInput:
                 self = .waiting(reason: "Waiting on user input")
             case .idle:
-                if let recovering = liveState.recoveryStatus, !recovering.isEmpty {
+                if let waitReason = liveState.waitReason, !waitReason.isEmpty {
+                    self = .waiting(reason: Self.waitCaption(liveState))
+                } else if let recovering = liveState.recoveryStatus, !recovering.isEmpty {
                     self = .waiting(reason: recovering)
                 } else {
                     self = .waiting(reason: "Worker idle between turns")
@@ -278,6 +323,9 @@ enum AgentActivityState: Equatable {
         if liveState?.activity == .waitingForInput {
             return .waiting(reason: "Waiting on user input")
         }
+        if let liveState, let reason = liveState.waitReason, !reason.isEmpty {
+            return .waiting(reason: waitCaption(liveState))
+        }
         if liveState?.activity == .spawning {
             return .unknown(reason: "Worker state not yet reported")
         }
@@ -294,6 +342,14 @@ enum AgentActivityState: Equatable {
             return .waiting(reason: "AI review in progress")
         }
         return AgentActivityState(runtime: runtime, liveState: liveState)
+    }
+
+    static func waitCaption(_ liveState: WorkerLiveState) -> String {
+        let reason = liveState.waitReason ?? "long-running job"
+        if let expiry = liveState.waitExpiresAt, !expiry.isEmpty {
+            return "Waiting: \(reason) (until \(expiry))"
+        }
+        return "Waiting: \(reason)"
     }
 
     var tooltip: String {

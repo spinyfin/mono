@@ -48,6 +48,7 @@ impl WorkerCompletionHandler {
             background_children_horizon_secs: crate::background_children::DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS,
             run_done_silence_tracker: Arc::new(BuildWaitTracker::new()),
             hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
+            wait_registry: Arc::new(crate::wait_registry::WaitRegistry::new()),
             teardown_registry: Arc::new(crate::teardown_registry::TeardownRegistry::new()),
             max_review_cycles: crate::config::DEFAULT_MAX_REVIEW_CYCLES,
             min_review_changed_lines: crate::config::DEFAULT_MIN_REVIEW_CHANGED_LINES,
@@ -210,6 +211,14 @@ impl WorkerCompletionHandler {
     /// [`crate::stale_worker_sweep::run_one_pass`].
     pub fn with_hold_registry(mut self, registry: Arc<crate::hold_registry::HoldRegistry>) -> Self {
         self.hold_registry = registry;
+        self
+    }
+
+    /// Wire an externally-owned [`crate::wait_registry::WaitRegistry`] into
+    /// this handler. `app.rs` shares one instance with the SubmitProposal
+    /// RPC so a wait granted on the verb is visible at the next Stop.
+    pub fn with_wait_registry(mut self, registry: Arc<crate::wait_registry::WaitRegistry>) -> Self {
+        self.wait_registry = registry;
         self
     }
 

@@ -549,6 +549,8 @@ struct ServerStateOverrides {
     /// Test-injected source-packet collector. `None` uses the GitHub-backed
     /// default on the completion handler.
     source_packet_collector: Option<crate::review_guide_capture::SourcePacketCollector>,
+    /// Fake PR detector. `None` uses `CommandPrDetector` (shells out to `gh`).
+    pr_detector: Option<Arc<dyn PrDetector>>,
 }
 
 #[derive(bon::Builder)]
@@ -636,6 +638,12 @@ struct ServerState {
     /// [`crate::hold_registry`].
     #[builder(default)]
     hold_registry: Arc<crate::hold_registry::HoldRegistry>,
+    /// Worker-declared waits (`boss propose wait`) that hold the produce-a-PR
+    /// nudge ladder until expiry. Shared with the completion handler so Stop
+    /// and the recurring recheck consult the same grants. See
+    /// [`crate::wait_registry`].
+    #[builder(default)]
+    wait_registry: Arc<crate::wait_registry::WaitRegistry>,
     /// In-flight completion-teardown marks, shared with the completion
     /// handler so [`crate::terminal_work_sweep`] (wired in
     /// `app::server::serve`) never reclaims a pane whose own teardown is
@@ -1138,6 +1146,7 @@ impl ServerState {
             worker_registry: worker_registry_override,
             branch_verifier: branch_verifier_override,
             source_packet_collector: source_packet_collector_override,
+            pr_detector: pr_detector_override,
         } = overrides;
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
@@ -1261,7 +1270,8 @@ impl ServerState {
         let publisher: Arc<dyn ExecutionPublisher> = publisher_impl.clone();
         let cube_client: Arc<dyn CubeClient> =
             cube_client_override.unwrap_or_else(|| Arc::new(CommandCubeClient::new(cfg.clone())));
-        let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
+        let pr_detector: Arc<dyn PrDetector> =
+            pr_detector_override.unwrap_or_else(|| Arc::new(CommandPrDetector::new()));
         // The pane releaser and probe queuer both need a Weak<ServerState>
         // to call back into ServerState methods, so they're late-bound
         // after the Arc<ServerState> exists. Same pattern as
@@ -1432,6 +1442,8 @@ impl ServerState {
         let live_worker_states_for_completion = live_worker_states.clone();
         let hold_registry = Arc::new(crate::hold_registry::HoldRegistry::new());
         let hold_registry_for_state = hold_registry.clone();
+        let wait_registry = Arc::new(crate::wait_registry::WaitRegistry::new());
+        let wait_registry_for_state = wait_registry.clone();
         // ONE teardown registry shared by the completion handler (which
         // marks a teardown in flight before it terminalizes an execution)
         // and `terminal_work_sweep` (which must not reclaim a marked pane).
@@ -1463,6 +1475,7 @@ impl ServerState {
             crate::background_children::RegistryBackgroundActivityProbe::new(live_worker_states_for_completion.clone()),
         ))
         .with_hold_registry(hold_registry)
+        .with_wait_registry(wait_registry)
         .with_teardown_registry(teardown_registry)
         .with_review_pool_size(cfg.work.review_pool_size);
         if let Some(branch_verifier) = branch_verifier_override {
@@ -1610,6 +1623,7 @@ impl ServerState {
                 }))
                 .live_worker_states(live_worker_states)
                 .hold_registry(hold_registry_for_state)
+                .wait_registry(wait_registry_for_state)
                 .teardown_registry(teardown_registry_for_state)
                 .spawn_health(Arc::new(
                     crate::spawn_health::SpawnHealthTracker::new()

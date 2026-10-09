@@ -265,6 +265,9 @@ impl WorkerCompletionHandler {
             // An operator explicitly held this execution; nothing about
             // the CI attempt changes while held — mirrors EscalationPending.
             StopOutcome::Held { .. } => false,
+            // Worker declared a time-bounded wait; the auto-nudge is
+            // suppressed, not the attempt marked failed — mirrors Held.
+            StopOutcome::WorkerWaitPending { .. } => false,
             // Signal was already cleared before this worker ran — the
             // attempt has been marked succeeded by try_retire_cleared_blocking_signal.
             StopOutcome::SignalAlreadyCleared { .. } => false,

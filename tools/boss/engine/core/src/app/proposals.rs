@@ -43,7 +43,9 @@
 use super::*;
 
 use boss_engine_proposal_validation::{derive_idempotency_key, validate_caller_idempotency_key, validate_payload};
-use boss_protocol::{ProposalErrorCode, ProposalKind, ProposalSubmissionError};
+use boss_protocol::{
+    ProposalErrorCode, ProposalFieldError, ProposalKind, ProposalSubmissionError, WaitProposalPayload,
+};
 
 use crate::metrics::Registry;
 use crate::work::{SubmitWorkerProposalInput, SubmitWorkerProposalOutcome};
@@ -107,6 +109,11 @@ crate::register_counter!(
     "SubmitProposal accepted a proposal of kind `run_done` — a worker declared its run finished.",
 );
 crate::register_counter!(
+    PROPOSAL_SUBMITTED_WAIT,
+    "worker_proposals.submitted.wait",
+    "SubmitProposal accepted a proposal of kind `wait` — a worker declared a time-bounded wait.",
+);
+crate::register_counter!(
     PROPOSAL_VALIDATION_FAILED,
     "worker_proposals.validation_failed",
     "SubmitProposal rejected a submission for ProposalErrorCode::ValidationFailed (payload schema).",
@@ -137,6 +144,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_REPORT);
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_VERDICT);
     registry.register_counter(&PROPOSAL_SUBMITTED_RUN_DONE);
+    registry.register_counter(&PROPOSAL_SUBMITTED_WAIT);
     registry.register_counter(&PROPOSAL_VALIDATION_FAILED);
     registry.register_counter(&PROPOSAL_RATE_LIMITED);
 }
@@ -155,6 +163,7 @@ fn record_proposal_submitted(metrics: &Registry, kind: ProposalKind) {
         ProposalKind::ReviewReport => PROPOSAL_SUBMITTED_REVIEW_REPORT.inc(metrics),
         ProposalKind::ReviewVerdict => PROPOSAL_SUBMITTED_REVIEW_VERDICT.inc(metrics),
         ProposalKind::RunDone => PROPOSAL_SUBMITTED_RUN_DONE.inc(metrics),
+        ProposalKind::Wait => PROPOSAL_SUBMITTED_WAIT.inc(metrics),
     }
 }
 
@@ -328,7 +337,76 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 return send_rejection(&sink, &request_id, error);
             }
         },
+        None if kind == ProposalKind::Wait => {
+            // Each wait declaration is a new row so re-running renews.
+            // A caller-supplied `--idempotency-key` still replays.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("auto:wait:{}:{nanos}", caller.execution_id)
+        }
         None => derive_idempotency_key(&caller.execution_id, kind, &validated.canonical_json),
+    };
+
+    // Serialise the whole wait submission per execution (replay lookup,
+    // budget check, DB acceptance, grant commit) so concurrent declarations
+    // cannot both pass the budget check and leave an accepted row with no
+    // grant. Held until the end of the handler's wait handling.
+    let wait_lock = (kind == ProposalKind::Wait).then(|| server_state.wait_registry.submit_lock(&caller.execution_id));
+    let _wait_guard = match &wait_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+
+    // Validate the wait read-only first so a duration/cap refusal never
+    // leaves an `applied` audit row. The grant itself is committed only after
+    // the row is freshly accepted (below). The budget check applies only to
+    // fresh declarations: a keyed replay of an accepted wait must resolve to
+    // the original row even when the budget is now spent.
+    let wait_payload = if kind == ProposalKind::Wait {
+        match serde_json::from_str::<WaitProposalPayload>(&validated.canonical_json) {
+            Ok(payload) => {
+                let is_replay = matches!(
+                    work_db.find_worker_proposal_by_idempotency_key(&caller.execution_id, &idempotency_key),
+                    Ok(Some(_))
+                );
+                if !is_replay
+                    && let Err(err) = server_state
+                        .wait_registry
+                        .check(&caller.execution_id, payload.duration_secs)
+                {
+                    let error = ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+                        "duration_secs",
+                        err.to_string(),
+                    )]);
+                    tracing::info!(
+                        execution_id = %caller.execution_id,
+                        %err,
+                        "submit_proposal rejected: worker wait cap or duration refused"
+                    );
+                    return send_rejection(&sink, &request_id, error);
+                }
+                Some(payload)
+            }
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %caller.execution_id,
+                    ?err,
+                    "submit_proposal: wait payload failed to deserialize after validation"
+                );
+                return send_rejection(
+                    &sink,
+                    &request_id,
+                    ProposalSubmissionError::new(
+                        ProposalErrorCode::Internal,
+                        format!("validated wait payload could not be deserialized: {err}"),
+                    ),
+                );
+            }
+        }
+    } else {
+        None
     };
 
     let outcome = work_db.submit_worker_proposal(SubmitWorkerProposalInput {
@@ -347,6 +425,50 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             review_batch_quorum_outcome,
         })) => {
             record_proposal_submitted(&server_state.metrics, kind);
+            if let Some(payload) = wait_payload
+                && !already_submitted
+            {
+                let now = boss_engine_utils::epoch_time::now_epoch_secs();
+                match server_state.wait_registry.declare(
+                    &caller.execution_id,
+                    payload.reason,
+                    payload.waiting_on,
+                    payload.duration_secs,
+                    now,
+                ) {
+                    Ok(record) => {
+                        server_state.broadcast_live_worker_states().await;
+                        // Expiry is observed lazily and emits no event, and an
+                        // idle worker fires no hooks, so push one more
+                        // snapshot just after the deadline to clear the app's
+                        // "Waiting" caption.
+                        let state = server_state.clone();
+                        let delay = (record.expires_at_epoch - now).max(0) as u64 + 1;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                            state.broadcast_live_worker_states().await;
+                        });
+                    }
+                    Err(err) => {
+                        // Unreachable under the per-execution submit lock
+                        // (the check above covered this exact budget), but
+                        // never acknowledge a wait that holds nothing.
+                        tracing::error!(
+                            execution_id = %caller.execution_id,
+                            %err,
+                            "submit_proposal: wait row accepted but the registry refused the grant"
+                        );
+                        return send_rejection(
+                            &sink,
+                            &request_id,
+                            ProposalSubmissionError::new(
+                                ProposalErrorCode::Internal,
+                                format!("wait was recorded but could not be granted: {err}"),
+                            ),
+                        );
+                    }
+                }
+            }
             tracing::info!(
                 proposal_id = %proposal.id,
                 execution_id = %caller.execution_id,

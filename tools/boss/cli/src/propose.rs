@@ -150,6 +150,16 @@ pub(crate) enum ProposeCommand {
     /// the PR with the md5 crate swap"` / `boss propose done --outcome
     /// no-changes-needed --summary "already on main; empty diff"`
     Done(RunDoneArgs),
+    /// Declare that this run is deliberately waiting on a long-running job
+    /// and should be given more time. Applied synchronously: holds the
+    /// produce-a-PR nudge ladder and the nudge circuit breaker until the
+    /// wait expires. Re-running renews the wait, subject to the engine's
+    /// per-declaration (2h) and per-execution (4h) caps. Does not pause
+    /// the stale-worker reap or other safety checks.
+    ///
+    /// Example: `boss propose wait --reason "bazel test //tools/boss/engine/...
+    /// still compiling" --duration 30m --waiting-on task_abc`
+    Wait(WaitArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -397,6 +407,27 @@ pub(crate) struct RunDoneArgs {
     common: IdempotencyArgs,
 }
 
+#[derive(Debug, Clone, Args)]
+pub(crate) struct WaitArgs {
+    /// What you are waiting on (a background build, test gate, etc.).
+    #[arg(long)]
+    reason: String,
+
+    /// How long to hold the produce-a-PR nudge. A compact duration such as
+    /// `30s`, `5m`, `2h`, or `1h30m`, or a bare integer number of seconds.
+    /// The engine rejects a value above 2 hours.
+    #[arg(long)]
+    duration: String,
+
+    /// Optional handle for what is being waited on: a background task id,
+    /// a pid, or a file path. Display-only.
+    #[arg(long = "waiting-on")]
+    waiting_on: Option<String>,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
 /// CLI-local mirror of [`RunDoneOutcome`], for the same reason as
 /// [`ProposalKindArg`]. Note the kebab-case `--outcome no-changes-needed`
 /// spelling clap derives; the wire value stays `no_changes_needed`.
@@ -434,6 +465,7 @@ pub(crate) enum ProposalKindArg {
     ReviewReport,
     ReviewVerdict,
     RunDone,
+    Wait,
 }
 
 impl From<ProposalKindArg> for ProposalKind {
@@ -450,6 +482,7 @@ impl From<ProposalKindArg> for ProposalKind {
             ProposalKindArg::ReviewReport => ProposalKind::ReviewReport,
             ProposalKindArg::ReviewVerdict => ProposalKind::ReviewVerdict,
             ProposalKindArg::RunDone => ProposalKind::RunDone,
+            ProposalKindArg::Wait => ProposalKind::Wait,
         }
     }
 }
@@ -696,6 +729,19 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             .map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
+        ProposeCommand::Wait(args) => {
+            let duration_secs = parse_wait_duration_secs(&args.duration).map_err(CliError::usage)?;
+            (
+                ProposalKind::Wait,
+                serde_json::to_value(boss_protocol::WaitProposalPayload {
+                    duration_secs,
+                    reason: args.reason,
+                    waiting_on: args.waiting_on,
+                })
+                .map_err(CliError::internal)?,
+                args.common.idempotency_key,
+            )
+        }
     })
 }
 
@@ -743,6 +789,62 @@ fn operator_question_from_flags(
         }
         Some(other) => Err(CliError::usage(format!("unsupported --answer-type `{other}`"))),
     }
+}
+
+/// Parse `--duration` into seconds. Accepts a bare integer or a compact
+/// unit suffix (`30s`, `5m`, `2h`) including compounds (`1h30m`).
+fn parse_wait_duration_secs(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("duration must not be empty".to_owned());
+    }
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        let secs: u64 = trimmed
+            .parse()
+            .map_err(|_| format!("duration `{raw}` is not a valid integer number of seconds"))?;
+        if secs == 0 {
+            return Err("duration must be at least 1 second".to_owned());
+        }
+        return Ok(secs);
+    }
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    let mut total: u64 = 0;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if start == i {
+            return Err(format!(
+                "duration `{raw}` is not a number of seconds or a compact unit like 30s, 5m, 2h"
+            ));
+        }
+        let n: u64 = trimmed[start..i]
+            .parse()
+            .map_err(|_| format!("duration `{raw}` contains a number that does not fit in 64 bits"))?;
+        if i >= bytes.len() {
+            return Err("duration number is missing a unit (s, m, or h)".to_owned());
+        }
+        let unit = bytes[i];
+        i += 1;
+        let multiplier = match unit {
+            b's' | b'S' => 1_u64,
+            b'm' | b'M' => 60,
+            b'h' | b'H' => 3600,
+            other => {
+                return Err(format!(
+                    "unknown duration unit `{}`; expected s, m, or h",
+                    other as char
+                ));
+            }
+        };
+        total = total.saturating_add(n.saturating_mul(multiplier));
+    }
+    if total == 0 {
+        return Err("duration must be at least 1 second".to_owned());
+    }
+    Ok(total)
 }
 
 async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result<(), CliError> {
@@ -894,6 +996,9 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::RunDone, "question.explanation") => Some("--explanation"),
         (ProposalKind::RunDone, "question.answer_type.name") => Some("--prerequisite-name"),
         (ProposalKind::RunDone, "question.answer_type.brief") => Some("--prerequisite-brief"),
+        (ProposalKind::Wait, "reason") => Some("--reason"),
+        (ProposalKind::Wait, "duration_secs") => Some("--duration"),
+        (ProposalKind::Wait, "waiting_on") => Some("--waiting-on"),
 
         _ => None,
     }
@@ -1285,6 +1390,17 @@ mod tests {
             flag_hint_for_field(ProposalKind::EffortEscalation, "requested_level"),
             Some("--level")
         );
+        for (kind, field, flag) in [
+            (ProposalKind::RunDone, "question", "--question"),
+            (ProposalKind::RunDone, "question.text", "--question"),
+            (ProposalKind::RunDone, "question.answer_type.kind", "--answer-type"),
+            (ProposalKind::RunDone, "question.explanation", "--explanation"),
+            (ProposalKind::Wait, "reason", "--reason"),
+            (ProposalKind::Wait, "duration_secs", "--duration"),
+            (ProposalKind::Wait, "waiting_on", "--waiting-on"),
+        ] {
+            assert_eq!(flag_hint_for_field(kind, field), Some(flag));
+        }
         assert_eq!(flag_hint_for_field(ProposalKind::PrCreated, "unknown_field"), None);
     }
 
@@ -1451,6 +1567,41 @@ mod tests {
             payload,
             serde_json::json!({"batch_id":"rvb_1","verdict":{"outcome":"approved"}})
         );
+    }
+
+    #[test]
+    fn payload_for_wait_parses_compact_duration() {
+        let (kind, payload, _) = payload_for(command_for(&[
+            "wait",
+            "--reason",
+            "bazel test still compiling",
+            "--duration",
+            "30m",
+            "--waiting-on",
+            "pid:12",
+        ]))
+        .unwrap();
+        assert_eq!(kind, ProposalKind::Wait);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "duration_secs": 1800,
+                "reason": "bazel test still compiling",
+                "waiting_on": "pid:12",
+            })
+        );
+    }
+
+    #[test]
+    fn parse_wait_duration_accepts_units_and_compounds() {
+        assert_eq!(parse_wait_duration_secs("90").unwrap(), 90);
+        assert_eq!(parse_wait_duration_secs("30s").unwrap(), 30);
+        assert_eq!(parse_wait_duration_secs("5m").unwrap(), 300);
+        assert_eq!(parse_wait_duration_secs("2h").unwrap(), 7200);
+        assert_eq!(parse_wait_duration_secs("1h30m").unwrap(), 5400);
+        assert!(parse_wait_duration_secs("0").is_err());
+        assert!(parse_wait_duration_secs("2d").is_err());
+        assert!(parse_wait_duration_secs("").is_err());
     }
 
     #[test]
