@@ -294,6 +294,7 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         revision_parent_pr_url: None,
         // Derived; populated after mapping by attach_in_progress_revision_flag.
         has_in_progress_revision: false,
+        in_revision_blocked_only: false,
         // Derived; populated after mapping by attach_has_attachments_flag.
         has_attachments: false,
         // Populated by map_task_with_source_automation_id when the SELECT

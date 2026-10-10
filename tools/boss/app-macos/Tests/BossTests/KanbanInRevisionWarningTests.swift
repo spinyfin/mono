@@ -4,7 +4,8 @@ import XCTest
 /// Covers the "in revision" warning indicator on kanban PR cards.
 ///
 /// When a chain-root task (the one carrying `prURL`) has at least one
-/// descendant revision whose status is `todo` or `active`, the engine
+/// descendant revision whose status is `todo`, `active` or `blocked`
+/// (`can_still_change_pr`, the merge gate's definition), the engine
 /// sets `has_in_progress_revision = true` on the root's work-tree row.
 /// The macOS app surfaces this as an orange "in revision" badge next to
 /// the PR link chip on the card.
@@ -91,6 +92,78 @@ final class KanbanInRevisionWarningTests: XCTestCase {
         model.productLevelRevisionsByProductID = ["prod_test": [revision]]
 
         XCTAssertEqual(model.mostRecentActiveRevision(forParentID: chore.id)?.id, revision.id)
+    }
+
+    // MARK: Blocked revisions (merge-gate parity)
+
+    /// Drift guard for the Swift mirror of `TaskStatus::can_still_change_pr`.
+    func testCanStillChangePRMatchesEnginePredicate() {
+        for status in ["todo", "active", "blocked"] {
+            XCTAssertTrue(makeTask(status: status).canStillChangePR, status)
+        }
+        for status in ["in_review", "done", "archived"] {
+            XCTAssertFalse(makeTask(status: status).canStillChangePR, status)
+        }
+    }
+
+    /// The merge gate (`can_still_change_pr`) counts a `blocked` revision, so
+    /// the hover list and click resolver must too.
+    func testActiveRevisionsIncludesBlockedRevision() {
+        let model = makeModel()
+        let parent = makeParent(status: "in_review")
+        let blocked = makeRevision(id: "task_blocked", status: "blocked", seq: 1, parentID: parent.id)
+        model.tasksByProjectID = ["proj_1": [parent, blocked]]
+
+        XCTAssertEqual(model.activeRevisions(forParentID: parent.id).map(\.id), [blocked.id])
+        XCTAssertEqual(model.mostRecentActiveRevision(forParentID: parent.id)?.id, blocked.id,
+                       "a parent whose only open revision is blocked must still resolve it")
+    }
+
+    /// When a running revision coexists with a blocked one, the badge renders
+    /// as running, so the click must reveal the running one even if the
+    /// blocked one has a higher seq.
+    func testMostRecentActiveRevisionPrefersRunningOverBlocked() {
+        let model = makeModel()
+        let parent = makeParent(status: "in_review")
+        let running = makeRevision(id: "task_running", status: "active", seq: 1, parentID: parent.id)
+        let blocked = makeRevision(id: "task_blocked", status: "blocked", seq: 2, parentID: parent.id)
+        model.tasksByProjectID = ["proj_1": [parent, running, blocked]]
+
+        XCTAssertEqual(model.mostRecentActiveRevision(forParentID: parent.id)?.id, running.id)
+    }
+
+    /// The indicator renders for a blocked-only parent and is visibly
+    /// distinguished from the running badge.
+    func testBlockedOnlyParentShowsBlockedIndicator() {
+        var task = makeTaskWithPR(prURL: "https://github.com/org/repo/pull/20")
+        task.hasInProgressRevision = true
+        task.inRevisionBlockedOnly = true
+        let slice = footerSlice(for: task)
+        XCTAssertTrue(slice.hasInProgressRevision, "blocked-only parent must still show the badge")
+        XCTAssertTrue(slice.inRevisionBlockedOnly)
+
+        let blocked = PrInRevisionIndicator(isBlocked: slice.inRevisionBlockedOnly)
+        let running = PrInRevisionIndicator(isBlocked: false)
+        XCTAssertEqual(blocked.label, "revision blocked")
+        XCTAssertEqual(running.label, "in revision")
+        XCTAssertNotEqual(blocked.helpText, running.helpText)
+        XCTAssertNotEqual(blocked.accessibilityText, running.accessibilityText)
+    }
+
+    /// `in_revision_blocked_only` round-trips through the wire parser, and an
+    /// absent key decodes as false.
+    func testBlockedOnlyFlagParsesFromWire() {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var payload = wirePayload(
+            for: makeTaskWithPR(prURL: "https://github.com/org/repo/pull/21"),
+            includeHasInProgressRevision: false
+        )
+        XCTAssertEqual(client.parseTask(payload)?.inRevisionBlockedOnly, false)
+        payload["has_in_progress_revision"] = true
+        payload["in_revision_blocked_only"] = true
+        let parsed = client.parseTask(payload)
+        XCTAssertEqual(parsed?.hasInProgressRevision, true)
+        XCTAssertEqual(parsed?.inRevisionBlockedOnly, true)
     }
 
     /// `done` / `in_review` revisions are not in-progress and must be

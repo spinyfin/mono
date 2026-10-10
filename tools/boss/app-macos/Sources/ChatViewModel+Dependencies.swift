@@ -171,7 +171,9 @@ extension ChatViewModel {
         return nil
     }
 
-    /// All active (todo/active) revision tasks whose revision chain rolls up
+    /// All open revision tasks (`canStillChangePR`: todo/active/blocked — the
+    /// same set the engine's merge gate and `has_in_progress_revision` use)
+    /// whose revision chain rolls up
     /// to `taskID` — i.e. `taskID` is the first non-revision ancestor reached
     /// by walking `parentTaskId` through `kind == "revision"` rows. Shared by
     /// the hover highlight and the click resolver below, which MUST agree on
@@ -179,7 +181,7 @@ extension ChatViewModel {
     func activeRevisions(forParentID taskID: String) -> [WorkTask] {
         let matches: (WorkTask) -> Bool = { [self] candidate in
             candidate.kind == "revision"
-                && (candidate.status == "todo" || candidate.status == "active")
+                && candidate.canStillChangePR
                 && revisionChainRootID(for: candidate.id) == taskID
         }
         var candidates: [WorkTask] = []
@@ -193,7 +195,7 @@ extension ChatViewModel {
     }
 
     /// Called when the pointer enters or leaves an "In revision" badge on a
-    /// kanban card. On enter, collects all active (todo/active) revision tasks
+    /// kanban card. On enter, collects all open (todo/active/blocked) revision tasks
     /// whose chain rolls up to `taskID` (see `activeRevisions`) and highlights
     /// them with the same green-border overlay used by the dep frontier. On
     /// leave (`nil`), clears.
@@ -217,13 +219,20 @@ extension ChatViewModel {
     }
 
     /// The revision task the "In revision" badge should reveal when tapped:
-    /// the most recently created (highest `revisionSeq`) active revision
+    /// the most recently created (highest `revisionSeq`) open revision
     /// whose chain rolls up to `taskID` — same membership rule as
     /// `setRevisionBadgeHover`, since a task can have more than one open
-    /// revision row in flight. `nil` when the badge's backing flag is stale
+    /// revision row in flight. Running (todo/active) revisions win over
+    /// blocked ones, matching the badge (which only renders as blocked when
+    /// nothing is running). `nil` when the badge's backing flag is stale
     /// and no such row currently resolves.
     func mostRecentActiveRevision(forParentID taskID: String) -> WorkTask? {
-        activeRevisions(forParentID: taskID).max { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+        activeRevisions(forParentID: taskID).max {
+            let lhsBlocked = $0.status == "blocked"
+            let rhsBlocked = $1.status == "blocked"
+            if lhsBlocked != rhsBlocked { return lhsBlocked }
+            return ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0)
+        }
     }
 
     /// Transitively walks the prerequisite DAG from `taskID` and

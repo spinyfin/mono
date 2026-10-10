@@ -1403,6 +1403,73 @@ fn in_progress_flag_set_for_active_revision() {
 }
 
 #[test]
+fn in_progress_flag_set_for_blocked_revision() {
+    // The merge gate (`open_merge_revisions`) counts a blocked revision via
+    // `can_still_change_pr`, so the badge flag must too.
+    let root = make_bare_task("root", "chore", None, Some("https://gh/pull/2b"), "2026-01-01");
+    let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+    rev.status = TaskStatus::Blocked;
+
+    let mut tasks = vec![rev];
+    let mut chores = vec![root];
+    attach_in_progress_revision_flag(&mut tasks, &mut chores);
+
+    let root = chores.iter().find(|t| t.id == "root").unwrap();
+    assert!(
+        root.has_in_progress_revision,
+        "blocked revision must trigger the flag on the chain root"
+    );
+    assert!(
+        root.in_revision_blocked_only,
+        "a parent whose only open revision is blocked must be marked blocked-only"
+    );
+}
+
+#[test]
+fn in_progress_flag_not_blocked_only_when_a_revision_is_running() {
+    let root = make_bare_task("root", "chore", None, Some("https://gh/pull/2c"), "2026-01-01");
+    let mut blocked = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+    blocked.status = TaskStatus::Blocked;
+    let mut running = make_bare_task("r2", "revision", Some("root"), None, "2026-01-03");
+    running.status = TaskStatus::Active;
+
+    let mut tasks = vec![blocked, running];
+    let mut chores = vec![root];
+    attach_in_progress_revision_flag(&mut tasks, &mut chores);
+
+    let root = chores.iter().find(|t| t.id == "root").unwrap();
+    assert!(root.has_in_progress_revision);
+    assert!(
+        !root.in_revision_blocked_only,
+        "a running sibling means the badge is not blocked-only"
+    );
+}
+
+#[test]
+fn in_progress_flag_matches_merge_gate_definition() {
+    for status in [
+        TaskStatus::Todo,
+        TaskStatus::Active,
+        TaskStatus::Blocked,
+        TaskStatus::InReview,
+        TaskStatus::Done,
+        TaskStatus::Archived,
+    ] {
+        let root = make_bare_task("root", "chore", None, Some("https://gh/pull/2d"), "2026-01-01");
+        let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+        rev.status = status.clone();
+        let mut tasks = vec![rev];
+        let mut chores = vec![root];
+        attach_in_progress_revision_flag(&mut tasks, &mut chores);
+        assert_eq!(
+            chores[0].has_in_progress_revision,
+            status.can_still_change_pr(),
+            "badge flag must agree with can_still_change_pr for {status}"
+        );
+    }
+}
+
+#[test]
 fn in_progress_flag_clear_for_in_review_revision() {
     let root = make_bare_task("root", "chore", None, Some("https://gh/pull/3"), "2026-01-01");
     let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");

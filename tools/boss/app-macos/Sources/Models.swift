@@ -148,11 +148,16 @@ struct WorkTask: Identifiable, Hashable {
     /// Denormalized parent chain-root PR URL for fast revision card rendering.
     /// `nil` for non-revision rows. Mirrors `revision_parent_pr_url` on the wire.
     var revisionParentPrUrl: String? = nil
-    /// `true` when any descendant revision task in the chain has status
-    /// `todo` or `active`. Indicates new commits are still incoming and the
-    /// PR should not be merged yet. Only meaningful on chain-root tasks that
-    /// carry a `prURL`. Mirrors `has_in_progress_revision` on the wire.
+    /// `true` when any descendant revision task in the chain can still change
+    /// the PR (`todo`, `active` or `blocked` — see `canStillChangePR`).
+    /// Indicates new commits may still arrive and the PR should not be merged
+    /// yet. Only meaningful on chain-root tasks that carry a `prURL`. Mirrors
+    /// `has_in_progress_revision` on the wire.
     var hasInProgressRevision: Bool = false
+    /// `true` when `hasInProgressRevision` is set and every open descendant
+    /// revision is `blocked` (none is running). Lets the card render the badge
+    /// as blocked. Mirrors `in_revision_blocked_only` on the wire.
+    var inRevisionBlockedOnly: Bool = false
     /// `true` when this row's own attachments (or, for a chain-root task, a
     /// direct revision child's own attachments) are non-empty. Derived
     /// projection, not stored. Gates the kanban card's screenshot-viewer
@@ -463,6 +468,15 @@ enum WorkNodeID: Hashable {
 }
 
 extension WorkTask {
+    /// Mirrors the engine's `TaskStatus::can_still_change_pr`: a revision in
+    /// `todo`, `active` or `blocked` may still push to its parent PR. This is
+    /// the single definition behind the "in revision" badge, its hover/click
+    /// list, and the engine's merge-gate warning. Keep in sync with
+    /// `protocol/src/types/task.rs`.
+    var canStillChangePR: Bool {
+        status == "todo" || status == "active" || status == "blocked"
+    }
+
     /// Canonical mapping from engine status → kanban column.
     ///
     /// Tasks/chores carry one of `todo`, `active`, `blocked`,

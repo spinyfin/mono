@@ -243,6 +243,7 @@ extension EngineClient {
             revisionSeq: (payload["revision_seq"] as? NSNumber)?.intValue,
             revisionParentPrUrl: payload["revision_parent_pr_url"] as? String,
             hasInProgressRevision: (payload["has_in_progress_revision"] as? Bool) ?? false,
+            inRevisionBlockedOnly: (payload["in_revision_blocked_only"] as? Bool) ?? false,
             hasAttachments: (payload["has_attachments"] as? Bool) ?? false,
             effortLevel: (payload["effort_level"] as? String)
                 .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 },

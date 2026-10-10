@@ -591,26 +591,43 @@ struct MergeQueueBadge: View {
 }
 
 /// Warning indicator shown on the PR card of a chain root when at least one
-/// descendant revision is still `todo` or `active`. Signals that new commits
-/// are incoming and the PR should not be merged yet.
+/// descendant revision can still change the PR (`todo`, `active` or
+/// `blocked` — the same set the merge gate warns about). Signals that new
+/// commits may arrive and the PR should not be merged yet. Renders in red as
+/// "revision blocked" when every open revision is blocked, so a stalled
+/// revision reads differently from one that is running.
 
 struct PrInRevisionIndicator: View {
+    /// `true` when every open revision is blocked (none running).
+    var isBlocked: Bool = false
     /// Reveals the revision task the badge is reporting on. `nil` renders
     /// the badge inert (no button chrome, no click affordance).
     var onTap: (() -> Void)? = nil
 
+    var label: String { isBlocked ? "revision blocked" : "in revision" }
+
+    var helpText: String {
+        isBlocked
+            ? "A revision is blocked — do not merge this PR yet"
+            : "A revision is in progress — do not merge this PR yet"
+    }
+
+    var accessibilityText: String {
+        isBlocked ? "Revision blocked — do not merge" : "In revision — do not merge"
+    }
+
     var body: some View {
         let content = HStack(spacing: 3) {
-            Image(systemName: "exclamationmark.triangle.fill")
+            Image(systemName: isBlocked ? "exclamationmark.octagon.fill" : "exclamationmark.triangle.fill")
                 .font(.caption2.weight(.semibold))
-            Text("in revision")
+            Text(label)
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
         }
         .foregroundStyle(Color.white)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
-        .background(Color.orange)
+        .background(isBlocked ? Color.red : Color.orange)
         .clipShape(Capsule())
         .fixedSize()
 
@@ -619,13 +636,15 @@ struct PrInRevisionIndicator: View {
                 Button(action: onTap) { content }
                     .buttonStyle(.plain)
                     .pointerStyle(.link)
-                    .help("A revision is in progress — click to reveal it")
+                    .help(isBlocked
+                        ? "A revision is blocked — click to reveal it"
+                        : "A revision is in progress — click to reveal it")
             } else {
                 content
-                    .help("A revision is in progress — do not merge this PR yet")
+                    .help(helpText)
             }
         }
-        .accessibilityLabel("In revision — do not merge")
+        .accessibilityLabel(accessibilityText)
     }
 }
 
