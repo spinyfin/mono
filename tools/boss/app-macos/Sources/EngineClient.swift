@@ -42,6 +42,8 @@ final class EngineClient: @unchecked Sendable {
     /// still armed underneath the one that actually reconnects — corrupting
     /// the backoff sequence with extra, unwanted connect attempts.
     private var reconnectScheduled = false
+    /// Explicit stop/start invalidates timers from the previous lifecycle.
+    private var reconnectGeneration: UInt64 = 0
     /// Whether the current connection attempt has ever reached `.ready`.
     /// Reset per connection attempt; used to decide whether a lost
     /// connection should advance `socketIndex` (never got through, so the
@@ -77,21 +79,40 @@ final class EngineClient: @unchecked Sendable {
     }
 
     func start() {
-        shouldReconnect = true
-        reconnectAttempt = 0
-        reconnectScheduled = false
-        socketIndex = 0
-        connect()
+        queue.async {
+            self.shouldReconnect = true
+            self.reconnectAttempt = 0
+            self.reconnectScheduled = false
+            self.reconnectGeneration &+= 1
+            self.socketIndex = 0
+            self.connect()
+        }
     }
 
     func stop() {
-        shouldReconnect = false
-        reconnectAttempt = 0
-        reconnectScheduled = false
-        reachableState.withLock { $0 = false }
-        connection?.cancel()
+        queue.async {
+            self.shouldReconnect = false
+            self.reconnectAttempt = 0
+            self.reconnectScheduled = false
+            self.reconnectGeneration &+= 1
+            self.closeConnection()
+        }
+    }
+
+    /// A byte stream and its scan cursor belong to exactly one connection.
+    private func closeConnection() {
+        let oldConnection = connection
         connection = nil
+        oldConnection?.cancel()
+        reachableState.withLock { $0 = false }
+        if !buffer.isEmpty {
+            Self.logInvalidFrame(buffer, error: "connection closed with buffered bytes")
+        }
         buffer.removeAll(keepingCapacity: false)
+        unscannedPrefixLength = 0
+        advanceSocketCandidateIfNeverReady()
+        emit(.disconnected)
+        scheduleReconnect()
     }
 
     private func connect() {
@@ -104,8 +125,8 @@ final class EngineClient: @unchecked Sendable {
         let connection = NWConnection(to: endpoint, using: parameters)
         self.connection = connection
 
-        connection.stateUpdateHandler = { [weak self] (state: NWConnection.State) in
-            guard let self else { return }
+        connection.stateUpdateHandler = { [weak self, weak connection] (state: NWConnection.State) in
+            guard let self, let connection, self.connection === connection else { return }
             switch state {
             case .ready:
                 self.reachableState.withLock { $0 = true }
@@ -113,27 +134,11 @@ final class EngineClient: @unchecked Sendable {
                 self.socketIndex = 0
                 self.emit(.connected)
                 self.receiveNext()
-            case .waiting(let error):
-                self.reachableState.withLock { $0 = false }
-                self.emit(.error(message: "socket waiting: \(error.localizedDescription)"))
-                self.connection = nil
-                connection.cancel()
-                self.advanceSocketCandidateIfNeverReady()
-                self.emit(.disconnected)
-                self.scheduleReconnect()
-            case .failed(let error):
-                self.reachableState.withLock { $0 = false }
+            case .waiting(let error), .failed(let error):
                 self.emit(.error(message: "socket failed: \(error.localizedDescription)"))
-                self.connection = nil
-                self.advanceSocketCandidateIfNeverReady()
-                self.emit(.disconnected)
-                self.scheduleReconnect()
+                self.closeConnection()
             case .cancelled:
-                self.reachableState.withLock { $0 = false }
-                self.connection = nil
-                self.advanceSocketCandidateIfNeverReady()
-                self.emit(.disconnected)
-                self.scheduleReconnect()
+                self.closeConnection()
             default:
                 break
             }
@@ -201,7 +206,7 @@ final class EngineClient: @unchecked Sendable {
             data.append(0x0A)
 
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
-                guard let self else { return }
+                guard let self, self.connection === connection else { return }
                 if let error {
                     self.emit(.error(message:"socket send failed: \(error.localizedDescription)"))
                 }
@@ -214,27 +219,25 @@ final class EngineClient: @unchecked Sendable {
     }
 
     private func receiveNext() {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
+        guard let connection else { return }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
             [weak self] data, _, isComplete, error in
-            guard let self else { return }
+            guard let self, self.connection === connection else { return }
 
             if let error {
                 self.emit(.error(message:"socket receive failed: \(error.localizedDescription)"))
-                self.connection = nil
-                self.emit(.disconnected)
-                self.scheduleReconnect()
+                self.closeConnection()
                 return
             }
 
             if let data, !data.isEmpty {
                 self.buffer.append(data)
                 self.consumeLines()
+                guard self.connection === connection else { return }
             }
 
             if isComplete {
-                self.connection = nil
-                self.emit(.disconnected)
-                self.scheduleReconnect()
+                self.closeConnection()
                 return
             }
 
@@ -270,12 +273,15 @@ final class EngineClient: @unchecked Sendable {
             let lineRecvNanos = PopulationTiming.now()
             let lineByteCount = lineData.count
 
-            guard let envelope = try? JSONSerialization.jsonObject(with: Data(lineData)) as? [String: Any],
-                let payload = envelope["payload"] as? [String: Any],
-                let type = payload["type"] as? String
-            else {
-                emit(.error(message:"received invalid JSON message from engine"))
-                continue
+            let envelope: [String: Any]
+            let payload: [String: Any]
+            let type: String
+            do {
+                (envelope, payload, type) = try Self.decodeEnvelope(Data(lineData))
+            } catch {
+                Self.logInvalidFrame(Data(lineData), error: String(describing: error))
+                closeConnection()
+                return
             }
             let envelopeRequestId = envelope["request_id"] as? String
 
@@ -1198,9 +1204,10 @@ final class EngineClient: @unchecked Sendable {
 
         let delay = Self.reconnectDelays[min(reconnectAttempt, Self.reconnectDelays.count - 1)]
         reconnectAttempt += 1
+        let generation = reconnectGeneration
 
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
+            guard let self, self.reconnectGeneration == generation else { return }
             self.reconnectScheduled = false
             guard self.shouldReconnect, self.connection == nil else {
                 return
