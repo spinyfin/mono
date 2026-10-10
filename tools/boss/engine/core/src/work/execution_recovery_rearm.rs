@@ -239,6 +239,51 @@ mod tests {
     }
 
     #[test]
+    fn rearm_preserves_an_older_pending_execution() {
+        let db = WorkDb::open_in_memory().unwrap();
+        let product_id = product(&db);
+        let stale = format!("{NOT_DESCENDED_MESSAGE} boss-base/exec_failed");
+        let id = insert_blocked(&db, &product_id, "wedged", "execution_recovery_failed", &stale);
+        let pending = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::WaitingDependency)
+                    .build(),
+            )
+            .unwrap();
+        let failed = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Failed)
+                    .build(),
+            )
+            .unwrap();
+        let conn = db.connect().unwrap();
+        assert_eq!(
+            query_latest_execution_for_work_item(&conn, &id).unwrap().unwrap().id,
+            failed.id
+        );
+        assert_eq!(migrate(&conn).unwrap(), 1);
+        assert_eq!(migrate(&conn).unwrap(), 0);
+        let ids = conn
+            .prepare("SELECT id FROM work_executions WHERE work_item_id = ?1 ORDER BY created_at, rowid")
+            .unwrap()
+            .query_map([&id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![pending.id, failed.id],
+            "must not create another pending execution"
+        );
+    }
+
+    #[test]
     fn opening_a_pre_migration_database_rearms_wedged_items_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("work.db");
