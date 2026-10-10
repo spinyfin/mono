@@ -191,6 +191,172 @@ async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
     }
 }
 
+/// Records `execution_id`'s pointers in `db`, then deletes both heads so only
+/// the baseline survives. Returns the repo holding them.
+async fn record_then_delete_heads(
+    db: &WorkDb,
+    dir: &std::path::Path,
+    execution_id: &str,
+) -> boss_engine_test_git::jj::JjRepo {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_test_git::jj::JjRepo;
+    let repo = JjRepo::new(dir);
+    let record = create(&LocalJj, &repo.worker, execution_id, "local").await.unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "delete", &record.head(), &record.publication()],
+    );
+    repo
+}
+
+fn recovery_coordinator_for(db: Arc<WorkDb>) -> Arc<ExecutionCoordinator> {
+    Arc::new(ExecutionCoordinator::new(
+        db,
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ))
+}
+
+#[tokio::test]
+async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
+    let dir = tempdir().unwrap();
+    let (db, _prior, next) = blocked_pair(&dir.path().join("boss.db"));
+    let repo = record_then_delete_heads(&db, dir.path(), &next.id).await;
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient {
+            real_bookmarks: true,
+            ..FakeCubeClient::default()
+        }),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-new".into(),
+        workspace_id: "workspace-old".into(),
+        workspace_path: repo.worker.clone(),
+        dirty_verified: None,
+    };
+    let recovered = coordinator
+        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None)
+        .await
+        .unwrap();
+    assert!(recovered.is_none());
+    assert!(
+        db.execution_bookmark_optional(&next.id).unwrap().is_none(),
+        "a stale row would make dispatch skip creating fresh pointers"
+    );
+    // Dispatch now creates fresh pointers for the same execution id; the
+    // surviving baseline must not make that fail.
+    let fresh = coordinator
+        .host_adapter
+        .create_execution_bookmark(&repo.worker, &next.id, None, None)
+        .await
+        .expect("fresh creation must succeed after the orphaned baseline is discarded");
+    boss_engine_recovery::execution_bookmark::diff(&boss_engine_recovery::execution_bookmark::LocalJj, &fresh)
+        .await
+        .expect("fresh bookmarks must validate");
+}
+
+#[tokio::test]
+async fn self_retry_with_deleted_own_heads_and_stale_report_still_positions_on_the_bound_pr() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let (db, _prior, next) = blocked_pair(&path);
+    seed_local_claude_driver(&db);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET pr_url = 'https://github.com/spinyfin/mono/pull/99' WHERE id = ?1",
+            [&next.id],
+        )
+        .unwrap();
+    let next = db.get_execution(&next.id).unwrap();
+    use boss_engine_recovery::execution_bookmark::RestoreReport;
+    use boss_engine_test_git::jj::JjRepo;
+    let repo = record_then_delete_heads(&db, dir.path(), &next.id).await;
+    super::recovery::configure_recovery_origin(&repo.repo);
+    JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "main"]);
+    db.record_execution_restore_report(
+        &next.id,
+        &RestoreReport::builder()
+            .pointer("boss-recovery/exec_prior + pr/99")
+            .commits("abc1234 Preserved work\n")
+            .base_sha("0123456789abcdef")
+            .conflicts("")
+            .pr_bound(true)
+            .build(),
+    )
+    .unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        workspace_root: Some(dir.path().to_path_buf()),
+        next_workspace_id: Mutex::new(Some("replacement".into())),
+        real_bookmarks: true,
+        ..FakeCubeClient::default()
+    });
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        runner,
+    ));
+    let worker = coordinator
+        .pool_for_execution(&next)
+        .claim_worker(&next.id, None)
+        .await
+        .unwrap();
+    coordinator
+        .schedule_execution(&next, &worker, DispatchAdmission::Queued)
+        .await
+        .unwrap();
+    assert_eq!(
+        cube.goto_calls.lock().await.len(),
+        1,
+        "a stale restore report must not suppress positioning on the bound PR"
+    );
+    assert!(
+        db.execution_restore_report(&next.id).unwrap().is_none(),
+        "the stale report must be cleared"
+    );
+    let fresh = db.execution_bookmark(&next.id).unwrap();
+    boss_engine_recovery::execution_bookmark::diff(&boss_engine_recovery::execution_bookmark::LocalJj, &fresh)
+        .await
+        .expect("fresh bookmarks must validate");
+}
+
+#[tokio::test]
+async fn non_implementation_with_deleted_predecessor_heads_continues_without_recovery() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let (db, prior, next) = blocked_pair(&path);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE work_executions SET kind = 'pr_review'", [])
+        .unwrap();
+    let next = db.get_execution(&next.id).unwrap();
+    assert_eq!(next.kind, ExecutionKind::PrReview);
+    let repo = record_then_delete_heads(&db, dir.path(), &prior.id).await;
+    let coordinator = recovery_coordinator_for(db.clone());
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-new".into(),
+        workspace_id: "workspace-old".into(),
+        workspace_path: repo.worker.clone(),
+        dirty_verified: None,
+    };
+    let recovered = coordinator
+        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None)
+        .await
+        .unwrap();
+    assert!(recovered.is_none());
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+}
+
 #[tokio::test]
 async fn missing_predecessor_bookmark_dispatches_into_a_clean_workspace() {
     let dir = tempdir().unwrap();
@@ -603,7 +769,7 @@ async fn transient_fetch_failure_keeps_the_item_retryable() {
 }
 
 #[tokio::test]
-async fn recorded_predecessor_with_deleted_refs_blocks_dispatch() {
+async fn orphaned_predecessor_with_no_head_bookmarks_dispatches_cleanly() {
     use boss_engine_test_git::jj::JjRepo;
     let h = chain_harness(true, true, false).await;
     let db = &h.coordinator.work_db;
@@ -613,15 +779,23 @@ async fn recorded_predecessor_with_deleted_refs_blocks_dispatch() {
         &h.repo.repo,
         &["bookmark", "delete", &record.head(), &record.publication()],
     );
-    let error = h.dispatch().await.unwrap_err();
-    assert!(boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(
-        &error
-    ));
+    h.dispatch().await.unwrap();
     let (WorkItem::Task(item) | WorkItem::Chore(item)) = db.get_work_item(&h.next.work_item_id).unwrap() else {
         panic!("expected implementation item")
     };
-    assert_eq!(item.status, TaskStatus::Blocked);
-    assert!(!item.autostart);
+    assert_ne!(item.status, TaskStatus::Blocked);
+    assert!(db.get_execution(&h.next.id).unwrap().started_at.is_some());
+    assert!(db.bookmark_recovery(&h.next.id).unwrap().is_none());
+    assert!(db.execution_restore_report(&h.next.id).unwrap().is_none());
+    assert!(!h.repo.replacement.join("revision.txt").exists());
+    let successor = db.execution_bookmark(&h.next.id).unwrap();
+    assert!(
+        boss_engine_recovery::execution_bookmark::diff(&boss_engine_recovery::execution_bookmark::LocalJj, &successor)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(h.cube.goto_calls.lock().await.len(), 1);
 }
 
 #[tokio::test]

@@ -264,22 +264,14 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
 }
 
 #[tokio::test]
-async fn a_failed_bookmark_recovery_is_loud_and_legacy_evidence_is_kept() {
+async fn missing_baseline_recovery_is_loud_and_legacy_evidence_is_kept() {
     use boss_engine_test_git::jj::JjRepo;
     let dir = tempdir().unwrap();
     let repo = JjRepo::new(dir.path());
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let (dead_id, resume) = seed_resume_pair(&db);
     record_recovery_work(&db, &dead_id, &repo.worker).await;
-    JjRepo::run(
-        &repo.repo,
-        &[
-            "bookmark",
-            "delete",
-            &format!("boss-recovery/{dead_id}"),
-            &format!("boss/{dead_id}"),
-        ],
-    );
+    JjRepo::run(&repo.repo, &["bookmark", "delete", &format!("boss-base/{dead_id}")]);
     let patch = dir.path().join(format!("{dead_id}.patch"));
     std::fs::write(&patch, "legacy evidence").unwrap();
     let coordinator = recovery_coordinator(db);
@@ -294,6 +286,9 @@ async fn a_failed_bookmark_recovery_is_loud_and_legacy_evidence_is_kept() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("exactly one"), "{error:#}");
+    assert!(boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(
+        &error
+    ));
     assert!(patch.exists());
     assert!(!repo.replacement.join("hello.txt").exists());
 }
@@ -770,12 +765,16 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
         slot_id: Some(1),
         ..FakeExecutionRunner::default()
     });
-    let coordinator = Arc::new(ExecutionCoordinator::new(
-        db.clone(),
-        WorkerPool::new(2),
-        Arc::new(FakeCubeClient::default()),
-        runner.clone(),
-    ));
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(2),
+            Arc::new(FakeCubeClient::default()),
+            runner.clone(),
+        )
+        .with_dispatch_events(recording.clone()),
+    );
 
     coordinator
         .resume_pane_spawn_for_running_execution(&exec)
@@ -787,6 +786,16 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
             .iter()
             .any(|a| a.kind == crate::execution_bookmark_recovery::RECOVERY_FAILED),
         "missing bookmark on resume is loud in logs, not an attention failure"
+    );
+    let events = recording.events_for(&exec.id).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.stage == crate::dispatch_events::Stage::WorkspaceRecovery.as_str()
+                && e.outcome == crate::dispatch_events::Outcome::Skipped.as_str())
+            .count(),
+        1,
+        "a resume with no bookmark row must emit the skipped-recovery event once"
     );
 
     let mut saw_call = false;
@@ -806,6 +815,60 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
         Some("lease-stranded"),
         "resume must keep the already-adopted lease"
     );
+}
+
+#[tokio::test]
+async fn resume_pane_spawn_continues_when_the_recorded_heads_are_missing() {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_test_git::jj::JjRepo;
+    let (_dir, db) = open_db_arc();
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "stranded-missing-heads");
+    db.reconcile_product_executions(&product.id).unwrap();
+    db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let exec = db.list_executions(Some(&chore.id)).unwrap().into_iter().next().unwrap();
+    let (exec, _run) = db
+        .start_execution_run(
+            &exec.id,
+            "worker-1",
+            "mono",
+            "lease-stranded",
+            "ws-stranded",
+            "/tmp/ws-stranded",
+        )
+        .unwrap();
+    let root = tempdir().unwrap();
+    let repo = JjRepo::new(root.path());
+    let record = create(&LocalJj, &repo.worker, &exec.id, "local").await.unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "delete", &record.head(), &record.publication()],
+    );
+
+    let runner = Arc::new(FakeExecutionRunner {
+        slot_id: Some(1),
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(2),
+        Arc::new(FakeCubeClient::default()),
+        runner.clone(),
+    ));
+    coordinator
+        .resume_pane_spawn_for_running_execution(&exec)
+        .await
+        .expect("missing recorded heads must not wedge a live worker");
+    assert!(
+        !db.list_attention_items(&exec.id)
+            .unwrap()
+            .iter()
+            .any(|a| a.kind == crate::execution_bookmark_recovery::RECOVERY_FAILED)
+    );
+    assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Running);
 }
 
 #[tokio::test]
