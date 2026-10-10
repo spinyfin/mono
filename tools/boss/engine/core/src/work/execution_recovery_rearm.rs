@@ -146,8 +146,12 @@ mod tests {
     }
 
     #[test]
-    fn migration_and_reconcile_restart_terminal_chores_and_revisions_once() {
-        for revision in [false, true] {
+    fn migration_and_reconcile_restart_terminal_implementations_once() {
+        for kind in [
+            ExecutionKind::ChoreImplementation,
+            ExecutionKind::TaskImplementation,
+            ExecutionKind::RevisionImplementation,
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("work.db");
             let pr_url = "https://github.com/example/repo/pull/42";
@@ -161,7 +165,27 @@ mod tests {
                     "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at) VALUES (?1, ?2, 'blocks', '1')",
                     params![id, prerequisite],
                 ).unwrap();
-                if revision {
+                if kind == ExecutionKind::TaskImplementation {
+                    let project = db
+                        .create_project(CreateProjectInput {
+                            product_id: product_id.clone(),
+                            name: "recovery project".to_owned(),
+                            description: None,
+                            goal: None,
+                            autostart: true,
+                            no_design_task: true,
+                            design_reasoning_effort_xhigh: false,
+                        })
+                        .unwrap();
+                    db.connect()
+                        .unwrap()
+                        .execute(
+                            "UPDATE tasks SET kind = 'project_task', project_id = ?2, ordinal = 1 WHERE id = ?1",
+                            params![id, project.id],
+                        )
+                        .unwrap();
+                }
+                if kind == ExecutionKind::RevisionImplementation {
                     let root = crate::test_support::create_test_chore_manual(&db, &product_id, "root");
                     let conn = db.connect().unwrap();
                     conn.execute(
@@ -179,11 +203,7 @@ mod tests {
                     .create_execution(
                         CreateExecutionInput::builder()
                             .work_item_id(id.clone())
-                            .kind(if revision {
-                                ExecutionKind::RevisionImplementation
-                            } else {
-                                ExecutionKind::ChoreImplementation
-                            })
+                            .kind(kind.clone())
                             .status(ExecutionStatus::Failed)
                             .started_at("1")
                             .finished_at("2")
@@ -203,7 +223,8 @@ mod tests {
             assert_eq!(queued.status, ExecutionStatus::WaitingDependency);
             assert_ne!(queued.id, failed_id);
             assert_eq!(db.recovery_predecessor(&queued).unwrap().unwrap().id, failed_id);
-            if revision {
+            assert_eq!(queued.kind, kind);
+            if kind == ExecutionKind::RevisionImplementation {
                 assert_eq!(queued.pr_url.as_deref(), Some(pr_url));
             }
             for _ in 0..2 {
