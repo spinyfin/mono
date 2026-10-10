@@ -648,6 +648,7 @@ mod exec_status_helpers;
 mod exec_tail;
 mod execution_bookmarks;
 mod execution_launch_config;
+mod execution_recovery_rearm;
 mod execution_retention;
 mod executions_runs;
 mod feedback_target;
