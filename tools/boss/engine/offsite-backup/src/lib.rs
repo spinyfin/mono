@@ -26,6 +26,6 @@ mod config;
 mod copy;
 mod retention;
 
-pub use config::{CONFIG_SECTION, OffsiteConfig, ValidatedDestination, host_name, sanitize_host_component};
+pub use config::{CONFIG_SECTION, OffsiteConfig, ValidatedDestination, sanitize_host_component};
 pub use copy::{BACKUP_FILE_PREFIX, CopyOutcome, backup_file_name, copy_open_to_offsite, copy_to_offsite};
 pub use retention::{PruneOutcome, prune};

@@ -24,7 +24,7 @@ fn offsite_runtime(dest: &Path, keep_hourly: usize, keep_daily: usize) -> (Arc<O
 
 fn host_dir(dest: &Path) -> PathBuf {
     dest.join(boss_engine_offsite_backup::sanitize_host_component(
-        &boss_engine_offsite_backup::host_name(),
+        &boss_engine_utils::host::host_name(),
     ))
 }
 

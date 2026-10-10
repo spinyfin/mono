@@ -6,7 +6,6 @@ workspace = "../../../.."
 
 [dependencies]
 anyhow = { workspace = true }
-libc = { workspace = true }
 boss-engine-utils = { path = "../utils" }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
