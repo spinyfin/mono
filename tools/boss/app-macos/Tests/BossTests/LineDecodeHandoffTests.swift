@@ -85,3 +85,84 @@ private extension OSAllocatedUnfairLockBox where T == [Int] {
         return value.count
     }
 }
+
+final class ReadLoopPauseGateTests: XCTestCase {
+    private final class Conn {}
+
+    private final class GateState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var gate = ReadLoopPauseGate<Conn>()
+        private var decoded = 0
+        func nextDecodeIndex() -> Int { lock.lock(); defer { lock.unlock() }; defer { decoded += 1 }; return decoded }
+        func pause(_ c: Conn) { lock.lock(); defer { lock.unlock() }; gate.pause(c) }
+        func resume(_ c: Conn) -> Bool { lock.lock(); defer { lock.unlock() }; return gate.resume(current: c) }
+        var isPaused: Bool { lock.lock(); defer { lock.unlock() }; return gate.isPaused }
+    }
+
+    func testResumesOnlyThePausedConnection() {
+        var gate = ReadLoopPauseGate<Conn>()
+        let old = Conn()
+        let new = Conn()
+        XCTAssertFalse(gate.resume(current: old), "nothing paused yet")
+        gate.pause(old)
+        XCTAssertTrue(gate.isPaused)
+        XCTAssertFalse(gate.resume(current: new), "reconnected: stale resume ignored")
+        XCTAssertFalse(gate.resume(current: nil))
+        XCTAssertTrue(gate.resume(current: old))
+        XCTAssertFalse(gate.isPaused)
+        XCTAssertFalse(gate.resume(current: old), "resume is single-use")
+    }
+
+    /// Reader loop modelled on `EngineClient.receiveNext`: reads continue
+    /// while a decode is blocked, pause once over the bound, and resume
+    /// after the decoder drains.
+    func testReaderKeepsReadingThenPausesAndResumes() {
+        let conn = Conn()
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let resumed = DispatchSemaphore(value: 0)
+        let state = GateState()
+        let handoff = LineDecodeHandoff(
+            maxPendingBytes: 40,
+            decode: { data, _ in
+                if state.nextDecodeIndex() == 0 {
+                    started.signal()
+                    release.wait()
+                }
+            },
+            onResume: {
+                if state.resume(conn) { resumed.signal() }
+            }
+        )
+        let chunk = [(data: Data(count: 8), recvNanos: UInt64(0))]
+        XCTAssertTrue(handoff.enqueue(chunk))
+        XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+        // Decode is blocked; the reader keeps accepting chunks under the bound.
+        var reads = 1
+        var keepReading = true
+        while keepReading && reads < 100 {
+            keepReading = handoff.enqueue(chunk)
+            reads += 1
+        }
+        XCTAssertGreaterThan(reads, 3, "reads continued while a decode was blocked")
+        XCTAssertFalse(keepReading, "reader paused once backlog exceeded the bound")
+        state.pause(conn)
+        release.signal()
+        XCTAssertEqual(resumed.wait(timeout: .now() + 5), .success)
+        XCTAssertFalse(state.isPaused)
+    }
+
+    func testDisconnectRunsAfterPendingLines() {
+        let order = OSAllocatedUnfairLockBox<[Int]>([])
+        let done = expectation(description: "disconnect ran")
+        let handoff = LineDecodeHandoff(
+            maxPendingBytes: 1 << 20,
+            decode: { _, _ in usleep(2000); _ = order.append(1) },
+            onResume: {}
+        )
+        for _ in 0..<5 { _ = handoff.enqueue([(data: Data(count: 4), recvNanos: 0)]) }
+        handoff.afterPendingLines { _ = order.append(2); done.fulfill() }
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(order.get(), [1, 1, 1, 1, 1, 2])
+    }
+}

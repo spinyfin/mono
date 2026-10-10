@@ -11,9 +11,9 @@ final class EngineClient: @unchecked Sendable {
     private var connection: NWConnection?
     private var buffer = Data()
     /// Connection whose read loop is suspended by decode backpressure.
-    private var pausedConnection: NWConnection?
+    private var readPause = ReadLoopPauseGate<NWConnection>()
     /// Byte count at the front of `buffer` already scanned for a newline
-    /// with none found. `consumeLines()` resumes scanning from here instead
+    /// with none found. `frameLines()` resumes scanning from here instead
     /// of `buffer`'s start, so a large multi-chunk message (e.g. a ~6 MB
     /// `work_tree` reply arriving as ~94 64 KiB reads) doesn't re-scan
     /// already-scanned bytes on every chunk — that repeated full-buffer
@@ -85,8 +85,7 @@ final class EngineClient: @unchecked Sendable {
             self.queue.async {
                 // Only resume the connection that paused; a reconnect in
                 // the meantime already started its own read loop.
-                guard let paused = self.pausedConnection, paused === self.connection else { return }
-                self.pausedConnection = nil
+                guard self.readPause.resume(current: self.connection) else { return }
                 self.receiveNext()
             }
         }
@@ -134,7 +133,7 @@ final class EngineClient: @unchecked Sendable {
         buffer.removeAll(keepingCapacity: false)
         unscannedPrefixLength = 0
         advanceSocketCandidateIfNeverReady()
-        emit(.disconnected)
+        emitDisconnectedAfterPendingLines()
         scheduleReconnect()
     }
 
@@ -261,7 +260,7 @@ final class EngineClient: @unchecked Sendable {
                 let lines = self.frameLines().map { (data: $0, recvNanos: recvNanos) }
                 if !lines.isEmpty, !self.handoff.enqueue(lines), !isComplete {
                     // Backlog over bound: stop reading until `onResume`.
-                    self.pausedConnection = self.connection
+                    self.readPause.pause(self.connection)
                     return
                 }
             }
@@ -273,6 +272,13 @@ final class EngineClient: @unchecked Sendable {
 
             self.receiveNext()
         }
+    }
+
+    /// Emit `.disconnected` only after lines already handed to the decoder
+    /// have been decoded and emitted, so stale replies from the dropped
+    /// connection never arrive after the disconnect.
+    private func emitDisconnectedAfterPendingLines() {
+        handoff.afterPendingLines { [weak self] in self?.emit(.disconnected) }
     }
 
     /// Pull every complete line out of `buffer`. Framing only — no JSON
@@ -352,9 +358,10 @@ final class EngineClient: @unchecked Sendable {
                 .compactMap(parseWorkItemDependency)
             let ideas = (payload["ideas"] as? [[String: Any]] ?? [])
                 .compactMap { decodeWire(WorkIdea.self, from: $0) }
-            // Population-timing: this decode runs on the EngineClient
-            // serial queue (off main). Record request→reply + decode
-            // duration, payload size, and item cardinalities so timing
+            // Population-timing: this decode runs on the decode queue
+            // (off main). `lineRecvNanos` is taken at framing time, so the
+            // decode segment includes time the line waited behind earlier
+            // decodes. Record request→reply + decode duration, payload size, and item cardinalities so timing
             // correlates with the ~1,908-item real population. The
             // decoded context is stashed FIFO per product for the
             // upcoming @MainActor apply.
@@ -434,7 +441,8 @@ final class EngineClient: @unchecked Sendable {
             // trust-check rejection, or the engine tearing down a session
             // it can't register) hot-loop reconnects at the shortest delay
             // forever instead of backing off.
-            reconnectAttempt = 0
+            // `reconnectAttempt` is confined to `queue`; decode runs elsewhere.
+            queue.async { [weak self] in self?.reconnectAttempt = 0 }
             emit(.appSessionRegistered)
         case "engine_pool_config":
             let workerSlots = (payload["worker_slots"] as? NSNumber)?.intValue ?? 8

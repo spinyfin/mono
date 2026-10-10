@@ -6,11 +6,11 @@ private let handoffLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: 
 /// Bounded, order-preserving handoff of complete wire lines from the
 /// socket-reading queue to a separate serial decode queue.
 ///
-/// `EngineClient` used to JSON-decode each line on the same queue that
-/// reads the socket, so a large reply (a ~25 MB `work_tree`) stopped all
-/// reads for seconds and the engine kicked the app as a stuck subscriber.
-/// Here the reader only frames lines and calls `enqueue`; decoding happens
-/// on `decodeQueue`, in arrival order.
+/// Decoding a large reply (tens of MB) can take seconds; doing it on the
+/// socket-reading queue would stall reads long enough for the engine to
+/// treat the app as a stuck subscriber. The reader therefore only frames
+/// lines and calls `enqueue`; decoding happens on `decodeQueue`, in
+/// arrival order.
 ///
 /// Memory is bounded by `maxPendingBytes`: once the undecoded backlog
 /// exceeds it, `enqueue` returns `false` and the reader must stop issuing
@@ -67,6 +67,13 @@ final class LineDecodeHandoff: @unchecked Sendable {
         return keepReading
     }
 
+    /// Run `block` on the decode queue after every line enqueued so far has
+    /// been decoded, so events derived from the connection's final lines
+    /// (e.g. a disconnect notification) cannot overtake them.
+    func afterPendingLines(_ block: @escaping @Sendable () -> Void) {
+        decodeQueue.async(execute: block)
+    }
+
     private func completed(bytes: Int) {
         let (resume, backlog) = state.withLock { s -> (Bool, Int) in
             s.pendingBytes -= bytes
@@ -83,4 +90,26 @@ final class LineDecodeHandoff: @unchecked Sendable {
     }
 
     var pendingBytesForTesting: Int { state.withLock { $0.pendingBytes } }
+}
+
+/// Tracks which connection's read loop is suspended by decode backpressure,
+/// so a resume only restarts the connection that paused (a reconnect in the
+/// meantime has already started its own read loop). Confined to the socket
+/// queue.
+struct ReadLoopPauseGate<Connection: AnyObject> {
+    private var paused: Connection?
+
+    mutating func pause(_ connection: Connection?) {
+        paused = connection
+    }
+
+    /// Returns `true` (and clears the pause) iff `current` is the connection
+    /// that was paused.
+    mutating func resume(current: Connection?) -> Bool {
+        guard let paused, paused === current else { return false }
+        self.paused = nil
+        return true
+    }
+
+    var isPaused: Bool { paused != nil }
 }
