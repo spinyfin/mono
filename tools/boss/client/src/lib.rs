@@ -689,7 +689,7 @@ async fn ensure_engine_running_with(
         .find_map(|(_, pid_path)| running_engine_pid(pid_path).map(|pid| (pid, pid_path)))
         .filter(|(pid, _)| is_likely_engine_process(*pid))
     {
-        if wait_for_discovered_engine_until(discovery, deadline, &mut None).await? {
+        if wait_for_discovered_engine_until(discovery, deadline, spawned).await? {
             return Ok(());
         }
         bail!(
@@ -737,7 +737,7 @@ impl std::fmt::Display for AutostartFailed {
 impl std::error::Error for AutostartFailed {}
 
 /// Poll for a reachable engine until `deadline`. If `child` is the engine this
-/// call started and it exits first, fail at once with its exit status.
+/// call started exits first, report its status unless another engine is starting.
 async fn wait_for_discovered_engine_until(
     discovery: &Discovery,
     deadline: Instant,
@@ -750,6 +750,19 @@ async fn wait_for_discovered_engine_until(
         if let Some(child) = child
             && let Ok(Some(status)) = child.try_wait()
         {
+            // A concurrent autostart may have won ownership while our child
+            // exited. Check again before reporting a startup failure.
+            if discover_running_engine_until(discovery, deadline).await.is_some() {
+                return Ok(true);
+            }
+            let another_engine = discovery.endpoint_candidates().into_iter().any(|(_, path)| {
+                running_engine_pid(path)
+                    .is_some_and(|pid| pid != child.id() && is_likely_engine_process(pid))
+            });
+            if another_engine {
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             return Err(anyhow::Error::new(AutostartFailed(format!(
                 "the engine process started for this command exited before becoming ready ({status}); \
                  socket {} was never published",

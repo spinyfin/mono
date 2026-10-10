@@ -487,3 +487,78 @@ async fn worker_environment_never_launches_an_engine() {
     assert!(format!("{err:#}").contains("worker session"), "{err:#}");
     assert!(!counter.exists(), "no process was launched");
 }
+
+// Put the target early in the command so even a width-limited ps listing
+// recognizes the fixture as an engine launched through Bazel.
+fn recognizable_engine(script: &str, args: Vec<String>) -> EngineCommand {
+    let mut command_args = vec!["-c".into(), format!(": {ENGINE_BINARY_TARGET}; {script}"), "engine".into()];
+    command_args.extend(args);
+    EngineCommand {
+        program: "/bin/sh".into(),
+        args: command_args,
+        source: "test".into(),
+        attempted: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn published_pid_still_monitors_child_exit_in_a_later_readiness_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut discovery = discovery(dir.path(), RetryPolicy::default());
+    discovery.autostart = true;
+    let release = dir.path().join("exit");
+    discovery.engine = recognizable_engine(
+        r#"echo $$ > "$1"; while [ ! -f "$2" ]; do sleep 0.02; done; exit 7"#,
+        vec![discovery.pid_file_path.clone(), release.to_string_lossy().into_owned()],
+    );
+    let mut child = None;
+    ensure_engine_running_with(&discovery, true, Duration::from_millis(100), &mut child)
+        .await
+        .expect_err("first readiness window expires");
+    let pid = child.as_ref().unwrap().id();
+    assert_eq!(read_pid_file(&discovery.pid_file_path), Some(pid));
+    assert!(is_likely_engine_process(pid));
+    assert!(child.as_mut().unwrap().try_wait().unwrap().is_none());
+
+    let exit = tokio::spawn(async move {
+        sleep(Duration::from_millis(150)).await;
+        std::fs::write(release, "exit").unwrap();
+    });
+    let error = ensure_engine_running_with(&discovery, false, Duration::from_secs(5), &mut child)
+        .await
+        .expect_err("child exits during the pid-file readiness wait");
+    exit.await.unwrap();
+    assert!(error.downcast_ref::<AutostartFailed>().is_some(), "{error:#}");
+    assert!(format!("{error:#}").contains("exit status: 7"), "{error:#}");
+}
+
+#[tokio::test]
+async fn autostart_loser_waits_for_the_winners_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = discovery(dir.path(), fast_policy(Duration::from_secs(10), &notices));
+    discovery.autostart = true;
+    let mut winner = Command::new("/bin/sh")
+        .args(["-c", &format!(": {ENGINE_BINARY_TARGET}; while :; do sleep 0.1; done")])
+        .spawn()
+        .unwrap();
+    // The winner claims the pid path only after the loser's pre-spawn check.
+    discovery.engine = recognizable_engine(
+        r#"echo "$2" > "$1"; exit 1"#,
+        vec![discovery.pid_file_path.clone(), winner.id().to_string()],
+    );
+    let pid_path = discovery.pid_file_path.clone();
+    let socket = discovery.socket_path.clone();
+    let engine = tokio::spawn(async move {
+        while !Path::new(&pid_path).exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+        sleep(Duration::from_millis(300)).await;
+        UnixListener::bind(socket).unwrap()
+    });
+    let result = BossClient::connect(&discovery).await;
+    winner.kill().unwrap();
+    winner.wait().unwrap();
+    let _listener = engine.await.unwrap();
+    assert!(result.is_ok(), "winner becomes reachable: {result:?}");
+}

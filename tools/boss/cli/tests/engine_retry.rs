@@ -169,3 +169,17 @@ fn no_retry_fails_fast_without_a_progress_notice() {
     assert!(stderr.contains("retry disabled"), "{stderr}");
     assert!(!stderr.contains("retrying"), "no retry notice when disabled: {stderr}");
 }
+
+#[test]
+fn invalid_wait_environment_warns_on_stderr_with_clean_json_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("missing.sock").to_string_lossy().into_owned();
+    let output = run_boss(&socket, &["--no-retry"], "5s");
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty(), "nothing on stdout: {:?}", output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("BOSS_ENGINE_MAX_WAIT_SECS"), "{stderr}");
+    assert!(stderr.contains("not a whole number of seconds"), "{stderr}");
+    assert!(stderr.contains("600"), "warning names the default fallback: {stderr}");
+}
