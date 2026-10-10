@@ -312,7 +312,7 @@ final class PopulationTimingLog: @unchecked Sendable {
 /// Coordinator that stitches the four segments of one population together.
 ///
 /// Threading: `fetchIssued` is called from the main actor (the send site);
-/// `workTreeDecoded` from the `EngineClient` serial queue (off main);
+/// `workTreeDecoded` from the `EngineClient` decode queue (off main);
 /// `takeContextForApply` / `recordApply` / `recordRender` from the main
 /// actor again (in `handle(.workTree)` and the render tick). All shared
 /// state is guarded by a single lock. Two FIFO queues per product handle
