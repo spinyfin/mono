@@ -16,14 +16,14 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
     /// communicates this state to the user.
     func testSocketWaitingDoesNotSetWorkErrorMessage() {
         let model = makeModel()
-        model.applyEventForTest(.error(message: "socket waiting: Connection refused"))
+        model.applyEventForTest(.transportError(message: "socket waiting: Connection refused"))
         XCTAssertNil(model.workErrorMessage)
     }
 
     /// Same routing rule for the terminal `socket failed:` variant.
     func testSocketFailedDoesNotSetWorkErrorMessage() {
         let model = makeModel()
-        model.applyEventForTest(.error(message: "socket failed: POSIXErrorCode(rawValue: 61)"))
+        model.applyEventForTest(.transportError(message: "socket failed: POSIXErrorCode(rawValue: 61)"))
         XCTAssertNil(model.workErrorMessage)
     }
 
@@ -32,10 +32,10 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
     /// transport error and must follow the same rule.
     func testSocketSendAndReceiveFailedDoNotSetWorkErrorMessage() {
         let model = makeModel()
-        model.applyEventForTest(.error(message: "socket send failed: connection reset"))
+        model.applyEventForTest(.transportError(message: "socket send failed: connection reset"))
         XCTAssertNil(model.workErrorMessage)
 
-        model.applyEventForTest(.error(message: "socket receive failed: connection reset"))
+        model.applyEventForTest(.transportError(message: "socket receive failed: connection reset"))
         XCTAssertNil(model.workErrorMessage)
     }
 
@@ -64,9 +64,44 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
     func testRepeatedSocketWaitingDoesNotResurrectModal() {
         let model = makeModel()
         for _ in 0..<10 {
-            model.applyEventForTest(.error(message: "socket waiting: Connection refused"))
+            model.applyEventForTest(.transportError(message: "socket waiting: Connection refused"))
         }
         XCTAssertNil(model.workErrorMessage)
+    }
+
+    /// A send while disconnected is typed `.notConnected`: no modal, and
+    /// the connection-lost banner state is left to its own debounce.
+    func testDroppedActionStaysVisibleThroughReconnectWithoutSystemMessages() {
+        let model = makeModel()
+        XCTAssertFalse(model.showSystemMessages)
+        model.applyEventForTest(.notConnected(requestKind: "create_chore"))
+        XCTAssertNotNil(model.disconnectedActionNotice)
+        model.applyEventForTest(.connected)
+        XCTAssertNotNil(model.disconnectedActionNotice)
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertFalse(model.showConnectionLostBanner)
+    }
+
+    /// `EngineClient` with no connection: a read is queued (not emitted as
+    /// an error); a mutation is failed back as `.notConnected`.
+    func testClientQueuesReadsAndReportsNotConnectedForMutations() async {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var events: [EngineEvent] = []
+        client.onEvent = { events.append($0) }
+
+        XCTAssertNotNil(client.sendLine(["type": "get_work_tree"], queueIfDisconnected: true))
+        XCTAssertNotNil(client.sendLine(["type": "get_work_tree"], queueIfDisconnected: true))
+        XCTAssertEqual(client.queuedReadCountForTesting, 1, "identical reads coalesce")
+        XCTAssertNil(client.sendListEngineAttempts(limit: 0, includeBackgroundWork: true))
+        XCTAssertEqual(client.queuedReadCountForTesting, 1, "background polls retry on reconnect without holding a pending reply")
+        XCTAssertNotNil(client.sendListEngineAttempts(limit: 20, includeBackgroundWork: true))
+        XCTAssertEqual(client.queuedReadCountForTesting, 2, "on-demand history reads must survive backoff")
+        XCTAssertNil(client.sendLine(["type": "create_chore"]))
+
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(events.count, 1)
+        if case .notConnected(let kind) = events.first { XCTAssertEqual(kind, "create_chore") }
+        else { XCTFail("expected .notConnected, got \(events)") }
     }
 
     private func makeModel() -> ChatViewModel {

@@ -134,8 +134,9 @@ final class EngineClient: @unchecked Sendable {
                 self.socketIndex = 0
                 self.emit(.connected)
                 self.receiveNext()
+                self.flushQueuedReads()
             case .waiting(let error), .failed(let error):
-                self.emit(.error(message: "socket failed: \(error.localizedDescription)"))
+                self.emit(.transportError(message: "socket failed: \(error.localizedDescription)"))
                 self.closeConnection()
             case .cancelled:
                 self.closeConnection()
@@ -170,11 +171,11 @@ final class EngineClient: @unchecked Sendable {
     // Not `private`: called from the `EngineClient+PaneResponses.swift`
     // extension, which needs file-scoped-`private` loosened to `internal`
     // to reach it.
-    /// Returns the envelope id after a socket write. `nil` when nothing
-    /// was sent (`connection == nil` or the payload failed to encode) so
-    /// callers do not register a pending reply that can never arrive.
+    /// Returns the envelope id for a socket write or queued read. Only
+    /// self-retrying background polls may opt out of disconnected reports;
+    /// user actions must either queue or report a visible failure.
     @discardableResult
-    func sendLine(_ payload: [String: Any]) -> String? {
+    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true) -> String? {
         let envelopeRequestId = UUID().uuidString
         outboundRecorder?(payload)
 
@@ -192,11 +193,71 @@ final class EngineClient: @unchecked Sendable {
             )
         }
 
-        guard let connection else {
-            emit(.error(message:"engine connection is not established"))
+        guard connection != nil else {
+            // A send while the socket is down is a transport condition,
+            // not an engine-reported error. Idempotent reads are held and
+            // delivered on reconnect when the caller opts in with
+            // `queueIfDisconnected`; anything else is failed back to the
+            // app as a typed `.notConnected`.
+            let kind = (payload["type"] as? String) ?? "unknown"
+            if queueIfDisconnected {
+                Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
+                // Held as sorted-key JSON so the queue is Sendable and an
+                // identical newer request supersedes the queued one.
+                if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
+                    queuedReads.withLock { state in
+                        state.removeAll { $0.data == data }
+                        state.append((envelopeRequestId, data))
+                        if state.count > Self.maxQueuedReads { state.removeFirst(state.count - Self.maxQueuedReads) }
+                    }
+                } else {
+                    emit(.notConnected(requestKind: kind))
+                    return nil
+                }
+                return envelopeRequestId
+            }
+            if !reportIfDisconnected {
+                Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
+                return nil
+            }
+            Self.log.info("dropped \(kind, privacy: .public) while disconnected; reporting not-connected")
+            emit(.notConnected(requestKind: kind))
             return nil
         }
+        return write(payload, envelopeRequestId: envelopeRequestId)
+    }
 
+    private static let log = Logger(subsystem: "Boss", category: "EngineClient")
+    private static let maxQueuedReads = 64
+    private let queuedReads = OSAllocatedUnfairLock(
+        initialState: [(id: String, data: Data)]()
+    )
+
+    /// Number of reads waiting for a connection. Test hook.
+    var queuedReadCountForTesting: Int { queuedReads.withLock { $0.count } }
+
+    func isReadQueued(requestId: String) -> Bool {
+        queuedReads.withLock { $0.contains { $0.id == requestId } }
+    }
+
+    private func flushQueuedReads() {
+        let drained = queuedReads.withLock { state -> [(id: String, data: Data)] in
+            let copy = state
+            state.removeAll()
+            return copy
+        }
+        for item in drained {
+            guard let payload = (try? JSONSerialization.jsonObject(with: item.data)) as? [String: Any] else { continue }
+            write(payload, envelopeRequestId: item.id)
+        }
+    }
+
+    @discardableResult
+    private func write(_ payload: [String: Any], envelopeRequestId: String) -> String? {
+        guard let connection else {
+            emit(.notConnected(requestKind: (payload["type"] as? String) ?? "unknown"))
+            return nil
+        }
         do {
             let envelope: [String: Any] = [
                 "request_id": envelopeRequestId,
@@ -208,7 +269,7 @@ final class EngineClient: @unchecked Sendable {
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
                 guard let self, self.connection === connection else { return }
                 if let error {
-                    self.emit(.error(message:"socket send failed: \(error.localizedDescription)"))
+                    self.emit(.transportError(message: "socket send failed: \(error.localizedDescription)"))
                 }
             })
             return envelopeRequestId
@@ -225,7 +286,7 @@ final class EngineClient: @unchecked Sendable {
             guard let self, self.connection === connection else { return }
 
             if let error {
-                self.emit(.error(message:"socket receive failed: \(error.localizedDescription)"))
+                self.emit(.transportError(message:"socket receive failed: \(error.localizedDescription)"))
                 self.closeConnection()
                 return
             }

@@ -497,6 +497,7 @@ struct ContentView: View {
             supervisionState: model.engineSupervisionState
         )
             || (model.isConnected && !model.bannerHealthIssues.isEmpty)
+            || model.disconnectedActionNotice != nil
     }
 
     /// Insertion-only: a banner slides down into the gap AppKit has just
@@ -516,6 +517,15 @@ struct ContentView: View {
     @ViewBuilder
     private var chromeBanners: some View {
         VStack(spacing: 0) {
+            if let notice = model.disconnectedActionNotice {
+                HStack {
+                    Label(notice, systemImage: "exclamationmark.triangle")
+                    Spacer()
+                    Button("Dismiss") { model.disconnectedActionNotice = nil }
+                }
+                .padding(8)
+                .background(Color.orange.opacity(0.12))
+            }
             // Persistent chrome-level signal that the engine socket is
             // down. Only shown after we've connected at least once so
             // the banner doesn't flash on launch during the normal
