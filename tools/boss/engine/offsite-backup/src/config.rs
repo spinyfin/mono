@@ -119,11 +119,8 @@ impl OffsiteConfig {
         }
     }
 
-    /// Check that an enabled config points at a usable destination, creating
-    /// the per-host subfolder. Errors name the offending setting. Call at
-    /// each copy on the destination worker: a sync folder can be unmounted
-    /// and remounted while the engine runs.
-    pub fn validate(&self, host: &str) -> Result<ValidatedDestination> {
+    /// The no-I/O part of validation: `destination` must be set and absolute.
+    pub fn destination_setting(&self) -> Result<&Path> {
         let Some(destination) = &self.destination else {
             bail!("{CONFIG_SECTION} is enabled but `destination` is not set");
         };
@@ -133,6 +130,15 @@ impl OffsiteConfig {
                 destination.display()
             );
         }
+        Ok(destination)
+    }
+
+    /// Check that an enabled config points at a usable destination, creating
+    /// the per-host subfolder. Errors name the offending setting. Call at
+    /// each copy on the destination worker: a sync folder can be unmounted
+    /// and remounted while the engine runs.
+    pub fn validate(&self, host: &str) -> Result<ValidatedDestination> {
+        let destination = self.destination_setting()?;
         match std::fs::metadata(destination) {
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => bail!(

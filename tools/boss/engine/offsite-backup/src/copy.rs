@@ -20,6 +20,13 @@ pub struct CopyOutcome {
 /// Streams through the shared atomic publisher's exclusive staging sibling.
 /// Retention removes crash-orphaned staging files after 24 hours.
 pub fn copy_to_offsite(src: &Path, host_dir: &Path) -> Result<CopyOutcome> {
+    let name = backup_file_name(src)?;
+    let source = File::open(src).with_context(|| format!("open {}", src.display()))?;
+    copy_open_to_offsite(source, name, host_dir)
+}
+
+/// Validate that `src` names a finished backup and return its file name.
+pub fn backup_file_name(src: &Path) -> Result<&str> {
     let name = src
         .file_name()
         .and_then(|n| n.to_str())
@@ -29,10 +36,15 @@ pub fn copy_to_offsite(src: &Path, host_dir: &Path) -> Result<CopyOutcome> {
         // the live state.db / -wal / -shm.
         bail!("refusing to copy {name}: not a finished `{BACKUP_FILE_PREFIX}*` backup");
     }
+    Ok(name)
+}
+
+/// Like [`copy_to_offsite`], streaming from an already-open `source` so the
+/// copy survives the local path being pruned in the meantime.
+pub fn copy_open_to_offsite(mut source: File, name: &str, host_dir: &Path) -> Result<CopyOutcome> {
     let final_path = host_dir.join(name);
-    let mut source = File::open(src).with_context(|| format!("open {}", src.display()))?;
     let bytes = boss_engine_utils::atomic_blob::write_stream_atomic(&final_path, &mut source)
-        .with_context(|| format!("copy {} to {}", src.display(), final_path.display()))?;
+        .with_context(|| format!("copy {name} to {}", final_path.display()))?;
     Ok(CopyOutcome {
         copied_path: final_path,
         bytes,

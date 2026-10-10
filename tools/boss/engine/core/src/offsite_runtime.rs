@@ -1,6 +1,7 @@
 //! Off-machine dispatch and metrics.
 use boss_engine_offsite_backup::{CONFIG_SECTION, OffsiteConfig};
 use boss_metrics::Registry;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -47,6 +48,12 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_gauge(&OFFSITE_LAST_SUCCESS_AGE_SECS);
 }
 
+/// A finished local backup held open so local retention cannot invalidate it.
+pub struct Snapshot {
+    file: File,
+    name: String,
+}
+
 /// Runtime state for off-machine copies. Never fails the caller: every
 /// problem is logged at ERROR/WARN naming the setting and counted.
 #[derive(bon::Builder)]
@@ -76,6 +83,8 @@ impl OffsiteRuntime {
                     "database-backup: cannot read {CONFIG_SECTION} settings; off-machine backups are NOT running",
                 );
                 OFFSITE_CONFIG_INVALID.inc(&registry);
+                // No runtime means no refresher; a default 0 would read as fresh.
+                OFFSITE_LAST_SUCCESS_AGE_SECS.set(&registry, -1);
                 return None;
             }
         };
@@ -110,9 +119,56 @@ impl OffsiteRuntime {
         ))
     }
 
+    /// Fail loudly at startup, independent of local snapshot success. The
+    /// settings checks need no I/O and run inline; filesystem validation runs
+    /// on the single-flight worker so startup never waits on the destination.
+    pub fn validate_at_startup(self: &Arc<Self>) {
+        if let Err(err) = self.config.destination_setting() {
+            self.report_config_invalid(&err);
+            return;
+        }
+        self.start_job(|runtime| {
+            if let Err(err) = runtime.config.validate(&runtime.host) {
+                runtime.report_config_invalid(&err);
+            }
+            runtime.refresh_age_gauge();
+        });
+    }
+
+    fn report_config_invalid(&self, err: &anyhow::Error) {
+        OFFSITE_CONFIG_INVALID.inc(&self.registry);
+        tracing::error!(
+            error = %format!("{err:#}"),
+            "database-backup: off-machine backups are enabled but the {CONFIG_SECTION} destination is unusable",
+        );
+    }
+
+    /// Open the finished local `snapshot` so it can still be copied after
+    /// local retention unlinks its path. Failures are logged and counted.
+    pub fn open_snapshot(&self, snapshot: &Path) -> Option<Snapshot> {
+        let opened = boss_engine_offsite_backup::backup_file_name(snapshot)
+            .map(str::to_owned)
+            .and_then(|name| {
+                let file = File::open(snapshot).map_err(anyhow::Error::from)?;
+                Ok(Snapshot { file, name })
+            });
+        match opened {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                OFFSITE_COPIES_FAILED.inc(&self.registry);
+                tracing::error!(
+                    error = %format!("{err:#}"),
+                    snapshot = %snapshot.display(),
+                    "database-backup: cannot open snapshot for off-machine copy",
+                );
+                None
+            }
+        }
+    }
+
     /// Dispatch without waiting for destination validation, copying, or pruning.
-    pub fn submit(self: &Arc<Self>, snapshot: PathBuf) {
-        self.start_job(move |runtime| runtime.copy_and_prune(&snapshot));
+    pub fn submit(self: &Arc<Self>, snapshot: Snapshot) {
+        self.start_job(move |runtime| runtime.copy_and_prune(snapshot));
     }
 
     fn start_job(self: &Arc<Self>, job: impl FnOnce(&Self) + Send + 'static) {
@@ -143,7 +199,8 @@ impl OffsiteRuntime {
     }
 
     /// Copy the finished local backup `snapshot` off-machine, then prune.
-    pub fn copy_and_prune(&self, snapshot: &Path) {
+    pub fn copy_and_prune(&self, snapshot: Snapshot) {
+        let Snapshot { file, name } = snapshot;
         let result = self
             .config
             .validate(&self.host)
@@ -151,7 +208,7 @@ impl OffsiteRuntime {
                 OFFSITE_CONFIG_INVALID.inc(&self.registry);
             })
             .and_then(|dest| {
-                let outcome = boss_engine_offsite_backup::copy_to_offsite(snapshot, &dest.host_dir)?;
+                let outcome = boss_engine_offsite_backup::copy_open_to_offsite(file, &name, &dest.host_dir)?;
                 Ok((dest, outcome))
             });
         match result {
@@ -161,7 +218,7 @@ impl OffsiteRuntime {
                 if let Err(error) =
                     boss_engine_utils::atomic_blob::write_blob_atomic(&self.success_path, record.as_bytes())
                 {
-                    OFFSITE_COPIES_FAILED.inc(&self.registry);
+                    // The copy itself succeeded, so it is not counted as failed.
                     tracing::error!(%error, "database-backup: cannot persist off-machine success timestamp");
                 }
                 self.last_success.store(now, Ordering::Relaxed);
@@ -193,7 +250,7 @@ impl OffsiteRuntime {
                 OFFSITE_COPIES_FAILED.inc(&self.registry);
                 tracing::error!(
                     error = %format!("{err:#}"),
-                    snapshot = %snapshot.display(),
+                    snapshot = %name,
                     "database-backup: off-machine copy FAILED (local backup is unaffected); \
                      check the {CONFIG_SECTION} destination setting",
                 );

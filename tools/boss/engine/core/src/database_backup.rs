@@ -196,14 +196,17 @@ pub fn run_backup_with_offsite(
             return;
         }
     }
+    // Open before retention: with a low (or zero) retention the path may be
+    // unlinked before the async worker starts, but an open handle stays valid.
+    let pending = offsite.and_then(|offsite| offsite.open_snapshot(&dest));
     if let Err(err) = apply_retention(backup_dir, retention) {
         tracing::warn!(
             error = %format!("{err:#}"),
             "database-backup: retention enforcement failed (non-fatal)",
         );
     }
-    if let Some(offsite) = offsite {
-        offsite.submit(dest);
+    if let (Some(offsite), Some(pending)) = (offsite, pending) {
+        offsite.submit(pending);
     }
 }
 
@@ -221,6 +224,7 @@ pub fn spawn_loop(
     offsite: Option<Arc<OffsiteRuntime>>,
 ) -> tokio::task::JoinHandle<()> {
     if let Some(offsite) = offsite.clone() {
+        offsite.validate_at_startup();
         // Keep the staleness gauge climbing between backups so a wedged
         // loop is still visible.
         tokio::spawn(async move {
