@@ -71,7 +71,7 @@ use crate::dead_pid_sweep::{PidStatus, probe_pid};
 /// process — the hostname does not change while an engine is running.
 pub(crate) fn engine_install_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(boss_engine_offsite_backup::host_name)
+    ID.get_or_init(boss_engine_utils::host::host_name)
 }
 
 /// Reason recorded on every force-release this sweep performs.

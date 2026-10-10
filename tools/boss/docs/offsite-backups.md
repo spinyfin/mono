@@ -34,7 +34,7 @@ The settings are read once at engine start; restart the engine after editing. Th
 
 Copies land in `<destination>/<hostname>/state.db.bak-YYYYMMDD-HHMMSS`, so several machines can share one destination. The destination directory itself must already exist (Boss only creates the per-host subfolder); a missing destination usually means the sync folder is not mounted.
 
-Retention is the union of both windows, measured over the copies that exist (not wall-clock), so an engine that was off for a week does not prune its only copies. Retention also removes recognized crash staging files older than 24 hours: legacy `.state.db.bak-YYYYMMDD-HHMMSS.partial` files and atomic-publisher `state.db.bak-YYYYMMDD-HHMMSS.<pid>.<sequence>.tmp` files. Recent staging files and unrelated files are left alone.
+Retention is the union of both windows, measured over the copies that exist (not wall-clock), so an engine that was off for a week does not prune its only copies. Retention also removes recognized crash staging files older than 24 hours: atomic-publisher `state.db.bak-YYYYMMDD-HHMMSS.<pid>.<sequence>.tmp` files. Recent staging files and unrelated files are left alone.
 
 ### How a copy is made
 
@@ -53,6 +53,7 @@ Destination validation, copying, and pruning run on a separate single-flight wor
 | `database_backup.offsite.config_invalid`        | counter of unusable-config detections                                                                                                                                                                                                                         |
 | `database_backup.offsite.copies_skipped`        | counter of cycles skipped while a previous destination operation is running                                                                                                                                                                                   |
 | `database_backup.offsite.retention_failed`      | counter of retention enumeration/deletion failures (also logged at ERROR)                                                                                                                                                                                     |
+| `database_backup.offsite.success_record_failed` | counter: a copy landed but its success timestamp could not be written to the state root, so the age gauge reads -1 after a restart. Not counted as a failed copy.                                                                                             |
 | `database_backup.offsite.last_success_age_secs` | gauge, refreshed every 60s: seconds since the last good copy, persisted locally across restarts for this destination; -1 means no durable success is known (also set when `[backup.offsite]` cannot be parsed). Alert on -1 or when this exceeds a few hours. |
 
 ### Why a synced folder rather than a cloud bucket

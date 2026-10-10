@@ -28,6 +28,11 @@ crate::register_gauge!(
     "Seconds since the last successful off-machine copy (-1 if no durable success is known). Only updated while off-machine backups are enabled."
 );
 crate::register_counter!(
+    OFFSITE_SUCCESS_RECORD_FAILED,
+    "database_backup.offsite.success_record_failed",
+    "Copies that landed but whose success timestamp could not be persisted locally (the age gauge reads -1 after a restart)."
+);
+crate::register_counter!(
     OFFSITE_COPIES_SKIPPED,
     "database_backup.offsite.copies_skipped",
     "Copies skipped while the previous destination operation is running."
@@ -43,6 +48,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&OFFSITE_COPIES_SUCCEEDED);
     registry.register_counter(&OFFSITE_COPIES_FAILED);
     registry.register_counter(&OFFSITE_CONFIG_INVALID);
+    registry.register_counter(&OFFSITE_SUCCESS_RECORD_FAILED);
     registry.register_counter(&OFFSITE_COPIES_SKIPPED);
     registry.register_counter(&OFFSITE_RETENTION_FAILED);
     registry.register_gauge(&OFFSITE_LAST_SUCCESS_AGE_SECS);
@@ -95,7 +101,7 @@ impl OffsiteRuntime {
         if !config.enabled {
             return None;
         }
-        let host = boss_engine_offsite_backup::host_name();
+        let host = boss_engine_utils::host::host_name();
         // Read local durable evidence only: startup must never touch the mount.
         let last_success = std::fs::read_to_string(&success_path)
             .ok()
@@ -219,6 +225,7 @@ impl OffsiteRuntime {
                     boss_engine_utils::atomic_blob::write_blob_atomic(&self.success_path, record.as_bytes())
                 {
                     // The copy itself succeeded, so it is not counted as failed.
+                    OFFSITE_SUCCESS_RECORD_FAILED.inc(&self.registry);
                     tracing::error!(%error, "database-backup: cannot persist off-machine success timestamp");
                 }
                 self.last_success.store(now, Ordering::Relaxed);

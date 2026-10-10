@@ -76,13 +76,6 @@ fn remove(path: &Path, outcome: &mut PruneOutcome) {
 }
 
 fn is_staging_name(name: &str) -> bool {
-    if let Some(stamp) = name
-        .strip_prefix(".")
-        .and_then(|n| n.strip_prefix(BACKUP_FILE_PREFIX))
-        .and_then(|n| n.strip_suffix(".partial"))
-    {
-        return is_stamp(stamp);
-    }
     let Some(tail) = name
         .strip_prefix(BACKUP_FILE_PREFIX)
         .and_then(|n| n.strip_suffix(".tmp"))
@@ -157,12 +150,12 @@ mod tests {
         touch(d, "20260101-000000");
         touch(d, "20260102-000000");
         std::fs::write(d.join("notes.txt"), b"x").unwrap();
-        std::fs::write(d.join(".state.db.bak-20260101-000000.partial"), b"x").unwrap();
+        std::fs::write(d.join("state.db.bak-20260101-000000.1.1.tmp"), b"x").unwrap();
         std::fs::write(d.join("state.db.bak-garbage"), b"x").unwrap();
         prune(d, 1, 0).unwrap();
         let n = names(d);
         assert!(n.contains(&"notes.txt".to_owned()));
-        assert!(n.contains(&".state.db.bak-20260101-000000.partial".to_owned()));
+        assert!(n.contains(&"state.db.bak-20260101-000000.1.1.tmp".to_owned()));
         assert!(n.contains(&"state.db.bak-garbage".to_owned()));
         assert!(!n.contains(&"state.db.bak-20260101-000000".to_owned()));
         assert!(n.contains(&"state.db.bak-20260102-000000".to_owned()));
@@ -191,7 +184,7 @@ mod tests {
     fn old_staging_files_are_pruned_but_recent_and_unrelated_files_survive() {
         let tmp = TempDir::new().unwrap();
         for name in [
-            ".state.db.bak-20260101-000000.partial",
+            "state.db.bak-20260101-000000.1.1.tmp",
             "state.db.bak-20260101-000000.123.4.tmp",
             "unrelated.tmp",
         ] {
@@ -202,12 +195,12 @@ mod tests {
             )
             .unwrap();
         }
-        std::fs::write(tmp.path().join(".state.db.bak-20260102-000000.partial"), b"active").unwrap();
+        std::fs::write(tmp.path().join("state.db.bak-20260102-000000.2.2.tmp"), b"active").unwrap();
         let result = prune(tmp.path(), 1, 1).unwrap();
         assert!(result.failures.is_empty());
         assert_eq!(result.removed.len(), 2);
         assert!(tmp.path().join("unrelated.tmp").exists());
-        assert!(tmp.path().join(".state.db.bak-20260102-000000.partial").exists());
+        assert!(tmp.path().join("state.db.bak-20260102-000000.2.2.tmp").exists());
     }
 
     #[test]
