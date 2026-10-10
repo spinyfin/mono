@@ -9,6 +9,7 @@
 pub mod duration;
 pub mod env_parse;
 pub mod epoch_time;
+pub mod host;
 pub mod iso8601;
 pub mod json_extract;
 pub mod local_time;

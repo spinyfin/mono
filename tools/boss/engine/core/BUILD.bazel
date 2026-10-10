@@ -114,6 +114,7 @@ rust_library(
         "//tools/boss/engine/grok-home-retention",
         "//tools/boss/engine/live-status-redact",
         "//tools/boss/engine/metrics",
+        "//tools/boss/engine/offsite-backup",
         "//tools/boss/engine/planner-validation",
         "//tools/boss/engine/pr-review",
         "//tools/boss/engine/pr-review-sources",

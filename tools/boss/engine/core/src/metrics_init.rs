@@ -24,6 +24,9 @@ use boss_metrics::Registry;
 /// at the first increment (design §"Risks / open questions" item 6).
 pub fn init_all(registry: &Registry) {
     crate::work::personas::register_metrics(registry);
+    // Off-machine state.db backup copies: success/failure counters and the
+    // last-success-age staleness gauge.
+    crate::database_backup::register_metrics(registry);
     // Question → answer-agent lifecycle counters and queue-wait histogram.
     crate::answer_agent_observability::register_metrics(registry);
     // Phase 3: PR URL capture path counters.
@@ -303,21 +306,34 @@ mod tests {
             );
         }
         assert!(names.contains(&"persona_roster_exhausted".to_owned()));
+        for expected in [
+            "database_backup.offsite.config_invalid",
+            "database_backup.offsite.copies_failed",
+            "database_backup.offsite.copies_skipped",
+            "database_backup.offsite.copies_succeeded",
+            "database_backup.offsite.retention_failed",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
         assert_eq!(
             names.len(),
-            114,
+            119,
             "expected 6 answer_agent + 6 pr_url_capture + 6 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 15 merge_poller + 3 review_pool + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
              14 worker_proposals submit + 1 worker_proposals channel_error + \
              5 github_api + 2 codex_unobserved_command + 2 codex_guard_trace + \
-             4 work_attachments + 1 completion mid_turn_reap + 1 nudge_ladder + 3 run_done + 1 persona counters"
+             4 work_attachments + 1 completion mid_turn_reap + 1 nudge_ladder + 3 run_done + 1 persona + 5 database_backup offsite counters"
         );
         // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();
         assert_eq!(
             gauge_names,
             vec![
+                "database_backup.offsite.last_success_age_secs",
                 "dependency_unblock.longest_stale_seconds",
                 "dispatch.drain_pass_duration_ms",
                 "dispatch.queue_depth.automation",

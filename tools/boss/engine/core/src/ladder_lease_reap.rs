@@ -71,16 +71,7 @@ use crate::dead_pid_sweep::{PidStatus, probe_pid};
 /// process — the hostname does not change while an engine is running.
 pub(crate) fn engine_install_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(|| {
-        let mut buf = [0u8; 256];
-        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
-        if rc == 0 {
-            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            String::from_utf8_lossy(&buf[..end]).into_owned()
-        } else {
-            "unknown-host".to_owned()
-        }
-    })
+    ID.get_or_init(boss_engine_utils::host::host_name)
 }
 
 /// Reason recorded on every force-release this sweep performs.

@@ -458,6 +458,7 @@ dependencies = [
  "boss-engine-gh-invocation",
  "boss-engine-grok-home-retention",
  "boss-engine-live-status-redact",
+ "boss-engine-offsite-backup",
  "boss-engine-planner-validation",
  "boss-engine-proposal-validation",
  "boss-engine-recovery",
@@ -719,6 +720,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-offsite-backup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-engine-utils",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "boss-engine-planner-validation"
 version = "0.1.0"
 dependencies = [
@@ -808,6 +820,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]
