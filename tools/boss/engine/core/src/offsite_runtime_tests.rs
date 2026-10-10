@@ -46,13 +46,19 @@ fn offsite_enabled_without_destination_fails_loudly() {
     register_metrics(&registry);
     let rt = OffsiteRuntime::from_settings(&settings, registry.clone()).expect("runtime kept for retries");
     assert_eq!(rt.age_secs_at(123), -1);
-    // Copies fail (and are counted) rather than guessing a destination.
-    let snap = tmp.path().join("state.db.bak-20260101-000000");
-    std::fs::write(&snap, b"x").unwrap();
-    rt.copy_and_prune(&snap);
+    // Reported at startup, before any snapshot exists.
+    rt.validate_at_startup();
     assert_eq!(
         registry.counter_value("database_backup.offsite.config_invalid"),
         Some(1)
+    );
+    // Copies fail (and are counted) rather than guessing a destination.
+    let snap = tmp.path().join("state.db.bak-20260101-000000");
+    std::fs::write(&snap, b"x").unwrap();
+    rt.copy_and_prune(rt.open_snapshot(&snap).unwrap());
+    assert_eq!(
+        registry.counter_value("database_backup.offsite.config_invalid"),
+        Some(2)
     );
     assert_eq!(registry.counter_value("database_backup.offsite.copies_failed"), Some(1));
     assert_eq!(
@@ -71,6 +77,97 @@ fn offsite_unparseable_section_is_counted() {
     assert!(OffsiteRuntime::from_settings(&settings, registry.clone()).is_none());
     assert_eq!(
         registry.counter_value("database_backup.offsite.config_invalid"),
+        Some(1)
+    );
+    assert_eq!(
+        registry.gauge_value("database_backup.offsite.last_success_age_secs"),
+        Some(-1)
+    );
+}
+
+#[test]
+fn startup_reports_invalid_destination_when_local_snapshot_fails() {
+    let tmp = TempDir::new().unwrap();
+    let db = open_file_db(tmp.path());
+    // A regular file as the backup dir makes every local snapshot fail.
+    let backup_dir = tmp.path().join("not-a-dir");
+    std::fs::write(&backup_dir, b"x").unwrap();
+    let (rt, registry) = offsite_runtime(&tmp.path().join("missing-mount"), 1, 1);
+    rt.validate_at_startup();
+    wait_for_worker(&rt);
+    run_backup_with_offsite(&db, &backup_dir, 24, Some(&rt));
+    wait_for_worker(&rt);
+    assert_eq!(
+        registry.counter_value("database_backup.offsite.config_invalid"),
+        Some(1)
+    );
+    assert_eq!(registry.counter_value("database_backup.offsite.copies_failed"), Some(0));
+}
+
+#[test]
+fn zero_local_retention_still_copies_off_machine() {
+    let tmp = TempDir::new().unwrap();
+    let db = open_file_db(tmp.path());
+    let backup_dir = tmp.path().join("backups");
+    let dest = tmp.path().join("sync");
+    std::fs::create_dir(&dest).unwrap();
+    let (rt, registry) = offsite_runtime(&dest, 24, 14);
+    run_backup_with_offsite(&db, &backup_dir, 0, Some(&rt));
+    wait_for_worker(&rt);
+    assert_eq!(std::fs::read_dir(&backup_dir).unwrap().count(), 0, "local pruned");
+    assert_eq!(std::fs::read_dir(host_dir(&dest)).unwrap().count(), 1);
+    assert_eq!(
+        registry.counter_value("database_backup.offsite.copies_succeeded"),
+        Some(1)
+    );
+}
+
+#[test]
+fn snapshot_pruned_while_destination_validation_is_blocked_still_copies() {
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("sync");
+    std::fs::create_dir(&dest).unwrap();
+    let (rt, registry) = offsite_runtime(&dest, 24, 14);
+    let snap = tmp.path().join("state.db.bak-20260101-000000");
+    std::fs::write(&snap, b"snapshot").unwrap();
+    let pending = rt.open_snapshot(&snap).unwrap();
+    // Occupy the worker, then unlink the path before the copy runs.
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (started, ready) = std::sync::mpsc::channel();
+    rt.start_job(move |_| {
+        started.send(()).unwrap();
+        blocked.recv().unwrap();
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    std::fs::remove_file(&snap).unwrap();
+    release.send(()).unwrap();
+    wait_for_worker(&rt);
+    rt.copy_and_prune(pending);
+    assert_eq!(
+        std::fs::read(host_dir(&dest).join("state.db.bak-20260101-000000")).unwrap(),
+        b"snapshot"
+    );
+    assert_eq!(
+        registry.counter_value("database_backup.offsite.copies_succeeded"),
+        Some(1)
+    );
+}
+
+#[test]
+fn success_record_write_failure_is_not_a_failed_copy() {
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("sync");
+    std::fs::create_dir(&dest).unwrap();
+    let (rt, registry) = offsite_runtime(&dest, 24, 14);
+    // Make the success record path a directory so persisting it fails.
+    std::fs::remove_file(&rt.success_path).ok();
+    std::fs::create_dir(&rt.success_path).unwrap();
+    let snap = tmp.path().join("state.db.bak-20260101-000000");
+    std::fs::write(&snap, b"snapshot").unwrap();
+    rt.copy_and_prune(rt.open_snapshot(&snap).unwrap());
+    assert_eq!(registry.counter_value("database_backup.offsite.copies_failed"), Some(0));
+    assert_eq!(
+        registry.counter_value("database_backup.offsite.copies_succeeded"),
         Some(1)
     );
 }
@@ -199,7 +296,7 @@ fn successful_copy_persists_timestamp_for_restart() {
     let (rt, registry) = offsite_runtime(tmp.path(), 1, 1);
     let snapshot = tmp.path().join("state.db.bak-20260101-000000");
     std::fs::write(&snapshot, b"snapshot").unwrap();
-    rt.copy_and_prune(&snapshot);
+    rt.copy_and_prune(rt.open_snapshot(&snapshot).unwrap());
     let restarted = OffsiteRuntime::from_config(rt.config.clone(), registry, rt.success_path.clone()).unwrap();
     assert_eq!(
         restarted.last_success.load(Ordering::Relaxed),
@@ -216,7 +313,7 @@ fn retention_failure_is_counted_without_failing_copy() {
     std::fs::create_dir_all(host.join("state.db.bak-20200101-000000")).unwrap();
     let snapshot = tmp.path().join("state.db.bak-20260101-000000");
     std::fs::write(&snapshot, b"snapshot").unwrap();
-    rt.copy_and_prune(&snapshot);
+    rt.copy_and_prune(rt.open_snapshot(&snapshot).unwrap());
     assert_eq!(
         registry.counter_value("database_backup.offsite.retention_failed"),
         Some(1)
