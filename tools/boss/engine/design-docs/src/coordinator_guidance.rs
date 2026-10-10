@@ -263,10 +263,15 @@ mod tests {
         let service = DesignDocsService::with_source(source.clone());
         service.list_markdown_docs(Some(REPO), false).await;
         assert_eq!(service.peek("spinyfin/mono").unwrap().default_branch, "main");
-        service.fetch_coordinator_guidance(Some(REPO)).await;
+        let original = service.fetch_coordinator_guidance(Some(REPO)).await;
+        assert_eq!(original.state.git_ref(), Some(SHA_A));
+        assert!(
+            matches!(original.state, CoordinatorGuidanceState::Loaded { markdown, .. } if markdown == "# old rules")
+        );
         *source.default_branch.lock().unwrap() = "trunk".to_owned();
         *source.shas.lock().unwrap() = vec![SHA_B];
         *source.blob.lock().unwrap() = Ok("# new rules".to_owned());
+        assert_eq!(source.head_sha("spinyfin", "mono", "main").await.unwrap(), SHA_A);
         let refreshed = service.fetch_coordinator_guidance(Some(REPO)).await;
         assert_eq!(service.peek("spinyfin/mono").unwrap().default_branch, "main");
         // Guidance asks GitHub for `HEAD`, never a cached branch name.
