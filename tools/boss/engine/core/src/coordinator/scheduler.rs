@@ -905,7 +905,7 @@ impl ExecutionCoordinator {
         // flight, not new work, so an operator-originated pause exempts
         // them — they keep draining into the review pool while
         // main/automation rows are held. A breaker-originated pause (the
-        // app's spawn path itself is broken — see `spawn_health.rs`) exempts
+        // engine's tmux spawn path itself is broken — see `spawn_health.rs`) exempts
         // nothing, since dispatching a review would just burn another spawn
         // attempt against the same dead path.
         let pause = self.dispatch_pause();

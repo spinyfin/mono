@@ -1026,8 +1026,8 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
         // `bossctl agents reap` is the manual escape hatch for
         // orphans the engine startup probe missed (e.g. the
         // cube lease was still within its TTL on relaunch, so
-        // the probe said "Live" even though the libghostty
-        // pane is gone). Gate it `BossOnly`: this is a state
+        // the probe said "Live" even though the tmux session
+        // is gone). Gate it `BossOnly`: this is a state
         // mutation that should not be reachable from a worker
         // pane subtree.
         if !server_state.authorize_rpc(RpcTier::BossOnly, peer_pid) {

@@ -114,8 +114,7 @@ async fn breaker_pause_pushes_engine_health_to_a_running_app() {
 }
 
 /// The other direction: a breaker auto-resume must clear the banner live
-/// too. This is the path a fresh app session and the half-open recovery
-/// probe both take, and it is likewise not an RPC handler.
+/// too. This is the path the half-open recovery probe takes, and it is likewise not an RPC handler.
 #[tokio::test]
 async fn breaker_auto_resume_pushes_a_cleared_engine_health_to_a_running_app() {
     let (state, _dir) = test_server_state();

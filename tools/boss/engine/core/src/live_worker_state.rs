@@ -380,7 +380,7 @@ pub enum ReadoptionEvidence {
     /// so re-adoption records it rather than throwing it away.
     DriverHook,
     /// Only a recorded shell pid was observed alive (`crate::durable_liveness`
-    /// probing the pid the app reported for the pane). That is evidence
+    /// probing the tmux `#{pane_pid}` the engine recorded at session creation). That is evidence
     /// about the *shell*, never about the driver — the exact conflation
     /// `driver_signal_at` exists to prevent — so nothing is recorded as
     /// driver proof.
@@ -437,7 +437,7 @@ impl DriverSignalKind {
 pub struct UnverifiedDriverStart {
     pub slot_id: u8,
     pub run_id: String,
-    /// The shell pid the app reported, if any. Carried purely so the
+    /// The tmux `#{pane_pid}` the engine read at session creation, if any. Carried purely so the
     /// reap can name it in the log and the attention item — it is
     /// explicitly NOT part of the decision.
     pub shell_pid: i32,

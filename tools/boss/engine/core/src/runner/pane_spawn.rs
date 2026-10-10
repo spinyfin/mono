@@ -718,8 +718,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // `worker_id` is `worker-{N}` (main pool), `auto-worker-{N}`
         // (automation pool), or `review-{N}` (review pool); N is the slot
         // the engine owns. Decode it here and thread it into the spawn so
-        // the app hosts the pane in this exact slot rather than running its
-        // own (now-deleted) firstIndex(where:) heuristic.
+        // the app attaches its viewer to the slot the engine claimed.
         let slot_id = slot_id_from_worker_id(worker_id).ok_or_else(|| {
             anyhow!(
                 "PaneSpawnRunner received worker_id {worker_id:?} that does not parse as worker-{{N}}, auto-worker-{{N}}, or review-{{N}}"

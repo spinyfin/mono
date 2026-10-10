@@ -103,31 +103,6 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         tokio::spawn(async move {
             pane_reconcile_state.retry_startup_pane_reconcile().await;
         });
-        // A fresh app session is the operator's natural recovery action
-        // (e.g. relaunching the app after waking the display) — clear the
-        // spawn-capability breaker's failure window and any half-open probe
-        // state left over from before, and auto-resume dispatch if it's
-        // currently Breaker-paused. Never touches an operator pause:
-        // `resume_dispatch_after_breaker_recovery` no-ops unless the
-        // current pause is Breaker-origin.
-        server_state.spawn_health.record_success();
-        server_state.spawn_health.reset_probe();
-        if crate::spawn_health::resume_dispatch_after_breaker_recovery(
-            &server_state.work_db,
-            &server_state.execution_coordinator,
-            server_state.dispatch_events.as_ref(),
-            None,
-            "fresh app session registered",
-        )
-        .await
-        {
-            // No explicit health broadcast: the `resume_dispatch` inside
-            // `resume_dispatch_after_breaker_recovery` already notified the
-            // pause-state transition, and the pause-state broadcaster turns
-            // that into the push. See
-            // `ServerState::spawn_pause_state_health_broadcaster`.
-            server_state.execution_coordinator.kick();
-        }
         // Push pool sizes immediately after registration so the app's
         // WorkersWorkspaceModel can configure its slot ranges before the
         // engine dispatches any AttachWorkerPane. This is the single source

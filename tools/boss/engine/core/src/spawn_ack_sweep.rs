@@ -1916,7 +1916,7 @@ mod tests {
 
     /// The incident, reproduced end to end.
     ///
-    /// A pane spawned, the app reported a real foreground shell pid, and no
+    /// A pane spawned, the engine recorded a real tmux pane pid, and no
     /// driver-originated signal ever arrived. Before this check existed the
     /// positive pid made the slot invisible to every sweep and it held its
     /// slot and cube lease indefinitely with no attention item.

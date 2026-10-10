@@ -384,9 +384,12 @@ impl ExecutionCoordinator {
 
                 // A `SlotBusy` app rejection means the engine and the app
                 // disagree about this specific slot's occupancy — the app
-                // itself documents this as "the engine should reconcile
-                // rather than retry blindly" (see
-                // `ServerState::attach_worker_viewer`'s contract).
+                // documents this as "the engine should reconcile rather
+                // than retry blindly" (see the doc comment on
+                // `WorkersWorkspaceModel.hostAttachedPane`).
+                // `ServerState::attach_worker_viewer` already treats a
+                // same-run SlotBusy as success and only detaches a
+                // provably stale occupant.
                 // It is an engine/app desync, not a genuine task or
                 // automation failure, so it is handled differently below:
                 // the work stays queued instead of bouncing to a terminal
