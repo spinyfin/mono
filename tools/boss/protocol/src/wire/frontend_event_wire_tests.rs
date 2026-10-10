@@ -20,9 +20,10 @@ use super::*;
 // Enum discriminants and inputs used only by these fixtures are not part of
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
-    AttachmentMediaType, AutomationTrigger, Decision, DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree,
-    DispatchAdmissionBlocker, DispatchPauseSnapshot, EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput,
-    ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
+    AttachmentMediaType, AutomationTrigger, COORDINATOR_GUIDANCE_PATH, CoordinatorGuidanceState, Decision,
+    DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree, DispatchAdmissionBlocker, DispatchPauseSnapshot,
+    EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError,
+    TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -1506,6 +1507,34 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "coordinator_handoff_set",
         },
         TagCase {
+            label: "CoordinatorGuidanceList",
+            event: FrontendEvent::CoordinatorGuidanceList {
+                guidance: vec![
+                    CoordinatorGuidanceView::builder()
+                        .product_id("prod_1")
+                        .fetched_at("2026-10-09T12:00:00Z")
+                        .path(COORDINATOR_GUIDANCE_PATH)
+                        .product_name("Boss")
+                        .state(CoordinatorGuidanceState::Loaded {
+                            git_ref: "b95bd654ec91f84f70f62127ef8d53317bd52ebb".into(),
+                            bytes: 12,
+                            markdown: "# Boss rules".into(),
+                        })
+                        .owner_repo("spinyfin/mono")
+                        .repo_remote_url("git@github.com:spinyfin/mono.git")
+                        .build(),
+                    CoordinatorGuidanceView::builder()
+                        .product_id("prod_2")
+                        .fetched_at("2026-10-09T12:00:00Z")
+                        .path(COORDINATOR_GUIDANCE_PATH)
+                        .product_name("Notes")
+                        .state(CoordinatorGuidanceState::NoRepoConfigured)
+                        .build(),
+                ],
+            },
+            expected_tag: "coordinator_guidance_list",
+        },
+        TagCase {
             label: "WorkerTierDenied",
             event: FrontendEvent::WorkerTierDenied {
                 denial: WorkerTierDenial::redirect(
@@ -2225,6 +2254,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::PrBodyResult { .. }
         | FrontendEvent::CoordinatorHandoffResult { .. }
         | FrontendEvent::CoordinatorHandoffSet { .. }
+        | FrontendEvent::CoordinatorGuidanceList { .. }
         | FrontendEvent::WorkerTierDenied { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }
         | FrontendEvent::FeatureFlagsList { .. }

@@ -186,6 +186,7 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
             model: &server_state.coordinator_model,
             working_directory: &working_directory,
             version_probe: &crate::coordinator_tmux::RealClaudeVersionProbe,
+            design_docs: &server_state.design_docs,
         })
         .await
         {
@@ -633,6 +634,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
                 model: &server_state.coordinator_model,
                 working_directory: &working_directory,
                 version_probe: &crate::coordinator_tmux::RealClaudeVersionProbe,
+                design_docs: &server_state.design_docs,
             },
             &expected_spawn_token,
             reason,
