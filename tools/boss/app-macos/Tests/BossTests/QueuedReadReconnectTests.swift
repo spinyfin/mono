@@ -15,6 +15,7 @@ final class QueuedReadReconnectTests: XCTestCase {
         let contentReceived = expectation(description: "viewer received queued guide response")
         var sawDisconnect = false
         var droppedRequests: [String] = []
+        var transportErrors: [String] = []
         client.onEvent = { event in
             model.applyEventForTest(event)
             switch event {
@@ -22,6 +23,7 @@ final class QueuedReadReconnectTests: XCTestCase {
                 sawDisconnect = true
                 disconnected.fulfill()
             case .notConnected(let kind): droppedRequests.append(kind)
+            case .transportError(let message): transportErrors.append(message)
             case .reviewGuideContent: contentReceived.fulfill()
             default: break
             }
@@ -33,6 +35,8 @@ final class QueuedReadReconnectTests: XCTestCase {
             model.applyEventForTest(.disconnected)
         }
         await fulfillment(of: [disconnected], timeout: 5)
+        XCTAssertFalse(transportErrors.isEmpty, "a failed socket attempt must report a typed transport error")
+        XCTAssertNil(model.workErrorMessage, "connection cleanup must not route socket failures to the modal")
 
         let treeID = try XCTUnwrap(client.sendLine(
             ["type": "get_work_tree", "product_id": "product"], queueIfDisconnected: true
