@@ -267,7 +267,7 @@ async fn autostart_spawns_at_most_one_engine_while_waiting_for_it() {
     // A stand-in "engine" that records each launch and never serves.
     discovery.engine = EngineCommand {
         program: "/bin/sh".into(),
-        args: vec!["-c".into(), format!("echo x >> '{}'", counter.display())],
+        args: vec!["-c".into(), format!("echo x >> '{}'; exec sleep 5", counter.display())],
         source: "test".into(),
         attempted: Vec::new(),
     };
@@ -276,6 +276,53 @@ async fn autostart_spawns_at_most_one_engine_while_waiting_for_it() {
     assert!(err.downcast_ref::<EngineUnreachable>().is_some(), "{err:#}");
     let launches = std::fs::read_to_string(&counter).unwrap_or_default().lines().count();
     assert_eq!(launches, 1, "one engine started, then waited on across retries");
+}
+
+#[tokio::test]
+async fn autostart_with_a_missing_engine_binary_fails_promptly_with_the_resolution_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    // A long budget: the failure must come from the spawn error, not from
+    // running the budget out.
+    let mut discovery = discovery(dir.path(), fast_policy(Duration::from_secs(60), &notices));
+    discovery.autostart = true;
+    discovery.engine = EngineCommand {
+        program: dir.path().join("no-such-engine").to_string_lossy().into_owned(),
+        args: Vec::new(),
+        source: "test source".into(),
+        attempted: vec!["BOSS_ENGINE_BIN (unset)".into()],
+    };
+
+    let started = Instant::now();
+    let err = BossClient::connect(&discovery).await.expect_err("engine cannot start");
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(err.downcast_ref::<EngineUnreachable>().is_none(), "{err:#}");
+    let message = format!("{err:#}");
+    assert!(message.contains("failed to start engine"), "{message}");
+    assert!(message.contains("Resolution chain"), "{message}");
+    assert!(message.contains("BOSS_ENGINE_BIN"), "{message}");
+}
+
+#[tokio::test]
+async fn autostart_fails_at_once_when_the_engine_it_started_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = discovery(dir.path(), fast_policy(Duration::from_secs(60), &notices));
+    discovery.autostart = true;
+    discovery.start_timeout = Duration::from_secs(30);
+    discovery.engine = EngineCommand {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "exit 3".into()],
+        source: "test".into(),
+        attempted: Vec::new(),
+    };
+
+    let started = Instant::now();
+    let err = BossClient::connect(&discovery).await.expect_err("engine exits");
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    let message = format!("{err:#}");
+    assert!(message.contains("exited before becoming ready"), "{message}");
+    assert!(message.contains("exit status: 3"), "{message}");
 }
 
 #[test]
@@ -429,7 +476,7 @@ async fn worker_environment_never_launches_an_engine() {
     worker.worker_environment = true;
     worker.engine = EngineCommand {
         program: "/bin/sh".into(),
-        args: vec!["-c".into(), format!("echo x >> '{}'", counter.display())],
+        args: vec!["-c".into(), format!("echo x >> '{}'; exec sleep 5", counter.display())],
         source: "test".into(),
         attempted: Vec::new(),
     };
@@ -439,4 +486,83 @@ async fn worker_environment_never_launches_an_engine() {
         .expect_err("workers cannot start an engine");
     assert!(format!("{err:#}").contains("worker session"), "{err:#}");
     assert!(!counter.exists(), "no process was launched");
+}
+
+// Put the target early in the command so even a width-limited ps listing
+// recognizes the fixture as an engine launched through Bazel.
+fn recognizable_engine(script: &str, args: Vec<String>) -> EngineCommand {
+    let mut command_args = vec![
+        "-c".into(),
+        format!(": {ENGINE_BINARY_TARGET}; {script}"),
+        "engine".into(),
+    ];
+    command_args.extend(args);
+    EngineCommand {
+        program: "/bin/sh".into(),
+        args: command_args,
+        source: "test".into(),
+        attempted: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn published_pid_still_monitors_child_exit_in_a_later_readiness_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut discovery = discovery(dir.path(), RetryPolicy::default());
+    discovery.autostart = true;
+    let release = dir.path().join("exit");
+    discovery.engine = recognizable_engine(
+        r#"echo $$ > "$1"; while [ ! -f "$2" ]; do sleep 0.02; done; exit 7"#,
+        vec![discovery.pid_file_path.clone(), release.to_string_lossy().into_owned()],
+    );
+    let mut child = None;
+    ensure_engine_running_with(&discovery, true, Duration::from_millis(100), &mut child)
+        .await
+        .expect_err("first readiness window expires");
+    let pid = child.as_ref().unwrap().id();
+    assert_eq!(read_pid_file(&discovery.pid_file_path), Some(pid));
+    assert!(is_likely_engine_process(pid));
+    assert!(child.as_mut().unwrap().try_wait().unwrap().is_none());
+
+    let exit = tokio::spawn(async move {
+        sleep(Duration::from_millis(150)).await;
+        std::fs::write(release, "exit").unwrap();
+    });
+    let error = ensure_engine_running_with(&discovery, false, Duration::from_secs(5), &mut child)
+        .await
+        .expect_err("child exits during the pid-file readiness wait");
+    exit.await.unwrap();
+    assert!(error.downcast_ref::<AutostartFailed>().is_some(), "{error:#}");
+    assert!(format!("{error:#}").contains("exit status: 7"), "{error:#}");
+}
+
+#[tokio::test]
+async fn autostart_loser_waits_for_the_winners_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = discovery(dir.path(), fast_policy(Duration::from_secs(10), &notices));
+    discovery.autostart = true;
+    let mut winner = Command::new("/bin/sh")
+        .args(["-c", &format!(": {ENGINE_BINARY_TARGET}; while :; do sleep 0.1; done")])
+        .spawn()
+        .unwrap();
+    // The winner claims the pid path only after the loser's pre-spawn check.
+    discovery.engine = recognizable_engine(
+        r#"echo "$2" > "$1"; exit 1"#,
+        vec![discovery.pid_file_path.clone(), winner.id().to_string()],
+    );
+    let pid_path = discovery.pid_file_path.clone();
+    let socket = discovery.socket_path.clone();
+    let engine = tokio::spawn(async move {
+        while !Path::new(&pid_path).exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+        sleep(Duration::from_millis(300)).await;
+        UnixListener::bind(socket).unwrap()
+    });
+    let result = BossClient::connect(&discovery).await;
+    winner.kill().unwrap();
+    winner.wait().unwrap();
+    let _listener = engine.await.unwrap();
+    assert!(result.is_ok(), "winner becomes reachable: {result:?}");
 }

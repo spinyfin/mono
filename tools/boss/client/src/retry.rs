@@ -96,16 +96,16 @@ impl Default for RetryPolicy {
 
 impl RetryPolicy {
     /// The default policy, with `BOSS_ENGINE_MAX_WAIT_SECS` applied if set.
-    /// An unparseable value is ignored (with a warning in the log) rather
+    /// An unparseable value is ignored with a warning on stderr rather
     /// than silently disabling retry.
     pub fn from_env() -> Self {
         let mut policy = Self::default();
         match std::env::var(MAX_WAIT_ENV) {
             Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u64>() {
                 Ok(secs) => policy.max_wait = Duration::from_secs(secs),
-                Err(_) => tracing::warn!(
-                    value = raw,
-                    "{MAX_WAIT_ENV} is not a whole number of seconds; using the default"
+                Err(_) => eprintln!(
+                    "boss: warning: {MAX_WAIT_ENV}={raw:?} is not a whole number of seconds; using the default of {}s",
+                    DEFAULT_MAX_WAIT.as_secs()
                 ),
             },
             _ => {}
