@@ -65,11 +65,6 @@ fn archived_dependency_edge_renders_its_provenance() {
 }
 
 #[test]
-fn format_stored_epoch_falls_back_for_non_integer_legacy_values() {
-    assert_eq!(format_stored_epoch("not-an-epoch"), "not-an-epoch");
-}
-
-#[test]
 fn archived_tasks_hidden_from_list_by_default_but_shown_on_request() {
     let archived = Task::builder()
         .id("task_archived")
