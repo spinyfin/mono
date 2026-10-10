@@ -217,6 +217,10 @@ mod tests {
             if let Some(err) = self.head_error.lock().unwrap().clone() {
                 return Err(err);
             }
+            // The former default branch remains reachable at its old commit.
+            if git_ref != "HEAD" && git_ref != *self.default_branch.lock().unwrap() {
+                return Ok(SHA_A.to_owned());
+            }
             Ok(self.next_sha())
         }
 
@@ -254,15 +258,17 @@ mod tests {
     const REPO: &str = "git@github.com:spinyfin/mono.git";
 
     #[tokio::test]
-    async fn refresh_observes_a_new_head_despite_cached_listing() {
+    async fn refresh_observes_a_new_default_branch_despite_cached_listing() {
         let source = FakeSource::with_body("# old rules");
         let service = DesignDocsService::with_source(source.clone());
         service.list_markdown_docs(Some(REPO), false).await;
         assert_eq!(service.peek("spinyfin/mono").unwrap().default_branch, "main");
         service.fetch_coordinator_guidance(Some(REPO)).await;
+        *source.default_branch.lock().unwrap() = "trunk".to_owned();
         *source.shas.lock().unwrap() = vec![SHA_B];
         *source.blob.lock().unwrap() = Ok("# new rules".to_owned());
         let refreshed = service.fetch_coordinator_guidance(Some(REPO)).await;
+        assert_eq!(service.peek("spinyfin/mono").unwrap().default_branch, "main");
         // Guidance asks GitHub for `HEAD`, never a cached branch name.
         assert_eq!(
             source.head_refs.lock().unwrap().last().map(String::as_str),
