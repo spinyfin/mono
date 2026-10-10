@@ -3,7 +3,7 @@ import XCTest
 import os
 @testable import Boss
 
-/// Regression guard for the `consumeLines()` O(n²) buffer rescan documented
+/// Regression guard for the `frameLines()` O(n²) buffer rescan documented
 /// in `docs/investigations/task-population-latency-on-start-and-product-switch.md`
 /// §11: every appended ~64 KiB chunk of a large single-line message used to
 /// re-scan the *whole* accumulated buffer from the start looking for the
