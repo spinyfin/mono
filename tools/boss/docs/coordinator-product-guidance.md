@@ -17,9 +17,8 @@ The coordinator does not lease repos, so the file is read the way design docs ar
 A read, implemented in `boss_engine_design_docs::DesignDocsService::fetch_coordinator_guidance` (`tools/boss/engine/design-docs/src/coordinator_guidance.rs`):
 
 1. parses the product's `repo_remote_url` into `owner/repo` (not a GitHub URL → `NotGitHub`; no URL → `NoRepoConfigured`);
-2. resolves the default branch afresh, independently of the Designs-tab listing cache;
-3. probes the default branch's HEAD sha — one tiny request;
-4. fetches `BOSS_COORDINATOR.md` **at that sha**, through the same sha-keyed body cache design docs use. A sha is immutable, so a cache hit needs no revalidation, and a push is picked up by the very next read because the sha probe precedes the lookup.
+2. probes the default branch's HEAD sha with a single `commits/HEAD` request, which GitHub resolves to the current default branch server side — so a renamed default branch is followed without a separate lookup and the Designs-tab listing cache is never consulted;
+3. fetches `BOSS_COORDINATOR.md` **at that sha**, through the same sha-keyed body cache design docs use. A sha is immutable, so a cache hit needs no revalidation, and a push is picked up by the very next read because the sha probe precedes the lookup.
 
 ### Versioning
 
@@ -27,7 +26,7 @@ The version the coordinator is acting on is always the commit sha HEAD resolved 
 
 ### When it is fetched: both, by design
 
-- **At coordinator session start**, for every non-archived product. `start_new` (`tools/boss/engine/core/src/coordinator_tmux.rs`) reads them concurrently, each bounded by `SESSION_START_FETCH_BUDGET` (3 s), and `compose_start_brief` injects the result as a "Product coordinator guidance" section of the session-start brief, after the handoff and before the consumption steps. A fresh session is therefore bound by product rules on its first turn with no action on its part. A product whose read overruns the budget is reported as `Failed` naming the budget; the launch is never blocked past it.
+- **At coordinator session start**, for every non-archived product. `start_new` (`tools/boss/engine/core/src/coordinator_tmux.rs`) reads them concurrently, each bounded by `SESSION_START_FETCH_BUDGET` (3 s; a cold read is two sequential `gh api` calls — HEAD sha, then the blob — and a warm read is one; the budget assumes roughly a second per call, and an overrun is reported as `Failed` rather than hidden), and `compose_start_brief` injects the result as a "Product coordinator guidance" section of the session-start brief, after the handoff and before the consumption steps. A fresh session is therefore bound by product rules on its first turn with no action on its part. A product whose read overruns the budget is reported as `Failed` naming the budget; the launch is never blocked past it.
   Recreate holds `coordinator_tmux_lock` during this read after killing the old session; the short budget bounds added downtime and lifecycle contention, while the on-demand retry has 45 seconds.
 - **On demand**, via `boss guidance show [--product <id>]` (`FrontendRequest::ListCoordinatorGuidance`). This always re-probes HEAD, so it is the way to see a change that landed mid-session, retry a read that failed at launch, or confirm the sha in context. The generic prompt tells the coordinator to run it after a chore that edits a product's file merges, when a product is added mid-session, and when the brief reported a fetch failure.
 
