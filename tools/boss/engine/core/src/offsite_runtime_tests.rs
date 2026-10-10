@@ -45,7 +45,7 @@ fn offsite_enabled_without_destination_fails_loudly() {
     let registry = Arc::new(Registry::new());
     register_metrics(&registry);
     let rt = OffsiteRuntime::from_settings(&settings, registry.clone()).expect("runtime kept for retries");
-    assert_eq!(rt.age_secs(), -1);
+    assert_eq!(rt.age_secs_at(123), -1);
     // Copies fail (and are counted) rather than guessing a destination.
     let snap = tmp.path().join("state.db.bak-20260101-000000");
     std::fs::write(&snap, b"x").unwrap();
@@ -103,9 +103,18 @@ fn run_backup_copies_off_machine_and_prunes() {
         registry.counter_value("database_backup.offsite.copies_succeeded"),
         Some(1)
     );
+    // Sample at a known instant: copying/pruning may cross a clock second.
+    let success = rt.last_success.load(Ordering::Relaxed);
+    assert!(success > 0);
+    rt.refresh_age_gauge_at(success);
     assert_eq!(
         registry.gauge_value("database_backup.offsite.last_success_age_secs"),
         Some(0)
+    );
+    rt.refresh_age_gauge_at(success + 120);
+    assert_eq!(
+        registry.gauge_value("database_backup.offsite.last_success_age_secs"),
+        Some(120)
     );
     assert_eq!(std::fs::read_dir(&backup_dir).unwrap().count(), 1, "local backup kept");
 }
@@ -142,9 +151,9 @@ fn offsite_failure_never_fails_local_backup() {
 fn age_gauge_uses_last_success_once_present() {
     let tmp = TempDir::new().unwrap();
     let (rt, _registry) = offsite_runtime(tmp.path(), 1, 1);
-    rt.last_success
-        .store(boss_engine_utils::epoch_time::now_epoch_secs() - 120, Ordering::Relaxed);
-    assert!((120..=125).contains(&rt.age_secs()));
+    rt.last_success.store(1000, Ordering::Relaxed);
+    assert_eq!(rt.age_secs_at(1120), 120);
+    assert_eq!(rt.age_secs_at(999), 0);
 }
 
 fn wait_for_worker(rt: &OffsiteRuntime) {
@@ -181,7 +190,7 @@ fn restart_preserves_stale_success_and_new_destination_has_no_success() {
         ..config
     };
     let rt = OffsiteRuntime::from_config(changed, registry, path).unwrap();
-    assert_eq!(rt.age_secs(), -1);
+    assert_eq!(rt.age_secs_at(123), -1);
 }
 
 #[test]
