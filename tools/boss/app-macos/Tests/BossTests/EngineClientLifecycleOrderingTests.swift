@@ -94,6 +94,37 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         second.close()
     }
 
+    func testDelayedMalformedFrameCannotCloseReplacementConnection() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let seen = OSAllocatedUnfairLock(initialState: [Seen]())
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let client = makeClient(
+            path: path, seen: seen, blocking: "invalid-frame", started: started, release: release)
+        client.start()
+        defer { client.stop() }
+        defer { release.signal() }
+
+        let first = try XCTUnwrap(server.accept(timeout: 5))
+        XCTAssertTrue(waitUntil(5) { seen.withLock { $0 } == [.connected] })
+        first.write(Data("invalid-frame\n".utf8) + (try line("rejected-reply")))
+        XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+        first.close()
+        let second = try XCTUnwrap(server.accept(timeout: 10))
+        defer { second.close() }
+        second.write(try line("new-reply"))
+        release.signal()
+
+        let expected: [Seen] = [.connected, .disconnected, .connected, .reply("new-reply")]
+        XCTAssertTrue(waitUntil(5) { seen.withLock { $0.count >= expected.count } })
+        XCTAssertEqual(seen.withLock { $0 }, expected)
+        second.write(try line("still-connected"))
+        XCTAssertTrue(waitUntil(5) { seen.withLock { $0.contains(.reply("still-connected")) } })
+        XCTAssertEqual(seen.withLock { $0 }, expected + [.reply("still-connected")])
+    }
+
     /// State-callback termination (`cancel()` → `.cancelled`) while a decode
     /// is blocked: exactly one `.disconnected`, after the old reply.
     func testStateCallbackDisconnectStaysBehindBlockedDecode() throws {

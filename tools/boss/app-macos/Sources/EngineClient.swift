@@ -80,6 +80,10 @@ final class EngineClient: @unchecked Sendable {
     /// above the largest observed single reply (~25 MB `work_tree`) so
     /// backpressure only engages under a genuine decode backlog.
     static let maxPendingDecodeBytes = 128 * 1024 * 1024
+    // Accessed only on the serial decode queue.
+    private var decodingGeneration = 0
+    private var rejectedDecodeGeneration: Int?
+
     private lazy var handoff = LineDecodeHandoff(
         maxPendingBytes: Self.maxPendingDecodeBytes,
         decode: { [weak self] data, recvNanos in
@@ -281,6 +285,10 @@ final class EngineClient: @unchecked Sendable {
                 // Framing only; JSON decode happens on the decode queue so
                 // this queue keeps reading the socket.
                 let recvNanos = PopulationTiming.now()
+                let generation = self.connectionGeneration
+                self.handoff.afterPendingLines { [weak self] in
+                    self?.decodingGeneration = generation
+                }
                 let lines = self.frameLines().map { (data: $0, recvNanos: recvNanos) }
                 if !lines.isEmpty, !self.handoff.enqueue(lines), !isComplete {
                     // Backlog over bound: stop reading until `onResume`.
@@ -330,6 +338,8 @@ final class EngineClient: @unchecked Sendable {
     /// Parse one complete engine line and emit its event(s). Runs on the
     /// decode queue (never the socket-reading queue) in production.
     private func decodeLine(_ lineData: Data, lineRecvNanos: UInt64) {
+        let generation = decodingGeneration
+        guard rejectedDecodeGeneration != generation else { return }
         let lineByteCount = lineData.count
 
         let envelope: [String: Any]
@@ -339,7 +349,11 @@ final class EngineClient: @unchecked Sendable {
             (envelope, payload, type) = try Self.decodeEnvelope(lineData)
         } catch {
             Self.logInvalidFrame(lineData, error: String(describing: error))
-            queue.async { [weak self] in self?.closeConnection() }
+            rejectedDecodeGeneration = generation
+            queue.async { [weak self] in
+                guard let self, self.connectionGeneration == generation else { return }
+                self.closeConnection()
+            }
             return
         }
         let envelopeRequestId = envelope["request_id"] as? String
