@@ -114,6 +114,95 @@ pub const PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND: &str = "pr_review_repor
 /// matching the merge poller's stalled-reviewer cutoff.
 pub const REVIEW_BATCH_STALE_SECS: u64 = 10 * 60;
 
+/// Highest pre-merge batch `generation` the engine will mint for one target
+/// SHA on its own. Generation 1 is the ordinary batch; generation 2 is the
+/// single automatic re-mint a `failed` generation earns when it never
+/// produced a leaf report (reaped inert, or every leaf attempt died before
+/// reporting) — i.e. when nothing actually reviewed that head. A second
+/// failure of the same kind leaves the head "Not reviewed" with its
+/// attention standing rather than looping reviewers at it. Explicit
+/// (`bossctl review start`) generations are not bounded by this.
+pub const MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS: i64 = 2;
+
+/// Whether a prior pre-merge batch at some target may be replaced by an
+/// automatically minted next generation at the same target: it is `failed`,
+/// no member of it ever `reported`, and it is under
+/// [`MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`]. A batch that `completed`,
+/// or that failed only after at least one leaf reported (an insufficient-
+/// quorum decision backed by a real review), is NOT re-minted: those are
+/// terminal review decisions, and re-reviewing them is an operator call
+/// (explicit start). Shared with the SQL twin
+/// [`pre_merge_review_needs_readmission_sql`] so the deferred-admission
+/// candidate query and the in-transaction mint decision cannot disagree.
+fn failed_batch_is_automatically_remintable_in(conn: &rusqlite::Connection, batch: &ReviewBatch) -> Result<bool> {
+    if batch.phase != ReviewBatchPhase::PreMerge
+        || batch.status != ReviewBatchStatus::Failed
+        || batch.generation >= MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS
+    {
+        return Ok(false);
+    }
+    let reported: Option<()> = conn
+        .query_row(
+            "SELECT 1 FROM pr_review_batch_members WHERE batch_id = ?1 AND status = 'reported' LIMIT 1",
+            params![batch.id],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(reported.is_none())
+}
+
+/// SQL boolean over a cycle-root id expression (`cycle_root_expr` is spliced
+/// verbatim — pass a column reference, never user input): true when that
+/// root's NEWEST pre-merge batch leaves the PR head needing a fresh review
+/// that nothing else will schedule:
+///
+/// - it `failed` without any member reporting and is under
+///   [`MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`] (the Rust twin is
+///   [`failed_batch_is_automatically_remintable_in`]), so `enqueue` will
+///   mint the next generation at the same head — or a generation-1 batch at
+///   the new head if it has since moved; or
+/// - it `completed` with a [`super::review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD`]
+///   verdict: the head had already moved when its verdict landed, so the
+///   current head is unreviewed and `enqueue` creates its batch.
+///
+/// Keyed on the newest batch so it switches off the moment a replacement
+/// batch exists in any status, and never re-fires once the cap is reached —
+/// the condition is self-limiting, so a candidate query may splice it with
+/// no inertia cutoff and no attention marker.
+pub(crate) fn pre_merge_review_needs_readmission_sql(cycle_root_expr: &str) -> String {
+    format!(
+        "EXISTS (
+            SELECT 1 FROM pr_review_batches newest
+            WHERE newest.id = (
+                SELECT latest.id FROM pr_review_batches latest
+                WHERE latest.cycle_root_id = {cycle_root_expr}
+                  AND latest.phase = 'pre_merge'
+                ORDER BY latest.created_at DESC, latest.generation DESC, latest.id DESC
+                LIMIT 1
+            )
+            AND (
+                (
+                    newest.status = 'failed'
+                    AND newest.generation < {cap}
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pr_review_batch_members m
+                        WHERE m.batch_id = newest.id AND m.status = 'reported'
+                    )
+                )
+                OR (
+                    newest.status = 'completed'
+                    AND EXISTS (
+                        SELECT 1 FROM pr_review_verdicts rv
+                        WHERE rv.batch_id = newest.id AND rv.gate_outcome = '{stale_head}'
+                    )
+                )
+            )
+        )",
+        cap = MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS,
+        stale_head = super::review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD,
+    )
+}
+
 /// Grace window for [`file_reported_live_review_batch_member_attentions`]'s
 /// reporting-member exemption: any member (leaf or supervisor) that just
 /// reported its verdict is `reported` + live for the brief span between its
@@ -1163,28 +1252,43 @@ impl WorkDb {
         }
         let mut generation = 1;
         if let Some(batch) = review_batch_for_target_in(&tx, &input.cycle_root_id, input.phase, &input.target_sha)? {
-            if !explicit || !matches!(batch.status, ReviewBatchStatus::Completed | ReviewBatchStatus::Failed) {
+            let remint = if explicit {
+                matches!(batch.status, ReviewBatchStatus::Completed | ReviewBatchStatus::Failed)
+            } else {
+                failed_batch_is_automatically_remintable_in(&tx, &batch)?
+            };
+            if !remint {
                 let executions = batch_executions_in_tx(&tx, &batch.id)?;
                 tx.commit()?;
                 return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
             }
             // Batch completion can precede reviewer teardown. Wait for all
-            // member executions to settle before admitting another generation:
-            // the coordinator's double-spawn guard joins on batch_id and would
-            // treat overlapping generations as redundant reviewers.
-            let unsettled = batch_executions_in_tx(&tx, &batch.id)?
-                .into_iter()
-                .find(|execution| !execution.status.is_terminal());
+            // member executions to settle before admitting another
+            // generation, so a superseded generation's reviewer never
+            // overlaps the generation that replaces it at the same target.
+            // (The dispatch guard itself now admits reviewer pairs across
+            // batches of one cycle root — see
+            // `are_admissible_concurrent_review_batch_pair` — so this wait
+            // is a deliberate ordering choice, not a guard workaround.)
+            let executions = batch_executions_in_tx(&tx, &batch.id)?;
+            let unsettled = executions.iter().find(|execution| !execution.status.is_terminal());
             if let Some(execution) = unsettled {
-                bail!(
-                    "cannot mint generation {} for {}: superseded batch {} still owns \
-                     unsettled execution {} ({}); the prior batch's reviewer is still tearing down; retry once it settles",
-                    batch.generation + 1,
-                    input.cycle_root_id,
-                    batch.id,
-                    execution.id,
-                    execution.status,
-                );
+                if explicit {
+                    bail!(
+                        "cannot mint generation {} for {}: superseded batch {} still owns \
+                         unsettled execution {} ({}); the prior batch's reviewer is still tearing down; retry once it settles",
+                        batch.generation + 1,
+                        input.cycle_root_id,
+                        batch.id,
+                        execution.id,
+                        execution.status,
+                    );
+                }
+                // Automatic path: not an error, just not yet. The caller
+                // sees the failed batch and the deferred-admission sweep
+                // retries on its next pass once the straggler settles.
+                tx.commit()?;
+                return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
             }
             generation = batch.generation + 1;
         }
@@ -1503,23 +1607,50 @@ impl WorkDb {
         file_reported_live_review_batch_member_attentions(&mut conn)
     }
 
-    /// True only when two executions are compatible roles of the same
-    /// persisted pre-merge batch. This narrowly permits leaf fan-out and the
-    /// supervisor that consumes those leaf reports while keeping the ordinary
-    /// single-writer chain guard intact.
-    pub fn are_admissible_same_review_batch_pair(&self, execution_id: &str, other_execution_id: &str) -> Result<bool> {
+    /// True only when two executions are read-only reviewer roles of
+    /// persisted pre-merge batches under the SAME cycle root. This narrowly
+    /// relaxes the ordinary same-work-item double-spawn guard for review
+    /// work while keeping it intact for everything else.
+    ///
+    /// Admissible pairs:
+    /// - leaf/leaf and leaf/supervisor of one batch (leaf fan-out, plus the
+    ///   supervisor that consumes those leaf reports);
+    /// - ANY two reviewer roles of two DIFFERENT batches of the same cycle
+    ///   root — e.g. a new head's leaf reviewers against the previous
+    ///   head's still-running supervisor. Each batch reviews its own frozen
+    ///   `target_sha` in its own cube lease and writes nothing to the PR,
+    ///   so the two never contend. Treating that pair as redundant (which
+    ///   joining on `batch_id` alone did) abandoned the new head's leaves
+    ///   at dispatch, burned their one retry against the same live
+    ///   supervisor, and left the new head with a batch nothing could
+    ///   settle but the inert-batch reaper — the current head then stayed
+    ///   unreviewed with nothing scheduled to review it.
+    ///
+    /// Rejected: two supervisors of one batch (a retry overlapping its own
+    /// live predecessor is a genuine duplicate), any pair spanning two cycle
+    /// roots, any post-merge member, and any execution with no member row.
+    pub fn are_admissible_concurrent_review_batch_pair(
+        &self,
+        execution_id: &str,
+        other_execution_id: &str,
+    ) -> Result<bool> {
         let conn = self.connect()?;
         let found = conn
             .query_row(
                 "SELECT 1
                  FROM pr_review_batch_members current
-                 JOIN pr_review_batch_members other ON other.batch_id = current.batch_id
-                 JOIN pr_review_batches batch ON batch.id = current.batch_id
-                 WHERE current.execution_id = ?1 AND other.execution_id = ?2
-                   AND batch.phase = 'pre_merge'
+                 JOIN pr_review_batches current_batch ON current_batch.id = current.batch_id
+                 JOIN pr_review_batch_members other ON other.execution_id = ?2
+                 JOIN pr_review_batches other_batch ON other_batch.id = other.batch_id
+                 WHERE current.execution_id = ?1
+                   AND current_batch.phase = 'pre_merge'
+                   AND other_batch.phase = 'pre_merge'
+                   AND current_batch.cycle_root_id = other_batch.cycle_root_id
                    AND current.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer', 'supervisor')
                    AND other.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer', 'supervisor')
-                   AND (current.role != 'supervisor' OR other.role != 'supervisor')",
+                   AND (current.batch_id != other.batch_id
+                        OR current.role != 'supervisor'
+                        OR other.role != 'supervisor')",
                 params![execution_id, other_execution_id],
                 |_| Ok(()),
             )
@@ -1950,7 +2081,11 @@ impl WorkDb {
                             "The review batch `{batch_id}` for {pr_url} was marked failed because its \
                              cycle root is gone or its members have not moved within {stale_secs}s \
                              with nothing left to retry. Its reservation is released so other PRs can \
-                             be reviewed."
+                             be reviewed. If the PR is still open and no reviewer reported for this \
+                             head, the deferred-admission sweep re-admits one replacement batch for \
+                             the current head on its own (generation cap \
+                             {MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS}); a second reap leaves the \
+                             head unreviewed for a human to decide."
                         ))
                         .build(),
                 )?;

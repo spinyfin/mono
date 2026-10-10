@@ -1281,7 +1281,7 @@ fn leaf_dispatch_creates_two_atomic_role_pinned_executions() {
         ]
     );
     assert!(
-        db.are_admissible_same_review_batch_pair(&executions[0].id, &executions[1].id)
+        db.are_admissible_concurrent_review_batch_pair(&executions[0].id, &executions[1].id)
             .unwrap()
     );
 
@@ -1300,71 +1300,12 @@ fn leaf_dispatch_creates_two_atomic_role_pinned_executions() {
     }
 }
 
-/// `are_admissible_same_review_batch_pair` relaxes the ordinary single-writer chain
-/// guard for exactly one case: two leaf executions of the SAME persisted
-/// batch. Its false cases are the safety-critical ones — a too-permissive
-/// predicate would let genuinely unrelated executions run concurrently on
-/// one work item, which is precisely what the guard exists to stop.
-#[test]
-fn admissible_same_review_batch_pair_rejects_cross_batch_and_memberless_pairs() {
-    let db = WorkDb::open(temp_db_path("review-batch-leaves-negative")).unwrap();
-    let product = create_test_product(&db);
-    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
-
-    let (_batch_a, executions_a) = match db
-        .create_pre_merge_review_batch(
-            batch_input(cycle_root.id.clone(), "head-sha-a", ReviewBatchPhase::PreMerge),
-            "https://github.com/example/repo",
-        )
-        .unwrap()
-    {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
-        other => panic!("expected a newly-created review batch, got {other:?}"),
-    };
-
-    // (a) Two leaves belonging to DIFFERENT batches under the same cycle
-    // root (a second batch at another target SHA) must not read as "same
-    // batch leaves".
-    let (_batch_b, executions_b) = match db
-        .create_pre_merge_review_batch(
-            batch_input(cycle_root.id.clone(), "head-sha-b", ReviewBatchPhase::PreMerge),
-            "https://github.com/example/repo",
-        )
-        .unwrap()
-    {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
-        other => panic!("expected a newly-created review batch, got {other:?}"),
-    };
-    assert!(
-        !db.are_admissible_same_review_batch_pair(&executions_a[0].id, &executions_b[0].id)
-            .unwrap(),
-        "leaves from different batches must not be treated as the same batch's leaves"
-    );
-
-    // (b) A leaf paired with an execution that has no member row at all
-    // must not read as "same batch leaves" either.
-    let bare_execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(cycle_root.id.clone())
-                .kind(ExecutionKind::PrReview)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
-    assert!(
-        !db.are_admissible_same_review_batch_pair(&executions_a[0].id, &bare_execution.id)
-            .unwrap(),
-        "an execution with no batch member row must not be treated as a batch leaf"
-    );
-}
-
 /// The consolidator reads every leaf's report and is therefore the one
 /// additional batch role allowed through the single-writer admission guard.
 /// This is deliberately exercised after the real quorum transition creates
 /// the supervisor, rather than by hand-writing a member row.
 #[test]
-fn admissible_same_review_batch_pair_admits_supervisor_leaf_pairs() {
+fn admissible_concurrent_review_batch_pair_admits_supervisor_leaf_pairs() {
     let db = WorkDb::open(temp_db_path("review-batch-supervisor-admission")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -1398,12 +1339,12 @@ fn admissible_same_review_batch_pair_admits_supervisor_leaf_pairs() {
         .expect("quorum must create a supervisor execution");
 
     assert!(
-        db.are_admissible_same_review_batch_pair(&supervisor_execution_id, &executions[0].id)
+        db.are_admissible_concurrent_review_batch_pair(&supervisor_execution_id, &executions[0].id)
             .unwrap(),
         "the supervisor must be admitted alongside a leaf from its own batch"
     );
     assert!(
-        db.are_admissible_same_review_batch_pair(&executions[0].id, &supervisor_execution_id)
+        db.are_admissible_concurrent_review_batch_pair(&executions[0].id, &supervisor_execution_id)
             .unwrap(),
         "pair admission must be symmetric"
     );

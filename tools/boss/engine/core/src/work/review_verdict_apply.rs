@@ -135,6 +135,25 @@ impl WorkDb {
         // `revision_warranted = false` cannot suppress a critical/high
         // finding or a category that already forces remediation.
         let original_revision_warranted = crate::pr_review::passes_severity_gate(&review_result);
+
+        // Stale-head guard. A pre-merge verdict is a judgement about one
+        // frozen `target_sha`; if a later push has already moved the PR head
+        // past it (mono PR #3110: the previous head's supervisor reported
+        // after a revision pushed the next head), acting on it is wrong in
+        // both directions — a revision minted from it chases code that may
+        // no longer exist and its own push then invalidates the batch
+        // reviewing the current head, while a clean verdict would read as
+        // settling a head nobody reviewed. Record it as `stale_head` and
+        // let the current head's own batch own remediation (see
+        // `REVIEW_GATE_OUTCOME_STALE_HEAD`). Explicit batches are exempt:
+        // an operator asked for exactly that SHA's findings. PostMerge
+        // targets are merge commits and cannot move.
+        let superseding_head = if batch.phase == boss_protocol::ReviewBatchPhase::PreMerge && !batch.explicit {
+            self.pre_merge_target_superseded_by(&batch, pr_checker)?
+        } else {
+            None
+        };
+        let stale_head = superseding_head.is_some();
         // A `PostMerge` batch's created_via carries its own durable
         // `post_merge:` sub-prefix (still matching every
         // `starts_with(CREATED_VIA_PR_REVIEW_PREFIX)` check elsewhere) so
@@ -242,15 +261,39 @@ impl WorkDb {
             existing_review_findings_work_item(&conn, &created_via)?
         };
 
+        // A prior apply pass that materialised under this proposal and
+        // failed before its bookkeeping commit already decided this verdict
+        // was actionable; a head move since then must not orphan that work.
+        // Only a verdict with no materialisation yet is held as stale.
+        let stale_head = stale_head && existing.is_none();
+        if stale_head && let Some(live_head) = superseding_head.as_deref() {
+            tracing::info!(
+                proposal_id = %proposal.id,
+                batch_id = %batch.id,
+                cycle_root_id = %batch.cycle_root_id,
+                reviewed_head = %batch.target_sha,
+                current_head = %live_head,
+                findings = review_result.findings.len(),
+                revision_warranted = original_revision_warranted,
+                "review-verdict apply: PR head moved past the reviewed target before the verdict landed; \
+                 recording it as stale_head and minting no remediation — the current head's batch owns it",
+            );
+        }
+
         // incident-002 both-parents deletion tripwire, same halt as the
         // legacy `finalize_pr_review_pass` path: a conflict-resolution PR
         // that removed a merged parent's surface is held at
         // `blocked: deletion_signoff` with the shared attention kind, and
         // no revision is minted. If a prior apply already materialised one
         // under this proposal's created_via key, tombstone it so the hold
-        // does not leave an autostart revision running.
-        let deletion_signoff =
-            self.compute_batch_merge_parent_deletion_signoff(&origin_task, &verdict.target_sha, pr_checker)?;
+        // does not leave an autostart revision running. Skipped for a
+        // stale-head verdict: the tripwire judges the PR at the reviewed
+        // target, and the current head's batch re-evaluates it there.
+        let deletion_signoff = if stale_head {
+            Vec::new()
+        } else {
+            self.compute_batch_merge_parent_deletion_signoff(&origin_task, &verdict.target_sha, pr_checker)?
+        };
         if !deletion_signoff.is_empty() {
             self.hold_cycle_root_for_deletion_signoff(&batch.cycle_root_id, &batch.pr_url, &deletion_signoff)?;
             if let Some(ref existing_task) = existing {
@@ -261,7 +304,7 @@ impl WorkDb {
             }
         }
 
-        let remediating_task = if !deletion_signoff.is_empty() {
+        let remediating_task = if !deletion_signoff.is_empty() || stale_head {
             None
         } else if let Some(existing) = existing {
             Some(existing)
@@ -278,7 +321,9 @@ impl WorkDb {
             None
         };
 
-        let gate_outcome = if duplicate_head && original_revision_warranted {
+        let gate_outcome = if stale_head {
+            REVIEW_GATE_OUTCOME_STALE_HEAD
+        } else if duplicate_head && original_revision_warranted {
             REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD
         } else if revision_warranted {
             REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS
@@ -315,6 +360,62 @@ impl WorkDb {
         }
 
         Ok(applied_ref)
+    }
+
+    /// The PR head that has superseded a pre-merge `batch`'s frozen
+    /// `target_sha`, or `None` when the target is (as far as can be told)
+    /// still the head. Two sources, cheapest first:
+    ///
+    /// 1. A newer pre-merge batch for the same cycle root at a different
+    ///    target. Batches are only ever created from a live head fetch, so
+    ///    a later batch at another SHA proves the head moved — no GitHub
+    ///    round-trip needed, and this is the shape mono PR #3110 had.
+    /// 2. The live head from `pr_checker.inspect` (one `gh pr view`, the
+    ///    same call supervisor recovery already relies on). A checker that
+    ///    cannot report a head, or whose call fails, yields `None`: an
+    ///    unknown head is never treated as a move, so the verdict applies
+    ///    exactly as before this guard existed.
+    ///
+    /// The stored `tasks.pr_head_sha` observation is deliberately NOT
+    /// consulted: the merge poller's snapshot can lag a push that batch
+    /// creation already saw live, which would misreport the newest batch's
+    /// own target as stale.
+    fn pre_merge_target_superseded_by(
+        &self,
+        batch: &boss_protocol::ReviewBatch,
+        pr_checker: &dyn PrStateChecker,
+    ) -> Result<Option<String>> {
+        let newer_target: Option<String> = {
+            let conn = self.connect()?;
+            conn.query_row(
+                "SELECT target_sha FROM pr_review_batches
+                 WHERE cycle_root_id = ?1
+                   AND phase = 'pre_merge'
+                   AND target_sha != ?2
+                   AND (created_at > ?3 OR (created_at = ?3 AND id > ?4))
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![batch.cycle_root_id, batch.target_sha, batch.created_at, batch.id],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
+        if newer_target.is_some() {
+            return Ok(newer_target);
+        }
+        match pr_checker.inspect(&batch.pr_url) {
+            Ok(inspect) => Ok(inspect.head_sha.filter(|head| head != &batch.target_sha)),
+            Err(error) => {
+                tracing::warn!(
+                    batch_id = %batch.id,
+                    pr_url = %batch.pr_url,
+                    ?error,
+                    "review-verdict apply: could not inspect the live PR head; applying the verdict \
+                     without the stale-head check",
+                );
+                Ok(None)
+            }
+        }
     }
 
     fn materialize_review_findings(
@@ -397,6 +498,7 @@ impl WorkDb {
             return Ok(applied_ref);
         }
 
+        let stale_head = input.gate_outcome == REVIEW_GATE_OUTCOME_STALE_HEAD;
         let existing_verdict_id: Option<String> = tx
             .query_row(
                 "SELECT id FROM pr_review_verdicts WHERE batch_id = ?1",
@@ -422,7 +524,14 @@ impl WorkDb {
                 &input,
                 remediating_task_id,
             )?;
-            increment_review_cycle_once_in_tx(&tx, &batch.cycle_root_id, Some(verdict.target_sha.as_str()))?;
+            // A stale-head verdict reviewed a head the PR has moved past:
+            // it is not a cycle on this PR and must not stamp
+            // `last_reviewed_sha` with a superseded SHA (the card's
+            // "Not reviewed: latest commit" stays truthful either way, but
+            // the cycle budget belongs to verdicts that drove a decision).
+            if !stale_head {
+                increment_review_cycle_once_in_tx(&tx, &batch.cycle_root_id, Some(verdict.target_sha.as_str()))?;
+            }
             inserted
         };
 
@@ -460,8 +569,13 @@ impl WorkDb {
 
         // Open origin: the parent sits in human Review (clean, or beside
         // the autostarted revision). Merged origin: parent is already
-        // `done`/`archived` and this no-ops.
-        advance_cycle_root_to_in_review_in_tx(&mut pending, &tx, &batch.cycle_root_id, &now)?;
+        // `done`/`archived` and this no-ops. A stale-head verdict advances
+        // nothing: the root stays held for the batch that reviews the head
+        // it actually has now (which the deferred-admission sweep's
+        // readmission arm creates if the moving push did not).
+        if !stale_head {
+            advance_cycle_root_to_in_review_in_tx(&mut pending, &tx, &batch.cycle_root_id, &now)?;
+        }
 
         // A revision under this chain root that is held `active` pending
         // exactly this reviewed push must ALSO reach `in_review` here: the

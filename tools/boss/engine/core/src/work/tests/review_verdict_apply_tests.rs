@@ -2046,3 +2046,270 @@ fn assert_post_merge_followup_membership(in_project: bool) {
 
 #[path = "review_guide_findings_tests.rs"]
 mod review_guide_findings_tests;
+
+// ── stale-head verdicts ─────────────────────────────────────────────────────
+
+/// Stand up a cycle root held `active` pending review (the PendingReview
+/// hold), with a `supervising` batch at `target_sha` whose supervisor has
+/// already stopped. Returns `(root_id, batch, supervisor_execution_id)`.
+fn supervising_batch_on_held_root(db: &WorkDb, target_sha: &str) -> (String, boss_protocol::ReviewBatch, String) {
+    let product = create_test_product(db);
+    let cycle_root = create_test_chore_manual(db, product.id, "review target");
+    bind_open_pr(db, &cycle_root.id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active' WHERE id = ?1",
+            rusqlite::params![cycle_root.id],
+        )
+        .unwrap();
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    // A reported claude leaf, so the findings' cited `claude` source is a
+    // known member of the batch (`review_verdict_unknown_source_reason`).
+    let claude = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), target_sha),
+            &[
+                member(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(claude.id),
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member(
+                    ReviewBatchMemberRole::Supervisor,
+                    Some(supervisor.id.clone()),
+                    ReviewBatchMemberStatus::Pending,
+                ),
+            ],
+        )
+        .unwrap();
+    force_batch_supervising(db, &batch.id);
+    (cycle_root.id, batch, supervisor.id)
+}
+
+/// Stage a findings verdict from the supervisor, then stop the supervisor
+/// (the production order: the verdict is acknowledged before teardown).
+fn stage_stale_scenario_findings_verdict(
+    db: &WorkDb,
+    root_id: &str,
+    batch_id: &str,
+    supervisor_id: &str,
+    target_sha: &str,
+) -> String {
+    let proposal_id = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: supervisor_id,
+            work_item_id: root_id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &findings_verdict_payload(batch_id, target_sha),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap()
+        .proposal
+        .id;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![supervisor_id],
+        )
+        .unwrap();
+    proposal_id
+}
+
+fn revision_count(db: &WorkDb, root_id: &str) -> i64 {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE parent_task_id = ?1 AND kind = 'revision' AND deleted_at IS NULL",
+            rusqlite::params![root_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// mono PR #3110: the previous head's supervisor reported after a later push
+/// had already moved the PR on (a batch for the new head exists). The
+/// verdict must be recorded as `stale_head` with no revision minted, the
+/// batch completed, the proposal applied, and the root left held for the
+/// current head's review — with neither cycle count nor `last_reviewed_sha`
+/// stamped from a superseded SHA.
+#[test]
+fn findings_verdict_for_a_superseded_head_is_recorded_stale_and_mints_nothing() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-stale-newer-batch")).unwrap();
+    let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+    // The push that moved the head already created the next head's batch.
+    let (newer, _) = db
+        .create_review_batch(
+            batch_input(root_id.clone(), "head-b"),
+            &[member(
+                ReviewBatchMemberRole::ClaudeReviewer,
+                None,
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+    let created = db
+        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
+
+    assert_eq!(created, None, "a stale-head verdict must mint no remediation");
+    assert_eq!(revision_count(&db, &root_id), 0);
+    let verdict = db.review_verdict_for_execution(&supervisor_id).unwrap().unwrap();
+    assert_eq!(verdict.gate_outcome, REVIEW_GATE_OUTCOME_STALE_HEAD);
+    assert_eq!(verdict.head_sha.as_deref(), Some("head-a"));
+    assert_eq!(verdict.findings_count, 1);
+    assert!(
+        verdict.revision_warranted,
+        "the gate's own answer is preserved on the row"
+    );
+    assert!(
+        !is_informative_gate_outcome(&verdict.gate_outcome),
+        "a stale verdict says nothing about the current head"
+    );
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Completed,
+        "the stale batch still settles and releases its reservation"
+    );
+    assert_eq!(
+        db.review_batch(&newer.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Collecting,
+        "the current head's batch is untouched"
+    );
+    let proposal = db
+        .list_worker_proposals(None, None, Some(ProposalKind::ReviewVerdict), None, None)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.id == proposal_id)
+        .unwrap();
+    assert_eq!(proposal.state, ProposalState::Applied);
+    let root = query_task(&db.connect().unwrap(), &root_id).unwrap().unwrap();
+    assert_eq!(
+        root.status,
+        TaskStatus::Active,
+        "the root stays held for the batch that reviews the head it actually has"
+    );
+    assert_eq!(
+        db.get_task_review_cycle_state(&root_id).unwrap(),
+        (0, None),
+        "a superseded head is neither a cycle nor the last reviewed SHA"
+    );
+}
+
+/// Without a newer batch in the DB, the live PR head (one `gh pr view`,
+/// via `PrStateChecker::inspect`) is the second source of truth for a move.
+/// The revision whose push produced the stale head is still released from
+/// its hold — nothing else ever will — while the root stays held.
+#[test]
+fn verdict_for_a_head_the_live_pr_has_moved_past_is_stale_and_releases_the_held_revision() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-stale-live-head")).unwrap();
+    let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+    let revision_id = make_held_revision(&db, &root_id, PR_URL, "head-a");
+    let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-b");
+    let created = db.apply_review_verdict_proposal(&proposal_id, &checker).unwrap();
+
+    assert_eq!(created, None);
+    assert_eq!(
+        db.review_verdict_for_execution(&supervisor_id)
+            .unwrap()
+            .unwrap()
+            .gate_outcome,
+        REVIEW_GATE_OUTCOME_STALE_HEAD
+    );
+    // The held revision's own work is done (its push was reviewed, if
+    // stalely) and nothing newer will release it; the root is not advanced.
+    let revision = query_task(&db.connect().unwrap(), &revision_id).unwrap().unwrap();
+    assert_eq!(revision.status, TaskStatus::InReview);
+    // The stale findings' revision was never minted: the only revision is
+    // the pre-existing held one.
+    assert_eq!(revision_count(&db, &root_id), 1);
+    let root = query_task(&db.connect().unwrap(), &root_id).unwrap().unwrap();
+    assert_eq!(root.status, TaskStatus::Active);
+}
+
+/// A live head that still matches the target is not a move: the verdict
+/// applies exactly as before the guard existed.
+#[test]
+fn verdict_whose_target_is_still_the_live_head_applies_normally() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-live-head-unchanged")).unwrap();
+    let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+    let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-a");
+    let created = db.apply_review_verdict_proposal(&proposal_id, &checker).unwrap();
+
+    assert!(created.is_some(), "findings on the current head mint a revision");
+    assert_eq!(revision_count(&db, &root_id), 1);
+    assert_eq!(
+        db.review_verdict_for_execution(&supervisor_id)
+            .unwrap()
+            .unwrap()
+            .gate_outcome,
+        REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS
+    );
+    assert_eq!(
+        db.get_task_review_cycle_state(&root_id).unwrap(),
+        (1, Some("head-a".to_owned()))
+    );
+}
+
+/// An explicit (`bossctl review start`) batch is a deliberate request for
+/// one exact SHA's findings; a head move does not make them stale.
+#[test]
+fn explicit_batch_verdict_is_applied_even_after_the_head_moved() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-explicit-not-stale")).unwrap();
+    let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET explicit = 1 WHERE id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+    db.create_review_batch(
+        batch_input(root_id.clone(), "head-b"),
+        &[member(
+            ReviewBatchMemberRole::ClaudeReviewer,
+            None,
+            ReviewBatchMemberStatus::Pending,
+        )],
+    )
+    .unwrap();
+    let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+    let created = db
+        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
+
+    assert!(created.is_some(), "an explicit batch's findings always materialise");
+    assert_eq!(
+        db.review_verdict_for_execution(&supervisor_id)
+            .unwrap()
+            .unwrap()
+            .gate_outcome,
+        REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS
+    );
+}
