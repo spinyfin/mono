@@ -113,7 +113,8 @@ impl InflightDispatches {
 
     /// Pre-filter for drain rows. Rechecked atomically by `try_reserve`.
     /// Rejects a repeated execution and incompatible same-work-item rows,
-    /// while allowing persisted same-batch members through to dispatch.
+    /// while allowing persisted review-batch members of one cycle root
+    /// (same batch or not) through to dispatch.
     pub fn blocks_execution(&self, execution: &WorkExecution, db: &WorkDb) -> bool {
         let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
         Self::conflicts(&table, execution, db)
@@ -129,7 +130,7 @@ impl InflightDispatches {
             .values()
             .filter(|e| e.work_item_id == execution.work_item_id)
             .any(
-                |other| match db.are_admissible_same_review_batch_pair(&execution.id, &other.id) {
+                |other| match db.are_admissible_concurrent_review_batch_pair(&execution.id, &other.id) {
                     Ok(admissible) => !admissible,
                     Err(err) => {
                         tracing::warn!(execution_id = %execution.id, other_execution_id = %other.id,

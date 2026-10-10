@@ -1082,3 +1082,265 @@ async fn stalled_reviewer_does_not_skip_a_new_head_when_fanout_owns_the_hold() {
         "a prior-cycle verdict must not skip review of a new PendingReview hold"
     );
 }
+
+// ── re-admission after a reaped / stale-head batch ──────────────────────────
+
+fn readmission_batch_input(root_id: &str, pr_url: &str, target_sha: &str) -> crate::work::ReviewBatchCreateInput {
+    crate::work::ReviewBatchCreateInput::builder()
+        .cycle_root_id(root_id)
+        .base_sha("base-sha")
+        .classification(
+            boss_protocol::ReviewClassification::builder()
+                .changed_files(vec!["src/lib.rs".to_owned()])
+                .complexity_flags(vec![])
+                .has_production_code(true)
+                .metadata_missing(vec![])
+                .production_languages(vec![boss_protocol::ReviewLanguageBucket::Rust])
+                .profile(boss_protocol::ReviewProfile::Light)
+                .subsystem_buckets(vec!["src".to_owned()])
+                .build(),
+        )
+        .phase(boss_protocol::ReviewBatchPhase::PreMerge)
+        .pr_number(94)
+        .pr_url(pr_url)
+        .target_sha(target_sha)
+        .build()
+}
+
+/// Create a real two-leaf batch for `root_id` at `target_sha`, then put it
+/// in the state the inert-batch reaper leaves behind: every leaf abandoned
+/// before reporting, members `failed`, batch `failed`.
+fn reaped_batch(db: &WorkDb, root_id: &str, pr_url: &str, target_sha: &str) -> String {
+    let (batch, executions) = match db
+        .create_pre_merge_review_batch(
+            readmission_batch_input(root_id, pr_url, target_sha),
+            "https://github.com/spinyfin/mono",
+        )
+        .unwrap()
+    {
+        crate::work::ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        other => panic!("expected a new batch, got {other:?}"),
+    };
+    for execution in &executions {
+        db.mark_execution_redundant(&execution.id).unwrap();
+    }
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE pr_review_batch_members SET status = 'failed' WHERE batch_id = ?1",
+        params![batch.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
+        params![batch.id],
+    )
+    .unwrap();
+    batch.id
+}
+
+/// The mono PR #3110 aftermath: the cycle root is already `in_review` (an
+/// earlier verdict advanced it), its newest pre-merge batch was reaped
+/// without any leaf reporting, and no marker is open. It must surface
+/// immediately — no inertia wait — so the sweep re-admits a batch for the
+/// head nothing reviewed. Once the replacement batch exists it drops out,
+/// and once the automatic generation cap is reached it stays out.
+#[test]
+fn deferred_admission_query_surfaces_an_in_review_root_whose_newest_batch_was_reaped_unreported() {
+    let db = WorkDb::open(temp_db_path("readmission-reaped")).unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/94";
+    let product_id = make_revision_product(&db, "readmission-reaped");
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let fresh = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert!(
+        fresh.is_empty(),
+        "an in_review root with no batch history is not a candidate: {fresh:?}"
+    );
+
+    reaped_batch(&db, &root_id, pr_url, "head-sha");
+    let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert_eq!(
+        deferred.len(),
+        1,
+        "an in_review root whose newest batch was reaped unreported must surface at once: {deferred:?}"
+    );
+    assert_eq!(deferred[0].task_id, root_id);
+    assert_eq!(deferred[0].cycle_root_id, root_id);
+    assert_eq!(deferred[0].pr_url, pr_url);
+
+    // The re-admission the sweep performs: generation 2 at the same head.
+    let next = match db
+        .create_pre_merge_review_batch(
+            readmission_batch_input(&root_id, pr_url, "head-sha"),
+            "https://github.com/spinyfin/mono",
+        )
+        .unwrap()
+    {
+        crate::work::ReviewBatchDispatch::Created { batch, .. } => batch,
+        other => panic!("the reaped head must be re-minted, got {other:?}"),
+    };
+    assert_eq!(next.generation, 2);
+    let live = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert!(live.is_empty(), "a live replacement batch excludes the root: {live:?}");
+
+    // Generation 2 reaped too: the cap is reached, the attention stands,
+    // and the query must not keep costing a `gh pr view` every sweep.
+    for execution in db.list_executions(Some(&root_id)).unwrap() {
+        if execution.kind == ExecutionKind::PrReview && !execution.status.is_terminal() {
+            db.mark_execution_redundant(&execution.id).unwrap();
+        }
+    }
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
+            params![next.id],
+        )
+        .unwrap();
+    let capped = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert!(
+        capped.is_empty(),
+        "generation {} is the automatic cap; the root must not be re-surfaced: {capped:?}",
+        crate::work::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS
+    );
+}
+
+/// A failed batch in which one leaf reported still has no consolidated
+/// verdict, so the head stays unsettled and the root is surfaced for
+/// re-admission.
+#[test]
+fn deferred_admission_query_surfaces_a_failed_batch_that_had_a_partial_report() {
+    let db = WorkDb::open(temp_db_path("readmission-reported-failure")).unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/95";
+    let product_id = make_revision_product(&db, "readmission-reported");
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+    let batch_id = reaped_batch(&db, &root_id, pr_url, "head-sha");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batch_members SET status = 'reported'
+             WHERE id = (SELECT id FROM pr_review_batch_members WHERE batch_id = ?1 ORDER BY id LIMIT 1)",
+            params![batch_id],
+        )
+        .unwrap();
+
+    let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert_eq!(
+        deferred.len(),
+        1,
+        "a failed batch with no consolidated verdict keeps a recovery path: {deferred:?}"
+    );
+    assert_eq!(deferred[0].cycle_root_id, root_id);
+}
+
+/// A newest batch that completed with a `stale_head` verdict reviewed a head
+/// the PR has moved past; the root surfaces so the sweep creates a batch
+/// for the head it has now — unless a newer batch already covers it.
+#[test]
+fn deferred_admission_query_surfaces_a_root_whose_newest_verdict_was_stale_head() {
+    let db = WorkDb::open(temp_db_path("readmission-stale-head")).unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/96";
+    let product_id = make_revision_product(&db, "readmission-stale");
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let (batch, executions) = match db
+        .create_pre_merge_review_batch(
+            readmission_batch_input(&root_id, pr_url, "old-head"),
+            "https://github.com/spinyfin/mono",
+        )
+        .unwrap()
+    {
+        crate::work::ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        other => panic!("expected a new batch, got {other:?}"),
+    };
+    let conn = db.connect().unwrap();
+    for execution in &executions {
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            params![execution.id],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+        params![batch.id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO pr_review_verdicts (
+            id, execution_id, work_item_id, head_sha, findings_count,
+            revision_warranted, gate_outcome, revision_task_id, created_at, batch_id, proposal_id
+         ) VALUES ('rvv_stale', ?1, ?2, 'old-head', 2, 1, ?3, NULL, '1', ?4, 'prop_stale')",
+        params![
+            executions[0].id,
+            root_id,
+            crate::work::REVIEW_GATE_OUTCOME_STALE_HEAD,
+            batch.id
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert_eq!(
+        deferred.len(),
+        1,
+        "a stale-head verdict leaves the current head unreviewed; the root must surface: {deferred:?}"
+    );
+    assert_eq!(deferred[0].task_id, root_id);
+
+    // A batch for the new head (whatever its status) supersedes the stale
+    // one as "newest" and switches the arm off.
+    let newer = match db
+        .create_pre_merge_review_batch(
+            readmission_batch_input(&root_id, pr_url, "new-head"),
+            "https://github.com/spinyfin/mono",
+        )
+        .unwrap()
+    {
+        crate::work::ReviewBatchDispatch::Created { batch, .. } => batch,
+        other => panic!("expected a new batch, got {other:?}"),
+    };
+    assert!(db.list_tasks_awaiting_pre_merge_review_admission().unwrap().is_empty());
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'completed'
+         WHERE id IN (SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)",
+        params![newer.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+        params![newer.id],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(
+        db.list_tasks_awaiting_pre_merge_review_admission().unwrap().is_empty(),
+        "once a newer batch has settled the stale verdict is history, not a candidate"
+    );
+}
+
+/// A root and its `in_review` revisions are one cycle: the readmission arm
+/// yields a single candidate (the cycle root), not one per task, so the sweep
+/// pays one `gh pr view` per cycle.
+#[test]
+fn deferred_admission_query_yields_one_candidate_per_cycle() {
+    let db = WorkDb::open(temp_db_path("readmission-one-per-cycle")).unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/97";
+    let product_id = make_revision_product(&db, "readmission-dedup");
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+    let revision_id = insert_revision_row(&db, &product_id, &root_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            params![revision_id, pr_url],
+        )
+        .unwrap();
+    reaped_batch(&db, &root_id, pr_url, "head-sha");
+
+    let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert_eq!(deferred.len(), 1, "one candidate per cycle root: {deferred:?}");
+    assert_eq!(deferred[0].task_id, root_id);
+}

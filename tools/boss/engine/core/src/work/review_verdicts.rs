@@ -21,16 +21,29 @@ pub const REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD: &str = "dropped_duplicate_
 /// discarded. Amended onto the row after the initial `completed_with_findings`
 /// write via [`WorkDb::mark_review_verdict_revision_creation_failed`].
 pub const REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED: &str = "revision_creation_failed";
+/// A pre-merge supervisor produced a verdict for a `target_sha` that was no
+/// longer the PR head by the time the verdict applied (a later push landed
+/// while the batch was running). The verdict is recorded for the head it
+/// reviewed, but no revision or follow-up is minted from it: findings about
+/// a superseded head would send a worker chasing code that may already have
+/// changed, and its push would in turn invalidate the batch reviewing the
+/// current head. The current head owns remediation — its own batch reviews
+/// it (created by the push that moved the head, or by the deferred-admission
+/// sweep's re-admission arm if nothing else did). Non-informative: it says
+/// nothing about the head the card shows, so the badge keeps "Not reviewed".
+pub const REVIEW_GATE_OUTCOME_STALE_HEAD: &str = "stale_head";
 
 /// Gate outcomes that represent a real completed judgement about a pass —
 /// the only ones the AI-review badge (`attach_ai_review_state`) will ever
 /// render as `"reviewed_with_findings"` / `"reviewed_all_clear"`.
-/// `gave_up` and `dropped_duplicate_head` are deliberately excluded: neither
-/// is positive evidence of anything (a give-up never produced a result; a
-/// dropped-duplicate pass reviewed a head an EARLIER, still-informative row
-/// already covers), so a badge resolver must skip past them and keep
-/// looking rather than surface either as if it were a completed verdict.
-/// The card projection additionally requires a match to the current PR head.
+/// `gave_up`, `dropped_duplicate_head` and `stale_head` are deliberately
+/// excluded: none is positive evidence of anything about the current head (a
+/// give-up never produced a result; a dropped-duplicate pass reviewed a head
+/// an EARLIER, still-informative row already covers; a stale-head pass
+/// reviewed a head the PR has since moved past), so a badge resolver must
+/// skip past them and keep looking rather than surface any as if it were a
+/// completed verdict. The card projection additionally requires a match to
+/// the current PR head.
 pub(crate) const INFORMATIVE_GATE_OUTCOMES: [&str; 3] = [
     REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
     REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
@@ -47,18 +60,21 @@ pub fn is_informative_gate_outcome(gate_outcome: &str) -> bool {
 }
 
 /// Gate outcomes that mean the pass produced a `ReviewResult`. This is
-/// [`INFORMATIVE_GATE_OUTCOMES`] plus `dropped_duplicate_head`: that pass
-/// did produce a result, then the duplicate-head guard discarded a redundant
-/// revision because an earlier informative row already covers the same
-/// head. Badge lookup still skips dropped-duplicate rows (it must look
-/// through to that earlier covering pass); stalled-reviewer "was a result
-/// written?" must not, or a missed Stop hook after a dropped-duplicate
-/// finalize would re-fire the review instead of advancing the card.
-pub(crate) const REVIEW_RESULT_GATE_OUTCOMES: [&str; 4] = [
+/// [`INFORMATIVE_GATE_OUTCOMES`] plus `dropped_duplicate_head` and
+/// `stale_head`: those passes did produce a result, then the engine
+/// declined to act on it — the duplicate-head guard because an earlier
+/// informative row already covers the same head, the stale-head guard
+/// because the PR head had moved past the reviewed one. Badge lookup still
+/// skips both (it must look through to a pass covering the current head);
+/// stalled-reviewer "was a result written?" must not, or a missed Stop hook
+/// after such a finalize would re-fire the review instead of advancing the
+/// card.
+pub(crate) const REVIEW_RESULT_GATE_OUTCOMES: [&str; 5] = [
     REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
     REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
     REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED,
     REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD,
+    REVIEW_GATE_OUTCOME_STALE_HEAD,
 ];
 
 /// SQL list literal for [`REVIEW_RESULT_GATE_OUTCOMES`]. Engine-owned

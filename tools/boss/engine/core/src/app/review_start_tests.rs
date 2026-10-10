@@ -13,6 +13,13 @@ impl PrStateChecker for OpenPr {
     fn check(&self, _: &str) -> anyhow::Result<PrOpenState> {
         Ok(PrOpenState::Open)
     }
+
+    fn inspect(&self, _: &str) -> anyhow::Result<crate::work::PrInspect> {
+        Ok(crate::work::PrInspect {
+            open_state: PrOpenState::Open,
+            head_sha: Some("head".to_owned()),
+        })
+    }
 }
 
 fn state(fanout: bool) -> (Arc<ServerState>, tempfile::TempDir) {

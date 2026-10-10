@@ -47,9 +47,12 @@ fn apply_findings(db: &WorkDb, root: &str, sha: &str) -> String {
         })
         .unwrap()
         .unwrap();
-    db.apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
-        .unwrap()
-        .unwrap()
+    db.apply_review_verdict_proposal(
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha(sha),
+    )
+    .unwrap()
+    .unwrap()
 }
 
 fn findings(db: &WorkDb, root: &str) -> Option<boss_protocol::ReviewGuideFindings> {
