@@ -20,14 +20,9 @@ use super::*;
 /// refetch) without the client ever having been the problem.
 pub(super) const MAX_SESSION_QUEUE: usize = 256;
 
-/// How long the head-of-line bulk envelope must have waited before we treat
-/// a full queue as a genuinely stuck client rather than a transient burst.
-/// Incident 2026-07-14: sessions were disconnected with `oldest_age_ms` of
-/// only ~1.3-1.8s — the client was actively draining, just slower than a
-/// merge-poller sweep's publish rate for a couple seconds. A real wedge (app
-/// not reading its socket at all) blows well past this within one sweep
-/// interval, so 5s comfortably separates "bursty but alive" from "stuck"
-/// without meaningfully delaying detection of an actually-dead client.
+/// Maximum time without socket write progress before a full bulk queue is
+/// considered stuck. Queue age alone is insufficient: a large response can
+/// occupy the writer for much longer while the client keeps consuming bytes.
 pub(super) const STUCK_CLIENT_AGE_MS: u64 = 5_000;
 
 /// Reserved synthetic topic for the resync marker [`SessionQueue`] injects
@@ -55,8 +50,8 @@ pub(super) enum EnqueueOutcome {
     Enqueued,
     Coalesced,
     Closed,
-    /// The bulk lane is full and the client is genuinely stuck (the
-    /// head-of-line envelope has waited past [`STUCK_CLIENT_AGE_MS`]).
+    /// The bulk lane is full and has made no socket write progress for
+    /// [`STUCK_CLIENT_AGE_MS`].
     /// Callers disconnect the session on this outcome.
     Slow,
     /// The bulk lane was full but the client is actively draining (just
@@ -129,6 +124,9 @@ pub(super) struct SessionQueue {
     /// — only an eviction under pressure is a drop.
     #[builder(default)]
     pub(super) dropped_response_request_ids: Vec<String>,
+    /// Updated only after the socket accepts bytes, never on enqueue/eviction.
+    pub(super) last_write_progress: Option<tokio::time::Instant>,
+    pub(super) in_flight: Option<super::session_write::EnvelopeSummary>,
 }
 
 impl SessionQueue {
@@ -140,6 +138,8 @@ impl SessionQueue {
             closed: false,
             slow: false,
             dropped_response_request_ids: Vec::new(),
+            last_write_progress: None,
+            in_flight: None,
         }
     }
 
@@ -197,28 +197,19 @@ impl SessionQueue {
         EnqueueOutcome::Enqueued
     }
 
-    /// Called once the bulk lane is at [`MAX_SESSION_QUEUE`] and a new
-    /// envelope needs a slot. Distinguishes a genuinely stuck client from a
-    /// transient publish burst by the head-of-line envelope's age (incident
-    /// 2026-07-14: sessions were torn down mid-burst with `oldest_age_ms`
-    /// of only ~1.3-1.8s, i.e. the client was draining fine, just not fast
-    /// enough for an instant). A stuck client (past [`STUCK_CLIENT_AGE_MS`])
-    /// still gets `Slow`, which callers turn into a disconnect. A bursty-but-
-    /// alive client instead has its oldest pending entry dropped to make
-    /// room — bounded, O(1), never grows the queue past `MAX_SESSION_QUEUE`
-    /// — and a [`RESYNC_TOPIC`] marker is admitted alongside it (dropping a
-    /// second entry to make room if one isn't already pending) so the
-    /// client knows to refetch rather than silently miss the dropped
-    /// topic(s). The marker coalesces like any other topic (at most one
-    /// pending at a time), so a sustained burst that keeps degrading before
-    /// the marker is ever delivered doesn't queue more than one.
+    /// At capacity, disconnect only when both the backlog and the last
+    /// successful socket write are old. Otherwise retain bounded burst
+    /// shedding and its resync marker. Dropping queued entries is not write
+    /// progress; the writer also times out a stalled frame independently of
+    /// further publishes, so shedding cannot keep a non-reader alive forever.
     fn admit_under_pressure(&mut self, env: FrontendEventEnvelope, topic: Option<String>) -> EnqueueOutcome {
         let oldest_age_ms = self
             .items
             .front()
             .map(|(enqueued_at, _)| Instant::now().saturating_duration_since(*enqueued_at).as_millis() as u64)
             .unwrap_or(0);
-        if oldest_age_ms >= STUCK_CLIENT_AGE_MS {
+        let write_idle_ms = self.last_write_progress.map(|at| at.elapsed().as_millis() as u64);
+        if oldest_age_ms >= STUCK_CLIENT_AGE_MS && write_idle_ms.is_none_or(|age| age >= STUCK_CLIENT_AGE_MS) {
             self.slow = true;
             return EnqueueOutcome::Slow;
         }
@@ -667,15 +658,7 @@ impl TopicBroker {
         }
 
         for (session_id, sink) in slow {
-            let stats = sink.queue_stats();
-            tracing::warn!(
-                session_id = %session_id,
-                topic,
-                queue_depth = stats.depth,
-                priority_depth = stats.priority_depth,
-                oldest_age_ms = stats.oldest_age_ms,
-                "slow subscriber: outbound queue full, disconnecting"
-            );
+            sink.log_stuck(&session_id, "outbound queue full", Some(topic));
             sink.close();
             sink.trigger_shutdown();
             self.remove_session(&session_id).await;

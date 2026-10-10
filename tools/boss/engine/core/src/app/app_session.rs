@@ -172,6 +172,9 @@ impl ServerState {
                     "send_to_app: app outbound queue saturated — request undeliverable; \
                      tearing down wedged app session",
                 );
+                if outcome == EnqueueOutcome::Slow {
+                    sink.log_stuck(&session_id, "priority queue full", None);
+                }
                 sink.close();
                 sink.trigger_shutdown();
                 return Err(SendToAppError::SessionWedged);

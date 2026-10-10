@@ -372,6 +372,7 @@ mod revision_no_op_live_seam_reproduction;
 mod selected_product;
 mod semantic_progress_ingress;
 mod session_sink_queue;
+mod session_write_progress;
 mod shutdown_workers;
 mod t02;
 mod t03;

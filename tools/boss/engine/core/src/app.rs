@@ -2169,6 +2169,7 @@ impl crate::external_tracker::reconcile::WorkInvalidationPublisher for ServerSta
 }
 
 mod session_queue;
+mod session_write;
 use session_queue::*;
 
 async fn handle_frontend_connection(
@@ -2221,6 +2222,7 @@ async fn handle_frontend_connection(
     // flag would leave every live worker session still sanitized until it
     // reconnected, which is not what a kill switch means.
     let writer_flags = server_state.feature_flags.clone();
+    let writer_session_id = session_id.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(mut event) = writer_sink.next().await {
             // The exposure boundary's single write choke point. Every frame
@@ -2259,17 +2261,10 @@ async fn handle_frontend_connection(
             }
 
             let write_start = Instant::now();
-            let mut write_failed = false;
-            if let Err(err) = write_half.write_all(line.as_bytes()).await {
-                tracing::error!(?err, "failed to write event to frontend socket");
-                write_failed = true;
-            } else if let Err(err) = write_half.write_all(b"\n").await {
-                tracing::error!(?err, "failed to delimit frontend event line");
-                write_failed = true;
-            } else if let Err(err) = write_half.flush().await {
-                tracing::error!(?err, "failed to flush frontend socket");
-                write_failed = true;
-            }
+            let write_failed = writer_sink
+                .write_frame(&mut write_half, &line, &writer_session_id)
+                .await
+                .is_err();
 
             if let Some(mut t) = trace {
                 t.record_plain(
