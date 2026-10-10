@@ -258,12 +258,13 @@ mod tests {
     const REPO: &str = "git@github.com:spinyfin/mono.git";
 
     #[tokio::test]
-    async fn refresh_observes_a_new_head_despite_cached_listing() {
+    async fn refresh_observes_a_new_default_branch_despite_cached_listing() {
         let source = FakeSource::with_body("# old rules");
         let service = DesignDocsService::with_source(source.clone());
         service.list_markdown_docs(Some(REPO), false).await;
         assert_eq!(service.peek("spinyfin/mono").unwrap().default_branch, "main");
         service.fetch_coordinator_guidance(Some(REPO)).await;
+        *source.default_branch.lock().unwrap() = "trunk".to_owned();
         *source.shas.lock().unwrap() = vec![SHA_B];
         *source.blob.lock().unwrap() = Ok("# new rules".to_owned());
         let refreshed = service.fetch_coordinator_guidance(Some(REPO)).await;
