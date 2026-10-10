@@ -1415,8 +1415,14 @@ fn in_progress_flag_set_for_blocked_revision() {
     attach_in_progress_revision_flag(&mut tasks, &mut chores);
 
     let root = chores.iter().find(|t| t.id == "root").unwrap();
-    assert!(root.has_in_progress_revision, "blocked revision must trigger the flag on the chain root");
-    assert!(root.in_revision_blocked_only, "a parent whose only open revision is blocked must be marked blocked-only");
+    assert!(
+        root.has_in_progress_revision,
+        "blocked revision must trigger the flag on the chain root"
+    );
+    assert!(
+        root.in_revision_blocked_only,
+        "a parent whose only open revision is blocked must be marked blocked-only"
+    );
 }
 
 #[test]
@@ -1433,7 +1439,10 @@ fn in_progress_flag_not_blocked_only_when_a_revision_is_running() {
 
     let root = chores.iter().find(|t| t.id == "root").unwrap();
     assert!(root.has_in_progress_revision);
-    assert!(!root.in_revision_blocked_only, "a running sibling means the badge is not blocked-only");
+    assert!(
+        !root.in_revision_blocked_only,
+        "a running sibling means the badge is not blocked-only"
+    );
 }
 
 #[test]

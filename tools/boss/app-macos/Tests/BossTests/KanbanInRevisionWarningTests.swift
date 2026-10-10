@@ -96,6 +96,16 @@ final class KanbanInRevisionWarningTests: XCTestCase {
 
     // MARK: Blocked revisions (merge-gate parity)
 
+    /// Drift guard for the Swift mirror of `TaskStatus::can_still_change_pr`.
+    func testCanStillChangePRMatchesEnginePredicate() {
+        for status in ["todo", "active", "blocked"] {
+            XCTAssertTrue(makeTask(status: status).canStillChangePR, status)
+        }
+        for status in ["in_review", "done", "archived"] {
+            XCTAssertFalse(makeTask(status: status).canStillChangePR, status)
+        }
+    }
+
     /// The merge gate (`can_still_change_pr`) counts a `blocked` revision, so
     /// the hover list and click resolver must too.
     func testActiveRevisionsIncludesBlockedRevision() {

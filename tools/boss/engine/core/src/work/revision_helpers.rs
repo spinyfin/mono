@@ -1784,7 +1784,7 @@ mod tests {
         t3528.ci_required_state = Some("success".to_owned());
         t3528.pr_mergeable_state = Some("conflicting".to_owned());
 
-        // `in revision` badge (descendant revision still todo/active).
+        // `in revision` badge (descendant revision where `TaskStatus::can_still_change_pr` holds).
         let in_revision_ids = ["t3519", "t3513", "t3540", "t3537"];
         let mut in_revision_tasks: Vec<Task> = in_revision_ids
             .iter()

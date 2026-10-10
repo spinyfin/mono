@@ -59,6 +59,8 @@ impl TaskStatus {
     /// True when a revision can still push commits onto its parent PR.
     /// `in_review` has already published its branch; `done` and `archived`
     /// are closed. Used by the merge-when-ready confirmation gate.
+    /// The macOS app mirrors this as `WorkTask.canStillChangePR`
+    /// (`app-macos/Sources/Models.swift`); update both together.
     pub fn can_still_change_pr(&self) -> bool {
         matches!(self, Self::Todo | Self::Active | Self::Blocked)
     }
