@@ -282,7 +282,8 @@ extension EngineClient {
 
     /// Accept an open `deferred_scope` attention item without filing a
     /// followup task. Replies with `attention_item_updated`.
-    func sendAcceptDeferredScopeAttention(id: String) {
+    @discardableResult
+    func sendAcceptDeferredScopeAttention(id: String) -> String? {
         sendLine([
             "type": "accept_deferred_scope_attention",
             "id": id,
@@ -291,7 +292,8 @@ extension EngineClient {
 
     /// File a followup task from an open `deferred_scope` attention item.
     /// Replies with `attention_item_converted`.
-    func sendCreateTaskFromDeferredScopeAttention(attentionID: String) {
+    @discardableResult
+    func sendCreateTaskFromDeferredScopeAttention(attentionID: String) -> String? {
         sendLine([
             "type": "create_task_from_deferred_scope_attention",
             "attention_id": attentionID,
@@ -321,7 +323,8 @@ extension EngineClient {
     /// Release a project's staged auto-populate batch: flips `autostart =
     /// true` on every task tagged with the project's live (staged) planner
     /// run. Replies with `release_project_result`.
-    func sendReleaseProject(projectId: String) {
+    @discardableResult
+    func sendReleaseProject(projectId: String) -> String? {
         sendLine([
             "type": "release_project",
             "project_id": projectId,
@@ -331,7 +334,8 @@ extension EngineClient {
     /// Undo an auto-populate batch: soft-deletes every task tagged with
     /// `runId` that has no execution yet, and clears the run's idempotency
     /// gate. Replies with `unpopulate_project_result`.
-    func sendUnpopulateProject(projectId: String, runId: String) {
+    @discardableResult
+    func sendUnpopulateProject(projectId: String, runId: String) -> String? {
         sendLine([
             "type": "unpopulate_project",
             "project_id": projectId,
@@ -413,7 +417,8 @@ extension EngineClient {
     /// work item, check out the PR head branch, and return the workspace
     /// path for opening a Ghostty terminal. The engine replies with
     /// `review_terminal_ready` or `work_error`.
-    func sendOpenReviewTerminal(workItemID: String) {
+    @discardableResult
+    func sendOpenReviewTerminal(workItemID: String) -> String? {
         sendLine([
             "type": "open_review_terminal",
             "work_item_id": workItemID,
@@ -424,7 +429,8 @@ extension EngineClient {
     /// already-live execution workspace — no new lease, just the path.
     /// The engine replies with `live_workspace_terminal_ready` or
     /// `work_error`.
-    func sendOpenLiveWorkspaceTerminal(workItemID: String) {
+    @discardableResult
+    func sendOpenLiveWorkspaceTerminal(workItemID: String) -> String? {
         sendLine([
             "type": "open_live_workspace_terminal",
             "work_item_id": workItemID,
@@ -447,7 +453,8 @@ extension EngineClient {
     /// any violation is surfaced as a `workError` event. On success the
     /// engine replies with a `mergeWhenReadyAccepted` event and kicks the
     /// PR-reconciler so the kanban state updates promptly.
-    func sendMergeWhenReady(workItemID: String, confirmedRevisions: [OpenMergeRevision] = []) {
+    @discardableResult
+    func sendMergeWhenReady(workItemID: String, confirmedRevisions: [OpenMergeRevision] = []) -> String? {
         sendLine([
             "type": "merge_when_ready",
             "work_item_id": workItemID,

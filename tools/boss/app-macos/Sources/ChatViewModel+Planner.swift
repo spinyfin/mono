@@ -63,7 +63,9 @@ extension ChatViewModel {
     func releaseProject(projectID: String) {
         guard !plannerActionInFlightProjectIDs.contains(projectID) else { return }
         plannerActionInFlightProjectIDs.insert(projectID)
-        engine.sendReleaseProject(projectId: projectID)
+        if engine.sendReleaseProject(projectId: projectID) == nil {
+            plannerActionInFlightProjectIDs.remove(projectID)
+        }
     }
 
     /// Undo `runID`'s batch: the engine deletes the still-untouched staged
@@ -72,7 +74,9 @@ extension ChatViewModel {
     func unpopulateProject(projectID: String, runID: String) {
         guard !plannerActionInFlightProjectIDs.contains(projectID) else { return }
         plannerActionInFlightProjectIDs.insert(projectID)
-        engine.sendUnpopulateProject(projectId: projectID, runId: runID)
+        if engine.sendUnpopulateProject(projectId: projectID, runId: runID) == nil {
+            plannerActionInFlightProjectIDs.remove(projectID)
+        }
     }
 
     /// Open the full Planner Run inspector sheet for a project, refreshing

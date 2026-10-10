@@ -24,7 +24,9 @@ extension ChatViewModel {
             return
         }
         deferredScopeActionInFlightIDs.insert(id)
-        engine.sendAcceptDeferredScopeAttention(id: id)
+        if engine.sendAcceptDeferredScopeAttention(id: id) == nil {
+            deferredScopeActionInFlightIDs.remove(id)
+        }
     }
 
     /// File a followup task from an open `deferred_scope` attention item —
@@ -37,7 +39,9 @@ extension ChatViewModel {
             return
         }
         deferredScopeActionInFlightIDs.insert(attentionID)
-        engine.sendCreateTaskFromDeferredScopeAttention(attentionID: attentionID)
+        if engine.sendCreateTaskFromDeferredScopeAttention(attentionID: attentionID) == nil {
+            deferredScopeActionInFlightIDs.remove(attentionID)
+        }
     }
 
     /// Common handler for the three attention-item pushes that can affect

@@ -204,6 +204,10 @@ final class EngineClient: @unchecked Sendable {
     /// no behaviour change.
     var outboundRecorder: (([String: Any]) -> Void)?
 
+    /// Test-only: report sends as accepted without a socket, so view-model
+    /// tests can exercise the connected path.
+    var simulateConnectedForTesting = false
+
     // Not `private`: called from the `EngineClient+PaneResponses.swift`
     // extension, which needs file-scoped-`private` loosened to `internal`
     // to reach it.
@@ -229,6 +233,7 @@ final class EngineClient: @unchecked Sendable {
             )
         }
 
+        if simulateConnectedForTesting { return envelopeRequestId }
         guard connection != nil else {
             // A send while the socket is down is a transport condition,
             // not an engine-reported error. Idempotent reads are held and
