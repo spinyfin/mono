@@ -67,11 +67,28 @@ impl WorkDb {
         Ok(())
     }
 
-    pub(crate) fn delete_execution_bookmark(&self, execution_id: &str) -> Result<()> {
+    pub(crate) fn delete_execution_restore_report(&self, execution_id: &str) -> Result<()> {
         self.connect()?.execute(
+            "DELETE FROM execution_restore_reports WHERE execution_id = ?1",
+            [execution_id],
+        )?;
+        Ok(())
+    }
+
+    /// Drop the bookmark row and any restore report in one transaction, so a
+    /// run degraded to clean dispatch cannot be treated as already recovered.
+    pub(crate) fn delete_execution_bookmark_and_restore_report(&self, execution_id: &str) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM execution_bookmarks WHERE execution_id = ?1",
             [execution_id],
         )?;
+        tx.execute(
+            "DELETE FROM execution_restore_reports WHERE execution_id = ?1",
+            [execution_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

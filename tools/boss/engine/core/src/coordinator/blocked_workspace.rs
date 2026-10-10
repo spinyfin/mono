@@ -35,6 +35,7 @@ impl ExecutionCoordinator {
         };
         let Some(record) = self.work_db.execution_bookmark_optional(&prior.id)? else {
             self.warn_missing_execution_bookmark(execution, Some(&prior.id)).await;
+            self.work_db.delete_execution_restore_report(&execution.id)?;
             return Ok(None);
         };
         if record.host_id != adapter.host_id() {
@@ -57,6 +58,8 @@ impl ExecutionCoordinator {
                 Err(err) if is_missing_pointer_error(&err) => {
                     self.degrade_missing_pointers(execution, Some(&prior.id), &record, &err)
                         .await;
+                    // A report from an earlier attempt would make dispatch skip PR positioning.
+                    self.work_db.delete_execution_restore_report(&execution.id)?;
                     return Ok(None);
                 }
                 Err(err) => return Err(err),
@@ -152,14 +155,18 @@ impl ExecutionCoordinator {
                 Err(err) if is_missing_pointer_error(&err) => {
                     self.degrade_missing_pointers(execution, Some(&prior.id), &record, &err)
                         .await;
+                    self.work_db.delete_execution_restore_report(&execution.id)?;
                     if prior.id == execution.id {
                         // The row names heads that no longer exist; keeping it
                         // would make dispatch treat the run as already recovered
                         // and skip creating fresh pointers. The surviving
                         // baseline would also make fresh creation fail, so drop
-                        // it first (it refuses unless both heads are absent).
+                        // it first (it refuses unless both heads are absent). Any
+                        // restore report from an earlier attempt goes with the row,
+                        // or dispatch would skip positioning on the bound PR.
                         adapter.discard_orphaned_execution_baseline(&record).await?;
-                        self.work_db.delete_execution_bookmark(&execution.id)?;
+                        self.work_db
+                            .delete_execution_bookmark_and_restore_report(&execution.id)?;
                     }
                     return Ok(None);
                 }

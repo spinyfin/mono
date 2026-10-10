@@ -261,6 +261,76 @@ async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
 }
 
 #[tokio::test]
+async fn self_retry_with_deleted_own_heads_and_stale_report_still_positions_on_the_bound_pr() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let (db, _prior, next) = blocked_pair(&path);
+    seed_local_claude_driver(&db);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET pr_url = 'https://github.com/spinyfin/mono/pull/99' WHERE id = ?1",
+            [&next.id],
+        )
+        .unwrap();
+    let next = db.get_execution(&next.id).unwrap();
+    use boss_engine_recovery::execution_bookmark::RestoreReport;
+    use boss_engine_test_git::jj::JjRepo;
+    let repo = record_then_delete_heads(&db, dir.path(), &next.id).await;
+    super::recovery::configure_recovery_origin(&repo.repo);
+    JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "main"]);
+    db.record_execution_restore_report(
+        &next.id,
+        &RestoreReport::builder()
+            .pointer("boss-recovery/exec_prior + pr/99")
+            .commits("abc1234 Preserved work\n")
+            .base_sha("0123456789abcdef")
+            .conflicts("")
+            .pr_bound(true)
+            .build(),
+    )
+    .unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        workspace_root: Some(dir.path().to_path_buf()),
+        next_workspace_id: Mutex::new(Some("replacement".into())),
+        real_bookmarks: true,
+        ..FakeCubeClient::default()
+    });
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        runner,
+    ));
+    let worker = coordinator
+        .pool_for_execution(&next)
+        .claim_worker(&next.id, None)
+        .await
+        .unwrap();
+    coordinator
+        .schedule_execution(&next, &worker, DispatchAdmission::Queued)
+        .await
+        .unwrap();
+    assert_eq!(
+        cube.goto_calls.lock().await.len(),
+        1,
+        "a stale restore report must not suppress positioning on the bound PR"
+    );
+    assert!(
+        db.execution_restore_report(&next.id).unwrap().is_none(),
+        "the stale report must be cleared"
+    );
+    let fresh = db.execution_bookmark(&next.id).unwrap();
+    boss_engine_recovery::execution_bookmark::diff(&boss_engine_recovery::execution_bookmark::LocalJj, &fresh)
+        .await
+        .expect("fresh bookmarks must validate");
+}
+
+#[tokio::test]
 async fn non_implementation_with_deleted_predecessor_heads_continues_without_recovery() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
