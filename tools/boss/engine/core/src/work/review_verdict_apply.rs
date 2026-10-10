@@ -29,6 +29,16 @@ pub struct ReviewVerdictApplyStats {
     pub superseded: usize,
 }
 
+/// Result of comparing a pre-merge batch's frozen target with the PR head.
+enum PreMergeTargetFreshness {
+    /// The target is the live head.
+    Current,
+    /// The head has moved to this SHA.
+    SupersededBy(String),
+    /// The live head could not be determined.
+    Unknown,
+}
+
 impl WorkDb {
     /// Apply every still-`proposed` `review_verdict`. Safe to call
     /// redundantly: a proposal already applied is skipped, and the
@@ -145,11 +155,27 @@ impl WorkDb {
         // reviewing the current head, while a clean verdict would read as
         // settling a head nobody reviewed. Record it as `stale_head` and
         // let the current head's own batch own remediation (see
-        // `REVIEW_GATE_OUTCOME_STALE_HEAD`). Explicit batches are exempt:
-        // an operator asked for exactly that SHA's findings. PostMerge
-        // targets are merge commits and cannot move.
-        let superseding_head = if batch.phase == boss_protocol::ReviewBatchPhase::PreMerge && !batch.explicit {
-            self.pre_merge_target_superseded_by(&batch, pr_checker)?
+        // `REVIEW_GATE_OUTCOME_STALE_HEAD`). The guard covers explicit
+        // (`bossctl review start`) batches too: their findings stay visible
+        // as `stale_head` but never mint automatic remediation against moved
+        // code. When freshness cannot be established (the live head is
+        // unreachable), the proposal stays `proposed` and a later sweep
+        // retries it. PostMerge targets are merge commits and cannot move.
+        let superseding_head = if batch.phase == boss_protocol::ReviewBatchPhase::PreMerge {
+            match self.pre_merge_target_freshness(&batch, pr_checker)? {
+                PreMergeTargetFreshness::Current => None,
+                PreMergeTargetFreshness::SupersededBy(head) => Some(head),
+                PreMergeTargetFreshness::Unknown => {
+                    tracing::warn!(
+                        proposal_id = %proposal.id,
+                        batch_id = %batch.id,
+                        pr_url = %batch.pr_url,
+                        "review-verdict apply: the live PR head is unknown, so the verdict's freshness \
+                         cannot be established; leaving the proposal proposed for retry",
+                    );
+                    return Ok(None);
+                }
+            }
         } else {
             None
         };
@@ -362,29 +388,28 @@ impl WorkDb {
         Ok(applied_ref)
     }
 
-    /// The PR head that has superseded a pre-merge `batch`'s frozen
-    /// `target_sha`, or `None` when the target is (as far as can be told)
-    /// still the head. Two sources, cheapest first:
+    /// Whether a pre-merge `batch`'s frozen `target_sha` is still the PR
+    /// head. Two sources, cheapest first:
     ///
     /// 1. A newer pre-merge batch for the same cycle root at a different
     ///    target. Batches are only ever created from a live head fetch, so
     ///    a later batch at another SHA proves the head moved — no GitHub
     ///    round-trip needed, and this is the shape mono PR #3110 had.
     /// 2. The live head from `pr_checker.inspect` (one `gh pr view`, the
-    ///    same call supervisor recovery already relies on). A checker that
-    ///    cannot report a head, or whose call fails, yields `None`: an
-    ///    unknown head is never treated as a move, so the verdict applies
-    ///    exactly as before this guard existed.
+    ///    same call supervisor recovery already relies on). A failed call or
+    ///    a checker that reports no head yields
+    ///    [`PreMergeTargetFreshness::Unknown`], which is distinct from a
+    ///    matching head: an unknown head never lets the verdict apply.
     ///
     /// The stored `tasks.pr_head_sha` observation is deliberately NOT
     /// consulted: the merge poller's snapshot can lag a push that batch
     /// creation already saw live, which would misreport the newest batch's
     /// own target as stale.
-    fn pre_merge_target_superseded_by(
+    fn pre_merge_target_freshness(
         &self,
         batch: &boss_protocol::ReviewBatch,
         pr_checker: &dyn PrStateChecker,
-    ) -> Result<Option<String>> {
+    ) -> Result<PreMergeTargetFreshness> {
         let newer_target: Option<String> = {
             let conn = self.connect()?;
             conn.query_row(
@@ -400,20 +425,23 @@ impl WorkDb {
             )
             .optional()?
         };
-        if newer_target.is_some() {
-            return Ok(newer_target);
+        if let Some(newer) = newer_target {
+            return Ok(PreMergeTargetFreshness::SupersededBy(newer));
         }
         match pr_checker.inspect(&batch.pr_url) {
-            Ok(inspect) => Ok(inspect.head_sha.filter(|head| head != &batch.target_sha)),
+            Ok(inspect) => Ok(match inspect.head_sha {
+                Some(head) if head == batch.target_sha => PreMergeTargetFreshness::Current,
+                Some(head) => PreMergeTargetFreshness::SupersededBy(head),
+                None => PreMergeTargetFreshness::Unknown,
+            }),
             Err(error) => {
                 tracing::warn!(
                     batch_id = %batch.id,
                     pr_url = %batch.pr_url,
                     ?error,
-                    "review-verdict apply: could not inspect the live PR head; applying the verdict \
-                     without the stale-head check",
+                    "review-verdict apply: could not inspect the live PR head",
                 );
-                Ok(None)
+                Ok(PreMergeTargetFreshness::Unknown)
             }
         }
     }

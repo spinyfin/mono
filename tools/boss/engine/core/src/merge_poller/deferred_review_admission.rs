@@ -12,6 +12,27 @@ pub(crate) async fn sweep_deferred_review_admission(
     review_pool_size: usize,
     outcome: &mut SweepOutcome,
 ) {
+    sweep_deferred_review_admission_with(
+        work_db,
+        publisher,
+        &crate::completion::GhReviewBatchEnqueuer,
+        wanted_pr_urls,
+        review_pool_size,
+        outcome,
+    )
+    .await;
+}
+
+/// [`sweep_deferred_review_admission`] with the batch-creation strategy
+/// injected, so tests can supply PR metadata without `gh`.
+pub(crate) async fn sweep_deferred_review_admission_with(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    enqueuer: &dyn crate::completion::ReviewBatchEnqueuer,
+    wanted_pr_urls: Option<&std::collections::HashSet<&str>>,
+    review_pool_size: usize,
+    outcome: &mut SweepOutcome,
+) {
     let candidates = match work_db.list_tasks_awaiting_pre_merge_review_admission() {
         Ok(items) => items,
         Err(err) => {
@@ -33,14 +54,15 @@ pub(crate) async fn sweep_deferred_review_admission(
             outcome.review_admission_still_deferred += 1;
             continue;
         }
-        match crate::completion::enqueue_review_batch(
-            work_db,
-            &candidate.task_id,
-            &candidate.repo_remote_url,
-            &candidate.pr_url,
-            review_pool_size,
-        )
-        .await
+        match enqueuer
+            .enqueue(
+                work_db,
+                &candidate.task_id,
+                &candidate.repo_remote_url,
+                &candidate.pr_url,
+                review_pool_size,
+            )
+            .await
         {
             Ok(crate::work::ReviewBatchDispatch::Created { batch, executions }) => {
                 tracing::info!(

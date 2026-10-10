@@ -203,7 +203,10 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
         [&cycle_root.id],
     ).unwrap();
     let created = db
-        .apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
+        .apply_review_verdict_proposal(
+            &outcome.proposal.id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        )
         .unwrap();
     assert_eq!(created, None);
 
@@ -258,7 +261,7 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
 /// `pr_flow.rs`'s `PendingReview` completion target leaves a revision in
 /// while an automated review pass runs. Returns the revision's task id.
 fn make_held_revision(db: &WorkDb, cycle_root_id: &str, cycle_root_pr_url: &str, contributed_sha: &str) -> String {
-    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha");
     let revision = db.create_revision(revision_input(cycle_root_id), &checker).unwrap();
     let exec = db
         .create_execution(
@@ -333,8 +336,11 @@ fn clean_verdict_advances_both_cycle_root_and_the_held_revision_it_reviewed() {
         .unwrap()
         .unwrap();
 
-    db.apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
-        .unwrap();
+    db.apply_review_verdict_proposal(
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
 
     let root_after = query_task(&db.connect().unwrap(), &cycle_root.id).unwrap().unwrap();
     assert_eq!(root_after.status, TaskStatus::InReview, "cycle root must reach Review");
@@ -393,8 +399,11 @@ fn clean_verdict_does_not_advance_a_revision_with_a_different_contributed_head()
         .unwrap()
         .unwrap();
 
-    db.apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
-        .unwrap();
+    db.apply_review_verdict_proposal(
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
 
     let revision_after = query_task(&db.connect().unwrap(), &revision_id).unwrap().unwrap();
     assert_eq!(
@@ -461,8 +470,11 @@ fn clean_verdict_does_not_advance_revision_when_only_an_older_execution_matches(
         })
         .unwrap()
         .unwrap();
-    db.apply_review_verdict_proposal(&proposal.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
-        .unwrap();
+    db.apply_review_verdict_proposal(
+        &proposal.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
     assert_eq!(
         query_task(&db.connect().unwrap(), &revision_id)
             .unwrap()
@@ -550,8 +562,11 @@ fn clean_verdict_advances_a_revision_nested_under_another_revision() {
         .unwrap()
         .unwrap();
 
-    db.apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
-        .unwrap();
+    db.apply_review_verdict_proposal(
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
 
     let root_after = query_task(&db.connect().unwrap(), &cycle_root.id).unwrap().unwrap();
     assert_eq!(root_after.status, TaskStatus::InReview, "cycle root must reach Review");
@@ -607,7 +622,10 @@ fn clean_verdict_does_not_release_a_deletion_signoff_hold() {
         .unwrap();
 
     let created = db
-        .apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
+        .apply_review_verdict_proposal(
+            &outcome.proposal.id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        )
         .unwrap();
     assert_eq!(created, None);
 
@@ -686,7 +704,10 @@ fn qualifying_findings_on_an_open_origin_create_a_revision() {
     };
 
     let created = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        )
         .unwrap()
         .expect("open origin with findings must mint a revision");
     let task = query_task(&db.connect().unwrap(), &created).unwrap().unwrap();
@@ -741,7 +762,10 @@ fn qualifying_findings_on_an_open_origin_create_a_revision() {
     drop(conn);
 
     let replay = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        )
         .unwrap();
     assert_eq!(replay, None, "an already-applied proposal is a no-op");
     let (cycle_after, _) = db.get_task_review_cycle_state(&cycle_root.id).unwrap();
@@ -805,7 +829,10 @@ fn qualifying_findings_on_a_merged_origin_create_a_followup() {
     };
 
     let created = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+        )
         .unwrap()
         .expect("merged origin with findings must mint a follow-up");
     let task = query_task(&db.connect().unwrap(), &created).unwrap().unwrap();
@@ -880,7 +907,10 @@ fn merge_during_apply_creates_a_followup_instead_of_discarding_findings() {
     };
 
     let created = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+        )
         .unwrap()
         .expect("merge-during-apply must mint a follow-up, not drop findings");
     let task = query_task(&db.connect().unwrap(), &created).unwrap().unwrap();
@@ -951,7 +981,10 @@ fn reapplying_a_merged_followup_returns_the_same_work_item() {
     };
 
     let first = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+        )
         .unwrap()
         .unwrap();
     // Simulate a crash after materialisation but before the proposal was
@@ -971,7 +1004,10 @@ fn reapplying_a_merged_followup_returns_the_same_work_item() {
         )
         .unwrap();
     let second = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(first, second, "proposal id is the materialisation idempotency key");
@@ -1035,7 +1071,10 @@ fn reapplying_a_post_merge_followup_seeded_under_the_legacy_created_via_returns_
         .unwrap();
 
     let applied = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+        )
         .unwrap()
         .expect("retry must recover the follow-up already materialised under the legacy created_via key");
     assert_eq!(
@@ -1134,7 +1173,7 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
         .unwrap();
     let (findings_batch, _) = db
         .create_review_batch(
-            batch_input(findings_root.id.clone(), "findings-head-sha"),
+            batch_input(findings_root.id.clone(), "head-sha"),
             &[
                 member(
                     ReviewBatchMemberRole::ClaudeReviewer,
@@ -1155,7 +1194,7 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
             execution_id: &findings_supervisor.id,
             work_item_id: &findings_root.id,
             kind: ProposalKind::ReviewVerdict,
-            payload_json: &findings_verdict_payload(&findings_batch.id, "findings-head-sha"),
+            payload_json: &findings_verdict_payload(&findings_batch.id, "head-sha"),
             idempotency_key: "verdict-1",
         })
         .unwrap()
@@ -1177,7 +1216,7 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
         .unwrap();
     let (applied_batch, _) = db
         .create_review_batch(
-            batch_input(applied_root.id.clone(), "applied-head-sha"),
+            batch_input(applied_root.id.clone(), "head-sha"),
             &[member(
                 ReviewBatchMemberRole::Supervisor,
                 Some(applied_supervisor.id.clone()),
@@ -1191,14 +1230,14 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
             execution_id: &applied_supervisor.id,
             work_item_id: &applied_root.id,
             kind: ProposalKind::ReviewVerdict,
-            payload_json: &clean_verdict_payload(&applied_batch.id, "applied-head-sha"),
+            payload_json: &clean_verdict_payload(&applied_batch.id, "head-sha"),
             idempotency_key: "verdict-1",
         })
         .unwrap()
         .unwrap();
     db.apply_review_verdict_proposal(
         &applied_outcome.proposal.id,
-        &FakePrStateChecker::always(PrOpenState::Open),
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
     )
     .unwrap();
     let applied_proposals = db
@@ -1217,7 +1256,7 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
     );
 
     let stats = db
-        .apply_pending_review_verdicts(&FakePrStateChecker::always(PrOpenState::Open))
+        .apply_pending_review_verdicts(&FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"))
         .unwrap();
     assert_eq!(
         stats,
@@ -1297,6 +1336,10 @@ struct DeletingPrChecker {
 impl PrStateChecker for DeletingPrChecker {
     fn check(&self, pr_url: &str) -> anyhow::Result<PrOpenState> {
         self.inner.check(pr_url)
+    }
+
+    fn inspect(&self, pr_url: &str) -> anyhow::Result<crate::work::PrInspect> {
+        self.inner.inspect(pr_url)
     }
 
     fn merged_parent_deletions(
@@ -1442,6 +1485,10 @@ impl PrStateChecker for SupersedeOnTripwireCheck {
         self.inner.check(pr_url)
     }
 
+    fn inspect(&self, pr_url: &str) -> anyhow::Result<crate::work::PrInspect> {
+        self.inner.inspect(pr_url)
+    }
+
     fn merged_parent_deletions(
         &self,
         _repo_slug: &str,
@@ -1514,7 +1561,10 @@ fn tombstone_cancels_the_orphaned_revision_ready_execution() {
         .unwrap()
         .unwrap();
     let created = db
-        .apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
+        .apply_review_verdict_proposal(
+            &outcome.proposal.id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        )
         .unwrap()
         .expect("findings must mint a revision");
     let before = db.list_executions(Some(&created)).unwrap();
@@ -1551,7 +1601,7 @@ fn clean_verdict_runs_the_merge_parent_deletion_tripwire() {
 
     let (batch_id, proposal_id) = stage_clean_verdict(&db, &cycle_root.id, "head-sha");
     let checker = DeletingPrChecker {
-        inner: FakePrStateChecker::always(PrOpenState::Open),
+        inner: FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
         deletions: vec!["`src/lib.rs` — added by a merged parent, removed by this resolution".to_owned()],
     };
     let created = db.apply_review_verdict_proposal(&proposal_id, &checker).unwrap();
@@ -1587,7 +1637,10 @@ fn supervising_batch_is_re_advanced_to_applying_then_applied() {
     force_batch_supervising(&db, &batch_id);
 
     let created = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        )
         .unwrap();
     assert_eq!(created, None);
     assert_eq!(
@@ -1614,7 +1667,10 @@ fn persistent_not_applying_bail_files_attention_once_and_is_not_counted_applied(
         .unwrap();
 
     let created = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        )
         .unwrap();
     assert_eq!(created, None);
     let proposal = db
@@ -1628,8 +1684,11 @@ fn persistent_not_applying_bail_files_attention_once_and_is_not_counted_applied(
         .unwrap();
     assert_eq!(proposal.len(), 1, "stranded apply must leave the proposal proposed");
 
-    db.apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
-        .unwrap();
+    db.apply_review_verdict_proposal(
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
     let attentions: Vec<_> = db
         .list_attention_items_for_work_item(&cycle_root.id)
         .unwrap()
@@ -1643,7 +1702,7 @@ fn persistent_not_applying_bail_files_attention_once_and_is_not_counted_applied(
     );
 
     let stats = db
-        .apply_pending_review_verdicts(&FakePrStateChecker::always(PrOpenState::Open))
+        .apply_pending_review_verdicts(&FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"))
         .unwrap();
     assert_eq!(
         stats,
@@ -1672,7 +1731,7 @@ fn sweep_does_not_list_an_already_superseded_proposal() {
         .unwrap();
 
     let stats = db
-        .apply_pending_review_verdicts(&FakePrStateChecker::always(PrOpenState::Open))
+        .apply_pending_review_verdicts(&FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"))
         .unwrap();
     assert_eq!(
         stats,
@@ -1696,7 +1755,10 @@ fn tripwire_retry_tombstones_an_already_materialised_remediation() {
     let (batch_id, proposal_id) = stage_findings_verdict(&db, &cycle_root.id, "head-sha");
 
     let created = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        )
         .unwrap()
         .expect("first apply must mint a revision");
     let before = db.list_executions(Some(&created)).unwrap();
@@ -1727,7 +1789,7 @@ fn tripwire_retry_tombstones_an_already_materialised_remediation() {
     drop(conn);
 
     let checker = DeletingPrChecker {
-        inner: FakePrStateChecker::always(PrOpenState::Open),
+        inner: FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
         deletions: vec!["`src/lib.rs` — added by a merged parent, removed by this resolution".to_owned()],
     };
     let replay = db.apply_review_verdict_proposal(&proposal_id, &checker).unwrap();
@@ -1801,7 +1863,7 @@ fn sweep_counts_a_proposal_superseded_during_apply() {
     assert_eq!(first.proposal.state, ProposalState::Proposed);
 
     let checker = SupersedeOnTripwireCheck {
-        inner: FakePrStateChecker::always(PrOpenState::Open),
+        inner: FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
         db: db.clone(),
         proposal_id: first.proposal.id,
     };
@@ -1882,7 +1944,10 @@ fn post_merge_verdict_materialises_a_followup_despite_matching_the_prior_reviewe
     );
 
     let created = db
-        .apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .apply_review_verdict_proposal(
+            &outcome.proposal.id,
+            &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+        )
         .unwrap()
         .expect("a post-merge verdict's findings must materialise a follow-up even at the prior reviewed head");
     let task = query_task(&db.connect().unwrap(), &created).unwrap().unwrap();
@@ -1977,7 +2042,10 @@ fn assert_post_merge_followup_membership(in_project: bool) {
         .unwrap();
 
     let created = db
-        .apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .apply_review_verdict_proposal(
+            &outcome.proposal.id,
+            &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+        )
         .unwrap()
         .expect("a post-merge verdict's findings must materialise a follow-up");
     let task = query_task(&db.connect().unwrap(), &created).unwrap().unwrap();
@@ -2170,7 +2238,10 @@ fn findings_verdict_for_a_superseded_head_is_recorded_stale_and_mints_nothing() 
     let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
 
     let created = db
-        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        )
         .unwrap();
 
     assert_eq!(created, None, "a stale-head verdict must mint no remediation");
@@ -2251,7 +2322,7 @@ fn verdict_for_a_head_the_live_pr_has_moved_past_is_stale_and_releases_the_held_
 }
 
 /// A live head that still matches the target is not a move: the verdict
-/// applies exactly as before the guard existed.
+/// applies normally.
 #[test]
 fn verdict_whose_target_is_still_the_live_head_applies_normally() {
     let db = WorkDb::open(temp_db_path("verdict-apply-live-head-unchanged")).unwrap();
@@ -2276,11 +2347,12 @@ fn verdict_whose_target_is_still_the_live_head_applies_normally() {
     );
 }
 
-/// An explicit (`bossctl review start`) batch is a deliberate request for
-/// one exact SHA's findings; a head move does not make them stale.
+/// An explicit (`bossctl review start`) batch targets the head at request
+/// time; if the PR is pushed again while it runs, its findings are recorded
+/// as `stale_head` and mint no automatic remediation against moved code.
 #[test]
-fn explicit_batch_verdict_is_applied_even_after_the_head_moved() {
-    let db = WorkDb::open(temp_db_path("verdict-apply-explicit-not-stale")).unwrap();
+fn explicit_batch_verdict_for_a_moved_head_is_recorded_stale() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-explicit-stale")).unwrap();
     let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
     db.connect()
         .unwrap()
@@ -2304,12 +2376,101 @@ fn explicit_batch_verdict_is_applied_even_after_the_head_moved() {
         .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
         .unwrap();
 
-    assert!(created.is_some(), "an explicit batch's findings always materialise");
-    assert_eq!(
-        db.review_verdict_for_execution(&supervisor_id)
-            .unwrap()
-            .unwrap()
-            .gate_outcome,
-        REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS
+    assert_eq!(created, None, "a stale explicit verdict mints no remediation");
+    assert_eq!(revision_count(&db, &root_id), 0);
+    let verdict = db.review_verdict_for_execution(&supervisor_id).unwrap().unwrap();
+    assert_eq!(verdict.gate_outcome, REVIEW_GATE_OUTCOME_STALE_HEAD);
+    assert_eq!(verdict.findings_count, 1, "the findings stay visible on the row");
+}
+
+/// An explicit batch whose target is still the live head applies normally.
+#[test]
+fn explicit_batch_verdict_for_the_current_head_is_applied() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-explicit-current")).unwrap();
+    let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET explicit = 1 WHERE id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+    let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+    let created = db
+        .apply_review_verdict_proposal(
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-a"),
+        )
+        .unwrap();
+
+    assert!(
+        created.is_some(),
+        "an explicit batch's findings on the current head materialise"
     );
+}
+
+fn proposal_state(db: &WorkDb, proposal_id: &str) -> ProposalState {
+    db.list_worker_proposals(None, None, Some(ProposalKind::ReviewVerdict), None, None)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.id == proposal_id)
+        .unwrap()
+        .state
+}
+
+/// A `PrStateChecker` whose live-head lookup fails.
+struct FailingInspectChecker;
+
+impl PrStateChecker for FailingInspectChecker {
+    fn check(&self, _pr_url: &str) -> anyhow::Result<PrOpenState> {
+        Ok(PrOpenState::Open)
+    }
+
+    fn inspect(&self, _pr_url: &str) -> anyhow::Result<crate::work::PrInspect> {
+        Err(anyhow::anyhow!("github unavailable"))
+    }
+}
+
+/// When the live head cannot be established (inspect errors, or reports no
+/// head), the verdict's freshness is unknown: nothing is remediated, the
+/// cycle does not advance, and the proposal stays `proposed` until a later
+/// pass can see the head.
+#[test]
+fn verdict_with_an_unknown_live_head_is_held_until_inspect_succeeds() {
+    for (label, unknown) in [("inspect-error", true), ("missing-head", false)] {
+        let db = WorkDb::open(temp_db_path(&format!("verdict-apply-unknown-head-{label}"))).unwrap();
+        let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+        let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+        let created = if unknown {
+            db.apply_review_verdict_proposal(&proposal_id, &FailingInspectChecker)
+        } else {
+            db.apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
+        }
+        .unwrap();
+
+        assert_eq!(created, None, "{label}: no remediation while freshness is unknown");
+        assert_eq!(revision_count(&db, &root_id), 0, "{label}");
+        assert_eq!(
+            db.get_task_review_cycle_state(&root_id).unwrap(),
+            (0, None),
+            "{label}: cycle must not advance"
+        );
+        assert!(
+            db.review_verdict_for_execution(&supervisor_id).unwrap().is_none(),
+            "{label}: no verdict row is committed"
+        );
+        assert_eq!(proposal_state(&db, &proposal_id), ProposalState::Proposed, "{label}");
+
+        // Once the head is visible and matches, the same proposal applies.
+        let created = db
+            .apply_review_verdict_proposal(
+                &proposal_id,
+                &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-a"),
+            )
+            .unwrap();
+        assert!(created.is_some(), "{label}: applies once inspect succeeds");
+        assert_eq!(proposal_state(&db, &proposal_id), ProposalState::Applied, "{label}");
+    }
 }

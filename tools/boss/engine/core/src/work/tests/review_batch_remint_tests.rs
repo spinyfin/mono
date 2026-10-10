@@ -1,8 +1,6 @@
-//! Review batches across heads of one cycle root: the dispatch guard's
-//! cross-batch admissibility, and the single automatic re-mint a batch that
-//! never reported earns so the head it left unreviewed is reviewed. Split
-//! from `review_batches_tests.rs` (file-size budget); shares its fixtures by
-//! construction, not by import.
+//! Cross-batch review admission across heads of one cycle root, and the
+//! single automatic re-mint a failed pre-merge batch without a consolidated
+//! verdict earns. Fixtures are local to this module.
 
 use boss_protocol::{
     ExecutionKind, ExecutionStatus, ProposalKind, ReviewBatchMemberRole, ReviewBatchPhase, ReviewBatchStatus,
@@ -245,13 +243,13 @@ fn failed_batch_without_a_report_is_automatically_reminted_once() {
     }
 }
 
-/// A batch that failed AFTER at least one leaf reported was a real review
-/// decision (insufficient quorum backed by an actual report); it is not
-/// silently re-reviewed. Re-reviewing it is an operator call (explicit
-/// start), which may still mint the next generation.
+/// A batch reaped after one leaf reported and the other exhausted its
+/// attempts has no consolidated verdict, so the head it left unsettled keeps
+/// a recovery path: the reaper fails the batch and the next admission mints
+/// generation 2 at the same target.
 #[test]
-fn failed_batch_with_a_report_is_not_automatically_reminted() {
-    let db = WorkDb::open(temp_db_path("review-batch-no-remint-after-report")).unwrap();
+fn batch_reaped_after_a_partial_leaf_report_is_automatically_reminted() {
+    let db = WorkDb::open(temp_db_path("review-batch-remint-after-partial-report")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
     let repo = "https://github.com/example/repo";
@@ -281,7 +279,28 @@ fn failed_batch_with_a_report_is_not_automatically_reminted() {
             rusqlite::params![executions[0].id],
         )
         .unwrap();
-    fail_batch_as_reaped(&db, &batch.id, &executions[1..]);
+    // The other leaf exhausted its attempts and died without reporting.
+    db.mark_execution_redundant(&executions[1].id).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE pr_review_batch_members SET status = 'failed', attempt = 2
+             WHERE batch_id = ?1 AND status != 'reported'",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pr_review_batches SET updated_at = '1' WHERE id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+    }
+
+    assert_eq!(db.reap_inert_review_batches(0).unwrap(), vec![batch.id.clone()]);
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Failed
+    );
 
     match db
         .create_pre_merge_review_batch(
@@ -290,8 +309,8 @@ fn failed_batch_with_a_report_is_not_automatically_reminted() {
         )
         .unwrap()
     {
-        ReviewBatchDispatch::ExistingBatch { batch: existing, .. } => assert_eq!(existing.id, batch.id),
-        other => panic!("a failed batch that had a report must not be re-minted automatically, got {other:?}"),
+        ReviewBatchDispatch::Created { batch: next, .. } => assert_eq!(next.generation, 2),
+        other => panic!("a reaped batch with a partial report must keep a recovery path, got {other:?}"),
     }
 }
 

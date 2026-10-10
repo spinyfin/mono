@@ -138,9 +138,9 @@ fn ordinary_duplicate_and_other_root_batch_cannot_share_a_reservation() {
 
 /// A new head's batch on the SAME cycle root is not a duplicate of the
 /// previous head's batch: its leaves must be handed off while the previous
-/// batch's members are still in flight. Holding them (as joining on
-/// `batch_id` alone did) is what abandoned mono PR #3110's latest-head
-/// reviewers as "redundant" against the previous batch's live supervisor.
+/// batch's members are still in flight. Holding them would abandon the
+/// latest head's reviewers as "redundant" against the previous batch's live
+/// supervisor (mono PR #3110).
 #[test]
 fn a_new_heads_batch_on_the_same_cycle_root_shares_the_reservation() {
     let dir = tempdir().unwrap();

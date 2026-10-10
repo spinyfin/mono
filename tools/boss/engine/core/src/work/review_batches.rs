@@ -116,23 +116,24 @@ pub const REVIEW_BATCH_STALE_SECS: u64 = 10 * 60;
 
 /// Highest pre-merge batch `generation` the engine will mint for one target
 /// SHA on its own. Generation 1 is the ordinary batch; generation 2 is the
-/// single automatic re-mint a `failed` generation earns when it never
-/// produced a leaf report (reaped inert, or every leaf attempt died before
-/// reporting) — i.e. when nothing actually reviewed that head. A second
-/// failure of the same kind leaves the head "Not reviewed" with its
-/// attention standing rather than looping reviewers at it. Explicit
-/// (`bossctl review start`) generations are not bounded by this.
+/// single automatic re-mint a `failed` generation earns when it produced no
+/// consolidated verdict (reaped inert, every leaf attempt died, or too few
+/// leaves reported for a supervisor to run) — i.e. when nothing settled
+/// that head. A second failure of the same kind leaves the head "Not
+/// reviewed" with its attention standing rather than looping reviewers at
+/// it. Explicit (`bossctl review start`) generations are not bounded by
+/// this.
 pub const MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS: i64 = 2;
 
 /// Whether a prior pre-merge batch at some target may be replaced by an
 /// automatically minted next generation at the same target: it is `failed`,
-/// no member of it ever `reported`, and it is under
-/// [`MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`]. A batch that `completed`,
-/// or that failed only after at least one leaf reported (an insufficient-
-/// quorum decision backed by a real review), is NOT re-minted: those are
-/// terminal review decisions, and re-reviewing them is an operator call
-/// (explicit start). Shared with the SQL twin
-/// [`pre_merge_review_needs_readmission_sql`] so the deferred-admission
+/// it never produced a consolidated (non-`stale_head`) verdict, and it is
+/// under [`MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`]. Whether individual
+/// leaves reported is irrelevant: a partial leaf report without a
+/// supervisor verdict leaves the head unsettled. A batch that `completed`
+/// is a terminal review decision and is never re-minted; a new generation
+/// for it requires an explicit review-start request. Shared with the SQL
+/// twin [`pre_merge_review_needs_readmission_sql`] so the deferred-admission
 /// candidate query and the in-transaction mint decision cannot disagree.
 fn failed_batch_is_automatically_remintable_in(conn: &rusqlite::Connection, batch: &ReviewBatch) -> Result<bool> {
     if batch.phase != ReviewBatchPhase::PreMerge
@@ -141,14 +142,14 @@ fn failed_batch_is_automatically_remintable_in(conn: &rusqlite::Connection, batc
     {
         return Ok(false);
     }
-    let reported: Option<()> = conn
+    let settled: Option<()> = conn
         .query_row(
-            "SELECT 1 FROM pr_review_batch_members WHERE batch_id = ?1 AND status = 'reported' LIMIT 1",
-            params![batch.id],
+            "SELECT 1 FROM pr_review_verdicts WHERE batch_id = ?1 AND gate_outcome != ?2 LIMIT 1",
+            params![batch.id, super::review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD],
             |_| Ok(()),
         )
         .optional()?;
-    Ok(reported.is_none())
+    Ok(settled.is_none())
 }
 
 /// SQL boolean over a cycle-root id expression (`cycle_root_expr` is spliced
@@ -156,7 +157,7 @@ fn failed_batch_is_automatically_remintable_in(conn: &rusqlite::Connection, batc
 /// root's NEWEST pre-merge batch leaves the PR head needing a fresh review
 /// that nothing else will schedule:
 ///
-/// - it `failed` without any member reporting and is under
+/// - it `failed` without a consolidated verdict and is under
 ///   [`MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`] (the Rust twin is
 ///   [`failed_batch_is_automatically_remintable_in`]), so `enqueue` will
 ///   mint the next generation at the same head — or a generation-1 batch at
@@ -185,8 +186,8 @@ pub(crate) fn pre_merge_review_needs_readmission_sql(cycle_root_expr: &str) -> S
                     newest.status = 'failed'
                     AND newest.generation < {cap}
                     AND NOT EXISTS (
-                        SELECT 1 FROM pr_review_batch_members m
-                        WHERE m.batch_id = newest.id AND m.status = 'reported'
+                        SELECT 1 FROM pr_review_verdicts settled
+                        WHERE settled.batch_id = newest.id AND settled.gate_outcome != '{stale_head}'
                     )
                 )
                 OR (
@@ -1266,10 +1267,9 @@ impl WorkDb {
             // member executions to settle before admitting another
             // generation, so a superseded generation's reviewer never
             // overlaps the generation that replaces it at the same target.
-            // (The dispatch guard itself now admits reviewer pairs across
-            // batches of one cycle root — see
-            // `are_admissible_concurrent_review_batch_pair` — so this wait
-            // is a deliberate ordering choice, not a guard workaround.)
+            // The dispatch guard admits reviewer pairs across batches of one
+            // cycle root (see `are_admissible_concurrent_review_batch_pair`),
+            // so this wait is an ordering choice, not a guard workaround.
             let executions = batch_executions_in_tx(&tx, &batch.id)?;
             let unsettled = executions.iter().find(|execution| !execution.status.is_terminal());
             if let Some(execution) = unsettled {
@@ -1619,12 +1619,11 @@ impl WorkDb {
     ///   root — e.g. a new head's leaf reviewers against the previous
     ///   head's still-running supervisor. Each batch reviews its own frozen
     ///   `target_sha` in its own cube lease and writes nothing to the PR,
-    ///   so the two never contend. Treating that pair as redundant (which
-    ///   joining on `batch_id` alone did) abandoned the new head's leaves
-    ///   at dispatch, burned their one retry against the same live
-    ///   supervisor, and left the new head with a batch nothing could
-    ///   settle but the inert-batch reaper — the current head then stayed
-    ///   unreviewed with nothing scheduled to review it.
+    ///   so the two never contend. Rejecting that pair would abandon the
+    ///   new head's leaves at dispatch while the previous head's supervisor
+    ///   is live, burn their one retry against it, and leave the current
+    ///   head with a batch only the inert-batch reaper could settle (mono
+    ///   PR #3110).
     ///
     /// Rejected: two supervisors of one batch (a retry overlapping its own
     /// live predecessor is a genuine duplicate), any pair spanning two cycle

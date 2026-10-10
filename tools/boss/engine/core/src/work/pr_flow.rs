@@ -775,13 +775,14 @@ impl WorkDb {
     /// when its cycle root's newest pre-merge batch left the current head
     /// needing a review that nothing else will schedule
     /// ([`super::review_batches::pre_merge_review_needs_readmission_sql`]):
-    /// the batch was reaped or died without any leaf reporting (the
+    /// the batch was reaped or died without a consolidated verdict (the
     /// re-admission mints the next generation, bounded by
     /// [`super::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`]), or its verdict
     /// landed `stale_head` after a later push moved the PR on. The root is
     /// typically `in_review` by then (an earlier verdict advanced it), which
-    /// is exactly why this arm cannot be gated on `active`; it is
-    /// self-limiting (keyed on the newest batch, which the re-admission
+    /// is exactly why this arm cannot be gated on `active`; it applies to the
+    /// cycle root itself only, so a root and its revisions yield one
+    /// candidate per cycle; it is self-limiting (keyed on the newest batch, which the re-admission
     /// replaces), so it needs neither marker nor inertia cutoff.
     pub fn list_tasks_awaiting_pre_merge_review_admission(&self) -> Result<Vec<DeferredReviewAdmissionCandidate>> {
         let conn = self.connect()?;
@@ -831,7 +832,7 @@ impl WorkDb {
                          AND ai.kind = 'pr_review_admission_deferred'
                          AND ai.status = 'open'
                      )
-                     OR {needs_readmission}
+                     OR ({needs_readmission} AND t.id = roots.cycle_root_id)
                    )
                AND NOT EXISTS (
                      SELECT 1 FROM pr_review_batches b
@@ -859,7 +860,7 @@ impl WorkDb {
                          AND ai.status = 'open'
                      )
                      OR t.updated_at < ?1
-                     OR {needs_readmission}
+                     OR ({needs_readmission} AND t.id = roots.cycle_root_id)
                    )
              ORDER BY t.updated_at ASC",
             walk = walk,
