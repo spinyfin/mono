@@ -80,7 +80,24 @@ impl SessionSink {
         session_id: &str,
     ) -> io::Result<()> {
         self.queue.lock().expect("session queue lock poisoned").in_flight = Some(EnvelopeSummary::from_line(line));
+        // Log before awaiting the write: shutdown may cancel this future in
+        // the middle of a frame. Samples are bounded raw bytes, not UTF-8
+        // slices, so a multibyte character at either boundary is harmless.
+        let bytes = line.as_bytes();
+        tracing::info!(
+            session_id,
+            length_bytes = bytes.len(),
+            prefix_bytes = ?&bytes[..bytes.len().min(128)],
+            suffix_bytes = ?&bytes[bytes.len().saturating_sub(128)..],
+            "frontend frame write started"
+        );
         let result = self.write_frame_bytes(writer, line).await;
+        tracing::info!(
+            session_id,
+            length_bytes = bytes.len(),
+            success = result.is_ok(),
+            "frontend frame write finished"
+        );
         if let Err(err) = &result {
             if err.kind() == io::ErrorKind::TimedOut {
                 self.log_stuck(session_id, "socket write made no progress", None);
