@@ -113,3 +113,17 @@ struct ReadLoopPauseGate<Connection: AnyObject> {
 
     var isPaused: Bool { paused != nil }
 }
+
+/// Reports each connection's termination at most once, so the receive path
+/// and the state handler observing the same drop do not both emit a
+/// disconnect. Confined to the socket queue.
+struct ConnectionTerminationLatch<Connection: AnyObject> {
+    private var last: Connection?
+
+    /// Returns `true` the first time `connection` is marked, `false` after.
+    mutating func markTerminated(_ connection: Connection) -> Bool {
+        if let last, last === connection { return false }
+        last = connection
+        return true
+    }
+}

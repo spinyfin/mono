@@ -78,6 +78,15 @@ private final class OSAllocatedUnfairLockBox<T>: @unchecked Sendable {
     func get() -> T { lock.lock(); defer { lock.unlock() }; return value }
 }
 
+private extension OSAllocatedUnfairLockBox where T == Bool {
+    /// Returns the current value and sets it to `false`.
+    func take() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        defer { value = false }
+        return value
+    }
+}
+
 private extension OSAllocatedUnfairLockBox where T == [Int] {
     func append(_ v: Int) -> Int {
         lock.lock(); defer { lock.unlock() }
@@ -164,5 +173,51 @@ final class ReadLoopPauseGateTests: XCTestCase {
         handoff.afterPendingLines { _ = order.append(2); done.fulfill() }
         wait(for: [done], timeout: 5)
         XCTAssertEqual(order.get(), [1, 1, 1, 1, 1, 2])
+    }
+
+    /// Old replies → disconnected → connected → new replies, even when the
+    /// replacement connection becomes ready while an old decode is blocked.
+    func testLifecycleEventsStayOrderedAcrossReconnect() {
+        let order = OSAllocatedUnfairLockBox<[Int]>([])
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let done = expectation(description: "all ran")
+        let first = OSAllocatedUnfairLockBox<Bool>(true)
+        let handoff = LineDecodeHandoff(
+            maxPendingBytes: 1 << 20,
+            decode: { data, _ in
+                if first.take() {
+                    started.signal()
+                    release.wait()
+                }
+                _ = order.append(data.count)  // 1 = old reply, 4 = new reply
+            },
+            onResume: {}
+        )
+        let old = [(data: Data(count: 1), recvNanos: UInt64(0))]
+        XCTAssertTrue(handoff.enqueue(old))
+        XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+        XCTAssertTrue(handoff.enqueue(old))
+        handoff.afterPendingLines { _ = order.append(2) }  // old .disconnected
+        handoff.afterPendingLines { _ = order.append(3) }  // new .connected
+        XCTAssertTrue(handoff.enqueue([(data: Data(count: 4), recvNanos: 0)]))
+        handoff.afterPendingLines { done.fulfill() }
+        release.signal()
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(order.get(), [1, 1, 2, 3, 4])
+    }
+}
+
+final class ConnectionTerminationLatchTests: XCTestCase {
+    private final class Conn {}
+
+    func testReportsEachConnectionOnce() {
+        var latch = ConnectionTerminationLatch<Conn>()
+        let a = Conn()
+        let b = Conn()
+        XCTAssertTrue(latch.markTerminated(a))
+        XCTAssertFalse(latch.markTerminated(a), "duplicate report suppressed")
+        XCTAssertTrue(latch.markTerminated(b))
+        XCTAssertFalse(latch.markTerminated(b))
     }
 }

@@ -52,6 +52,8 @@ final class EngineClient: @unchecked Sendable {
     /// next candidate is worth trying) or stay put (it worked before, so
     /// don't wander off a healthy endpoint just because it dropped).
     private var reachedReady = false
+    /// Dedupes termination reports; see [[terminate]]. Socket queue only.
+    private var terminationLatch = ConnectionTerminationLatch<NWConnection>()
 
     /// Thread-safe liveness signal for `EngineProcessController`'s
     /// supervision tick: true only while this connection is `.ready`. Lets
@@ -123,9 +125,8 @@ final class EngineClient: @unchecked Sendable {
 
     /// A byte stream and its scan cursor belong to exactly one connection.
     private func closeConnection() {
-        let oldConnection = connection
-        connection = nil
-        oldConnection?.cancel()
+        guard let oldConnection = connection, terminate(oldConnection) else { return }
+        oldConnection.cancel()
         reachableState.withLock { $0 = false }
         if !buffer.isEmpty {
             Self.logInvalidFrame(buffer, error: "connection closed with buffered bytes")
@@ -154,7 +155,10 @@ final class EngineClient: @unchecked Sendable {
                 self.reachableState.withLock { $0 = true }
                 self.reachedReady = true
                 self.socketIndex = 0
-                self.emit(.connected)
+                // Ordered behind any previous connection's pending lines
+                // and `.disconnected`, so a fast reconnect cannot land
+                // `.connected` before the old connection's teardown.
+                self.handoff.afterPendingLines { [weak self] in self?.emit(.connected) }
                 self.receiveNext()
             case .waiting(let error), .failed(let error):
                 self.emit(.error(message: "socket failed: \(error.localizedDescription)"))
@@ -240,6 +244,20 @@ final class EngineClient: @unchecked Sendable {
         }
     }
 
+    /// Records that `connection` has terminated. Returns `false` if it was
+    /// already reported (the receive path and the state handler can both
+    /// observe one drop), in which case the caller must do nothing more.
+    /// Clears `self.connection` only if it is still the terminated one, so a
+    /// late callback never clobbers its replacement.
+    private func terminate(_ connection: NWConnection) -> Bool {
+        guard terminationLatch.markTerminated(connection) else { return false }
+        if self.connection === connection || self.connection == nil {
+            self.connection = nil
+            reachableState.withLock { $0 = false }
+        }
+        return true
+    }
+
     private func receiveNext() {
         guard let connection else { return }
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
@@ -247,7 +265,7 @@ final class EngineClient: @unchecked Sendable {
             guard let self, self.connection === connection else { return }
 
             if let error {
-                self.emit(.error(message:"socket receive failed: \(error.localizedDescription)"))
+                self.emit(.error(message: "socket receive failed: \(error.localizedDescription)"))
                 self.closeConnection()
                 return
             }
@@ -361,10 +379,10 @@ final class EngineClient: @unchecked Sendable {
             // Population-timing: this decode runs on the decode queue
             // (off main). `lineRecvNanos` is taken at framing time, so the
             // decode segment includes time the line waited behind earlier
-            // decodes. Record request→reply + decode duration, payload size, and item cardinalities so timing
-            // correlates with the ~1,908-item real population. The
-            // decoded context is stashed FIFO per product for the
-            // upcoming @MainActor apply.
+            // decodes. Record request→reply + decode duration, payload
+            // size, and item cardinalities so timing correlates with the
+            // ~1,908-item real population. The decoded context is
+            // stashed FIFO per product for the upcoming @MainActor apply.
             let decodeEndNanos = PopulationTiming.now()
             PopulationTiming.shared.workTreeDecoded(
                 productId: product.id,
