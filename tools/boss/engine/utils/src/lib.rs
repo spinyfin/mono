@@ -6,6 +6,7 @@
 //! vice versa. The dependency edge is strictly one-directional: `engine/core`
 //! depends on `boss_engine_utils`, never the reverse.
 
+pub mod duration;
 pub mod env_parse;
 pub mod epoch_time;
 pub mod iso8601;

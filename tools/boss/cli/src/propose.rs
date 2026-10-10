@@ -34,10 +34,12 @@ use crate::{
 /// fields are printed and the command exits non-zero so a worker session
 /// can fix and retry in the same run — see [`render_proposal_rejection`].
 ///
-/// Idempotency is automatic: omit `--idempotency-key` (every verb below)
-/// and the engine derives one from your execution id, the kind, and a hash
-/// of the payload, so a retried or resumed command replays the existing
-/// row (`already_submitted: true`) instead of duplicating it.
+/// Idempotency is automatic: omit `--idempotency-key` (every verb below
+/// except `wait`) and the engine derives one from your execution id, the
+/// kind, and a hash of the payload, so a retried or resumed command replays
+/// the existing row (`already_submitted: true`) instead of duplicating it.
+/// A keyless `wait` is the exception: each call is a new declaration that
+/// renews the wait and charges the per-execution wait budget again.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ProposeArgs {
     #[command(subcommand)]
@@ -173,8 +175,11 @@ pub(crate) struct ReviewGuideArgs {
 ///
 /// Almost never needed: omit it and the engine derives the same key your
 /// retried/resumed command would derive, so replays are automatically
-/// safe. Set it explicitly only if you need a caller-chosen replay scope
-/// narrower or wider than "this exact payload".
+/// safe. Exception: a keyless `wait` is never replayed — each call is a new
+/// declaration that renews the wait and charges the wait budget again; pass
+/// an explicit key to make a `wait` retry replay instead. Set it explicitly
+/// only if you need a caller-chosen replay scope narrower or wider than
+/// "this exact payload".
 #[derive(Debug, Clone, Args)]
 struct IdempotencyArgs {
     #[arg(long = "idempotency-key", value_name = "KEY")]
@@ -420,7 +425,8 @@ pub(crate) struct WaitArgs {
     duration: String,
 
     /// Optional handle for what is being waited on: a background task id,
-    /// a pid, or a file path. Display-only.
+    /// a pid, or a file path. Recorded in the proposal row and the engine log;
+    /// the engine does not watch it.
     #[arg(long = "waiting-on")]
     waiting_on: Option<String>,
 
@@ -792,59 +798,20 @@ fn operator_question_from_flags(
 }
 
 /// Parse `--duration` into seconds. Accepts a bare integer or a compact
-/// unit suffix (`30s`, `5m`, `2h`) including compounds (`1h30m`).
+/// duration (`30s`, `5m`, `2h`, `1h30m`); the engine enforces the upper bound.
 fn parse_wait_duration_secs(raw: &str) -> Result<u64, String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("duration must not be empty".to_owned());
-    }
-    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
-        let secs: u64 = trimmed
+    let secs = if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        trimmed
             .parse()
-            .map_err(|_| format!("duration `{raw}` is not a valid integer number of seconds"))?;
-        if secs == 0 {
-            return Err("duration must be at least 1 second".to_owned());
-        }
-        return Ok(secs);
-    }
-    let bytes = trimmed.as_bytes();
-    let mut i = 0;
-    let mut total: u64 = 0;
-    while i < bytes.len() {
-        let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        if start == i {
-            return Err(format!(
-                "duration `{raw}` is not a number of seconds or a compact unit like 30s, 5m, 2h"
-            ));
-        }
-        let n: u64 = trimmed[start..i]
-            .parse()
-            .map_err(|_| format!("duration `{raw}` contains a number that does not fit in 64 bits"))?;
-        if i >= bytes.len() {
-            return Err("duration number is missing a unit (s, m, or h)".to_owned());
-        }
-        let unit = bytes[i];
-        i += 1;
-        let multiplier = match unit {
-            b's' | b'S' => 1_u64,
-            b'm' | b'M' => 60,
-            b'h' | b'H' => 3600,
-            other => {
-                return Err(format!(
-                    "unknown duration unit `{}`; expected s, m, or h",
-                    other as char
-                ));
-            }
-        };
-        total = total.saturating_add(n.saturating_mul(multiplier));
-    }
-    if total == 0 {
+            .map_err(|_| format!("duration `{raw}` is not a valid integer number of seconds"))?
+    } else {
+        boss_engine_utils::duration::parse_compact_duration_secs(raw)?
+    };
+    if secs == 0 {
         return Err("duration must be at least 1 second".to_owned());
     }
-    Ok(total)
+    Ok(secs)
 }
 
 async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result<(), CliError> {
@@ -1600,7 +1567,7 @@ mod tests {
         assert_eq!(parse_wait_duration_secs("2h").unwrap(), 7200);
         assert_eq!(parse_wait_duration_secs("1h30m").unwrap(), 5400);
         assert!(parse_wait_duration_secs("0").is_err());
-        assert!(parse_wait_duration_secs("2d").is_err());
+        assert_eq!(parse_wait_duration_secs("2d").unwrap(), 172_800);
         assert!(parse_wait_duration_secs("").is_err());
     }
 

@@ -167,6 +167,39 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         }
     }
 
+    func testDeclaredWaitIsParsedAndCaptionedOnlyWhileIdle() throws {
+        let client = EngineClient(socketPath: "/tmp/wait-test-\(UUID().uuidString).sock")
+        let payload: [String: Any] = [
+            "slot_id": 1, "run_id": "run-wait", "model": "opus", "activity": "idle",
+            "wait_reason": "bazel test", "wait_expires_at": "2026-10-09T12:00:00Z",
+        ]
+        let live = try XCTUnwrap(client.parseWorkerLiveState(payload))
+        XCTAssertEqual(live.waitReason, "bazel test")
+        XCTAssertEqual(live.waitExpiresAt, "2026-10-09T12:00:00Z")
+
+        let caption = "Waiting: bazel test (until 2026-10-09T12:00:00Z)"
+        XCTAssertEqual(AgentActivityState(runtime: nil, liveState: live), .waiting(reason: caption))
+        XCTAssertEqual(
+            AgentActivityState.forDoingCard(
+                runtime: nil, liveState: live, isDispatchPending: false,
+                isResolvingConflicts: false, isRemediatingCI: false
+            ),
+            .waiting(reason: caption)
+        )
+
+        // A worker that resumed before the wait expired is active again.
+        let resumed = Self.makeLiveState(
+            activity: .working, waitReason: "bazel test", waitExpiresAt: "2026-10-09T12:00:00Z"
+        )
+        XCTAssertEqual(
+            AgentActivityState.forDoingCard(
+                runtime: nil, liveState: resumed, isDispatchPending: false,
+                isResolvingConflicts: false, isRemediatingCI: false
+            ),
+            .active
+        )
+    }
+
     func testRenderedLiveStateFieldsFlipEquality() {
         let slot = WorkerSlot(slotId: 1, runId: "exec-1", idleFlavorCycle: 0)
         let base = Self.makeLiveState()

@@ -1989,6 +1989,20 @@ mod tests {
     }
 
     #[test]
+    fn format_live_state_short_renders_declared_wait() {
+        let mut state = worker(3, "run_a", "Riker");
+        let plain = format_live_state_short(&state, TmuxListEvidence::Missing);
+        assert!(!plain.contains("wait_reason"), "{plain}");
+        state.wait_reason = Some("bazel test".to_owned());
+        state.wait_expires_at = Some("2026-10-09T12:00:00Z".to_owned());
+        let line = format_live_state_short(&state, TmuxListEvidence::Missing);
+        assert!(
+            line.contains("wait_reason=\"bazel test\"  wait_expires_at=2026-10-09T12:00:00Z"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn format_live_state_short_renders_stamped_pool_and_kind() {
         let mut state = worker(5, "run_b", "Data");
         state.pool = Some("automation".to_owned());

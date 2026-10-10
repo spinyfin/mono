@@ -488,8 +488,8 @@ pub struct WaitProposalPayload {
     pub duration_secs: u64,
     pub reason: String,
     /// Optional handle for what the worker is waiting on: a background
-    /// task id, a pid, or a file path. Display-only; the engine does not
-    /// watch it.
+    /// task id, a pid, or a file path. Recorded in the proposal row and
+    /// engine log; the engine does not watch it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_on: Option<String>,
 }

@@ -298,14 +298,18 @@ enum AgentActivityState: Equatable {
     ///    is watching for. This must precede the bound-slot shortcut
     ///    below; it clears on its own once the worker resumes and the
     ///    activity flips back to `.working`.
-    /// 4. A slot-bound worker which has not reported a hook-derived state
+    /// 4. An idle worker with a declared wait (`waitReason`) reads as
+    ///    *waiting* with the wait caption, matching
+    ///    `init(runtime:liveState:)`. A worker that has resumed (any other
+    ///    activity) falls through even if the wait has not yet expired.
+    /// 5. A slot-bound worker which has not reported a hook-derived state
     ///    reads as unknown rather than being guessed as active: after
     ///    re-adoption, `.spawning` means the engine knows the process exists
     ///    but not what it is doing.
-    /// 5. A bound live worker otherwise reads as active.
-    /// 6. Conflict / CI-remediation runs without a bound live worker
+    /// 6. A bound live worker otherwise reads as active.
+    /// 7. Conflict / CI-remediation runs without a bound live worker
     ///    read as their respective "resolving" waits.
-    /// 7. Fall back to the runtime+liveState mapping.
+    /// 8. Fall back to the runtime+liveState mapping.
     static func forDoingCard(
         runtime: WorkTaskRuntime?,
         liveState: WorkerLiveState?,
@@ -323,7 +327,7 @@ enum AgentActivityState: Equatable {
         if liveState?.activity == .waitingForInput {
             return .waiting(reason: "Waiting on user input")
         }
-        if let liveState, let reason = liveState.waitReason, !reason.isEmpty {
+        if let liveState, liveState.activity == .idle, let reason = liveState.waitReason, !reason.isEmpty {
             return .waiting(reason: waitCaption(liveState))
         }
         if liveState?.activity == .spawning {
