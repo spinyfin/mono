@@ -191,3 +191,103 @@ async fn empty_run_is_distinct_from_a_missing_or_unrelated_pointer() {
     );
     assert!(f.root.path().exists());
 }
+
+async fn commit_ids(f: &Fixture, revset: &str) -> Vec<String> {
+    LocalJj
+        .run(
+            &f.repo,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                revset,
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+        )
+        .await
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Rewrite the bookmarked commit twice concurrently, as happens when a PR head
+/// is rewritten elsewhere while the execution pointer stays put. That leaves
+/// two visible commits sharing one change id (a divergent change) and the
+/// pointer bookmark itself conflicted between them. Returns the two twins.
+async fn rewrite_head_concurrently(f: &Fixture, record: &ExecutionBookmark) -> Vec<String> {
+    std::fs::write(f.worker.join("work.txt"), "first change\n").unwrap();
+    LocalJj.run(&f.worker, &["describe", "-m", "Work"]).await.unwrap();
+    LocalJj.run(&f.worker, &["new", "-m", "Next"]).await.unwrap();
+    LocalJj
+        .run(&f.worker, &["bookmark", "set", &record.head(), "-r", "@-"])
+        .await
+        .unwrap();
+    let work = commit_ids(f, &revision(&record.head())).await.remove(0);
+    let op = LocalJj
+        .run(&f.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"])
+        .await
+        .unwrap();
+    for message in ["left", "right"] {
+        LocalJj
+            .run(&f.repo, &["--at-op", op.trim(), "describe", &work, "-m", message])
+            .await
+            .unwrap();
+    }
+    let twins = commit_ids(f, "description(substring:\"left\") | description(substring:\"right\")").await;
+    assert_eq!(twins.len(), 2, "expected a divergent change: {twins:?}");
+    twins
+}
+
+#[tokio::test]
+async fn divergent_change_id_does_not_fail_the_ancestry_check() {
+    let f = Fixture::new().await;
+    let record = f.record("exec_divergent").await;
+    let twins = rewrite_head_concurrently(&f, &record).await;
+    // Both pointers target one twin; the other twin shares its change id.
+    for bookmark in [record.head(), record.publication()] {
+        LocalJj
+            .run(&f.repo, &["bookmark", "set", &bookmark, "-r", &twins[0]])
+            .await
+            .unwrap();
+    }
+    let patch = diff(&LocalJj, &record).await.unwrap();
+    assert!(patch.contains("work.txt"), "{patch}");
+    assert!(restore(&LocalJj, &record, &f.replacement).await.unwrap());
+    assert!(f.replacement.join("work.txt").exists());
+}
+
+#[tokio::test]
+async fn divergent_change_id_still_fails_when_the_pointer_does_not_descend_from_baseline() {
+    let f = Fixture::new().await;
+    let record = f.record("exec_divergent_unrelated").await;
+    rewrite_head_concurrently(&f, &record).await;
+    LocalJj
+        .run(&f.repo, &["bookmark", "delete", &record.publication()])
+        .await
+        .unwrap();
+    LocalJj
+        .run(
+            &f.repo,
+            &["bookmark", "set", &record.head(), "-r", "root()", "--allow-backwards"],
+        )
+        .await
+        .unwrap();
+    let error = diff(&LocalJj, &record).await.unwrap_err();
+    assert!(is_pointer_integrity_error(&error), "{error:#}");
+    assert!(error.to_string().contains("not descended"), "{error:#}");
+}
+
+#[tokio::test]
+async fn conflicted_pointer_bookmark_is_a_pointer_integrity_error() {
+    let f = Fixture::new().await;
+    let record = f.record("exec_conflicted").await;
+    rewrite_head_concurrently(&f, &record).await;
+    // The concurrent rewrites left the pointer itself conflicted: a real
+    // error, never something to resolve by silently picking a side.
+    let error = diff(&LocalJj, &record).await.unwrap_err();
+    assert!(is_pointer_integrity_error(&error), "{error:#}");
+    assert!(error.to_string().contains("exactly one"), "{error:#}");
+}
