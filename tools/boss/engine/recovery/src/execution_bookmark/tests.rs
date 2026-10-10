@@ -263,16 +263,17 @@ async fn divergent_change_id_does_not_fail_the_ancestry_check() {
 async fn divergent_change_id_still_fails_when_the_pointer_does_not_descend_from_baseline() {
     let f = Fixture::new().await;
     let record = f.record("exec_divergent_unrelated").await;
-    rewrite_head_concurrently(&f, &record).await;
+    let twins = rewrite_head_concurrently(&f, &record).await;
+    for bookmark in [record.head(), record.publication()] {
+        LocalJj
+            .run(&f.repo, &["bookmark", "set", &bookmark, "-r", &twins[0]])
+            .await
+            .unwrap();
+    }
+    // The other twin is a sibling, not an ancestor; the checked pointer
+    // still has a divergent change id.
     LocalJj
-        .run(&f.repo, &["bookmark", "delete", &record.publication()])
-        .await
-        .unwrap();
-    LocalJj
-        .run(
-            &f.repo,
-            &["bookmark", "set", &record.head(), "-r", "root()", "--allow-backwards"],
-        )
+        .run(&f.repo, &["bookmark", "set", &record.base(), "-r", &twins[1]])
         .await
         .unwrap();
     let error = diff(&LocalJj, &record).await.unwrap_err();
