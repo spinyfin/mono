@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 38;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 39;
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -86,6 +86,10 @@ impl WorkDb {
         }
         if version < 38 {
             tx.execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")?;
+        }
+        if version < 39 {
+            // Data only: restart items blocked by the false ancestry failure.
+            execution_recovery_rearm::migrate(&tx)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -514,7 +518,16 @@ mod floor_tests {
 
     #[test]
     fn supported_databases_apply_post_floor_migrations_without_losing_data() {
-        for version in [32, 33, 34, 35, 36, CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1] {
+        for version in [
+            32,
+            33,
+            34,
+            35,
+            36,
+            38,
+            CURRENT_SCHEMA_VERSION,
+            CURRENT_SCHEMA_VERSION + 1,
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
             let conn = Connection::open(&path).unwrap();

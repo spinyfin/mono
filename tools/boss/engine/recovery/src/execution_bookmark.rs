@@ -32,6 +32,11 @@ impl std::fmt::Display for PointerIntegrityError {
 
 impl std::error::Error for PointerIntegrityError {}
 
+/// The message a pointer that is not descended from its baseline reports,
+/// followed by ` boss-base/<execution id>`. Shared so a stored work-item
+/// blocker can be recognised exactly, rather than by a copied string.
+pub const NOT_DESCENDED_MESSAGE: &str = "preserved execution pointer is not descended from its engine-created baseline";
+
 pub fn pointer_integrity_error(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(PointerIntegrityError(message.into()))
 }
@@ -161,6 +166,11 @@ fn revision(bookmark: &str) -> String {
     )
 }
 
+/// Resolve a bookmark to the single commit it targets. Commit ids, unlike
+/// change ids, stay unique when a change is divergent (two visible commits
+/// sharing one change id), so ancestry checks built on them cannot match a
+/// sibling of the bookmarked commit. A conflicted bookmark resolves to several
+/// commits and is a real pointer-integrity error.
 async fn resolve_optional(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<Option<String>> {
     let output = jj
         .run(
@@ -172,7 +182,7 @@ async fn resolve_optional(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<Op
                 "-r",
                 &revision(bookmark),
                 "-T",
-                "change_id ++ \"\\n\"",
+                "commit_id ++ \"\\n\"",
             ],
         )
         .await?;
@@ -209,13 +219,13 @@ async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String
                     "-r",
                     &format!("({base})::({head}) & ({head})"),
                     "-T",
-                    "change_id",
+                    "commit_id",
                 ],
             )
             .await?;
         if connected.trim() != head {
             return Err(pointer_integrity_error(format!(
-                "preserved execution pointer is not descended from its engine-created baseline {}",
+                "{NOT_DESCENDED_MESSAGE} {}",
                 record.base()
             )));
         }
@@ -236,7 +246,7 @@ async fn head_bookmark(jj: &dyn Jj, record: &ExecutionBookmark) -> Result<String
                             "-r",
                             &format!("({ancestor})::({descendant}) & ({descendant})"),
                             "-T",
-                            "change_id",
+                            "commit_id",
                         ],
                     )
                     .await?;
