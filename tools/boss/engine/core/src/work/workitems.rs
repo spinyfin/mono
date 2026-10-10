@@ -1151,7 +1151,8 @@ impl WorkDb {
         let t = Instant::now();
         let mut tasks = attach_revision_projections(tasks, &chores);
         // Compute has_in_progress_revision for every chain-root task that
-        // has at least one todo/active descendant revision.
+        // has at least one descendant revision that
+        // `TaskStatus::can_still_change_pr`.
         attach_in_progress_revision_flag(&mut tasks, &mut chores);
         // Compute ready_for_review for every Review-lane task that is
         // waiting on the operator and nothing else (no block, no

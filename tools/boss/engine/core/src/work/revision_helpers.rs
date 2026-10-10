@@ -355,17 +355,23 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
 }
 
 /// Set `has_in_progress_revision = true` on every chain-root task that has
-/// at least one descendant revision with status `todo` or `active`.
+/// at least one descendant revision that can still change the PR.
 ///
 /// Called by `get_work_tree` after [`attach_revision_projections`]. Only
 /// revisions in the `tasks` slice are inspected (revisions can only be
 /// `kind = "revision"` tasks, never chores). The chain root can live in
 /// either `tasks` or `chores`, so both slices are mutated.
 ///
-/// Status rule: `todo` and `active` are the in-progress states. `in_review`
-/// means the revision's commit has already landed on the PR branch — that is
-/// NOT a merge blocker. `done` and deleted revisions likewise don't trigger
-/// the flag.
+/// Status rule: a revision counts when [`TaskStatus::can_still_change_pr`]
+/// holds (`todo`, `active`, `blocked`) — the same predicate the
+/// merge-when-ready gate (`open_merge_revisions`) uses, so the badge shows
+/// exactly when merging would warn. `in_review` means the revision's commit
+/// has already landed on the PR branch — NOT a merge blocker. `done`,
+/// `archived` and deleted revisions likewise don't trigger the flag.
+///
+/// Also sets `in_revision_blocked_only` when every counted revision for a
+/// root is `blocked`, so the card can show the badge as blocked rather than
+/// as running work.
 pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut [Task]) {
     // Build a compact lookup: id → (kind, parent_task_id) for chain walking.
     let mut lookup: std::collections::HashMap<String, (TaskKind, Option<String>)> = std::collections::HashMap::new();
@@ -390,29 +396,34 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
         None
     }
 
-    // Collect all root ids that have at least one in-progress revision.
-    let mut in_progress_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // root id → whether any of its open revisions is running (not blocked).
+    let mut open_roots: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     for t in tasks.iter() {
         if t.kind == TaskKind::Revision
-            && (t.status == TaskStatus::Todo || t.status == TaskStatus::Active)
+            && t.status.can_still_change_pr()
             && let Some(root_id) = walk_to_root(&t.id, &lookup)
         {
-            in_progress_roots.insert(root_id);
+            let running = t.status != TaskStatus::Blocked;
+            *open_roots.entry(root_id).or_insert(false) |= running;
         }
     }
 
-    if in_progress_roots.is_empty() {
+    if open_roots.is_empty() {
         return;
     }
 
     for task in tasks.iter_mut() {
-        if task.kind != TaskKind::Revision && in_progress_roots.contains(&task.id) {
+        if task.kind != TaskKind::Revision
+            && let Some(running) = open_roots.get(&task.id)
+        {
             task.has_in_progress_revision = true;
+            task.in_revision_blocked_only = !running;
         }
     }
     for chore in chores.iter_mut() {
-        if in_progress_roots.contains(&chore.id) {
+        if let Some(running) = open_roots.get(&chore.id) {
             chore.has_in_progress_revision = true;
+            chore.in_revision_blocked_only = !running;
         }
     }
 }
@@ -1009,6 +1020,7 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.revision_seq = src.revision_seq;
     dst.revision_parent_pr_url = src.revision_parent_pr_url.clone();
     dst.has_in_progress_revision = src.has_in_progress_revision;
+    dst.in_revision_blocked_only = src.in_revision_blocked_only;
     dst.has_attachments = src.has_attachments;
     dst.ai_reviewing = src.ai_reviewing;
     dst.ai_review_state = src.ai_review_state.clone();
@@ -1772,7 +1784,7 @@ mod tests {
         t3528.ci_required_state = Some("success".to_owned());
         t3528.pr_mergeable_state = Some("conflicting".to_owned());
 
-        // `in revision` badge (descendant revision still todo/active).
+        // `in revision` badge (descendant revision where `TaskStatus::can_still_change_pr` holds).
         let in_revision_ids = ["t3519", "t3513", "t3540", "t3537"];
         let mut in_revision_tasks: Vec<Task> = in_revision_ids
             .iter()

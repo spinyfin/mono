@@ -20,6 +20,7 @@ struct WorkBoardCardFooterSlice: Equatable {
     let prMergeableState: String?
     let ambiguousRepoNames: Set<String>
     let hasInProgressRevision: Bool
+    let inRevisionBlockedOnly: Bool
     let shortID: Int?
     let hasReviewRow: Bool
     let reviewRequiredState: String?
@@ -40,6 +41,7 @@ struct WorkBoardCardFooterSlice: Equatable {
         self.prMergeableState = snapshot.prMergeableState
         self.ambiguousRepoNames = snapshot.ambiguousRepoNames
         self.hasInProgressRevision = snapshot.hasInProgressRevision
+        self.inRevisionBlockedOnly = snapshot.inRevisionBlockedOnly
         self.shortID = snapshot.shortID
         self.hasReviewRow = snapshot.hasReviewRow
         self.reviewRequiredState = snapshot.reviewRequiredState
@@ -102,7 +104,7 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                     )
                     .layoutPriority(1)
                     if slice.hasInProgressRevision {
-                        PrInRevisionIndicator(onTap: onRevisionBadgeTap)
+                        PrInRevisionIndicator(isBlocked: slice.inRevisionBlockedOnly, onTap: onRevisionBadgeTap)
                             .onHover { hovering in
                                 onRevisionBadgeHover?(hovering)
                             }
