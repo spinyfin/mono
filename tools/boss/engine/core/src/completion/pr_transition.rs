@@ -110,8 +110,8 @@ pub(crate) fn file_admission_deferred_attention(work_db: &crate::work::WorkDb, w
     let title = "Automated reviewer: waiting for a review-pool slot";
     let body = format!(
         "Pre-merge review for {pr_url} was deferred because the review pool has no free \
-         reservation for another pre-merge batch. The task stays in Doing until a batch \
-         completes and the deferred-admission sweep retries. Dismiss this item once that \
+         reservation for another pre-merge batch. The review starts once a batch completes \
+         and the deferred-admission sweep retries. Dismiss this item once that \
          pass starts."
     );
     if let Err(err) = work_db.upsert_external_tracker_attention(
@@ -1256,7 +1256,7 @@ mod already_reviewed_at_head_tests {
     }
 
     /// A batch leaf's verdict is keyed by the cycle root; passing that id
-    /// (as callers now do — see [`super::enqueue_review_batch`]) matches.
+    /// (as callers now do — see [`enqueue_review_batch`]) matches.
     #[test]
     fn matches_a_batch_leaf_verdict_keyed_by_the_cycle_root() {
         let dir = tempfile::tempdir().unwrap();

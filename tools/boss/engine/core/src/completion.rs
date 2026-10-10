@@ -102,7 +102,7 @@ mod worker_signals;
 use contribution_gate::{RevisionContributionReason, RevisionReviewGate};
 pub use pr_transition::ReviewBatchEnqueuer;
 pub(crate) use pr_transition::{
-    GhReviewBatchEnqueuer, enqueue_review_batch, file_admission_deferred_attention, review_batch_input_from_metadata,
+    GhReviewBatchEnqueuer, file_admission_deferred_attention, review_batch_input_from_metadata,
 };
 
 // Counter handles for the PR URL capture channels, in the order they are

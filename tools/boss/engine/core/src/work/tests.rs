@@ -517,6 +517,7 @@ mod human_driven_tests;
 mod idea_tests;
 mod project_membership_move_tests;
 mod resolve_repo_tests;
+mod review_batch_remint_tests;
 mod review_batches_tests;
 mod review_guide_state_tests;
 mod review_verdict_apply_tests;

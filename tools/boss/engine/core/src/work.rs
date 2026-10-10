@@ -750,10 +750,11 @@ pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use proposal_apply::*;
 pub(crate) use query_ensure::*;
 pub use review_batches::{
-    PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND, PR_REVIEW_BATCH_STALE_ATTENTION_KIND,
-    PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND, PRE_MERGE_BATCH_RESERVATION_UNITS,
-    REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS, REVIEW_BATCH_STALE_SECS, RetryDeadReviewBatchMember,
-    ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput, ReviewBatchQuorumOutcome,
+    MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS, PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+    PR_REVIEW_BATCH_STALE_ATTENTION_KIND, PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND,
+    PRE_MERGE_BATCH_RESERVATION_UNITS, REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS, REVIEW_BATCH_STALE_SECS,
+    RetryDeadReviewBatchMember, ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput,
+    ReviewBatchQuorumOutcome,
 };
 pub(crate) use review_findings_followup::*;
 pub(crate) use review_verdict_apply::*;
@@ -826,7 +827,8 @@ pub use proposals::SubmitWorkerProposalOutcome;
 pub use review_verdicts::{
     REVIEW_GATE_OUTCOME_COMPLETED_CLEAN, REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
     REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD, REVIEW_GATE_OUTCOME_GAVE_UP,
-    REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED, ReviewVerdict, ReviewVerdictInput, is_informative_gate_outcome,
+    REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED, REVIEW_GATE_OUTCOME_STALE_HEAD, ReviewVerdict, ReviewVerdictInput,
+    is_informative_gate_outcome,
 };
 pub use revision_helpers::normalize_priority;
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};

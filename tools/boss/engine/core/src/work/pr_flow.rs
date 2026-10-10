@@ -770,6 +770,20 @@ impl WorkDb {
     /// [`super::REVIEW_BATCH_STALE_SECS`], so a task merely waiting on a pool
     /// slot or between orphan-sweep passes does not cost a `gh pr view` on
     /// every full sweep before it has had a chance to resolve on its own.
+    ///
+    /// A task — `active` OR already `in_review` — also qualifies immediately
+    /// when its cycle root's newest pre-merge batch left the current head
+    /// needing a review that nothing else will schedule
+    /// ([`super::review_batches::pre_merge_review_needs_readmission_sql`]):
+    /// the batch was reaped or died without a consolidated verdict (the
+    /// re-admission mints the next generation, bounded by
+    /// [`super::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`]), or its verdict
+    /// landed `stale_head` after a later push moved the PR on. The root is
+    /// typically `in_review` by then (an earlier verdict advanced it), which
+    /// is exactly why this arm cannot be gated on `active`; it applies to the
+    /// cycle root itself only, so a root and its revisions yield one
+    /// candidate per cycle; it is self-limiting (keyed on the newest batch, which the re-admission
+    /// replaces), so it needs neither marker nor inertia cutoff.
     pub fn list_tasks_awaiting_pre_merge_review_admission(&self) -> Result<Vec<DeferredReviewAdmissionCandidate>> {
         let conn = self.connect()?;
         let inertia_cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
@@ -778,18 +792,18 @@ impl WorkDb {
         // Shared with `list_orphan_active_candidates`: same walk, same
         // `CYCLE_ROOT_WALK_SQL_DEPTH_BOUND` (`MAX_CHAIN_DEPTH - 1`). The
         // previous inlined copy used `depth < 64`, which could emit depth 64
-        // and overshoot [`super::chain_root`].
+        // and overshoot [`super::chain_root`]. The seed admits every
+        // `in_review` PR task because the readmission arm below needs the
+        // walked cycle root, which the seed filter cannot see yet; the
+        // outer WHERE narrows `in_review` rows to the marker and
+        // readmission arms.
         let walk = super::cycle_root_walk_cte(
-            "(t.status = 'active' OR (t.status = 'in_review' AND EXISTS (
-                 SELECT 1 FROM work_attention_items ai
-                 WHERE ai.work_item_id = t.id
-                   AND ai.kind = 'pr_review_admission_deferred'
-                   AND ai.status = 'open'
-             )))
+            "t.status IN ('active', 'in_review')
                  AND t.pr_url IS NOT NULL
                  AND t.pr_url != ''
                  AND t.deleted_at IS NULL",
         );
+        let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("roots.cycle_root_id");
         let sql = format!(
             "{walk}
              SELECT t.id, t.product_id, t.pr_url,
@@ -810,7 +824,17 @@ impl WorkDb {
              FROM tasks t
              JOIN products p ON p.id = t.product_id
              JOIN roots ON roots.task_id = t.id
-             WHERE NOT EXISTS (
+             WHERE (
+                     t.status = 'active'
+                     OR EXISTS (
+                       SELECT 1 FROM work_attention_items ai
+                       WHERE ai.work_item_id = t.id
+                         AND ai.kind = 'pr_review_admission_deferred'
+                         AND ai.status = 'open'
+                     )
+                     OR ({needs_readmission} AND t.id = roots.cycle_root_id)
+                   )
+               AND NOT EXISTS (
                      SELECT 1 FROM pr_review_batches b
                      WHERE b.cycle_root_id = roots.cycle_root_id
                        AND b.phase = 'pre_merge'
@@ -836,9 +860,11 @@ impl WorkDb {
                          AND ai.status = 'open'
                      )
                      OR t.updated_at < ?1
+                     OR ({needs_readmission} AND t.id = roots.cycle_root_id)
                    )
              ORDER BY t.updated_at ASC",
-            walk = walk
+            walk = walk,
+            needs_readmission = needs_readmission,
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([inertia_cutoff], |row| {

@@ -527,17 +527,22 @@ impl ExecutionCoordinator {
             Ok(Some(live)) => {
                 if self
                     .work_db
-                    .are_admissible_same_review_batch_pair(&execution.id, &live.id)?
+                    .are_admissible_concurrent_review_batch_pair(&execution.id, &live.id)?
                 {
                     tracing::info!(
                         execution_id = %execution.id,
                         live_execution_id = %live.id,
                         work_item_id = %execution.work_item_id,
-                        "spawn_attempt: permitting concurrent read-only leaf reviewers from one batch",
+                        "spawn_attempt: permitting concurrent read-only review-batch members on one cycle root",
                     );
-                    // Same-batch leaf reviewers have no workspace-writing role;
-                    // their report proposals are independently scoped to their
-                    // persisted member rows. Continue to ordinary host selection.
+                    // Review-batch members have no workspace-writing role and
+                    // each reviews its own batch's frozen target in its own
+                    // lease; their proposals are independently scoped to their
+                    // persisted member rows. That holds across batches too: a
+                    // new head's leaves must not be abandoned as "redundant"
+                    // because the previous head's supervisor is still running
+                    // (the shape that left mono PR #3110's latest head
+                    // unreviewed). Continue to ordinary host selection.
                 } else {
                     // Liveness gate (waiting_human-zombie fix, 2026-06-14 incident):
                     // `get_live_execution_for_work_item` returns any row in
