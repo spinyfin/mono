@@ -203,16 +203,20 @@ impl OffsiteRuntime {
     }
 
     /// Seconds since durable success, or -1 if none is known.
-    pub fn age_secs(&self) -> i64 {
+    fn age_secs_at(&self, now: i64) -> i64 {
         let last = self.last_success.load(Ordering::Relaxed);
         if last <= 0 {
             return -1;
         }
-        (boss_engine_utils::epoch_time::now_epoch_secs() - last).max(0)
+        (now - last).max(0)
     }
 
     pub fn refresh_age_gauge(&self) {
-        OFFSITE_LAST_SUCCESS_AGE_SECS.set(&self.registry, self.age_secs());
+        self.refresh_age_gauge_at(boss_engine_utils::epoch_time::now_epoch_secs());
+    }
+
+    fn refresh_age_gauge_at(&self, now: i64) {
+        OFFSITE_LAST_SUCCESS_AGE_SECS.set(&self.registry, self.age_secs_at(now));
     }
 }
 
