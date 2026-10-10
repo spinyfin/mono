@@ -298,3 +298,53 @@ async fn older_dead_pane_diagnostics_only_update_the_token_matched_run() {
         Some("newer diagnostic")
     );
 }
+
+#[tokio::test]
+async fn restart_dead_retained_pane_does_not_leak_or_backfill_persona() {
+    for legacy in [false, true] {
+        let (_dir, db) = open_db_arc();
+        let id = start_local_run(&db, "worker-1");
+        stamp_tmux_identity(&db, &id, "tok-dead");
+        let original = db.persona_display_name(&id).unwrap();
+        if legacy {
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE work_runs SET persona = NULL, persona_lease_active = 0 WHERE execution_id = ?1",
+                    [&id],
+                )
+                .unwrap();
+        }
+        let (tmux, _) = fake_tmux(dead_pane_server("tok-dead"));
+        let coordinator = coordinator_with_one_slot(db.clone());
+        let spawner = RecordingSpawner::default();
+        let outcome = run_boot_time_adoption(
+            &db,
+            &tmux,
+            &coordinator,
+            &spawner,
+            &RecordingConvergence::default(),
+            &RecordingDispatchEventSink::new(),
+            &FixedEngineOwnerProbe(Some(true)),
+        )
+        .await;
+        assert_eq!(outcome.dead_panes, 1);
+        assert!(outcome.adopted_execution_ids.is_empty());
+        assert!(db.get_execution(&id).unwrap().status.is_terminal());
+        let (persona, held): (Option<String>, bool) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT persona, persona_lease_active FROM work_runs WHERE execution_id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!held);
+        if legacy {
+            assert!(persona.is_none());
+        } else {
+            assert_eq!(db.persona_display_name(&id).unwrap(), original);
+        }
+    }
+}

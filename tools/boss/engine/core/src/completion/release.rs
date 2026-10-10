@@ -35,8 +35,21 @@ impl WorkerCompletionHandler {
         // it into a same-workspace collision. In that case the
         // lease stays held; the in-flight `run_execution` reaps the
         // worker once its spawn settles and releases the lease then.
+        //
+        // A remote worker is not reaped by `release_pane` (the engine cannot
+        // stop it), and a cancelled status does not mean its process exited.
+        // Hold the lease, persona and live state until a pid probe proves it
+        // gone; `remote_lease_reconcile` releases them once it does.
+        if !self.remote_worker_proven_gone(execution_id).await {
+            tracing::info!(
+                execution_id,
+                "force_release: remote worker not proven gone; leaving the lease, persona and live state held \
+                 for remote-lease reconcile",
+            );
+            return ForceReleaseOutcome::HeldForRemoteWorker;
+        }
         if matches!(
-            self.pane_releaser.release_pane(execution_id).await,
+            self.pane_releaser.release_proven_dead_remote_pane(execution_id).await,
             PaneReleaseOutcome::NoLiveWorker
         ) {
             tracing::info!(
@@ -50,8 +63,9 @@ impl WorkerCompletionHandler {
 
         // Remote leases belong to the owning host. Keep the durable lease
         // columns until its adapter confirms release so a failed call can retry.
-        match self.remote_cleanup_adapter(execution_id).await {
-            Ok(Some(adapter)) => {
+        match self.owning_cube(execution_id).await {
+            Ok(resolved) if !resolved.is_local() => {
+                let adapter = resolved.cube;
                 let execution = match self.work_db.get_execution(execution_id) {
                     Ok(execution) => execution,
                     Err(_) => return ForceReleaseOutcome::WorkspaceColumnClearFailed,
@@ -68,7 +82,7 @@ impl WorkerCompletionHandler {
                     Err(_) => ForceReleaseOutcome::WorkspaceColumnClearFailed,
                 };
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(err) => {
                 tracing::warn!(execution_id, ?err, "force_release: host lookup failed; retaining lease");
                 return ForceReleaseOutcome::WorkspaceColumnClearFailed;

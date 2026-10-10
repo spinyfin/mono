@@ -205,6 +205,12 @@ fn list_dispatch_failed_recovery_candidates_breaks_dispatch_failed_at_ties_by_id
     // Swap the id columns so the first-inserted row (lower rowid) ends up
     // with the lexicographically larger id, and vice versa, via a temp value.
     let conn = db.connect().unwrap();
+    // The two parking calls can straddle a second; explicitly establish the tie.
+    conn.execute(
+        "UPDATE tasks SET dispatch_failed_at = (SELECT dispatch_failed_at FROM tasks WHERE id = ?1) WHERE id = ?2",
+        rusqlite::params![first_inserted, second_inserted],
+    )
+    .unwrap();
     let tmp = format!("{first_inserted}-swap-tmp");
     conn.execute(
         "UPDATE tasks SET id = ?2 WHERE id = ?1",

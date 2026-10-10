@@ -446,6 +446,17 @@ pub async fn reconcile_if_pane_dead(
             "pane-death reconcile: finalized execution whose worker pane is gone",
         );
 
+        // The roster name is released under the same gate as the cube lease
+        // below: a worker the live registry still tracks may be alive, and
+        // freeing its name would let a second worker take it. Otherwise the
+        // run died with no registry entry to release through (typically while
+        // the engine was down), so this is the only place the lease is freed.
+        if !live_states.is_some_and(|live| live.is_run_live(&execution.id))
+            && let Err(err) = work_db.release_persona(&execution.id)
+        {
+            tracing::warn!(execution_id = %execution.id, ?err, "pane-death reconcile: persona release failed");
+        }
+
         // DB-only reconcile: no signal, no pane teardown. A residual false
         // reap can leave a still-running worker writing into the workspace,
         // so only force-release when the live registry does not still track
@@ -597,6 +608,65 @@ mod tests {
             "the pessimistic placeholder must be replaced, got {:?}",
             runs[0].detail
         );
+    }
+
+    /// A worker whose pane died while the engine was down has no live
+    /// registry entry to release its roster name through; the reconcile must
+    /// free it or the name leaks across every later restart.
+    #[tokio::test]
+    async fn reconciled_dead_pane_releases_its_persona_lease() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/tmp/ws-p", "local", Some(dead_pid()));
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+        db.lease_persona_for_execution(&exec.id).unwrap();
+        let held = |db: &WorkDb| -> bool {
+            db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1 AND persona_lease_active = 1)",
+                    [&exec.id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert!(held(&db));
+
+        let sink = NoopDispatchEventSink;
+        assert!(reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None, None).await);
+        assert!(!held(&db), "the reconciled run's persona lease must be released");
+    }
+
+    /// The persona release shares the cube lease's gate: a run the live
+    /// registry still tracks as non-terminal may be alive, and freeing its
+    /// roster name would let a second worker take it.
+    #[tokio::test]
+    async fn reconciled_pane_still_tracked_live_keeps_its_persona_lease() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/tmp/ws-tracked", "local", Some(dead_pid()));
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+        db.lease_persona_for_execution(&exec.id).unwrap();
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, &exec.id, "claude-opus-4-7", 424242, None);
+
+        let sink = NoopDispatchEventSink;
+        assert!(
+            reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), Some(&live_states), None).await,
+            "precondition: the dead pid with no corroborating activity is reconciled",
+        );
+        let held: bool = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1 AND persona_lease_active = 1)",
+                [&exec.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(held, "a registry-tracked run must keep its persona lease");
     }
 
     /// The double-finalize bug this closes: a triage execution whose Stop

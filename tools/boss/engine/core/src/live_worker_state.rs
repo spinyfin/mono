@@ -1338,6 +1338,14 @@ impl LiveWorkerStateRegistry {
         None
     }
 
+    /// Keep a retained worker addressable without claiming a released roster name.
+    pub fn forget_persona_name(&self, run_id: &str) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        for entry in guard.values_mut().filter(|entry| entry.state.run_id == run_id) {
+            entry.state.name = boss_protocol::placeholder_worker_name(run_id);
+        }
+    }
+
     /// Look up the state for one slot.
     pub fn get(&self, slot_id: u8) -> Option<LiveWorkerState> {
         self.inner

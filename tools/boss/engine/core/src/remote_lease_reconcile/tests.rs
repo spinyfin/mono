@@ -437,13 +437,16 @@ async fn terminal_remote_persona_backstop_preserves_history_and_live_leases() {
     let (_d, db) = open_db_arc();
     db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
     let dead = start_remote_run(&db, &create_chore(&db), "anaplian", "dead", Some(1));
-    let live = start_remote_run(&db, &create_chore(&db), "anaplian", "live", Some(2));
+    // No pid: the reconciler has no evidence about this worker and leaves it.
+    let live = start_remote_run(&db, &create_chore(&db), "anaplian", "live", None);
     let dead_name = db.persona_display_name(&dead).unwrap();
     let live_name = db.persona_display_name(&live).unwrap();
     db.cancel_running_execution(&dead).unwrap();
-    let (_, provider) = provider("anaplian", Probe::Alive);
+    let (adapter, provider) = provider("anaplian", Probe::Dead);
     reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
-    assert!(db.terminal_remote_persona_executions().unwrap().is_empty());
+    assert!(db.terminal_remote_cleanup_runs().unwrap().is_empty());
+    assert_eq!(adapter.force_released.lock().unwrap()[0].0, "dead");
+    assert!(db.get_execution(&dead).unwrap().cube_lease_id.is_none());
     let next = start_remote_run(&db, &create_chore(&db), "anaplian", "next", Some(3));
     assert_eq!(db.persona_display_name(&next).unwrap(), dead_name);
     assert_eq!(db.persona_display_name(&dead).unwrap(), dead_name);
@@ -461,8 +464,98 @@ async fn concurrent_terminalization_still_releases_persona() {
     let outcome = reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
     assert_eq!(outcome.reaped, 1);
     assert_eq!(db.get_execution(&id).unwrap().status, ExecutionStatus::Cancelled);
-    assert!(db.terminal_remote_persona_executions().unwrap().is_empty());
     let next = start_remote_run(&db, &create_chore(&db), "anaplian", "next", Some(2));
     assert_eq!(db.persona_display_name(&next).unwrap(), name);
     assert_eq!(db.persona_display_name(&id).unwrap(), name);
+}
+
+#[tokio::test]
+async fn cancelled_remote_worker_still_alive_keeps_lease_and_persona() {
+    let (_d, db) = open_db_arc();
+    db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+    let id = start_remote_run(&db, &create_chore(&db), "anaplian", "lease", Some(7));
+    db.cancel_running_execution(&id).unwrap();
+    let (adapter, provider) = provider("anaplian", Probe::Alive);
+    reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
+    assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease"));
+    assert_eq!(db.terminal_remote_cleanup_runs().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_remote_run_without_pid_releases_persona_but_leaves_lease_to_ttl() {
+    let (_d, db) = open_db_arc();
+    db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+    let id = start_remote_run(&db, &create_chore(&db), "anaplian", "lease", None);
+    let name = db.persona_display_name(&id).unwrap();
+    db.cancel_running_execution(&id).unwrap();
+    let (adapter, provider) = provider("anaplian", Probe::Dead);
+    reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
+    // No pid → nothing to probe: the cube lease is left to its TTL, but the
+    // persona (which has no TTL) is freed for reuse.
+    assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease"));
+    let next = start_remote_run(&db, &create_chore(&db), "anaplian", "next", Some(3));
+    assert_eq!(db.persona_display_name(&next).unwrap(), name);
+}
+
+#[tokio::test]
+async fn terminal_persona_retention_is_bounded_without_releasing_remote_resources() {
+    for (host_exists, expired, probe) in [
+        (false, false, Probe::Alive),
+        (true, false, Probe::Error),
+        (true, true, Probe::Error),
+        (true, true, Probe::Alive),
+    ] {
+        let (_d, db) = open_db_arc();
+        if host_exists {
+            db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+        }
+        let id = start_remote_run(&db, &create_chore(&db), "anaplian", "lease", Some(7));
+        db.cancel_running_execution(&id).unwrap();
+        if expired {
+            db.connect()
+                .unwrap()
+                .execute("UPDATE work_executions SET finished_at = '1' WHERE id = ?1", [&id])
+                .unwrap();
+        }
+        let (adapter, provider) = provider("anaplian", probe);
+        for _ in 0..2 {
+            reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
+        }
+        let held: bool = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT persona_lease_active FROM work_runs WHERE execution_id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(held, host_exists && !expired);
+        assert!(adapter.force_released.lock().unwrap().is_empty());
+        assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease"));
+    }
+}
+
+#[tokio::test]
+async fn mismatched_host_adapter_cannot_prove_death_or_release_resources() {
+    let (_d, db) = open_db_arc();
+    db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+    let id = start_remote_run(&db, &create_chore(&db), "anaplian", "lease", Some(7));
+    db.cancel_running_execution(&id).unwrap();
+    let (adapter, provider) = provider("wrong-host", Probe::Dead);
+    reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
+    assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease"));
+    let held: bool = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT persona_lease_active FROM work_runs WHERE execution_id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(held);
 }

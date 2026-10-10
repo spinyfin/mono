@@ -333,6 +333,7 @@ async fn reconcile_if_execution_dead_at(
                 workspace_path = %workspace_path,
                 "lost-workspace reconcile: finalized execution whose workspace directory is gone",
             );
+            release_reconciled_persona(work_db, execution);
             maybe_force_release_reconciled_lease(execution, cube_client).await;
         }
 
@@ -430,10 +431,30 @@ async fn reconcile_if_execution_dead_at(
             age_in_status_secs = ?age_in_status_secs,
             "execution-liveness reconcile: finalized execution whose worker pane never attached",
         );
+        release_reconciled_persona(work_db, execution);
         maybe_force_release_reconciled_lease(execution, cube_client).await;
     }
 
     reconciled
+}
+
+/// Free the roster name of an execution reconciled as gone. The worker has no
+/// live registry entry to release it through (this sweep is DB-only, and the
+/// run may have died while the engine was down), so without this the
+/// `persona_lease_active` row would outlive the run permanently. The
+/// workspace is gone or the pane never came up, so no live worker can still
+/// be using the name.
+///
+/// Unlike [`crate::dead_pane_sweep`], this deliberately has no live-registry
+/// gate (this sweep has no registry): its death signals are not a pid probe
+/// that a reused pid could fool. A vanished workspace directory leaves no cwd
+/// for a worker to run in, and the never-attached signal requires that no pid
+/// was ever reported past the attach deadline. The cube lease is released
+/// under the same reasoning just below.
+fn release_reconciled_persona(work_db: &WorkDb, execution: &WorkExecution) {
+    if let Err(err) = work_db.release_persona(&execution.id) {
+        tracing::warn!(execution_id = %execution.id, ?err, "lost-workspace reconcile: persona release failed");
+    }
 }
 
 /// Best-effort cube lease release after a successful lost-workspace /
@@ -569,6 +590,60 @@ mod tests {
             "the pessimistic placeholder must be replaced, got {:?}",
             runs[0].detail
         );
+    }
+
+    fn persona_held(db: &WorkDb, execution_id: &str) -> bool {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1 AND persona_lease_active = 1)",
+                [execution_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn workspace_gone_reconcile_releases_the_persona_lease() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/nonexistent/old-root/mono-agent-029", "local");
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+        db.lease_persona_for_execution(&exec.id).unwrap();
+        assert!(persona_held(&db, &exec.id));
+
+        assert!(reconcile_if_execution_dead(&db, &NoopDispatchEventSink, &exec, None).await);
+        assert!(!persona_held(&db, &exec.id));
+    }
+
+    #[tokio::test]
+    async fn never_attached_reconcile_releases_the_persona_lease() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let real_dir = TempDir::new().unwrap();
+        let exec = parked_triage_execution(&db, &automation, real_dir.path().to_str().unwrap(), "local");
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+        db.lease_persona_for_execution(&exec.id).unwrap();
+        let now = started_epoch(&exec) + PANE_ATTACH_DEADLINE_SECS + 1;
+
+        assert!(reconcile_if_execution_dead_at(&db, &NoopDispatchEventSink, &exec, now, None).await);
+        assert!(!persona_held(&db, &exec.id));
+    }
+
+    #[tokio::test]
+    async fn leaves_persona_of_execution_that_is_not_reconciled() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let real_dir = TempDir::new().unwrap();
+        let exec = parked_triage_execution(&db, &automation, real_dir.path().to_str().unwrap(), "local");
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+        db.lease_persona_for_execution(&exec.id).unwrap();
+
+        assert!(!reconcile_if_execution_dead(&db, &NoopDispatchEventSink, &exec, None).await);
+        assert!(persona_held(&db, &exec.id));
     }
 
     #[tokio::test]

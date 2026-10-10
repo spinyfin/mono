@@ -34,6 +34,7 @@ pub(super) enum WorkerPaneLiveness {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn skip_if_not_live(
     work_db: &WorkDb,
+    live_states: Option<&crate::live_worker_state::LiveWorkerStateRegistry>,
     tmux: &Tmux,
     dispatch_events: &dyn DispatchEventSink,
     execution_id: &str,
@@ -47,7 +48,7 @@ pub(super) async fn skip_if_not_live(
             pane_dead_status,
             last_output,
         } => {
-            reconcile_dead_worker_pane(
+            let reaped = reconcile_dead_worker_pane(
                 work_db,
                 tmux,
                 dispatch_events,
@@ -59,6 +60,15 @@ pub(super) async fn skip_if_not_live(
                 outcome,
             )
             .await;
+            if reaped
+                && !live_states.is_some_and(|live| live.is_run_live(execution_id))
+                && work_db
+                    .get_execution(execution_id)
+                    .is_ok_and(|e| e.status.is_terminal())
+                && let Err(err) = work_db.release_persona(execution_id)
+            {
+                tracing::warn!(execution_id, ?err, "dead pane adoption: persona release failed");
+            }
             true
         }
         WorkerPaneLiveness::Unreadable => true,
@@ -117,7 +127,7 @@ pub(super) async fn reconcile_dead_worker_pane(
     pane_dead_status: Option<String>,
     last_output: Option<String>,
     outcome: &mut TmuxAdoptionOutcome,
-) {
+) -> bool {
     let observation = TmuxIdentityObservation {
         adoption_state: boss_protocol::TmuxAdoptionState::Adopted,
         pane_dead: Some(true),
@@ -138,8 +148,7 @@ pub(super) async fn reconcile_dead_worker_pane(
                 "tmux session sweep: dead pane observed but the execution row could not be loaded",
             );
             outcome.dead_panes += 1;
-            kill_retained_session(tmux, session_name, spawn_token, execution_id).await;
-            return;
+            return kill_retained_session(tmux, session_name, spawn_token, execution_id).await;
         }
     };
 
@@ -195,8 +204,9 @@ pub(super) async fn reconcile_dead_worker_pane(
         );
     }
 
-    kill_retained_session(tmux, session_name, spawn_token, execution_id).await;
+    let reaped = kill_retained_session(tmux, session_name, spawn_token, execution_id).await;
     outcome.dead_panes += 1;
+    reaped
 }
 
 pub(super) fn dead_pane_reason(
@@ -237,11 +247,11 @@ fn truncate_pane_output(text: &str) -> String {
     format!("…{snippet}")
 }
 
-async fn kill_retained_session(tmux: &Tmux, session_name: &str, spawn_token: &str, execution_id: &str) {
+async fn kill_retained_session(tmux: &Tmux, session_name: &str, spawn_token: &str, execution_id: &str) -> bool {
     match tmux.kill_session_verified(session_name, spawn_token).await {
         // Owning teardown still needs the durable identity to confirm the absent
         // session before detaching its viewer and releasing live state and pool.
-        Ok(boss_tmux::KillSessionOutcome::Killed | boss_tmux::KillSessionOutcome::Absent) => {}
+        Ok(boss_tmux::KillSessionOutcome::Killed | boss_tmux::KillSessionOutcome::Absent) => true,
         Err(err) => {
             tracing::warn!(
                 execution_id,
@@ -249,6 +259,7 @@ async fn kill_retained_session(tmux: &Tmux, session_name: &str, spawn_token: &st
                 error = %format!("{err:#}"),
                 "tmux session sweep: failed to reap the retained dead pane; a later pass will retry",
             );
+            false
         }
     }
 }

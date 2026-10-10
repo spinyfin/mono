@@ -1165,6 +1165,69 @@ impl WorkDb {
         Ok(out)
     }
 
+    /// The latest run of `execution_id` when it was dispatched to a remote
+    /// host, with the remote pid captured at spawn. `None` for a local or
+    /// run-less execution. Same latest-run preference as
+    /// [`Self::list_live_remote_runs`], but without the liveness filter, so
+    /// teardown can ask whether a (possibly already terminal) remote worker
+    /// is provably gone.
+    pub fn latest_remote_run_for_execution(&self, execution_id: &str) -> Result<Option<RemoteRunHandle>> {
+        let conn = self.connect()?;
+        let handle = conn
+            .query_row(
+                "SELECT id, execution_id, host_id, remote_pid FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY CASE WHEN finished_at IS NULL THEN 0 ELSE 1 END, created_at DESC, id DESC
+                 LIMIT 1",
+                [execution_id],
+                |row| {
+                    Ok(RemoteRunHandle {
+                        run_id: row.get(0)?,
+                        execution_id: row.get(1)?,
+                        host_id: row.get(2)?,
+                        remote_pid: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(handle.filter(|handle| handle.host_id != "local"))
+    }
+
+    /// Latest remote run of every terminal execution that still holds remote
+    /// resources — an active persona lease or a cube lease with a recorded
+    /// pid. Slot and cube cleanup require positive death evidence; persona
+    /// cleanup also has a bounded fallback. No-pid rows stop matching after
+    /// persona release. Tmux-owned executions are excluded.
+    pub fn terminal_remote_cleanup_runs(&self) -> Result<Vec<RemoteRunHandle>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT r.execution_id FROM work_runs r
+             JOIN work_executions e ON e.id = r.execution_id
+             WHERE r.host_id != 'local'
+               AND r.id = (SELECT latest.id FROM work_runs latest
+                   WHERE latest.execution_id = e.id
+                   ORDER BY CASE WHEN latest.finished_at IS NULL THEN 0 ELSE 1 END,
+                       latest.created_at DESC, latest.id DESC LIMIT 1)
+               AND e.status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND (r.persona_lease_active = 1 OR (e.cube_lease_id IS NOT NULL AND r.remote_pid IS NOT NULL))
+               AND NOT EXISTS (SELECT 1 FROM work_runs t
+                   WHERE t.execution_id = r.execution_id AND t.tmux_spawn_token IS NOT NULL)
+             ORDER BY r.created_at ASC, r.id ASC",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        drop(conn);
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(handle) = self.latest_remote_run_for_execution(&id)? {
+                out.push(handle);
+            }
+        }
+        Ok(out)
+    }
+
     /// Local, non-terminal worker runs whose tmux identity was durably
     /// recorded. The startup adoption pass enumerates tmux separately and
     /// performs an exact token match against this set; neither a session name

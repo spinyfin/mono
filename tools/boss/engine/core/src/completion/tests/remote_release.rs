@@ -3,6 +3,8 @@ use super::*;
 struct RemoteReleaseAdapter {
     calls: std::sync::Mutex<Vec<String>>,
     fail: bool,
+    /// Verdict of the remote pid probe: `true` models a still-running process.
+    alive: bool,
 }
 
 crate::stub_host_adapter! { RemoteReleaseAdapter {
@@ -11,6 +13,9 @@ crate::stub_host_adapter! { RemoteReleaseAdapter {
         self.calls.lock().unwrap().push(lease_id.to_owned());
         if self.fail { anyhow::bail!("remote unavailable"); }
         Ok(())
+    }
+    async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> Result<Option<bool>> {
+        Ok(Some(self.alive))
     }
 } }
 
@@ -40,6 +45,7 @@ fn remote_fixture() -> (TempDir, Arc<WorkDb>, String) {
         "remote",
     )
     .unwrap();
+    db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
     db.cancel_running_execution(&execution.id).unwrap();
     (dir, db, execution.id)
 }
@@ -52,6 +58,7 @@ async fn cancelled_remote_release_uses_owning_host_and_is_idempotent() {
     let adapter = Arc::new(RemoteReleaseAdapter {
         calls: Default::default(),
         fail: false,
+        alive: false,
     });
     handler.set_host_adapter_provider(Arc::new(Provider(adapter.clone())));
     assert!(matches!(
@@ -75,6 +82,7 @@ async fn failed_remote_release_retains_lease_for_retry() {
     let adapter = Arc::new(RemoteReleaseAdapter {
         calls: Default::default(),
         fail: true,
+        alive: false,
     });
     handler.set_host_adapter_provider(Arc::new(Provider(adapter)));
     assert!(matches!(
@@ -95,6 +103,7 @@ async fn completion_teardown_releases_on_remote_host() {
     let adapter = Arc::new(RemoteReleaseAdapter {
         calls: Default::default(),
         fail: false,
+        alive: false,
     });
     handler.set_host_adapter_provider(Arc::new(Provider(adapter.clone())));
     let cleared = db.clear_execution_workspace(&id).unwrap().unwrap();
@@ -119,11 +128,43 @@ async fn missing_remote_adapter_never_falls_back_to_local_cube() {
     let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
     assert!(matches!(
         handler.force_release(&id).await,
-        ForceReleaseOutcome::WorkspaceColumnClearFailed
+        ForceReleaseOutcome::HeldForRemoteWorker
     ));
     assert_eq!(
         db.get_execution(&id).unwrap().cube_lease_id.as_deref(),
         Some("remote-lease")
     );
     assert!(cube.release_calls.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_a_running_remote_worker_holds_its_lease() {
+    let (_dir, db, id) = remote_fixture();
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let adapter = Arc::new(RemoteReleaseAdapter {
+        calls: Default::default(),
+        fail: false,
+        alive: true,
+    });
+    handler.set_host_adapter_provider(Arc::new(Provider(adapter.clone())));
+    assert!(matches!(
+        handler.force_release(&id).await,
+        ForceReleaseOutcome::HeldForRemoteWorker
+    ));
+    assert!(adapter.calls.lock().unwrap().is_empty());
+    assert!(cube.release_calls.lock().await.is_empty());
+    assert_eq!(
+        db.get_execution(&id).unwrap().cube_lease_id.as_deref(),
+        Some("remote-lease")
+    );
+    let held: bool = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1 AND persona_lease_active = 1)",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(held);
 }

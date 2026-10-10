@@ -18,6 +18,10 @@ async fn adoption_of_dead_registered_worker_preserves_owning_teardown() {
             "BOSS_SESSION_SCHEMA={}\n",
             crate::spawn_flow::TMUX_SESSION_SCHEMA
         )),
+        // Persona restoration checks liveness before adoption checks it again.
+        ok("1"),
+        ok("127"),
+        ok("worker exited"),
         ok("1"),
         ok("127"),
         ok("worker exited"),
@@ -50,7 +54,7 @@ async fn adoption_of_dead_registered_worker_preserves_owning_teardown() {
     assert!(state.live_worker_states.get(1).is_none());
     assert!(pool.claims().await.is_empty());
     assert!(state.work_db.tmux_identity_for_execution(&run).unwrap().is_none());
-    assert_eq!(runner.calls().len(), 9);
+    assert_eq!(runner.calls().len(), 12);
 }
 
 pub(super) async fn answer_detach(state: &ServerState, sink: &SessionSink, slot: u8) {

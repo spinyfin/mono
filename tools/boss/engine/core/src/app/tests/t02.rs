@@ -640,6 +640,20 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
         Some(slot),
         "subsequent hooks must reuse the same virtual slot",
     );
+    server_state
+        .work_db
+        .add_host("zakalwe", "user@zakalwe", 4, &[])
+        .unwrap();
+    server_state
+        .work_db
+        .set_run_remote_pid_for_execution(&execution.id, 4242)
+        .unwrap();
+    server_state
+        .completion_handler
+        .set_host_adapter_provider(Arc::new(ProbeProvider(Arc::new(ProbeAdapter {
+            probe: std::sync::Mutex::new(RemoteProbe::Dead),
+            released_leases: Default::default(),
+        }))));
     let name = server_state.work_db.persona_display_name(&execution.id).unwrap();
     server_state.work_db.cancel_running_execution(&execution.id).unwrap();
     assert_eq!(
@@ -683,7 +697,11 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
         )
         .unwrap();
     assert_eq!(server_state.work_db.persona_display_name(&next.id).unwrap(), name);
-    // A terminal remote execution must release even before any hook allocated
+    server_state
+        .work_db
+        .set_run_remote_pid_for_execution(&next.id, 4243)
+        .unwrap();
+    // A proven-dead terminal remote execution releases before any hook allocated
     // its virtual slot (also the state immediately after an engine restart).
     server_state.work_db.cancel_running_execution(&next.id).unwrap();
     assert_eq!(
@@ -701,6 +719,261 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
         )
         .unwrap();
     assert!(!active);
+}
+
+/// Verdict of the remote pid probe in [`cancelled_remote_worker_release_is_guarded_by_pid_probe`].
+#[derive(Clone, Copy)]
+enum RemoteProbe {
+    Alive,
+    Inconclusive,
+    Dead,
+    DeadOnce,
+}
+
+struct ProbeAdapter {
+    probe: std::sync::Mutex<RemoteProbe>,
+    released_leases: std::sync::Mutex<Vec<String>>,
+}
+
+crate::stub_host_adapter! { ProbeAdapter {
+    fn host_id(&self) -> &str { "zakalwe" }
+    async fn force_release_lease(&self, lease_id: &str, _: Option<&str>) -> anyhow::Result<()> {
+        self.released_leases.lock().unwrap().push(lease_id.to_owned());
+        Ok(())
+    }
+    async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> anyhow::Result<Option<bool>> {
+        let mut probe = self.probe.lock().unwrap();
+        match *probe {
+            RemoteProbe::Alive => Ok(Some(true)),
+            RemoteProbe::Dead => Ok(Some(false)),
+            RemoteProbe::DeadOnce => {
+                *probe = RemoteProbe::Inconclusive;
+                Ok(Some(false))
+            }
+            RemoteProbe::Inconclusive => anyhow::bail!("host unreachable"),
+        }
+    }
+} }
+
+struct ProbeProvider(Arc<ProbeAdapter>);
+
+#[async_trait::async_trait]
+impl crate::host_adapter::HostAdapterProvider for ProbeProvider {
+    async fn adapter_for(
+        &self,
+        _: &crate::host_registry::Host,
+    ) -> anyhow::Result<Arc<dyn crate::host_adapter::HostAdapter>> {
+        Ok(self.0.clone())
+    }
+}
+
+/// Cancelling a running remote worker does not stop its process, so the real
+/// teardown (`force_release` → `ServerState::release_worker_pane`) must keep
+/// the lease, virtual slot, live state and persona held while the pid probe
+/// reports the worker alive or cannot answer, including during terminal-work
+/// sweeps. No-pid reconciliation frees only the persona; positive death
+/// releases the remaining resources.
+#[tokio::test]
+async fn cancelled_remote_worker_release_is_guarded_by_pid_probe() {
+    retained_remote_worker_release(false).await;
+}
+
+#[tokio::test]
+async fn completed_remote_worker_releases_after_exit_and_reuses_persona_without_collision() {
+    retained_remote_worker_release(true).await;
+}
+
+async fn retained_remote_worker_release(completed: bool) {
+    use crate::completion::ForceReleaseOutcome;
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::RequestExecutionInput;
+
+    let (server_state, _dir) = test_server_state();
+    let db = &server_state.work_db;
+    db.add_host("zakalwe", "user@zakalwe", 4, &[]).unwrap();
+    let product = create_test_product_with_repo(db, "p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(db, product.id.clone(), "remote chore");
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let (_, run) = db
+        .start_execution_run_on_host(
+            &execution.id,
+            "worker-1",
+            "repo-1",
+            "lease-1",
+            "ws-1",
+            "/tmp/ws-1",
+            "zakalwe",
+        )
+        .unwrap();
+    db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+        Some(execution.id.clone()),
+        Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+    );
+    dispatch_live_worker_state(&server_state, &event).await;
+    let slot = server_state.worker_registry.slot_for_run(&execution.id).unwrap();
+    let name = db.persona_display_name(&execution.id).unwrap();
+    if completed {
+        db.finish_execution_run(
+            crate::work::FinishExecutionRunInput::builder()
+                .execution_id(&execution.id)
+                .run_id(&run.id)
+                .execution_status(crate::work::ExecutionStatus::Completed)
+                .run_status("completed")
+                .clear_workspace_lease(false)
+                .build(),
+        )
+        .unwrap();
+    } else {
+        db.cancel_running_execution(&execution.id).unwrap();
+    }
+
+    let adapter = Arc::new(ProbeAdapter {
+        probe: std::sync::Mutex::new(RemoteProbe::Alive),
+        released_leases: Default::default(),
+    });
+    server_state
+        .completion_handler
+        .set_host_adapter_provider(Arc::new(ProbeProvider(adapter.clone())));
+
+    let persona_held = || -> bool {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1 AND persona_lease_active = 1)",
+                [&execution.id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    for probe in [RemoteProbe::Alive, RemoteProbe::Inconclusive] {
+        *adapter.probe.lock().unwrap() = probe;
+        assert_eq!(
+            server_state.completion_handler.force_release(&execution.id).await,
+            ForceReleaseOutcome::HeldForRemoteWorker
+        );
+        let mut seen = std::collections::HashSet::new();
+        for pass in 0..2 {
+            let outcome = crate::terminal_work_sweep::run_one_pass(
+                db,
+                &server_state.live_worker_states,
+                server_state.as_ref(),
+                server_state.cube_client.as_ref(),
+                server_state.dispatch_events.as_ref(),
+                &server_state.teardown_registry,
+                &mut seen,
+            )
+            .await;
+            assert_eq!(outcome.pending_confirmation, usize::from(pass == 0));
+            assert_eq!(outcome.reaped, usize::from(pass == 1));
+        }
+        assert_eq!(
+            server_state.release_worker_pane(&execution.id).await,
+            PaneReleaseOutcome::NoLiveWorker
+        );
+        assert_eq!(server_state.worker_registry.slot_for_run(&execution.id), Some(slot));
+        assert!(server_state.live_worker_states.get(slot).is_some());
+        assert!(persona_held());
+        assert_eq!(
+            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
+            Some("lease-1")
+        );
+        assert!(adapter.released_leases.lock().unwrap().is_empty());
+    }
+
+    db.connect()
+        .unwrap()
+        .execute(
+            if completed {
+                "UPDATE work_executions SET finished_at = '1' WHERE id = ?1"
+            } else {
+                "UPDATE work_runs SET remote_pid = NULL WHERE execution_id = ?1"
+            },
+            [&execution.id],
+        )
+        .unwrap();
+    let releaser = ServerStatePaneReleaser::default();
+    releaser.set_server_state(Arc::downgrade(&server_state));
+    crate::remote_lease_reconcile::reconcile_remote_leases(
+        db,
+        &ProbeProvider(adapter.clone()),
+        server_state.dispatch_events.as_ref(),
+        Some(&releaser),
+    )
+    .await;
+    assert_eq!(server_state.worker_registry.slot_for_run(&execution.id), Some(slot));
+    assert!(server_state.live_worker_states.get(slot).is_some());
+    assert!(!persona_held());
+    if !completed {
+        assert!(db.terminal_remote_cleanup_runs().unwrap().is_empty());
+    }
+    assert_eq!(
+        db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
+        Some("lease-1")
+    );
+    db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
+
+    assert_eq!(
+        server_state.live_worker_states.get(slot).unwrap().name,
+        boss_protocol::placeholder_worker_name(&execution.id)
+    );
+    let replacement = create_test_chore_manual(db, product.id, "replacement remote chore");
+    let next = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(replacement.id).build())
+        .unwrap();
+    db.start_execution_run_on_host(
+        &next.id,
+        "worker-2",
+        "repo-1",
+        "lease-2",
+        "ws-2",
+        "/tmp/ws-2",
+        "zakalwe",
+    )
+    .unwrap();
+    let next_event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "claude-sess-2".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+        Some(next.id.clone()),
+        None,
+    );
+    dispatch_live_worker_state(&server_state, &next_event).await;
+    assert_eq!(db.persona_display_name(&next.id).unwrap(), name);
+    // bossctl resolves crew names by case-insensitive equality over this snapshot.
+    let matches: Vec<_> = server_state
+        .live_worker_states
+        .snapshot()
+        .into_iter()
+        .filter(|state| state.name.eq_ignore_ascii_case(name.as_deref().unwrap()))
+        .collect();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].run_id, next.id);
+
+    // A second probe would fail: force_release must carry its first verdict.
+    *adapter.probe.lock().unwrap() = RemoteProbe::DeadOnce;
+    assert!(matches!(
+        server_state.completion_handler.force_release(&execution.id).await,
+        ForceReleaseOutcome::Released { .. }
+    ));
+    assert!(server_state.worker_registry.slot_for_run(&execution.id).is_none());
+    assert!(server_state.live_worker_states.get(slot).is_none());
+    assert!(!persona_held());
+    assert_eq!(db.persona_display_name(&execution.id).unwrap(), name);
+    assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
+    assert_eq!(*adapter.released_leases.lock().unwrap(), ["lease-1"]);
 }
 
 /// A late or duplicate hook for a remote run whose execution has already

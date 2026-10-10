@@ -288,19 +288,8 @@ impl ExecutionCubes for HostRoutedCubes {
             }
             Some(host_id) => host_id.to_owned(),
         };
-        let host = self
-            .work_db
-            .get_host(&host_id)
-            .with_context(|| format!("looking up host '{host_id}' to heartbeat execution {execution_id}"))?
-            .with_context(|| {
-                format!(
-                    "execution {execution_id} is bound to host '{host_id}', which is no longer in the host registry; \
-                     its lease lives on that host's cube and cannot be reached from here"
-                )
-            })?;
-        let adapter = self.provider.adapter_for(&host).await.with_context(|| {
-            format!("building the host adapter for '{host_id}' to heartbeat execution {execution_id}")
-        })?;
+        let adapter =
+            crate::host_adapter::resolve_host_adapter(&self.work_db, self.provider.as_ref(), &host_id).await?;
         Ok(ResolvedExecutionCube {
             cube: Arc::new(HostAdapterCubeClient::new(adapter)),
             host_id,
@@ -901,6 +890,51 @@ async fn run_one_pass_impl(
                 "cube-lease heartbeat: failed to query in-flight executions for DB-fallback sweep",
             );
         }
+    }
+
+    // Terminal remote executions whose worker may still be running: a cancel
+    // makes the execution terminal (so it drops out of the in-flight scan)
+    // but cannot stop the remote process, and `force_release` keeps the lease
+    // held until a pid probe proves death. Keep that retained lease alive
+    // until `remote_lease_reconcile` observes death and clears the lease
+    // columns, at which point the row leaves this set. Runs with no recorded
+    // pid are skipped: they can never be proven dead, so their lease is left
+    // to the cube TTL rather than being kept alive forever.
+    match work_db.terminal_remote_cleanup_runs() {
+        Ok(handles) => {
+            for handle in handles.into_iter().filter(|handle| handle.remote_pid.is_some()) {
+                let Ok(execution) = work_db.get_execution(&handle.execution_id) else {
+                    continue;
+                };
+                let Some(lease_id) = execution.cube_lease_id.as_deref() else {
+                    continue;
+                };
+                let target = HeartbeatTarget {
+                    execution_id: &execution.id,
+                    lease_id,
+                    work_item_id: &execution.work_item_id,
+                    cube_workspace_id: execution.cube_workspace_id.as_deref().unwrap_or(""),
+                };
+                let mut failed_count = 0usize;
+                if heartbeat_one(
+                    &ctx,
+                    &target,
+                    heartbeat_timeout,
+                    &mut outcome.db_fallback_heartbeated,
+                    &mut failed_count,
+                )
+                .await
+                {
+                    tracing::debug!(
+                        execution_id = %execution.id,
+                        lease_id,
+                        "cube-lease heartbeat: kept a retained terminal remote lease alive",
+                    );
+                }
+                outcome.failed += failed_count;
+            }
+        }
+        Err(err) => tracing::warn!(?err, "cube-lease heartbeat: terminal remote lease query failed"),
     }
 
     // Bound the breaker map to executions this pass actually observed as
@@ -1881,6 +1915,9 @@ mod tests {
             "ok event must carry the concrete host id from resolution"
         );
     }
+
+    #[path = "retained_remote_tests.rs"]
+    mod retained_remote_tests;
 
     /// A local execution keeps going to the engine's own cube: host routing
     /// must not disturb the single-host path, which is every deployment

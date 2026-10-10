@@ -383,6 +383,14 @@ pub enum PaneReleaseOutcome {
 #[async_trait]
 pub trait WorkerPaneReleaser: Send + Sync {
     async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome;
+
+    /// Remove a retained live entry's roster name before its persona becomes reusable.
+    async fn forget_persona_name(&self, _run_id: &str) {}
+
+    /// The owning host has positively confirmed this remote worker is gone.
+    async fn release_proven_dead_remote_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        self.release_pane(run_id).await
+    }
 }
 
 /// `WorkerPaneReleaser` that does nothing — used when no app session
@@ -1591,6 +1599,11 @@ pub struct WorkerCompletionHandler {
     /// Resolves remote adapters for structured-output collection at the read
     /// site. Kept optional for local-only tests and installations.
     host_adapter_provider: Arc<std::sync::RwLock<Option<Arc<dyn crate::host_adapter::HostAdapterProvider>>>>,
+    /// Owning-cube resolver shared with the lease heartbeat
+    /// ([`crate::cube_lease_heartbeat::HostRoutedCubes`]); installed together
+    /// with the adapter provider. Until then a remote run fails to resolve
+    /// rather than falling back to the local cube.
+    execution_cubes: Arc<std::sync::RwLock<Option<Arc<dyn crate::cube_lease_heartbeat::ExecutionCubes>>>>,
     /// Clock the auto-nudge debounce guard reads from
     /// ([`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`]). Defaults to the
     /// real wall clock (`Instant::now`) — correct for production, where
@@ -1659,10 +1672,15 @@ struct ConflictSignalPrefetch {
 /// scattered across this function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForceReleaseOutcome {
-    /// No live worker pane was mapped (mid-spawn or already released).
-    /// The cube lease is deliberately left held for the in-flight
-    /// `run_execution` to reap and release once its spawn settles.
+    /// No live worker pane was mapped (mid-spawn or already released). The
+    /// cube lease is deliberately left held for the in-flight `run_execution`
+    /// to reap and release once its spawn settles.
     HeldForInFlightSpawn,
+    /// A remote worker was not proven gone (alive, or its pid probe was
+    /// inconclusive or impossible). The cube lease, persona and live state
+    /// are deliberately left held; `remote_lease_reconcile` releases them
+    /// once a pid probe reports positive death.
+    HeldForRemoteWorker,
     /// The pane was reaped but the execution held no lease columns —
     /// already released by a prior call, or never leased.
     NoLeaseHeld,
@@ -1682,6 +1700,7 @@ impl ForceReleaseOutcome {
     fn label(&self) -> &'static str {
         match self {
             Self::HeldForInFlightSpawn => "held_for_in_flight_spawn",
+            Self::HeldForRemoteWorker => "held_for_remote_worker",
             Self::NoLeaseHeld => "no_lease_held",
             Self::Released { .. } => "released",
             Self::WorkspaceColumnClearFailed => "workspace_column_clear_failed",
@@ -1721,7 +1740,12 @@ impl crate::coordinator::AutomationPreemptor for WorkerCompletionHandler {
     async fn preempt_worker(&self, execution_id: &str) -> PreemptOutcome {
         match self.force_release(execution_id).await {
             ForceReleaseOutcome::Released { .. } | ForceReleaseOutcome::NoLeaseHeld => PreemptOutcome::Released,
-            ForceReleaseOutcome::HeldForInFlightSpawn => PreemptOutcome::MidSpawn,
+            // A remote worker that is not proven gone is still running, so
+            // like a mid-spawn worker nothing was torn down: the caller must
+            // abandon the preemption rather than requeue its work.
+            ForceReleaseOutcome::HeldForInFlightSpawn | ForceReleaseOutcome::HeldForRemoteWorker => {
+                PreemptOutcome::MidSpawn
+            }
             outcome @ (ForceReleaseOutcome::LeaseReleaseFailed { .. }
             | ForceReleaseOutcome::WorkspaceColumnClearFailed) => {
                 tracing::warn!(
