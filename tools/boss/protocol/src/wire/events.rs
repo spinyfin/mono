@@ -1098,6 +1098,12 @@ pub enum FrontendEvent {
     CoordinatorHandoffSet {
         handoff: CoordinatorHandoffView,
     },
+    /// Reply for [`FrontendRequest::ListCoordinatorGuidance`]: one entry
+    /// per product asked about, each carrying the explicit state of its
+    /// `BOSS_COORDINATOR.md` and the commit sha it was resolved at.
+    CoordinatorGuidanceList {
+        guidance: Vec<CoordinatorGuidanceView>,
+    },
     /// Response to [`FrontendRequest::UnpopulateProject`]. `deleted`
     /// carries the ids of tasks soft-deleted; `preserved` carries the
     /// tasks that already had an execution (released and dispatched)

@@ -443,9 +443,12 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // The session handoff is the coordinator's own note to its
         // successor; a worker has no business reading the operator's
         // standing instructions to the coordinator, let alone rewriting
-        // them.
+        // them. Per-product coordinator guidance (`BOSS_COORDINATOR.md`)
+        // is coordinator-facing by construction — it exists precisely so
+        // coordinator vocabulary stays out of every worker's context.
         FrontendRequest::EngineResponse { .. }
         | FrontendRequest::GetCoordinatorHandoff
+        | FrontendRequest::ListCoordinatorGuidance { .. }
         | FrontendRequest::RecreateCoordinator { .. }
         | FrontendRequest::RegisterAppSession
         | FrontendRequest::RegisterCapabilities { .. }

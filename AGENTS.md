@@ -51,6 +51,10 @@ root-cause rule as the section below.
   writes, how the incoming one is briefed, and the three states it can
   report):
   [`tools/boss/docs/coordinator-session-handoff.md`](tools/boss/docs/coordinator-session-handoff.md)
+- Per-product coordinator guidance (`BOSS_COORDINATOR.md` at a product
+  repo's root: coordinator-only rules, how the engine loads them from
+  GitHub, and why they never go in `AGENTS.md`):
+  [`tools/boss/docs/coordinator-product-guidance.md`](tools/boss/docs/coordinator-product-guidance.md)
 - Worker tool environment (why bare `checkleft` resolves to the repo's
   Bazel build in a worker, how the composed `PATH` is sealed across
   driver tool shells, and what that seal does not cover):

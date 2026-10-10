@@ -188,7 +188,7 @@ impl DesignDocsService {
         }
     }
 
-    async fn fetch_with_retry(
+    pub(crate) async fn fetch_with_retry(
         &self,
         owner: &str,
         repo: &str,
@@ -219,7 +219,7 @@ impl DesignDocsService {
     }
 }
 
-enum FetchOk {
+pub(crate) enum FetchOk {
     Body { text: String, etag: Option<String> },
     NotModified,
 }
