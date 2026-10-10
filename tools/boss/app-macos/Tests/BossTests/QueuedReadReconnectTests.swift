@@ -9,6 +9,7 @@ final class QueuedReadReconnectTests: XCTestCase {
         let path = "\(directory)/replay-\(UUID().uuidString).sock"
         defer { unlink(path) }
         let model = ChatViewModel(socketPath: path)
+        model.asyncMarkdownViewerOpener = {}
         let client = model.engine
         let disconnected = expectation(description: "entered reconnect backoff")
         let contentReceived = expectation(description: "viewer received queued guide response")
@@ -62,10 +63,11 @@ final class QueuedReadReconnectTests: XCTestCase {
         XCTAssertEqual(client.queuedReadCountForTesting, 0)
         XCTAssertTrue(droppedRequests.isEmpty)
         XCTAssertNil(model.pendingReviewGuideRequestId)
-        guard case .failed(_, let message) = model.asyncMarkdownViewerVM.state else {
-            return XCTFail("the server's missing-content reply must replace loading")
+        guard case .loaded(_, let markdown, _) = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("the replayed guide response must finish loading")
         }
-        XCTAssertEqual(message, "This review guide is no longer available.")
+        XCTAssertEqual(markdown, "# Reconnected guide")
+        XCTAssertNil(model.workErrorMessage)
     }
 }
 
@@ -127,7 +129,14 @@ private final class QueuedReadSocketServer {
                     if kind == "get_review_guide_content" {
                         let reply: [String: Any] = [
                             "request_id": id,
-                            "payload": ["type": "review_guide_content", "version_id": "version", "content": NSNull()],
+                            "payload": [
+                                "type": "review_guide_content", "version_id": "version",
+                                "content": [
+                                    "id": "version", "series_id": "series", "comparison_id": "comparison",
+                                    "attempt_id": "attempt", "markdown": "# Reconnected guide",
+                                    "content_hash": "hash", "prompt_version": "v1", "generated_at": "2026-01-01",
+                                ],
+                            ],
                         ]
                         guard var data = try? JSONSerialization.data(withJSONObject: reply) else { return }
                         data.append(0x0A)
