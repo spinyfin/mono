@@ -6,11 +6,13 @@ This file is read by the Boss **coordinator** session only, for work on the Boss
 
 When an investigation concerns Boss's own engine history (runs, executions, attention items, dispatch decisions, audit trail), take a **read-only snapshot of the engine state database before briefing an agent**, and point the agent at the snapshot. Never let an agent — background subagent or cube worker — open or query the live engine's `state.db`: the engine holds it open in WAL mode, a reader can block its checkpoints, and anything an agent reads from the live file is volatile by the time it is briefed.
 
-Make the snapshot with SQLite's online backup so it is consistent, into a temp path outside Application Support:
+Make the snapshot yourself, with SQLite's online backup opened read-only so it is consistent and cannot write to the live file, into your scratchpad (not Application Support, and not a shared `/tmp` name):
 
 ```sh
-sqlite3 "$HOME/Library/Application Support/Boss/state.db" ".backup '/tmp/boss-state-snapshot-$(date +%Y%m%dT%H%M%S).db'"
+sqlite3 -readonly "<state root>/state.db" ".backup '<scratchpad>/<unique-name>.db'"
 ```
+
+Subagents cannot take the copy themselves (the Boss data directory is fenced from them). Pass the agent the snapshot path and tell it to open the copy with `?immutable=1`. When denied access, agents fall back to loops of per-item `boss`/`bossctl` calls or log sweeps, which hammers the live engine, so **every brief must explicitly forbid that fallback**: no per-item `boss` or `bossctl` query loops and no log sweeps against the live engine as a substitute for the snapshot.
 
 Put the snapshot path, the time it was taken, and the schema tables of interest in the brief. For provenance questions ("who deleted this row", "which surface changed this"), start from `engine-audit.log` rather than the DB; `tools/boss/docs/forensic-surfaces.md` says what each surface can answer and how long it is retained.
 

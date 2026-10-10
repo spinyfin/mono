@@ -3,8 +3,8 @@
 //!
 //! The coordinator never leases a repo, so this is a GitHub read like a
 //! design doc: GitHub is the source of truth, Boss stores `(repo, path,
-//! ref)` and fetches at read time. The read resolves the default branch,
-//! probes its HEAD sha, and fetches the file *at that sha*, so:
+//! ref)` and fetches at read time. The read probes the default branch's
+//! HEAD sha (`commits/HEAD`), and fetches the file *at that sha*, so:
 //!
 //! * the version the coordinator is acting on is always a concrete sha
 //!   it can be shown and asked about, and
@@ -69,14 +69,12 @@ impl DesignDocsService {
     }
 
     async fn resolve_guidance(&self, owner: &str, repo: &str, owner_repo: &str) -> CoordinatorGuidanceState {
-        // Observe branch renames independently of the Designs listing cache.
-        let default_branch = match self.source.default_branch(owner, repo).await {
-            Ok(branch) => branch,
-            Err(err) => return failed(owner_repo, "resolve the default branch", &err),
-        };
-        let head_sha = match self.source.head_sha(owner, repo, &default_branch).await {
+        // `commits/HEAD` resolves the repo's current default branch server
+        // side, so a rename is observed without a separate default-branch
+        // round trip and without the Designs listing cache.
+        let head_sha = match self.source.head_sha(owner, repo, "HEAD").await {
             Ok(sha) => sha,
-            Err(err) => return failed(owner_repo, &format!("resolve HEAD of `{default_branch}`"), &err),
+            Err(err) => return failed(owner_repo, "resolve HEAD of the default branch", &err),
         };
 
         let key = CacheKey::new(owner, repo, COORDINATOR_GUIDANCE_PATH, head_sha.as_str());
@@ -172,6 +170,7 @@ mod tests {
         shas: Mutex<Vec<&'static str>>,
         blob: Mutex<Result<String, TreeApiError>>,
         head_error: Mutex<Option<TreeApiError>>,
+        head_refs: Mutex<Vec<String>>,
         blob_calls: AtomicUsize,
         head_calls: AtomicUsize,
     }
@@ -183,6 +182,7 @@ mod tests {
                 shas: Mutex::new(vec![SHA_A]),
                 blob: Mutex::new(blob),
                 head_error: Mutex::new(None),
+                head_refs: Mutex::new(Vec::new()),
                 blob_calls: AtomicUsize::new(0),
                 head_calls: AtomicUsize::new(0),
             })
@@ -213,11 +213,7 @@ mod tests {
 
         async fn head_sha(&self, _owner: &str, _repo: &str, git_ref: &str) -> Result<String, TreeApiError> {
             self.head_calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(
-                git_ref,
-                *self.default_branch.lock().unwrap(),
-                "HEAD must use the current default branch"
-            );
+            self.head_refs.lock().unwrap().push(git_ref.to_owned());
             if let Some(err) = self.head_error.lock().unwrap().clone() {
                 return Err(err);
             }
@@ -258,16 +254,20 @@ mod tests {
     const REPO: &str = "git@github.com:spinyfin/mono.git";
 
     #[tokio::test]
-    async fn refresh_observes_a_changed_default_branch_despite_cached_listing() {
+    async fn refresh_observes_a_new_head_despite_cached_listing() {
         let source = FakeSource::with_body("# old rules");
         let service = DesignDocsService::with_source(source.clone());
         service.list_markdown_docs(Some(REPO), false).await;
         assert_eq!(service.peek("spinyfin/mono").unwrap().default_branch, "main");
         service.fetch_coordinator_guidance(Some(REPO)).await;
-        *source.default_branch.lock().unwrap() = "trunk".to_owned();
         *source.shas.lock().unwrap() = vec![SHA_B];
         *source.blob.lock().unwrap() = Ok("# new rules".to_owned());
         let refreshed = service.fetch_coordinator_guidance(Some(REPO)).await;
+        // Guidance asks GitHub for `HEAD`, never a cached branch name.
+        assert_eq!(
+            source.head_refs.lock().unwrap().last().map(String::as_str),
+            Some("HEAD")
+        );
         assert_eq!(refreshed.state.git_ref(), Some(SHA_B));
         assert!(
             matches!(refreshed.state, CoordinatorGuidanceState::Loaded { markdown, .. } if markdown == "# new rules")
@@ -393,7 +393,7 @@ mod tests {
         let CoordinatorGuidanceState::Failed { reason } = fetch.state else {
             panic!("expected Failed, got {:?}", fetch.state);
         };
-        assert!(reason.contains("resolve HEAD of `main`"), "{reason}");
+        assert!(reason.contains("resolve HEAD of the default branch"), "{reason}");
         assert!(reason.contains("not authorized"), "{reason}");
         assert_eq!(source.blob_calls.load(Ordering::SeqCst), 0);
     }
