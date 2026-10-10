@@ -53,7 +53,10 @@ final class EngineClient: @unchecked Sendable {
     /// don't wander off a healthy endpoint just because it dropped).
     private var reachedReady = false
     /// Dedupes termination reports; see [[terminate]]. Socket queue only.
-    private var terminationLatch = ConnectionTerminationLatch<NWConnection>()
+    private var terminationLatch = ConnectionTerminationLatch()
+    /// Generation of the live connection attempt, from `terminationLatch`.
+    private var connectionGeneration = 0
+    private let decodeHook = OSAllocatedUnfairLock<(@Sendable (Data) -> Void)?>(initialState: nil)
 
     /// Thread-safe liveness signal for `EngineProcessController`'s
     /// supervision tick: true only while this connection is `.ready`. Lets
@@ -80,6 +83,7 @@ final class EngineClient: @unchecked Sendable {
     private lazy var handoff = LineDecodeHandoff(
         maxPendingBytes: Self.maxPendingDecodeBytes,
         decode: { [weak self] data, recvNanos in
+            self?.decodeHook.withLock { $0 }?(data)
             self?.decodeLine(data, lineRecvNanos: recvNanos)
         },
         onResume: { [weak self] in
@@ -125,7 +129,7 @@ final class EngineClient: @unchecked Sendable {
 
     /// A byte stream and its scan cursor belong to exactly one connection.
     private func closeConnection() {
-        guard let oldConnection = connection, terminate(oldConnection) else { return }
+        guard let oldConnection = connection, terminate(oldConnection, generation: connectionGeneration) else { return }
         oldConnection.cancel()
         reachableState.withLock { $0 = false }
         if !buffer.isEmpty {
@@ -147,6 +151,8 @@ final class EngineClient: @unchecked Sendable {
         let endpoint = NWEndpoint.unix(path: socketPaths[socketIndex])
         let connection = NWConnection(to: endpoint, using: parameters)
         self.connection = connection
+        let generation = terminationLatch.beginConnection()
+        connectionGeneration = generation
 
         connection.stateUpdateHandler = { [weak self, weak connection] (state: NWConnection.State) in
             guard let self, let connection, self.connection === connection else { return }
@@ -249,8 +255,8 @@ final class EngineClient: @unchecked Sendable {
     /// observe one drop), in which case the caller must do nothing more.
     /// Clears `self.connection` only if it is still the terminated one, so a
     /// late callback never clobbers its replacement.
-    private func terminate(_ connection: NWConnection) -> Bool {
-        guard terminationLatch.markTerminated(connection) else { return false }
+    private func terminate(_ connection: NWConnection, generation: Int) -> Bool {
+        guard terminationLatch.markTerminated(generation) else { return false }
         if self.connection === connection || self.connection == nil {
             self.connection = nil
             reachableState.withLock { $0 = false }
@@ -1234,6 +1240,12 @@ final class EngineClient: @unchecked Sendable {
     /// `emit` privately; tests inject events without a socket.
     func emitForTesting(_ event: EngineEvent) {
         emit(event)
+    }
+
+    /// Runs on the decode queue before each line is decoded; lets a test
+    /// block a specific decode to exercise lifecycle ordering.
+    func setDecodeHookForTesting(_ hook: (@Sendable (Data) -> Void)?) {
+        decodeHook.withLock { $0 = hook }
     }
 
     /// Feed one complete wire envelope through the production decoder.

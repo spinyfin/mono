@@ -114,16 +114,29 @@ struct ReadLoopPauseGate<Connection: AnyObject> {
     var isPaused: Bool { paused != nil }
 }
 
-/// Reports each connection's termination at most once, so the receive path
-/// and the state handler observing the same drop do not both emit a
-/// disconnect. Confined to the socket queue.
-struct ConnectionTerminationLatch<Connection: AnyObject> {
-    private var last: Connection?
+/// Reports each connection attempt's termination at most once, so the
+/// receive path and the state handler observing the same drop do not both
+/// emit a disconnect, and so a late callback from a superseded connection
+/// can never be mistaken for the live one's. Each `beginConnection()`
+/// starts a new generation; only the current generation can terminate, and
+/// only once. State is O(1) — no per-connection history is kept. Confined
+/// to the socket queue.
+struct ConnectionTerminationLatch {
+    private var generation = 0
+    private var terminated = false
 
-    /// Returns `true` the first time `connection` is marked, `false` after.
-    mutating func markTerminated(_ connection: Connection) -> Bool {
-        if let last, last === connection { return false }
-        last = connection
+    /// Starts a new connection attempt, superseding every earlier one.
+    mutating func beginConnection() -> Int {
+        generation += 1
+        terminated = false
+        return generation
+    }
+
+    /// Returns `true` only the first time the current generation is marked;
+    /// `false` for a repeat or for any superseded generation.
+    mutating func markTerminated(_ connectionGeneration: Int) -> Bool {
+        guard connectionGeneration == generation, !terminated else { return false }
+        terminated = true
         return true
     }
 }

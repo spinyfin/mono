@@ -209,15 +209,34 @@ final class ReadLoopPauseGateTests: XCTestCase {
 }
 
 final class ConnectionTerminationLatchTests: XCTestCase {
-    private final class Conn {}
-
     func testReportsEachConnectionOnce() {
-        var latch = ConnectionTerminationLatch<Conn>()
-        let a = Conn()
-        let b = Conn()
+        var latch = ConnectionTerminationLatch()
+        let a = latch.beginConnection()
         XCTAssertTrue(latch.markTerminated(a))
         XCTAssertFalse(latch.markTerminated(a), "duplicate report suppressed")
+        let b = latch.beginConnection()
         XCTAssertTrue(latch.markTerminated(b))
         XCTAssertFalse(latch.markTerminated(b))
+    }
+
+    /// A late callback from an earlier connection must stay rejected even
+    /// after an intervening connection has terminated (a, b, a).
+    func testSupersededConnectionIsRejectedAfterIntervening() {
+        var latch = ConnectionTerminationLatch()
+        let a = latch.beginConnection()
+        XCTAssertTrue(latch.markTerminated(a))
+        let b = latch.beginConnection()
+        XCTAssertTrue(latch.markTerminated(b))
+        XCTAssertFalse(latch.markTerminated(a))
+    }
+
+    /// A superseded connection that never terminated cannot terminate the
+    /// live replacement.
+    func testSupersededConnectionCannotTerminateLiveOne() {
+        var latch = ConnectionTerminationLatch()
+        let a = latch.beginConnection()
+        let b = latch.beginConnection()
+        XCTAssertFalse(latch.markTerminated(a))
+        XCTAssertTrue(latch.markTerminated(b))
     }
 }
