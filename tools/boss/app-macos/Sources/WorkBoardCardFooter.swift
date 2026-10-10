@@ -61,6 +61,14 @@ struct WorkBoardCardFooterSlice: Equatable {
     }
 }
 
+/// Frame (global space) of the rendered short id; lets tests assert its anchor.
+struct ShortIDFramePreferenceKey: PreferenceKey {
+    static let defaultValue: [CGRect] = []
+    static func reduce(value: inout [CGRect], nextValue: () -> [CGRect]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
 /// PR / review / short-id / revision-rollup footer under the badge strip.
 struct WorkBoardCardFooter: View, @MainActor Equatable {
     let slice: WorkBoardCardFooterSlice
@@ -72,6 +80,38 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slice == rhs.slice
+    }
+
+    /// True when a row sits below the PR / badge rows (review status,
+    /// revision-parent PR, or the in-review rollup list).
+    private var hasRowsBelowPRRow: Bool {
+        (slice.hasReviewRow && slice.reviewRequiredState != nil)
+            || (slice.hasRevisionParentPRRow && slice.revisionParentPrUrl != nil)
+            || slice.hasInReviewRevisions
+    }
+
+    /// The id rides on the PR row (or the badge row) only when nothing renders
+    /// below it; otherwise it gets its own trailing row so it always stays the
+    /// bottom-right element of the footer.
+    private var idIsInline: Bool {
+        slice.hasPRRow && slice.prURL != nil && !hasRowsBelowPRRow
+    }
+
+    private func shortIDLabel(_ id: Int) -> some View {
+        Text("T" + String(id))
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: ShortIDFramePreferenceKey.self,
+                        value: [proxy.frame(in: .global)]
+                    )
+                }
+            )
+            .font(.system(.caption2, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("T" + String(id))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
     }
 
     var body: some View {
@@ -101,20 +141,23 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                         ambiguousRepoNames: slice.ambiguousRepoNames
                     )
                     .layoutPriority(1)
-                    if slice.hasInProgressRevision {
+                    Spacer(minLength: 0)
+                    // With a revision badge the id moves to that (bottom) row so
+                    // it stays anchored bottom-right.
+                    if idIsInline, let id = slice.shortID, !slice.hasInProgressRevision {
+                        shortIDLabel(id)
+                    }
+                }
+                if slice.hasInProgressRevision {
+                    HStack(alignment: .center, spacing: 6) {
                         PrInRevisionIndicator(onTap: onRevisionBadgeTap)
                             .onHover { hovering in
                                 onRevisionBadgeHover?(hovering)
                             }
-                    }
-                    Spacer(minLength: 0)
-                    if let id = slice.shortID {
-                        Text("T" + String(id))
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .accessibilityLabel("T" + String(id))
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
+                        Spacer(minLength: 0)
+                        if idIsInline, let id = slice.shortID {
+                            shortIDLabel(id)
+                        }
                     }
                 }
             }
@@ -140,23 +183,18 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                 }
             }
 
-            if slice.hasStandaloneShortID, let id = slice.shortID {
-                HStack {
-                    Spacer(minLength: 0)
-                    Text("T" + String(id))
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("T" + String(id))
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-            }
-
             if slice.hasInReviewRevisions {
                 Divider()
                     .padding(.vertical, 2)
                 ForEach(slice.inReviewRevisions) { revision in
                     RevisionRollupLine(revision: revision)
+                }
+            }
+
+            if !idIsInline, slice.hasPRRow || slice.hasStandaloneShortID, let id = slice.shortID {
+                HStack {
+                    Spacer(minLength: 0)
+                    shortIDLabel(id)
                 }
             }
         }

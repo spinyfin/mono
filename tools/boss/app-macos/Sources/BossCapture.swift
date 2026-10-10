@@ -112,6 +112,15 @@ enum BossWindowCapture {
         guard let window = pickWindow() else {
             throw CaptureError.noWindow
         }
+        try captureWindow(window, to: path)
+    }
+
+    /// Fixture captures must use their own window rather than a startup WindowGroup.
+    @MainActor
+    static func captureWindow(_ window: NSWindow, to path: String) throws {
+        guard BossEnginePaths.isIsolatedInstance else {
+            throw CaptureError.notIsolated
+        }
         // contentView.superview includes the titlebar / unified toolbar.
         // Capturing contentView alone leaves a black band where chrome should be.
         guard let frameView = window.contentView?.superview else {
