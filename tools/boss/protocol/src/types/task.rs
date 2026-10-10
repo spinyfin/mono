@@ -658,13 +658,24 @@ pub struct Task {
     pub created_via: String,
 
     pub description: String,
-    /// `true` when any descendant revision task in the chain has status
-    /// `todo` or `active` — new commits are still incoming, so the PR is
-    /// not safe to merge yet. Derived projection, not stored. Only
-    /// meaningful on chain-root tasks that carry a `pr_url`.
+    /// `true` when any descendant revision task in the chain can still change
+    /// the PR (`TaskStatus::can_still_change_pr`: `todo`, `active` or
+    /// `blocked`) — the same definition the merge-when-ready gate uses, so a
+    /// card shows the badge exactly when merging would warn. Derived
+    /// projection, not stored. Only meaningful on chain-root tasks that carry
+    /// a `pr_url`.
     #[serde(default, skip_serializing_if = "is_false")]
     #[builder(default)]
     pub has_in_progress_revision: bool,
+
+    /// `true` when `has_in_progress_revision` is set and every open
+    /// descendant revision is `blocked` (none is `todo` or `active`). Lets the
+    /// card render the badge as "blocked" rather than as running work.
+    /// Derived projection, not stored; always `false` when
+    /// `has_in_progress_revision` is `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(default)]
+    pub in_revision_blocked_only: bool,
 
     /// `true` when this row's own `work_attachments` (or, for a chain-root
     /// task, any direct revision child's own attachments) are non-empty.

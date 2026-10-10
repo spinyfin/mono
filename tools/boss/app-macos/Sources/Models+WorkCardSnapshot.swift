@@ -119,6 +119,7 @@ struct WorkCardSnapshot: Equatable {
     let revisionSeq: Int?
     let createdVia: String
     let hasInProgressRevision: Bool
+    let inRevisionBlockedOnly: Bool
     let hasAttachments: Bool
     let sourceAutomationId: String?
     /// Engine-origin badge for revision cards (`nil` when operator-driven).
@@ -386,6 +387,7 @@ struct WorkCardSnapshot: Equatable {
             revisionSeq: task.revisionSeq,
             createdVia: task.createdVia,
             hasInProgressRevision: task.hasInProgressRevision,
+            inRevisionBlockedOnly: task.inRevisionBlockedOnly,
             hasAttachments: task.hasAttachments,
             sourceAutomationId: task.sourceAutomationId,
             engineRevisionOrigin: EngineRevisionOrigin(createdVia: task.createdVia),
