@@ -491,7 +491,11 @@ async fn worker_environment_never_launches_an_engine() {
 // Put the target early in the command so even a width-limited ps listing
 // recognizes the fixture as an engine launched through Bazel.
 fn recognizable_engine(script: &str, args: Vec<String>) -> EngineCommand {
-    let mut command_args = vec!["-c".into(), format!(": {ENGINE_BINARY_TARGET}; {script}"), "engine".into()];
+    let mut command_args = vec![
+        "-c".into(),
+        format!(": {ENGINE_BINARY_TARGET}; {script}"),
+        "engine".into(),
+    ];
     command_args.extend(args);
     EngineCommand {
         program: "/bin/sh".into(),

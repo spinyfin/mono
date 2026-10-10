@@ -6,6 +6,8 @@
 //! autostart of the engine binary) lives behind [`Discovery`] so the CLI, tests,
 //! and future TUI/web frontends share one set of rules.
 
+#[cfg(target_os = "macos")]
+mod process_args;
 mod replay;
 mod retry;
 #[cfg(test)]
@@ -756,8 +758,7 @@ async fn wait_for_discovered_engine_until(
                 return Ok(true);
             }
             let another_engine = discovery.endpoint_candidates().into_iter().any(|(_, path)| {
-                running_engine_pid(path)
-                    .is_some_and(|pid| pid != child.id() && is_likely_engine_process(pid))
+                running_engine_pid(path).is_some_and(|pid| pid != child.id() && is_likely_engine_process(pid))
             });
             if another_engine {
                 sleep(Duration::from_millis(100)).await;
@@ -951,6 +952,16 @@ fn clear_pid_file_if_owned(pid_file_path: &str, pid: u32) {
 }
 
 fn is_likely_engine_process(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        process_args::command(pid).is_some_and(|command| is_likely_engine_command(&command))
+    }
+    #[cfg(not(target_os = "macos"))]
+    is_likely_engine_process_with_ps(pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_likely_engine_process_with_ps(pid: u32) -> bool {
     let Ok(output) = Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
