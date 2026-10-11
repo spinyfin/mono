@@ -364,6 +364,85 @@ pub(super) async fn handle_get_settings(ctx: Dispatch, req: FrontendRequest) {
     }
 }
 
+fn offsite_wire(
+    config: &boss_engine_offsite_backup::OffsiteConfig,
+    load_error: Option<String>,
+) -> boss_protocol::OffsiteBackupSettings {
+    boss_protocol::OffsiteBackupSettings {
+        enabled: config.enabled,
+        destination: config
+            .destination
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        keep_hourly: u32::try_from(config.keep_hourly).unwrap_or(u32::MAX),
+        keep_daily: u32::try_from(config.keep_daily).unwrap_or(u32::MAX),
+        load_error,
+    }
+}
+
+pub(super) async fn handle_get_offsite_backup(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetOffsiteBackup = req else {
+        unreachable!()
+    };
+    let settings = match server_state.settings.offsite_config() {
+        Ok(config) => offsite_wire(&config, None),
+        Err(err) => offsite_wire(
+            &boss_engine_offsite_backup::OffsiteConfig::default(),
+            Some(format!("{err:#}")),
+        ),
+    };
+    send_response(&sink, &request_id, FrontendEvent::OffsiteBackupSettings { settings });
+}
+
+pub(super) async fn handle_set_offsite_backup(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::SetOffsiteBackup {
+        enabled,
+        destination,
+        keep_hourly,
+        keep_daily,
+    } = req
+    else {
+        unreachable!()
+    };
+    let config = boss_engine_offsite_backup::OffsiteConfig {
+        enabled,
+        destination: destination
+            .map(|d| d.trim().to_owned())
+            .filter(|d| !d.is_empty())
+            .map(std::path::PathBuf::from),
+        keep_hourly: keep_hourly as usize,
+        keep_daily: keep_daily as usize,
+    };
+    match server_state.settings.set_offsite_config(&config) {
+        Ok(()) => {
+            tracing::info!(
+                enabled,
+                "settings: off-machine backup configured via macOS Settings window"
+            );
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::OffsiteBackupSettings {
+                    settings: offsite_wire(&config, None),
+                },
+            );
+        }
+        Err(err) => send_work_error(&sink, &request_id, format!("{err:#}")),
+    }
+}
+
 pub(super) async fn handle_set_setting(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

@@ -273,6 +273,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::EngineHealthResult { .. }
         | FrontendEvent::SettingsList { .. }
         | FrontendEvent::SettingSet { .. }
+        | FrontendEvent::OffsiteBackupSettings { .. }
         | FrontendEvent::SelectedProductResult { .. }
         | FrontendEvent::SelectedProductReported { .. }
         | FrontendEvent::HostsList { .. }

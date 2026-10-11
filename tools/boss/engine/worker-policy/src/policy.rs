@@ -389,6 +389,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GenerateReviewGuide { .. }
         | FrontendRequest::GetSelectedProduct
         | FrontendRequest::GetSettings
+        | FrontendRequest::GetOffsiteBackup
         | FrontendRequest::GetTaskRuntime { .. }
         | FrontendRequest::InterruptWorkerPane { .. }
         | FrontendRequest::ListEngineAttempts { .. }
@@ -418,6 +419,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::SetFeatureFlag { .. }
         | FrontendRequest::SetLiveStatusEnabled { .. }
         | FrontendRequest::SetSetting { .. }
+        | FrontendRequest::SetOffsiteBackup { .. }
         | FrontendRequest::StopRun { .. }
         | FrontendRequest::Subscribe { .. }
         | FrontendRequest::TailRunTranscript { .. }

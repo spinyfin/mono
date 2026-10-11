@@ -24,6 +24,9 @@ use boss_metrics::Registry;
 /// at the first increment (design §"Risks / open questions" item 6).
 pub fn init_all(registry: &Registry) {
     crate::work::personas::register_metrics(registry);
+    // Off-machine state.db backup copies: success/failure counters and the
+    // last-success-age staleness gauge.
+    crate::database_backup::register_metrics(registry);
     // Question → answer-agent lifecycle counters and queue-wait histogram.
     crate::answer_agent_observability::register_metrics(registry);
     // Phase 3: PR URL capture path counters.
@@ -103,6 +106,12 @@ mod tests {
                 "cube_workspace_lease.attempts",
                 "cube_workspace_lease.failure",
                 "cube_workspace_lease.success",
+                "database_backup.offsite.config_invalid",
+                "database_backup.offsite.copies_failed",
+                "database_backup.offsite.copies_skipped",
+                "database_backup.offsite.copies_succeeded",
+                "database_backup.offsite.retention_failed",
+                "database_backup.offsite.success_record_failed",
                 "dispatch.completed",
                 "dispatcher.hook_events.dropped_missing_run_id",
                 "dispatcher.hook_events.for_terminal_execution",
@@ -211,6 +220,7 @@ mod tests {
         assert_eq!(
             gauge_names,
             vec![
+                "database_backup.offsite.last_success_age_secs",
                 "dependency_unblock.longest_stale_seconds",
                 "dispatch.drain_pass_duration_ms",
                 "dispatch.queue_depth.automation",

@@ -18,6 +18,13 @@
 //! | `BOSS_BACKUP_INTERVAL_SECS` | `3600` | Seconds between backups |
 //! | `BOSS_BACKUP_RETENTION` | `24` | Maximum backups to keep |
 //!
+//! ## Off-machine copies
+//!
+//! Optionally, each finished snapshot is also copied into a user-configured
+//! destination directory that a sync agent replicates off the machine. See
+//! [`OffsiteRuntime`] and `tools/boss/docs/offsite-backups.md`. It is off by
+//! default and configured in the `[backup.offsite]` table of `settings.toml`.
+//!
 //! ## Non-fatal by construction
 //!
 //! Like [`boss_engine_recovery::recovery_backup`], every failure mode is logged and
@@ -29,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use boss_engine_offsite_backup::BACKUP_FILE_PREFIX;
 
 use crate::work::WorkDb;
 
@@ -44,7 +52,7 @@ pub const DEFAULT_BACKUP_INTERVAL: Duration = Duration::from_secs(3600);
 /// Default retention: 24 most-recent backups.
 pub const DEFAULT_RETENTION_COUNT: usize = 24;
 
-const BACKUP_FILE_PREFIX: &str = "state.db.bak-";
+pub use crate::offsite_runtime::{OffsiteRuntime, register_metrics};
 
 /// Resolve the backup directory: `BOSS_BACKUP_DIR` override wins, then
 /// `<state_root>/backups`.
@@ -154,6 +162,18 @@ fn utc_timestamp() -> String {
 /// In-memory databases are silently skipped. All other failures are
 /// logged at `warn` and swallowed so the caller's main flow is unaffected.
 pub fn run_backup(work_db: &WorkDb, backup_dir: &Path, retention: usize) {
+    run_backup_with_offsite(work_db, backup_dir, retention, None);
+}
+
+/// [`run_backup`], additionally copying the finished snapshot off-machine
+/// when `offsite` is set. An off-machine failure never affects the local
+/// backup or its retention.
+pub fn run_backup_with_offsite(
+    work_db: &WorkDb,
+    backup_dir: &Path,
+    retention: usize,
+    offsite: Option<&Arc<OffsiteRuntime>>,
+) {
     if work_db.is_in_memory() {
         return;
     }
@@ -169,14 +189,24 @@ pub fn run_backup(work_db: &WorkDb, backup_dir: &Path, retention: usize) {
                 error = %format!("{err:#}"),
                 "database-backup: snapshot failed (non-fatal)",
             );
+            if let Some(offsite) = offsite {
+                // No fresh snapshot to ship: keep the staleness gauge honest.
+                offsite.refresh_age_gauge();
+            }
             return;
         }
     }
+    // Open before retention: with a low (or zero) retention the path may be
+    // unlinked before the async worker starts, but an open handle stays valid.
+    let pending = offsite.and_then(|offsite| offsite.open_snapshot(&dest));
     if let Err(err) = apply_retention(backup_dir, retention) {
         tracing::warn!(
             error = %format!("{err:#}"),
             "database-backup: retention enforcement failed (non-fatal)",
         );
+    }
+    if let (Some(offsite), Some(pending)) = (offsite, pending) {
+        offsite.submit(pending);
     }
 }
 
@@ -191,14 +221,29 @@ pub fn spawn_loop(
     backup_dir: PathBuf,
     interval: Duration,
     retention: usize,
+    offsite: Option<Arc<OffsiteRuntime>>,
 ) -> tokio::task::JoinHandle<()> {
+    if let Some(offsite) = offsite.clone() {
+        offsite.validate_at_startup();
+        // Keep the staleness gauge climbing between backups so a wedged
+        // loop is still visible.
+        tokio::spawn(async move {
+            loop {
+                offsite.refresh_age_gauge();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
     tokio::spawn(async move {
         loop {
             let db = work_db.clone();
             let dir = backup_dir.clone();
-            tokio::task::spawn_blocking(move || run_backup(db.as_ref(), &dir, retention))
-                .await
-                .ok();
+            let offsite = offsite.clone();
+            tokio::task::spawn_blocking(move || {
+                run_backup_with_offsite(db.as_ref(), &dir, retention, offsite.as_ref())
+            })
+            .await
+            .ok();
             tokio::time::sleep(interval).await;
         }
     })

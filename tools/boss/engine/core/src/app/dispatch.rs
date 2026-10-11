@@ -127,6 +127,7 @@ pub(super) async fn dispatch_request(mut ctx: Dispatch, request: FrontendRequest
         r @ FrontendRequest::GetDecision { .. } => Box::pin(decisions::handle_get_decision(ctx, r)),
         r @ FrontendRequest::GetDispatchConcurrency => Box::pin(engine_meta::handle_get_dispatch_concurrency(ctx, r)),
         r @ FrontendRequest::GetDispatchState => Box::pin(engine_meta::handle_get_dispatch_state(ctx, r)),
+        r @ FrontendRequest::GetOffsiteBackup => Box::pin(engine_meta::handle_get_offsite_backup(ctx, r)),
         r @ FrontendRequest::GetEngineHealth => Box::pin(engine_meta::handle_get_engine_health(ctx, r)),
         r @ FrontendRequest::GetEngineVersion => Box::pin(engine_meta::handle_get_engine_version(ctx, r)),
         r @ FrontendRequest::GetExecution { .. } => Box::pin(executions::handle_get_execution(ctx, r)),
@@ -284,6 +285,7 @@ pub(super) async fn dispatch_request(mut ctx: Dispatch, request: FrontendRequest
         r @ FrontendRequest::SetDriverTrafficSplit { .. } => {
             Box::pin(engine_meta::handle_set_driver_traffic_split(ctx, r))
         }
+        r @ FrontendRequest::SetOffsiteBackup { .. } => Box::pin(engine_meta::handle_set_offsite_backup(ctx, r)),
         r @ FrontendRequest::SetDispatchConcurrency { .. } => {
             Box::pin(engine_meta::handle_set_dispatch_concurrency(ctx, r))
         }

@@ -1591,6 +1591,19 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "settings_list",
         },
         TagCase {
+            label: "OffsiteBackupSettings",
+            event: FrontendEvent::OffsiteBackupSettings {
+                settings: OffsiteBackupSettings {
+                    enabled: true,
+                    destination: Some("/mnt/sync".into()),
+                    keep_hourly: 24,
+                    keep_daily: 14,
+                    load_error: None,
+                },
+            },
+            expected_tag: "offsite_backup_settings",
+        },
+        TagCase {
             label: "SettingSet",
             event: FrontendEvent::SettingSet {
                 key: "some_setting".into(),
@@ -2263,6 +2276,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::EngineHealthResult { .. }
         | FrontendEvent::SettingsList { .. }
         | FrontendEvent::SettingSet { .. }
+        | FrontendEvent::OffsiteBackupSettings { .. }
         | FrontendEvent::HostsList { .. }
         | FrontendEvent::HostResult { .. }
         | FrontendEvent::HostUpdated { .. }

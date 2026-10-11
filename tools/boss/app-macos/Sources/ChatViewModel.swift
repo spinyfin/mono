@@ -415,6 +415,11 @@ final class ChatViewModel: ObservableObject {
     /// first opened in this session.
     @Published var engineSettings: [EngineSetting] = []
 
+    /// Persisted off-machine backup configuration, from `get_offsite_backup`
+    /// on Settings open and `offsite_backup_settings` after each save. `nil`
+    /// until the engine first answers.
+    @Published var offsiteBackup: OffsiteBackupSettings?
+
     /// All registered hosts, populated by `list_hosts` on Settings-pane
     /// appear and updated in-place by `host_result`, `host_updated`, and
     /// `host_removed` responses.

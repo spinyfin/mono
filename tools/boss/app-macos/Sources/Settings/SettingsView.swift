@@ -21,6 +21,10 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Engine", systemImage: "gearshape")
                 }
+            BackupSettingsPane()
+                .tabItem {
+                    Label("Backups", systemImage: "externaldrive.badge.icloud")
+                }
             HostRegistryPane()
                 .tabItem {
                     Label("Hosts", systemImage: "server.rack")
@@ -41,6 +45,7 @@ struct SettingsView: View {
         .environmentObject(chatModel)
         .onAppear {
             chatModel.refreshSettings()
+            chatModel.refreshOffsiteBackup()
             // Engine health is fetched on every reconnect, but the
             // user may open Settings against a long-lived session
             // where the API-key state changed (a restart with a new

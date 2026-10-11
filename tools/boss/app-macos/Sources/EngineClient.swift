@@ -883,6 +883,14 @@ final class EngineClient: @unchecked Sendable {
             let raw = payload["settings"] as? [[String: Any]] ?? []
             let settings = raw.compactMap(parseEngineSetting)
             emit(.settingsList(settings: settings))
+        case "offsite_backup_settings":
+            emit(.offsiteBackupSettings(OffsiteBackupSettings(
+                enabled: (payload["enabled"] as? NSNumber)?.boolValue ?? false,
+                destination: payload["destination"] as? String,
+                keepHourly: (payload["keep_hourly"] as? NSNumber)?.intValue ?? OffsiteBackupSettings.defaultKeepHourly,
+                keepDaily: (payload["keep_daily"] as? NSNumber)?.intValue ?? OffsiteBackupSettings.defaultKeepDaily,
+                loadError: payload["load_error"] as? String
+            )))
         case "setting_set":
             let key = payload["key"] as? String ?? ""
             let enabled = (payload["enabled"] as? NSNumber)?.boolValue ?? false

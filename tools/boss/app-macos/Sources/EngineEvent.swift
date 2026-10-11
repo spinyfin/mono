@@ -197,6 +197,9 @@ enum EngineEvent {
     /// persisted the new value. The Settings window uses this as the
     /// "saved" signal.
     case settingSet(key: String, enabled: Bool)
+    /// Response to `get_offsite_backup` and `set_offsite_backup` — the
+    /// persisted `[backup.offsite]` configuration.
+    case offsiteBackupSettings(OffsiteBackupSettings)
     /// Response to `list_hosts` — all registered hosts with capabilities.
     case hostsList(hosts: [EngineHost])
     /// Response to `add_host` or `get_host` — one host with capabilities.

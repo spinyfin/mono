@@ -146,6 +146,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::GetExecution { .. }
         | FrontendRequest::GetHost { .. }
         | FrontendRequest::GetIdea { .. }
+        | FrontendRequest::GetOffsiteBackup
         | FrontendRequest::GetPrBody { .. }
         | FrontendRequest::GetProductDesignDoc { .. }
         | FrontendRequest::GetPrStatus { .. }
@@ -216,6 +217,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::SetDispatchPaused { .. }
         | FrontendRequest::SetDriverTrafficSplit { .. }
         | FrontendRequest::SetFeatureFlag { .. }
+        | FrontendRequest::SetOffsiteBackup { .. }
         | FrontendRequest::SetHostEnabled { .. }
         | FrontendRequest::SetLiveStatusEnabled { .. }
         | FrontendRequest::SetProductDefaultDriver { .. }
