@@ -158,7 +158,13 @@ async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn saturated_reads_return_busy_over_the_wire_while_status_works() {
-    let (state, _dir) = crate::app::tests::test_server_state();
+    // An explicit small budget: the production defaults wait far longer
+    // than this test's two-second bound before answering busy.
+    let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
+        crate::app::ServerStateOverrides::builder()
+            .read_admission(Arc::new(ReadAdmission::new(32, 16, 128, Duration::from_millis(500))))
+            .build(),
+    );
     // Hold every real admission slot, deterministically modelling slow reads.
     let mut held = Vec::new();
     for _ in 0..state.read_admission.active.available_permits() {
