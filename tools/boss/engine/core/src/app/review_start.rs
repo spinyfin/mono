@@ -57,6 +57,19 @@ async fn handle_trigger_pr_review_with<F, Fut>(
                 .collect(),
             None => matches,
         };
+        let matches = match collapse_to_cycle_roots(&work_db, matches) {
+            Ok(matches) => matches,
+            Err(err) => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    },
+                );
+                return;
+            }
+        };
         let owner = match matches.len() {
             0 => {
                 let scope = repo
@@ -72,13 +85,17 @@ async fn handle_trigger_pr_review_with<F, Fut>(
                 );
                 return;
             }
-            1 => matches.into_iter().next().expect("len checked == 1").owner,
+            1 => matches.into_iter().next().expect("len checked == 1"),
             n => {
+                let urls: Vec<&str> = matches.iter().filter_map(|owner| owner.pr_url.as_deref()).collect();
                 send_response(
                     &sink,
                     &request_id,
                     FrontendEvent::WorkError {
-                        message: format!("PR #{pr_number} is ambiguous across {n} repos — pass --repo to disambiguate"),
+                        message: format!(
+                            "PR #{pr_number} is ambiguous across {n} repos ({}) — pass --repo to disambiguate",
+                            urls.join(", ")
+                        ),
                     },
                 );
                 return;
@@ -150,6 +167,33 @@ async fn handle_trigger_pr_review_with<F, Fut>(
             }
         }
     }
+}
+
+/// Collapse work items sharing one PR to that PR's review-cycle root.
+///
+/// A task and its revisions all carry the same `pr_url`, but review batches
+/// are keyed on the non-revision chain root, so several matches for one
+/// (repo, PR) are one target, not an ambiguity. Only matches resolving to
+/// different roots remain as candidates.
+fn collapse_to_cycle_roots(
+    work_db: &crate::work::WorkDb,
+    matches: Vec<crate::work::PrWorkItemMatch>,
+) -> anyhow::Result<Vec<Task>> {
+    let mut by_root: Vec<(String, Task)> = Vec::new();
+    for found in matches {
+        let owner = found.owner;
+        let root_id = work_db.resolve_review_cycle_root(&owner.id)?;
+        match by_root.iter_mut().find(|(id, _)| *id == root_id) {
+            // Prefer the root itself over a revision as the representative.
+            Some((_, existing)) => {
+                if owner.id == root_id {
+                    *existing = owner;
+                }
+            }
+            None => by_root.push((root_id, owner)),
+        }
+    }
+    Ok(by_root.into_iter().map(|(_, owner)| owner).collect())
 }
 
 /// One admitted batch and whether it was freshly created or reused, carrying

@@ -587,12 +587,36 @@ async fn repo_substring_disambiguates_identical_pr_numbers() {
     let second = seed(&state, "example/second", 42);
     rejected(
         request(&state, 42, None, Ok(metadata("head"))).await,
-        "ambiguous across 2 repos",
+        "ambiguous across 2 repos (https://github.com/example/first/pull/42, https://github.com/example/second/pull/42)",
     );
     let execution = triggered(request(&state, 42, Some("second"), Ok(metadata("head"))).await);
     assert_eq!(execution.work_item_id, second);
     assert!(state.work_db.review_batches_for_cycle_root(&first).unwrap().is_empty());
     assert_eq!(state.work_db.review_batches_for_cycle_root(&second).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pr_shared_by_task_and_revision_resolves_to_cycle_root() {
+    let (state, _dir) = state(true);
+    let root = seed(&state, "example/repo", 42);
+    let pr_url = "https://github.com/example/repo/pull/42";
+    {
+        let conn = state.work_db.connect().unwrap();
+        let product_id: String = conn
+            .query_row("SELECT product_id FROM tasks WHERE id = ?1", [&root], |row| row.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, kind, name, description, status, pr_url, \
+             created_at, updated_at, parent_task_id) \
+             VALUES ('rev-shared', ?1, 'revision', 'review finding', '', 'active', ?2, \
+             '2026-01-01', '2026-01-01', ?3)",
+            rusqlite::params![product_id, pr_url, root],
+        )
+        .unwrap();
+    }
+    let execution = triggered(request(&state, 42, Some("example/repo"), Ok(metadata("head"))).await);
+    assert_eq!(execution.work_item_id, root);
+    assert_eq!(state.work_db.review_batches_for_cycle_root(&root).unwrap().len(), 1);
 }
 
 #[tokio::test]
