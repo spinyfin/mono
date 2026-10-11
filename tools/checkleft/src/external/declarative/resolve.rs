@@ -418,27 +418,36 @@ fn override_npm_binding(name: &str, requirement: &BinaryRequirement, npm: &toml:
     }
 }
 
+/// Construct provisioning commands with canonical startup flags and environment.
+pub(super) fn bazel_resolve_command(repo_root: &Path, launcher: &Path, target: &str, build: bool) -> Command {
+    let mut command = Command::new(crate::external::environment::locate(launcher));
+    command
+        .args(super::ci_bazel_startup_flags())
+        .arg(if build { "build" } else { "cquery" })
+        .args(["--color=no", "--curses=no", "--noshow_progress"]);
+    if build {
+        command
+            .args(["--show_result=0", "--ui_event_filters=-info"])
+            .arg(target);
+    } else {
+        command
+            .arg(target)
+            .arg("--output=starlark")
+            .arg("--starlark:expr=target.files_to_run.executable.path if target.files_to_run.executable else ''");
+    }
+    command.current_dir(repo_root);
+    command
+}
+
 /// Builds `target` and resolves its executable path via `bazel cquery --output=starlark`.
 /// Returns an absolute path to the built binary.
-///
-/// `pub(crate)` so tests can call it directly (gated e2e, parity).
 pub(crate) fn resolve_bazel_target_executable(
     repo_root: &Path,
     target: &str,
     check_id: &str,
     deadline: CheckDeadline,
 ) -> Result<PathBuf> {
-    let mut build = Command::new(crate::external::environment::locate(Path::new("bazel")));
-    build
-        .args(super::ci_bazel_startup_flags())
-        .arg("build")
-        .arg("--color=no")
-        .arg("--curses=no")
-        .arg("--noshow_progress")
-        .arg("--show_result=0")
-        .arg("--ui_event_filters=-info")
-        .arg(target)
-        .current_dir(repo_root);
+    let mut build = bazel_resolve_command(repo_root, Path::new("bazel"), target, true);
     let build_output = output_with_timeout(
         &mut build,
         check_id,
@@ -455,17 +464,7 @@ pub(crate) fn resolve_bazel_target_executable(
         );
     }
 
-    let mut cquery = Command::new(crate::external::environment::locate(Path::new("bazel")));
-    cquery
-        .args(super::ci_bazel_startup_flags())
-        .arg("cquery")
-        .arg("--color=no")
-        .arg("--curses=no")
-        .arg("--noshow_progress")
-        .arg(target)
-        .arg("--output=starlark")
-        .arg("--starlark:expr=target.files_to_run.executable.path if target.files_to_run.executable else ''")
-        .current_dir(repo_root);
+    let mut cquery = bazel_resolve_command(repo_root, Path::new("bazel"), target, false);
     let cquery_output = output_with_timeout(
         &mut cquery,
         check_id,

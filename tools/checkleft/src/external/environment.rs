@@ -25,31 +25,43 @@ pub(crate) fn is_bazel_launcher(program: &Path) -> bool {
         .is_some_and(|name| name == "bazel" || name == "bazelisk")
 }
 
-/// Bazel launchers keep the caller's exact environment and arguments so server
-/// and cache keys match ordinary builds. Only the Bazelisk version selection is
-/// pinned, so `~/.bazeliskrc` cannot override the repository's `.bazelversion`.
-fn prepare_bazel(
-    command: &mut Command,
-    declared: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
-    home: tempfile::TempDir,
-) -> Result<tempfile::TempDir> {
-    let pinned = command
+/// Match Bazelisk's workspace version precedence.
+fn repo_bazel_version(root: &Path) -> Option<String> {
+    let rc = std::fs::read_to_string(root.join(".bazeliskrc")).unwrap_or_default();
+    rc.lines()
+        .filter_map(|line| line.trim().split_once('='))
+        .filter(|(key, _)| key.trim() == "USE_BAZEL_VERSION")
+        .map(|(_, value)| value.trim().to_owned())
+        .rfind(|value| !value.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string(root.join(".bazelversion"))
+                .ok()?
+                .lines()
+                .next()
+                .map(|line| line.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+/// Keep the caller's environment and caches; reject conflicting version selectors.
+fn prepare_bazel(command: &mut Command, home: tempfile::TempDir) -> Result<tempfile::TempDir> {
+    let root = command
         .get_current_dir()
-        .map(|dir| dir.join(".bazelversion"))
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| text.lines().next().map(|line| line.trim().to_owned()))
-        .filter(|version| !version.is_empty());
-    if let Some(version) = pinned
-        && std::env::var_os("USE_BAZEL_VERSION").is_none()
-    {
-        command.env("USE_BAZEL_VERSION", version);
-    }
-    for (key, value) in declared {
-        if let Some(value) = value {
-            command.env(key, value);
-        } else {
-            command.env_remove(key);
+        .map(Path::to_owned)
+        .unwrap_or(std::env::current_dir()?);
+    if let Some(version) = repo_bazel_version(&root) {
+        let inherited = command
+            .get_envs()
+            .find(|(key, _)| *key == "USE_BAZEL_VERSION")
+            .map(|(_, value)| value.map(|v| v.to_owned()))
+            .unwrap_or_else(|| std::env::var_os("USE_BAZEL_VERSION"));
+        if let Some(value) = inherited {
+            anyhow::ensure!(
+                value == version.as_str(),
+                "USE_BAZEL_VERSION={value:?} conflicts with repository Bazel pin {version}; unset USE_BAZEL_VERSION or set it to {version} before running checkleft"
+            );
         }
+        command.env("USE_BAZEL_VERSION", version);
     }
     Ok(home)
 }
@@ -74,7 +86,7 @@ pub(crate) fn prepare(command: &mut Command) -> Result<tempfile::TempDir> {
     ]);
     let bazel = is_bazel_launcher(program);
     if bazel {
-        return prepare_bazel(command, declared, home);
+        return prepare_bazel(command, home);
     }
     let npm = program.file_name().is_some_and(|name| name == "npx");
     command
@@ -149,40 +161,6 @@ mod tests {
         assert!(is_bazel_launcher(Path::new("/x/bazel")));
         assert!(is_bazel_launcher(Path::new("bazelisk")));
         assert!(!is_bazel_launcher(Path::new("npx")));
-    }
-
-    #[test]
-    fn bazel_keeps_caller_env_and_args_and_pins_repo_version() {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join(".bazelversion"), "7.4.1\n").unwrap();
-        let mut command = Command::new("/usr/bin/bazel");
-        command.args(["--max_idle_secs=5", "build"]).current_dir(repo.path());
-        let _home = prepare(&mut command).unwrap();
-        let args: Vec<_> = command.get_args().collect();
-        assert_eq!(args, ["--max_idle_secs=5", "build"]);
-        let envs = envs(&command);
-        // Nothing rewritten: PATH, HOME, locale and TZ come from the caller.
-        for key in ["PATH", "HOME", "LC_ALL", "LANG", "TZ", "XDG_CACHE_HOME"] {
-            assert!(!envs.contains_key(key), "{key} must not be overridden");
-        }
-        assert!(command.get_envs().count() == 1 || std::env::var_os("USE_BAZEL_VERSION").is_some());
-        if std::env::var_os("USE_BAZEL_VERSION").is_none() {
-            assert_eq!(envs["USE_BAZEL_VERSION"].as_deref(), Some("7.4.1"));
-        }
-    }
-
-    #[test]
-    fn hostile_bazeliskrc_cannot_override_repo_pin() {
-        // The pin is an explicit env var, which Bazelisk ranks above any rc file.
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join(".bazelversion"), "8.0.0").unwrap();
-        let mut command = Command::new("bazelisk");
-        command.current_dir(repo.path());
-        let _home = prepare(&mut command).unwrap();
-        if std::env::var_os("USE_BAZEL_VERSION").is_none() {
-            assert_eq!(envs(&command)["USE_BAZEL_VERSION"].as_deref(), Some("8.0.0"));
-        }
-        assert!(!envs(&command).contains_key("HOME"));
     }
 
     #[test]

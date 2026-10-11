@@ -894,6 +894,10 @@ fn extract_config_string_values(config: &toml::Value) -> BTreeMap<String, String
         .collect()
 }
 
+#[cfg(test)]
+#[path = "tests_bazel_environment.rs"]
+mod bazel_environment_tests;
+
 struct InvocationOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -909,14 +913,11 @@ struct CheckExecutionContext<'a> {
     binaries: Option<&'a BTreeMap<String, resolve::ResolvedBinary>>,
 }
 
-fn spawn(
-    context: CheckExecutionContext<'_>,
-    binary: &Path,
-    args: &[String],
-    invocation_id: &str,
-) -> Result<InvocationOutput> {
+fn invocation_command(context: CheckExecutionContext<'_>, binary: &Path, args: &[String]) -> Result<Command> {
     let mut command = Command::new(crate::external::environment::locate(binary));
-    if let Some(binaries) = context.binaries {
+    if !crate::external::environment::is_bazel_launcher(Path::new(command.get_program()))
+        && let Some(binaries) = context.binaries
+    {
         let mut paths = Vec::new();
         if let Some(parent) = Path::new(command.get_program()).parent().filter(|p| p.is_absolute()) {
             paths.push(parent.to_owned());
@@ -946,6 +947,16 @@ fn spawn(
         }
     }
     command.args(args).current_dir(context.repo_root);
+    Ok(command)
+}
+
+fn spawn(
+    context: CheckExecutionContext<'_>,
+    binary: &Path,
+    args: &[String],
+    invocation_id: &str,
+) -> Result<InvocationOutput> {
+    let mut command = invocation_command(context, binary, args)?;
     let output = output_with_timeout(
         &mut command,
         context.check_id,
