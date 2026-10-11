@@ -17,6 +17,13 @@ pub enum Event {
         host_id: String,
         pool_claim: Option<String>,
     },
+    /// A reconciler moved a not-yet-started execution between `queued`,
+    /// `ready` and `waiting_dependency`. `status` is the new status.
+    ExecutionStatusChanged {
+        execution_id: String,
+        task_id: String,
+        status: String,
+    },
     /// The merge poller confirmed a PR merge.
     PrMerged { pr_url: String, task_id: String },
     /// A host was marked offline/disabled.
@@ -49,6 +56,7 @@ pub enum EventKind {
     TaskTerminal,
     ProjectImplDrained,
     ExecutionTerminal,
+    ExecutionStatusChanged,
     PrMerged,
     HostDisabled,
     DependencyPrereqsSatisfied,
@@ -71,6 +79,7 @@ impl EventKind {
             EventKind::TaskTerminal => "task_terminal",
             EventKind::ProjectImplDrained => "project_impl_drained",
             EventKind::ExecutionTerminal => "execution_terminal",
+            EventKind::ExecutionStatusChanged => "execution_status_changed",
             EventKind::PrMerged => "pr_merged",
             EventKind::HostDisabled => "host_disabled",
             EventKind::DependencyPrereqsSatisfied => "dependency_prereqs_satisfied",
@@ -91,6 +100,7 @@ impl Event {
             Event::TaskTerminal { .. } => EventKind::TaskTerminal,
             Event::ProjectImplDrained { .. } => EventKind::ProjectImplDrained,
             Event::ExecutionTerminal { .. } => EventKind::ExecutionTerminal,
+            Event::ExecutionStatusChanged { .. } => EventKind::ExecutionStatusChanged,
             Event::PrMerged { .. } => EventKind::PrMerged,
             Event::HostDisabled { .. } => EventKind::HostDisabled,
             Event::DependencyPrereqsSatisfied { .. } => EventKind::DependencyPrereqsSatisfied,
@@ -117,6 +127,7 @@ impl Event {
             Event::TaskTerminal { task_id, .. } => task_id.clone(),
             Event::ProjectImplDrained { project_id } => project_id.clone(),
             Event::ExecutionTerminal { execution_id, .. } => execution_id.clone(),
+            Event::ExecutionStatusChanged { execution_id, .. } => execution_id.clone(),
             Event::PrMerged { pr_url, .. } => pr_url.clone(),
             Event::HostDisabled { host_id } => host_id.clone(),
             Event::DependencyPrereqsSatisfied { task_id } => task_id.clone(),

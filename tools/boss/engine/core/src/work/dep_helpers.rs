@@ -769,6 +769,10 @@ pub(crate) fn cascade_dependents_after_prereq_status_change(
     new_prereq_status: &str,
     now_epoch: &str,
 ) -> Result<()> {
+    // A conflict fix parks same-chain writers whose tasks are not `blocked`
+    // (restarted `in_review`, released `active`), so the dependents walk below
+    // never visits them; wake them directly.
+    super::revision_sequencing::wake_writers_after_conflict_change(pending, conn, prereq_id)?;
     // Fire the cascade when the prereq reaches any status that *might*
     // satisfy at least one class of dependent:
     //   - `done` / `archived` satisfy all dependents (standard rule).

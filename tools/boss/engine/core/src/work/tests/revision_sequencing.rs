@@ -230,8 +230,30 @@ fn released_writer_claim_stays_behind_conflict_revision() {
     );
     assert!(deps::gating_prereqs_for(&conn, &conflict.id).unwrap().is_empty());
     drop(conn);
+    // The re-claim must be refused: a claimed row counts as a live writer and
+    // would otherwise switch the gate off before dispatch checks it.
+    assert_eq!(
+        db.claim_execution_for_dispatch(&writer_exec.id).unwrap(),
+        DispatchClaimOutcome::Rejected
+    );
+    assert_eq!(
+        db.get_execution(&writer_exec.id).unwrap().status,
+        ExecutionStatus::WaitingDependency
+    );
     finish(&db, &conflict);
     assert!(db.gating_prereqs_for(&writer.id).unwrap().is_empty());
+    assert_eq!(
+        db.promote_todo_autostart_stuck_executions().unwrap(),
+        vec![writer.id.clone()]
+    );
+    assert_eq!(
+        db.get_execution(&writer_exec.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+    assert_eq!(
+        db.claim_execution_for_dispatch(&writer_exec.id).unwrap(),
+        DispatchClaimOutcome::Won
+    );
 }
 
 #[test]
@@ -254,6 +276,17 @@ fn failed_writer_retry_stays_behind_conflict_revision() {
         vec![conflict.id.clone()]
     );
     assert!(deps::gating_prereqs_for(&conn, &conflict.id).unwrap().is_empty());
+    drop(conn);
+    // The real retry API refuses to restart a writer while the fix is in flight.
+    let request = || RequestExecutionInput::builder().work_item_id(writer.id.clone()).build();
+    assert!(db.request_execution(request()).is_err());
+    finish(&db, &conflict);
+    let retry = db.request_execution(request()).unwrap();
+    assert_eq!(retry.status, ExecutionStatus::Ready);
+    assert_eq!(
+        db.claim_execution_for_dispatch(&retry.id).unwrap(),
+        DispatchClaimOutcome::Won
+    );
 }
 
 #[test]
@@ -277,6 +310,67 @@ fn restarted_in_review_revision_waits_for_conflict_revision() {
     assert_eq!(db.gating_prereqs_for(&review.id).unwrap(), vec![conflict.id.clone()]);
     finish(&db, &conflict);
     assert!(db.gating_prereqs_for(&review.id).unwrap().is_empty());
+    // The task stays `in_review`, so only the writer sweep can wake it.
+    assert_eq!(
+        db.promote_todo_autostart_stuck_executions().unwrap(),
+        vec![review.id.clone()]
+    );
+    assert_eq!(db.get_execution(&restart.id).unwrap().status, ExecutionStatus::Ready);
+    assert_eq!(
+        db.claim_execution_for_dispatch(&restart.id).unwrap(),
+        DispatchClaimOutcome::Won
+    );
+}
+
+#[test]
+fn demotion_and_wake_stage_status_events_published_only_on_commit() {
+    use boss_event_bus::{Event, EventKind, TopicFilter};
+    let (db, root) = setup();
+    let review = revision(&db, &root, false);
+    let review_exec = execution(&db, &review);
+    let mut sub = db
+        .event_bus()
+        .subscribe(TopicFilter::kind(EventKind::ExecutionStatusChanged));
+    let conflict = revision(&db, &root, true);
+    let changed = |status: &str| Event::ExecutionStatusChanged {
+        execution_id: review_exec.id.clone(),
+        task_id: review.id.clone(),
+        status: status.to_owned(),
+    };
+    // Events are staged synchronously, so a single poll sees everything published.
+    fn next(sub: &mut boss_event_bus::Subscription) -> Option<Event> {
+        let mut recv = std::pin::pin!(sub.recv());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::future::Future::poll(recv.as_mut(), &mut cx) {
+            std::task::Poll::Ready(event) => event,
+            std::task::Poll::Pending => None,
+        }
+    }
+    assert_eq!(next(&mut sub), Some(changed("waiting_dependency")));
+
+    finish(&db, &conflict);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&review.id])
+        .unwrap();
+    // Rolled back: the staged wake-up must never reach subscribers.
+    let mut conn = db.connect().unwrap();
+    let tx = conn.transaction().unwrap();
+    let mut pending = PendingEvents::new();
+    super::super::revision_sequencing::promote_waiting_writers(&mut pending, &tx, None).unwrap();
+    assert!(!pending.is_empty());
+    drop(tx);
+    drop(conn);
+    drop(pending);
+    assert_eq!(next(&mut sub), None);
+    assert_eq!(
+        db.get_execution(&review_exec.id).unwrap().status,
+        ExecutionStatus::WaitingDependency
+    );
+
+    // Committed: published.
+    db.promote_todo_autostart_stuck_executions().unwrap();
+    assert_eq!(next(&mut sub), Some(changed("ready")));
 }
 
 #[test]

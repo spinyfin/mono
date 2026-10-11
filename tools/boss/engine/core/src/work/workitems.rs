@@ -2106,7 +2106,16 @@ impl WorkDb {
                 promoted.push(work_item_id);
             }
         }
-        tx.commit()?;
+        // Writers parked behind a conflict fix keep a non-`todo` task status
+        // (restarted `in_review`, released `active`), so the loop above never
+        // sees them.
+        let mut pending = PendingEvents::new();
+        promoted.extend(super::revision_sequencing::promote_waiting_writers(
+            &mut pending,
+            &tx,
+            None,
+        )?);
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(promoted)
     }
 

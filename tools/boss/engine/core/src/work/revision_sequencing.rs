@@ -157,9 +157,68 @@ pub(super) fn prioritize_conflict_revision(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for execution_id in ids {
-            update_execution_status(conn, &execution_id, ExecutionStatus::WaitingDependency)?;
+            if let Some(demoted) = update_execution_status(conn, &execution_id, ExecutionStatus::WaitingDependency)? {
+                stage_execution_status_changed(pending, &demoted);
+            }
         }
     }
     maybe_engine_block_dependent(pending, conn, revision_id, now)?;
+    Ok(())
+}
+
+/// Promote `waiting_dependency` writer executions whose conflict-fix gate has
+/// cleared back to `ready`. `maybe_engine_unblock_dependent` only wakes
+/// `blocked` tasks and the stuck-execution sweep only looks at `todo` ones, but
+/// a restarted `in_review` revision or a released/retried `active` writer is
+/// parked behind a conflict fix while keeping its task status, so it needs its
+/// own wake-up. `task_ids` limits the scan; `None` scans every task.
+pub(crate) fn promote_waiting_writers(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    task_ids: Option<&[String]>,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT we.id, we.work_item_id FROM work_executions we
+         JOIN tasks t ON t.id = we.work_item_id
+         WHERE we.status = 'waiting_dependency' AND we.kind = 'revision_implementation'
+           AND t.kind = 'revision' AND t.deleted_at IS NULL
+           AND t.status IN ('active', 'in_review')
+         ORDER BY we.created_at ASC, we.id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut promoted = Vec::new();
+    for (execution_id, work_item_id) in rows {
+        if task_ids.is_some_and(|ids| !ids.contains(&work_item_id))
+            || query_live_execution_for_work_item(conn, &work_item_id)?.is_some()
+            || !deps::gating_prereqs_for(conn, &work_item_id)?.is_empty()
+        {
+            continue;
+        }
+        if let Some(ready) = update_execution_status(conn, &execution_id, ExecutionStatus::Ready)? {
+            stage_execution_status_changed(pending, &ready);
+            pending.push(Event::DispatchReady);
+            promoted.push(work_item_id);
+        }
+    }
+    Ok(promoted)
+}
+
+/// Cascade hook: when a conflict fix changes state, wake the same-chain
+/// writers that were parked behind it.
+pub(crate) fn wake_writers_after_conflict_change(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    task_id: &str,
+) -> Result<()> {
+    if !is_conflict_revision(conn, task_id)? {
+        return Ok(());
+    }
+    let root_id = chain_root(conn, task_id)?;
+    let mut members = collect_chain_revision_ids_including_deleted(conn, &root_id)?;
+    members.push(root_id);
+    promote_waiting_writers(pending, conn, Some(&members))?;
     Ok(())
 }
