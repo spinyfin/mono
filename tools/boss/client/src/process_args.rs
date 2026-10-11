@@ -1,25 +1,14 @@
 //! Darwin process arguments without launching the setuid `ps` executable,
 //! which macOS refuses to execute inside a Seatbelt sandbox.
 
-use std::ffi::{c_int, c_void};
-
-unsafe extern "C" {
-    fn sysctl(
-        name: *mut c_int,
-        namelen: u32,
-        oldp: *mut c_void,
-        oldlenp: *mut usize,
-        newp: *mut c_void,
-        newlen: usize,
-    ) -> c_int;
-}
+use std::ffi::c_int;
 
 fn read_sysctl(name: &mut [c_int], buffer: &mut [u8]) -> Option<usize> {
     let mut len = buffer.len();
     // SAFETY: Both slices are valid for their supplied lengths, len is a
     // writable size_t, and the null newp requests a read-only operation.
     let result = unsafe {
-        sysctl(
+        libc::sysctl(
             name.as_mut_ptr(),
             name.len().try_into().ok()?,
             buffer.as_mut_ptr().cast(),
@@ -32,12 +21,14 @@ fn read_sysctl(name: &mut [c_int], buffer: &mut [u8]) -> Option<usize> {
 }
 
 pub(super) fn command(pid: u32) -> Option<String> {
-    // CTL_KERN, KERN_ARGMAX and KERN_PROCARGS2 from Darwin's sys/sysctl.h.
     let mut size = [0; size_of::<c_int>()];
-    read_sysctl(&mut [1, 8], &mut size)?;
+    read_sysctl(&mut [libc::CTL_KERN, libc::KERN_ARGMAX], &mut size)?;
     let capacity = usize::try_from(c_int::from_ne_bytes(size)).ok()?;
     let mut buffer = vec![0; capacity];
-    let len = read_sysctl(&mut [1, 49, pid.try_into().ok()?], &mut buffer)?;
+    let len = read_sysctl(
+        &mut [libc::CTL_KERN, libc::KERN_PROCARGS2, pid.try_into().ok()?],
+        &mut buffer,
+    )?;
     parse_command(&buffer[..len])
 }
 

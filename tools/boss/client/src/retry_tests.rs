@@ -505,6 +505,16 @@ fn recognizable_engine(script: &str, args: Vec<String>) -> EngineCommand {
     }
 }
 
+// Writes the release file on drop so a fixture shell waiting on it exits even
+// when an assertion fails first.
+struct ReleaseOnDrop(std::path::PathBuf);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, "exit");
+    }
+}
+
 #[tokio::test]
 async fn published_pid_still_monitors_child_exit_in_a_later_readiness_round() {
     let dir = tempfile::tempdir().unwrap();
@@ -516,10 +526,17 @@ async fn published_pid_still_monitors_child_exit_in_a_later_readiness_round() {
         vec![discovery.pid_file_path.clone(), release.to_string_lossy().into_owned()],
     );
     let mut child = None;
+    // Ensure the fixture shell is terminated on every exit path.
+    let _release_guard = ReleaseOnDrop(release.clone());
     ensure_engine_running_with(&discovery, true, Duration::from_millis(100), &mut child)
         .await
         .expect_err("first readiness window expires");
     let pid = child.as_ref().unwrap().id();
+    // The shell publishes its pid asynchronously; wait for it generously.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while read_pid_file(&discovery.pid_file_path) != Some(pid) && Instant::now() < deadline {
+        sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(read_pid_file(&discovery.pid_file_path), Some(pid));
     assert!(is_likely_engine_process(pid));
     assert!(child.as_mut().unwrap().try_wait().unwrap().is_none());
