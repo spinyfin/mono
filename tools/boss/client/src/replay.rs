@@ -176,6 +176,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::ListChores { .. }
         | FrontendRequest::ListCiRemediations { .. }
         | FrontendRequest::ListConflictResolutions { .. }
+        | FrontendRequest::ListCoordinatorGuidance { .. }
         | FrontendRequest::ListDecisions { .. }
         | FrontendRequest::ListDeferredScopeAttentions { .. }
         | FrontendRequest::ListDependencies { .. }
