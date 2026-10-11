@@ -54,6 +54,12 @@ Additional full-tree paths include CRUD result handlers, planner completion, `pr
 
 New `work invalidation fanout` records report source, reason, product correlation, item count, and requested topic count (before de-duplication) at the mutation, batch, and execution publishers without logging item contents. Group these by source/reason to obtain arrival counts; join with the existing population-timing and frontend-frame diagnostics to measure actual refetches and bytes. Publisher counts are not equivalent to app refetch counts because subscriptions and existing coalescing intervene. Historical event frequency cannot be recovered from a state-only SQLite snapshot. The coordinator's supplied observations remain the historical evidence: 19–58 tree refetches per ten minutes and five disconnections in approximately eleven minutes.
 
+### Measurement gap
+
+The source table above is a static inventory, not measured source/reason counts or an item-count distribution. The benchmark exercises database assembly and serialization; it does not drive invalidation publishers or capture outbound frames. No controlled-workload source/reason counts, item-count distributions, or per-topic frame-byte measurements were collected.
+
+That measurement remains a separate deliverable: run representative single-item mutations, dependency changes, multi-product batches, and execution transitions against an isolated scratch engine with known subscriptions. Capture publisher source/reason counts and item-count distributions alongside outbound bytes per topic, distinguishing invalidation frames from resulting full-tree responses. Label results as controlled-workload measurements, not production arrival rates. This needs an event-driving/subscription harness beyond the database benchmark; a state-only snapshot cannot substitute for it.
+
 ## Visibility and payload
 
 The authorized October 11 snapshot contains 8,108 task rows: 6,702 done, 461 archived, 334 in review, 333 todo, 201 blocked, and 77 active. Across all products, done descriptions occupy 26,125,681 characters. These are newer counts than the October 9 fixture specification.
@@ -68,7 +74,7 @@ A read-only SQL experiment over 5,054 PR-bearing/revision IDs on the authorized 
 
 The timing experiment used the broader 5,054-ID diagnostic input. Three standalone Python/SQLite baseline executions of the extracted current-head query took 7,276 / 15,812 / 30,341 ms. A diagnostic query forcing the existing parent index took 1,693 / 688 / 1,332 ms. These are noisy, non-interleaved query experiments during local compilation, not engine before/after benchmarks and not production performance promises. No query change ships here. A fix should use the engine's SQLite build, verify identical verdicts and cycle behavior, and pin the relevant query plan with a regression test rather than adding an unproven index.
 
-## Proposed split
+## Deferred implementation and measurement
 
 The measured waste is not just a missing point lookup: thousands of hidden revision rows feed parent projections, all historical Done rows remain expandable, and the existing revision counter is global across subscribed and unsubscribed topics. An item-only patch with global `last + 1` checking would either leave related cards stale or repeatedly resync on unrelated events.
 
@@ -78,4 +84,8 @@ Use three reviewable implementation changes after this measurement:
 2. Engine-owned scoped reconciliation, product-scoped sequence/replay or explicit gap response, consistent snapshot watermark, relationship closure, tombstones and product moves; thin-client patch application; reconnect/race/gap tests (approximately 1,000–1,400 changed lines).
 3. Compact board records plus on-demand descriptions and expandable historical detail, with popover/search/history regression coverage (approximately 500–800 changed lines).
 
-The combined estimate is 1,650–2,500 lines before this fixture and diagnostics, above the brief's roughly 1,500-line reviewability boundary. These are engineering estimates from the concrete paths above, not measured implementation line counts. This PR therefore uses the explicitly permitted measurement-first split. Scoped updates, payload shrinking, and the query fix remain undelivered; the board continues its current full-refetch behavior.
+The combined estimate is 1,650–2,500 lines before this fixture and diagnostics, exceeding a reviewable size of roughly 1,500 lines. These are engineering estimates from the concrete paths above, not measured implementation line counts. This PR stops after the database/payload baseline and source inventory. Scoped updates, payload shrinking, and the query fix remain undelivered; the board continues its current full-refetch behavior.
+
+The query fix could fit independently within that size boundary and should be the first implementation change. It remains separate because the apparent speedup comes from an extracted query using system SQLite with broader input, not a validated engine change. The recursive family CTE in `work/review_badge.rs` is shared by current-head state and historical badges; changing its plan needs engine-SQLite plan-pinning tests, verdict/cycle equivalence checks, and matched synthetic/authorized-copy before-and-after measurements in the same reviewable change. Size alone is not the reason to omit this fix.
+
+Scoped reconciliation remains separate because sequence/gap recovery, snapshot watermarks, and related-card updates form one correctness boundary across engine and app. Compact records remain separate because removing descriptions or history requires the corresponding detail-loading consumers and regression coverage. The controlled invalidation measurement described above is also undelivered: publisher/frame collection requires a separate event-driving harness, and the current baseline does not establish source frequencies or per-topic traffic.
