@@ -1,7 +1,6 @@
 //! Reserve FIFO turns in the reader loop, before spawned tasks can reorder.
 //!
-//! A turn is keyed by the full request (kind and parameters): only identical
-//! reads can deliver snapshots of the same view that overwrite each other, so
+//! A turn is keyed by the response view, excluding execution options, so
 //! a slow read never delays a read of a different key.
 use boss_protocol::FrontendRequest;
 use std::{
@@ -29,7 +28,20 @@ impl ReadOrdering {
 
     pub(in crate::app) async fn reserve(&mut self, request: &FrontendRequest) -> Turn {
         self.keys.retain(|_, mutex| mutex.strong_count() > 0);
-        let key = serde_json::to_string(request).unwrap_or_default();
+        // Refresh changes how a listing is loaded, not its destination view.
+        let key = match request {
+            FrontendRequest::GetDriverQuotaUsage { .. } => {
+                serde_json::to_string(&FrontendRequest::GetDriverQuotaUsage { refresh: false })
+            }
+            FrontendRequest::ListProductDesignDocs { product_id, .. } => {
+                serde_json::to_string(&FrontendRequest::ListProductDesignDocs {
+                    product_id: product_id.clone(),
+                    refresh: false,
+                })
+            }
+            _ => serde_json::to_string(request),
+        }
+        .expect("serializable request");
         let mutex = match self.keys.get(&key).and_then(Weak::upgrade) {
             Some(mutex) => mutex,
             None => {

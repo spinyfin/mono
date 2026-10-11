@@ -6,6 +6,11 @@ pub(in crate::app) enum ReadLane {
     Live,
     Ordered,
 }
+// Classification and inventory share one definition; the audit is independent.
+macro_rules! define_lanes {
+    ($($live:ident $( { $($fields:tt)* } )?),* $(,)?) => {
+        #[cfg(test)]
+        pub(super) const LIVE_VARIANTS: &[&str] = &[$(stringify!($live)),*];
 pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
     match request {
         R::AuditProductEffort { .. }
@@ -90,16 +95,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::TrunkStatus
         | R::ListOperatorQuestions { .. }
         | R::ListCoordinatorGuidance { .. } => ReadLane::Bulk,
-        R::GetEngineHealth
-        | R::GetEngineVersion
-        | R::ListHostedPaneStatuses
-        | R::ListTmuxWorkerStatuses
-        | R::ListWorkerLiveStates
-        | R::MetricsListLive
-        | R::MetricsShowLive { .. }
-        | R::ProbeStatus { .. }
-        | R::WorkerPoolSummary
-        | R::WorkspacePoolSummary => ReadLane::Live,
+        $(R::$live $( { $($fields)* } )?)|* => ReadLane::Live,
         R::AbandonCiRemediation { .. }
         | R::AbandonConflictResolution { .. }
         | R::AcceptDeferredScopeAttention { .. }
@@ -228,4 +224,18 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::UpdateWorkItem { .. }
         | R::GetPrStatus { refresh: true, .. } => ReadLane::Ordered,
     }
+}
+    };
+}
+define_lanes! {
+    GetEngineHealth,
+    GetEngineVersion,
+    ListHostedPaneStatuses,
+    ListTmuxWorkerStatuses,
+    ListWorkerLiveStates,
+    MetricsListLive,
+    MetricsShowLive { .. },
+    ProbeStatus { .. },
+    WorkerPoolSummary,
+    WorkspacePoolSummary,
 }

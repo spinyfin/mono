@@ -10,14 +10,12 @@
 //! Coordinator-only at the worker-tier gate
 //! (`boss_worker_policy::worker_verb_decision`).
 //!
-//! The GitHub work is `tokio::spawn`ed rather than awaited inline so a slow
-//! round trip (up to the 45 s on-demand budget) does not hold bulk-read
-//! permits or the per-connection ordering turn while idle on the network. A
-//! small dedicated limit bounds the detached fetches instead.
+//! Foreground fetches retain bulk admission and the ordering turn through the
+//! correlated response, with an additional global fetch limit.
 
 use super::*;
 
-/// Concurrent detached guidance fetches, across all connections.
+/// Concurrent guidance fetches, across all connections.
 const MAX_CONCURRENT_FETCHES: usize = 4;
 static FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_FETCHES);
 
@@ -59,43 +57,22 @@ pub(super) async fn handle_list_coordinator_guidance(ctx: Dispatch, req: Fronten
         return;
     };
     let design_docs = server_state.design_docs.clone();
-    tokio::spawn(async move {
-        let _permit = permit;
-        let guidance = crate::coordinator_guidance::load_product_guidance(
-            &design_docs,
-            &products,
-            crate::coordinator_guidance::ON_DEMAND_FETCH_BUDGET,
-            boss_engine_utils::epoch_time::now_epoch_secs(),
-        )
-        .await;
-        for view in &guidance {
-            tracing::info!(
-                product_id = %view.product_id,
-                owner_repo = view.owner_repo.as_deref().unwrap_or(""),
-                state = view.state.tag(),
-                git_ref = view.state.git_ref().unwrap_or(""),
-                "coordinator guidance read on demand"
-            );
-        }
-        send_response(&sink, &request_id, FrontendEvent::CoordinatorGuidanceList { guidance });
-    });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Saturating the detached fetch limit leaves bulk read admission free.
-    #[tokio::test]
-    async fn saturated_guidance_fetches_do_not_consume_bulk_permits() {
-        let held: Vec<_> = (0..MAX_CONCURRENT_FETCHES)
-            .map(|_| FETCHES.try_acquire().unwrap())
-            .collect();
-        assert!(FETCHES.try_acquire().is_err());
-        let gate = std::sync::Arc::new(read_admission::ReadAdmission::default());
-        let connection = gate.connection();
-        assert!(gate.enqueue(&connection).unwrap().acquire().await.is_ok());
-        drop(held);
-        assert!(FETCHES.try_acquire().is_ok());
+    let _permit = permit;
+    let guidance = crate::coordinator_guidance::load_product_guidance(
+        &design_docs,
+        &products,
+        crate::coordinator_guidance::ON_DEMAND_FETCH_BUDGET,
+        boss_engine_utils::epoch_time::now_epoch_secs(),
+    )
+    .await;
+    for view in &guidance {
+        tracing::info!(
+            product_id = %view.product_id,
+            owner_repo = view.owner_repo.as_deref().unwrap_or(""),
+            state = view.state.tag(),
+            git_ref = view.state.git_ref().unwrap_or(""),
+            "coordinator guidance read on demand"
+        );
     }
+    send_response(&sink, &request_id, FrontendEvent::CoordinatorGuidanceList { guidance });
 }

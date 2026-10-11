@@ -265,6 +265,10 @@ impl GitHubTreeSource for GatedSource {
     }
 
     async fn head_sha(&self, owner: &str, repo: &str, git_ref: &str) -> Result<String, TreeApiError> {
+        if git_ref == "HEAD" {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.gate.acquire().await.unwrap().forget();
+        }
         self.inner.head_sha(owner, repo, git_ref).await
     }
 
@@ -280,8 +284,10 @@ impl GitHubTreeSource for GatedSource {
         git_ref: &str,
         etag: Option<&str>,
     ) -> Result<BlobFetch, TreeApiError> {
-        self.started.fetch_add(1, Ordering::SeqCst);
-        self.gate.acquire().await.unwrap().forget();
+        if path != boss_protocol::COORDINATOR_GUIDANCE_PATH {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.gate.acquire().await.unwrap().forget();
+        }
         self.inner.fetch_blob(owner, repo, path, git_ref, etag).await
     }
 }

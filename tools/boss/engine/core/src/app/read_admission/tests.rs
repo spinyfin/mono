@@ -115,6 +115,12 @@ fn live_lane_is_exactly_the_audited_local_only_set() {
         R::WorkerPoolSummary,
         R::WorkspacePoolSummary,
     ];
+    let audited: std::collections::BTreeSet<_> = live
+        .iter()
+        .map(|request| format!("{request:?}").split([' ', '{']).next().unwrap().to_owned())
+        .collect();
+    let classified: std::collections::BTreeSet<_> = lane::LIVE_VARIANTS.iter().map(|name| name.to_string()).collect();
+    assert_eq!(classified, audited);
     for request in &live {
         assert_eq!(read_lane(request), ReadLane::Live, "{request:?}");
     }
@@ -236,4 +242,35 @@ async fn completed_keys_are_not_retained() {
     }
     let _last = ordering.reserve(&R::ListProducts).await;
     assert!(ordering.len() <= 2);
+}
+
+#[tokio::test]
+async fn refresh_options_share_a_view_but_products_remain_concurrent() {
+    use boss_protocol::FrontendRequest as R;
+    let mut ordering = ReadOrdering::default();
+    let listing = |product: &str, refresh| R::ListProductDesignDocs {
+        product_id: product.into(),
+        refresh,
+    };
+    let first = ordering.reserve(&listing("a", false)).await.await;
+    let mut refresh = ordering.reserve(&listing("a", true)).await;
+    let other = ordering.reserve(&listing("b", true)).await;
+    let _other = tokio::time::timeout(Duration::from_secs(1), other).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut refresh)
+            .await
+            .is_err()
+    );
+    drop(first);
+    assert!(tokio::time::timeout(Duration::from_secs(1), refresh).await.is_ok());
+
+    let first = ordering.reserve(&R::GetDriverQuotaUsage { refresh: false }).await.await;
+    let mut refresh = ordering.reserve(&R::GetDriverQuotaUsage { refresh: true }).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut refresh)
+            .await
+            .is_err()
+    );
+    drop(first);
+    assert!(tokio::time::timeout(Duration::from_secs(1), refresh).await.is_ok());
 }

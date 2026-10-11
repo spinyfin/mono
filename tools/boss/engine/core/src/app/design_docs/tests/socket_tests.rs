@@ -109,13 +109,24 @@ async fn blocked_document_holds_real_dispatch_admission_until_response() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_cached_reads_start_one_revalidation_fetch() {
+    cached_read_burst(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_read_burst_waits_for_slow_first_response_without_admission_errors() {
+    cached_read_burst(true).await;
+}
+
+async fn cached_read_burst(slow_first: bool) {
     let source = Arc::new(GatedSource {
         inner: FakeSource::new(),
-        gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        gate: Arc::new(tokio::sync::Semaphore::new(usize::from(!slow_first))),
         started: AtomicUsize::new(0),
     });
     let svc = Arc::new(DesignDocsService::with_source(source.clone()));
-    svc.open_markdown_doc(FLUNGE, PATH, GIT_REF).await;
+    if !slow_first {
+        svc.open_markdown_doc(FLUNGE, PATH, GIT_REF).await;
+    }
     let (state, _dir) =
         crate::app::tests::test_server_state_with_overrides(ServerStateOverrides::builder().design_docs(svc).build());
     let registry = state.design_doc_revalidation.clone();
@@ -126,12 +137,24 @@ async fn concurrent_cached_reads_start_one_revalidation_fetch() {
     for index in 0..32 {
         send(&mut write, &format!("cached-{index}"), get(PATH, GIT_REF)).await;
     }
+    if slow_first {
+        wait_started(&source, 1).await;
+        // Exceed the production 500 ms admission wait while all 31
+        // successors queue for their ordering turn on this same view.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(source.started.load(Ordering::SeqCst), 1);
+        source.gate.add_permits(1);
+    }
     let mut ids = std::collections::HashSet::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         while ids.len() < 32 {
             let env: FrontendEventEnvelope = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
             if let Some(id) = env.request_id {
-                assert!(matches!(env.payload, FrontendEvent::ProductDesignDocContent { .. }));
+                assert!(
+                    matches!(env.payload, FrontendEvent::ProductDesignDocContent { .. }),
+                    "{id}: {:?}",
+                    env.payload
+                );
                 assert!(ids.insert(id));
             }
         }
@@ -173,4 +196,75 @@ fn revalidation_capacity_is_global_and_released_on_drop() {
     assert!(matches!(registry.try_begin(key("extra.md"), &sink), Begin::Owner(_)));
     drop(guards);
     assert!(registry.in_flight.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn guidance_fetch_holds_connection_admission_and_identical_reply_order() {
+    let source = Arc::new(GatedSource {
+        inner: FakeSource::new(),
+        gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        started: AtomicUsize::new(0),
+    });
+    let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
+        ServerStateOverrides::builder()
+            .design_docs(Arc::new(DesignDocsService::with_source(source.clone())))
+            .read_admission(Arc::new(ReadAdmission::new(4, 1, 8, Duration::from_secs(5))))
+            .build(),
+    );
+    let product = crate::test_support::create_test_product_with_repo(&state.work_db, "Guidance", Some(FLUNGE));
+    let other = crate::test_support::create_test_product_with_repo(&state.work_db, "Other", Some(FLUNGE));
+    let (client, server) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(handle_frontend_connection(server, state, None));
+    let (read, mut write) = client.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let request = |product_id: &str| FrontendRequest::ListCoordinatorGuidance {
+        product_id: Some(product_id.into()),
+    };
+    send(&mut write, "first", request(&product.id)).await;
+    wait_started(&source, 1).await;
+    send(&mut write, "second", request(&product.id)).await;
+    send(&mut write, "other", request(&other.id)).await;
+    send(&mut write, "barrier", FrontendRequest::ListWorkerLiveStates).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let env: FrontendEventEnvelope = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            if env.request_id.as_deref() == Some("barrier") {
+                break;
+            }
+            assert!(env.request_id.is_none(), "{env:?}");
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        source.started.load(Ordering::SeqCst),
+        1,
+        "fetch escaped the connection limit"
+    );
+    source.gate.add_permits(1);
+    wait_started(&source, 2).await;
+    assert_eq!(source.started.load(Ordering::SeqCst), 2);
+    source.gate.add_permits(2);
+    let mut ids = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ids.len() < 3 {
+            let env: FrontendEventEnvelope = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            if let Some(id) = env.request_id {
+                assert!(
+                    matches!(env.payload, FrontendEvent::CoordinatorGuidanceList { .. }),
+                    "{id}: {:?}",
+                    env.payload
+                );
+                ids.push(id);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(ids.iter().position(|id| id == "first").unwrap() < ids.iter().position(|id| id == "second").unwrap());
+    assert_eq!(source.started.load(Ordering::SeqCst), 3);
+    drop(lines);
+    drop(write);
+    handler.await.unwrap().unwrap();
 }
