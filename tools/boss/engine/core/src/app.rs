@@ -97,6 +97,7 @@ mod ideas;
 pub mod isolation;
 mod launch_environment;
 mod live_status;
+mod metric_series;
 mod metrics;
 mod pane_delivery;
 mod pane_ops;

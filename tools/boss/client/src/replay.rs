@@ -146,6 +146,8 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::GetExecution { .. }
         | FrontendRequest::GetHost { .. }
         | FrontendRequest::GetIdea { .. }
+        | FrontendRequest::GetMetricCatalog
+        | FrontendRequest::GetMetricSeries { .. }
         | FrontendRequest::GetPrBody { .. }
         | FrontendRequest::GetProductDesignDoc { .. }
         | FrontendRequest::GetPrStatus { .. }
