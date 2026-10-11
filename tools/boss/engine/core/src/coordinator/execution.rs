@@ -711,8 +711,8 @@ impl ExecutionCoordinator {
         //
         // Goes through `resolve_chain_hold` (not the raw `WorkDb` query) so
         // this backstop shares the pre-claim guard's zombie reconciliation —
-        // see that method's docs — and its review-yields-to-conflict-fix
-        // carve-out, so a merge-conflict revision the pre-claim check in
+        // see that method's docs — and its review-yields-to-revision
+        // carve-out, so a revision the pre-claim check in
         // `drain_ready_queue` just bypassed isn't immediately re-deferred
         // here (which would otherwise wedge it in a defer loop instead of
         // ever actually dispatching).
@@ -775,8 +775,8 @@ impl ExecutionCoordinator {
                     work_item_id = %execution.work_item_id,
                     live_sibling_execution_id = %sibling.id,
                     live_sibling_work_item_id = %sibling.work_item_id,
-                    "spawn_attempt: proceeding — live sibling is a read-only pr_review, \
-                     bypassed for this merge-conflict revision",
+                    "spawn_attempt: proceeding — live sibling is a read-only review, \
+                     bypassed for this revision",
                 );
             }
             Ok(ChainHold::Clear) => {}
@@ -1399,7 +1399,7 @@ impl ExecutionCoordinator {
         // Goes through `resolve_chain_hold` for the same reason as the other
         // two call sites: a `waiting_human` "sibling" that is actually a
         // dead worker must not refuse this spawn forever, and a live
-        // `pr_review` sibling must not refuse a merge-conflict revision the
+        // read-only review sibling must not refuse a revision the
         // earlier checkpoints already bypassed for it (see
         // `resolve_chain_hold`'s docs) — otherwise this defense-in-depth
         // assertion would defeat the bypass right before the irreversible
