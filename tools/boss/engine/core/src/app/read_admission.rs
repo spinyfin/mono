@@ -31,13 +31,18 @@ pub(super) struct WaitingRead {
     deadline: tokio::time::Instant,
 }
 
+// Deliberately very high, pending measurement of normal traffic: the
+// earlier defaults (32 active, 500 ms wait) rejected the macOS app's own
+// startup reads after a cold engine start. These match the overrides that
+// restored normal use. Lower them only from measured data, with a generous
+// buffer above the observed peak. The env overrides below still apply.
 impl Default for ReadAdmission {
     fn default() -> Self {
         Self::new(
-            setting("BOSS_RPC_READ_CONCURRENCY", 32),
-            setting("BOSS_RPC_READ_PER_CONNECTION", 16),
-            setting("BOSS_RPC_READ_QUEUE", 128),
-            Duration::from_millis(setting("BOSS_RPC_READ_WAIT_MS", 500) as u64),
+            setting("BOSS_RPC_READ_CONCURRENCY", 4096),
+            setting("BOSS_RPC_READ_PER_CONNECTION", 4096),
+            setting("BOSS_RPC_READ_QUEUE", 100_000),
+            Duration::from_millis(setting("BOSS_RPC_READ_WAIT_MS", 60_000) as u64),
         )
     }
 }
@@ -55,10 +60,11 @@ fn setting(name: &str, default: usize) -> usize {
 impl ReadAdmission {
     pub(super) fn live() -> Self {
         Self::new(
-            setting("BOSS_RPC_LIVE_READ_CONCURRENCY", 8),
-            setting("BOSS_RPC_LIVE_READ_PER_CONNECTION", 2),
-            setting("BOSS_RPC_LIVE_READ_QUEUE", 32),
-            Duration::from_millis(setting("BOSS_RPC_READ_WAIT_MS", 250) as u64),
+            // Deliberately very high pending measurement; see the bulk defaults above.
+            setting("BOSS_RPC_LIVE_READ_CONCURRENCY", 1024),
+            setting("BOSS_RPC_LIVE_READ_PER_CONNECTION", 1024),
+            setting("BOSS_RPC_LIVE_READ_QUEUE", 100_000),
+            Duration::from_millis(setting("BOSS_RPC_READ_WAIT_MS", 60_000) as u64),
         )
     }
 

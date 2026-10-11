@@ -18,15 +18,17 @@ Bulk read handlers execute on the blocking pool, with their admission permits he
 
 Environment settings are read when engine state is constructed; restart the engine after changing them.
 
+The defaults are deliberately very high pending measurement of normal traffic: the original values (32 active, 500 ms wait) rejected the macOS app's own startup reads after a cold engine start. Lower them only from measured data, with a generous buffer above the observed peak.
+
 | Setting                             | Default | Meaning                                             |
 | ----------------------------------- | ------- | --------------------------------------------------- |
-| `BOSS_RPC_READ_CONCURRENCY`         | 32      | Active bulk handlers across connections             |
-| `BOSS_RPC_READ_PER_CONNECTION`      | 16      | Active bulk handlers on one connection              |
-| `BOSS_RPC_READ_QUEUE`               | 128     | Pending reads across connections                    |
-| `BOSS_RPC_READ_WAIT_MS`             | 500     | Total admission wait across both concurrency limits |
-| `BOSS_RPC_LIVE_READ_CONCURRENCY`    | 8       | Active status reads, reserved above the bulk limit  |
-| `BOSS_RPC_LIVE_READ_PER_CONNECTION` | 2       | Active status reads on one connection               |
-| `BOSS_RPC_LIVE_READ_QUEUE`          | 32      | Pending status reads across connections             |
+| `BOSS_RPC_READ_CONCURRENCY`         | 4096    | Active bulk handlers across connections             |
+| `BOSS_RPC_READ_PER_CONNECTION`      | 4096    | Active bulk handlers on one connection              |
+| `BOSS_RPC_READ_QUEUE`               | 100000  | Pending reads across connections                    |
+| `BOSS_RPC_READ_WAIT_MS`             | 60000   | Total admission wait across both concurrency limits |
+| `BOSS_RPC_LIVE_READ_CONCURRENCY`    | 1024    | Active status reads, reserved above the bulk limit  |
+| `BOSS_RPC_LIVE_READ_PER_CONNECTION` | 1024    | Active status reads on one connection               |
+| `BOSS_RPC_LIVE_READ_QUEUE`          | 100000  | Pending status reads across connections             |
 
 Each connection also has a pending queue of four times its active limit. Full queues reject immediately. Other excess requests queue on FIFO semaphores and expire at a single deadline. A connection obtains its local permit before joining the global semaphore, limiting its representation in the global queue. Invalid settings use the default via the shared environment parser; zero or values above one million also log a warning. Multiple separate CLI connections are constrained by the global limit; this is connection fairness, not authenticated per-user accounting.
 
@@ -40,7 +42,7 @@ Rejections produce a correlated `Error` response containing `engine busy, retry:
 
 ## Sizing for the macOS app
 
-The app sends every UI read over one long-lived socket. On connect it pipelines roughly a dozen bulk reads (products, settings, work tree, attention groups and items, deferred scopes, planner runs, engine attempts, disabled live-status slots) plus comment reads per open viewer, and invalidation refetch adds one `ListExecutions` per visible history. The original per-connection budget of 4 active reads and a 250 ms deadline rejected reads 5 and onward whenever a slow `GetWorkTree` held its slot, and the app turns the busy reply into a generic error event with no retry. The defaults are now 16 active, 64 pending and 500 ms per connection, so one app session's connect and refetch fan-out is admitted outright. The incident is still bounded by the global cap of 32 active and 128 queued reads, which is what protects the engine from the eight-process CLI burst (each CLI process holds one socket and one request). `one_socket_pipelining_sixteen_bulk_reads_never_sees_busy` and `default_budget_admits_app_session_fan_out_behind_a_slow_read` pin this.
+The app sends every UI read over one long-lived socket. On connect it pipelines roughly a dozen bulk reads (products, settings, work tree, attention groups and items, deferred scopes, planner runs, engine attempts, disabled live-status slots) plus comment reads per open viewer, and invalidation refetch adds one `ListExecutions` per visible history. The original per-connection budget of 4 active reads and a 250 ms deadline rejected reads 5 and onward whenever a slow `GetWorkTree` held its slot, and the app turns the busy reply into a generic error event with no retry. The defaults were then raised to 16 active, 64 pending and 500 ms per connection under a global cap of 32 active and 128 queued reads. That still rejected the app's startup reads after a cold engine start, so the defaults are now far higher (see Limits); the global cap remains the bound on a runaway CLI burst (each CLI process holds one socket and one request). `one_socket_pipelining_sixteen_bulk_reads_never_sees_busy` and `default_budget_admits_app_session_fan_out_behind_a_slow_read` pin this.
 
 `GetPrStatus` with `refresh: true` awaits a GitHub probe and is not a bulk read; it is bounded by its per-execution refresh budget so network latency cannot occupy bulk slots. Design-document reads await their response inside the admission permits; only the follow-up revalidation is detached.
 
