@@ -52,16 +52,16 @@ fn coalescing_indices_survive_pops_of_other_topics() {
 #[test]
 fn enqueue_degrades_gracefully_when_queue_is_full_but_client_is_draining() {
     let mut q = SessionQueue::new();
-    // Fill with non-coalescing responses up to the cap. Enqueued back to
+    // Fill with distinct topic pushes up to the cap. Enqueued back to
     // back like this, the head-of-line entry is always well under
     // `STUCK_CLIENT_AGE_MS`.
     for i in 0..MAX_SESSION_QUEUE {
         assert_eq!(
-            q.enqueue(response_envelope(&format!("r-{i}"))),
+            q.enqueue(topic_envelope(&format!("r-{i}"), 1)),
             EnqueueOutcome::Enqueued
         );
     }
-    assert_eq!(q.enqueue(response_envelope("overflow")), EnqueueOutcome::Degraded);
+    assert_eq!(q.enqueue(topic_envelope("overflow", 1)), EnqueueOutcome::Degraded);
     assert!(!q.slow, "a draining client must not latch the disconnect flag");
     assert_eq!(q.items.len(), MAX_SESSION_QUEUE, "depth stays bounded at the cap");
     assert!(
@@ -70,13 +70,13 @@ fn enqueue_degrades_gracefully_when_queue_is_full_but_client_is_draining() {
     );
     // r-0 was dropped to make room for the new envelope, and r-1 was
     // dropped to make room for the resync marker admitted alongside it.
-    assert_eq!(q.items.front().unwrap().1.request_id.as_deref(), Some("r-2"));
-    assert_eq!(q.items.back().unwrap().1.request_id.as_deref(), Some("overflow"));
+    assert_eq!(topic_of(&q.items.front().unwrap().1).as_deref(), Some("r-2"));
+    assert_eq!(topic_of(&q.items.back().unwrap().1).as_deref(), Some("overflow"));
     // Subsequent enqueues keep degrading rather than disconnecting. The
     // resync marker is already pending, so this overflow drops only one
     // more entry.
-    assert_eq!(q.enqueue(response_envelope("after-overflow")), EnqueueOutcome::Degraded);
-    assert_eq!(q.items.front().unwrap().1.request_id.as_deref(), Some("r-3"));
+    assert_eq!(q.enqueue(topic_envelope("after-overflow", 1)), EnqueueOutcome::Degraded);
+    assert_eq!(topic_of(&q.items.front().unwrap().1).as_deref(), Some("r-3"));
 }
 
 /// The resync marker must actually reach the client — dropping entries
@@ -86,11 +86,11 @@ fn degraded_admission_delivers_a_resync_marker() {
     let mut q = SessionQueue::new();
     for i in 0..MAX_SESSION_QUEUE {
         assert_eq!(
-            q.enqueue(response_envelope(&format!("r-{i}"))),
+            q.enqueue(topic_envelope(&format!("r-{i}"), 1)),
             EnqueueOutcome::Enqueued
         );
     }
-    assert_eq!(q.enqueue(response_envelope("overflow")), EnqueueOutcome::Degraded);
+    assert_eq!(q.enqueue(topic_envelope("overflow", 1)), EnqueueOutcome::Degraded);
 
     let mut saw_marker = false;
     while let Some(env) = q.pop_front() {
@@ -358,7 +358,7 @@ async fn broker_publish_degrades_bursty_subscriber_without_disconnecting() {
     {
         let mut q = sink.queue.lock().unwrap();
         for i in 0..MAX_SESSION_QUEUE {
-            let outcome = q.enqueue(response_envelope(&format!("r-{i}")));
+            let outcome = q.enqueue(topic_envelope(&format!("r-{i}"), 1));
             assert_eq!(outcome, EnqueueOutcome::Enqueued);
         }
     }
@@ -376,4 +376,95 @@ async fn broker_publish_degrades_bursty_subscriber_without_disconnecting() {
     assert!(shutdown.is_err(), "a draining session must not be disconnected");
     let inner = broker.inner.lock().await;
     assert!(inner.sinks.contains_key("session-1"));
+}
+
+#[tokio::test]
+async fn request_reader_stalls_until_outbound_lane_drains() {
+    let (tx, _rx) = oneshot::channel();
+    let sink = Arc::new(SessionSink::new(tx));
+    // Nothing queued: no stall.
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        sink.wait_for_response_headroom(MAX_SESSION_QUEUE / 2),
+    )
+    .await
+    .expect("empty queue must not stall the reader");
+
+    for i in 0..(MAX_SESSION_QUEUE / 2) {
+        sink.enqueue(FrontendEventEnvelope::response(
+            format!("r{i}"),
+            FrontendEvent::Error { message: "busy".into() },
+        ));
+    }
+    let waiter = tokio::spawn({
+        let sink = sink.clone();
+        async move { sink.wait_for_response_headroom(MAX_SESSION_QUEUE / 2).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiter.is_finished(), "reader must pause while replies are backlogged");
+
+    // The writer draining makes room; no reply was evicted meanwhile.
+    assert!(sink.next().await.is_some());
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("reader must resume once the lane drains")
+        .unwrap();
+    let stats = sink.queue_stats();
+    assert_eq!(stats.depth, (MAX_SESSION_QUEUE / 2) - 1);
+    assert!(!stats.slow);
+}
+
+/// A reply at the head of a lane full of evictable pushes must survive: the
+/// oldest uncorrelated pushes are dropped instead and the session stays open.
+#[tokio::test]
+async fn reply_at_head_is_kept_and_pushes_are_evicted_instead() {
+    for response_index in [0, 1] {
+        let (tx, mut rx) = oneshot::channel();
+        let sink = SessionSink::new(tx);
+        for index in 0..MAX_SESSION_QUEUE {
+            let env = if index == response_index {
+                response_envelope("must-survive")
+            } else {
+                topic_envelope(&format!("topic-{index}"), 1)
+            };
+            assert_eq!(sink.enqueue(env), EnqueueOutcome::Enqueued);
+        }
+        assert_eq!(sink.enqueue(topic_envelope("overflow", 1)), EnqueueOutcome::Degraded);
+        assert!(rx.try_recv().is_err(), "a draining client must not be shut down");
+        assert!(!sink.queue_stats().closed);
+        let q = sink.queue.lock().unwrap();
+        assert_eq!(q.items.len(), MAX_SESSION_QUEUE);
+        assert_eq!(
+            q.items
+                .iter()
+                .filter(|(_, env)| env.request_id.as_deref() == Some("must-survive"))
+                .count(),
+            1
+        );
+        assert!(q.pending_topics.contains_key(RESYNC_TOPIC));
+        // Every recorded topic index still points at its own envelope.
+        for (topic, &idx) in &q.pending_topics {
+            assert_eq!(topic_of(&q.items[idx].1).as_deref(), Some(topic.as_str()));
+        }
+    }
+}
+
+/// With nothing evictable left (every entry a correlated reply) the sink
+/// explicitly disconnects rather than dropping a reply.
+#[tokio::test]
+async fn response_eviction_disconnects_even_when_producer_ignores_outcome() {
+    let (tx, rx) = oneshot::channel();
+    let sink = SessionSink::new(tx);
+    for index in 0..MAX_SESSION_QUEUE {
+        assert_eq!(
+            sink.enqueue(response_envelope(&format!("reply-{index}"))),
+            EnqueueOutcome::Enqueued
+        );
+    }
+    let _ = sink.enqueue(topic_envelope("overflow", 1));
+    rx.await.expect("evicting a reply must explicitly disconnect");
+    assert!(sink.queue_stats().closed);
+    let q = sink.queue.lock().unwrap();
+    assert_eq!(q.items.len(), MAX_SESSION_QUEUE, "no reply was dropped");
+    assert!(!q.pending_topics.contains_key(RESYNC_TOPIC));
 }

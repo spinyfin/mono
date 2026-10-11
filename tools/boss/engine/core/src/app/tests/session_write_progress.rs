@@ -99,6 +99,32 @@ async fn non_reading_client_times_out_without_more_publishes_and_logs_envelopes(
 }
 
 #[test]
+fn recent_write_progress_preserves_old_correlated_reply_under_pressure() {
+    let (tx, mut shutdown) = oneshot::channel();
+    let sink = SessionSink::new(tx);
+    {
+        let mut q = sink.queue.lock().unwrap();
+        assert_eq!(q.enqueue(response_envelope("pending-reply")), EnqueueOutcome::Enqueued);
+        for i in 1..MAX_SESSION_QUEUE {
+            assert_eq!(
+                q.enqueue(topic_envelope(&format!("progress.{i}"), 1)),
+                EnqueueOutcome::Enqueued
+            );
+        }
+        q.backdate_oldest_bulk_entry(STUCK_CLIENT_AGE_MS + 100);
+        q.last_write_progress = Some(tokio::time::Instant::now());
+    }
+
+    assert_eq!(sink.enqueue(topic_envelope("overflow", 1)), EnqueueOutcome::Degraded);
+    let mut q = sink.queue.lock().unwrap();
+    assert!(!q.closed && !q.slow);
+    assert_eq!(q.items.len(), MAX_SESSION_QUEUE);
+    assert!(q.pending_topics.contains_key(RESYNC_TOPIC));
+    assert_eq!(q.pop_front().unwrap().request_id.as_deref(), Some("pending-reply"));
+    assert!(matches!(shutdown.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+}
+
+#[test]
 fn old_write_progress_does_not_protect_stuck_client() {
     let (tx, _shutdown) = oneshot::channel();
     let sink = SessionSink::new(tx);
