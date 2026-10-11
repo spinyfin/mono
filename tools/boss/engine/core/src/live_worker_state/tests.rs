@@ -153,6 +153,61 @@ fn attributed_pool_label_matches_coordinator_routing() {
     );
 }
 
+/// The badge type (`AgentType::for_execution`) and the pool stamped on the same
+/// `LiveWorkerState` (`attributed_pool_label`) encode the same
+/// review > automation precedence; this fails if either drifts.
+#[test]
+fn agent_type_agrees_with_attributed_pool_label_for_every_kind() {
+    use boss_protocol::AgentType;
+    let kinds = [
+        ExecutionKind::AnswerAgent,
+        ExecutionKind::AutomationTriage,
+        ExecutionKind::ChoreImplementation,
+        ExecutionKind::CiRemediation,
+        ExecutionKind::ConflictResolution,
+        ExecutionKind::InvestigationImplementation,
+        ExecutionKind::PrReview,
+        ExecutionKind::PrReviewGuide,
+        ExecutionKind::ProductDesign,
+        ExecutionKind::ProjectDesign,
+        ExecutionKind::RevisionImplementation,
+        ExecutionKind::TaskImplementation,
+    ];
+    // Exhaustiveness guard: a new kind must be added to the list above.
+    for kind in &kinds {
+        match kind {
+            ExecutionKind::AnswerAgent
+            | ExecutionKind::AutomationTriage
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::CiRemediation
+            | ExecutionKind::ConflictResolution
+            | ExecutionKind::InvestigationImplementation
+            | ExecutionKind::PrReview
+            | ExecutionKind::PrReviewGuide
+            | ExecutionKind::ProductDesign
+            | ExecutionKind::ProjectDesign
+            | ExecutionKind::RevisionImplementation
+            | ExecutionKind::TaskImplementation => {}
+        }
+    }
+    for kind in kinds {
+        for has_source_automation in [false, true] {
+            let pool = attributed_pool_label(kind.clone(), has_source_automation);
+            let agent_type = AgentType::for_execution(&kind, has_source_automation);
+            assert_eq!(
+                agent_type == AgentType::Review,
+                pool == "review",
+                "review split diverged for {kind:?} (automation={has_source_automation})"
+            );
+            assert_eq!(
+                agent_type == AgentType::Automation,
+                pool == "automation",
+                "automation split diverged for {kind:?} (automation={has_source_automation})"
+            );
+        }
+    }
+}
+
 #[test]
 fn release_slot_clears_entry() {
     let reg = LiveWorkerStateRegistry::new();
@@ -1233,4 +1288,70 @@ fn unarmed_or_disarmed_runs_buffer_nothing() {
     registry.disarm_pending_hooks("run-failed");
     registry.register_spawn(2, "run-failed", "opus", 42, None);
     assert!(!registry.has_driver_signal_for_run("run-failed"));
+}
+
+#[test]
+fn readoption_of_a_tracked_run_backfills_missing_metadata_without_overwriting() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn_with_capabilities(
+        1,
+        "run-1",
+        "claude-opus-4-7",
+        7,
+        None,
+        false,
+        LiveSpawnRouting::none().with_metadata(LiveWorkerMetadata {
+            agent_type: Some("coding".to_owned()),
+            ..LiveWorkerMetadata::default()
+        }),
+    );
+    reg.register_readoption(
+        1,
+        "run-1",
+        "claude-opus-4-7",
+        7,
+        None,
+        false,
+        LiveSpawnRouting::none().with_metadata(LiveWorkerMetadata {
+            agent_type: Some("review".to_owned()),
+            project_id: Some("proj_1".to_owned()),
+            project_name: Some("One".to_owned()),
+            host_id: Some("local".to_owned()),
+            started_at: Some("2026-10-09T00:00:00Z".to_owned()),
+        }),
+        ReadoptionEvidence::LiveShellPid,
+    );
+
+    let state = reg.get(1).unwrap();
+    assert_eq!(
+        state.agent_type.as_deref(),
+        Some("coding"),
+        "stamped value is never overwritten"
+    );
+    assert_eq!(state.project_id.as_deref(), Some("proj_1"));
+    assert_eq!(state.project_name.as_deref(), Some("One"));
+    assert_eq!(state.host_id.as_deref(), Some("local"));
+    assert_eq!(state.started_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+}
+
+#[test]
+fn spawn_registration_stamps_routing_metadata_on_the_state() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn_with_capabilities(
+        2,
+        "run-2",
+        "claude-opus-4-7",
+        0,
+        None,
+        false,
+        LiveSpawnRouting::new("review", "pr_review").with_metadata(LiveWorkerMetadata {
+            agent_type: Some("review".to_owned()),
+            host_id: Some("zakalwe".to_owned()),
+            ..LiveWorkerMetadata::default()
+        }),
+    );
+    let state = reg.get(2).unwrap();
+    assert_eq!(state.agent_type.as_deref(), Some("review"));
+    assert_eq!(state.host_id.as_deref(), Some("zakalwe"));
+    assert_eq!(state.project_id, None);
 }
