@@ -17,8 +17,8 @@ Pipeline:
 
 This is the guest-side build infrastructure for checkleft Component Model
 checks (see the design doc's Build section). It is deliberately NOT
-rules_rust's `rust_wasm_bindgen`, which wraps wasm-bindgen (JS interop, wasm32-unknown-unknown) and has no
-connection to WASI or the Component Model.
+rules_rust's `rust_wasm_bindgen`, which wraps wasm-bindgen (JS interop,
+wasm32-unknown-unknown) and has no connection to WASI or the Component Model.
 """
 
 WasmComponentInfo = provider(
