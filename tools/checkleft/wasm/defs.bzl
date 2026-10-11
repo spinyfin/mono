@@ -31,13 +31,25 @@ WasmComponentInfo = provider(
 
 # Outgoing transition: build the guest crate for the Component Model guest
 # platform regardless of the host configuration the rule is analyzed in.
+#
+# Guests are always built with `-c opt`, independent of the invoking build's
+# compilation mode. Checks like rust/giant-structs run `syn` over every changed
+# file inside the wasm sandbox under a wall-clock budget; an opt-level-0
+# (fastbuild) guest is an order of magnitude slower and times out on large
+# changesets.
 def _wasip2_transition_impl(_settings, _attr):
-    return {"//command_line_option:platforms": str(Label("//platforms:wasm32_wasip2"))}
+    return {
+        "//command_line_option:compilation_mode": "opt",
+        "//command_line_option:platforms": str(Label("//platforms:wasm32_wasip2")),
+    }
 
 _wasip2_transition = transition(
     implementation = _wasip2_transition_impl,
     inputs = [],
-    outputs = ["//command_line_option:platforms"],
+    outputs = [
+        "//command_line_option:compilation_mode",
+        "//command_line_option:platforms",
+    ],
 )
 
 def _single_wasm_output(target):
