@@ -75,6 +75,13 @@ pub enum ExecutionKind {
 }
 
 impl ExecutionKind {
+    /// Kinds that only ever read the PR and never write to its branch. They
+    /// cannot race a writer for the shared jj backing store, so per-PR
+    /// writer serialization (chain serialization) does not apply to them.
+    pub fn is_read_only_review(&self) -> bool {
+        matches!(self, Self::PrReview | Self::PrReviewGuide)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AnswerAgent => "answer_agent",

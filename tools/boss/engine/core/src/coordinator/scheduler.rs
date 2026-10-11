@@ -638,74 +638,87 @@ impl ExecutionCoordinator {
     }
 
     /// Resolve the per-PR single-writer chain check for `execution`,
-    /// applying the review-yields-to-conflict-fix carve-out: a live
-    /// `pr_review` sibling never blocks a merge-conflict-fix revision
-    /// (`DispatchClass::MergeConflictRevision`).
+    /// applying the review-yields-to-revision carve-out: a live read-only
+    /// review sibling (`pr_review` / `pr_review_guide`) never blocks a
+    /// *revision* (any [`DispatchClass`] other than `OtherWork`).
     ///
-    /// Rationale (the 2026-07-10 priority-inversion incident): a
-    /// `pr_review` execution is strictly read-only — never writes, commits,
-    /// or pushes (enforced by the reviewer CLAUDE.md, its tool denylist, and
-    /// its prompt mandate; see `crate::pr_review` module docs) — so it
-    /// cannot participate in the writer-vs-writer two-concurrent-writers-to-one-PR hazard this
-    /// guard exists to prevent (two *writers* rebasing/rewriting each
-    /// other's commits on the shared jj backing store). Meanwhile a pending
-    /// merge-conflict fix is urgent and, once it lands, immediately
-    /// invalidates whatever the in-flight review was looking at anyway —
-    /// the completion path's revision-triggered-review re-fire
-    /// (`enable_revision_triggered_reviews`) already spawns a fresh review
-    /// pass against the new head, so nothing is lost by not waiting for the
-    /// stale one to finish. Every other pairing — writer vs writer, writer
-    /// vs anything else, or a *non*-conflict revision (CI-fix,
-    /// review-findings, operator-filed) waiting behind a review — keeps
-    /// serializing exactly as before; only this one combination bypasses.
+    /// Rationale: a review execution is strictly read-only — never writes,
+    /// commits, or pushes (enforced by the reviewer CLAUDE.md, its tool
+    /// denylist, and its prompt mandate; see `crate::pr_review` module
+    /// docs) — so it cannot participate in the writer-vs-writer
+    /// two-concurrent-writers-to-one-PR hazard this guard exists to prevent
+    /// (two *writers* rebasing/rewriting each other's commits on the shared
+    /// jj backing store). Serializing a writer behind a reader adds no
+    /// safety, only waits (and deadlocks when the review is itself stuck:
+    /// mono#3123, where a review-finding revision showed "blocked by" its own
+    /// originating task for two days). A review that lands after the revision
+    /// pushes is a stale-head verdict, which has to be handled at verdict
+    /// time regardless, and the completion path's revision-triggered-review
+    /// re-fire (`enable_revision_triggered_reviews`) already spawns a fresh
+    /// pass against the new head. Writer-vs-writer pairings (implementation,
+    /// revision, CI-fix, conflict-fix on one PR branch) keep serializing
+    /// exactly as before, as does non-revision work waiting behind a review.
     ///
-    /// The bypass decision is made against **every** live chain sibling, not
-    /// just the first one a naive single-sibling lookup would return. The chain
-    /// walk is root-first, so trusting a single sibling meant a live
-    /// `pr_review` on the chain root could mask a live *writer* further down
-    /// the chain (a descendant conflict-fix revision) — bypassing would then
-    /// co-dispatch a second writer alongside that still-live one, the exact
-    /// two-writer hazard (the two-concurrent-writers-to-one-PR incident) this guard exists to prevent. So the
-    /// bypass only fires when EVERY live sibling is a review; if even one is
-    /// a non-review (writer), this fails closed to `Blocked`.
+    /// The decision is made against **every** live chain sibling, not just
+    /// the first one a naive single-sibling lookup would return. The chain
+    /// walk is root-first, so trusting a single sibling meant a live review
+    /// on the chain root could mask a live *writer* further down the chain —
+    /// bypassing would then co-dispatch a second writer alongside that
+    /// still-live one, the exact two-concurrent-writers-to-one-PR hazard.
+    /// So read-only siblings are dropped from consideration and the hold is
+    /// computed over the remaining (writer) siblings; if even one writer
+    /// remains, this is `Blocked` on that writer.
     ///
     /// Shared by all three chain-guard call sites (`drain_ready_queue`'s
     /// pre-claim check, `schedule_execution`'s pre-lease backstop, and its
-    /// post-lease TOCTOU assertion) so the bypass decision — and therefore
-    /// whether a merge-conflict revision ever gets refused — is identical
-    /// at every checkpoint. Without that consistency a checkpoint later in
-    /// the pipeline could re-defer what an earlier one just bypassed,
-    /// wedging the row in a defer loop instead of actually dispatching it.
+    /// post-lease TOCTOU assertion) so the bypass decision is identical at
+    /// every checkpoint. Without that consistency a checkpoint later in the
+    /// pipeline could re-defer what an earlier one just bypassed, wedging
+    /// the row in a defer loop instead of actually dispatching it.
     pub(super) async fn resolve_chain_hold(&self, execution: &WorkExecution) -> Result<ChainHold> {
         let siblings = self.live_chain_siblings(execution).await?;
         let Some(first_sibling) = siblings.first().cloned() else {
             return Ok(ChainHold::Clear);
         };
-        let queue_len = siblings.len();
-        let all_review_siblings = siblings.iter().all(|s| s.kind == ExecutionKind::PrReview);
-        let is_conflict_revision = matches!(
+        let is_revision = !matches!(
             self.work_db.classify_work_item_for_dispatch(&execution.work_item_id),
-            Ok(DispatchClass::MergeConflictRevision)
+            Ok(DispatchClass::OtherWork) | Err(_)
         );
-        if all_review_siblings && is_conflict_revision {
-            Ok(ChainHold::ReviewBypassed(first_sibling))
-        } else {
-            // Prefer surfacing a non-review (writer) sibling in the
-            // `Blocked` outcome when one is present, since that is the
-            // actually-blocking reason — a mix of a review and a writer
-            // sibling should report the writer, not the review, in trace
-            // output and wait-reason labeling.
-            let sibling = siblings
+        let all_review_siblings = siblings.iter().all(|s| s.kind.is_read_only_review());
+        if is_revision {
+            // Reviews are read-only: drop them from the hold entirely so a
+            // revision is neither blocked by one nor shown as "blocked by"
+            // its parent task on the card because of one.
+            let writers: Vec<WorkExecution> = siblings
                 .iter()
-                .find(|s| s.kind != ExecutionKind::PrReview)
+                .filter(|s| !s.kind.is_read_only_review())
                 .cloned()
-                .unwrap_or(first_sibling);
-            Ok(ChainHold::Blocked {
-                sibling,
-                review_held: all_review_siblings,
-                queue_len,
-            })
+                .collect();
+            return Ok(match writers.first().cloned() {
+                None => ChainHold::ReviewBypassed(first_sibling),
+                Some(sibling) => ChainHold::Blocked {
+                    sibling,
+                    review_held: false,
+                    queue_len: writers.len(),
+                },
+            });
         }
+        // Non-revision work keeps serializing behind a review. Prefer
+        // surfacing a non-review (writer) sibling in the `Blocked` outcome
+        // when one is present, since that is the actually-blocking reason — a
+        // mix of a review and a writer sibling should report the writer, not
+        // the review, in trace output and wait-reason labeling.
+        let queue_len = siblings.len();
+        let sibling = siblings
+            .iter()
+            .find(|s| !s.kind.is_read_only_review())
+            .cloned()
+            .unwrap_or(first_sibling);
+        Ok(ChainHold::Blocked {
+            sibling,
+            review_held: all_review_siblings,
+            queue_len,
+        })
     }
 
     /// Build the operator-facing string persisted into
@@ -1334,9 +1347,9 @@ impl ExecutionCoordinator {
             // worker pane is actually dead doesn't wedge this row forever —
             // see `live_chain_siblings`'s docs for the chain-serialization
             // re-defer stall incident this
-            // closes — and so a merge-conflict-fix revision never waits
+            // closes — and so a revision never waits
             // behind a read-only review (see `resolve_chain_hold`'s docs for
-            // the 2026-07-10 priority-inversion incident this closes).
+            // the mono#3123 stall this closes).
             match self.resolve_chain_hold(&execution).await {
                 Ok(ChainHold::Blocked {
                     sibling,
@@ -1391,8 +1404,8 @@ impl ExecutionCoordinator {
                     continue;
                 }
                 Ok(ChainHold::ReviewBypassed(sibling)) => {
-                    // Reviews are read-only — a pending merge-conflict fix
-                    // must not wait the length of a review run behind one.
+                    // Reviews are read-only — a pending revision must not
+                    // wait the length of a review run behind one.
                     // Fall through and dispatch this pass; the review keeps
                     // running (it will self-terminate normally, and its
                     // findings will already be stale against the fix's
@@ -1404,14 +1417,14 @@ impl ExecutionCoordinator {
                         live_sibling_execution_id = %sibling.id,
                         live_sibling_work_item_id = %sibling.work_item_id,
                         pool = pool_label,
-                        "spawn_attempt status=ready -> chain_hold_bypassed reason=review_yields_to_conflict_fix"
+                        "spawn_attempt status=ready -> chain_hold_bypassed reason=review_yields_to_revision"
                     );
                     self.dispatch_events
                         .emit(
                             DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Ok, &execution.id)
                                 .with_work_item(&execution.work_item_id)
                                 .with_details(serde_json::json!({
-                                    "chain_hold_bypassed": "review_yields_to_conflict_fix",
+                                    "chain_hold_bypassed": "review_yields_to_revision",
                                     "pool": pool_label,
                                     "execution_kind": execution.kind.as_str(),
                                     "review_held": true,

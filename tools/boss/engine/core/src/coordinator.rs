@@ -381,8 +381,8 @@ enum ChainHold {
         review_held: bool,
         queue_len: usize,
     },
-    /// A live `pr_review` sibling was found but bypassed: `execution` is a
-    /// merge-conflict-fix revision, and reviews are read-only so cannot
+    /// A live read-only review sibling was found but bypassed: `execution` is
+    /// a revision, and reviews are read-only so cannot
     /// race the shared jj backing store the guard protects (see
     /// `resolve_chain_hold`'s doc comment). The caller may proceed but
     /// should log the bypass so the trace distinguishes it from `Clear`.

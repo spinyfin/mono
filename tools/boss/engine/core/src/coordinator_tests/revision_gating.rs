@@ -676,13 +676,13 @@ async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_desc
     );
 }
 
-/// A non-conflict revision (no `merge-conflict:` `created_via` marker)
-/// gets none of the bypass above — it keeps serializing behind a live
-/// `pr_review` sibling exactly as before this fix. Only merge-conflict
-/// revisions are urgent enough, and safe enough (see the module docs on
-/// `ExecutionCoordinator::resolve_chain_hold`), to bypass a review.
+/// Any revision — not just a merge-conflict fix — bypasses a live
+/// read-only `pr_review` on its own chain (mono#3123: a review-finding
+/// revision showed "blocked by" its own originating task for two days
+/// because the parent's reviewer execution was still considered live).
+/// This one carries no `merge-conflict:` `created_via` marker.
 #[tokio::test]
-async fn schedule_execution_still_defers_non_conflict_revision_behind_live_review_sibling() {
+async fn schedule_execution_bypasses_live_review_sibling_for_non_conflict_revision() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
@@ -746,30 +746,112 @@ async fn schedule_execution_still_defers_non_conflict_revision_behind_live_revie
         .schedule_execution(&revision_exec, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
-        result.is_err(),
-        "a non-conflict revision must still defer behind a live pr_review sibling: {result:?}",
-    );
-    let after_defer = db.get_execution(&revision_exec.id).unwrap();
-    assert_eq!(
-        after_defer.status,
-        ExecutionStatus::Ready,
-        "deferred revision must remain ready, got {:?}",
-        after_defer.status,
+        result.is_ok(),
+        "a non-conflict revision must bypass a live read-only pr_review sibling: {result:?}",
     );
     assert!(
-        cube.lease_calls.lock().await.is_empty(),
-        "no cube workspace may be leased while serialized behind a live review sibling",
+        !cube.lease_calls.lock().await.is_empty(),
+        "a cube workspace must be leased — the review sibling must not block the lease",
     );
 }
 
-/// The auto-dispatcher's pre-claim chain check must record a
-/// `dispatch_wait_reason` that distinguishes a review-held chain hold
-/// from a writer-held one — the trace line chore_18c0da77bef326b0_840
-/// asked for, so an operator (or the kanban card) can tell "waiting on
-/// a read-only review" from "waiting on another writer" without
-/// cross-referencing `engine-trace.jsonl` by hand.
+/// A plain revision is still serialized behind a live *writer* on the same
+/// branch even when a read-only review is also live on the chain root — the
+/// review must neither block it nor mask the writer.
 #[tokio::test]
-async fn drain_records_review_held_wait_reason_distinct_from_writer_held() {
+async fn schedule_execution_defers_non_conflict_revision_behind_live_writer_despite_review() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+    let pr_url = "https://github.com/spinyfin/mono/pull/1467";
+    let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+            rusqlite::params![root_id],
+        )
+        .unwrap();
+        for id in ["task_rev_plain_writer", "task_rev_plain_second"] {
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 SELECT ?2, product_id, 'revision', 'Address feedback', '', 'todo', '1', '1', ?1
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id, id],
+            )
+            .unwrap();
+        }
+    }
+
+    let _root_review_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let _writer_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id("task_rev_plain_writer".to_owned())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Running)
+                .pr_url(pr_url.to_owned())
+                .build(),
+        )
+        .unwrap();
+    let revision_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id("task_rev_plain_second".to_owned())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .pr_url(pr_url.to_owned())
+                .build(),
+        )
+        .unwrap();
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+            .with_pre_start_retry_delays(Vec::new()),
+    );
+
+    let worker_id = coordinator
+        .worker_pool()
+        .claim_worker(&revision_exec.id, None)
+        .await
+        .expect("worker pool slot available");
+
+    let result = coordinator
+        .schedule_execution(&revision_exec, &worker_id, DispatchAdmission::Queued)
+        .await;
+    assert!(
+        result.is_err(),
+        "a revision must still defer behind a live writer on the same branch: {result:?}",
+    );
+    assert_eq!(
+        db.get_execution(&revision_exec.id).unwrap().status,
+        ExecutionStatus::Ready,
+    );
+    assert!(
+        cube.lease_calls.lock().await.is_empty(),
+        "no cube workspace may be leased while serialized behind a live writer",
+    );
+}
+
+/// The auto-dispatcher's pre-claim chain check must admit a revision whose
+/// chain has only a live read-only review: no chain-serialized wait reason
+/// is recorded (so the card never reads "blocked by" the revision's own
+/// parent task because of a review) and a workspace is leased.
+#[tokio::test]
+async fn drain_admits_revision_despite_live_review_without_wait_reason() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
@@ -825,29 +907,23 @@ async fn drain_records_review_held_wait_reason_distinct_from_writer_held() {
     ));
     coordinator.kick();
 
-    let mut wait_reason = None;
+    let mut leased = false;
     for _ in 0..200 {
-        wait_reason = db.get_execution(&revision_exec.id).unwrap().dispatch_wait_reason;
-        if wait_reason.is_some() {
+        if !cube.lease_calls.lock().await.is_empty() {
+            leased = true;
             break;
         }
         sleep(Duration::from_millis(10)).await;
     }
+    assert!(
+        leased,
+        "a revision with only a live review on its chain must be dispatched"
+    );
 
-    let wait_reason = wait_reason.expect("dispatch_wait_reason must be set");
+    let wait_reason = db.get_execution(&revision_exec.id).unwrap().dispatch_wait_reason;
     assert!(
-        wait_reason.contains("an automated PR review runs at a time"),
-        "a revision deferred behind a live pr_review sibling must record the review-held \
-             reason, not the generic writer-held wording; got {wait_reason:?}",
-    );
-    assert!(
-        !wait_reason.contains("revisions on the same PR run one at a time"),
-        "must not use the writer-held phrasing for a review-held wait; got {wait_reason:?}",
-    );
-    assert!(
-        !wait_reason.to_lowercase().contains("sibling"),
-        "operator-facing wait reason must not use engine-internal \"sibling\" vocabulary; \
-             got {wait_reason:?}",
+        wait_reason.is_none(),
+        "a review must not produce a chain-serialized wait reason for a revision; got {wait_reason:?}",
     );
 }
 
