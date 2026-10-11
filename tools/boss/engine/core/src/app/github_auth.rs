@@ -106,13 +106,11 @@ pub(super) async fn handle_git_hub_auth_status(ctx: Dispatch, req: FrontendReque
         if let GitHubAuthState::Authorized { record, .. } = current {
             let server_state = server_state.clone();
             let token = record.token.clone();
-            tokio::spawn(async move {
-                let controller = server_state.github_auth.clone();
-                let flow = controller.device_flow();
-                let org_sink = WorkDbOrgStateSink::new(server_state.work_db.as_ref());
-                let resolved = probe_and_record_org_state(&org_sink, flow.as_ref(), &token).await;
-                controller.update_org_state(resolved);
-            });
+            let controller = server_state.github_auth.clone();
+            let flow = controller.device_flow();
+            let org_sink = WorkDbOrgStateSink::new(server_state.work_db.as_ref());
+            let resolved = probe_and_record_org_state(&org_sink, flow.as_ref(), &token).await;
+            controller.update_org_state(resolved);
         }
     }
 }

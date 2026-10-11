@@ -216,18 +216,42 @@ pub(super) async fn handle_get_product_design_doc(ctx: Dispatch, req: FrontendRe
     // The correlated response is produced inline so it stays inside the read
     // admission permits. Only the follow-up revalidation (network, with a
     // backoff ladder) is detached, and it is bounded by `registry`.
-    if !serve_product_design_doc(&design_docs, &sink, &request_id, &repo_remote_url, &path, &git_ref).await {
-        return;
+    if let Some(guard) = serve_and_begin(
+        &design_docs,
+        &registry,
+        &sink,
+        &request_id,
+        &repo_remote_url,
+        &path,
+        &git_ref,
+    )
+    .await
+    {
+        tokio::spawn(async move {
+            revalidate_product_design_doc(design_docs, guard, repo_remote_url, path, git_ref).await;
+        });
     }
-    let key = (repo_remote_url.clone(), path.clone(), git_ref.clone());
-    match registry.try_begin(key, &sink) {
-        Begin::Owner(guard) => {
-            tokio::spawn(async move {
-                revalidate_product_design_doc(design_docs, guard, repo_remote_url, path, git_ref).await;
-            });
+}
+
+async fn serve_and_begin(
+    design_docs: &boss_engine_design_docs::DesignDocsService,
+    registry: &Arc<RevalidationRegistry>,
+    sink: &Arc<SessionSink>,
+    request_id: &str,
+    repo_remote_url: &str,
+    path: &str,
+    git_ref: &str,
+) -> Option<RevalidationGuard> {
+    if !serve_product_design_doc(design_docs, sink, request_id, repo_remote_url, path, git_ref).await {
+        return None;
+    }
+    match registry.try_begin((repo_remote_url.to_owned(), path.to_owned(), git_ref.to_owned()), sink) {
+        Begin::Owner(guard) => Some(guard),
+        Begin::Coalesced => None,
+        Begin::AtCapacity => {
+            push_unvalidated(design_docs, sink, repo_remote_url, path, git_ref).await;
+            None
         }
-        Begin::Coalesced => {}
-        Begin::AtCapacity => push_unvalidated(&design_docs, &sink, &repo_remote_url, &path, &git_ref).await,
     }
 }
 
@@ -298,16 +322,18 @@ async fn get_product_design_doc(
     path: String,
     git_ref: String,
 ) {
-    if !serve_product_design_doc(&design_docs, &sink, &request_id, &repo_remote_url, &path, &git_ref).await {
-        return;
-    }
-    let key = (repo_remote_url.clone(), path.clone(), git_ref.clone());
-    match registry.try_begin(key, &sink) {
-        Begin::Owner(guard) => {
-            revalidate_product_design_doc(design_docs, guard, repo_remote_url, path, git_ref).await;
-        }
-        Begin::Coalesced => {}
-        Begin::AtCapacity => push_unvalidated(&design_docs, &sink, &repo_remote_url, &path, &git_ref).await,
+    if let Some(guard) = serve_and_begin(
+        &design_docs,
+        &registry,
+        &sink,
+        &request_id,
+        &repo_remote_url,
+        &path,
+        &git_ref,
+    )
+    .await
+    {
+        revalidate_product_design_doc(design_docs, guard, repo_remote_url, path, git_ref).await;
     }
 }
 

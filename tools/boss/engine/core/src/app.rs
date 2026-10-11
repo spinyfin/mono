@@ -2244,6 +2244,7 @@ async fn handle_frontend_connection(
         );
     }
     let peer_is_worker = peer_class.is_worker();
+    let mut read_ordering = read_admission::ReadOrdering::default();
     let connection_reads = server_state.read_admission.connection();
     let connection_live_reads = server_state.live_read_admission.connection();
 
@@ -2402,13 +2403,12 @@ async fn handle_frontend_connection(
             continue;
         }
 
-        let bulk_read = read_admission::is_bulk_read(&request);
-        let read_lane = if bulk_read {
-            Some((&server_state.read_admission, &connection_reads))
-        } else if read_admission::is_live_read(&request) {
-            Some((&server_state.live_read_admission, &connection_live_reads))
-        } else {
-            None
+        let lane = read_admission::read_lane(&request);
+        let bulk_read = lane == read_admission::ReadLane::Bulk;
+        let read_lane = match lane {
+            read_admission::ReadLane::Bulk => Some((&server_state.read_admission, &connection_reads)),
+            read_admission::ReadLane::Live => Some((&server_state.live_read_admission, &connection_live_reads)),
+            read_admission::ReadLane::Ordered => None,
         };
         let waiting_read = if let Some((admission, connection)) = read_lane {
             match admission.enqueue(connection) {
@@ -2438,12 +2438,20 @@ async fn handle_frontend_connection(
             .recv_instant(recv_instant)
             .decode_ms(decode_ms)
             .build();
+        let turn = if waiting_read.is_some() {
+            Some(read_ordering.reserve(&request).await)
+        } else {
+            None
+        };
         let dispatch_fut = dispatch::dispatch_request(ctx, request, bulk_read);
         if let Some(waiting) = waiting_read {
             let sink = sink.clone();
             let session_id = session_id.clone();
             tokio::spawn(async move {
-                match waiting.acquire().await {
+                match waiting
+                    .acquire_ordered(turn.expect("admitted read has a FIFO turn"))
+                    .await
+                {
                     Ok(permits) => {
                         // Synchronous SQLite work must not occupy the async
                         // runtime threads that serve writes and live status.

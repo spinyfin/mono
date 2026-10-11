@@ -10,10 +10,7 @@
 //! Coordinator-only at the worker-tier gate
 //! (`boss_worker_policy::worker_verb_decision`).
 //!
-//! The GitHub work is `tokio::spawn`ed rather than awaited inline, for the
-//! same reason the design-doc handlers do it: the connection's read loop
-//! awaits each handler, so a slow GitHub round trip awaited here would
-//! stall every other request on that connection.
+//! The fetch is awaited inside bulk admission through the correlated response.
 
 use super::*;
 
@@ -51,23 +48,21 @@ pub(super) async fn handle_list_coordinator_guidance(ctx: Dispatch, req: Fronten
     };
 
     let design_docs = server_state.design_docs.clone();
-    tokio::spawn(async move {
-        let guidance = crate::coordinator_guidance::load_product_guidance(
-            &design_docs,
-            &products,
-            crate::coordinator_guidance::ON_DEMAND_FETCH_BUDGET,
-            boss_engine_utils::epoch_time::now_epoch_secs(),
-        )
-        .await;
-        for view in &guidance {
-            tracing::info!(
-                product_id = %view.product_id,
-                owner_repo = view.owner_repo.as_deref().unwrap_or(""),
-                state = view.state.tag(),
-                git_ref = view.state.git_ref().unwrap_or(""),
-                "coordinator guidance read on demand"
-            );
-        }
-        send_response(&sink, &request_id, FrontendEvent::CoordinatorGuidanceList { guidance });
-    });
+    let guidance = crate::coordinator_guidance::load_product_guidance(
+        &design_docs,
+        &products,
+        crate::coordinator_guidance::ON_DEMAND_FETCH_BUDGET,
+        boss_engine_utils::epoch_time::now_epoch_secs(),
+    )
+    .await;
+    for view in &guidance {
+        tracing::info!(
+            product_id = %view.product_id,
+            owner_repo = view.owner_repo.as_deref().unwrap_or(""),
+            state = view.state.tag(),
+            git_ref = view.state.git_ref().unwrap_or(""),
+            "coordinator guidance read on demand"
+        );
+    }
+    send_response(&sink, &request_id, FrontendEvent::CoordinatorGuidanceList { guidance });
 }

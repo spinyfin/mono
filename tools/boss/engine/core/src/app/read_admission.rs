@@ -57,6 +57,20 @@ fn setting(name: &str, default: usize) -> usize {
     }
 }
 
+// At most 100 outstanding replies per lane leaves 55 outbound entries.
+const MAX_PER_CONNECTION: usize = 20;
+fn connection_setting(name: &str, default: usize) -> usize {
+    let value = setting(name, default);
+    if value > MAX_PER_CONNECTION {
+        tracing::warn!(
+            name,
+            value,
+            MAX_PER_CONNECTION,
+            "clamping read admission setting to preserve reply headroom"
+        );
+    }
+    value.min(MAX_PER_CONNECTION)
+}
 impl ReadAdmission {
     pub(super) fn live() -> Self {
         Self::new(
@@ -64,7 +78,7 @@ impl ReadAdmission {
             setting("BOSS_RPC_LIVE_READ_CONCURRENCY", 1024),
             setting("BOSS_RPC_LIVE_READ_PER_CONNECTION", 1024),
             setting("BOSS_RPC_LIVE_READ_QUEUE", 100_000),
-            Duration::from_millis(setting("BOSS_RPC_READ_WAIT_MS", 60_000) as u64),
+            Duration::from_millis(setting("BOSS_RPC_LIVE_READ_WAIT_MS", 60_000) as u64),
         )
     }
 
@@ -104,6 +118,21 @@ impl ReadAdmission {
 }
 
 impl WaitingRead {
+    pub(super) async fn acquire_ordered(
+        self,
+        order: ordering::Turn,
+    ) -> Result<
+        (
+            (OwnedSemaphorePermit, OwnedSemaphorePermit),
+            tokio::sync::OwnedMutexGuard<()>,
+        ),
+        &'static str,
+    > {
+        let turn = tokio::time::timeout_at(self.deadline, order).await.map_err(|_| BUSY)?;
+        let permits = self.acquire().await?;
+        Ok((permits, turn))
+    }
+
     pub(super) async fn acquire(self) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), &'static str> {
         tokio::time::timeout_at(self.deadline, async {
             let local = self.connection.active.clone().acquire_owned().await.map_err(|_| BUSY)?;
@@ -115,118 +144,10 @@ impl WaitingRead {
     }
 }
 
-/// Status used by `agents list` has its own reserved live-work path.
-/// `GetPrStatus` with `refresh: true` awaits a GitHub probe, so it is
-/// outside the bulk lane because its per-execution refresh budget already
-/// bounds probes. Design-doc reads deliberately use the bulk budget through
-/// their network fetch and correlated response; they have no separate
-/// foreground budget and must not escape admission on cache misses.
-/// Mutations, subscriptions, and worker proposals remain ordered on their
-/// connection. Bulk read replies are correlated by request id.
-pub(super) fn is_bulk_read(request: &boss_protocol::FrontendRequest) -> bool {
-    use boss_protocol::FrontendRequest as R;
-    matches!(
-        request,
-        R::AuditProductEffort { .. }
-            | R::ResolveProjectDesignDoc { .. }
-            | R::CommentsBannerState { .. }
-            | R::CommentsGet { .. }
-            | R::CommentsList { .. }
-            | R::DebugLiveStatusPipeline
-            | R::EvaluateDispatchAdmission { .. }
-            | R::EvaluateEditorialRules { .. }
-            | R::ExecutionTranscript { .. }
-            | R::FindWorkItemsByPr { .. }
-            | R::GetAttentionGroup { .. }
-            | R::GetAttentionItem { .. }
-            | R::GetAutomation { .. }
-            | R::GetAutomationOpenTaskCount { .. }
-            | R::GetAutomationState
-            | R::GetCiBudget { .. }
-            | R::GetCiRemediation { .. }
-            | R::GetConflictHotspots { .. }
-            | R::GetConflictResolution { .. }
-            | R::GetCoordinatorHandoff
-            | R::GetCostWindowReport { .. }
-            | R::GetDecision { .. }
-            | R::GetDispatchConcurrency
-            | R::GetDispatchState
-            | R::GetDriverQuotaUsage { .. }
-            | R::GetDriverTrafficSplit
-            | R::GetExecution { .. }
-            | R::GetHost { .. }
-            | R::GetIdea { .. }
-            | R::GetPrBody { .. }
-            | R::GetProductDesignDoc { .. }
-            | R::GetPrStatus { refresh: false, .. }
-            | R::GetReviewGuideContent { .. }
-            | R::GetReviewGuideSummary { .. }
-            | R::GetRun { .. }
-            | R::GetSelectedProduct
-            | R::GetSettings
-            | R::GetTaskRuntime { .. }
-            | R::GetTopCostConsumers { .. }
-            | R::GetWorkerContext { .. }
-            | R::GetWorkItem { .. }
-            | R::GetWorkItemByShortId { .. }
-            | R::GetWorkItemCostReport { .. }
-            | R::GetWorkTree { .. }
-            | R::ListAnswerAgentRuns { .. }
-            | R::ListAttachments { .. }
-            | R::ListAttachmentsForWorkItem { .. }
-            | R::ListAttentionGroups { .. }
-            | R::ListAttentionItems { .. }
-            | R::ListAttentionItemsForWorkItem { .. }
-            | R::ListAttentionMerges { .. }
-            | R::ListAutomationDedupSuppressions { .. }
-            | R::ListAutomationRuns { .. }
-            | R::ListAutomations { .. }
-            | R::ListAutomationTasks { .. }
-            | R::ListChores { .. }
-            | R::ListCiRemediations { .. }
-            | R::ListConflictResolutions { .. }
-            | R::ListDecisions { .. }
-            | R::ListDeferredScopeAttentions { .. }
-            | R::ListDependencies { .. }
-            | R::ListDependenciesDetailed { .. }
-            | R::ListEditorialActions { .. }
-            | R::ListEngineAttempts { .. }
-            | R::ListExecutions { .. }
-            | R::ListFeatureFlags
-            | R::ListHosts
-            | R::ListIdeas { .. }
-            | R::ListLiveStatusDisabledSlots
-            | R::ListPlannerRuns { .. }
-            | R::ListProductDesignDocs { .. }
-            | R::ListProducts
-            | R::ListProjects { .. }
-            | R::ListProposals { .. }
-            | R::ListRevisions { .. }
-            | R::ListRuns { .. }
-            | R::ListTasks { .. }
-            | R::TailRunTranscript { .. }
-    )
-}
-
-pub(super) fn is_live_read(request: &boss_protocol::FrontendRequest) -> bool {
-    use boss_protocol::FrontendRequest as R;
-    matches!(
-        request,
-        R::GetEngineHealth
-            | R::GetEngineVersion
-            | R::GitHubAuthStatus
-            | R::ListHostedPaneStatuses
-            | R::ListTmuxWorkerStatuses
-            | R::ListWorkerLiveStates
-            | R::MetricsListLive
-            | R::MetricsShowLive { .. }
-            | R::ProbeStatus { .. }
-            | R::TrunkStatus
-            | R::WorkerPoolSummary
-            | R::WorkspacePoolSummary
-    )
-}
-
+mod lane;
+pub(super) use lane::{ReadLane, read_lane};
+mod ordering;
+pub(super) use ordering::ReadOrdering;
 #[cfg(test)]
 mod burst_tests;
 #[cfg(test)]

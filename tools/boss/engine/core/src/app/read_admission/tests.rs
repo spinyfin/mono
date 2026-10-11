@@ -1,5 +1,9 @@
 use super::*;
 
+fn is_bulk_read(request: &boss_protocol::FrontendRequest) -> bool {
+    read_lane(request) == ReadLane::Bulk
+}
+
 #[tokio::test]
 async fn limits_queue_deadline_and_release_are_bounded() {
     let gate = Arc::new(ReadAdmission::new(2, 1, 8, Duration::from_millis(30)));
@@ -79,4 +83,114 @@ async fn default_budget_admits_app_session_fan_out_behind_a_slow_read() {
     }
     drop(held);
     drop(slow);
+}
+
+#[test]
+fn omitted_and_network_reads_use_bulk() {
+    use boss_protocol::FrontendRequest as R;
+    for request in [
+        R::ListOperatorQuestions { id: "task".into() },
+        R::ListCoordinatorGuidance { product_id: None },
+        R::TrunkStatus,
+        R::GitHubAuthStatus,
+    ] {
+        assert_eq!(read_lane(&request), ReadLane::Bulk);
+    }
+}
+
+#[test]
+fn every_live_variant_has_an_audited_local_only_handler() {
+    // Inventory of handlers that read local process state, local SQL, or the
+    // local cube socket only. Changing live membership requires this audit.
+    let source = include_str!("lane.rs");
+    let live = source
+        .split("=> ReadLane::Bulk,")
+        .nth(1)
+        .unwrap()
+        .split("=> ReadLane::Live,")
+        .next()
+        .unwrap();
+    let actual: std::collections::BTreeSet<_> = live
+        .split("R::")
+        .skip(1)
+        .map(|s| s.split(|c: char| !c.is_alphanumeric()).next().unwrap())
+        .collect();
+    let audited = [
+        "GetEngineHealth",
+        "GetEngineVersion",
+        "ListHostedPaneStatuses",
+        "ListTmuxWorkerStatuses",
+        "ListWorkerLiveStates",
+        "MetricsListLive",
+        "MetricsShowLive",
+        "ProbeStatus",
+        "WorkerPoolSummary",
+        "WorkspacePoolSummary",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(actual, audited);
+}
+
+#[test]
+fn maximum_connection_limits_preserve_reader_headroom() {
+    let lane = ReadAdmission::new(32, MAX_PER_CONNECTION, 128, Duration::from_millis(500));
+    assert_eq!(
+        super::super::session_queue::MAX_SESSION_QUEUE - 2 * lane.outstanding_per_connection() - 1,
+        55
+    );
+}
+
+#[tokio::test]
+async fn same_kind_reads_keep_receive_order_even_when_tasks_poll_in_reverse() {
+    use boss_protocol::FrontendRequest as R;
+    let mut ordering = ReadOrdering::default();
+    let first = ordering.reserve(&R::ListProducts).await;
+    let mut second = ordering.reserve(&R::ListProducts).await;
+    let third = ordering.reserve(&R::ListProducts).await;
+    let unrelated = ordering.reserve(&R::GetEngineHealth).await;
+    let unrelated_guard = tokio::time::timeout(Duration::from_secs(1), unrelated).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut second)
+            .await
+            .is_err()
+    );
+    let first_guard = first.await;
+    drop(first_guard);
+    let second_guard = second.await;
+    let mut third = third;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut third)
+            .await
+            .is_err()
+    );
+    drop(second_guard);
+    assert!(tokio::time::timeout(Duration::from_secs(1), third).await.is_ok());
+    drop(unrelated_guard);
+}
+
+#[tokio::test]
+async fn expired_ordering_wait_does_not_release_predecessor_or_leak_capacity() {
+    use boss_protocol::FrontendRequest as R;
+    let gate = Arc::new(ReadAdmission::new(2, 2, 8, Duration::from_millis(20)));
+    let connection = gate.connection();
+    let mut ordering = ReadOrdering::default();
+    let first = ordering.reserve(&R::ListProducts).await.await;
+    let second = ordering.reserve(&R::ListProducts).await;
+    assert_eq!(
+        gate.enqueue(&connection)
+            .unwrap()
+            .acquire_ordered(second)
+            .await
+            .unwrap_err(),
+        BUSY
+    );
+    let mut third = ordering.reserve(&R::ListProducts).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut third)
+            .await
+            .is_err()
+    );
+    drop(first);
+    assert!(gate.enqueue(&connection).unwrap().acquire_ordered(third).await.is_ok());
 }
