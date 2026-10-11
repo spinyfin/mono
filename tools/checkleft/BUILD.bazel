@@ -264,10 +264,9 @@ _CHECKLEFT_LIB_TEST_COMPILE_DATA = [
 # fix path against the hermetic 1.99.0-toolchain rustfmt rather than whatever
 # `rustfmt` happens to be on the host PATH. The wrapper is itself a rust_binary
 # that resolves its wrapped tool via runfiles (see its rustc_env
-# WRAPPED_TOOL_TARGET); because `spawn()` (executor.rs) never clears the child
-# env, the RUNFILES_DIR bazel sets for this test binary is inherited by the
-# spawned wrapper subprocess unchanged, which is enough for it to resolve its
-# own wrapped-tool rlocation — no extra env wiring needed here.
+# WRAPPED_TOOL_TARGET). The subprocess environment allowlist preserves Bazel's
+# RUNFILES_DIR and RUNFILES_MANIFEST_FILE, so the spawned wrapper can resolve
+# its own wrapped-tool rlocation after the ambient environment is cleared.
 #
 # :precompiled_cwasm stages the build-time AOT `.cwasm` fixtures; the heavy
 # rust/giant-structs tests (both external::runtime:: and the exclusion-audit

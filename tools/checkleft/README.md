@@ -213,3 +213,32 @@ A private scratch repo, [`brianduff/checkleft-sandbox`](https://github.com/brian
 
 - `checkleft` shells out to `git` or `jj` to discover repository state.
 - Some built-in checks are specific to Bazel- or monorepo-style workflows.
+
+### Check subprocess environment
+
+npm bindings use Node **24.8.0**, downloaded from nodejs.org and checked against
+embedded SHA-256 digests before extraction. The platform-specific distribution
+is published atomically in checkleft's platform cache directory. macOS and Linux
+on x86-64 and ARM64 are supported; other platforms fail closed. No host Node or
+npx is consulted. Cache misses require network access. Package versions remain
+pinned by each check's npm binding.
+
+Check invocations, fixes, version probes and provisioning subprocesses clear the
+ambient environment. PATH contains the resolved executable's directory, other declared tool directories, followed
+by `/usr/bin:/bin:/usr/sbin:/sbin`. HOME and XDG_CONFIG_HOME point to a temporary
+empty directory; LANG and LC_ALL are `C`, and TZ is `UTC`. The only inherited
+variables are RUNFILES_DIR, RUNFILES_MANIFEST_FILE and TEST_SRCDIR (Bazel tool
+runfiles), TMPDIR (temporary storage), and SYSTEMROOT (platform support).
+RUSTUP_TOOLCHAIN, NODE_OPTIONS, ambient npm settings and user configuration are absent.
+For npx, checkleft sets npm_config_cache to its own persistent cache and npm
+user/global config paths to the empty HOME.
+A check can explicitly declare string values in its CHECKS configuration under
+`config.environment`, including HOME when user configuration is intentional. PATH remains framework-owned
+and cannot be overridden.
+
+Bazel launcher processes additionally retain HOME, USER and XDG_CACHE_HOME to
+preserve the existing Bazel cache namespace. They use `--nohome_rc` to exclude
+user Bazel configuration; repository rc files and normal action caching remain
+in effect. Repositories remain responsible for pinning their Bazel toolchains
+and explicit path bindings. `format/rust` requires its rules_rust wrapper:
+failure to resolve it is an error, with no PATH rustfmt fallback.

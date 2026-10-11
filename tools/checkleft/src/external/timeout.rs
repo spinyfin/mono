@@ -115,6 +115,7 @@ pub(crate) fn output_with_timeout(
     subprocess: &str,
     timeout_ms: u64,
 ) -> Result<Output> {
+    let _home = super::environment::prepare(command)?;
     // Match `Command::output()`: subprocesses must see immediate EOF rather
     // than inheriting checkleft's stdin (which is the pre-push ref list there).
     command

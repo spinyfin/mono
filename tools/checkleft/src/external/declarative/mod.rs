@@ -32,6 +32,7 @@ use crate::external::ExternalCheckLimits;
 use crate::output::Severity;
 
 pub mod executor;
+mod node;
 pub mod resolve;
 pub mod selector;
 pub mod template;
@@ -141,9 +142,8 @@ pub struct BinaryRequirement {
     pub default: BinaryBinding,
     /// Optional fallback for when the default binding fails to resolve. Only
     /// meaningful when `default` is `bazel` or `npm` (a `path` default always
-    /// resolves). When the primary resolution fails, the framework uses the
-    /// fallback and emits a loud warning to stderr so the operator knows the
-    /// pinned/hermetic toolchain was skipped.
+    /// resolves). Only alternate pinned Bazel/npm bindings may be used; legacy
+    /// PATH fallbacks fail closed if primary resolution fails.
     pub fallback: Option<BinaryBinding>,
 }
 
@@ -157,11 +157,8 @@ pub enum BinaryBinding {
     /// A direct path or PATH name — the portable fallback (no Bazel involved).
     Path(String),
     /// A version-pinned npm package, provisioned via `npx --yes <package>@<version>`
-    /// (environment-conditional: requires `npx`/Node on PATH). The version pin is
-    /// part of the package spec, so npx fetches and runs exactly that release
-    /// regardless of any globally-installed copy — a reproducible tool without
-    /// standing up a parallel Bazel JS toolchain. Pair with a `fallback.path` for
-    /// environments that have the tool on PATH but no npx.
+    /// Runs with checkleft's SHA-verified, pinned Node distribution; no host
+    /// Node or npm installation is required.
     Npm { package: String, version: String },
 }
 

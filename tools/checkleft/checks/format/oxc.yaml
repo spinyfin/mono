@@ -34,8 +34,7 @@ skip_symlinks: true
 #     pinned here to 0.55.0. The version is part of the package spec, so npx
 #     fetches and runs exactly that release regardless of any globally-installed
 #     copy — a reproducible tool without a parallel Bazel JS toolchain (mono has
-#     no rules_js/node Bazel integration today; Node arrives on PATH via the CI
-#     bootstrap). oxfmt is distributed as the standalone `oxfmt` npm package with
+#     no rules_js/node Bazel integration today; checkleft provisions Node). oxfmt is distributed as the standalone `oxfmt` npm package with
 #     an `oxfmt` binary. Re-pin per-repo via CHECKS config, setting only the
 #     version (the package is inherited from this default `npm` binding):
 #
@@ -51,11 +50,7 @@ skip_symlinks: true
 #     pin is pending. Because oxfmt is pre-1.0 and ships ~weekly, treat the pin as
 #     load-bearing and re-verify the formatted-language set when bumping it.
 #
-#   - fallback: when `npx` is not on PATH (some local/non-CI environments), the
-#     framework uses `oxfmt` from PATH and warns loudly on stderr so you know the
-#     pinned toolchain was skipped. A repo that later adopts a hermetic Bazel JS
-#     toolchain can point `needs.oxfmt.bazel` at its oxfmt target via CHECKS
-#     config with no change to this definition.
+#   - Node and npx use checkleft's SHA-verified runtime pin.
 #   - oxfmt discovers the REPO's own config (.oxfmtrc.json / .oxfmtrc.jsonc, etc.)
 #     and .gitignore/.prettierignore relative to the repo root (invocations run
 #     with cwd = repo root). checkleft imposes no formatting options of its own;
@@ -66,8 +61,6 @@ needs:
       npm:
         package: "oxfmt"
         version: "0.55.0"
-    fallback:
-      path: "oxfmt"
 
 invocations:
   - id: format

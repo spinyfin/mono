@@ -135,6 +135,8 @@ fn run_declarative_check_impl(
         repo_root,
         check_id: package_id,
         deadline: CheckDeadline::new(timeout_ms),
+        environment: config.get("environment"),
+        binaries: None,
     };
     let binaries = if package
         .invocations
@@ -144,6 +146,11 @@ fn run_declarative_check_impl(
         resolve::resolve_all_with_deadline(repo_root, &package.needs, config, context.check_id, context.deadline)?
     } else {
         BTreeMap::new()
+    };
+
+    let context = CheckExecutionContext {
+        binaries: Some(&binaries),
+        ..context
     };
 
     // Extract top-level string values from the config blob for {{config.KEY}}
@@ -898,6 +905,8 @@ struct CheckExecutionContext<'a> {
     repo_root: &'a Path,
     check_id: &'a str,
     deadline: CheckDeadline,
+    environment: Option<&'a toml::Value>,
+    binaries: Option<&'a BTreeMap<String, resolve::ResolvedBinary>>,
 }
 
 fn spawn(
@@ -906,7 +915,39 @@ fn spawn(
     args: &[String],
     invocation_id: &str,
 ) -> Result<InvocationOutput> {
-    let mut command = Command::new(binary);
+    let mut command = Command::new(crate::external::environment::locate(binary));
+    if binary.file_name().is_some_and(|name| name == "bazel") {
+        command.arg("--nohome_rc");
+    }
+    if let Some(binaries) = context.binaries {
+        let mut paths = Vec::new();
+        if let Some(parent) = Path::new(command.get_program()).parent().filter(|p| p.is_absolute()) {
+            paths.push(parent.to_owned());
+        }
+        for binary in binaries.values() {
+            if let Some(parent) = binary.program.parent().filter(|p| p.is_absolute())
+                && !paths.iter().any(|path| path == parent)
+            {
+                paths.push(parent.to_owned());
+            }
+        }
+        paths.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
+        command.env("PATH", std::env::join_paths(paths)?);
+    }
+    if let Some(environment) = context.environment {
+        let entries = environment
+            .as_table()
+            .context("config.environment must be a string map")?;
+        for (key, value) in entries {
+            if key == "PATH" {
+                bail!("config.environment cannot override the framework-owned PATH");
+            }
+            command.env(
+                key,
+                value.as_str().context("config.environment values must be strings")?,
+            );
+        }
+    }
     command.args(args).current_dir(context.repo_root);
     let output = output_with_timeout(
         &mut command,
@@ -1064,6 +1105,8 @@ pub fn run_declarative_fix(
         repo_root: context.repo_root,
         check_id: context.check_id,
         deadline: CheckDeadline::new(timeout_ms),
+        environment: config.get("environment"),
+        binaries: None,
     };
     let binaries = match resolve::resolve_all_with_deadline(
         context.repo_root,
@@ -1092,6 +1135,10 @@ pub fn run_declarative_fix(
     };
 
     let config_values = extract_config_string_values(config);
+    let context = CheckExecutionContext {
+        binaries: Some(&binaries),
+        ..context
+    };
     let ceiling = HostCeiling::new(context.repo_root);
     let mut outcomes = Vec::new();
     let mut total_processed = 0usize;
@@ -1481,6 +1528,8 @@ case "$1" in *b.txt) exit 1 ;; *) exit 0 ;; esac"#,
                 repo_root: dir.path(),
                 check_id: "test/fix",
                 deadline: CheckDeadline::new(5_000),
+                environment: None,
+                binaries: None,
             },
             Path::new("/bin/sh"),
             &prefix,
@@ -1544,6 +1593,8 @@ exit 1"#,
                 repo_root: dir.path(),
                 check_id: "test/fix",
                 deadline: CheckDeadline::new(5_000),
+                environment: None,
+                binaries: None,
             },
             Path::new("/bin/sh"),
             &prefix,
@@ -1595,6 +1646,8 @@ exit 1"#,
                 repo_root: dir.path(),
                 check_id: "test/fix",
                 deadline: CheckDeadline::new(5_000),
+                environment: None,
+                binaries: None,
             },
             Path::new("/bin/sh"),
             &prefix,
@@ -1640,6 +1693,8 @@ exit 1"#,
                 repo_root: dir.path(),
                 check_id: "test/fix",
                 deadline: CheckDeadline::new(25),
+                environment: None,
+                binaries: None,
             },
             Path::new("/bin/sh"),
             &prefix,

@@ -86,7 +86,7 @@ fn format_biome_args_use_format_ignore_unknown_and_json_reporter() {
 }
 
 #[test]
-fn format_biome_needs_npm_default_pinned_to_2_5_0_with_path_fallback() {
+fn format_biome_needs_npm_default_pinned_to_2_5_0_without_host_fallback() {
     let package = parse_format_biome_package();
     let req = package.needs.get("biome").expect("biome binary must be declared");
     match &req.default {
@@ -97,8 +97,8 @@ fn format_biome_needs_npm_default_pinned_to_2_5_0_with_path_fallback() {
         other => panic!("default binding must be an npm version-pinned binding; got: {other:?}"),
     }
     assert!(
-        matches!(req.fallback, Some(super::BinaryBinding::Path(_))),
-        "fallback binding must be a PATH binary for non-npx environments; got: {:?}",
+        req.fallback.is_none(),
+        "host fallback must be absent; got: {:?}",
         req.fallback
     );
 }
@@ -233,7 +233,7 @@ fn format_biome_transform_no_findings_on_clean_output() {
 
 fn format_biome_manifest_with_path_default(script: &Path) -> String {
     FORMAT_BIOME_MANIFEST.replace(
-        "needs:\n  biome:\n    default:\n      npm:\n        package: \"@biomejs/biome\"\n        version: \"2.5.0\"\n    fallback:\n      path: \"biome\"",
+        "needs:\n  biome:\n    default:\n      npm:\n        package: \"@biomejs/biome\"\n        version: \"2.5.0\"",
         &format!("needs:\n  biome:\n    default:\n      path: \"{}\"", script.display()),
     )
 }
