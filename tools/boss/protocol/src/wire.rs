@@ -942,6 +942,10 @@ pub enum FrontendRequest {
         id: String,
     },
 
+    /// Read the `[backup.offsite]` off-machine backup configuration.
+    /// Replies with [`FrontendEvent::OffsiteBackupSettings`]. Read-only.
+    GetOffsiteBackup,
+
     /// Worker → engine, read-only: the caller's own PR's body as Boss
     /// snapshotted it at the start of this execution's run (see
     /// `WorkDb::get_execution_pr_body_before`) — never a live GitHub read.
@@ -2445,6 +2449,21 @@ pub enum FrontendRequest {
         enabled: bool,
     },
 
+    /// Replace the `[backup.offsite]` off-machine backup configuration.
+    /// The engine validates (an enabled config needs an absolute
+    /// `destination`; retention cannot be 0/0), persists to
+    /// `settings.toml` atomically, and replies with
+    /// [`FrontendEvent::OffsiteBackupSettings`] carrying the saved
+    /// values. The engine reads this section at startup, so a change
+    /// takes effect on the next engine restart.
+    SetOffsiteBackup {
+        enabled: bool,
+        #[serde(default)]
+        destination: Option<String>,
+        keep_hourly: u32,
+        keep_daily: u32,
+    },
+
     /// Set (or clear) a product's `default_driver`. `driver` is a
     /// driver slug stored verbatim; `None` clears the column (the
     /// engine resolves `NULL` to `"claude"`). The engine does NOT
@@ -2525,7 +2544,6 @@ pub enum FrontendRequest {
         key: String,
         enabled: bool,
     },
-
     /// Set (or clear) a task's per-task doc pointer. Independent of
     /// `kind` — any leaf work item may carry one. Persists the three
     /// `tasks.doc_*` columns per [`SetTaskDocPointerInput`]'s semantics
@@ -2828,7 +2846,8 @@ pub use events::FrontendEvent;
 // `boss_protocol::{..}` paths are unchanged.
 mod snapshot_wire;
 pub use snapshot_wire::{
-    FeatureFlagSnapshot, SettingSnapshot, WorkerPoolClaimEntry, WorkerPoolEntry, WorkspacePoolEntry,
+    FeatureFlagSnapshot, OffsiteBackupSettings, SettingSnapshot, WorkerPoolClaimEntry, WorkerPoolEntry,
+    WorkspacePoolEntry,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

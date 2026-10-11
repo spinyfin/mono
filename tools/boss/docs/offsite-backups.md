@@ -12,7 +12,9 @@ Boss can copy each finished local backup into a directory that a sync agent repl
 
 ### Settings
 
-In `<state_root>/settings.toml`:
+In the Boss app: **Settings → Backups**. Turn on "Copy backups off this machine", choose the synced folder with **Choose…**, set the hourly/daily retention, and press **Save**. The engine validates the values (an enabled config needs an absolute folder and at least one retained copy), writes `[backup.offsite]` to `settings.toml`, and the pane offers **Restart engine to apply**, because the section is read at engine start.
+
+Or edit `<state_root>/settings.toml` by hand:
 
 ```toml
 [backup.offsite]

@@ -344,6 +344,8 @@ extension ChatViewModel {
             panePoolConfigHandler?(workerSlots, automationSlots, reviewSlots, coordinatorModel)
         case .settingsList(let settings):
             engineSettings = settings
+        case .offsiteBackupSettings(let settings):
+            offsiteBackup = settings
         case .settingSet(let key, let enabled):
             if let idx = engineSettings.firstIndex(where: { $0.key == key }) {
                 let prior = engineSettings[idx]

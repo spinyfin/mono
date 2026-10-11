@@ -1160,6 +1160,13 @@ pub enum FrontendEvent {
     SettingsList {
         settings: Vec<SettingSnapshot>,
     },
+    /// Response to [`FrontendRequest::GetOffsiteBackup`] and
+    /// [`FrontendRequest::SetOffsiteBackup`]: the persisted off-machine
+    /// backup configuration.
+    OffsiteBackupSettings {
+        #[serde(flatten)]
+        settings: OffsiteBackupSettings,
+    },
     /// Response to [`FrontendRequest::SetSetting`]: the engine has
     /// persisted the new value. The macOS Settings window uses this as
     /// the "saved" signal to commit the toggle state.

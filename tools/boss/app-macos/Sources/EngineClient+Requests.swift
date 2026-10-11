@@ -148,6 +148,27 @@ extension EngineClient {
         ])
     }
 
+    /// Fetch the persisted off-machine backup configuration.
+    func sendGetOffsiteBackup() {
+        sendLine(["type": "get_offsite_backup"], queueIfDisconnected: true)
+    }
+
+    /// Replace the off-machine backup configuration. The engine validates,
+    /// persists to `settings.toml`, and replies with
+    /// `offsite_backup_settings`; it applies on the next engine restart.
+    func sendSetOffsiteBackup(_ settings: OffsiteBackupSettings) {
+        var line: [String: Any] = [
+            "type": "set_offsite_backup",
+            "enabled": settings.enabled,
+            "keep_hourly": settings.keepHourly,
+            "keep_daily": settings.keepDaily,
+        ]
+        if let destination = settings.destination {
+            line["destination"] = destination
+        }
+        sendLine(line)
+    }
+
     /// Fetch the full host registry (including `local`).
     func sendListHosts() {
         sendLine(["type": "list_hosts"], queueIfDisconnected: true)

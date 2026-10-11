@@ -54,6 +54,24 @@ pub struct SettingSnapshot {
     pub enabled: bool,
 }
 
+/// Persisted `[backup.offsite]` configuration. Wire type for
+/// `FrontendEvent::OffsiteBackupSettings`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OffsiteBackupSettings {
+    pub enabled: bool,
+    /// Absolute directory replicated by a sync agent; `None` when unset.
+    #[serde(default)]
+    pub destination: Option<String>,
+    /// Distinct most-recent hours that keep their newest copy.
+    pub keep_hourly: u32,
+    /// Distinct most-recent days that keep their newest copy.
+    pub keep_daily: u32,
+    /// Set when the stored section is unparseable; the other fields are
+    /// then defaults and a save overwrites the bad section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<String>,
+}
+
 /// One row of the cube workspace pool, as exposed via
 /// `FrontendEvent::WorkspacePoolSummaryResult`. Mirrors
 /// `CubeWorkspaceStatus` plus an optional engine-side annotation
