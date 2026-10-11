@@ -201,3 +201,101 @@ fn conflict_priority_preserves_external_prerequisites_and_other_pr_queues() {
     assert!(gates.contains(&other.id));
     assert!(gates.contains(&conflict.id));
 }
+
+fn live_writer_then_conflict(db: &WorkDb, root: &str) -> (Task, WorkExecution, Task) {
+    let writer = revision(db, root, false);
+    let writer_exec = execution(db, &writer);
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'claimed' WHERE id = ?1",
+        [&writer_exec.id],
+    )
+    .unwrap();
+    conn.execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&writer.id])
+        .unwrap();
+    drop(conn);
+    let conflict = revision(db, root, true);
+    (writer, writer_exec, conflict)
+}
+
+#[test]
+fn released_writer_claim_stays_behind_conflict_revision() {
+    let (db, root) = setup();
+    let (writer, writer_exec, conflict) = live_writer_then_conflict(&db, &root);
+    assert!(db.release_dispatch_claim(&writer_exec.id).unwrap());
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        deps::gating_prereqs_for(&conn, &writer.id).unwrap(),
+        vec![conflict.id.clone()]
+    );
+    assert!(deps::gating_prereqs_for(&conn, &conflict.id).unwrap().is_empty());
+    drop(conn);
+    finish(&db, &conflict);
+    assert!(db.gating_prereqs_for(&writer.id).unwrap().is_empty());
+}
+
+#[test]
+fn failed_writer_retry_stays_behind_conflict_revision() {
+    let (db, root) = setup();
+    let (writer, writer_exec, conflict) = live_writer_then_conflict(&db, &root);
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'failed' WHERE id = ?1",
+        [&writer_exec.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'worker_failed' WHERE id = ?1",
+        [&writer.id],
+    )
+    .unwrap();
+    assert_eq!(
+        deps::gating_prereqs_for(&conn, &writer.id).unwrap(),
+        vec![conflict.id.clone()]
+    );
+    assert!(deps::gating_prereqs_for(&conn, &conflict.id).unwrap().is_empty());
+}
+
+#[test]
+fn restarted_in_review_revision_waits_for_conflict_revision() {
+    let (db, root) = setup();
+    let review = revision(&db, &root, false);
+    finish(&db, &review);
+    let restart = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(review.id.clone()).build())
+        .unwrap();
+    assert_eq!(restart.status, ExecutionStatus::Ready);
+    let conflict = revision(&db, &root, true);
+    assert_eq!(
+        db.get_execution(&restart.id).unwrap().status,
+        ExecutionStatus::WaitingDependency
+    );
+    assert_eq!(
+        db.claim_execution_for_dispatch(&restart.id).unwrap(),
+        DispatchClaimOutcome::Rejected
+    );
+    assert_eq!(db.gating_prereqs_for(&review.id).unwrap(), vec![conflict.id.clone()]);
+    finish(&db, &conflict);
+    assert!(db.gating_prereqs_for(&review.id).unwrap().is_empty());
+}
+
+#[test]
+fn failed_newer_conflict_revision_does_not_strand_older_conflict_revision() {
+    let (db, root) = setup();
+    let older = revision(&db, &root, true);
+    let newer = revision(&db, &root, true);
+    assert_eq!(db.gating_prereqs_for(&older.id).unwrap(), vec![newer.id.clone()]);
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'failed' WHERE work_item_id = ?1",
+        [&newer.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'worker_failed' WHERE id = ?1",
+        [&newer.id],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(db.gating_prereqs_for(&older.id).unwrap().is_empty());
+}

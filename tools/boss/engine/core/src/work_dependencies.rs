@@ -395,6 +395,13 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
             _ => gating.push(edge.prerequisite_id),
         }
     }
+    if dependent_kind.as_deref() == Some("revision") {
+        for id in crate::work::revision_sequencing::queued_behind_conflict_fixes(conn, work_item_id)? {
+            if !gating.contains(&id) {
+                gating.push(id);
+            }
+        }
+    }
     Ok(gating)
 }
 
