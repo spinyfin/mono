@@ -559,8 +559,15 @@ async fn autostart_loser_waits_for_the_winners_socket() {
     let notices = Arc::new(Mutex::new(Vec::new()));
     let mut discovery = discovery(dir.path(), fast_policy(Duration::from_secs(10), &notices));
     discovery.autostart = true;
+    let release = dir.path().join("winner-exit");
+    let _release_guard = ReleaseOnDrop(release.clone());
     let mut winner = Command::new("/bin/sh")
-        .args(["-c", &format!(": {ENGINE_BINARY_TARGET}; while :; do sleep 0.1; done")])
+        .args([
+            "-c",
+            &format!(": {ENGINE_BINARY_TARGET}; while [ ! -f \"$1\" ]; do sleep 0.1; done"),
+            "engine",
+            release.to_str().unwrap(),
+        ])
         .spawn()
         .unwrap();
     // The winner claims the pid path only after the loser's pre-spawn check.
@@ -571,9 +578,13 @@ async fn autostart_loser_waits_for_the_winners_socket() {
     let pid_path = discovery.pid_file_path.clone();
     let socket = discovery.socket_path.clone();
     let engine = tokio::spawn(async move {
-        while !Path::new(&pid_path).exists() {
-            sleep(Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !Path::new(&pid_path).exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("losing autostart publishes the winner pid");
         sleep(Duration::from_millis(300)).await;
         UnixListener::bind(socket).unwrap()
     });
