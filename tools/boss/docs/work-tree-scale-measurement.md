@@ -76,6 +76,8 @@ The timing experiment used the broader 5,054-ID diagnostic input. Three standalo
 
 ## Deferred implementation and measurement
 
+The four items below are declared as deferred scope on this work item (not merely noted here), so each is recorded for a human to schedule: (1) the `db.ai_review_state` query optimization, (2) engine-owned scoped reconciliation, (3) compact board records with on-demand detail, and (4) the controlled-workload invalidation measurement.
+
 The measured waste is not just a missing point lookup: thousands of hidden revision rows feed parent projections, all historical Done rows remain expandable, and the existing revision counter is global across subscribed and unsubscribed topics. An item-only patch with global `last + 1` checking would either leave related cards stale or repeatedly resync on unrelated events.
 
 Use three reviewable implementation changes after this measurement:
