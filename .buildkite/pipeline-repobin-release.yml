@@ -1,53 +1,14 @@
 # mono-repobin-release Buildkite pipeline.
 #
-# Cuts a GitHub Release of the `repobin` binary on spinyfin/mono, tagged
-# repobin-vX.Y.Z, with prebuilt binaries for Linux and macOS attached as
-# assets. repobin is consumed as a prebuilt by external repos (repobin's
-# registered //tools/repobin:repobin target builds from source, which is
-# unworkable for a consumer that wants a pinned, checksum-verified binary
-# with no cold Bazel/mono checkout); this is the pipeline that produces what
-# they pull.
-#
-# This is a SEPARATE pipeline from the main `mono` CI pipeline (it has its own
-# cron schedule and its own manual trigger), modeled directly on
-# `mono-checkleft-release` (.buildkite/pipeline-checkleft-release.yml).
-# Registration is NOT automatic — see the operator checklist in
-# tools/repobin/docs/buildkite-release-setup.md.
-#
-# Trigger model (enforced inside repobin-release.sh, BUILDKITE_SOURCE):
-#   - scheduled (cron) builds  → skip unless repobin changed since last tag.
-#   - manual builds (ui / api) → always release.
-# The pipeline should NOT be wired to build on push; releases come from the cron
-# schedule and manual triggers, and the idempotency guard no-ops a re-run on an
-# already-released commit.
-#
-# Agent targeting: every phase runs on the bazel-any queue (the shared Mac/Linux
-# pool) pinned to its OS by agent tag (os: linux / os: darwin) — otherwise a
-# phase can land on the wrong OS (the linux phase hard-fails if it lands on a
-# Mac).
-#
-# Structure: a single static `prepare` step (skip-logic + version + tag +
-# GitHub Release, created as a DRAFT) fans out to the `linux` and `darwin`
-# build steps ONLY when a release is actually being cut, followed by a
-# `publish` step (depends_on both) that verifies every required asset's
-# checksum and flips the release from draft to published. The fan-out is
-# dynamic: at the end of `prepare`, if a release was created, it calls
-# `buildkite-agent pipeline upload
-# .buildkite/pipeline-repobin-release-builds.yml` to inject the build +
-# publish steps into the running build. On a no-release run (scheduled build,
-# nothing changed) prepare exits without uploading that fragment, so the leaf
-# steps never appear and no bazel builds run.
-#
-# The concurrency_group lives on `prepare` so two release runs can't create
-# tags at once; the build steps are unconstrained (each run's builds attach to
-# that run's own release).
-#
-# Unlike checkleft, there is no musl phase — repobin has no C dependencies,
-# so a native Linux build is enough (see .buildkite/steps/repobin-release.sh
-# header for the full list of simplifications relative to checkleft's script).
+# Releases the //tools/repobin binary as checksum-verified prebuilt assets.
+# Other repos' CI needs repobin before it can dispatch anything through it, so
+# it cannot be obtained via repobin itself; consumers download a pinned release
+# instead. The static prepare step only uploads the build fragment when a
+# release is needed, so scheduled no-op runs do not build either platform.
+# Registration is NOT automatic — see tools/repobin/docs/buildkite-release-setup.md.
 
 steps:
-  - label: ":mag: repobin-release (prepare)"
+  - label: ":package: repobin-release (prepare)"
     key: "repobin-release-prepare"
     command: ".buildkite/steps/repobin-release.sh prepare"
     agents:
@@ -57,7 +18,3 @@ steps:
     concurrency_group: "repobin-release"
     retry:
       automatic: false
-  # The linux/darwin build steps are NOT listed here. They are injected
-  # dynamically by `prepare` via `buildkite-agent pipeline upload
-  # .buildkite/pipeline-repobin-release-builds.yml` — but only when a release
-  # is actually being cut. On a no-release run they never appear.

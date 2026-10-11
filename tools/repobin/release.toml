@@ -1,0 +1,19 @@
+repo = "spinyfin/mono"
+tag_prefix = "repobin-v"
+title_prefix = "repobin"
+change_paths = [
+  "tools/repobin/",
+  ".buildkite/steps/repobin-release.sh",
+  ".buildkite/pipeline-repobin-release.yml",
+  ".buildkite/pipeline-repobin-release-builds.yml",
+]
+required_assets = ["repobin-x86_64-unknown-linux-gnu", "repobin-aarch64-apple-darwin"]
+optional_assets = []
+
+[version]
+scheme = "alpha-counter"
+manifest = "tools/repobin/Cargo.toml"
+
+[notes]
+source = "changelog"
+project = "tools/repobin/PROJECT.yaml"
