@@ -109,7 +109,10 @@ pub(super) async fn handle_get_metric_series(ctx: Dispatch, req: FrontendRequest
                 statuses,
                 require_pr_url,
                 require_duration,
-                &filters,
+                MetricExecutionFactOptions {
+                    first_pr_only: unique_by_pr_url,
+                    filters: &filters,
+                },
                 group_by.as_deref(),
             ) {
                 Ok(minima) => minima,

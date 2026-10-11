@@ -91,23 +91,13 @@ pub(crate) fn parse_epoch_bound(input: &str, now: i64) -> Result<i64, CliError> 
     if let Some(epoch) = boss_engine_utils::iso8601::parse_iso8601_lenient(trimmed) {
         return Ok(epoch);
     }
-    let (digits, unit_secs) = if let Some(rest) = trimmed.strip_suffix(['h', 'H']) {
-        (rest, 3_600_i64)
-    } else if let Some(rest) = trimmed.strip_suffix(['d', 'D']) {
-        (rest, 86_400_i64)
-    } else if let Some(rest) = trimmed.strip_suffix(['w', 'W']) {
-        (rest, 604_800_i64)
-    } else {
-        return Err(CliError::usage(format!(
+    let secs = boss_engine_utils::duration::parse_compact_duration_secs(trimmed).map_err(|_| {
+        CliError::usage(format!(
             "could not parse {input:?} as a time bound: expected RFC3339 (e.g. 2026-07-01T00:00:00Z) \
              or a relative duration like 24h / 7d / 2w"
-        )));
-    };
-    let count: i64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| CliError::usage(format!("could not parse relative duration {input:?}")))?;
-    Ok(now - count.saturating_mul(unit_secs))
+        ))
+    })?;
+    Ok(now.saturating_sub(i64::try_from(secs).unwrap_or(i64::MAX)))
 }
 
 pub(crate) fn resolve_window(since: &str, until: Option<&str>) -> Result<(i64, i64), CliError> {
@@ -170,6 +160,24 @@ mod tests {
         assert_eq!(parse_epoch_bound("7d", now).unwrap(), now - 7 * 86_400);
         assert_eq!(parse_epoch_bound("2W", now).unwrap(), now - 2 * 604_800);
         assert_eq!(parse_epoch_bound("24H", now).unwrap(), now - 24 * 3_600);
+    }
+
+    #[test]
+    fn parse_epoch_bound_accepts_seconds_minutes_and_compound_durations() {
+        let now = 1_800_000_000;
+        assert_eq!(parse_epoch_bound("90s", now).unwrap(), now - 90);
+        assert_eq!(parse_epoch_bound("30m", now).unwrap(), now - 1_800);
+        assert_eq!(parse_epoch_bound("1h30m", now).unwrap(), now - 5_400);
+    }
+
+    #[test]
+    fn parse_epoch_bound_saturates_instead_of_overflowing() {
+        assert_eq!(parse_epoch_bound("99999999999999999w", i64::MIN + 5).unwrap(), i64::MIN);
+    }
+
+    #[test]
+    fn parse_epoch_bound_rejects_negative_counts() {
+        assert!(parse_epoch_bound("-5h", 0).is_err());
     }
 
     #[test]
