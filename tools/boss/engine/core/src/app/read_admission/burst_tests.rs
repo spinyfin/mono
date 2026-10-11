@@ -296,6 +296,9 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
     let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
         crate::app::ServerStateOverrides::builder()
             .read_admission(Arc::new(ReadAdmission::new(1, 32, 128, Duration::from_millis(50))))
+            // Small live budget too: reader headroom is derived from both
+            // limits, and the production defaults would leave none.
+            .live_read_admission(Arc::new(ReadAdmission::new(8, 2, 32, Duration::from_millis(250))))
             .build(),
     );
     let held = state

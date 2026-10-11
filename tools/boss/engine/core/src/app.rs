@@ -542,6 +542,7 @@ type CoordinatorInstalledVersionCache = Arc<StdMutex<Option<CoordinatorInstalled
 struct ServerStateOverrides {
     design_docs: Option<Arc<boss_engine_design_docs::DesignDocsService>>,
     read_admission: Option<Arc<read_admission::ReadAdmission>>,
+    live_read_admission: Option<Arc<read_admission::ReadAdmission>>,
     /// Fake live-CI probe. `None` uses `CommandMergeProbe`.
     merge_probe: Option<Arc<dyn MergeProbe>>,
     /// Fake Trunk token store. `None` uses `boss_trunk_auth::TrunkTokenStore`.
@@ -1162,6 +1163,7 @@ impl ServerState {
         let ServerStateOverrides {
             design_docs: design_docs_override,
             read_admission: read_admission_override,
+            live_read_admission: live_read_admission_override,
             merge_probe: merge_probe_override,
             trunk_token_store: trunk_token_store_override,
             trunk_client: trunk_client_override,
@@ -1661,6 +1663,7 @@ impl ServerState {
                 .transcript_path_cache(Arc::new(crate::live_status_loop::TranscriptPathCache::new()))
                 .run_cost_capture(Arc::new(crate::run_cost::RunCostCapture::new()))
                 .read_admission(read_admission_override.unwrap_or_default())
+                .maybe_live_read_admission(live_read_admission_override)
                 .design_docs(design_docs_override.unwrap_or_else(|| {
                     Arc::new(boss_engine_design_docs::DesignDocsService::new(
                         state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),
