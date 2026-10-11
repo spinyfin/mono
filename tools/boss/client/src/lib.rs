@@ -372,7 +372,7 @@ impl BossClient {
             // outcome, not "nothing was sent".
             let gave_up = |this: &Self, err: anyhow::Error| {
                 if first_possible_delivery.is_some() && matches!(safety, ReplaySafety::Within(_)) {
-                    this.outcome_unknown(request, &error)
+                    this.outcome_unknown(request, &anyhow::anyhow!("{error:#}; reconnect failed: {err:#}"))
                 } else {
                     err
                 }
@@ -390,8 +390,7 @@ impl BossClient {
             }
             let fresh = match Self::connect_within(&discovery, retry).await {
                 Ok(fresh) => fresh,
-                Err(err) if err.is::<EngineUnreachable>() => return Err(gave_up(self, err)),
-                Err(err) => return Err(err),
+                Err(err) => return Err(gave_up(self, err)),
             };
             self.reader = fresh.reader;
             self.writer = fresh.writer;
@@ -768,7 +767,10 @@ async fn wait_for_discovered_engine_until(
             }
             return Err(anyhow::Error::new(AutostartFailed(format!(
                 "the engine process started for this command exited before becoming ready ({status}); \
-                 socket {} was never published",
+                 started `{}` (resolved via {}); socket {} was never published. \
+                 Set BOSS_ENGINE_BIN to an explicit engine binary path.",
+                format_engine_command(&discovery.engine.program, &discovery.engine.args),
+                discovery.engine.source,
                 discovery.socket_path
             ))));
         }

@@ -274,6 +274,7 @@ async fn autostart_spawns_at_most_one_engine_while_waiting_for_it() {
 
     let err = BossClient::connect(&discovery).await.expect_err("engine never serves");
     assert!(err.downcast_ref::<EngineUnreachable>().is_some(), "{err:#}");
+    assert!(format!("{err:#}").contains("engine autostart did not help"), "{err:#}");
     let launches = std::fs::read_to_string(&counter).unwrap_or_default().lines().count();
     assert_eq!(launches, 1, "one engine started, then waited on across retries");
 }
@@ -323,6 +324,15 @@ async fn autostart_fails_at_once_when_the_engine_it_started_exits() {
     let message = format!("{err:#}");
     assert!(message.contains("exited before becoming ready"), "{message}");
     assert!(message.contains("exit status: 3"), "{message}");
+    assert!(
+        message.contains(&format_engine_command(
+            &discovery.engine.program,
+            &discovery.engine.args
+        )),
+        "{message}"
+    );
+    assert!(message.contains("resolved via test"), "{message}");
+    assert!(message.contains("BOSS_ENGINE_BIN"), "{message}");
 }
 
 #[test]
@@ -344,6 +354,48 @@ fn guarded_create() -> FrontendRequest {
             .name("a task")
             .build(),
     }
+}
+
+#[tokio::test]
+async fn guarded_create_has_unknown_outcome_when_reconnect_autostart_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = discovery(dir.path(), fast_policy(Duration::from_secs(60), &notices));
+    discovery.autostart = true;
+    discovery.start_timeout = Duration::from_secs(30);
+    discovery.engine = EngineCommand {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "exit 3".into()],
+        source: "test".into(),
+        attempted: Vec::new(),
+    };
+    let listener = UnixListener::bind(&discovery.socket_path).unwrap();
+    let mut client = BossClient::connect(&discovery).await.unwrap();
+    let socket = discovery.socket_path.clone();
+    let engine = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+        let request = read_request(&mut stream).await.expect("create delivered");
+        assert!(matches!(request.payload, FrontendRequest::CreateTask { .. }));
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
+        drop(stream);
+    });
+
+    let err = client
+        .send_request(&guarded_create())
+        .await
+        .expect_err("reply lost and restart failed");
+    engine.await.unwrap();
+    let unknown = err.downcast_ref::<OutcomeUnknown>().expect("typed unknown outcome");
+    assert_eq!(unknown.request, "create_task");
+    assert!(
+        unknown
+            .detail
+            .contains("engine closed the socket before returning a response"),
+        "{err:#}"
+    );
+    assert!(unknown.detail.contains("exit status: 3"), "{err:#}");
 }
 
 #[tokio::test]
