@@ -207,15 +207,13 @@ extension ChatViewModel {
             // An error carrying the answer's own request id is not ambiguous:
             // settle it onto that card without blaming any other request.
             if settleOperatorAnswerWorkError(message: message, requestId: requestId) { return }
+            // Likewise a refused project archive: the row drops its pending
+            // mark and the message surfaces, with no other state touched.
+            if settleArchiveWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
-            // A refused project archive: the row drops its pending mark and
-            // the message surfaces through `workErrorMessage` below (the
-            // project is still `active` in the store — nothing to undo).
             // Unattributable errors clear every pending archive rather than
             // risk a row stuck on "Archiving…" for a reply that never comes.
-            if let requestId, let projectID = archiveRequestProjectIDs[requestId] {
-                settleArchiveRequest(projectID: projectID)
-            } else if requestId == nil {
+            if requestId == nil {
                 settleAllArchiveRequests()
             }
             // The engine's WorkError reply carries no request context, so we
@@ -296,6 +294,11 @@ extension ChatViewModel {
             }
             showDisconnectedActionNotice()
             appendSystemMessage("Not connected to the engine; \(requestKind) was not sent.", alwaysShow: true)
+        case .workItemUpdateDecodeFailed(let message, let requestId):
+            // The reply a pending archive was waiting on arrived undecodable;
+            // it is the only reply that request gets, so settle it here.
+            if settleArchiveWorkError(message: message, requestId: requestId) { return }
+            handle(.error(message: message))
         case .error(let message):
             if pendingDragAdmissionCheck != nil {
                 // A malformed/undecodable `dispatch_admission_evaluated`

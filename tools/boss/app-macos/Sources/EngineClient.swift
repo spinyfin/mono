@@ -513,7 +513,10 @@ final class EngineClient: @unchecked Sendable {
             guard let itemPayload = payload["item"] as? [String: Any],
                   let item = parseWorkItem(itemPayload)
             else {
-                emit(.error(message: "received invalid work item payload from engine"))
+                emit(.workItemUpdateDecodeFailed(
+                    message: "received invalid work item payload from engine",
+                    requestId: envelopeRequestId
+                ))
                 break
             }
             emit(.workItemUpdated(item: item))

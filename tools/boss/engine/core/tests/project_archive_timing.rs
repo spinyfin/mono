@@ -9,7 +9,9 @@
 //!
 //! ```text
 //!   rpc          UpdateWorkItem issue → WorkItemUpdated reply
-//!   invalidation UpdateWorkItem issue → WorkInvalidated push on the watcher
+//!   invalidation UpdateWorkItem issue → WorkInvalidated push arrival, stamped
+//!                by the watcher's reader task when the push is decoded (not
+//!                when the test drains the queue)
 //!   work_tree    GetWorkTree issue → WorkTree reply (what the app refetches)
 //! ```
 //!
@@ -18,6 +20,12 @@
 //! exactly one `WorkInvalidated` push on the product topic, regardless of N.
 //! A per-child invalidation (or a per-child `WorkItemUpdated`) would show up
 //! here as extra pushes inside the quiet window and fail the test.
+//!
+//! What this harness does **not** measure: the handler's internal
+//! entry → commit → publish boundaries (the project transaction is roughly
+//! `rpc` minus a priority-only patch's `rpc`, an estimate, not a commit
+//! timestamp), and the app's main-actor apply/re-render after the fetch
+//! (needs the live GUI). Treat those as estimates wherever they are quoted.
 //!
 //! Timings are printed (`--test_output=all`), not asserted: wall clock on a
 //! shared CI runner is not a stable gate. The event-count pin is the gate.
@@ -178,7 +186,7 @@ async fn measure(child_count: usize) -> Result<ArchiveTimings> {
 
     // The archive's own invalidation: one push, naming the project.
     let push = watcher.next_invalidation(PUSH_TIMEOUT).await?;
-    let invalidation = started.elapsed();
+    let invalidation = push.received_at.saturating_duration_since(started);
     assert_eq!(push.topic, topic);
     match push.event {
         TopicEventPayload::WorkInvalidated {

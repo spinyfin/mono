@@ -114,6 +114,18 @@ extension ChatViewModel {
         archiveRequestProjectIDs = archiveRequestProjectIDs.filter { $0.value != projectID }
     }
 
+    /// A `work_error` (or undecodable reply) carrying a pending archive's own
+    /// request id belongs to that archive alone: drop its pending mark and
+    /// surface the message, without touching any other in-flight state.
+    /// Returns whether the request id matched an archive.
+    func settleArchiveWorkError(message: String, requestId: String?) -> Bool {
+        guard let requestId, let projectID = archiveRequestProjectIDs[requestId] else { return false }
+        abandonBackgroundWorkRequest(requestId: requestId)
+        settleArchiveRequest(projectID: projectID)
+        workErrorMessage = message
+        return true
+    }
+
     /// Clear every pending archive: used when the link drops or an error
     /// arrives that cannot be attributed to one request.
     func settleAllArchiveRequests() {

@@ -217,13 +217,11 @@ extension ChatViewModel {
                 return
             }
         case .project(let project):
-            // Apply the reply in place, exactly as task updates do, instead
-            // of refetching the whole work tree. The engine's own
-            // `work_invalidated` push for this patch still schedules the
-            // one debounced refetch; issuing a second, un-debounced
-            // `GetWorkTree` here doubled the cost of every project edit —
-            // measured at ~5 s per fetch on a ~2,000-task product, which is
-            // the whole "archive takes several seconds" symptom.
+            // Apply the reply in place, as task updates do. Do not send
+            // `GetWorkTree` here: the engine's `work_invalidated` push for
+            // this patch already schedules the debounced refetch, and a
+            // second, un-debounced full fetch would double the cost of every
+            // project edit.
             upsertProject(project)
             settleArchiveRequest(projectID: project.id)
         case .task(let updatedTask), .chore(let updatedTask):

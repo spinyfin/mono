@@ -123,6 +123,36 @@ final class ProjectArchiveContextMenuTests: XCTestCase {
         XCTAssertEqual(model.projectsByProductID["prod_test"]?.first?.status, "active")
     }
 
+    /// A refused archive settles onto the archive alone: a kanban move and a
+    /// merge-when-ready in flight are neither bounced nor given the message.
+    func testWorkErrorForArchiveDoesNotFanOutToOtherInFlightState() {
+        let model = makeConnectedModel()
+        model.archiveProject(id: "proj_test")
+        let requestID = model.archiveRequestProjectIDs.keys.first
+        model.mergingWhenReadyIDs = ["task_merge"]
+
+        model.applyEventForTest(.workError(message: "archive refused", requestId: requestID))
+
+        XCTAssertEqual(model.workErrorMessage, "archive refused")
+        XCTAssertEqual(model.mergingWhenReadyIDs, ["task_merge"])
+        XCTAssertNil(model.mergeErrorNoticesByTaskID["task_merge"])
+        XCTAssertFalse(model.archivingProjectIDs.contains("proj_test"))
+    }
+
+    /// An undecodable `work_item_updated` reply is the archive's only reply;
+    /// it must clear the pending mark rather than strand the row.
+    func testUndecodableArchiveReplyClearsPendingAndSurfacesMessage() {
+        let model = makeConnectedModel()
+        model.archiveProject(id: "proj_test")
+        let requestID = model.archiveRequestProjectIDs.keys.first
+
+        model.applyEventForTest(.workItemUpdateDecodeFailed(message: "bad payload", requestId: requestID))
+
+        XCTAssertTrue(model.archivingProjectIDs.isEmpty)
+        XCTAssertTrue(model.archiveRequestProjectIDs.isEmpty)
+        XCTAssertEqual(model.workErrorMessage, "bad payload")
+    }
+
     /// A `work_error` for some *other* request leaves the archive pending:
     /// its own reply is still coming.
     func testWorkErrorForUnrelatedRequestLeavesArchivePending() {
