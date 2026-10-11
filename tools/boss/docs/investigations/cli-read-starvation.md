@@ -35,6 +35,7 @@ Each connection also has a pending queue of four times its active limit. Full qu
 
 Per-connection active settings use the same validation as global settings, with no additional clamp. Bulk and live wait settings are independent and both default to 60 s. Outbound-queue headroom needs separate measurement of normal traffic before limits can be sized with a generous buffer; assumed reply counts do not justify lowering admission limits.
 
+
 Rejections produce a correlated `Error` response containing `engine busy, retry: read admission limit exceeded` and a warning identifying the session and whether its queue was full or its deadline expired. No retry loop is added to the CLI. Live status has an independent path rather than consuming the bulk quota.
 
 ## Regression evidence
