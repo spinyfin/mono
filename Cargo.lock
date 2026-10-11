@@ -311,6 +311,7 @@ dependencies = [
  "boss-backoff",
  "boss-log-files",
  "boss-protocol",
+ "libc",
  "serde",
  "serde_json",
  "shlex 1.3.0",

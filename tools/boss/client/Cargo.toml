@@ -9,6 +9,7 @@ anyhow = { workspace = true }
 boss-backoff = { path = "../backoff" }
 boss-log-files = { path = "../log-files" }
 boss-protocol = { path = "../protocol" }
+libc = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 shlex = { workspace = true }

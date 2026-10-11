@@ -28,6 +28,7 @@ _RUNTIME_TOOLS = [
     "od",
     "perl",
     "printf",
+    "ps",
     "pwd",
     "python3",
     "rm",
