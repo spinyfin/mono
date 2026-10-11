@@ -99,8 +99,9 @@ impl WorkerRegistry {
             .insert(pid, run_id.into());
     }
 
-    /// Record the viewer slot id the engine claimed for `run_id`'s tmux
-    /// worker. The engine uses this to route follow-up pane writes by run id.
+    /// Record the viewer slot id for `run_id` without a tmux session identity.
+    /// Local pane writes and interrupts fail closed for such a run; tmux-hosted
+    /// local workers must use [`Self::register_tmux_run_slot`].
     pub fn register_run_slot(&self, run_id: impl Into<String>, slot_id: u8) {
         {
             let mut inner = self.inner.lock().expect("registry poisoned");

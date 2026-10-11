@@ -58,7 +58,7 @@ pub const PROBE_UNDELIVERED_ATTENTION_KIND: &str = "probe_undelivered";
 /// then `set_server_state` plumbs the upgrade target in. A probe queued
 /// through this adapter is queued from inside a `Stop` fan-out, and
 /// `dispatch_probe_on_stop` — which runs later in that same fan-out —
-/// writes it into the pane as if the user had typed it.
+/// types it into the pane via tmux `send-keys` as if the user had typed it.
 #[derive(Default)]
 pub(super) struct ServerStateProbeQueuer {
     server: std::sync::OnceLock<Weak<ServerState>>,
@@ -340,7 +340,7 @@ impl ServerState {
     }
 
     /// Push a pre-minted `PendingProbe` back onto the front of the queue for
-    /// `run_id`. Used when the pane write fails after the probe was already
+    /// `run_id`. Used when a pane write fails after the probe was already
     /// claimed — a later delivery opportunity retries, and the caller's
     /// `probe_id` stays stable across the retry. Delivery sites should call
     /// [`Self::release_probe_reservation`], which also frees the in-flight

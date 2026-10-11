@@ -225,6 +225,36 @@ impl RecordingPaneRunner {
         self.calls().iter().any(|call| Self::call_is_text_write(call))
     }
 
+    /// Last prompt text written into the pane: prefer non-empty recorded
+    /// stdin, otherwise the most recent `send-keys -l -- <text>` argument.
+    pub(crate) fn try_last_paste(&self) -> Option<String> {
+        if let Some(stdin) = self.stdin().last()
+            && !stdin.is_empty()
+        {
+            return Some(String::from_utf8(stdin.clone()).expect("paste is utf-8"));
+        }
+        for call in self.calls().iter().rev() {
+            if call.iter().any(|arg| arg == "send-keys")
+                && call.iter().any(|arg| arg == "-l")
+                && let Some(idx) = call.iter().position(|arg| arg == "--")
+                && let Some(text) = call.get(idx + 1)
+            {
+                return Some(text.clone());
+            }
+        }
+        None
+    }
+
+    pub(crate) fn last_paste(&self) -> String {
+        self.try_last_paste().unwrap_or_else(|| {
+            panic!(
+                "expected a tmux pane write; calls={:?} stdin={:?}",
+                self.calls(),
+                self.stdin()
+            )
+        })
+    }
+
     fn call_is_text_write(call: &[String]) -> bool {
         call.iter().any(|arg| arg == "load-buffer")
             || (call.iter().any(|arg| arg == "send-keys") && call.iter().any(|arg| arg == "-l"))

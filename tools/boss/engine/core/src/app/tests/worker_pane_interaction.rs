@@ -159,10 +159,9 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
     let runner = Arc::new(RecordingPaneRunner::alive("claude", "boss-tmux-send"));
     *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
 
-    // No app session is registered. The runner notification proves the
-    // waiter has been registered and the direct tmux path was selected before
-    // we emit the hook that makes this a confirmed (not merely unconfirmed)
-    // delivery.
+    // The runner notification proves the waiter has been registered and the
+    // tmux write has started before we emit the hook that makes this a
+    // confirmed (not merely unconfirmed) delivery.
     let command_started = runner.started.notified();
     let server_clone = server_state.clone();
     let run_id_for_send = run_id.clone();
@@ -733,7 +732,7 @@ async fn interrupt_worker_pane_unknown_run_returns_unknown_run() {
 }
 
 #[tokio::test]
-async fn interrupt_tmux_worker_does_not_require_an_app_session() {
+async fn interrupt_tmux_worker_sends_the_key_via_tmux() {
     let (server_state, _dir) = test_server_state();
     server_state
         .worker_registry

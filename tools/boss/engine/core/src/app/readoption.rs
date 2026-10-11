@@ -413,7 +413,30 @@ impl ServerState {
             None => None,
         };
         if let Some(slot_id) = slot_id {
-            self.worker_registry.register_run_slot(run_id.to_owned(), slot_id);
+            match self.work_db.tmux_identity_for_execution(run_id) {
+                Ok(Some(identity)) => {
+                    self.worker_registry
+                        .register_tmux_run_slot(run_id.to_owned(), slot_id, identity.session_name);
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        run_id,
+                        slot_id,
+                        "readopt: local run has no durable tmux identity; registering a sessionless \
+                         slot, so pane input, probes and interrupt fail closed until it is adopted",
+                    );
+                    self.worker_registry.register_run_slot(run_id.to_owned(), slot_id);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        run_id,
+                        slot_id,
+                        %error,
+                        "readopt: could not read the durable tmux identity; registering a sessionless slot",
+                    );
+                    self.worker_registry.register_run_slot(run_id.to_owned(), slot_id);
+                }
+            }
             if let Some(shell_pid) = observed_shell_pid {
                 self.worker_registry.register(shell_pid, run_id.to_owned());
             }
