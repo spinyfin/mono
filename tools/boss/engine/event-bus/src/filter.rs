@@ -27,6 +27,7 @@ impl TopicFilter {
             EventKind::TaskTerminal,
             EventKind::ProjectImplDrained,
             EventKind::ExecutionTerminal,
+            EventKind::ExecutionStatusChanged,
             EventKind::PrMerged,
             EventKind::HostDisabled,
             EventKind::DependencyPrereqsSatisfied,

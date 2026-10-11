@@ -367,6 +367,17 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
     let edges = prerequisites_of(conn, work_item_id, Some(RELATION_BLOCKS))?;
     let mut gating = Vec::new();
     for edge in edges {
+        // Conflict fixes wait for writers to stop, not for their successful
+        // delivery. A failed writer must not strand the branch's rebase.
+        if dependent_kind.as_deref() == Some("revision")
+            && let Some(waiting) =
+                crate::work::revision_sequencing::conflict_writer_gate(conn, work_item_id, &edge.prerequisite_id)?
+        {
+            if waiting {
+                gating.push(edge.prerequisite_id);
+            }
+            continue;
+        }
         let status = lookup_work_item_status_for_gating(conn, &edge.prerequisite_id)?;
         match status {
             Some(s) if status_satisfies_for_dependent(&s, dependent_kind.as_deref()) => {
@@ -382,6 +393,13 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
                 }
             }
             _ => gating.push(edge.prerequisite_id),
+        }
+    }
+    if dependent_kind.as_deref() == Some("revision") {
+        for id in crate::work::revision_sequencing::queued_behind_conflict_fixes(conn, work_item_id)? {
+            if !gating.contains(&id) {
+                gating.push(id);
+            }
         }
     }
     Ok(gating)

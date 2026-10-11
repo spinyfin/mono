@@ -690,6 +690,7 @@ mod review_verdict_apply;
 mod review_verdicts;
 mod revise_doc;
 mod revision_helpers;
+pub(crate) mod revision_sequencing;
 mod run_rows;
 mod schema_init;
 pub(crate) use schema_init::table_exists;

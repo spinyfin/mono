@@ -707,11 +707,28 @@ impl WorkDb {
     /// second worker. `Rejected` means the row left `ready` (typically
     /// `waiting_dependency` after a reconciler write that won the race).
     pub fn claim_execution_for_dispatch(&self, execution_id: &str) -> Result<DispatchClaimOutcome> {
-        let conn = self.connect()?;
-        let updated = conn.execute(
+        let mut conn = self.connect()?;
+        // The conflict-fix gate must be judged before the claim: once the row is
+        // `claimed` it counts as a live writer and the gate switches itself off,
+        // so a released or retried writer would otherwise slip past a fix that
+        // was minted while it sat in the queue.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvents::new();
+        if let Some(execution) = query_execution(&tx, execution_id)?
+            && execution.status == ExecutionStatus::Ready
+            && execution.kind == ExecutionKind::RevisionImplementation
+            && !super::revision_sequencing::queued_behind_conflict_fixes(&tx, &execution.work_item_id)?.is_empty()
+            && let Some(demoted) = update_execution_status(&tx, execution_id, ExecutionStatus::WaitingDependency)?
+        {
+            stage_execution_status_changed(&mut pending, &demoted);
+            commit_and_publish(tx, pending, self.event_bus())?;
+            return Ok(DispatchClaimOutcome::Rejected);
+        }
+        let updated = tx.execute(
             "UPDATE work_executions SET status = 'claimed' WHERE id = ?1 AND status = 'ready'",
             [execution_id],
         )?;
+        tx.commit()?;
         if updated > 0 {
             return Ok(DispatchClaimOutcome::Won);
         }

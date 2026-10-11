@@ -140,6 +140,18 @@ pub(crate) fn stage_execution_terminal(
     Ok(())
 }
 
+/// Stage an [`Event::ExecutionStatusChanged`] for a non-terminal status
+/// transition (`queued`/`ready`/`waiting_dependency`) so subscribers stop
+/// seeing the stale status. Published only after the caller's transaction
+/// commits.
+pub(crate) fn stage_execution_status_changed(pending: &mut PendingEvents, execution: &WorkExecution) {
+    pending.push(Event::ExecutionStatusChanged {
+        execution_id: execution.id.clone(),
+        task_id: execution.work_item_id.clone(),
+        status: execution.status.to_string(),
+    });
+}
+
 /// Publish an [`Event::ExecutionTerminal`] immediately — for the rarer
 /// terminal-write call sites that mutate `work_executions` through a plain
 /// (auto-committing) [`Connection`] rather than an explicit `Transaction`,

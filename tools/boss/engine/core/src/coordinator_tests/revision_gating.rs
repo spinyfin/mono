@@ -593,9 +593,10 @@ async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_desc
                 rusqlite::params![root_id],
             )
             .unwrap();
+        // Task ids encode creation order; the second fix is the newer one.
         conn.execute(
                 "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id, created_via)
-                 SELECT 'task_rev_conflict_second', product_id, 'revision', 'Resolve conflicts B', '', 'todo', '1', '1', ?1, 'merge-conflict:crz_b'
+                 SELECT 'task_rev_conflict_zsecond', product_id, 'revision', 'Resolve conflicts B', '', 'todo', '1', '1', ?1, 'merge-conflict:crz_b'
                  FROM tasks WHERE id = ?1",
                 rusqlite::params![root_id],
             )
@@ -630,7 +631,7 @@ async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_desc
     let revision_exec_b = db
         .create_execution(
             CreateExecutionInput::builder()
-                .work_item_id("task_rev_conflict_second".to_owned())
+                .work_item_id("task_rev_conflict_zsecond".to_owned())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
                 .pr_url(pr_url.to_owned())

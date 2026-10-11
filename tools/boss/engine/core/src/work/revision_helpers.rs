@@ -34,7 +34,7 @@ impl WorkDb {
     }
 }
 
-/// Return the id of the most-recently-created **live** revision that is a
+/// Return the id of the last unfinished revision in dependency order that is a
 /// descendant of `root_id`, or `None` when the chain has no prior live
 /// revision.
 ///
@@ -72,6 +72,13 @@ pub(crate) fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &
             FROM chain c
             JOIN tasks t ON t.id = c.id
             WHERE t.status IN ('todo', 'active', 'blocked')
+              AND NOT EXISTS (
+                  SELECT 1 FROM work_item_dependencies d
+                  JOIN chain successor ON successor.id = d.dependent_id
+                  JOIN tasks next ON next.id = successor.id
+                  WHERE d.prerequisite_id = c.id AND d.relation = 'blocks'
+                    AND next.status IN ('todo', 'active', 'blocked')
+              )
             ORDER BY c.id DESC
             LIMIT 1",
             params![root_id],
@@ -160,7 +167,15 @@ pub(crate) fn assert_parent_revisable_and_insert(
     // inserting the new one.  The new revision will be gated on this tail
     // so that back-to-back revisions targeting the same PR always execute
     // one-after-another rather than racing as concurrent workers.
-    let chain_tail_id = find_latest_active_revision_in_chain(conn, &root_id)?;
+    let is_conflict = input
+        .created_via
+        .as_deref()
+        .is_some_and(|source| source.trim().starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX));
+    let chain_tail_id = if is_conflict {
+        None
+    } else {
+        find_latest_active_revision_in_chain(conn, &root_id)?
+    };
 
     // ── 6. Insert revision ──────────────────────────────────────────────────
     // Always parent to the chain root (never to another revision). Callers
@@ -186,7 +201,10 @@ pub(crate) fn assert_parent_revisable_and_insert(
     // When a prior unfinished revision exists, the new one must wait for it
     // before the dispatcher can run it.  This prevents two workers from
     // committing to the same PR branch simultaneously.
-    let has_chain_tail_gate = chain_tail_id.is_some();
+    let has_chain_tail_gate = chain_tail_id.is_some() || is_conflict;
+    if is_conflict {
+        super::revision_sequencing::prioritize_conflict_revision(pending, conn, &new_revision.id, &root_id, &now)?;
+    }
     if let Some(tail_id) = chain_tail_id {
         deps::insert_edge(conn, &new_revision.id, &tail_id, RELATION_BLOCKS, &now)?;
         // `new_revision` was just inserted in this same transaction, so it
