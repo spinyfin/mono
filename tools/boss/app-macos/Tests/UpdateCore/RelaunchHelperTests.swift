@@ -209,15 +209,15 @@ final class RelaunchHelperTests: XCTestCase {
         try installToolStubs(openSucceeds: true, blocks: true)
         let start = Date()
         XCTAssertEqual(try runHelper(newAppBehaviour: .hangsWithoutFlag, watchdogSeconds: 1), 1)
-        XCTAssertLessThan(Date().timeIntervalSince(start), 10)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 60, "a hung open (120 s) must not hold the deadlines")
         XCTAssertTrue(helperEvents().contains { $0.event == "timeout" })
     }
 
     func testBlockedOpenWithoutProcessHitsLaunchDeadline() throws {
-        try writeExecutable(binDir.appendingPathComponent("open"), "#!/bin/sh\nsleep 20\n")
+        try writeExecutable(binDir.appendingPathComponent("open"), "#!/bin/sh\nsleep 120\n")
         let start = Date()
-        XCTAssertEqual(try runHelper(newAppBehaviour: .hangsWithoutFlag, watchdogSeconds: 1), 1)
-        XCTAssertLessThan(Date().timeIntervalSince(start), 10)
+        XCTAssertEqual(try runHelper(newAppBehaviour: .hangsWithoutFlag, watchdogSeconds: 1, launchTimeout: 3), 1)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 60, "a hung open (120 s) must not hold the deadlines")
         XCTAssertTrue(helperEvents().contains { $0.event == "decision" && $0.detail["reason"] == "launch-not-started" })
     }
 
@@ -341,7 +341,7 @@ extension RelaunchHelperTests {
             [ -x "$exe" ] || { echo "LSOpenURLsWithRole() failed with error -10810" >&2; exit 1; }
             "$exe" </dev/null >/dev/null 2>&1 &
             printf '%s %s\\n' "$!" "$exe" >> "\(registry)"
-            \(blocks ? "sleep 20" : "exit 0")
+            \(blocks ? "sleep 120" : "exit 0")
 
             """
             : """
@@ -412,6 +412,10 @@ extension RelaunchHelperTests {
         watchdogSeconds: Int,
         oldPID: Int32? = nil,
         oldExitTimeout: Int = 60,
+        // Generous by default: a loaded CI host can take seconds to fork the stub
+        // `open` and its child, and a launch deadline that fires first turns every
+        // scenario into `launch-not-started`. Tests of that deadline pass a short one.
+        launchTimeout: Int = 15,
         legacy: Bool = false
     ) throws -> Int32 {
         let flag = installer().firstLaunchFlagURL(for: v("1.0.28"))
@@ -468,7 +472,7 @@ extension RelaunchHelperTests {
                 if let index = arguments.firstIndex(of: flag) { arguments.removeSubrange(index...index + 1) }
             }
         }
-        proc.arguments = arguments + ["--old-exit-timeout", String(oldExitTimeout), "--launch-timeout", "3"]
+        proc.arguments = arguments + ["--old-exit-timeout", String(oldExitTimeout), "--launch-timeout", String(launchTimeout)]
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = binDir.path + ":" + (env["PATH"] ?? "/usr/bin:/bin")
         proc.environment = env

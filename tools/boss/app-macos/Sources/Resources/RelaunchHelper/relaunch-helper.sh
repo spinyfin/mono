@@ -420,10 +420,18 @@ fi
 # ---------------------------------------------------------------------------
 
 if [ "$alive" -eq 0 ]; then
-  # The process is gone, so the observer's NOTE_EXIT has fired (or it reported why it
-  # could not watch); its wait is bounded by the watchdog either way.
-  [ -z "$observer_pid" ] || wait "$observer_pid" 2>/dev/null
+  # The process is gone, so the observer's NOTE_EXIT should already have fired (or it
+  # reported why it could not watch). Give it at most ~2 s more, never the full
+  # watchdog: a rollback must not wait on a diagnostic.
+  obs_late=""
+  if [ -n "$observer_pid" ]; then
+    obs_i=0
+    while is_alive "$observer_pid" && [ "$obs_i" -lt 20 ]; do obs_i=$((obs_i + 1)); sleep 0.1; done
+    if is_alive "$observer_pid"; then kill "$observer_pid" 2>/dev/null; obs_late=1; fi
+    wait "$observer_pid" 2>/dev/null
+  fi
   exit_detail=$(cat "$exit_capture" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
+  [ -n "$exit_detail" ] || exit_detail="observerUnavailable=${obs_late:+no exit event within 2s}"
   rm -f "$exit_capture"
   observer_pid=""
   log_event handshake process-exited error "pid=$new_pid" "secondsAfterProcessStart=$handshake_elapsed" "flag=$flag" \

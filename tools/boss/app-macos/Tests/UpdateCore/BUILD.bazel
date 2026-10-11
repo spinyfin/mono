@@ -16,7 +16,9 @@ _COVERAGE_LINKOPTS = select({
 
 macos_unit_test(
     name = "UpdateTests",
-    size = "small",
+    # medium: RelaunchHelperTests runs real watchdog/launch deadlines in wall-clock
+    # time (about 30 s locally, slower on CI hosts), beyond small's 60 s budget there.
+    size = "medium",
     # RelaunchHelperTests runs the real relaunch-helper.sh (located via
     # TEST_SRCDIR/TEST_WORKSPACE) against stub bundles and PATH-stubbed tools.
     data = [
