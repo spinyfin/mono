@@ -2214,6 +2214,14 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
     }
 
     async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
+        tracing::info!(
+            source = "execution",
+            reason,
+            product_id,
+            item_count = 1,
+            topic_count = 1,
+            "work invalidation fanout"
+        );
         let revision = self.work_revision.fetch_add(1, Ordering::SeqCst) + 1;
         let topic = work_product_topic(product_id);
         let event = FrontendEvent::TopicEvent {

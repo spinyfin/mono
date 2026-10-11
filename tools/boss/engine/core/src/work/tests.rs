@@ -557,3 +557,5 @@ mod t33;
 mod tmux_pane_observation_tests;
 mod work_item_tags_tests;
 mod work_item_write_tests;
+
+mod work_tree_scale_tests;
