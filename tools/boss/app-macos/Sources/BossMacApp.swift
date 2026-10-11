@@ -479,6 +479,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // [[UpdateLifecycle]] and design doc §4.
         if !BossEnginePaths.isIsolatedInstance {
             UpdateLifecycle.reconcileAtLaunch()
+            // Surface a watchdog rollback the previous launch recorded ("Update to X
+            // failed: <reason>; rolled back to Y") as a chrome banner with Retry/Dismiss.
+            updateModel.refreshRollbackNotice()
         }
 
         // Main-thread hang watchdog — gated on Settings (default off).

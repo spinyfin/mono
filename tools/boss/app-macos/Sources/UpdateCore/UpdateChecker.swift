@@ -144,7 +144,9 @@ actor UpdateChecker {
     /// this to suppress auto-install while still surfacing update availability.
     nonisolated let isDevBuild: Bool
 
-    private let currentVersion: VersionTuple
+    /// The running version the checker compares releases against (internal so
+    /// `UpdateModel` can stamp it onto update-log records).
+    let currentVersion: VersionTuple
     private let fetcher: HTTPFetcher
     private let userAgentVersion: String
 

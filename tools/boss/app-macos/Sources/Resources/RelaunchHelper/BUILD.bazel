@@ -6,5 +6,8 @@ package(default_visibility = ["//visibility:private"])
 filegroup(
     name = "relaunch_helper",
     srcs = ["relaunch-helper.sh"],
-    visibility = ["//tools/boss/app-macos:__pkg__"],
+    visibility = [
+        "//tools/boss/app-macos:__pkg__",
+        "//tools/boss/app-macos/Tests/UpdateCore:__pkg__",
+    ],
 )

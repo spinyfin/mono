@@ -106,6 +106,48 @@ struct UpdateStager: Sendable {
     }
 }
 
+// MARK: - UpdateBlocklist
+
+/// Seam over ``UpdateInstaller``'s failed-version blocklist and rollback history so
+/// ``UpdateModel`` can refuse to re-stage a version that failed its first launch,
+/// surface the recorded rollback to the user, and clear the block only on an explicit
+/// retry. `.noop` never blocks (placeholder/preview models); tests inject their own.
+public struct UpdateBlocklist: Sendable {
+    public let isBlocked: @Sendable (VersionTuple) -> Bool
+    public let rollback: @Sendable (VersionTuple) -> RollbackRecord?
+    public let lastRollback: @Sendable () -> RollbackRecord?
+    public let unblock: @Sendable (VersionTuple) -> Void
+    public let acknowledgeRollbacks: @Sendable () -> Void
+
+    public init(
+        isBlocked: @escaping @Sendable (VersionTuple) -> Bool,
+        rollback: @escaping @Sendable (VersionTuple) -> RollbackRecord?,
+        lastRollback: @escaping @Sendable () -> RollbackRecord?,
+        unblock: @escaping @Sendable (VersionTuple) -> Void,
+        acknowledgeRollbacks: @escaping @Sendable () -> Void
+    ) {
+        self.isBlocked = isBlocked
+        self.rollback = rollback
+        self.lastRollback = lastRollback
+        self.unblock = unblock
+        self.acknowledgeRollbacks = acknowledgeRollbacks
+    }
+
+    public static let noop = UpdateBlocklist(
+        isBlocked: { _ in false }, rollback: { _ in nil }, lastRollback: { nil },
+        unblock: { _ in }, acknowledgeRollbacks: {})
+
+    /// Backed by the live installer's `install-state.json`.
+    public static func live(installer: UpdateInstaller) -> UpdateBlocklist {
+        UpdateBlocklist(
+            isBlocked: { installer.isBlocked($0) },
+            rollback: { installer.rollbackRecord(for: $0) },
+            lastRollback: { installer.lastRollback() },
+            unblock: { installer.unblockVersion($0) },
+            acknowledgeRollbacks: { installer.acknowledgeRollbacks() })
+    }
+}
+
 /// Resolves the running bundle's signing Team ID once and caches it. Reading the
 /// Team ID shells out to `codesign`, so we avoid repeating it on every download.
 private actor RunningTeamIDCache {
@@ -154,6 +196,11 @@ public final class UpdateModel: ObservableObject {
     /// Install & Relaunch / Quit to Finish. The sheet is re-presented with a
     /// status line so a cancelled or vetoed quit is never silent.
     @Published public private(set) var quitReturnedWithoutTerminating: Bool = false
+    /// The most recent watchdog rollback the user has not dismissed yet. Set by
+    /// ``refreshRollbackNotice()`` at launch (after `reconcileAtLaunch` folded the
+    /// helper's marker into state); drives the "Update to X failed … rolled back to Y"
+    /// chrome banner. Cleared by ``dismissRollbackNotice()`` or ``retryBlockedUpdate(_:)``.
+    @Published public private(set) var rollbackNotice: RollbackRecord?
 
     // MARK: - Private
 
@@ -169,6 +216,8 @@ public final class UpdateModel: ObservableObject {
     private let defaults: UserDefaults
     private let checker: UpdateChecker
     private let stager: UpdateStager
+    private let blocklist: UpdateBlocklist
+    private let log: UpdateLog?
     private let jitterRange: ClosedRange<TimeInterval>
     private var schedulerTask: Task<Void, Never>?
 
@@ -183,10 +232,13 @@ public final class UpdateModel: ObservableObject {
         guard let checker = UpdateChecker.fromBundle() else { return nil }
         let current = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)
             .flatMap(VersionTuple.parse) ?? VersionTuple(major: 0, minor: 0, patch: 0)
+        let installer = UpdateInstaller.live(installBundleURL: Bundle.main.bundleURL)
         return UpdateModel(
             checker: checker,
             defaults: defaults,
-            stager: .live(currentVersion: current)
+            stager: .live(currentVersion: current),
+            blocklist: .live(installer: installer),
+            log: installer.log
         )
     }
 
@@ -202,18 +254,22 @@ public final class UpdateModel: ObservableObject {
         )
     }
 
-    /// Designated initializer. `defaults`, `jitterRange`, and `stager` are injectable
-    /// for testing. `stager` defaults to `.noop` so tests that don't exercise the
-    /// download path never touch the network/filesystem.
+    /// Designated initializer. `defaults`, `jitterRange`, `stager`, `blocklist` and
+    /// `log` are injectable for testing. `stager` defaults to `.noop` so tests that
+    /// don't exercise the download path never touch the network/filesystem.
     init(
         checker: UpdateChecker,
         defaults: UserDefaults = .standard,
         jitterRange: ClosedRange<TimeInterval> = 30...120,
-        stager: UpdateStager = .noop
+        stager: UpdateStager = .noop,
+        blocklist: UpdateBlocklist = .noop,
+        log: UpdateLog? = nil
     ) {
         self.defaults = defaults
         self.checker = checker
         self.stager = stager
+        self.blocklist = blocklist
+        self.log = log
         self.jitterRange = jitterRange
 
         let modeRaw = defaults.string(forKey: StorageKeys.mode) ?? UpdateMode.notify.rawValue
@@ -328,14 +384,23 @@ public final class UpdateModel: ObservableObject {
         switch result {
         case .upToDate:
             modelLog.info("update check complete: up-to-date")
+            log?.record(stage: "check", event: "up-to-date", attempt: nil, from: checker.currentVersion)
         case .available(let update):
             modelLog.info(
                 "update check complete: update available version=\(update.version.description, privacy: .public) tag=\(update.tagName, privacy: .public)"
             )
+            log?.record(stage: "check", event: "available", attempt: nil, from: checker.currentVersion, to: update.version,
+                        detail: ["tag": update.tagName, "url": update.assetURL.absoluteString,
+                                 "bytes": String(update.assetSize), "mode": mode.rawValue,
+                                 "blocked": String(blocklist.isBlocked(update.version))])
         case .rateLimited(let retryAfter):
             modelLog.warning("update check complete: rate-limited, retry after \(retryAfter.description, privacy: .public)")
+            log?.record(stage: "check", event: "rate-limited", level: "warning", attempt: nil,
+                        from: checker.currentVersion, detail: ["retryAfter": retryAfter.description])
         case .networkError(let message):
             modelLog.error("update check complete: network error — \(message, privacy: .public)")
+            log?.record(stage: "check", event: "network-error", level: "warning", attempt: nil,
+                        from: checker.currentVersion, detail: ["error": message])
         }
 
         // In automatic mode, a known-available update is downloaded and staged here
@@ -368,7 +433,69 @@ public final class UpdateModel: ObservableObject {
     /// a clear failure state — no browser fallback.
     public func markInstallFailed(version: VersionTuple, reason: String) {
         modelLog.error("update install: failed version=\(version.description, privacy: .public) reason=\(reason, privacy: .public)")
+        log?.record(stage: "swap", event: "install-failed", level: "error", attempt: nil,
+                    from: checker.currentVersion, to: version, detail: ["reason": reason])
         downloadState = .installFailed(version: version, reason: reason)
+    }
+
+    // MARK: - Rollback notice / blocklist
+
+    /// `true` when `version` failed a prior first launch and is blocklisted. The UI
+    /// offers "Retry Update" instead of "Download" for such a version.
+    public func isBlocked(_ version: VersionTuple) -> Bool {
+        blocklist.isBlocked(version)
+    }
+
+    /// The recorded rollback for `version`, if it was ever rolled back.
+    public func rollbackRecord(for version: VersionTuple) -> RollbackRecord? {
+        blocklist.rollback(version)
+    }
+
+    /// Re-read the persisted rollback history and surface the latest rollback the user
+    /// has not yet dismissed. Call once at launch after `reconcileAtLaunch`.
+    public func refreshRollbackNotice() {
+        guard let record = blocklist.lastRollback(), !record.acknowledged else {
+            rollbackNotice = nil
+            return
+        }
+        rollbackNotice = record
+        log?.record(stage: "reconcile", event: "rollback-notice-shown", attempt: record.attemptID,
+                    to: VersionTuple.parse(record.version), detail: ["reason": record.reason.rawValue])
+    }
+
+    /// The user dismissed the rollback banner. The version stays blocklisted.
+    public func dismissRollbackNotice() {
+        guard let record = rollbackNotice else { return }
+        blocklist.acknowledgeRollbacks()
+        rollbackNotice = nil
+        log?.record(stage: "reconcile", event: "rollback-notice-dismissed", attempt: record.attemptID,
+                    to: VersionTuple.parse(record.version))
+    }
+
+    /// Deliberate retry of a version the watchdog rolled back: clear its block, then
+    /// stage it again (re-checking first when the last check is stale or missing) and
+    /// present the sheet so the user can press Install & Relaunch. This is the only
+    /// path that re-downloads a blocklisted version; background polling and the plain
+    /// "Download" button refuse to. The watchdog re-blocklists it if it fails again.
+    public func retryBlockedUpdate(_ version: VersionTuple) {
+        guard !isDevBuild else { return }
+        log?.record(stage: "blocklist", event: "retry-requested", attempt: nil,
+                    from: checker.currentVersion, to: version, detail: ["source": "user"])
+        blocklist.unblock(version)
+        blocklist.acknowledgeRollbacks()
+        rollbackNotice = nil
+        showUpdateSheet = true
+        if case .available(let update) = lastCheckResult, update.version >= version {
+            beginStaging(update)
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let result = await self.checkNow()
+            if case .available(let update) = result, update.version >= version {
+                self.beginStaging(update)
+            }
+        }
     }
 
     /// Records that the bundle swap for `version` was applied but the app has not yet
@@ -408,6 +535,14 @@ public final class UpdateModel: ObservableObject {
     /// no-op when no update is available.
     public func downloadAvailableUpdate() {
         guard !isDevBuild, case .available(let update) = lastCheckResult else { return }
+        guard !blocklist.isBlocked(update.version) else {
+            // A version that failed its first launch is only re-staged through the
+            // explicit ``retryBlockedUpdate(_:)`` path, which clears the block first.
+            modelLog.warning("update download: refusing to stage blocklisted version \(update.version.description, privacy: .public) without an explicit retry")
+            log?.record(stage: "stage", event: "refused-blocklisted", level: "warning", attempt: nil,
+                        from: checker.currentVersion, to: update.version, detail: ["source": "download-button"])
+            return
+        }
         beginStaging(update)
     }
 
@@ -417,6 +552,16 @@ public final class UpdateModel: ObservableObject {
     private func maybeAutoStage(_ result: UpdateCheckResult) {
         guard mode == .automatic, !isDevBuild else { return }
         guard case .available(let update) = result else { return }
+        guard !blocklist.isBlocked(update.version) else {
+            // The watchdog rolled this version back and `reconcileAtLaunch` reaped its
+            // staged directory. Re-downloading it here would silently undo that: the
+            // next quit/startup boundary would retry a version known to fail. Only an
+            // explicit user retry (``retryBlockedUpdate(_:)``) may re-stage it.
+            modelLog.warning("update auto-stage: skipping blocklisted version \(update.version.description, privacy: .public)")
+            log?.record(stage: "stage", event: "skipped-blocklisted", level: "warning", attempt: nil,
+                        from: checker.currentVersion, to: update.version, detail: ["source": "auto-stage"])
+            return
+        }
         beginStaging(update)
     }
 
@@ -438,6 +583,8 @@ public final class UpdateModel: ObservableObject {
         stagingTask?.cancel()
         downloadState = .downloading(version: version, progress: .determinate(0))
         modelLog.info("update download: staging version=\(version.description, privacy: .public)")
+        log?.record(stage: "stage", event: "begin", attempt: nil, from: checker.currentVersion, to: version,
+                    detail: ["mode": mode.rawValue])
         stagingTask = Task { [weak self] in
             guard let self else { return }
             let staged = await self.stager.stage(update) { [weak self] progress in

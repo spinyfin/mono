@@ -44,6 +44,10 @@ root-cause rule as the section below.
   [`tools/boss/docs/attention-lifecycle.md`](tools/boss/docs/attention-lifecycle.md)
 - Post-crash orphan recovery:
   [`tools/boss/docs/post-crash-recovery.md`](tools/boss/docs/post-crash-recovery.md)
+- Self-update attempt log (where the durable update trail lives, how to
+  follow one attempt across the old app, the relaunch helper and the new
+  app, and where a rollback's reason is recorded):
+  [`tools/boss/docs/update-attempt-log.md`](tools/boss/docs/update-attempt-log.md)
 - Crash watchdog (why an abort always kills the app, and
   `BOSS_CRASH_WATCHDOG_SECONDS`):
   [`tools/boss/docs/crash-watchdog.md`](tools/boss/docs/crash-watchdog.md)

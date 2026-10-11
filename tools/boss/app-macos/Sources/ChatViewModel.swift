@@ -859,6 +859,10 @@ final class ChatViewModel: ObservableObject {
 
         processController.onOutputLine = { [weak self] line in
             self?.appendSystemMessage(line)
+            // Engine handoff decisions (`[engine version-check …]`, `[engine upgrade]`,
+            // `[engine launch]`) join the durable update trail for the launch that
+            // completed or rolled back an update. No-op outside that context.
+            UpdateLifecycle.recordEngineLine(line)
         }
         processController.onSupervisionStateChange = { [weak self] state in
             guard let self, self.engineSupervisionState != state else { return }

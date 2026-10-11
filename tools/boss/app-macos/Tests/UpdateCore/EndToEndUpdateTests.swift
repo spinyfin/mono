@@ -225,7 +225,12 @@ final class EndToEndUpdateTests: XCTestCase {
 
         // Back on the old version after rollback. Reconcile processes the marker.
         let outcome = installer.reconcileAfterLaunch(currentVersion: v("1.0.27"))
-        XCTAssertEqual(outcome, .rolledBack(v("1.0.28")))
+        guard case .rolledBack(let record) = outcome else {
+            return XCTFail("expected .rolledBack, got \(outcome)")
+        }
+        XCTAssertEqual(record.version, "1.0.28")
+        XCTAssertEqual(record.reason, .unknown, "bare-version marker from a pre-reason helper")
+        XCTAssertEqual(record.restoredVersion, "1.0.27")
         XCTAssertTrue(installer.isBlocked(v("1.0.28")),
                       "1.0.28 must be blocklisted after rollback")
         XCTAssertFalse(exists(installer.rolledBackMarkerURL),
