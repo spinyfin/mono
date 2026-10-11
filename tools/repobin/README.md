@@ -49,6 +49,12 @@ own CLIs (`boss`, `cube`) are typical tools dispatched through it.
 cargo install repobin
 ```
 
+Once the `mono-repobin-release` pipeline is registered, prebuilt, checksum-verified binaries (macOS arm64, Linux x86_64) are published
+as `repobin-vX.Y.Z-alpha.N` GitHub Releases of `spinyfin/mono`. CI scripts should
+download a pinned version and verify its sha256; see
+[`docs/buildkite-release-setup.md`](docs/buildkite-release-setup.md#installing-in-ci)
+for the install snippet.
+
 ## Usage
 
 Check in a repo-root `REPOBIN.toml`:

@@ -1,0 +1,35 @@
+# Build fragment uploaded by mono-repobin-release's prepare step after it
+# creates or resumes a draft release. The two native builds run in parallel;
+# publish waits for both uploads and verifies their checksum sidecars before
+# publishing.
+
+steps:
+  - label: ":rust: repobin-release (linux)"
+    key: "repobin-release-linux"
+    command: ".buildkite/steps/repobin-release.sh linux"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false
+
+  - label: ":apple: repobin-release (darwin)"
+    key: "repobin-release-darwin"
+    command: ".buildkite/steps/repobin-release.sh darwin"
+    agents:
+      queue: bazel-any
+      os: darwin
+    retry:
+      automatic: false
+
+  - label: ":white_check_mark: repobin-release (publish)"
+    key: "repobin-release-publish"
+    command: ".buildkite/steps/repobin-release.sh publish"
+    depends_on:
+      - "repobin-release-linux"
+      - "repobin-release-darwin"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false

@@ -1,0 +1,20 @@
+# mono-repobin-release Buildkite pipeline.
+#
+# Releases the //tools/repobin binary as checksum-verified prebuilt assets.
+# Other repos' CI needs repobin before it can dispatch anything through it, so
+# it cannot be obtained via repobin itself; consumers download a pinned release
+# instead. The static prepare step only uploads the build fragment when a
+# release is needed, so scheduled no-op runs do not build either platform.
+# Registration is NOT automatic — see tools/repobin/docs/buildkite-release-setup.md.
+
+steps:
+  - label: ":package: repobin-release (prepare)"
+    key: "repobin-release-prepare"
+    command: ".buildkite/steps/repobin-release.sh prepare"
+    agents:
+      queue: bazel-any
+      os: linux
+    concurrency: 1
+    concurrency_group: "repobin-release"
+    retry:
+      automatic: false
