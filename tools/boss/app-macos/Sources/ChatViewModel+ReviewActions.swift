@@ -52,7 +52,12 @@ extension ChatViewModel {
         mergeErrorNoticesByTaskID.removeValue(forKey: task.id)
         mergingWhenReadyIDs.insert(task.id)
         mergeRevisionConfirmationOrigins[task.id] = origin
-        engine.sendMergeWhenReady(workItemID: task.id)
+        // A send dropped while disconnected never gets a reply; release the
+        // in-flight state now so the control isn't stuck.
+        if engine.sendMergeWhenReady(workItemID: task.id) == nil {
+            mergingWhenReadyIDs.remove(task.id)
+            mergeRevisionConfirmationOrigins.removeValue(forKey: task.id)
+        }
     }
 
     /// If a different task's confirmation is already showing, queue this one
@@ -164,7 +169,10 @@ extension ChatViewModel {
         reviewTerminalVM.state = .loading(taskName: task.name)
         reviewTerminalOpener?()
         openingReviewTerminalIDs.insert(task.id)
-        engine.sendOpenReviewTerminal(workItemID: task.id)
+        if engine.sendOpenReviewTerminal(workItemID: task.id) == nil {
+            openingReviewTerminalIDs.remove(task.id)
+            resetLoadingReviewTerminal()
+        }
     }
 
     /// Notify the engine that the review terminal for `leaseID` has
@@ -190,6 +198,15 @@ extension ChatViewModel {
         reviewTerminalVM.state = .loading(taskName: task.name)
         reviewTerminalOpener?()
         openingLiveWorkspaceTerminalIDs.insert(task.id)
-        engine.sendOpenLiveWorkspaceTerminal(workItemID: task.id)
+        if engine.sendOpenLiveWorkspaceTerminal(workItemID: task.id) == nil {
+            openingLiveWorkspaceTerminalIDs.remove(task.id)
+            resetLoadingReviewTerminal()
+        }
+    }
+
+    private func resetLoadingReviewTerminal() {
+        if case .loading = reviewTerminalVM.state {
+            reviewTerminalVM.state = .idle
+        }
     }
 }

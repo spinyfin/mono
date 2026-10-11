@@ -2,21 +2,21 @@ import Foundation
 
 extension EngineClient {
     func sendListProducts() {
-        sendLine(["type": "list_products"])
+        sendLine(["type": "list_products"], queueIfDisconnected: true)
     }
 
     /// Ask the engine for the current live runtime snapshot of every
     /// allocated worker slot. Pair this with a subscription to the
     /// `worker.live_states` topic to keep up to date in real time.
     func sendListWorkerLiveStates() {
-        sendLine(["type": "list_worker_live_states"])
+        sendLine(["type": "list_worker_live_states"], queueIfDisconnected: true)
     }
 
     /// Ask the engine for the current set of slot ids that have the
     /// live-status summarizer disabled. Used at session start so the
     /// Agents-tab toggle reflects the persisted state.
     func sendListLiveStatusDisabledSlots() {
-        sendLine(["type": "list_live_status_disabled_slots"])
+        sendLine(["type": "list_live_status_disabled_slots"], queueIfDisconnected: true)
     }
 
     /// Toggle the live-status summarizer for one slot. The engine
@@ -58,7 +58,7 @@ extension EngineClient {
     /// Used by the Settings window on appear so the rendered state
     /// reflects what the engine has persisted.
     func sendGetSettings() {
-        sendLine(["type": "get_settings"])
+        sendLine(["type": "get_settings"], queueIfDisconnected: true)
     }
 
     /// Ask the engine for the current driver traffic split — how eligible,
@@ -66,7 +66,7 @@ extension EngineClient {
     /// `grok`, `claude`, and `codex` drivers. Replies with
     /// `driver_traffic_split_result`.
     func sendGetDriverTrafficSplit() {
-        sendLine(["type": "get_driver_traffic_split"])
+        sendLine(["type": "get_driver_traffic_split"], queueIfDisconnected: true)
     }
 
     /// Set the driver traffic split. The three shares must sum to exactly
@@ -99,7 +99,7 @@ extension EngineClient {
     /// and reports a declined refresh as `refresh_throttled` rather than as
     /// an error. Replies with `driver_quota_usage_result`.
     func sendGetDriverQuotaUsage(refresh: Bool = false) {
-        sendLine(["type": "get_driver_quota_usage", "refresh": refresh])
+        sendLine(["type": "get_driver_quota_usage", "refresh": refresh], queueIfDisconnected: true)
     }
 
     /// Ask the engine for its user-visible configuration health.
@@ -109,7 +109,7 @@ extension EngineClient {
     /// — the engine just reads `Option::is_some` on the agent-config
     /// key; no IO.
     func sendGetEngineHealth() {
-        sendLine(["type": "get_engine_health"])
+        sendLine(["type": "get_engine_health"], queueIfDisconnected: true)
     }
 
     /// Pause or resume global dispatch — the same `SetDispatchPaused`
@@ -150,12 +150,12 @@ extension EngineClient {
 
     /// Fetch the full host registry (including `local`).
     func sendListHosts() {
-        sendLine(["type": "list_hosts"])
+        sendLine(["type": "list_hosts"], queueIfDisconnected: true)
     }
 
     /// Fetch one host by id.
     func sendGetHost(id: String) {
-        sendLine(["type": "get_host", "id": id])
+        sendLine(["type": "get_host", "id": id], queueIfDisconnected: true)
     }
 
     /// Register a new SSH remote host. The engine pushes the wrapper
@@ -199,7 +199,7 @@ extension EngineClient {
     /// Used by the Metrics debug pane on appear and on its 5-second
     /// polling timer so values refresh without a manual reload.
     func sendMetricsListLive() {
-        sendLine(["type": "metrics_list_live"])
+        sendLine(["type": "metrics_list_live"], queueIfDisconnected: true)
     }
 
     /// Signal the engine that the Boss app window just became active.
@@ -216,7 +216,7 @@ extension EngineClient {
     /// the Feature Flags debug pane on appear and after every toggle
     /// so the rendered state matches what the engine persisted.
     func sendListFeatureFlags() {
-        sendLine(["type": "list_feature_flags"])
+        sendLine(["type": "list_feature_flags"], queueIfDisconnected: true)
     }
 
     /// Toggle one feature flag. Engine persists to
@@ -270,19 +270,20 @@ extension EngineClient {
             "type": "get_work_tree",
             "product_id": productId,
             "fetch_seq": fetchSeq,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     func sendListAttentionItemsForWorkItem(workItemID: String) {
         sendLine([
             "type": "list_attention_items_for_work_item",
             "work_item_id": workItemID,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// Accept an open `deferred_scope` attention item without filing a
     /// followup task. Replies with `attention_item_updated`.
-    func sendAcceptDeferredScopeAttention(id: String) {
+    @discardableResult
+    func sendAcceptDeferredScopeAttention(id: String) -> String? {
         sendLine([
             "type": "accept_deferred_scope_attention",
             "id": id,
@@ -291,7 +292,8 @@ extension EngineClient {
 
     /// File a followup task from an open `deferred_scope` attention item.
     /// Replies with `attention_item_converted`.
-    func sendCreateTaskFromDeferredScopeAttention(attentionID: String) {
+    @discardableResult
+    func sendCreateTaskFromDeferredScopeAttention(attentionID: String) -> String? {
         sendLine([
             "type": "create_task_from_deferred_scope_attention",
             "attention_id": attentionID,
@@ -304,7 +306,7 @@ extension EngineClient {
         sendLine([
             "type": "list_deferred_scope_attentions",
             "product_id": productId,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     // MARK: Planner review/release/undo (auto-populate-project-tasks-on-design-pr-merge.md)
@@ -315,13 +317,14 @@ extension EngineClient {
         sendLine([
             "type": "list_planner_runs",
             "project_id": projectId,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// Release a project's staged auto-populate batch: flips `autostart =
     /// true` on every task tagged with the project's live (staged) planner
     /// run. Replies with `release_project_result`.
-    func sendReleaseProject(projectId: String) {
+    @discardableResult
+    func sendReleaseProject(projectId: String) -> String? {
         sendLine([
             "type": "release_project",
             "project_id": projectId,
@@ -331,7 +334,8 @@ extension EngineClient {
     /// Undo an auto-populate batch: soft-deletes every task tagged with
     /// `runId` that has no execution yet, and clears the run's idempotency
     /// gate. Replies with `unpopulate_project_result`.
-    func sendUnpopulateProject(projectId: String, runId: String) {
+    @discardableResult
+    func sendUnpopulateProject(projectId: String, runId: String) -> String? {
         sendLine([
             "type": "unpopulate_project",
             "project_id": projectId,
@@ -359,13 +363,13 @@ extension EngineClient {
         if let taskId { payload["task_id"] = taskId }
         if let kind { payload["kind"] = kind }
         if let state { payload["state"] = state }
-        sendLine(payload)
+        sendLine(payload, queueIfDisconnected: true)
     }
 
     /// Fetch one group (`atg_…` or `A<n>`) plus its members. Replies with
     /// `attention_group_result`.
     func sendGetAttentionGroup(id: String) {
-        sendLine(["type": "get_attention_group", "id": id])
+        sendLine(["type": "get_attention_group", "id": id], queueIfDisconnected: true)
     }
 
     /// Record the human's resolution of one member (`atn_…`): an `answer`
@@ -406,14 +410,15 @@ extension EngineClient {
     /// canonical `Attention` (`atn_…`) — feeds the Notifications window's
     /// merge-provenance affordance. Replies with `attention_merges_list`.
     func sendListAttentionMerges(attentionID: String) {
-        sendLine(["type": "list_attention_merges", "attention_id": attentionID])
+        sendLine(["type": "list_attention_merges", "attention_id": attentionID], queueIfDisconnected: true)
     }
 
     /// Ask the engine to lease a workspace for the given Review-column
     /// work item, check out the PR head branch, and return the workspace
     /// path for opening a Ghostty terminal. The engine replies with
     /// `review_terminal_ready` or `work_error`.
-    func sendOpenReviewTerminal(workItemID: String) {
+    @discardableResult
+    func sendOpenReviewTerminal(workItemID: String) -> String? {
         sendLine([
             "type": "open_review_terminal",
             "work_item_id": workItemID,
@@ -424,7 +429,8 @@ extension EngineClient {
     /// already-live execution workspace — no new lease, just the path.
     /// The engine replies with `live_workspace_terminal_ready` or
     /// `work_error`.
-    func sendOpenLiveWorkspaceTerminal(workItemID: String) {
+    @discardableResult
+    func sendOpenLiveWorkspaceTerminal(workItemID: String) -> String? {
         sendLine([
             "type": "open_live_workspace_terminal",
             "work_item_id": workItemID,
@@ -439,7 +445,7 @@ extension EngineClient {
     func sendGetReviewGuideSummary(rootTaskId: String, seriesId: String? = nil) {
         var payload: [String: Any] = ["type": "get_review_guide_summary", "root_task_id": rootTaskId]
         if let seriesId { payload["series_id"] = seriesId }
-        sendLine(payload)
+        sendLine(payload, queueIfDisconnected: true)
     }
 
     /// Ask the engine to merge (or queue for merging) the PR associated
@@ -447,7 +453,8 @@ extension EngineClient {
     /// any violation is surfaced as a `workError` event. On success the
     /// engine replies with a `mergeWhenReadyAccepted` event and kicks the
     /// PR-reconciler so the kanban state updates promptly.
-    func sendMergeWhenReady(workItemID: String, confirmedRevisions: [OpenMergeRevision] = []) {
+    @discardableResult
+    func sendMergeWhenReady(workItemID: String, confirmedRevisions: [OpenMergeRevision] = []) -> String? {
         sendLine([
             "type": "merge_when_ready",
             "work_item_id": workItemID,
@@ -491,7 +498,7 @@ extension EngineClient {
     /// re-runs the engine's org/SSO probe, so it doubles as the "Re-check"
     /// affordance behind the org-approval / SSO banners (design §7).
     func sendGitHubAuthStatus() {
-        sendLine(["type": "git_hub_auth_status"])
+        sendLine(["type": "git_hub_auth_status"], queueIfDisconnected: true)
     }
 
     /// Store the Trunk org API token (never logged, persisted to the OS
@@ -506,7 +513,7 @@ extension EngineClient {
 
     /// Request whether a Trunk org API token is currently configured.
     func sendTrunkStatus() {
-        sendLine(["type": "trunk_status"])
+        sendLine(["type": "trunk_status"], queueIfDisconnected: true)
     }
 
     func sendCreateProduct(name: String, description: String, repoRemoteURL: String) {
@@ -750,7 +757,7 @@ extension EngineClient {
             "type": "list_executions",
             "work_item_id": taskId,
             "include_revision_chain": true,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// Ask the engine for every screenshot filed against `taskId`'s revision
@@ -763,7 +770,7 @@ extension EngineClient {
             "type": "list_attachments_for_work_item",
             "work_item_id": taskId,
             "include_revision_chain": true,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// Ask the engine for the rendered transcript of one execution. The
@@ -775,7 +782,7 @@ extension EngineClient {
         sendLine([
             "type": "execution_transcript",
             "execution_id": executionId,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     // MARK: - Automation RPCs (designs/maintenance-tasks.md, Engine ownership)
@@ -786,7 +793,7 @@ extension EngineClient {
         sendLine([
             "type": "list_automations",
             "product_id": productId,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// Create a new automation. The engine replies with `automation_created`.
@@ -843,13 +850,13 @@ extension EngineClient {
     /// Get the count of open tasks produced by an automation. Engine replies
     /// with `automation_open_task_count`.
     func sendGetAutomationOpenTaskCount(automationId: String) {
-        sendLine(["type": "get_automation_open_task_count", "automation_id": automationId])
+        sendLine(["type": "get_automation_open_task_count", "automation_id": automationId], queueIfDisconnected: true)
     }
 
     /// List the run history for an automation (newest first). Engine replies
     /// with `automation_runs_list`.
     func sendListAutomationRuns(automationId: String) {
-        sendLine(["type": "list_automation_runs", "automation_id": automationId])
+        sendLine(["type": "list_automation_runs", "automation_id": automationId], queueIfDisconnected: true)
     }
 
     // MARK: - Idea RPCs
@@ -912,7 +919,7 @@ extension EngineClient {
             "product_id": productId,
         ]
         if let limit { msg["limit"] = limit }
-        sendLine(msg)
+        sendLine(msg, queueIfDisconnected: true)
     }
 
     /// Evaluate a product's editorial rules against a candidate PR body +
@@ -973,7 +980,7 @@ extension EngineClient {
             "artifact_kind": artifactKind,
             "artifact_id": artifactId,
             "include_resolved": includeResolved,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// Resolve every active comment on the artifact against the renderer's
@@ -1072,7 +1079,7 @@ extension EngineClient {
             "type": "comments_banner_state",
             "artifact_kind": artifactKind,
             "artifact_id": artifactId,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// The `[Revise]`-banner action: batch-address every unaddressed
@@ -1096,7 +1103,7 @@ extension EngineClient {
         sendLine([
             "type": "resolve_project_design_doc",
             "project_id": projectID,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// Fetch one immutable review-guide version's full Markdown. Engine
@@ -1108,7 +1115,7 @@ extension EngineClient {
         sendLine([
             "type": "get_review_guide_content",
             "version_id": versionID,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// Capture sources if needed and generate a guide for an existing PR.
@@ -1124,7 +1131,8 @@ extension EngineClient {
     /// Idempotently request another generation attempt for a PR's current
     /// review-guide series. Engine replies with `review_guide_retry_queued`
     /// carrying a `ReviewGuideAttempt`.
-    func sendRetryReviewGuide(rootTaskID: String, idempotencyToken: String) {
+    @discardableResult
+    func sendRetryReviewGuide(rootTaskID: String, idempotencyToken: String) -> String? {
         sendLine([
             "type": "retry_review_guide",
             "root_task_id": rootTaskID,
@@ -1146,7 +1154,7 @@ extension EngineClient {
             "type": "list_product_design_docs",
             "product_id": productID,
             "refresh": refresh,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// Fetch one document's body from GitHub. `gitRef` is the commit sha
@@ -1159,7 +1167,7 @@ extension EngineClient {
             "repo_remote_url": ref.repoRemoteURL,
             "path": ref.path,
             "git_ref": ref.gitRef,
-        ])
+        ], queueIfDisconnected: true)
     }
 
     /// Engine-tab listing fetch (Phase 5 #14). `productID = nil`
@@ -1184,7 +1192,7 @@ extension EngineClient {
         if let limit {
             payload["limit"] = limit
         }
-        sendLine(payload)
+        sendLine(payload, queueIfDisconnected: true)
     }
 
     /// Engine-tab listing fetch for CI remediations (design Phase 11
@@ -1208,7 +1216,7 @@ extension EngineClient {
         if let limit {
             payload["limit"] = limit
         }
-        sendLine(payload)
+        sendLine(payload, queueIfDisconnected: true)
     }
 
     /// Fetch the merged, shallow engine-attempt feed. Detailed records remain
@@ -1226,7 +1234,10 @@ extension EngineClient {
         if includeBackgroundWork {
             payload["include_background_work"] = true
         }
-        return sendLine(payload)
+        // Background-only polls restart on .connected and must not register
+        // a queued in-flight entry that suppresses the next poll. Activity's
+        // on-demand history read still queues for delivery after reconnect.
+        return sendLine(payload, queueIfDisconnected: limit != 0, reportIfDisconnected: limit != 0)
     }
 
     /// Fetch detailed fields for a selected unified attempt row. Rebase rows
@@ -1237,6 +1248,6 @@ extension EngineClient {
         sendLine([
             "type": requestType,
             "attempt_id": attempt.id,
-        ])
+        ], queueIfDisconnected: true)
     }
 }

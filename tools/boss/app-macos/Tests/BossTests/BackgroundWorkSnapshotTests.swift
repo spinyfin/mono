@@ -8,6 +8,28 @@ import XCTest
 @MainActor
 final class BackgroundWorkSnapshotTests: XCTestCase {
 
+    func testQueuedHistoryReplySurvivesRepeatedDisconnectsAndReconnect() throws {
+        let model = makeModel()
+        model.refreshEngineAttempts()
+        let requestId = try XCTUnwrap(model.backgroundWorkPending.keys.first)
+        XCTAssertTrue(model.engine.isReadQueued(requestId: requestId))
+        model.applyEventForTest(.disconnected)
+        model.applyEventForTest(.disconnected)
+        model.applyEventForTest(.connected)
+        defer { model.applyEventForTest(.disconnected) }
+        XCTAssertNotNil(model.backgroundWorkPending[requestId])
+
+        model.applyEventForTest(.engineAttemptsList(
+            attempts: [makeAttempt(id: "history")],
+            backgroundWork: [makeItem(id: "planner:queued")],
+            requestId: requestId
+        ))
+
+        XCTAssertEqual(model.engineAttempts.map(\.id), ["history"])
+        XCTAssertEqual(model.backgroundWork.map(\.id), ["planner:queued"])
+        XCTAssertTrue(model.backgroundWorkPending.isEmpty)
+    }
+
     func testConnectSendsImmediateBackgroundOnlyPoll() {
         let model = makeModel()
         let recorder = installRecorder(on: model)

@@ -329,6 +329,7 @@ final class ChatViewModel: ObservableObject {
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
     @Published var pendingWorkEditRequest: WorkEditRequest?
     @Published var workErrorMessage: String?
+    @Published var disconnectedActionNotice: String?
     /// Current state of an in-flight `evaluate_editorial_rules` RPC.
     @Published var editorialEvaluationState: EditorialEvaluationState = .idle
     @Published var workSearchText: String = "" {

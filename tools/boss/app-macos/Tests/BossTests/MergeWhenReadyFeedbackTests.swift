@@ -96,6 +96,7 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
         task.mergeQueueState = nil
         model.taskIndexByID = [task.id: task]
 
+        model.engine.simulateConnectedForTesting = true
         model.mergeWhenReady(for: task)
         XCTAssertTrue(model.mergingWhenReadyIDs.contains(task.id))
 
@@ -315,6 +316,7 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
         let task = makeMergeTask(id: "task_v")
         model.taskIndexByID = [task.id: task]
         model.isReviewGuideViewerWindowOpen = true
+        model.engine.simulateConnectedForTesting = true
         model.mergeWhenReady(for: task, origin: .reviewGuideViewer)
         model.applyEventForTest(.mergeConfirmationRequired(
             workItemID: task.id,
@@ -339,6 +341,7 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
         let task = makeMergeTask(id: "task_board")
         model.taskIndexByID = [task.id: task]
         model.isReviewGuideViewerWindowOpen = true
+        model.engine.simulateConnectedForTesting = true
         model.mergeWhenReady(for: task, origin: .board)
         model.applyEventForTest(.mergeConfirmationRequired(
             workItemID: task.id,
@@ -426,6 +429,32 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// A click while disconnected is dropped by the client with no reply, so
+    /// it must leave no in-flight entry behind.
+    func testMergeWhenReadyWhileDisconnectedLeavesNoInFlightState() {
+        let model = makeModel()
+        model.mergeWhenReady(for: makeMergeTask(id: "task_dc"), origin: .board)
+        XCTAssertFalse(model.mergingWhenReadyIDs.contains("task_dc"))
+        XCTAssertNil(model.mergeRevisionConfirmationOrigins["task_dc"])
+    }
+
+    func testOpenReviewTerminalWhileDisconnectedLeavesNoLoadingState() {
+        let model = makeModel()
+        model.openReviewTerminal(for: makeMergeTask(id: "task_dc"))
+        XCTAssertFalse(model.openingReviewTerminalIDs.contains("task_dc"))
+        if case .loading = model.reviewTerminalVM.state { XCTFail("terminal stuck loading") }
+        model.openLiveWorkspaceTerminal(for: makeMergeTask(id: "task_dc"))
+        XCTAssertFalse(model.openingLiveWorkspaceTerminalIDs.contains("task_dc"))
+        if case .loading = model.reviewTerminalVM.state { XCTFail("terminal stuck loading") }
+    }
+
+    func testPlannerActionWhileDisconnectedLeavesNoInFlightState() {
+        let model = makeModel()
+        model.releaseProject(projectID: "p1")
+        model.unpopulateProject(projectID: "p1", runID: "r1")
+        XCTAssertTrue(model.plannerActionInFlightProjectIDs.isEmpty)
+    }
 
     private func makeModel() -> ChatViewModel {
         ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")

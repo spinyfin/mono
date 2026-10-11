@@ -20,11 +20,13 @@ extension ChatViewModel {
     func acceptDeferredScopeAttention(id: String) {
         guard !deferredScopeActionInFlightIDs.contains(id) else { return }
         guard isConnected else {
-            workErrorMessage = "Not connected to the engine — reconnect and try again."
+            showDisconnectedActionNotice()
             return
         }
         deferredScopeActionInFlightIDs.insert(id)
-        engine.sendAcceptDeferredScopeAttention(id: id)
+        if engine.sendAcceptDeferredScopeAttention(id: id) == nil {
+            deferredScopeActionInFlightIDs.remove(id)
+        }
     }
 
     /// File a followup task from an open `deferred_scope` attention item —
@@ -33,11 +35,13 @@ extension ChatViewModel {
     func createTaskFromDeferredScopeAttention(attentionID: String) {
         guard !deferredScopeActionInFlightIDs.contains(attentionID) else { return }
         guard isConnected else {
-            workErrorMessage = "Not connected to the engine — reconnect and try again."
+            showDisconnectedActionNotice()
             return
         }
         deferredScopeActionInFlightIDs.insert(attentionID)
-        engine.sendCreateTaskFromDeferredScopeAttention(attentionID: attentionID)
+        if engine.sendCreateTaskFromDeferredScopeAttention(attentionID: attentionID) == nil {
+            deferredScopeActionInFlightIDs.remove(attentionID)
+        }
     }
 
     /// Common handler for the three attention-item pushes that can affect

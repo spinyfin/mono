@@ -305,6 +305,33 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         XCTAssertEqual(sent.first?["type"] as? String, "move_work_item_on_board")
     }
 
+    func testDragWhileDisconnectedBouncesBackWithoutModal() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
+
+        model.applyEventForTest(.notConnected(requestKind: "evaluate_dispatch_admission"))
+
+        XCTAssertNil(model.workErrorMessage, "disconnect must not raise the modal")
+        XCTAssertNotNil(model.dragRefusalNotice, "bounce shows the inline notice")
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
+    }
+
+    func testUnrelatedDroppedRequestsPreservePendingDrag() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
+        for kind in ["get_settings", "create_chore", "update_work_item"] {
+            model.applyEventForTest(.notConnected(requestKind: kind))
+            XCTAssertNotNil(model.pendingDragAdmissionCheck)
+            XCTAssertNotNil(model.pendingMoveOriginByTaskID[task.id])
+            XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+            XCTAssertNil(model.dragRefusalNotice)
+        }
+    }
+
     // MARK: - Helpers
 
     private func makeTask(
