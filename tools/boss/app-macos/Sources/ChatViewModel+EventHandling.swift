@@ -30,6 +30,7 @@ extension ChatViewModel {
     private func handle(_ event: EngineEvent) {
         switch event {
         case .connected:
+            UpdateLifecycle.recordStartup("engine-connected")
             markConnected()
             resetConnectionLostBanner()
             // A quota request in flight when the socket dropped will never be

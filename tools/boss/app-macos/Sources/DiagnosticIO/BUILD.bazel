@@ -1,0 +1,11 @@
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+
+swift_library(
+    name = "DiagnosticIO",
+    srcs = ["DiagnosticWrite.swift"],
+    module_name = "DiagnosticIO",
+    visibility = [
+        "//tools/boss/app-macos:__pkg__",
+        "//tools/boss/app-macos/Sources/UpdateCore:__pkg__",
+    ],
+)

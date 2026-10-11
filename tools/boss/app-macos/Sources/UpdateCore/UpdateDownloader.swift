@@ -47,6 +47,10 @@ struct UpdateManifest: Codable, Equatable, Sendable {
     var state: State
     /// Human-readable reason, populated only when `state == .failed`.
     var failureReason: String?
+    /// The update-attempt id minted when this version was staged; carried into the
+    /// swap plan and relaunch helper so the whole attempt shares one id in the
+    /// update log. Absent in manifests written before attempt ids existed.
+    var attemptID: String?
 }
 
 // MARK: - Result types
@@ -60,6 +64,8 @@ struct StagedUpdate: Equatable, Sendable {
     let bundleURL: URL
     /// `Updates/<version>/manifest.json`.
     let manifestURL: URL
+    /// The attempt id recorded in the manifest (see `UpdateManifest.attemptID`).
+    var attemptID: String? = nil
 }
 
 enum DownloadOutcome: Equatable, Sendable {
@@ -402,6 +408,8 @@ actor UpdateDownloader {
     private let runningTeamID: String?
     private let assetDownloader: AssetDownloader
     private let bundleOps: BundleOperations
+    /// Durable structured trail (`Updates/log/`); `nil` in tests that don't assert on it.
+    private let log: UpdateLog?
 
     /// `Updates/staging/` — in-progress work; never holds a complete version.
     var stagingDirectory: URL {
@@ -413,13 +421,15 @@ actor UpdateDownloader {
         currentVersion: VersionTuple,
         runningTeamID: String?,
         assetDownloader: AssetDownloader,
-        bundleOps: BundleOperations
+        bundleOps: BundleOperations,
+        log: UpdateLog? = nil
     ) {
         self.updatesDirectory = updatesDirectory
         self.currentVersion = currentVersion
         self.runningTeamID = runningTeamID
         self.assetDownloader = assetDownloader
         self.bundleOps = bundleOps
+        self.log = log
     }
 
     /// The canonical staging root: `~/Library/Application Support/Boss/Updates`.
@@ -431,12 +441,14 @@ actor UpdateDownloader {
 
     /// Live downloader rooted at the default Updates directory.
     static func live(currentVersion: VersionTuple, runningTeamID: String?) -> UpdateDownloader {
-        UpdateDownloader(
-            updatesDirectory: defaultUpdatesDirectory(),
+        let updates = defaultUpdatesDirectory()
+        return UpdateDownloader(
+            updatesDirectory: updates,
             currentVersion: currentVersion,
             runningTeamID: runningTeamID,
             assetDownloader: .live,
-            bundleOps: .live
+            bundleOps: .live,
+            log: UpdateLog.live(updatesDirectory: updates)
         )
     }
 
@@ -461,14 +473,29 @@ actor UpdateDownloader {
         // Short-circuit if a verified bundle for this version is already staged.
         if let existing = readyStagedUpdate(at: finalDir, expected: version) {
             downloaderLog.info("update download: version \(versionStr, privacy: .public) already staged — skipping download")
+            var detail = ["bundle": existing.bundleURL.path]
+            if let requested = update.attemptID, requested != existing.attemptID {
+                detail["requestedAttempt"] = requested
+            }
+            log?.record(stage: "stage", event: "already-staged", attempt: existing.attemptID ?? update.attemptID,
+                        from: currentVersion, to: version, detail: detail)
             return .alreadyStaged(existing)
         }
+
+        // One attempt id for the whole lifecycle of this version: download → verify →
+        // stage now, swap → relaunch → handshake later (read back from the manifest).
+        let attemptID = update.attemptID ?? UpdateAttemptID.make()
+        let startedAt = Date()
+        log?.record(stage: "download", event: "start", attempt: attemptID, from: currentVersion, to: version,
+                    detail: ["url": update.assetURL.absoluteString, "expectedBytes": String(update.assetSize), "tag": update.tagName])
 
         let workDir = stagingDirectory.appendingPathComponent(versionStr, isDirectory: true)
         do {
             try ensureDirectory(updatesDirectory)
             try resetDirectory(workDir)
         } catch {
+            log?.record(stage: "stage", event: "prepare-failed", level: "error", attempt: attemptID,
+                        from: currentVersion, to: version, detail: ["error": error.localizedDescription])
             return .failed(reason: "could not prepare staging directory: \(error.localizedDescription)")
         }
 
@@ -480,7 +507,8 @@ actor UpdateDownloader {
             sha256: nil,
             verifiedAt: nil,
             state: .downloading,
-            failureReason: nil
+            failureReason: nil,
+            attemptID: attemptID
         )
         writeManifest(manifest, to: workDir)
 
@@ -491,6 +519,10 @@ actor UpdateDownloader {
         } catch {
             return fail(workDir, &manifest, "download failed: \(error.localizedDescription)")
         }
+        log?.record(stage: "download", event: "complete", attempt: attemptID, from: currentVersion, to: version,
+                    detail: ["url": update.assetURL.absoluteString,
+                             "bytes": String(fileSize(of: downloadedURL) ?? -1),
+                             "durationMs": Self.elapsedMs(since: startedAt)])
 
         let zipURL = workDir.appendingPathComponent("Boss-\(versionStr).zip")
         do {
@@ -508,11 +540,16 @@ actor UpdateDownloader {
             return fail(workDir, &manifest, "size mismatch: expected \(update.assetSize) bytes, got \(actualSize)")
         }
         downloaderLog.info("update download: size verified \(actualSize, privacy: .public) bytes")
+        log?.record(stage: "verify", event: "size-ok", attempt: attemptID, from: currentVersion, to: version,
+                    detail: ["bytes": String(actualSize)])
 
         // Record the digest (bookkeeping / future checksum-asset verification).
+        let shaStarted = Date()
         manifest.sha256 = sha256Hex(of: zipURL)
         manifest.state = .verifying
         writeManifest(manifest, to: workDir)
+        log?.record(stage: "verify", event: "sha256", attempt: attemptID, from: currentVersion, to: version,
+                    detail: ["sha256": manifest.sha256 ?? "unavailable", "durationMs": Self.elapsedMs(since: shaStarted)])
 
         // 3. Unzip.
         let extractDir = workDir.appendingPathComponent("extract", isDirectory: true)
@@ -523,6 +560,8 @@ actor UpdateDownloader {
             return fail(workDir, &manifest, "extraction failed: \(error.localizedDescription)")
         }
         downloaderLog.info("update download: archive extracted")
+        log?.record(stage: "extract", event: "complete", attempt: attemptID, from: currentVersion, to: version,
+                    detail: ["zip": zipURL.path, "extractDir": extractDir.path])
 
         guard let extractedBundle = locateBundle(in: extractDir) else {
             return fail(workDir, &manifest, "no Boss.app found in archive")
@@ -535,6 +574,8 @@ actor UpdateDownloader {
             return fail(workDir, &manifest, "code signature verification failed: \(error.localizedDescription)")
         }
         downloaderLog.info("update download: code signature verified")
+        log?.record(stage: "verify", event: "codesign-ok", attempt: attemptID, from: currentVersion, to: version,
+                    detail: ["bundle": extractedBundle.path])
 
         let stagedTeamID: String?
         do {
@@ -551,6 +592,8 @@ actor UpdateDownloader {
         downloaderLog.info(
             "update download: Team ID match — staged=\(stagedTeamID ?? "none", privacy: .public) running=\(self.runningTeamID ?? "none", privacy: .public)"
         )
+        log?.record(stage: "verify", event: "team-id-ok", attempt: attemptID, from: currentVersion, to: version,
+                    detail: ["staged": stagedTeamID ?? "none", "running": runningTeamID ?? "none"])
 
         // Move the verified bundle to its canonical slot, drop the scratch extract dir.
         let bundleURL = workDir.appendingPathComponent("Boss.app", isDirectory: true)
@@ -569,6 +612,8 @@ actor UpdateDownloader {
             return fail(workDir, &manifest, "quarantine strip failed: \(error.localizedDescription)")
         }
         downloaderLog.info("update download: quarantine stripped")
+        log?.record(stage: "stage", event: "quarantine-stripped", attempt: attemptID, from: currentVersion, to: version,
+                    detail: ["bundle": bundleURL.path])
 
         // Mark ready, then atomically promote.
         manifest.state = .ready
@@ -586,17 +631,23 @@ actor UpdateDownloader {
             try? FileManager.default.removeItem(at: finalDir)
             try FileManager.default.moveItem(at: workDir, to: finalDir)
         } catch {
+            log?.record(stage: "stage", event: "promote-failed", level: "error", attempt: attemptID,
+                        from: currentVersion, to: version, detail: ["finalDir": finalDir.path, "error": error.localizedDescription])
             return .failed(reason: "atomic promotion to \(finalDir.path) failed: \(error.localizedDescription)")
         }
 
         downloaderLog.info("update download: version \(versionStr, privacy: .public) staged and ready at \(finalDir.path, privacy: .public)")
+        log?.record(stage: "stage", event: "ready", attempt: attemptID, from: currentVersion, to: version,
+                    detail: ["dir": finalDir.path, "sha256": manifest.sha256 ?? "unavailable",
+                             "totalDurationMs": Self.elapsedMs(since: startedAt)])
         cleanup()
 
         return .ready(StagedUpdate(
             version: version,
             tag: update.tagName,
             bundleURL: finalDir.appendingPathComponent("Boss.app", isDirectory: true),
-            manifestURL: finalDir.appendingPathComponent("manifest.json")
+            manifestURL: finalDir.appendingPathComponent("manifest.json"),
+            attemptID: attemptID
         ))
     }
 
@@ -670,7 +721,8 @@ actor UpdateDownloader {
             version: expected,
             tag: manifest.tag,
             bundleURL: bundleURL,
-            manifestURL: dir.appendingPathComponent("manifest.json")
+            manifestURL: dir.appendingPathComponent("manifest.json"),
+            attemptID: manifest.attemptID
         )
     }
 
@@ -678,10 +730,26 @@ actor UpdateDownloader {
     /// `cleanup()` to reap, and return a `.failed` outcome.
     private func fail(_ workDir: URL, _ manifest: inout UpdateManifest, _ reason: String) -> DownloadOutcome {
         downloaderLog.error("update download failed: \(reason, privacy: .public)")
+        log?.record(stage: Self.stage(forManifestState: manifest.state), event: "failed", level: "error",
+                    attempt: manifest.attemptID, from: currentVersion, to: VersionTuple.parse(manifest.version),
+                    detail: ["reason": reason, "workDir": workDir.path])
         manifest.state = .failed
         manifest.failureReason = reason
         writeManifest(manifest, to: workDir)
         return .failed(reason: reason)
+    }
+
+    /// Which lifecycle stage a failure in `state` belongs to, for the update log.
+    private static func stage(forManifestState state: UpdateManifest.State) -> String {
+        switch state {
+        case .downloading: return "download"
+        case .verifying: return "verify"
+        case .ready, .failed: return "stage"
+        }
+    }
+
+    private static func elapsedMs(since start: Date) -> String {
+        String(Int(Date().timeIntervalSince(start) * 1000))
     }
 
     private func manifestURL(in dir: URL) -> URL {

@@ -498,6 +498,7 @@ struct ContentView: View {
         )
             || (model.isConnected && !model.bannerHealthIssues.isEmpty)
             || model.disconnectedActionNotice != nil
+            || updateModel.rollbackNotice != nil
     }
 
     /// Insertion-only: a banner slides down into the gap AppKit has just
@@ -517,6 +518,21 @@ struct ContentView: View {
     @ViewBuilder
     private var chromeBanners: some View {
         VStack(spacing: 0) {
+            // A self-update whose first launch failed and was rolled back by the
+            // relaunch watchdog. Persistent until dismissed or retried so a silent
+            // "came back on the old version" can never happen again.
+            if let rollback = updateModel.rollbackNotice {
+                UpdateRollbackBanner(
+                    record: rollback,
+                    onRetry: {
+                        if let version = VersionTuple.parse(rollback.version) {
+                            updateModel.retryBlockedUpdate(version)
+                        }
+                    },
+                    onDismiss: { updateModel.dismissRollbackNotice() }
+                )
+                .transition(bannerTransition)
+            }
             if let notice = model.disconnectedActionNotice {
                 HStack {
                     Label(notice, systemImage: "exclamationmark.triangle")
@@ -568,6 +584,7 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.15), value: model.showConnectionLostBanner)
         .animation(.easeInOut(duration: 0.15), value: model.engineSupervisionState)
         .animation(.easeInOut(duration: 0.15), value: model.bannerHealthIssues)
+        .animation(.easeInOut(duration: 0.15), value: updateModel.rollbackNotice)
     }
 
     private var sidebar: some View {

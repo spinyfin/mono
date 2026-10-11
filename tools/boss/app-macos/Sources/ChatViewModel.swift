@@ -864,6 +864,10 @@ final class ChatViewModel: ObservableObject {
 
         processController.onOutputLine = { [weak self] line in
             self?.appendSystemMessage(line)
+            // Engine handoff decisions (`[engine version-check …]`, `[engine upgrade]`,
+            // `[engine launch]`) join the durable update trail for the launch that
+            // completed or rolled back an update. No-op outside that context.
+            UpdateLifecycle.recordEngineLine(line)
         }
         processController.onSupervisionStateChange = { [weak self] state in
             guard let self, self.engineSupervisionState != state else { return }
@@ -940,6 +944,7 @@ final class ChatViewModel: ObservableObject {
             exit(0)
         }
 
+        UpdateLifecycle.recordStartup("engine-handoff-begin")
         didStart = true
 
         // UI tests drive explicit fixture clients and events directly. The
@@ -955,6 +960,7 @@ final class ChatViewModel: ObservableObject {
                 do {
                     try processController.start()
                     DispatchQueue.main.async {
+                        UpdateLifecycle.recordStartup("engine-handoff-complete")
                         self?.startEngineIfNeeded()
                     }
                 } catch {

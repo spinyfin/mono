@@ -421,6 +421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// is a different entry point and does not satisfy that call, so
     /// launch would trap with "Use of unimplemented initializer 'init()'".
     override init() {
+        UpdateLifecycle.recordStartup("process-started", detail: ["pid": String(getpid()), "executable": Bundle.main.executableURL?.path ?? "", "runningVersion": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"])
         self.appNapActivity = AppNapActivityController()
         super.init()
     }
@@ -443,17 +444,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// and no focus theft, and still creates/renders the `WindowGroup` window.
     /// Never use `.prohibited` (may prevent window creation entirely).
     func applicationWillFinishLaunching(_ notification: Notification) {
+        UpdateLifecycle.recordStartup("will-finish-launching")
         if BossEnginePaths.isIsolatedInstance {
             NSApp.setActivationPolicy(.accessory)
         }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UpdateLifecycle.recordStartup("did-finish-launching")
         // Keep this assertion for the complete process lifetime. A
         // `worker.live_states` snapshot reaches the main actor through the
         // same path as a spawn request, so it cannot safely be used to
         // reacquire the assertion after App Nap has delayed that path.
         beginAppNapActivityForApplicationLifetime()
+        UpdateLifecycle.recordStartup("app-nap-assertion-acquired")
 
         // Isolated / capture instances: policy was already set to `.accessory`
         // in `applicationWillFinishLaunching`. Do **not** call
@@ -479,6 +483,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // [[UpdateLifecycle]] and design doc §4.
         if !BossEnginePaths.isIsolatedInstance {
             UpdateLifecycle.reconcileAtLaunch()
+            // Surface a watchdog rollback the previous launch recorded ("Update to X
+            // failed: <reason>; rolled back to Y") as a chrome banner with Retry/Dismiss.
+            updateModel.refreshRollbackNotice()
         }
 
         // Main-thread hang watchdog — gated on Settings (default off).
@@ -540,15 +547,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        UpdateLifecycle.recordStartup("should-terminate", stage: "quit")
+        var reply = "terminate-now"
+        defer { UpdateLifecycle.recordStartup("reply", stage: "quit", detail: ["reply": reply]) }
         // Capture runs always exit cleanly — no agent-running prompt.
         if BossCaptureArgs.shared.isCaptureMode {
             return .terminateNow
         }
         guard let alert = makeQuitConfirmationAlert() else { return .terminateNow }
 
+        UpdateLifecycle.recordStartup("agent-confirmation-wait", stage: "quit")
         let response = alert.runModal()
+        UpdateLifecycle.recordStartup("agent-confirmation-returned", stage: "quit")
         if response == .alertFirstButtonReturn {
             // Cancel — stay running.
+            reply = "terminate-cancel"
             return .terminateCancel
         }
         // Quit Anyway
@@ -565,6 +578,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Otherwise fall back to the best-effort automatic swap-on-quit. Non-blocking; a
     /// failed swap leaves the current bundle untouched and the startup path retries.
     func applicationWillTerminate(_ notification: Notification) {
+        UpdateLifecycle.recordStartup("will-terminate-entry", stage: "quit")
+        defer { UpdateLifecycle.recordStartup("will-terminate-exit", stage: "quit") }
         endAppNapActivityForApplicationLifetime()
         UpdateLifecycle.handleConfirmedTermination()
     }
