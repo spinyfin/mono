@@ -261,6 +261,7 @@ impl BossClient {
                 // Start (or wait for) the engine, then look again at once.
                 match ensure_engine_for_connect(discovery, retry, &mut spawned).await {
                     Ok(()) => {
+                        last_autostart_error = None;
                         attempt =
                             connect_any_endpoint(discovery, retry.connect_deadline(CONNECT_ATTEMPT_TIMEOUT)).await;
                     }
@@ -664,7 +665,7 @@ pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
 /// [`ensure_engine_running`] with the pieces `BossClient::connect` needs to
 /// call it repeatedly inside a backoff loop: `allow_spawn` says whether this
 /// call may start an engine process (the loop passes `false` once it has
-/// already started one), `wait` bounds each readiness wait, and `spawned` is
+/// already started one), `wait` bounds each readiness wait, and `spawned`
 /// holds the process when this call starts one.
 async fn ensure_engine_running_with(
     discovery: &Discovery,
@@ -738,8 +739,9 @@ impl std::fmt::Display for AutostartFailed {
 
 impl std::error::Error for AutostartFailed {}
 
-/// Poll for a reachable engine until `deadline`. If `child` is the engine this
-/// call started exits first, report its status unless another engine is starting.
+/// Poll for a reachable engine until `deadline`. If `child` (the engine this
+/// call started) exits first, report its exit status unless another
+/// recognizable engine is starting.
 async fn wait_for_discovered_engine_until(
     discovery: &Discovery,
     deadline: Instant,

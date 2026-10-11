@@ -505,13 +505,35 @@ fn recognizable_engine(script: &str, args: Vec<String>) -> EngineCommand {
     }
 }
 
-// Writes the release file on drop so a fixture shell waiting on it exits even
-// when an assertion fails first.
-struct ReleaseOnDrop(std::path::PathBuf);
+// Owns the fixture shell. On drop it writes the release file, gives the shell
+// a moment to exit, then kills and reaps it, so a failed assertion can neither
+// strand the shell nor race the TempDir removing the release file.
+struct FixtureShell {
+    release: std::path::PathBuf,
+    child: Option<std::process::Child>,
+}
 
-impl Drop for ReleaseOnDrop {
+impl FixtureShell {
+    fn new(release: std::path::PathBuf) -> Self {
+        Self { release, child: None }
+    }
+}
+
+impl Drop for FixtureShell {
     fn drop(&mut self) {
-        let _ = std::fs::write(&self.0, "exit");
+        let _ = std::fs::write(&self.release, "exit");
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -525,13 +547,12 @@ async fn published_pid_still_monitors_child_exit_in_a_later_readiness_round() {
         r#"echo $$ > "$1"; while [ ! -f "$2" ]; do sleep 0.02; done; exit 7"#,
         vec![discovery.pid_file_path.clone(), release.to_string_lossy().into_owned()],
     );
-    let mut child = None;
     // Ensure the fixture shell is terminated on every exit path.
-    let _release_guard = ReleaseOnDrop(release.clone());
-    ensure_engine_running_with(&discovery, true, Duration::from_millis(100), &mut child)
+    let mut shell = FixtureShell::new(release.clone());
+    ensure_engine_running_with(&discovery, true, Duration::from_millis(100), &mut shell.child)
         .await
         .expect_err("first readiness window expires");
-    let pid = child.as_ref().unwrap().id();
+    let pid = shell.child.as_ref().unwrap().id();
     // The shell publishes its pid asynchronously; wait for it generously.
     let deadline = Instant::now() + Duration::from_secs(10);
     while read_pid_file(&discovery.pid_file_path) != Some(pid) && Instant::now() < deadline {
@@ -539,13 +560,13 @@ async fn published_pid_still_monitors_child_exit_in_a_later_readiness_round() {
     }
     assert_eq!(read_pid_file(&discovery.pid_file_path), Some(pid));
     assert!(is_likely_engine_process(pid));
-    assert!(child.as_mut().unwrap().try_wait().unwrap().is_none());
+    assert!(shell.child.as_mut().unwrap().try_wait().unwrap().is_none());
 
     let exit = tokio::spawn(async move {
         sleep(Duration::from_millis(150)).await;
         std::fs::write(release, "exit").unwrap();
     });
-    let error = ensure_engine_running_with(&discovery, false, Duration::from_secs(5), &mut child)
+    let error = ensure_engine_running_with(&discovery, false, Duration::from_secs(5), &mut shell.child)
         .await
         .expect_err("child exits during the pid-file readiness wait");
     exit.await.unwrap();
@@ -560,8 +581,8 @@ async fn autostart_loser_waits_for_the_winners_socket() {
     let mut discovery = discovery(dir.path(), fast_policy(Duration::from_secs(10), &notices));
     discovery.autostart = true;
     let release = dir.path().join("winner-exit");
-    let _release_guard = ReleaseOnDrop(release.clone());
-    let mut winner = Command::new("/bin/sh")
+    let mut shell = FixtureShell::new(release.clone());
+    let winner = Command::new("/bin/sh")
         .args([
             "-c",
             &format!(": {ENGINE_BINARY_TARGET}; while [ ! -f \"$1\" ]; do sleep 0.1; done"),
@@ -570,10 +591,12 @@ async fn autostart_loser_waits_for_the_winners_socket() {
         ])
         .spawn()
         .unwrap();
+    let winner_pid = winner.id();
+    shell.child = Some(winner);
     // The winner claims the pid path only after the loser's pre-spawn check.
     discovery.engine = recognizable_engine(
         r#"echo "$2" > "$1"; exit 1"#,
-        vec![discovery.pid_file_path.clone(), winner.id().to_string()],
+        vec![discovery.pid_file_path.clone(), winner_pid.to_string()],
     );
     let pid_path = discovery.pid_file_path.clone();
     let socket = discovery.socket_path.clone();
@@ -589,8 +612,6 @@ async fn autostart_loser_waits_for_the_winners_socket() {
         UnixListener::bind(socket).unwrap()
     });
     let result = BossClient::connect(&discovery).await;
-    winner.kill().unwrap();
-    winner.wait().unwrap();
     let _listener = engine.await.unwrap();
     assert!(result.is_ok(), "winner becomes reachable: {result:?}");
 }

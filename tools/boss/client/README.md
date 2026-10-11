@@ -66,8 +66,8 @@ left of it; if the window closes the call fails with `OutcomeUnknown`. If
 the engine's duplicate guard refuses a replayed create, the client reports
 the existing item as the created one (it was almost certainly this
 request's first delivery) instead of a conflict. The full classification
-table is in `src/replay.rs`; unclassified requests default to _not_
-resendable.
+table is in `src/replay.rs`; it is an exhaustive match, so every request is
+classified and a new request variant does not compile until it is.
 
 Every connect (including autostart and readiness probes) is bounded by the
 remaining retry budget and a 5s per-attempt cap, so a stalled listener
@@ -76,7 +76,9 @@ cannot hold a call past `--engine-max-wait`.
 Autostart keeps its meaning (`--no-engine-autostart` still forbids it). When
 it applies, the client starts at most one engine per call and waits for an
 engine that is already starting or restarting (live pid file) rather than
-racing a second. A Boss worker (`BOSS_RUN_ID` set) never starts an engine:
+racing a second. A spawn failure, or the started engine exiting before it is
+ready, is reported immediately (with the engine-resolution context) rather
+than retried for the whole budget. A Boss worker (`BOSS_RUN_ID` set) never starts an engine:
 the spawn itself refuses, so `boss engine start` fails there too.
 
 The backoff and jitter arithmetic lives in `tools/boss/backoff`, shared with

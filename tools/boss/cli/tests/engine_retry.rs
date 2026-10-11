@@ -6,7 +6,7 @@
 //! request with an empty product list; the point is the CLI's transport
 //! behaviour, not engine semantics.
 
-use std::io::{BufRead, BufReader as StdBufReader, Read};
+use std::io::{BufRead, BufReader as StdBufReader};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -56,8 +56,6 @@ fn run_boss_until_first_notice(socket: &str, max_wait_secs: &str, on_first_notic
         }
         line.clear();
     }
-    let mut rest = String::new();
-    stderr.read_to_string(&mut rest).ok();
     let mut output = child.wait_with_output().expect("wait for boss");
     output.stderr = seen.into_bytes();
     output
