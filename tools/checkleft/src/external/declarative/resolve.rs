@@ -430,7 +430,6 @@ pub(crate) fn resolve_bazel_target_executable(
 ) -> Result<PathBuf> {
     let mut build = Command::new(crate::external::environment::locate(Path::new("bazel")));
     build
-        .arg("--nohome_rc")
         .args(super::ci_bazel_startup_flags())
         .arg("build")
         .arg("--color=no")
@@ -458,7 +457,6 @@ pub(crate) fn resolve_bazel_target_executable(
 
     let mut cquery = Command::new(crate::external::environment::locate(Path::new("bazel")));
     cquery
-        .arg("--nohome_rc")
         .args(super::ci_bazel_startup_flags())
         .arg("cquery")
         .arg("--color=no")

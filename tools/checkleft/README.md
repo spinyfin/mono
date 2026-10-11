@@ -228,7 +228,9 @@ ambient environment. PATH contains the resolved executable's directory, other de
 by `/usr/bin:/bin:/usr/sbin:/sbin`. HOME and XDG_CONFIG_HOME point to a temporary
 empty directory; LANG and LC_ALL are `C`, and TZ is `UTC`. The only inherited
 variables are RUNFILES_DIR, RUNFILES_MANIFEST_FILE and TEST_SRCDIR (Bazel tool
-runfiles), TMPDIR (temporary storage), and SYSTEMROOT (platform support).
+runfiles), TMPDIR (temporary storage), and SYSTEMROOT (platform support), plus the network-transport variables HTTP_PROXY,
+HTTPS_PROXY, NO_PROXY, ALL_PROXY (upper and lower case), SSL_CERT_FILE,
+SSL_CERT_DIR and NODE_EXTRA_CA_CERTS.
 RUSTUP_TOOLCHAIN, NODE_OPTIONS, ambient npm settings and user configuration are absent.
 For npx, checkleft sets npm_config_cache to its own persistent cache and npm
 user/global config paths to the empty HOME.
@@ -236,9 +238,12 @@ A check can explicitly declare string values in its CHECKS configuration under
 `config.environment`, including HOME when user configuration is intentional. PATH remains framework-owned
 and cannot be overridden.
 
-Bazel launcher processes additionally retain HOME, USER and XDG_CACHE_HOME to
-preserve the existing Bazel cache namespace. They use `--nohome_rc` to exclude
-user Bazel configuration; repository rc files and normal action caching remain
-in effect. Repositories remain responsible for pinning their Bazel toolchains
+Bazel and Bazelisk launchers are exempt from clearing: they run with the
+caller's exact environment and the startup flags from `CI_BAZEL_STARTUP_FLAGS`
+only, so server and cache keys match ordinary builds. The one addition is
+`USE_BAZEL_VERSION`, set from the repository's `.bazelversion` (unless the caller
+already set it), so `~/.bazeliskrc` cannot override the repo's Bazel pin.
+Hermeticity of Bazel actions belongs in the repository's `.bazelrc`.
+Repositories remain responsible for pinning their Bazel toolchains
 and explicit path bindings. `format/rust` requires its rules_rust wrapper:
 failure to resolve it is an error, with no PATH rustfmt fallback.

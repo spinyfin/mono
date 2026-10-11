@@ -916,9 +916,6 @@ fn spawn(
     invocation_id: &str,
 ) -> Result<InvocationOutput> {
     let mut command = Command::new(crate::external::environment::locate(binary));
-    if binary.file_name().is_some_and(|name| name == "bazel") {
-        command.arg("--nohome_rc");
-    }
     if let Some(binaries) = context.binaries {
         let mut paths = Vec::new();
         if let Some(parent) = Path::new(command.get_program()).parent().filter(|p| p.is_absolute()) {
