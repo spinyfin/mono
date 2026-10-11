@@ -1371,6 +1371,9 @@ impl BackgroundNudgeTracker {
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkerCompletionHandler {
+    /// Per-execution serialization for Stop acceptance and refusal.
+    #[builder(default)]
+    stop_locks: std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     work_db: Arc<WorkDb>,
     pr_detector: Arc<dyn PrDetector>,
     cube_client: Arc<dyn CubeClient>,

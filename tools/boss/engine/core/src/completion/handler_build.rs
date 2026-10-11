@@ -21,6 +21,7 @@ impl WorkerCompletionHandler {
         register_metrics(&local_metrics);
         crate::answer_agent_observability::register_metrics(&local_metrics);
         Self {
+            stop_locks: Default::default(),
             work_db,
             pr_detector,
             cube_client,

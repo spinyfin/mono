@@ -63,6 +63,22 @@ impl WorkerCompletionHandler {
         turn_end: Option<&crate::driver::TurnEnd>,
         defer_finalization: bool,
     ) -> StopOutcome {
+        // Serialize boundary decisions for each execution, including refusal
+        // (which consumes a declaration) and acceptance. Weak entries let the
+        // lock go away after the last in-flight boundary finishes.
+        let lock = {
+            let mut locks = self.stop_locks.lock().expect("stop locks poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(execution_id).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(execution_id.to_owned(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _boundary = lock.lock().await;
         let outcome = self.on_stop_inner(execution_id, turn_end, defer_finalization).await;
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
         // revision_implementation) gets the catch-all finalizer on Stop.
@@ -524,6 +540,24 @@ impl WorkerCompletionHandler {
                 tracing::warn!(execution_id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the driver-terminal-error failure");
             }
             return self.finalize_driver_terminal_error(&execution, &detail).await;
+        }
+
+        // No-op submission waits for this boundary so the driver's abandoned
+        // command notifications have been staged. Read the durable declaration
+        // here, never a payload cached by an in-flight submit finalizer.
+        if !defer_finalization
+            && self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("run_done_proposals_seam")
+            && self.worker_signalled_no_op(execution_id)
+        {
+            self.detect_and_file_unobserved_command_signal(&execution).await;
+            if self.refuse_no_op_declaration(&execution) {
+                return self.nudge_refused_no_op(&execution).await;
+            }
+            let (contribution, attention) = self.declared_run_done_no_op_inputs(&execution);
+            return self
+                .finalize_no_op_completion(&execution, contribution, attention)
+                .await;
         }
 
         // Maint task 6: an `automation_triage` execution never opens a PR.
@@ -1444,14 +1478,7 @@ must not be asked to open one",
                     // ago. This read also clears the flag, so a clean turn
                     // that follows gets a fair no-changes-needed evaluation.
                     if self.refuse_no_op_declaration(&execution) {
-                        tracing::warn!(
-                            execution_id,
-                            expected_branch = %expected_branch,
-                            kind = %execution.kind,
-                            "stop event: worker declared no-changes-needed but the no-op guard \
-                             refused it (declaration consumed); falling through to the \
-                             produce-a-PR nudge instead",
-                        );
+                        return self.nudge_refused_no_op(&execution).await;
                     } else {
                         tracing::info!(
                             execution_id,

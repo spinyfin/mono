@@ -44,6 +44,7 @@ async fn guide_no_op_attention_matches_outstanding_dispositions() {
             .unwrap();
         }
         let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+        declare_no_changes_needed(&db, &execution_id);
         let execution = db.get_execution(&execution_id).unwrap();
         let (contribution, attention) = handler.declared_run_done_no_op_inputs(&execution);
         assert!(attention.is_some(), "exercise the production attention input");
@@ -226,7 +227,9 @@ async fn inconclusive_revision_no_op_keeps_contradiction_and_validation_guards()
         declare_no_changes_needed(&db, &execution_id);
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Err("network unavailable".into())).await;
-        let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+        let TestHarness {
+            handler, cube, probes, ..
+        } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
         let handler = handler.with_branch_verifier(verifier);
         if observed_push {
             db.set_revision_stop_contributed_head(&execution_id, "after").unwrap();
@@ -238,6 +241,10 @@ async fn inconclusive_revision_no_op_keeps_contradiction_and_validation_guards()
         let outcome = handler.on_stop(&execution_id).await;
         assert!(!matches!(outcome, StopOutcome::NoChangesNeeded { .. }), "{outcome:?}");
         assert!(cube.release_calls.lock().await.is_empty());
+        assert_eq!(
+            probes.snapshot(),
+            [(execution_id.clone(), NO_OP_DECLARATION_REFUSED_PROBE.to_owned())]
+        );
         assert!(
             !db.list_attention_items(&execution_id)
                 .unwrap()
@@ -290,9 +297,20 @@ async fn revision_run_done_no_changes_needed_files_declined_finding_record() {
         ..
     } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
 
-    let outcome = handler
-        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)
-        .await;
+    declare_no_changes_needed(&db, &execution_id);
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("run_done_proposals_seam", true).unwrap();
+    let handler = handler.with_feature_flags(flags);
+    assert_eq!(
+        handler
+            .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)
+            .await,
+        StopOutcome::AwaitingInput,
+    );
+    let outcome = handler.on_stop(&execution_id).await;
     assert!(matches!(outcome, StopOutcome::NoChangesNeeded { .. }), "{outcome:?}");
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
@@ -362,9 +380,20 @@ async fn chore_run_done_no_changes_needed_does_not_file_revision_declined_record
         ..
     } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
 
-    let outcome = handler
-        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)
-        .await;
+    declare_no_changes_needed(&db, &execution_id);
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("run_done_proposals_seam", true).unwrap();
+    let handler = handler.with_feature_flags(flags);
+    assert_eq!(
+        handler
+            .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)
+            .await,
+        StopOutcome::AwaitingInput,
+    );
+    let outcome = handler.on_stop(&execution_id).await;
     assert!(
         matches!(outcome, StopOutcome::NoChangesNeeded { ref work_item_id } if work_item_id == &chore_id),
         "{outcome:?}"
@@ -397,9 +426,20 @@ async fn declared_no_changes_cannot_close_a_chore_with_a_bound_open_pr() {
         publisher,
         ..
     } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
-    let outcome = handler
-        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)
-        .await;
+    declare_no_changes_needed(&db, &execution_id);
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("run_done_proposals_seam", true).unwrap();
+    let handler = handler.with_feature_flags(flags);
+    assert_eq!(
+        handler
+            .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)
+            .await,
+        StopOutcome::AwaitingInput,
+    );
+    let outcome = handler.on_stop(&execution_id).await;
     assert!(matches!(outcome, StopOutcome::PrDetected { .. }), "{outcome:?}");
     let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
         panic!("expected chore")

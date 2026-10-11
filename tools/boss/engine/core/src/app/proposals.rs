@@ -680,8 +680,9 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                         // exact stranded-live-execution failure mode this
                         // seam exists to close. Submission is the primary
                         // path; recheck can recover a delivered staged URL,
-                        // while blocked, no-changes-needed, and no-PR
-                        // deliveries have no poller recovery.
+                        // while blocked and no-PR deliveries have no poller
+                        // recovery. No-op acceptance waits for the driver's
+                        // terminal boundary and its complete command evidence.
                         let delivery_outcome =
                             tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await;
                         match &delivery_outcome {

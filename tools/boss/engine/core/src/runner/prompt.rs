@@ -1110,7 +1110,7 @@ pub(crate) fn run_done_directive(
      ```\n\
      {boss} propose done --outcome <delivered|no-changes-needed|blocked> --summary \"<one line>\"\n\
      ```\n\n\
-     **This immediately ends your run** — the moment it is accepted, the engine tears your pane \
+     **An accepted declaration ends your run** — the engine tears your pane \
      down, with no turn after it, not even to see the response. Finish every other thing first, \
      including opening or updating the PR; only declare once nothing is left to do. The engine no \
      longer infers completion from PR state (a run dispatched against an already-open, already-green \
@@ -1120,7 +1120,8 @@ pub(crate) fn run_done_directive(
      Pick the outcome that is true:\n\n\
      - `delivered` — the deliverable exists (you opened or pushed to the PR, wrote the review, \
      posted the reply).\n\
-     - `no-changes-needed` — you verified there was nothing to produce.\n\
+     - `no-changes-needed` — you verified there was nothing to produce. End your turn after submitting; \
+     the engine checks command evidence at that boundary. If refused, verify again and redeclare.\n\
      - `blocked` — a genuine external blocker or mandated approval stop prevents delivery. This fails \
      the execution, releases its resources, and records the explanation on the task; it does not \
      park a live worker or automatically retry the same attempt. Fix recoverable failures first. \

@@ -242,8 +242,45 @@ impl WorkDb {
         detail: &str,
         attention: Option<CreateAttentionItemInput>,
     ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_no_op_completion_inner(execution_id, detail, attention, None)
+    }
+
+    /// Complete only while this exact proposal remains the applied no-op
+    /// declaration. The authorization check and terminal write share one
+    /// transaction, so a cleared or superseded declaration cannot close a run.
+    pub fn record_declared_worker_no_op_completion(
+        &self,
+        execution_id: &str,
+        declaration_id: &str,
+        detail: &str,
+        attention: Option<CreateAttentionItemInput>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_no_op_completion_inner(execution_id, detail, attention, Some(declaration_id))
+    }
+
+    fn record_worker_no_op_completion_inner(
+        &self,
+        execution_id: &str,
+        detail: &str,
+        attention: Option<CreateAttentionItemInput>,
+        declaration_id: Option<&str>,
+    ) -> Result<Option<WorkerPrCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        if let Some(declaration_id) = declaration_id {
+            let authorized: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM worker_proposals p JOIN work_executions e ON e.id = p.execution_id
+                    WHERE p.id = ?1 AND e.id = ?2 AND p.kind = 'run_done' AND p.state = 'applied'
+                      AND e.run_done_outcome = 'no_changes_needed'
+                )",
+                params![declaration_id, execution_id],
+                |row| row.get(0),
+            )?;
+            if !authorized {
+                return Ok(None);
+            }
+        }
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution.status.is_terminal() {
             return Ok(None);

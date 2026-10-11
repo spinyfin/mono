@@ -2831,8 +2831,8 @@ async fn no_op_declaration_is_refused_when_a_command_was_left_unobserved() {
     );
     assert_eq!(
         probes.snapshot(),
-        [(execution_id.clone(), PROBE_NO_PR.to_owned())],
-        "the refused no-op claim must still get the normal produce-a-PR nudge",
+        [(execution_id.clone(), NO_OP_DECLARATION_REFUSED_PROBE.to_owned())],
+        "the refusal must tell the worker to verify and declare again",
     );
     match db.get_work_item(&chore_id).unwrap() {
         WorkItem::Chore(t) => {
@@ -2881,8 +2881,8 @@ async fn no_op_declaration_requires_a_fresh_declaration_on_a_later_clean_turn_af
     );
     assert_eq!(
         probes.snapshot(),
-        [(execution_id.clone(), PROBE_NO_PR.to_owned())],
-        "turn N's refusal must still get the normal produce-a-PR nudge",
+        [(execution_id.clone(), NO_OP_DECLARATION_REFUSED_PROBE.to_owned())],
+        "turn N must explain that the declaration was discarded",
     );
 
     // Turn N+1: the refusal consumed the declaration, so a Stop WITHOUT a

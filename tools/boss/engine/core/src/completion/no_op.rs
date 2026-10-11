@@ -32,7 +32,7 @@ impl WorkerCompletionHandler {
             return None;
         }
         if self.refuse_no_op_declaration(execution) {
-            return None;
+            return Some(self.nudge_refused_no_op(execution).await);
         }
         let attention = Self::revision_no_op_attention_input(bound_pr_url, contribution);
         Some(
@@ -41,17 +41,29 @@ impl WorkerCompletionHandler {
         )
     }
 
+    pub(super) async fn nudge_refused_no_op(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        self.nudge_or_park(
+            execution,
+            NO_OP_DECLARATION_REFUSED_PROBE,
+            "no_op_declaration_refused",
+            None,
+            StopOutcome::AwaitingInput,
+        )
+        .await
+    }
+
     /// The one guard every `no-changes-needed` acceptance path runs before
     /// closing a run as a no-op — the Stop-boundary paths (`on_stop_inner`'s
-    /// primary arm, [`Self::try_revision_no_op`]) and the submit-time
-    /// finalize ([`Self::finalize_declared_run_done`]). Returns `true` when
+    /// primary arm, [`Self::try_revision_no_op`], and the declaration seam).
+    /// Returns `true` when
     /// the declaration is refused.
     ///
     /// Refuses when (a) a Codex command went unobserved since the gate last
     /// fired ([`crate::codex_unobserved_command::UnobservedCommandTracker::consume_unresolved`]),
     /// or (b) for a revision, an observed contribution contradicts the claim
-    /// (or the lookup failed, so the claim is unverifiable). DB reads and
-    /// in-memory state only — safe on the submit path.
+    /// (or the lookup failed, so the claim is unverifiable). Uses local DB
+    /// reads and writes plus in-memory state, with no network I/O. This is
+    /// not a pure predicate: refusal consumes the declaration.
     ///
     /// A refusal **consumes the declaration**: the durable `run_done` stamp
     /// is cleared, so a later Stop boundary cannot re-accept the same claim
@@ -97,6 +109,14 @@ impl WorkerCompletionHandler {
         contribution: Option<ContributionEvidence>,
         attention: Option<CreateAttentionItemInput>,
     ) -> StopOutcome {
+        let declaration_id = match self.work_db.current_no_op_declaration_id(&execution.id) {
+            Ok(Some(id)) => id,
+            Ok(None) => return StopOutcome::AwaitingInput,
+            Err(err) => {
+                tracing::error!(execution_id = %execution.id, ?err, "no-op declaration lookup failed");
+                return StopOutcome::DbError;
+            }
+        };
         // Captured before `record_worker_no_op_completion` below nulls
         // `workspace_path` in the same transaction that terminalizes the
         // execution — this path terminalizes a parked-live execution, so it
@@ -122,12 +142,20 @@ impl WorkerCompletionHandler {
         // this execution terminal-with-a-live-pane without also seeing
         // that its own teardown owns the pane — see `super::teardown`.
         let teardown = self.begin_teardown(&execution.id);
-        let completion = match self
-            .work_db
-            .record_worker_no_op_completion(&execution.id, detail, attention)
-        {
+        let completion = match self.work_db.record_declared_worker_no_op_completion(
+            &execution.id,
+            &declaration_id,
+            detail,
+            attention,
+        ) {
             Ok(Some(completion)) => completion,
-            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Ok(None) => {
+                return match self.work_db.get_execution(&execution.id) {
+                    Ok(current) if current.status.is_live() => StopOutcome::AwaitingInput,
+                    Ok(_) => StopOutcome::AlreadyTerminal,
+                    Err(_) => StopOutcome::DbError,
+                };
+            }
             Err(err) => {
                 tracing::error!(
                     execution_id = %execution.id,
@@ -210,7 +238,7 @@ impl WorkerCompletionHandler {
     /// Other execution kinds return `(None, None)`.
     ///
     /// Contribution is always [`ContributionEvidence::Indeterminate`]: this
-    /// path is the submit-time termination and must not call GitHub, so the
+    /// path is the declaration termination and must not call GitHub, so the
     /// record must not describe a measured empty diff.
     pub(super) fn declared_run_done_no_op_inputs(
         &self,
@@ -236,8 +264,7 @@ impl WorkerCompletionHandler {
     /// closed as a sanctioned no-op without addressing its finding.
     ///
     /// Returns the item to insert rather than inserting it itself: the
-    /// caller ([`Self::try_revision_no_op`] or
-    /// [`Self::finalize_declared_run_done`]) threads it into
+    /// Stop-boundary caller threads it into
     /// [`Self::finalize_no_op_completion`], which commits the attention
     /// item and the terminal transition in one transaction so the record
     /// can never assert closure that did not happen. The body does not

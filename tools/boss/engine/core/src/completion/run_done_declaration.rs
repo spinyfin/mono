@@ -21,8 +21,9 @@
 //! is the same fix `review_report` / `review_verdict` acceptance already
 //! applies (`app::proposals::handle_submit_proposal`'s
 //! `finalize_reporting_member` block): the declaration IS the completion
-//! signal, applied synchronously at submit — never a stamp waiting on a
-//! driver-specific turn boundary that may never come.
+//! signal for delivered/blocked outcomes, applied synchronously at submit.
+//! No-op declarations wait for the driver terminal boundary: only then has
+//! the driver drained abandoned commands and made command evidence authoritative.
 //!
 //! ## The hard rule this module is built around
 //!
@@ -73,7 +74,8 @@
 use super::*;
 
 impl WorkerCompletionHandler {
-    /// Finalize a `run_done` declaration synchronously, at submit — the
+    /// Finalize delivered/blocked declarations at submit; defer no-op
+    /// declarations until the driver terminal boundary. This is the
     /// counterpart to `on_stop`/`on_stop_inner` for every other completion
     /// path, but reached from `app::proposals::handle_submit_proposal`
     /// instead of a driver Stop hook. See the module doc for why this must
@@ -109,17 +111,10 @@ impl WorkerCompletionHandler {
 
         match outcome {
             boss_protocol::RunDoneOutcome::NoChangesNeeded => {
-                // Same guard the Stop-boundary paths run. On refusal the run
-                // stays live (the declaration is consumed) and the worker is
-                // told, visibly, to re-verify and declare again.
-                if self.refuse_no_op_declaration(&execution) {
-                    self.probe_queuer
-                        .queue_probe(&execution.id, NO_OP_DECLARATION_REFUSED_PROBE);
-                    return StopOutcome::AwaitingInput;
-                }
-                let (contribution, attention) = self.declared_run_done_no_op_inputs(&execution);
-                self.finalize_no_op_completion(&execution, contribution, attention)
-                    .await
+                // Only the driver's terminal boundary has authoritative command
+                // evidence. Submission (including delayed/replayed finalizers)
+                // cannot authorize a no-op, even if its cached payload says so.
+                StopOutcome::AwaitingInput
             }
             boss_protocol::RunDoneOutcome::Delivered => self.finalize_declared_delivery(&execution).await,
             boss_protocol::RunDoneOutcome::Blocked => self.finalize_declared_blocked(&execution).await,

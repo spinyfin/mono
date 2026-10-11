@@ -669,6 +669,22 @@ impl WorkDb {
         }
     }
 
+    /// Identify the applied declaration that currently authorizes a no-op.
+    /// Callers must revalidate this id in the terminal write transaction.
+    pub fn current_no_op_declaration_id(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT p.id FROM worker_proposals p JOIN work_executions e ON e.id = p.execution_id
+             WHERE e.id = ?1 AND e.run_done_outcome = 'no_changes_needed'
+               AND p.kind = 'run_done' AND p.state = 'applied'
+             ORDER BY p.rowid DESC LIMIT 1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Consume a refused `no-changes-needed` declaration: clear the durable
     /// stamp so a later Stop boundary cannot re-accept it without the worker
     /// declaring again, and supersede the applied `run_done` proposal that
