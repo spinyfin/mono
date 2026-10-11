@@ -2344,11 +2344,10 @@ async fn handle_frontend_connection(
             // Stop reading requests while the outbound lane is nearly full so
             // replies are never evicted for a client that is not draining.
             line = async {
-                sink.wait_for_response_headroom(
-                    server_state.read_admission.outstanding_per_connection()
-                        .saturating_add(server_state.live_read_admission.outstanding_per_connection())
-                        .saturating_add(1),
-                ).await;
+                sink.wait_for_response_headroom(read_admission::reply_headroom(
+                    &server_state.read_admission,
+                    &server_state.live_read_admission,
+                )).await;
                 reader.next_line().await
             } => line,
         };

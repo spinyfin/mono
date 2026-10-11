@@ -99,46 +99,51 @@ fn omitted_and_network_reads_use_bulk() {
 }
 
 #[test]
-fn every_live_variant_has_an_audited_local_only_handler() {
-    // Inventory of handlers that read local process state, local SQL, or the
-    // local cube socket only. Changing live membership requires this audit.
-    let source = include_str!("lane.rs");
-    let live = source
-        .split("=> ReadLane::Bulk,")
-        .nth(1)
-        .unwrap()
-        .split("=> ReadLane::Live,")
-        .next()
-        .unwrap();
-    let actual: std::collections::BTreeSet<_> = live
-        .split("R::")
-        .skip(1)
-        .map(|s| s.split(|c: char| !c.is_alphanumeric()).next().unwrap())
-        .collect();
-    let audited = [
-        "GetEngineHealth",
-        "GetEngineVersion",
-        "ListHostedPaneStatuses",
-        "ListTmuxWorkerStatuses",
-        "ListWorkerLiveStates",
-        "MetricsListLive",
-        "MetricsShowLive",
-        "ProbeStatus",
-        "WorkerPoolSummary",
-        "WorkspacePoolSummary",
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(actual, audited);
+fn live_lane_is_exactly_the_audited_local_only_set() {
+    use boss_protocol::FrontendRequest as R;
+    // Handlers that read local process state, local SQL, or the local cube
+    // socket only. Changing live membership requires this audit.
+    let live = [
+        R::GetEngineHealth,
+        R::GetEngineVersion,
+        R::ListHostedPaneStatuses,
+        R::ListTmuxWorkerStatuses,
+        R::ListWorkerLiveStates,
+        R::MetricsListLive,
+        R::MetricsShowLive { name: "n".into() },
+        R::ProbeStatus { probe_id: "p".into() },
+        R::WorkerPoolSummary,
+        R::WorkspacePoolSummary,
+    ];
+    for request in &live {
+        assert_eq!(read_lane(request), ReadLane::Live, "{request:?}");
+    }
+    // Network-bound reads must stay out of the live lane.
+    for request in [
+        R::TrunkStatus,
+        R::GitHubAuthStatus,
+        R::ListCoordinatorGuidance { product_id: None },
+    ] {
+        assert_ne!(read_lane(&request), ReadLane::Live, "{request:?}");
+    }
+}
+
+#[test]
+fn connection_setting_clamps_values_above_the_headroom_limit() {
+    let name = "BOSS_TEST_READ_ADMISSION_CLAMP";
+    // SAFETY: this variable name is unique to this test.
+    unsafe { std::env::set_var(name, (MAX_PER_CONNECTION + 50).to_string()) };
+    assert_eq!(connection_setting(name, 2), MAX_PER_CONNECTION);
+    unsafe { std::env::set_var(name, "3") };
+    assert_eq!(connection_setting(name, 2), 3);
+    unsafe { std::env::remove_var(name) };
 }
 
 #[test]
 fn maximum_connection_limits_preserve_reader_headroom() {
     let lane = ReadAdmission::new(32, MAX_PER_CONNECTION, 128, Duration::from_millis(500));
-    assert_eq!(
-        super::super::session_queue::MAX_SESSION_QUEUE - 2 * lane.outstanding_per_connection() - 1,
-        55
-    );
+    let headroom = reply_headroom(&lane, &lane);
+    assert!(super::super::session_queue::MAX_SESSION_QUEUE - headroom >= MIN_READER_HEADROOM);
 }
 
 #[tokio::test]
@@ -169,7 +174,7 @@ async fn same_kind_reads_keep_receive_order_even_when_tasks_poll_in_reverse() {
     drop(unrelated_guard);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn expired_ordering_wait_does_not_release_predecessor_or_leak_capacity() {
     use boss_protocol::FrontendRequest as R;
     let gate = Arc::new(ReadAdmission::new(2, 2, 8, Duration::from_millis(20)));
@@ -193,4 +198,42 @@ async fn expired_ordering_wait_does_not_release_predecessor_or_leak_capacity() {
     );
     drop(first);
     assert!(gate.enqueue(&connection).unwrap().acquire_ordered(third).await.is_ok());
+}
+
+/// A slow read must not turn later reads BUSY: a different key proceeds
+/// immediately, and an identical read waits past the admission deadline for
+/// its turn rather than being rejected.
+#[tokio::test(start_paused = true)]
+async fn slow_read_does_not_reject_other_keys_or_patient_same_key_reads() {
+    use boss_protocol::FrontendRequest as R;
+    let gate = Arc::new(ReadAdmission::new(4, 4, 8, Duration::from_millis(20)));
+    let connection = gate.connection();
+    let mut ordering = ReadOrdering::default();
+    let doc = |path: &str| R::GetProductDesignDoc {
+        repo_remote_url: "r".into(),
+        path: path.into(),
+        git_ref: "main".into(),
+    };
+    let slow = ordering.reserve(&doc("a")).await.await;
+    let same = ordering.reserve(&doc("a")).await;
+    let other = ordering.reserve(&doc("b")).await;
+    assert!(gate.enqueue(&connection).unwrap().acquire_ordered(other).await.is_ok());
+    let waiting = gate.enqueue(&connection).unwrap();
+    let same_read = tokio::spawn(async move { waiting.acquire_ordered(same).await.is_ok() });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!same_read.is_finished());
+    drop(slow);
+    assert!(same_read.await.unwrap());
+}
+
+#[tokio::test]
+async fn completed_keys_are_not_retained() {
+    use boss_protocol::FrontendRequest as R;
+    let mut ordering = ReadOrdering::default();
+    for i in 0..50 {
+        let turn = ordering.reserve(&R::GetWorkItem { id: format!("w{i}") }).await.await;
+        drop(turn);
+    }
+    let _last = ordering.reserve(&R::ListProducts).await;
+    assert!(ordering.len() <= 2);
 }

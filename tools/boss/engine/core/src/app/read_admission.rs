@@ -9,6 +9,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Queued (not yet active) reads allowed per active permit on one connection.
 const PENDING_PER_ACTIVE: usize = 4;
 
+/// Longest a read waits for an identical earlier read on the connection.
+/// Exceeds the 45 s on-demand fetch budget of the slowest network-bound read.
+const ORDER_WAIT: Duration = Duration::from_secs(60);
+
 pub(super) const BUSY: &str = "engine busy, retry: read admission limit exceeded";
 
 pub(super) struct ReadAdmission {
@@ -57,8 +61,26 @@ fn setting(name: &str, default: usize) -> usize {
     }
 }
 
-// At most 100 outstanding replies per lane leaves 55 outbound entries.
-const MAX_PER_CONNECTION: usize = 20;
+/// Outbound entries the reader loop keeps free for non-read replies and pushes.
+const MIN_READER_HEADROOM: usize = 55;
+
+/// Largest per-connection active limit such that both lanes' outstanding
+/// replies still leave [`MIN_READER_HEADROOM`] outbound entries.
+const MAX_PER_CONNECTION: usize =
+    (super::session_queue::MAX_SESSION_QUEUE - MIN_READER_HEADROOM - 1) / (2 * (PENDING_PER_ACTIVE + 1));
+const _: () = assert!(
+    2 * MAX_PER_CONNECTION * (PENDING_PER_ACTIVE + 1) + 1 + MIN_READER_HEADROOM
+        <= super::session_queue::MAX_SESSION_QUEUE
+);
+
+/// Outbound-queue depth the reader loop waits for before reading another
+/// request: every reply both lanes may have outstanding, plus one.
+pub(super) fn reply_headroom(bulk: &ReadAdmission, live: &ReadAdmission) -> usize {
+    bulk.outstanding_per_connection()
+        .saturating_add(live.outstanding_per_connection())
+        .saturating_add(1)
+}
+
 fn connection_setting(name: &str, default: usize) -> usize {
     let value = setting(name, default);
     if value > MAX_PER_CONNECTION {
@@ -71,6 +93,7 @@ fn connection_setting(name: &str, default: usize) -> usize {
     }
     value.min(MAX_PER_CONNECTION)
 }
+
 impl ReadAdmission {
     pub(super) fn live() -> Self {
         Self::new(
@@ -119,7 +142,7 @@ impl ReadAdmission {
 
 impl WaitingRead {
     pub(super) async fn acquire_ordered(
-        self,
+        mut self,
         order: ordering::Turn,
     ) -> Result<
         (
@@ -128,7 +151,11 @@ impl WaitingRead {
         ),
         &'static str,
     > {
-        let turn = tokio::time::timeout_at(self.deadline, order).await.map_err(|_| BUSY)?;
+        // Waiting behind an identical in-flight read is not admission
+        // pressure, so it has its own deadline; the admission deadline starts
+        // once this read's turn comes up.
+        let turn = tokio::time::timeout(ORDER_WAIT, order).await.map_err(|_| BUSY)?;
+        self.deadline = tokio::time::Instant::now() + self.engine.wait;
         let permits = self.acquire().await?;
         Ok((permits, turn))
     }
@@ -146,8 +173,10 @@ impl WaitingRead {
 
 mod lane;
 pub(super) use lane::{ReadLane, read_lane};
+
 mod ordering;
 pub(super) use ordering::ReadOrdering;
+
 #[cfg(test)]
 mod burst_tests;
 #[cfg(test)]
