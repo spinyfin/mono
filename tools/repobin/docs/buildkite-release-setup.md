@@ -1,6 +1,6 @@
 # Buildkite: repobin release setup
 
-Operator checklist for the **repobin release pipeline**, which builds prebuilt `repobin` binaries for macOS arm64 and Linux x86_64 and publishes them as pinned, checksum-verified assets on a `repobin-vX.Y.Z` GitHub Release of `spinyfin/mono`. It exists so that other repos' CI (e.g. `brianduff/flunge`) can install a specific repobin version by download instead of building it from source.
+Operator checklist for the **repobin release pipeline**, which builds prebuilt `repobin` binaries for macOS arm64 and Linux x86_64 and publishes them as pinned, checksum-verified assets on a `repobin-vX.Y.Z-alpha.N` GitHub Release of `spinyfin/mono`. It exists so that other repos' CI (e.g. `brianduff/flunge`) can install a specific repobin version by download instead of building it from source.
 
 The pipeline is a thin wrapper over the shared `bin/release` tool (`prepare` / `upload` / `publish`), configured by [`../release.toml`](../release.toml) and shaped like the `release` and `checkleft` pipelines. The full operator walk-through (cluster lookup, bootstrap step, disabling push triggers, cron schedule, recovery from a partial release, abandoning a draft) is in [`../../changelog/docs/buildkite-release-setup.md`](../../changelog/docs/buildkite-release-setup.md); substitute `repobin` for `changelog`. Differences:
 
