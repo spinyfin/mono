@@ -37,15 +37,29 @@ pub(super) fn migrate(conn: &Connection) -> Result<usize> {
         let Some(previous) = query_latest_execution_for_work_item(conn, &id)? else {
             continue;
         };
-        let has_pending: bool = conn.query_row(
+        if !previous.status.is_terminal() {
+            continue;
+        }
+        // The reconciler only looks at the latest execution, so a never-started
+        // pending attempt shadowed by the terminal one would never be promoted.
+        // Retire it; the replacement below becomes the single live execution.
+        // A started non-terminal row is a live worker: leave the item alone.
+        let has_started_live: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1
-             AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned'))",
+             AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')
+             AND started_at IS NOT NULL)",
             [&id],
             |row| row.get(0),
         )?;
-        if !previous.status.is_terminal() || has_pending {
+        if has_started_live {
             continue;
         }
+        conn.execute(
+            "UPDATE work_executions SET status = 'cancelled', finished_at = ?2
+             WHERE work_item_id = ?1
+               AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')",
+            params![id, now_string()],
+        )?;
         let kind = execution_kind_for_work_item(conn, &id)?;
         let pr_url = if kind == ExecutionKind::RevisionImplementation {
             get_chain_root_task(conn, &id)?.and_then(|root| root.pr_url)
@@ -260,48 +274,92 @@ mod tests {
     }
 
     #[test]
-    fn rearm_preserves_an_older_pending_execution() {
-        let db = WorkDb::open_in_memory().unwrap();
-        let product_id = product(&db);
-        let stale = format!("{NOT_DESCENDED_MESSAGE} boss-base/exec_failed");
-        let id = insert_blocked(&db, &product_id, "wedged", "execution_recovery_failed", &stale);
-        let pending = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::WaitingDependency)
-                    .build(),
-            )
-            .unwrap();
-        let failed = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Failed)
-                    .build(),
-            )
-            .unwrap();
+    fn rearm_replaces_an_older_pending_execution_shadowed_by_a_terminal_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work.db");
+        let (product_id, id, pending_id, failed_id, prerequisite) = {
+            let db = WorkDb::open(path.clone()).unwrap();
+            let product_id = product(&db);
+            let stale = format!("{NOT_DESCENDED_MESSAGE} boss-base/exec_failed");
+            let id = insert_blocked(&db, &product_id, "wedged", "execution_recovery_failed", &stale);
+            let prerequisite = crate::test_support::create_test_chore_manual(&db, &product_id, "prerequisite").id;
+            db.connect()
+                .unwrap()
+                .execute(
+                    "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at) VALUES (?1, ?2, 'blocks', '1')",
+                    params![id, prerequisite],
+                )
+                .unwrap();
+            let pending = db
+                .create_execution(
+                    CreateExecutionInput::builder()
+                        .work_item_id(id.clone())
+                        .kind(ExecutionKind::ChoreImplementation)
+                        .status(ExecutionStatus::WaitingDependency)
+                        .build(),
+                )
+                .unwrap();
+            let failed = db
+                .create_execution(
+                    CreateExecutionInput::builder()
+                        .work_item_id(id.clone())
+                        .kind(ExecutionKind::ChoreImplementation)
+                        .status(ExecutionStatus::Failed)
+                        .build(),
+                )
+                .unwrap();
+            db.connect()
+                .unwrap()
+                .execute("UPDATE metadata SET value = '38' WHERE key = 'schema_version'", [])
+                .unwrap();
+            (product_id, id, pending.id, failed.id, prerequisite)
+        };
+        let db = WorkDb::open(path).unwrap();
+        let live = |db: &WorkDb| -> Vec<(String, ExecutionStatus)> {
+            let conn = db.connect().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT id FROM work_executions WHERE work_item_id = ?1
+                     AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')",
+                )
+                .unwrap();
+            let ids = statement
+                .query_map([&id], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            ids.into_iter()
+                .map(|exec_id| {
+                    let status = query_execution(&conn, &exec_id).unwrap().unwrap().status;
+                    (exec_id, status)
+                })
+                .collect()
+        };
         let conn = db.connect().unwrap();
+        let replacement = query_latest_execution_for_work_item(&conn, &id).unwrap().unwrap();
+        assert_ne!(replacement.id, failed_id);
+        assert_ne!(replacement.id, pending_id);
         assert_eq!(
-            query_latest_execution_for_work_item(&conn, &id).unwrap().unwrap().id,
-            failed.id
+            query_execution(&conn, &pending_id).unwrap().unwrap().status,
+            ExecutionStatus::Cancelled
         );
-        assert_eq!(migrate(&conn).unwrap(), 1);
-        assert_eq!(migrate(&conn).unwrap(), 0);
-        let ids = conn
-            .prepare("SELECT id FROM work_executions WHERE work_item_id = ?1 ORDER BY created_at, rowid")
+        drop(conn);
+
+        for _ in 0..2 {
+            db.reconcile_product_executions(&product_id).unwrap();
+        }
+        assert_eq!(
+            live(&db),
+            vec![(replacement.id.clone(), ExecutionStatus::WaitingDependency)],
+            "stays waiting while the prerequisite is unmet"
+        );
+
+        db.connect()
             .unwrap()
-            .query_map([&id], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
+            .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&prerequisite])
             .unwrap();
-        assert_eq!(
-            ids,
-            vec![pending.id, failed.id],
-            "must not create another pending execution"
-        );
+        db.reconcile_product_executions(&product_id).unwrap();
+        assert_eq!(live(&db), vec![(replacement.id, ExecutionStatus::Ready)]);
     }
 
     #[test]
