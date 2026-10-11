@@ -1,14 +1,15 @@
 use super::*;
-use boss_engine_recovery::execution_bookmark::{is_base_unresolvable_error, pointer_integrity_error};
+use boss_engine_recovery::execution_bookmark::{
+    is_base_unresolvable_error, is_missing_pointer_error, pointer_integrity_error,
+};
 
 impl ExecutionCoordinator {
     /// Restore the predecessor's engine-created reference into the new lease.
     /// No read of its old workspace or lease history occurs.
     ///
-    /// A recorded predecessor must have a durable pointer. Missing or unreadable
-    /// pointers fail dispatch rather than silently discarding preserved work;
-    /// those failures are typed (`PointerIntegrityError`) so the caller can tell
-    /// them apart from transient fetch/goto/SSH failures, which stay retryable.
+    /// Missing predecessor heads degrade to clean dispatch with a warning.
+    /// Invalid pointers still fail with `PointerIntegrityError`; transient
+    /// fetch/goto/SSH failures stay retryable.
     ///
     /// `repo_id` is the handle `ensure_repo` returned for this execution; the
     /// registered repo is selected by it because `execution.repo_remote_url`
@@ -34,6 +35,7 @@ impl ExecutionCoordinator {
         };
         let Some(record) = self.work_db.execution_bookmark_optional(&prior.id)? else {
             self.warn_missing_execution_bookmark(execution, Some(&prior.id)).await;
+            self.work_db.delete_execution_restore_report(&execution.id)?;
             return Ok(None);
         };
         if record.host_id != adapter.host_id() {
@@ -51,7 +53,18 @@ impl ExecutionCoordinator {
                 | ExecutionKind::RevisionImplementation
         );
         let has_work = if prior.id != execution.id && is_implementation {
-            let has_work = !adapter.execution_bookmark_diff(&record).await?.trim().is_empty();
+            let patch = match adapter.execution_bookmark_diff(&record).await {
+                Ok(patch) => patch,
+                Err(err) if is_missing_pointer_error(&err) => {
+                    self.degrade_missing_pointers(execution, Some(&prior.id), &record, &err)
+                        .await;
+                    // A report from an earlier attempt would make dispatch skip PR positioning.
+                    self.work_db.delete_execution_restore_report(&execution.id)?;
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
+            };
+            let has_work = !patch.trim().is_empty();
             if execution.kind == ExecutionKind::RevisionImplementation && pr_for_goto.is_none() && !has_work {
                 return Ok(None);
             }
@@ -130,13 +143,35 @@ impl ExecutionCoordinator {
             self.work_db.record_execution_restore_report(&execution.id, &report)?;
             has_work
         } else {
-            adapter
+            match adapter
                 .restore_execution_bookmark(
                     &record,
                     &lease.workspace_path,
                     is_implementation && prior.id == execution.id,
                 )
-                .await?
+                .await
+            {
+                Ok(has_work) => has_work,
+                Err(err) if is_missing_pointer_error(&err) => {
+                    self.degrade_missing_pointers(execution, Some(&prior.id), &record, &err)
+                        .await;
+                    self.work_db.delete_execution_restore_report(&execution.id)?;
+                    if prior.id == execution.id {
+                        // The row names heads that no longer exist; keeping it
+                        // would make dispatch treat the run as already recovered
+                        // and skip creating fresh pointers. The surviving
+                        // baseline would also make fresh creation fail, so drop
+                        // it first (it refuses unless both heads are absent). Any
+                        // restore report from an earlier attempt goes with the row,
+                        // or dispatch would skip positioning on the bound PR.
+                        adapter.discard_orphaned_execution_baseline(&record).await?;
+                        self.work_db
+                            .delete_execution_bookmark_and_restore_report(&execution.id)?;
+                    }
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
+            }
         };
         self.dispatch_events
             .emit(
@@ -153,6 +188,23 @@ impl ExecutionCoordinator {
         Ok(Some((prior.id, has_work)))
     }
 
+    /// Shared handling for a recorded recovery pointer whose bookmarks are both
+    /// gone: name them in the log, emit the skipped-recovery event, and let the
+    /// caller continue without recovery. Integrity and transport errors never
+    /// come through here.
+    pub(super) async fn degrade_missing_pointers(
+        &self,
+        execution: &WorkExecution,
+        predecessor: Option<&str>,
+        record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
+        err: &anyhow::Error,
+    ) {
+        tracing::warn!(execution_id = %execution.id, predecessor,
+            recovery_pointer = %record.head(), publication_pointer = %record.publication(),
+            error = %err, "recovery pointers are missing; continuing without recovery");
+        self.warn_missing_execution_bookmark(execution, predecessor).await;
+    }
+
     /// Loud, non-fatal: a missing pointer is visible in dispatch events and
     /// logs, but does not fail dispatch or resume. The abandoned-bookmark
     /// sweep is the place that still reports it as attention.
@@ -160,7 +212,7 @@ impl ExecutionCoordinator {
         tracing::warn!(
             execution_id = %execution.id,
             predecessor,
-            "no engine-created recovery bookmark recorded; continuing without recovery"
+            "engine-created recovery bookmark unavailable; continuing without recovery"
         );
         self.dispatch_events
             .emit(
