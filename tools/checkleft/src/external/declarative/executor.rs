@@ -513,6 +513,49 @@ fn run_tool_invocation(
 /// `{{severity_deny_flag}}`, which resolves to `-Dwarnings` when the effective
 /// severity is `Error` (so clippy violations fail the build action) and causes
 /// the containing flag to be dropped when severity is anything else.
+/// Args for a `bazel query` that resolves labels; always led by `startup_flags`.
+fn aspect_query_args(startup_flags: &[String], query: String) -> Vec<String> {
+    let mut args = startup_flags.to_vec();
+    args.extend([
+        "query".to_owned(),
+        "--keep_going".to_owned(),
+        "--output=label".to_owned(),
+        query,
+    ]);
+    args
+}
+
+/// Args for the aspect `bazel build`; always led by `startup_flags`.
+fn aspect_build_args(
+    startup_flags: &[String],
+    aspect_flags: &[String],
+    build_flags: &[String],
+    targets: &[String],
+) -> Vec<String> {
+    let mut args = startup_flags.to_vec();
+    args.push("build".to_owned());
+    args.extend(aspect_flags.iter().cloned());
+    args.extend(build_flags.iter().cloned());
+    args.extend(targets.iter().cloned());
+    args
+}
+
+/// Args for the artifact-discovery `bazel cquery`; always led by `startup_flags`.
+fn aspect_cquery_args(
+    startup_flags: &[String],
+    aspect_flags: &[String],
+    build_flags: &[String],
+    targets: &[String],
+) -> Vec<String> {
+    let mut args = startup_flags.to_vec();
+    args.push("cquery".to_owned());
+    args.extend(aspect_flags.iter().cloned());
+    args.extend(build_flags.iter().cloned());
+    args.push("--output=files".to_owned());
+    args.push(format!("set({})", targets.join(" ")));
+    args
+}
+
 fn expand_build_flag(flag: &str, effective_severity: Option<Severity>) -> Option<String> {
     const SEVERITY_DENY_FLAG: &str = "{{severity_deny_flag}}";
     if flag.contains(SEVERITY_DENY_FLAG) {
@@ -557,13 +600,7 @@ fn run_bazel_aspect_invocation(
         .collect::<Vec<_>>()
         .join(" ");
     let query = format!("same_pkg_direct_rdeps(set({set}))");
-    let mut query_args = startup_flags.clone();
-    query_args.extend([
-        "query".to_owned(),
-        "--keep_going".to_owned(),
-        "--output=label".to_owned(),
-        query,
-    ]);
+    let query_args = aspect_query_args(&startup_flags, query);
     let query_output = spawn(context, &bazel, &query_args, &invocation.id)?;
     if !matches!(query_output.exit_code, Some(0) | Some(3)) {
         bail!(
@@ -611,13 +648,7 @@ fn run_bazel_aspect_invocation(
             .join(" ");
         let kinds = aspect.test_rdeps_kinds.join("|");
         let test_query = format!("kind(\"{kinds}\", same_pkg_direct_rdeps(set({targets_set})))");
-        let mut test_query_args = startup_flags.clone();
-        test_query_args.extend([
-            "query".to_owned(),
-            "--keep_going".to_owned(),
-            "--output=label".to_owned(),
-            test_query,
-        ]);
+        let test_query_args = aspect_query_args(&startup_flags, test_query);
         let test_query_output = spawn(context, &bazel, &test_query_args, &invocation.id)?;
         if matches!(test_query_output.exit_code, Some(0) | Some(3)) {
             for line in String::from_utf8_lossy(&test_query_output.stdout).lines() {
@@ -657,11 +688,7 @@ fn run_bazel_aspect_invocation(
         .iter()
         .filter_map(|f| expand_build_flag(f, effective_severity))
         .collect();
-    let mut build_args: Vec<String> = startup_flags;
-    build_args.push("build".to_owned());
-    build_args.extend(aspect_flags.iter().cloned());
-    build_args.extend(expanded_build_flags.iter().cloned());
-    build_args.extend(targets.iter().cloned());
+    let build_args = aspect_build_args(&startup_flags, &aspect_flags, &expanded_build_flags, &targets);
     let build_output = spawn(context, &bazel, &build_args, &invocation.id)?;
     match invocation.exit.classify(build_output.exit_code) {
         ExitOutcome::Ok => return Ok(Vec::new()),
@@ -678,11 +705,7 @@ fn run_bazel_aspect_invocation(
     //    same aspect/flags prints one workspace-relative path per line. Unlike
     //    `build`, cquery takes a single query EXPRESSION — multiple positional
     //    targets are a parse error — so the targets are wrapped in `set(...)`.
-    let mut cquery_args: Vec<String> = vec!["cquery".to_owned()];
-    cquery_args.extend(aspect_flags.iter().cloned());
-    cquery_args.extend(expanded_build_flags.iter().cloned());
-    cquery_args.push("--output=files".to_owned());
-    cquery_args.push(format!("set({})", targets.join(" ")));
+    let cquery_args = aspect_cquery_args(&startup_flags, &aspect_flags, &expanded_build_flags, &targets);
     let cquery_output = spawn(context, &bazel, &cquery_args, &invocation.id)?;
     if cquery_output.exit_code != Some(0) {
         bail!(

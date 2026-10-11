@@ -25,13 +25,21 @@ pub(crate) fn is_bazel_launcher(program: &Path) -> bool {
         .is_some_and(|name| name == "bazel" || name == "bazelisk")
 }
 
+/// Strip one matching pair of surrounding quotes, as Bazelisk's dotenv parser does.
+fn unquote(value: &str) -> &str {
+    ["\"", "'"]
+        .iter()
+        .find_map(|q| value.strip_prefix(q)?.strip_suffix(q))
+        .unwrap_or(value)
+}
+
 /// Match Bazelisk's workspace version precedence.
 fn repo_bazel_version(root: &Path) -> Option<String> {
     let rc = std::fs::read_to_string(root.join(".bazeliskrc")).unwrap_or_default();
     rc.lines()
         .filter_map(|line| line.trim().split_once('='))
         .filter(|(key, _)| key.trim() == "USE_BAZEL_VERSION")
-        .map(|(_, value)| value.trim().to_owned())
+        .map(|(_, value)| unquote(value.trim()).to_owned())
         .rfind(|value| !value.is_empty())
         .or_else(|| {
             std::fs::read_to_string(root.join(".bazelversion"))
@@ -47,8 +55,7 @@ fn repo_bazel_version(root: &Path) -> Option<String> {
 fn prepare_bazel(command: &mut Command, home: tempfile::TempDir) -> Result<tempfile::TempDir> {
     let root = command
         .get_current_dir()
-        .map(Path::to_owned)
-        .unwrap_or(std::env::current_dir()?);
+        .map_or_else(std::env::current_dir, |dir| Ok(dir.to_owned()))?;
     if let Some(version) = repo_bazel_version(&root) {
         let inherited = command
             .get_envs()
@@ -154,6 +161,19 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn quoted_bazeliskrc_pin_is_unquoted() {
+        let repo = tempfile::tempdir().unwrap();
+        for (rc, want) in [
+            ("USE_BAZEL_VERSION=\"7.4.1\"\n", "7.4.1"),
+            ("USE_BAZEL_VERSION='7.4.1'\n", "7.4.1"),
+            ("USE_BAZEL_VERSION=7.4.1\n", "7.4.1"),
+        ] {
+            std::fs::write(repo.path().join(".bazeliskrc"), rc).unwrap();
+            assert_eq!(repo_bazel_version(repo.path()).as_deref(), Some(want));
+        }
     }
 
     #[test]

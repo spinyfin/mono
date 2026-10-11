@@ -1,7 +1,7 @@
 use super::*;
 use crate::external::environment::prepare;
 
-fn commands(root: &Path, launcher: &Path) -> Vec<Command> {
+fn commands(root: &Path, launcher: &Path) -> Vec<(Command, Vec<String>)> {
     let binaries = BTreeMap::new();
     let context = CheckExecutionContext {
         repo_root: root,
@@ -11,13 +11,24 @@ fn commands(root: &Path, launcher: &Path) -> Vec<Command> {
         binaries: Some(&binaries),
     };
     let mut commands = Vec::new();
-    for operation in ["query", "build", "cquery"] {
-        let mut args = super::super::ci_bazel_startup_flags();
-        args.push(operation.into());
-        commands.push(invocation_command(context, launcher, &args).unwrap());
+    let startup = vec![
+        "--bazelrc=.ci.test.startup.bazelrc".to_owned(),
+        "--max_idle_secs=60".to_owned(),
+    ];
+    let aspect_flags = vec!["--aspects=@x//:y.bzl%z".to_owned()];
+    let targets = vec!["//a:b".to_owned()];
+    for args in [
+        aspect_query_args(&startup, "q".to_owned()),
+        aspect_build_args(&startup, &aspect_flags, &[], &targets),
+        aspect_cquery_args(&startup, &aspect_flags, &[], &targets),
+    ] {
+        commands.push((invocation_command(context, launcher, &args).unwrap(), startup.clone()));
     }
     for build in [true, false] {
-        commands.push(resolve::bazel_resolve_command(root, launcher, "//:tool", build));
+        commands.push((
+            resolve::bazel_resolve_command(root, launcher, "//:tool", build),
+            super::super::ci_bazel_startup_flags(),
+        ));
     }
     commands
 }
@@ -27,14 +38,11 @@ fn production_commands_preserve_environment_and_startup_flags() {
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join(".bazelversion"), "7.4.1\n").unwrap();
     for launcher in ["bazel", "bazelisk"] {
-        for mut command in commands(repo.path(), Path::new(launcher)) {
+        for (mut command, expected) in commands(repo.path(), Path::new(launcher)) {
             // Control the child's inherited selector without mutating process globals.
             command.env_remove("USE_BAZEL_VERSION");
             let before: Vec<_> = command.get_args().map(|v| v.to_owned()).collect();
-            let flags: Vec<std::ffi::OsString> = super::super::ci_bazel_startup_flags()
-                .into_iter()
-                .map(Into::into)
-                .collect();
+            let flags: Vec<std::ffi::OsString> = expected.into_iter().map(Into::into).collect();
             assert_eq!(&before[..flags.len()], flags.as_slice());
             assert!(["query", "build", "cquery"].iter().any(|v| before[flags.len()] == *v));
             let _home = prepare(&mut command).unwrap();
@@ -65,7 +73,7 @@ fn conflicting_version_selectors_fail_with_actionable_error() {
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join(".bazelversion"), "7.4.1").unwrap();
     for version in ["latest", "", "8.0.0"] {
-        for mut command in commands(repo.path(), Path::new("bazelisk")) {
+        for (mut command, _) in commands(repo.path(), Path::new("bazelisk")) {
             command.env("USE_BAZEL_VERSION", version);
             let error = prepare(&mut command).unwrap_err().to_string();
             assert!(error.contains("conflicts with repository Bazel pin 7.4.1"));
@@ -104,7 +112,7 @@ fn hostile_home_rc_cannot_override_workspace_pin_or_move_cache() {
             )
             .unwrap();
         }
-        for mut command in commands(repo.path(), &launcher) {
+        for (mut command, _) in commands(repo.path(), &launcher) {
             command.env("HOME", home.path()).env_remove("USE_BAZEL_VERSION");
             let _isolated_home = prepare(&mut command).unwrap();
             let output = command.output().unwrap();
