@@ -71,6 +71,19 @@ final class ChatViewModel: ObservableObject {
     /// per event; see the "refetch storm" evidence in
     /// docs/investigations/task-population-latency-on-start-and-product-switch.md §10.2.
     var pendingWorkTreeRefetchTasks: [String: Task<Void, Never>] = [:]
+
+    /// Projects whose navigator "Archive" gesture has been sent to the
+    /// engine and not yet answered. This is the gesture's immediate
+    /// feedback (the row dims and reads "Archiving…" the instant the menu
+    /// item is clicked) — it is *not* an optimistic status: the project
+    /// stays `active` in the store until the engine's `work_item_updated`
+    /// reply lands, and a `work_error` / disconnect clears the pending
+    /// state and surfaces the failure instead of leaving a ghost row.
+    @Published var archivingProjectIDs: Set<String> = []
+
+    /// Envelope request id of each in-flight archive → its project id, so
+    /// a `work_error` carrying that id settles onto the right row.
+    var archiveRequestProjectIDs: [String: String] = [:]
     /// Dependency edges keyed by product. Refreshed whenever the engine
     /// pushes a fresh `WorkTree` for that product. The kanban joins
     /// these against the task/chore/project name maps to render

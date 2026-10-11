@@ -596,7 +596,11 @@ extension EngineClient {
         sendLine(payload)
     }
 
-    func sendUpdateWorkItem(id: String, patch: [String: Any]) {
+    /// Returns the envelope request id so a caller can correlate a
+    /// `work_error` reply back to this patch (the engine echoes the id on
+    /// its reply envelope). `nil` means the line was not sent at all.
+    @discardableResult
+    func sendUpdateWorkItem(id: String, patch: [String: Any]) -> String? {
         sendLine([
             "type": "update_work_item",
             "id": id,

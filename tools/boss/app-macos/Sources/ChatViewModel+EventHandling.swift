@@ -95,6 +95,9 @@ extension ChatViewModel {
             // permanently disabled since no work_error will ever arrive.
             deferredScopeActionInFlightIDs.removeAll()
             operatorAnswerInFlightByTaskID.removeAll()
+            // An archive in flight gets no reply either; drop its pending
+            // mark so the row is not stuck reading "Archiving…".
+            settleAllArchiveRequests()
             // Same reasoning for a review-guide retry in flight: no
             // `review_guide_retry_queued` or `work_error` reply is ever
             // coming for a request the disconnect killed in transit, so
@@ -205,6 +208,16 @@ extension ChatViewModel {
             // settle it onto that card without blaming any other request.
             if settleOperatorAnswerWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
+            // A refused project archive: the row drops its pending mark and
+            // the message surfaces through `workErrorMessage` below (the
+            // project is still `active` in the store — nothing to undo).
+            // Unattributable errors clear every pending archive rather than
+            // risk a row stuck on "Archiving…" for a reply that never comes.
+            if let requestId, let projectID = archiveRequestProjectIDs[requestId] {
+                settleArchiveRequest(projectID: projectID)
+            } else if requestId == nil {
+                settleAllArchiveRequests()
+            }
             // The engine's WorkError reply carries no request context, so we
             // can't tell which in-flight list_executions/list_attachments
             // call failed. `hasOtherTrackedAppRequestInFlight` checks every
@@ -273,6 +286,9 @@ extension ChatViewModel {
             // user-facing signal; never a modal.
             appendSystemMessage(message)
         case .notConnected(let requestKind):
+            if requestKind == "update_work_item" {
+                settleAllArchiveRequests()
+            }
             // Only the drag's own requests may clear admission/optimistic state.
             if requestKind == "evaluate_dispatch_admission" || requestKind == "move_work_item_on_board" {
                 pendingDragAdmissionCheck = nil

@@ -115,6 +115,21 @@ extension ChatViewModel {
         }
     }
 
+    /// Replace (or insert) one project in its product's bucket without a
+    /// work-tree refetch. The bucket's `didSet` performs the full derived-
+    /// cache drop, which is correct here: project status drives navigator
+    /// visibility and board grouping, and a project row is tiny next to a
+    /// `GetWorkTree` round trip.
+    func upsertProject(_ project: WorkProject) {
+        var projects = projectsByProductID[project.productID] ?? []
+        if let index = projects.firstIndex(where: { $0.id == project.id }) {
+            projects[index] = project
+        } else {
+            projects.append(project)
+        }
+        projectsByProductID[project.productID] = projects.sorted(by: projectSort)
+    }
+
     func handleCreatedWorkItem(_ item: WorkItemPayload) {
         workErrorMessage = nil
         switch item {
@@ -202,7 +217,15 @@ extension ChatViewModel {
                 return
             }
         case .project(let project):
-            engine.sendGetWorkTree(productId: project.productID, flow: .itemRefetch)
+            // Apply the reply in place, exactly as task updates do, instead
+            // of refetching the whole work tree. The engine's own
+            // `work_invalidated` push for this patch still schedules the
+            // one debounced refetch; issuing a second, un-debounced
+            // `GetWorkTree` here doubled the cost of every project edit —
+            // measured at ~5 s per fetch on a ~2,000-task product, which is
+            // the whole "archive takes several seconds" symptom.
+            upsertProject(project)
+            settleArchiveRequest(projectID: project.id)
         case .task(let updatedTask), .chore(let updatedTask):
             // When the engine confirms an optimistic move, drop the origin record
             // so a subsequent work_error from an unrelated operation won't bounce
