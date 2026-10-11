@@ -1,4 +1,15 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+
 package(default_visibility = ["//visibility:private"])
+
+cc_binary(
+    name = "exit-observer",
+    srcs = ["exit-observer.c"],
+    visibility = [
+        "//tools/boss/app-macos:__pkg__",
+        "//tools/boss/app-macos/Tests/UpdateCore:__pkg__",
+    ],
+)
 
 # The detached swap/relaunch watchdog script, bundled into the app's
 # Contents/Resources/ via macos_application's additional_contents. Invoked as

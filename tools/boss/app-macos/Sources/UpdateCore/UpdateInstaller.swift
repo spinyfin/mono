@@ -524,7 +524,7 @@ public struct UpdateInstaller: Sendable {
         if !state.blocklist.contains(version.description) {
             state.blocklist.append(version.description)
             saveState(state)
-            log?.record(stage: "blocklist", event: "added", level: "warning", attempt: attemptID, to: version,
+            log?.record(stage: "blocklist", event: "added", level: "warning", attempt: attemptID, from: log?.allRecords().last(where: { $0.attempt == attemptID })?.from.flatMap(VersionTuple.parse), to: version,
                         detail: ["reason": reason, "blocklist": state.blocklist.joined(separator: ",")])
         }
     }
@@ -539,7 +539,8 @@ public struct UpdateInstaller: Sendable {
         state.blocklist.removeAll { $0 == version.description }
         if state.blocklist.count != before {
             saveState(state)
-            log?.record(stage: "blocklist", event: "removed", attempt: nil, to: version,
+            let context = log?.allRecords().last { $0.to == version.description }
+            log?.record(stage: "blocklist", event: "removed", attempt: context?.attempt, from: context?.from.flatMap(VersionTuple.parse), to: version,
                         detail: ["reason": "user-retry", "blocklist": state.blocklist.joined(separator: ",")])
         }
     }
@@ -630,6 +631,20 @@ public struct UpdateInstaller: Sendable {
     /// blocklist entry the marker represents.
     public func reconcileAfterLaunch(currentVersion: VersionTuple) -> LaunchReconciliation {
         let fm = FileManager.default
+        // The helper has no os_log of its own; mirror whatever it wrote since the last
+        // launch into the app's unified-log category.
+        log?.replayHelperRecords()
+        // Snapshot the blocklist on every exit path, so the next launch can tell
+        // whether something other than this code (an older app) grew it.
+        defer { writeBlocklistSnapshot() }
+
+        // A sidecar whose one-line marker is already gone was left by a rollback that
+        // an older app (1.0.734 and earlier) reconciled: it consumed the marker and
+        // blocklisted the version, but cannot read the reason. Fold it into the
+        // rollback history only. It must not touch the pending swap, staged directory
+        // or backup — those may now belong to a later attempt that is still being
+        // watched by its own helper.
+        let orphanedRollback = foldOrphanedRollbackDetail(currentVersion: currentVersion)
 
         if let marker = readRolledBackMarker() {
             let pending = loadState().pending
@@ -663,6 +678,7 @@ public struct UpdateInstaller: Sendable {
             try? fm.removeItem(at: stagedDirectory(for: marker.version))
             try? fm.removeItem(at: backupURL)
             try? fm.removeItem(at: rolledBackMarkerURL)
+            try? fm.removeItem(at: rolledBackDetailURL)
             return .rolledBack(record)
         }
 
@@ -682,7 +698,127 @@ public struct UpdateInstaller: Sendable {
             return .installed(currentVersion)
         }
 
+        if let record = detectHistoricalRollback(currentVersion: currentVersion) ?? orphanedRollback {
+            return .rolledBack(record)
+        }
         return .noChange
+    }
+
+    // MARK: Rollbacks performed by older code
+
+    private var blocklistSnapshotURL: URL {
+        updatesDirectory.appendingPathComponent("last-seen-blocklist.json")
+    }
+
+    private func writeBlocklistSnapshot() {
+        if let data = try? JSONEncoder().encode(loadState().blocklist) {
+            try? data.write(to: blocklistSnapshotURL, options: .atomic)
+        }
+    }
+
+    /// Record a rolled-back sidecar whose one-line marker an older app already
+    /// consumed (see `reconcileAfterLaunch`). History only: no blocklist change (the
+    /// older app's reading of the marker is authoritative, and the user may since
+    /// have retried), no pending/staged/backup cleanup.
+    private func foldOrphanedRollbackDetail(currentVersion: VersionTuple) -> RollbackRecord? {
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: rolledBackMarkerURL.path),
+              let text = try? String(contentsOf: rolledBackDetailURL, encoding: .utf8) else { return nil }
+        try? fm.removeItem(at: rolledBackDetailURL)
+        guard let marker = RolledBackMarker.parse(text) else { return nil }
+        var state = loadState()
+        if let attempt = marker.attemptID, state.rollbacks.contains(where: { $0.attemptID == attempt }) {
+            return nil
+        }
+        let record = RollbackRecord(
+            version: marker.version.description,
+            restoredVersion: marker.restoredVersion ?? currentVersion.description,
+            reason: marker.reason,
+            detail: marker.detail,
+            attemptID: marker.attemptID,
+            recordedAt: UpdateLog.timestamp(Date())
+        )
+        state.rollbacks.append(record)
+        state.rollbacks = Array(state.rollbacks.suffix(InstallState.maxRollbackHistory))
+        saveState(state)
+        log?.record(
+            stage: "reconcile", event: "rollback-detected", level: "warning", attempt: marker.attemptID,
+            from: marker.restoredVersion.flatMap(VersionTuple.parse), to: marker.version,
+            detail: [
+                "evidence": "rolled-back.detail sidecar left after an older app consumed the marker",
+                "reason": marker.reason.rawValue,
+                "detail": marker.detail,
+                "runningVersion": currentVersion.description,
+                "blocklisted": String(state.blocklist.contains(marker.version.description)),
+            ])
+        return record
+    }
+
+    /// Detect a rollback that code without this reconcile performed, so it still
+    /// reaches the trail and the rollback notice (reason `.unknown`). Two signals:
+    ///
+    /// - **The blocklist grew** since the snapshot the previous launch of this code
+    ///   wrote. Only reconcile code blocklists, and this code's own blocklisting
+    ///   returns before reaching here, so growth means an older app consumed a
+    ///   rolled-back marker. With no snapshot yet (the first launch of this code),
+    ///   blocklisted versions with no rollback record at all count.
+    /// - **A dangling attempt**: a committed swap (`swap.committed`) or a started
+    ///   helper (`relaunch.helper-started`) for a version other than the one running,
+    ///   while the running version is that attempt's `from` version — i.e. the
+    ///   previous version is back — with no success record (`reconcile.installed`,
+    ///   `handshake.flag-written`, `relaunch.committed`) and no rollback already
+    ///   recorded for it. Swap attempts that never committed (`rolled-back-in-process`,
+    ///   `skipped-*`) are not rollbacks and are ignored.
+    private func detectHistoricalRollback(currentVersion: VersionTuple) -> RollbackRecord? {
+        var state = loadState()
+        let snapshot = (try? Data(contentsOf: blocklistSnapshotURL)).flatMap {
+            try? JSONDecoder().decode([String].self, from: $0)
+        }
+        let grown = state.blocklist.filter { version in
+            if let snapshot { return !snapshot.contains(version) }
+            return !state.rollbacks.contains { $0.version == version }
+        }
+
+        let running = currentVersion.description
+        let records = log?.allRecords() ?? []
+        let resolved: Set<String> = Set(records.compactMap { record -> String? in
+            guard let attempt = record.attempt else { return nil }
+            switch (record.stage, record.event) {
+            case ("reconcile", "installed"), ("handshake", "flag-written"), ("relaunch", "committed"),
+                 ("reconcile", "rolled-back"), ("reconcile", "rollback-detected"):
+                return attempt
+            default:
+                return nil
+            }
+        }).union(state.rollbacks.compactMap(\.attemptID))
+        let dangling = records.last { record in
+            guard let attempt = record.attempt, !resolved.contains(attempt),
+                  let target = record.to, target != running, record.from == running else { return false }
+            return (record.stage == "swap" && record.event == "committed")
+                || (record.actor == "helper" && record.event == "helper-started")
+        }
+
+        guard let version = grown.last ?? dangling?.to else { return nil }
+        var evidence: [String] = []
+        if !grown.isEmpty {
+            evidence.append(snapshot == nil
+                ? "blocklisted with no rollback record: \(grown.joined(separator: ","))"
+                : "blocklist grew since last startup: \(grown.joined(separator: ","))")
+        }
+        if let dangling, let attempt = dangling.attempt {
+            evidence.append("attempt \(attempt) \(dangling.stage).\(dangling.event) for \(dangling.to ?? "?") with no successful launch")
+        }
+        let attempt = dangling?.to == version ? dangling?.attempt : nil
+        let record = RollbackRecord(version: version, restoredVersion: running,
+            reason: .unknown, detail: evidence.joined(separator: "; "), attemptID: attempt,
+            recordedAt: UpdateLog.timestamp(Date()))
+        state.rollbacks.append(record)
+        state.rollbacks = Array(state.rollbacks.suffix(InstallState.maxRollbackHistory))
+        saveState(state)
+        log?.record(stage: "reconcile", event: "rollback-detected", level: "warning",
+                    attempt: attempt, from: currentVersion, to: VersionTuple.parse(version),
+                    detail: ["evidence": record.detail, "runningVersion": running])
+        return record
     }
 
     // MARK: Helper invocation
@@ -691,6 +827,13 @@ public struct UpdateInstaller: Sendable {
     /// rollback; `reconcileAfterLaunch` reads and clears it on the next launch.
     public var rolledBackMarkerURL: URL {
         updatesDirectory.appendingPathComponent("rolled-back")
+    }
+
+    /// The helper's `rolled-back.detail` sidecar: reason, detail, attempt, from,
+    /// restored version. The marker itself stays a bare version so apps that predate
+    /// reasons (1.0.734 and earlier) still parse it and blocklist the failed version.
+    public var rolledBackDetailURL: URL {
+        rolledBackMarkerURL.appendingPathExtension("detail")
     }
 
     /// Build the detached `/bin/sh relaunch-helper.sh …` command for `plan`. The app
@@ -754,7 +897,8 @@ public struct UpdateInstaller: Sendable {
         try? data.write(to: stateURL, options: .atomic)
     }
 
-    private func recordPending(_ plan: SwapPlan) {
+    // Internal (not private) so tests can stage a pending swap directly.
+    func recordPending(_ plan: SwapPlan) {
         var state = loadState()
         state.pending = PendingRecord(
             version: plan.version.description,
@@ -776,9 +920,21 @@ public struct UpdateInstaller: Sendable {
         saveState(state)
     }
 
+    /// The rolled-back marker the next reconcile will consume, if any (read-only).
+    func pendingRollbackMarker() -> RolledBackMarker? {
+        readRolledBackMarker()
+    }
+
+    /// The one-line marker, enriched from the sidecar when the sidecar describes the
+    /// same version (a stale sidecar from an earlier rollback never relabels it).
     private func readRolledBackMarker() -> RolledBackMarker? {
-        guard let text = try? String(contentsOf: rolledBackMarkerURL, encoding: .utf8) else { return nil }
-        return RolledBackMarker.parse(text)
+        guard let text = try? String(contentsOf: rolledBackMarkerURL, encoding: .utf8),
+              let bare = RolledBackMarker.parse(text) else { return nil }
+        if let detailText = try? String(contentsOf: rolledBackDetailURL, encoding: .utf8),
+           let detailed = RolledBackMarker.parse(detailText), detailed.version == bare.version {
+            return detailed
+        }
+        return bare
     }
 
     private func pruneLaunchFlags(except keep: VersionTuple) {

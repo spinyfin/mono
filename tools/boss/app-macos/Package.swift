@@ -15,8 +15,10 @@ let package = Package(
             name: "GhosttyKit",
             path: "ThirdParty/GhosttyKit.xcframework"
         ),
+        .target(name: "DiagnosticIO", path: "Sources/DiagnosticIO"),
         .target(
             name: "UpdateCore",
+            dependencies: ["DiagnosticIO"],
             path: "Sources/UpdateCore"
         ),
         .target(
@@ -33,10 +35,11 @@ let package = Package(
                 .product(name: "Textual", package: "textual"),
                 "GhosttyKit",
                 "UpdateCore",
+                "DiagnosticIO",
                 "CrashWatchdog",
             ],
             path: "Sources",
-            exclude: ["UpdateCore", "CrashWatchdog", "PaneLayout"],
+            exclude: ["DiagnosticIO", "UpdateCore", "CrashWatchdog", "PaneLayout"],
             resources: [
                 .copy("Resources/TrekIcons"),
             ],

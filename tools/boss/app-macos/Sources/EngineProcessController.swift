@@ -395,8 +395,11 @@ final class EngineProcessController: @unchecked Sendable {
     }
 
     func stop() {
+        emit("[engine stop] begin")
+        defer { emit("[engine stop] end") }
         disableSupervision()
         guard stopOnExit else {
+            emit("[engine stop] keeping shared engine running")
             return
         }
 

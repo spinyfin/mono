@@ -39,7 +39,9 @@ final class RelaunchHelperTests: XCTestCase {
         // Filesystem outcome: previous bundle restored, backup consumed, marker written.
         XCTAssertEqual(installedVersion(), "1.0.27", "the previous bundle must be back in place")
         XCTAssertFalse(exists(backupURL), "the .bak is consumed by the restore")
-        let markerText = try String(contentsOf: installer().rolledBackMarkerURL, encoding: .utf8)
+        let bareMarker = try String(contentsOf: installer().rolledBackMarkerURL, encoding: .utf8)
+        XCTAssertEqual(VersionTuple.parse(bareMarker.trimmingCharacters(in: .whitespacesAndNewlines)), v("1.0.28"))
+        let markerText = try String(contentsOf: installer().rolledBackMarkerURL.appendingPathExtension("detail"), encoding: .utf8)
         XCTAssertTrue(markerText.contains("version=1.0.28\n"), markerText)
         XCTAssertTrue(markerText.contains("reason=handshake-timeout\n"), markerText)
         XCTAssertTrue(markerText.contains("attempt=\(attemptID)\n"), markerText)
@@ -107,18 +109,116 @@ final class RelaunchHelperTests: XCTestCase {
         XCTAssertEqual(log.records(attempt: attemptID).last?.detail["reason"], "handshake-timeout")
     }
 
+    /// Boss 1.0.734 arms the swapped-in bundle's helper with only
+    /// --pid/--install/--backup/--flag/--rolled-back-marker/--version/--watchdog.
+    func testLegacyInvocationWritesTrailAndCompatibleMarker() throws {
+        XCTAssertEqual(try runHelper(newAppBehaviour: .hangsWithoutFlag, watchdogSeconds: 1, legacy: true), 1)
+        let log = UpdateLog(directory: UpdateLog.directory(forUpdatesDirectory: updatesDir))
+        let records = log.allRecords()
+        XCTAssertEqual(records.first?.event, "helper-started")
+        XCTAssertEqual(records.first?.detail["derivedArguments"], "log attempt from ")
+        XCTAssertEqual(records.last.map { "\($0.stage).\($0.event)" }, "rollback.completed")
+        for event in ["old-process-exited", "bundle-assessment", "open", "new-process-started", "timeout", "decision"] {
+            XCTAssertTrue(records.contains { $0.event == event }, "missing \(event) in \(records.map(\.event))")
+        }
+        let attempt = try XCTUnwrap(records.first?.attempt)
+        XCTAssertNotNil(attempt.range(of: #"^upd-[0-9]+-[0-9a-f]{4}$"#, options: .regularExpression), attempt)
+        XCTAssertTrue(records.allSatisfy { $0.attempt == attempt && $0.from == "1.0.27" && $0.to == "1.0.28" })
+
+        // 1.0.734's reader: `VersionTuple.parse(text.trimmingCharacters(in: .whitespacesAndNewlines))`.
+        let marker = try String(contentsOf: installer().rolledBackMarkerURL, encoding: .utf8)
+        XCTAssertEqual(VersionTuple.parse(marker.trimmingCharacters(in: .whitespacesAndNewlines)), v("1.0.28"),
+                       "the failed version must still be blocklisted by an app that predates reasons")
+
+        // Simulate 1.0.734 reconciling it: blocklist the version and delete only the
+        // marker. The next launch of this code recovers the reason from the sidecar,
+        // without touching install state that may belong to a later attempt.
+        try Data("{\"blocklist\":[\"1.0.28\"],\"rollbacks\":[]}".utf8)
+            .write(to: updatesDir.appendingPathComponent("install-state.json"))
+        try FileManager.default.removeItem(at: installer().rolledBackMarkerURL)
+        let reconciler = UpdateInstaller(updatesDirectory: updatesDir, installBundleURL: installBundle, log: log)
+        guard case .rolledBack(let record) = reconciler.reconcileAfterLaunch(currentVersion: v("1.0.27")) else {
+            return XCTFail("the sidecar left behind must still surface the rollback")
+        }
+        XCTAssertEqual(record.reason, .handshakeTimeout)
+        XCTAssertEqual(record.attemptID, attempt)
+        XCTAssertFalse(exists(reconciler.rolledBackDetailURL), "sidecar consumed")
+        XCTAssertEqual(reconciler.reconcileAfterLaunch(currentVersion: v("1.0.27")), .noChange, "surfaced once")
+    }
+
+    func testEveryHelperRecordAlsoGoesToTheUnifiedLog() throws {
+        XCTAssertEqual(try runHelper(newAppBehaviour: .hangsWithoutFlag, watchdogSeconds: 1), 1)
+        let durable = helperEvents()
+        let unified = try String(contentsOf: binDir.appendingPathComponent("logger-lines"), encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        XCTAssertEqual(unified.count, durable.count, "one logger line per durable record")
+        XCTAssertTrue(unified.allSatisfy { $0.contains("-t boss-relaunch-helper") }, unified.joined(separator: "\n"))
+        XCTAssertTrue(unified.contains { $0.hasPrefix("-p user.err ") && $0.contains("\"event\":\"completed\"") })
+        XCTAssertTrue(unified.contains { $0.hasPrefix("-p user.notice ") && $0.contains("\"event\":\"helper-started\"") })
+    }
+
+    func testPreexistingProcessIsNeverAdoptedOrKilled() throws {
+        // A process already running the installed executable before `open` (say, a
+        // copy the user opened by hand) must not be mistaken for the new launch.
+        let bystander = Process()
+        bystander.executableURL = URL(fileURLWithPath: "/bin/sh")
+        bystander.arguments = ["-c", "sleep 30"]
+        bystander.standardInput = FileHandle.nullDevice
+        bystander.standardOutput = FileHandle.nullDevice
+        bystander.standardError = FileHandle.nullDevice
+        try bystander.run()
+        defer { if bystander.isRunning { bystander.terminate() }; bystander.waitUntilExit() }
+        let exe = installBundle.appendingPathComponent("Contents/MacOS/Boss").path
+        try "\(bystander.processIdentifier) \(exe)\n".write(
+            to: binDir.appendingPathComponent("launched-pids"), atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(try runHelper(newAppBehaviour: .hangsWithoutFlag, watchdogSeconds: 1), 1)
+        let events = helperEvents()
+        XCTAssertEqual(events.first { $0.event == "preexisting-process" }?.detail["pids"],
+                       String(bystander.processIdentifier))
+        let adopted = events.first { $0.event == "new-process-started" }?.detail["pid"]
+        XCTAssertNotNil(adopted)
+        XCTAssertNotEqual(adopted, String(bystander.processIdentifier), "the bystander is not the new launch")
+        XCTAssertTrue(bystander.isRunning, "rollback terminates only the process it launched")
+    }
+
     // MARK: - Other failure classifications
 
     func testEarlyExitIsRecordedAsProcessExited() throws {
         let status = try runHelper(newAppBehaviour: .exitsImmediately, watchdogSeconds: 5)
         XCTAssertEqual(status, 1)
         XCTAssertEqual(installedVersion(), "1.0.27")
-        let marker = try String(contentsOf: installer().rolledBackMarkerURL, encoding: .utf8)
+        let marker = try String(contentsOf: installer().rolledBackMarkerURL.appendingPathExtension("detail"), encoding: .utf8)
         XCTAssertTrue(marker.contains("reason=process-exited\n"), marker)
+        XCTAssertTrue(marker.contains("exitCode=3"), marker)
+        XCTAssertEqual(helperEvents().first { $0.event == "process-exited" }?.detail["termination"], "exitCode=3")
         let events = helperEvents().map(\.event)
         XCTAssertTrue(events.contains("new-process-started"), "\(events)")
         XCTAssertTrue(events.contains("process-exited"), "\(events)")
         XCTAssertFalse(events.contains("terminated-new-process"), "nothing left to terminate")
+    }
+
+    func testSignalExitIsRecorded() throws {
+        XCTAssertEqual(try runHelper(newAppBehaviour: .signalExit, watchdogSeconds: 5), 1)
+        let marker = try String(contentsOf: installer().rolledBackMarkerURL.appendingPathExtension("detail"), encoding: .utf8)
+        XCTAssertTrue(marker.contains("signal=15"), marker)
+        XCTAssertEqual(helperEvents().first { $0.event == "process-exited" }?.detail["termination"], "signal=15")
+    }
+
+    func testBlockedOpenDoesNotSuspendHandshakeDeadline() throws {
+        try installToolStubs(openSucceeds: true, blocks: true)
+        let start = Date()
+        XCTAssertEqual(try runHelper(newAppBehaviour: .hangsWithoutFlag, watchdogSeconds: 1), 1)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 10)
+        XCTAssertTrue(helperEvents().contains { $0.event == "timeout" })
+    }
+
+    func testBlockedOpenWithoutProcessHitsLaunchDeadline() throws {
+        try writeExecutable(binDir.appendingPathComponent("open"), "#!/bin/sh\nsleep 20\n")
+        let start = Date()
+        XCTAssertEqual(try runHelper(newAppBehaviour: .hangsWithoutFlag, watchdogSeconds: 1), 1)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 10)
+        XCTAssertTrue(helperEvents().contains { $0.event == "decision" && $0.detail["reason"] == "launch-not-started" })
     }
 
     func testOpenFailureIsRecordedAsOpenFailed() throws {
@@ -126,7 +226,7 @@ final class RelaunchHelperTests: XCTestCase {
         let status = try runHelper(newAppBehaviour: .writesFlag, watchdogSeconds: 5)
         XCTAssertEqual(status, 1)
         XCTAssertEqual(installedVersion(), "1.0.27")
-        let marker = try String(contentsOf: installer().rolledBackMarkerURL, encoding: .utf8)
+        let marker = try String(contentsOf: installer().rolledBackMarkerURL.appendingPathExtension("detail"), encoding: .utf8)
         XCTAssertTrue(marker.contains("reason=open-failed\n"), marker)
         XCTAssertTrue(marker.contains("-10810"), "open's stderr is preserved in the detail: \(marker)")
         let open = helperEvents().first { $0.event == "open" }
@@ -144,28 +244,33 @@ final class RelaunchHelperTests: XCTestCase {
         XCTAssertNotNil(helperEvents().first { $0.event == "flag-observed" }?.detail["secondsAfterProcessStart"])
     }
 
-    func testOldProcessThatNeverExitsGivesUpWithoutRollback() throws {
+    func testSlowOldProcessStillGetsWatchedLaunch() throws {
         // A stand-in for a Boss process that outlives the wait: must NOT trigger `open`
         // (LaunchServices would just activate it) and must NOT roll back the install.
         let sleeper = Process()
         sleeper.executableURL = URL(fileURLWithPath: "/bin/sh")
-        sleeper.arguments = ["-c", "sleep 30"]
+        sleeper.arguments = ["-c", "sleep 2"]
         sleeper.standardInput = FileHandle.nullDevice
         sleeper.standardOutput = FileHandle.nullDevice
         sleeper.standardError = FileHandle.nullDevice
         try sleeper.run()
-        defer { sleeper.terminate(); sleeper.waitUntilExit() }
+        defer { if sleeper.isRunning { sleeper.terminate() }; sleeper.waitUntilExit() }
 
         let status = try runHelper(
             newAppBehaviour: .writesFlag, watchdogSeconds: 5, oldPID: sleeper.processIdentifier, oldExitTimeout: 1)
-        XCTAssertEqual(status, 2, "distinct exit code: gave up waiting for the old process")
-        XCTAssertEqual(installedVersion(), "1.0.28", "install left in place for the next manual launch")
-        XCTAssertTrue(exists(backupURL), "backup retained")
-        XCTAssertFalse(exists(installer().rolledBackMarkerURL), "no rollback")
+        XCTAssertEqual(status, 0)
+        XCTAssertEqual(installedVersion(), "1.0.28")
+        XCTAssertFalse(exists(backupURL))
+        XCTAssertFalse(exists(installer().rolledBackMarkerURL))
         let events = helperEvents().map(\.event)
-        XCTAssertEqual(events, ["helper-started", "old-process-still-running"], "\(events)")
-        XCTAssertFalse(events.contains("open"), "open must never run while the old process is alive")
-        XCTAssertNil(installer().pendingSwap(), "the helper never writes install-state itself")
+        XCTAssertTrue(events.contains("old-process-still-running"))
+        XCTAssertTrue(events.contains("old-process-exited"))
+        XCTAssertTrue(events.contains("flag-observed"))
+        XCTAssertEqual(events.last, "committed", "the late launch is still watched to completion")
+        let exited = try XCTUnwrap(events.firstIndex(of: "old-process-exited"))
+        XCTAssertLessThan(try XCTUnwrap(events.firstIndex(of: "old-process-still-running")), exited)
+        XCTAssertLessThan(exited, try XCTUnwrap(events.firstIndex(of: "open")),
+                          "open never runs while the old process is alive")
     }
 }
 
@@ -178,6 +283,7 @@ extension RelaunchHelperTests {
         case hangsWithoutFlag
         /// Exits with status 3 before writing the flag (a crash / early exit).
         case exitsImmediately
+        case signalExit
         /// Writes the first-launch flag shortly after starting, then idles.
         case writesFlag
     }
@@ -226,7 +332,7 @@ extension RelaunchHelperTests {
     /// oracle is simulated here while the helper's control flow, timing, termination,
     /// rollback and logging run for real. (The real `ps` path is covered by running the
     /// same scenarios outside Bazel; see tools/boss/docs/update-attempt-log.md.)
-    private func installToolStubs(openSucceeds: Bool) throws {
+    private func installToolStubs(openSucceeds: Bool, blocks: Bool = false) throws {
         let registry = binDir.appendingPathComponent("launched-pids").path
         let open = openSucceeds
             ? """
@@ -235,7 +341,7 @@ extension RelaunchHelperTests {
             [ -x "$exe" ] || { echo "LSOpenURLsWithRole() failed with error -10810" >&2; exit 1; }
             "$exe" </dev/null >/dev/null 2>&1 &
             printf '%s %s\\n' "$!" "$exe" >> "\(registry)"
-            exit 0
+            \(blocks ? "sleep 20" : "exit 0")
 
             """
             : """
@@ -265,6 +371,10 @@ extension RelaunchHelperTests {
         try writeExecutable(binDir.appendingPathComponent("codesign"), "#!/bin/sh\nexit 0\n")
         try writeExecutable(binDir.appendingPathComponent("xattr"), "#!/bin/sh\nexit 1\n")
         try writeExecutable(binDir.appendingPathComponent("plutil"), "#!/bin/sh\nexit 1\n")
+        // The unified-log sink: record each invocation's arguments, one per line.
+        let loggerLines = binDir.appendingPathComponent("logger-lines").path
+        try writeExecutable(binDir.appendingPathComponent("logger"),
+                            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"\(loggerLines)\"\n")
     }
 
     private func writeExecutable(_ url: URL, _ contents: String) throws {
@@ -301,7 +411,8 @@ extension RelaunchHelperTests {
         newAppBehaviour: NewAppBehaviour,
         watchdogSeconds: Int,
         oldPID: Int32? = nil,
-        oldExitTimeout: Int = 60
+        oldExitTimeout: Int = 60,
+        legacy: Bool = false
     ) throws -> Int32 {
         let flag = installer().firstLaunchFlagURL(for: v("1.0.28"))
         // Real binaries keep their argv[0] path for life; the stubs stay a `sh` running
@@ -315,6 +426,8 @@ extension RelaunchHelperTests {
             // a process gone before the helper's first poll is indistinguishable from
             // one that never started and is classified `launch-not-started`.
             newApp = "#!/bin/sh\nsleep 0.5\nexit 3\n"
+        case .signalExit:
+            newApp = "#!/bin/sh\nsleep 0.5\nkill -TERM $$\n"
         case .writesFlag:
             newApp = "#!/bin/sh\ntrap 'kill $! 2>/dev/null; exit 0' TERM\nsleep 0.2\ntouch \"\(flag.path)\"\nsleep 3 &\nwait\n"
         }
@@ -349,7 +462,13 @@ extension RelaunchHelperTests {
 
         let proc = Process()
         proc.executableURL = invocation.executableURL
-        proc.arguments = invocation.arguments + ["--old-exit-timeout", String(oldExitTimeout), "--launch-timeout", "3"]
+        var arguments = invocation.arguments
+        if legacy {
+            for flag in ["--log", "--attempt", "--from"] {
+                if let index = arguments.firstIndex(of: flag) { arguments.removeSubrange(index...index + 1) }
+            }
+        }
+        proc.arguments = arguments + ["--old-exit-timeout", String(oldExitTimeout), "--launch-timeout", "3"]
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = binDir.path + ":" + (env["PATH"] ?? "/usr/bin:/bin")
         proc.environment = env

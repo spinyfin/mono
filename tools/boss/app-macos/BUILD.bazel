@@ -87,6 +87,7 @@ swift_library(
     module_name = "Boss",
     deps = [
         "//tools/boss/app-macos/Sources/CrashWatchdog",
+        "//tools/boss/app-macos/Sources/DiagnosticIO",
         "//tools/boss/app-macos/Sources/UpdateCore",
         "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",
@@ -331,6 +332,10 @@ macos_application(
         # Bundled at Resources/ top level so the app resolves it with
         # Bundle.main.url(forResource: "relaunch-helper", withExtension: "sh").
         "//tools/boss/app-macos/Sources/Resources/RelaunchHelper:relaunch_helper": "Resources",
+        # exit-observer: the helper's kqueue NOTE_EXITSTATUS probe for the new
+        # app's exit code / signal. Lives in Resources/bin/ with the other bundled
+        # Mach-Os so release.sh signs it (hardened runtime) before notarization.
+        "//tools/boss/app-macos/Sources/Resources/RelaunchHelper:exit-observer": "Resources/bin",
     },
     bundle_id = "dev.spinyfin.bossmacapp",
     infoplists = [

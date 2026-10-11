@@ -82,11 +82,25 @@ enum UpdateLifecycle {
     /// next confirmed quit. Consumed (cleared) by `consumePendingRelaunch()`.
     static var pendingRelaunch: SwapPlan?
 
-    /// The attempt id of the update this launch completed or rolled back (set by
-    /// `reconcileAtLaunch`). While set, engine handoff decisions are appended to the
-    /// update log under that attempt so the trail covers "did the new app restart the
-    /// engine". `nil` on an ordinary launch.
-    static var launchAttemptID: String?
+    /// Captured on the first startup record — the earliest point of the process
+    /// (`AppDelegate.init`) — before reconcile clears the pending swap or consumes the
+    /// rolled-back marker, so every later record of this launch carries the same
+    /// attempt id and from/to versions.
+    private static var startupTrail: UpdateStartupTrail?
+
+    /// Append one lifecycle record for this process to the durable update log (and its
+    /// unified-log mirror): `startup.*` steps from `AppDelegate.init` up to the
+    /// first-launch flag, `engine.decision` handoff lines, and `quit.*` steps. Runs on
+    /// every launch, not only update launches, so a version that hangs or dies before
+    /// reconcile still leaves the steps it reached. Skipped for isolated/capture
+    /// instances and tests, which must never touch the production Updates directory.
+    static func recordStartup(_ event: String, stage: String = "startup", detail: [String: String] = [:]) {
+        guard !BossEnginePaths.isIsolatedInstance, !BossEnginePaths.isRunningInTestContext else { return }
+        if startupTrail == nil {
+            startupTrail = UpdateStartupTrail(installer: installer(), running: runningVersion)
+        }
+        startupTrail?.record(event, stage: stage, detail: detail)
+    }
 
     /// Returns and clears any `pendingRelaunch` plan. Called from
     /// `applicationWillTerminate` — a confirmed quit — so the relaunch helper is armed
@@ -156,56 +170,53 @@ enum UpdateLifecycle {
     @discardableResult
     static func reconcileAtLaunch() -> RollbackRecord? {
         guard let running = runningVersion else { return nil }
+        recordStartup("reconcile-begin")
         let installer = installer()
         var rollback: RollbackRecord?
         switch installer.reconcileAfterLaunch(currentVersion: running) {
         case .installed(let version):
             NSLog("[update] now running freshly-installed version \(version)")
-            logNewAppLaunched(version: running, attempt: lastAttemptID(from: installer), outcome: "installed")
+            logNewAppLaunched(outcome: "installed")
         case .rolledBack(let record):
             NSLog("[update] update \(record.version) failed to launch (\(record.reason.rawValue)) and was rolled back + blocklisted")
-            launchAttemptID = record.attemptID
             rollback = record
-            logNewAppLaunched(version: running, attempt: record.attemptID, outcome: "rolled-back")
+            logNewAppLaunched(outcome: "rolled-back", rollback: record)
         case .noChange:
             break
         }
         // Always (re)assert the flag last so a relaunch watchdog from the swap that
         // brought us here sees a healthy first launch even on the `.noChange` path.
         installer.markLaunchSucceeded(version: running)
+        recordStartup("flag-written", stage: "handshake", detail: ["runningVersion": running.description, "flag": installer.firstLaunchFlagURL(for: running).path])
         return rollback
     }
 
-    /// The attempt id of the launch that just reconciled `.installed`: the installer
-    /// has already cleared the pending record, so read it back from the log's most
-    /// recent `reconcile.installed` record.
-    private static func lastAttemptID(from installer: UpdateInstaller) -> String? {
-        if let id = launchAttemptID { return id }
-        let id = installer.log?.allRecords().last(where: { $0.stage == "reconcile" && $0.event == "installed" })?.attempt
-        launchAttemptID = id
-        return id
-    }
-
-    private static func logNewAppLaunched(version: VersionTuple, attempt: String?, outcome: String) {
-        log?.record(
-            stage: "relaunch", event: "new-app-launched", attempt: attempt, to: version,
-            detail: [
-                "outcome": outcome,
-                "pid": String(getpid()),
-                "bundle": Bundle.main.bundleURL.path,
-                "executable": Bundle.main.executableURL?.path ?? "",
-                "fullVersion": Bundle.main.object(forInfoDictionaryKey: "BossFullVersion") as? String ?? "",
-            ])
+    /// The new (or restored) app's own account of the launch an update produced. Its
+    /// attempt and from/to come from the startup trail; for a rollback the record's
+    /// `to` stays the failed target and `runningVersion` is the restored version.
+    private static func logNewAppLaunched(outcome: String, rollback: RollbackRecord? = nil) {
+        var detail = [
+            "outcome": outcome,
+            "pid": String(getpid()),
+            "bundle": Bundle.main.bundleURL.path,
+            "executable": Bundle.main.executableURL?.path ?? "",
+            "fullVersion": Bundle.main.object(forInfoDictionaryKey: "BossFullVersion") as? String ?? "",
+        ]
+        if let rollback {
+            detail["failedVersion"] = rollback.version
+            detail["reason"] = rollback.reason.rawValue
+            detail["rollbackAttempt"] = rollback.attemptID ?? ""
+        }
+        recordStartup("new-app-launched", stage: "relaunch", detail: detail)
     }
 
     /// Append an engine-controller decision line (`[engine version-check …]`,
-    /// `[engine upgrade]`, `[engine launch]`) to the update trail of the launch that
-    /// completed or rolled back an update. Ignored for ordinary launches and for lines
-    /// that are not engine handoff decisions.
+    /// `[engine upgrade]`, `[engine launch]`, `[engine stop] …`) to the update log as
+    /// `engine.decision`, under this launch's attempt when an update produced it.
+    /// Lines that are not engine-controller decisions are ignored.
     static func recordEngineLine(_ line: String) {
-        guard let attempt = launchAttemptID, line.hasPrefix("[engine") else { return }
-        log?.record(stage: "engine", event: "decision", attempt: attempt, to: runningVersion,
-                    detail: ["line": line])
+        guard line.hasPrefix("[engine") else { return }
+        recordStartup("decision", stage: "engine", detail: ["line": line])
     }
 
     /// Run at the startup chokepoint, *before* the engine launches (design §4

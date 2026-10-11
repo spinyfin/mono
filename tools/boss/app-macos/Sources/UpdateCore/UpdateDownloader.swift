@@ -473,14 +473,18 @@ actor UpdateDownloader {
         // Short-circuit if a verified bundle for this version is already staged.
         if let existing = readyStagedUpdate(at: finalDir, expected: version) {
             downloaderLog.info("update download: version \(versionStr, privacy: .public) already staged — skipping download")
-            log?.record(stage: "stage", event: "already-staged", attempt: existing.attemptID,
-                        from: currentVersion, to: version, detail: ["bundle": existing.bundleURL.path])
+            var detail = ["bundle": existing.bundleURL.path]
+            if let requested = update.attemptID, requested != existing.attemptID {
+                detail["requestedAttempt"] = requested
+            }
+            log?.record(stage: "stage", event: "already-staged", attempt: existing.attemptID ?? update.attemptID,
+                        from: currentVersion, to: version, detail: detail)
             return .alreadyStaged(existing)
         }
 
         // One attempt id for the whole lifecycle of this version: download → verify →
         // stage now, swap → relaunch → handshake later (read back from the manifest).
-        let attemptID = UpdateAttemptID.make()
+        let attemptID = update.attemptID ?? UpdateAttemptID.make()
         let startedAt = Date()
         log?.record(stage: "download", event: "start", attempt: attemptID, from: currentVersion, to: version,
                     detail: ["url": update.assetURL.absoluteString, "expectedBytes": String(update.assetSize), "tag": update.tagName])

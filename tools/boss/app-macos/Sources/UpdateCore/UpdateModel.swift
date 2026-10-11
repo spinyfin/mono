@@ -217,6 +217,8 @@ public final class UpdateModel: ObservableObject {
     private let checker: UpdateChecker
     private let stager: UpdateStager
     private let blocklist: UpdateBlocklist
+    /// See ``attemptID(for:)``.
+    private var attemptIDs: [String: String] = [:]
     private let log: UpdateLog?
     private let jitterRange: ClosedRange<TimeInterval>
     private var schedulerTask: Task<Void, Never>?
@@ -375,7 +377,14 @@ public final class UpdateModel: ObservableObject {
     public func checkNow() async -> UpdateCheckResult {
         isChecking = true
         defer { isChecking = false }
-        let result = await checker.checkForUpdates()
+        var result = await checker.checkForUpdates()
+        if case .available(var update) = result {
+            // The attempt starts at the update decision: this id is carried through
+            // staging/download (manifest), the swap plan and pending record, the
+            // helper, and reconcile.
+            update.attemptID = attemptID(for: update.version)
+            result = .available(update)
+        }
         lastCheckResult = result
         let now = Date()
         lastCheckDate = now
@@ -389,7 +398,7 @@ public final class UpdateModel: ObservableObject {
             modelLog.info(
                 "update check complete: update available version=\(update.version.description, privacy: .public) tag=\(update.tagName, privacy: .public)"
             )
-            log?.record(stage: "check", event: "available", attempt: nil, from: checker.currentVersion, to: update.version,
+            log?.record(stage: "check", event: "available", attempt: update.attemptID, from: checker.currentVersion, to: update.version,
                         detail: ["tag": update.tagName, "url": update.assetURL.absoluteString,
                                  "bytes": String(update.assetSize), "mode": mode.rawValue,
                                  "blocked": String(blocklist.isBlocked(update.version))])
@@ -433,9 +442,24 @@ public final class UpdateModel: ObservableObject {
     /// a clear failure state — no browser fallback.
     public func markInstallFailed(version: VersionTuple, reason: String) {
         modelLog.error("update install: failed version=\(version.description, privacy: .public) reason=\(reason, privacy: .public)")
-        log?.record(stage: "swap", event: "install-failed", level: "error", attempt: nil,
+        log?.record(stage: "swap", event: "install-failed", level: "error", attempt: attemptID(for: version),
                     from: checker.currentVersion, to: version, detail: ["reason": reason])
         downloadState = .installFailed(version: version, reason: reason)
+    }
+
+    // MARK: - Attempt ids
+
+    /// The attempt id for an update to `version`, minted once per version per process
+    /// so repeated checks of the same release, its staging and a later install-failure
+    /// record all share one id. A deliberate retry replaces it with a fresh id
+    /// (``retryBlockedUpdate(_:)``). A version already staged by an earlier process
+    /// keeps the id in its manifest; the downloader's `stage.already-staged` record
+    /// carries that id and links this one as `requestedAttempt`.
+    private func attemptID(for version: VersionTuple) -> String {
+        if let id = attemptIDs[version.description] { return id }
+        let id = UpdateAttemptID.make()
+        attemptIDs[version.description] = id
+        return id
     }
 
     // MARK: - Rollback notice / blocklist
@@ -460,7 +484,7 @@ public final class UpdateModel: ObservableObject {
         }
         rollbackNotice = record
         log?.record(stage: "reconcile", event: "rollback-notice-shown", attempt: record.attemptID,
-                    to: VersionTuple.parse(record.version), detail: ["reason": record.reason.rawValue])
+                    from: record.restoredVersion.flatMap(VersionTuple.parse), to: VersionTuple.parse(record.version), detail: ["reason": record.reason.rawValue])
     }
 
     /// The user dismissed the rollback banner. The version stays blocklisted.
@@ -469,7 +493,7 @@ public final class UpdateModel: ObservableObject {
         blocklist.acknowledgeRollbacks()
         rollbackNotice = nil
         log?.record(stage: "reconcile", event: "rollback-notice-dismissed", attempt: record.attemptID,
-                    to: VersionTuple.parse(record.version))
+                    from: record.restoredVersion.flatMap(VersionTuple.parse), to: VersionTuple.parse(record.version))
     }
 
     /// Deliberate retry of a version the watchdog rolled back: clear its block, then
@@ -479,13 +503,18 @@ public final class UpdateModel: ObservableObject {
     /// "Download" button refuse to. The watchdog re-blocklists it if it fails again.
     public func retryBlockedUpdate(_ version: VersionTuple) {
         guard !isDevBuild else { return }
-        log?.record(stage: "blocklist", event: "retry-requested", attempt: nil,
+        // A retry is a new attempt: mint it here and use it for everything that
+        // follows (the unblock, the re-check, staging, swap, helper, reconcile).
+        let retryAttempt = UpdateAttemptID.make()
+        attemptIDs[version.description] = retryAttempt
+        log?.record(stage: "blocklist", event: "retry-requested", attempt: retryAttempt,
                     from: checker.currentVersion, to: version, detail: ["source": "user"])
         blocklist.unblock(version)
         blocklist.acknowledgeRollbacks()
         rollbackNotice = nil
         showUpdateSheet = true
-        if case .available(let update) = lastCheckResult, update.version >= version {
+        if case .available(var update) = lastCheckResult, update.version >= version {
+            update.attemptID = attemptID(for: update.version)
             beginStaging(update)
             return
         }
@@ -539,7 +568,7 @@ public final class UpdateModel: ObservableObject {
             // A version that failed its first launch is only re-staged through the
             // explicit ``retryBlockedUpdate(_:)`` path, which clears the block first.
             modelLog.warning("update download: refusing to stage blocklisted version \(update.version.description, privacy: .public) without an explicit retry")
-            log?.record(stage: "stage", event: "refused-blocklisted", level: "warning", attempt: nil,
+            log?.record(stage: "stage", event: "refused-blocklisted", level: "warning", attempt: update.attemptID,
                         from: checker.currentVersion, to: update.version, detail: ["source": "download-button"])
             return
         }
@@ -558,7 +587,7 @@ public final class UpdateModel: ObservableObject {
             // next quit/startup boundary would retry a version known to fail. Only an
             // explicit user retry (``retryBlockedUpdate(_:)``) may re-stage it.
             modelLog.warning("update auto-stage: skipping blocklisted version \(update.version.description, privacy: .public)")
-            log?.record(stage: "stage", event: "skipped-blocklisted", level: "warning", attempt: nil,
+            log?.record(stage: "stage", event: "skipped-blocklisted", level: "warning", attempt: update.attemptID,
                         from: checker.currentVersion, to: update.version, detail: ["source": "auto-stage"])
             return
         }
@@ -583,7 +612,7 @@ public final class UpdateModel: ObservableObject {
         stagingTask?.cancel()
         downloadState = .downloading(version: version, progress: .determinate(0))
         modelLog.info("update download: staging version=\(version.description, privacy: .public)")
-        log?.record(stage: "stage", event: "begin", attempt: nil, from: checker.currentVersion, to: version,
+        log?.record(stage: "stage", event: "begin", attempt: update.attemptID, from: checker.currentVersion, to: version,
                     detail: ["mode": mode.rawValue])
         stagingTask = Task { [weak self] in
             guard let self else { return }

@@ -19,7 +19,10 @@ macos_unit_test(
     size = "small",
     # RelaunchHelperTests runs the real relaunch-helper.sh (located via
     # TEST_SRCDIR/TEST_WORKSPACE) against stub bundles and PATH-stubbed tools.
-    data = ["//tools/boss/app-macos/Sources/Resources/RelaunchHelper:relaunch_helper"],
+    data = [
+        "//tools/boss/app-macos/Sources/Resources/RelaunchHelper:exit-observer",
+        "//tools/boss/app-macos/Sources/Resources/RelaunchHelper:relaunch_helper",
+    ],
     env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
     runner = "//tools/test-sandbox:macos_direct_test_runner",

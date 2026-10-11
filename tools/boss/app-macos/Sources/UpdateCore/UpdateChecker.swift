@@ -47,6 +47,10 @@ public struct ReleaseNote: Equatable, Sendable {
 }
 
 public struct AvailableUpdate: Equatable, Sendable {
+    /// The update attempt this release belongs to, set by `UpdateModel` at the update
+    /// decision (the check that found it) and carried into staging, so every record of
+    /// the attempt shares one id. `nil` straight out of the checker.
+    public var attemptID: String? = nil
     public let tagName: String
     public let version: VersionTuple
     public let assetURL: URL

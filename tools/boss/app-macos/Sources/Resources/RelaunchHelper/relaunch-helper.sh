@@ -7,11 +7,13 @@
 # helper is spawned. This script handles only the parts that cannot run inside the
 # Boss process once it has exited:
 #
-#   1. wait for the old Boss PID to exit (clean cold relaunch). If it never does,
-#      give up WITHOUT touching the install: `open` on a bundle whose previous
-#      process is still registered with LaunchServices merely activates that old
-#      process and launches nothing, so proceeding would always look like a
-#      failed launch of the new version and roll back a perfectly good install.
+#   1. wait for the old Boss PID to exit (clean cold relaunch). There is no give-up:
+#      `open` on a bundle whose previous process is still registered with
+#      LaunchServices merely activates that old process and launches nothing, so
+#      proceeding early would always look like a failed launch and roll back a good
+#      install; and exiting would leave the untried bundle installed with no
+#      first-launch watchdog. A slow quit is logged every `--old-exit-timeout`
+#      seconds (default 300) and the wait continues.
 #   2. assess the swapped bundle (version, executable, quarantine, codesign),
 #   3. `open` the new bundle and confirm a *new* process running the installed
 #      executable actually appeared (pid, version, path executed),
@@ -25,7 +27,17 @@
 #
 # Every step appends a JSON line to the update log (`--log`), tagged with the
 # attempt id (`--attempt`) the app minted, so the helper's records interleave with
-# the old app's swap records and the new app's handshake/reconcile records.
+# the old app's swap records and the new app's handshake/reconcile records. Each
+# record is also sent to the unified log through `logger` (tag
+# `boss-relaunch-helper`), and the next app launch replays the helper's records into
+# its own `update-lifecycle` os_log category.
+#
+# Backward compatibility: Boss 1.0.734 and earlier arm this script (the swapped-in
+# bundle's copy) with only --pid/--install/--backup/--flag/--rolled-back-marker/
+# --version/--watchdog. The log path, attempt id and `from` version are then derived
+# (see "0. Start"), and the rolled-back marker keeps its legacy one-line format —
+# just the failed version — because that old app is the one that reads it after a
+# rollback. The reason and context go to a `<marker>.detail` sidecar.
 #
 # See tools/boss/docs/designs/automatic-boss-updates.md §4 and
 # tools/boss/docs/update-attempt-log.md. Invoked as
@@ -49,7 +61,8 @@ watchdog=30
 attempt=""
 from=""
 logfile=""
-# How long to wait for the old process to exit before giving up (no rollback).
+# How often to log that the old process is still running (the wait itself never
+# gives up; see step 1).
 old_exit_timeout="${BOSS_RELAUNCH_OLD_EXIT_TIMEOUT:-300}"
 # How long after `open` to wait for a process running the installed bundle to appear.
 launch_timeout="${BOSS_RELAUNCH_LAUNCH_TIMEOUT:-15}"
@@ -91,21 +104,27 @@ json_or_null() {
 }
 
 # log_event STAGE EVENT LEVEL [key=value ...]
+# Writes one JSON line to the durable update log and the same line to the unified
+# log via `logger` (two independent sinks: either can fail without losing the other).
 # (POSIX sh has no `local`; every helper function uses a distinct variable prefix so
 # nested calls — rollback() logging while holding its own detail — cannot clobber.)
 log_event() {
   le_stage="$1"; le_event="$2"; le_level="$3"; shift 3
-  [ -n "$logfile" ] || return 0
   le_detail=""
   for le_kv in "$@"; do
     le_k="${le_kv%%=*}"
     le_v="${le_kv#*=}"
     le_detail="${le_detail}${le_detail:+,}\"$(json_escape "$le_k")\":\"$(json_escape "$le_v")\""
   done
-  mkdir -p "$(dirname "$logfile")" 2>/dev/null
-  printf '{"actor":"helper","attempt":%s,"detail":{%s},"event":"%s","from":%s,"level":"%s","pid":%s,"stage":"%s","to":%s,"ts":"%s"}\n' \
+  le_line=$(printf '{"actor":"helper","attempt":%s,"detail":{%s},"event":"%s","from":%s,"level":"%s","pid":%s,"stage":"%s","to":%s,"ts":"%s"}' \
     "$(json_or_null "$attempt")" "$le_detail" "$le_event" "$(json_or_null "$from")" "$le_level" "$$" \
-    "$le_stage" "$(json_or_null "$version")" "$(now_iso)" >> "$logfile"
+    "$le_stage" "$(json_or_null "$version")" "$(now_iso)")
+  if [ -n "$logfile" ]; then
+    mkdir -p "$(dirname "$logfile")" 2>/dev/null
+    printf '%s\n' "$le_line" >> "$logfile"
+  fi
+  case "$le_level" in error) le_pri=user.err ;; warning) le_pri=user.warning ;; *) le_pri=user.notice ;; esac
+  logger -p "$le_pri" -t boss-relaunch-helper -- "$le_line" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -133,12 +152,12 @@ executable_name() {
 # argument would show up in `ps` and match the awk process itself.
 find_running_pid() {
   BOSS_RELAUNCH_MATCH_PREFIX="$1" BOSS_RELAUNCH_OLD_PID="$pid" \
-  ps -axww -o pid=,command= 2>/dev/null | BOSS_RELAUNCH_MATCH_PREFIX="$1" BOSS_RELAUNCH_OLD_PID="$pid" awk '
+  ps -axww -o pid=,command= 2>/dev/null | BOSS_RELAUNCH_MATCH_PREFIX="$1" BOSS_RELAUNCH_OLD_PID="$pid" BOSS_RELAUNCH_OTHER_PID="$other_pid" awk '
     {
       p = $1
       $1 = ""
       cmd = substr($0, 2)
-      if (index(cmd, ENVIRON["BOSS_RELAUNCH_MATCH_PREFIX"]) > 0 && p != ENVIRON["BOSS_RELAUNCH_OLD_PID"]) { print p; exit }
+      if (index(cmd, ENVIRON["BOSS_RELAUNCH_MATCH_PREFIX"]) > 0 && p != ENVIRON["BOSS_RELAUNCH_OLD_PID"] && index(" " ENVIRON["BOSS_RELAUNCH_OTHER_PID"] " ", " " p " ") == 0) { print p }
     }'
 }
 
@@ -149,6 +168,7 @@ is_alive() { kill -0 "$1" 2>/dev/null; }
 # ---------------------------------------------------------------------------
 
 new_pid=""
+other_pid=""
 
 # rollback REASON DETAIL — restore the previous bundle, reopen it, record why.
 rollback() {
@@ -189,11 +209,19 @@ rollback() {
       printf 'from=%s\n' "$from"
       printf 'restored=%s\n' "$rb_restored"
       printf 'at=%s\n' "$(now_iso)"
-    } > "$marker"
+    } > "$marker.detail"
+    printf '%s\n' "$version" > "$marker"
     log_event rollback marker-written info "marker=$marker" "reason=$rb_reason"
   fi
 
-  rb_reopen=$(open "$install" 2>&1); rb_rc=$?
+  rb_capture="${TMPDIR:-/tmp}/boss-relaunch-restore.$$"
+  open "$install" >"$rb_capture" 2>&1 </dev/null &
+  rb_open_pid=$!
+  rb_started=$(now_s)
+  while is_alive "$rb_open_pid" && [ "$(( $(now_s) - rb_started ))" -lt "$launch_timeout" ]; do sleep 0.1; done
+  is_alive "$rb_open_pid" && kill -KILL "$rb_open_pid" 2>/dev/null
+  wait "$rb_open_pid"; rb_rc=$?
+  rb_reopen=$(cat "$rb_capture" 2>/dev/null); rm -f "$rb_capture"
   log_event rollback reopened-previous info "path=$install" "openExit=$rb_rc" "openOutput=$rb_reopen" "restoredVersion=$rb_restored"
   log_event rollback completed error "reason=$rb_reason" "restoredVersion=$rb_restored"
   exit 1
@@ -203,26 +231,36 @@ rollback() {
 # 0. Start
 # ---------------------------------------------------------------------------
 
+# Legacy invocation (Boss 1.0.734 and earlier pass no --log/--attempt/--from): derive
+# them so the trail is still complete. The first-launch flag lives directly in the
+# Updates directory, and the log is Updates/log/update-log.jsonl
+# (UpdateLog.directory(forUpdatesDirectory:)). The minted id has the app's
+# `upd-<unix-ms>-<hex>` shape; `from` is the version of the bundle being replaced.
+legacy_args=""
+if [ -z "$logfile" ] && [ -n "$flag" ]; then logfile="$(dirname "$flag")/log/update-log.jsonl"; legacy_args="${legacy_args}log "; fi
+if [ -z "$attempt" ]; then attempt="upd-$(date +%s)000-$(printf '%04x' "$(( $$ % 65536 ))")"; legacy_args="${legacy_args}attempt "; fi
+if [ -z "$from" ]; then from=$(plist_string "$backup" CFBundleShortVersionString 2>/dev/null || printf 'unknown'); legacy_args="${legacy_args}from "; fi
+
 log_event relaunch helper-started info "oldAppPid=$pid" "install=$install" "backup=$backup" "flag=$flag" \
   "marker=$marker" "watchdogSeconds=$watchdog" "oldExitTimeoutSeconds=$old_exit_timeout" \
-  "launchTimeoutSeconds=$launch_timeout" "helperPid=$$"
+  "launchTimeoutSeconds=$launch_timeout" "helperPid=$$" "derivedArguments=${legacy_args:-none}"
 
 # ---------------------------------------------------------------------------
 # 1. Wait for the old Boss process to exit so the relaunch is a clean cold start.
 # ---------------------------------------------------------------------------
 
 wait_started=$(now_s)
+old_exit_step="$old_exit_timeout"
 if [ -n "$pid" ]; then
   while is_alive "$pid"; do
     elapsed=$(( $(now_s) - wait_started ))
     if [ "$elapsed" -ge "$old_exit_timeout" ]; then
-      # Do NOT `open` here: LaunchServices would just activate the still-running old
-      # process (verified), and the watchdog would then roll back a good install.
-      # The swap stays committed; the new version runs on the next manual launch,
-      # where reconcileAfterLaunch sees the pending record and completes it.
-      log_event relaunch old-process-still-running error "oldAppPid=$pid" "waitedSeconds=$elapsed" \
-        "action=giving up without relaunch or rollback; install left in place"
-      exit 2
+      # Keep waiting: this helper is the swapped bundle's only first-launch watchdog,
+      # so exiting would leave an untried bundle installed with nothing to roll it
+      # back, and launching now would only activate the still-running old process.
+      log_event relaunch old-process-still-running warning "oldAppPid=$pid" "waitedSeconds=$elapsed" \
+        "action=continuing to wait before watched launch"
+      old_exit_timeout=$((old_exit_timeout + old_exit_step))
     fi
     sleep 0.1
   done
@@ -247,13 +285,19 @@ if command -v codesign >/dev/null 2>&1; then
 else
   codesign_state=unavailable
 fi
-other_pid=$(find_running_pid "$install/Contents/MacOS/")
+# Any process already running the installed executable before `open` is not the new
+# launch: remember it so the launch loop never adopts (and a rollback never kills) it.
+other_pid=$(find_running_pid "$install/Contents/MacOS/" | tr '\n' ' ' | sed 's/ *$//')
 log_event relaunch bundle-assessment info "install=$install" "installedVersion=$installed_version" \
   "expectedVersion=$version" "executable=$exe_path" "executableState=$exe_state" \
   "quarantine=$quarantine" "codesign=$codesign_state" "otherRunningPid=${other_pid:-none}"
 
 if [ "$exe_state" != executable ]; then
   rollback bundle-invalid "executable $exe_path is $exe_state"
+fi
+if [ -n "$other_pid" ]; then
+  log_event relaunch preexisting-process warning "pids=$other_pid" \
+    "action=excluded from new-process discovery and never terminated by rollback"
 fi
 if [ "$installed_version" != "$version" ]; then
   log_event relaunch version-mismatch warning "installedVersion=$installed_version" "expectedVersion=$version"
@@ -278,6 +322,11 @@ open_rc=""
 launch_started=$(now_s)
 
 record_open_result() {
+  [ -z "$open_rc" ] || return
+  if is_alive "$open_bg"; then
+    [ "${1:-poll}" = finish ] || return
+    kill -KILL "$open_bg" 2>/dev/null
+  fi
   wait "$open_bg"; open_rc=$?
   open_out=$(cat "$open_capture" 2>/dev/null | tr '\n' ' '); rm -f "$open_capture"
   log_event relaunch open info "path=$install" "exit=$open_rc" "output=$open_out" \
@@ -285,8 +334,8 @@ record_open_result() {
 }
 
 while :; do
-  new_pid=$(find_running_pid "$install/Contents/MacOS/")
-  [ -n "$new_pid" ] && break
+  new_pid=$(find_running_pid "$install/Contents/MacOS/" | head -1)
+  [ -n "$new_pid" ] && { watch_started=$(now_s); break; }
   if [ -z "$open_rc" ] && ! is_alive "$open_bg"; then
     record_open_result
     if [ "$open_rc" -ne 0 ]; then
@@ -295,7 +344,7 @@ while :; do
   fi
   elapsed=$(( $(now_s) - launch_started ))
   if [ "$elapsed" -ge "$launch_timeout" ]; then
-    [ -n "$open_rc" ] || record_open_result
+    [ -n "$open_rc" ] || record_open_result finish
     # Record what the process table did show, so "never started" can be told apart
     # from "a Boss from another bundle path is running" or "ps itself failed".
     scan=$(ps -axww -o pid=,command= 2>&1); scan_rc=$?
@@ -309,6 +358,26 @@ done
 # The process is up; still collect open's own result for the trail (it returns once
 # LaunchServices considers the launch complete, normally within a second or two).
 [ -n "$open_rc" ] || record_open_result
+# Exit status of the new process: it is LaunchServices' child, not ours, so `wait`
+# cannot report it. The bundled exit-observer registers a kqueue EVFILT_PROC
+# NOTE_EXIT|NOTE_EXITSTATUS watch and prints `exitCode=N` / `signal=N`. Its kernel
+# wait is bounded by the watchdog, plus a margin.
+exit_capture="${TMPDIR:-/tmp}/boss-relaunch-exit.$$"
+observer=""
+for obs_candidate in "$(dirname "$0")/bin/exit-observer" "$(dirname "$0")/exit-observer"; do
+  [ -x "$obs_candidate" ] && { observer="$obs_candidate"; break; }
+done
+observer_pid=""
+if [ -n "$observer" ]; then
+  "$observer" "$new_pid" "$(( watchdog + 5 ))" >"$exit_capture" 2>&1 </dev/null &
+  observer_pid=$!
+else
+  printf 'observerUnavailable=missing (no exit-observer next to %s)\n' "$0" >"$exit_capture"
+fi
+stop_observer() {
+  if [ -n "$observer_pid" ]; then kill "$observer_pid" 2>/dev/null; wait "$observer_pid" 2>/dev/null; fi
+  rm -f "$exit_capture"
+}
 new_exe=$(ps -p "$new_pid" -o command= 2>/dev/null | head -1)
 log_event relaunch new-process-started info "pid=$new_pid" "secondsAfterOpen=$(( $(now_s) - launch_started ))" \
   "command=$new_exe" "version=$installed_version"
@@ -317,10 +386,10 @@ log_event relaunch new-process-started info "pid=$new_pid" "secondsAfterOpen=$((
 # 4. Watchdog: poll for the first-launch-OK flag, timed from the new process start.
 # ---------------------------------------------------------------------------
 
-watch_started=$(now_s)
 ok=0
 alive=1
 while :; do
+  record_open_result
   if [ -n "$flag" ] && [ -f "$flag" ]; then ok=1; break; fi
   if ! is_alive "$new_pid"; then
     # Re-check once: the flag may have landed just before the process went away.
@@ -332,9 +401,11 @@ while :; do
   [ "$elapsed" -ge "$watchdog" ] && break
   sleep 0.1
 done
+record_open_result finish
 handshake_elapsed=$(( $(now_s) - watch_started ))
 
 if [ "$ok" -eq 1 ]; then
+  stop_observer
   log_event handshake flag-observed info "flag=$flag" "secondsAfterProcessStart=$handshake_elapsed" "pid=$new_pid"
   if [ -n "$backup" ]; then
     if rm -rf "$backup" 2>/dev/null; then ok_rm=ok; else ok_rm=failed; fi
@@ -349,9 +420,16 @@ fi
 # ---------------------------------------------------------------------------
 
 if [ "$alive" -eq 0 ]; then
+  # The process is gone, so the observer's NOTE_EXIT has fired (or it reported why it
+  # could not watch); its wait is bounded by the watchdog either way.
+  [ -z "$observer_pid" ] || wait "$observer_pid" 2>/dev/null
+  exit_detail=$(cat "$exit_capture" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
+  rm -f "$exit_capture"
+  observer_pid=""
   log_event handshake process-exited error "pid=$new_pid" "secondsAfterProcessStart=$handshake_elapsed" "flag=$flag" \
-    "note=exit status unavailable (not a child of this helper); check DiagnosticReports for pid $new_pid"
-  rollback process-exited "pid $new_pid exited ${handshake_elapsed}s after starting without writing $flag"
+    "termination=$exit_detail"
+  rollback process-exited "pid $new_pid exited ${handshake_elapsed}s after starting without writing $flag; $exit_detail"
 fi
+stop_observer
 log_event handshake timeout error "pid=$new_pid" "watchdogSeconds=$watchdog" "flag=$flag" "processAlive=yes"
 rollback handshake-timeout "no first-launch flag $flag within ${watchdog}s of pid $new_pid starting (process still alive)"

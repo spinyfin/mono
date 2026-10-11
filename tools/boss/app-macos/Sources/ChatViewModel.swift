@@ -939,6 +939,7 @@ final class ChatViewModel: ObservableObject {
             exit(0)
         }
 
+        UpdateLifecycle.recordStartup("engine-handoff-begin")
         didStart = true
 
         // UI tests drive explicit fixture clients and events directly. The
@@ -954,6 +955,7 @@ final class ChatViewModel: ObservableObject {
                 do {
                     try processController.start()
                     DispatchQueue.main.async {
+                        UpdateLifecycle.recordStartup("engine-handoff-complete")
                         self?.startEngineIfNeeded()
                     }
                 } catch {

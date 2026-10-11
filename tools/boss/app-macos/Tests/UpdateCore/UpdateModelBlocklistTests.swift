@@ -31,6 +31,25 @@ final class UpdateModelBlocklistTests: XCTestCase {
         try await super.tearDown()
     }
 
+    func testCheckAndStageShareAttemptContext() async {
+        let installer = makeInstaller()
+        let recorder = StageCounter()
+        let model = makeModel(stager: recorder.stager(), installer: installer)
+        await model.checkNow()
+        await model.checkNow()
+        model.downloadAvailableUpdate()
+        await model.awaitStagingForTesting()
+        let checks = log.allRecords().filter { $0.event == "available" }
+        XCTAssertEqual(checks.count, 2)
+        XCTAssertEqual(checks[0].attempt, checks[1].attempt, "re-checks of one release stay in one attempt")
+        let check = checks[0]
+        let stage = log.allRecords().first { $0.event == "begin" }!
+        XCTAssertNotNil(check.attempt)
+        XCTAssertEqual(stage.attempt, check.attempt)
+        XCTAssertEqual(stage.from, check.from)
+        XCTAssertEqual(stage.to, check.to)
+    }
+
     func testAutomaticModeDoesNotReStageBlocklistedVersion() async throws {
         defaults.set("automatic", forKey: "boss.update.mode")
         let installer = makeInstaller()
@@ -84,6 +103,12 @@ final class UpdateModelBlocklistTests: XCTestCase {
         let events = log.allRecords().map { "\($0.stage).\($0.event)" }
         XCTAssertTrue(events.contains("blocklist.retry-requested"), "\(events)")
         XCTAssertTrue(events.contains("blocklist.removed"), "\(events)")
+        // The retry is one new attempt from request through staging.
+        let records = log.allRecords()
+        let retry = try XCTUnwrap(records.first { $0.event == "retry-requested" }?.attempt)
+        XCTAssertNotEqual(retry, records.first { $0.event == "available" }?.attempt, "a retry is a new attempt")
+        XCTAssertEqual(records.first { $0.stage == "blocklist" && $0.event == "removed" }?.attempt, retry)
+        XCTAssertEqual(records.last { $0.stage == "stage" && $0.event == "begin" }?.attempt, retry)
     }
 
     func testRetryWithoutPriorCheckChecksFirst() async throws {

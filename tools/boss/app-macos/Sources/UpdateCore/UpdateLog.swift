@@ -1,4 +1,5 @@
 import Darwin
+import DiagnosticIO
 import Foundation
 import os.log
 
@@ -75,8 +76,9 @@ public struct UpdateLogRecord: Codable, Equatable, Sendable {
 /// `log show`).
 ///
 /// Degrades quietly: a failed write drops the line and warns once per rotation epoch,
-/// never aborts (the `FileHandle.write(_:)` NSException trap is avoided by writing via
-/// `write(2)` directly).
+/// never aborts. The `O_APPEND` open, the throwing write and the warn-once throttle are
+/// the shared `DiagnosticIO.DiagnosticWrite` primitive the app's other diagnostic logs
+/// use; this type owns only the record schema, rotation and the os_log mirror.
 public final class UpdateLog: @unchecked Sendable {
 
     /// File name of the live log inside ``directory``.
@@ -181,20 +183,45 @@ public final class UpdateLog: @unchecked Sendable {
         defer { lock.unlock() }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         rotateIfNeeded(incoming: data.count)
-        let fd = fileURL.path.withCString { open($0, O_WRONLY | O_CREAT | O_APPEND, 0o644) }
-        guard fd >= 0 else {
-            warnOnce("open failed: errno \(errno)")
-            return
+        guard let handle = DiagnosticWrite.openForAppending(atPath: fileURL.path) else { return }
+        defer { DiagnosticWrite.closeQuietly(handle) }
+        DiagnosticWrite.append(data, to: handle, site: "update-log", warned: &warned)
+    }
+
+    /// Replay the relaunch helper's durable records into this log's unified-log
+    /// mirror (the `update-lifecycle` category) at startup, so `log show` on that
+    /// category covers the helper's window too. The helper also sends each record to
+    /// the unified log itself, through `logger`; this replay is the copy under the
+    /// app's subsystem/category.
+    ///
+    /// The cursor is `<last replayed ts>\t<records replayed at that ts>`: helper
+    /// timestamps have one-second resolution, and the helper may still be appending
+    /// within the same second while the app it reopened starts, so a plain
+    /// "after this timestamp" cursor would either repeat or skip records. The cursor
+    /// advances only after the replay, so a crash mid-replay can repeat records but
+    /// never drops one.
+    public func replayHelperRecords() {
+        guard let mirror else { return }
+        let cursorURL = directory.appendingPathComponent("helper-mirror-cursor")
+        let parts = ((try? String(contentsOf: cursorURL, encoding: .utf8)) ?? "").split(separator: "\t")
+        let cursorTS = parts.first.map(String.init) ?? ""
+        let seenAtCursor = parts.count > 1 ? Int(parts[1]) ?? 0 : 0
+
+        var skippedAtCursor = 0
+        var lastTS = cursorTS
+        var countAtLast = seenAtCursor
+        for var record in allRecords() where record.actor == "helper" && record.ts >= cursorTS {
+            if record.ts == cursorTS && skippedAtCursor < seenAtCursor {
+                skippedAtCursor += 1
+                continue
+            }
+            record.detail["originalTimestamp"] = record.ts
+            record.detail["replayed"] = "true"
+            mirror(record)
+            if record.ts == lastTS { countAtLast += 1 } else { lastTS = record.ts; countAtLast = 1 }
         }
-        defer { close(fd) }
-        let written = data.withUnsafeBytes { buf -> Int in
-            guard let base = buf.baseAddress else { return 0 }
-            return Int(Darwin.write(fd, base, buf.count))
-        }
-        if written != data.count {
-            warnOnce("short write (\(written)/\(data.count)): errno \(errno)")
-        } else {
-            warned = false
+        if lastTS != cursorTS || countAtLast != seenAtCursor {
+            try? "\(lastTS)\t\(countAtLast)".write(to: cursorURL, atomically: true, encoding: .utf8)
         }
     }
 
@@ -245,12 +272,6 @@ public final class UpdateLog: @unchecked Sendable {
         }
         try? fm.moveItem(at: fileURL, to: rotatedURL(1))
         warned = false
-    }
-
-    private func warnOnce(_ message: String) {
-        guard !warned else { return }
-        warned = true
-        Self.mirrorLogger.warning("update log write failed, dropping line(s): \(message, privacy: .public)")
     }
 
     /// UTC ISO-8601 with milliseconds. A fresh formatter per call: records are rare
