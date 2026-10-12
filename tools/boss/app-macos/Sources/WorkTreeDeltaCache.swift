@@ -5,6 +5,18 @@ import Foundation
 struct WorkTreeDeltaCache {
     private var sequence: UInt64?
     private var tree: [String: Any]?
+    private var connectionGeneration: Int?
+
+    mutating func startConnection(_ generation: Int) {
+        guard connectionGeneration != generation else { return }
+        connectionGeneration = generation
+        resetBase()
+    }
+
+    mutating func resetBase() {
+        sequence = nil
+        tree = nil
+    }
 
     mutating func apply(_ update: [String: Any]) -> [String: Any]? {
         guard let nextSequence = update["sequence"] as? UInt64,

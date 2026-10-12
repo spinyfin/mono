@@ -371,7 +371,7 @@ struct SinkWakers {
 pub(super) struct SessionSink {
     #[builder(default = StdMutex::new(SessionQueue::new()))]
     pub(super) queue: StdMutex<SessionQueue>,
-    #[builder(default)]
+    #[builder(skip)]
     wakers: SinkWakers,
     shutdown: StdMutex<Option<oneshot::Sender<()>>>,
     /// In-flight population-timing traces for this session, keyed by the

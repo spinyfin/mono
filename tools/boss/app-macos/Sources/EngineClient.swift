@@ -355,6 +355,7 @@ final class EngineClient: @unchecked Sendable {
                 let recvNanos = PopulationTiming.now()
                 let generation = self.connectionGeneration
                 self.handoff.afterPendingLines { [weak self] in
+                    self?.workTreeCache.startConnection(generation)
                     self?.decodingGeneration = generation
                 }
                 let lines = self.frameLines().map { (data: $0, recvNanos: recvNanos) }
@@ -436,7 +437,7 @@ final class EngineClient: @unchecked Sendable {
             payload = tree
             type = "work_tree"
         } else if type == "work_tree" {
-            workTreeCache = WorkTreeDeltaCache()
+            workTreeCache.resetBase()
         }
         let envelopeRequestId = envelope["request_id"] as? String
 

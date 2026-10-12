@@ -29,6 +29,39 @@ fn update(event: FrontendEvent) -> boss_protocol::work_tree_delta::WorkTreeUpdat
     update
 }
 
+#[test]
+fn work_tree_snapshot_lock_precedes_database_read_for_concurrent_admission() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _entered = runtime.enter();
+    let (state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&state.work_db, "ordered");
+    let sink = make_session_sink();
+    // Stall the reader at the DB boundary. It must already own the session's
+    // snapshot lock, otherwise a second admitted read can overtake its result.
+    let connection = state.work_db.connect().unwrap();
+    let reader_state = state.clone();
+    let reader_sink = sink.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        started_tx.send(()).unwrap();
+        runtime.block_on(fetch(&reader_state, &reader_sink, &product.id, true))
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut locked = false;
+    while Instant::now() < deadline {
+        if sink.work_tree_cache.try_lock().is_err() {
+            locked = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop(connection);
+    assert!(update(reader.join().unwrap()).base_sequence.is_none());
+    assert!(locked, "snapshot lock must cover the database read, not just enqueue");
+}
+
 #[tokio::test]
 async fn work_tree_delta_handler_moves_deletes_and_recovers_full_snapshots() {
     let (state, _dir) = test_server_state();

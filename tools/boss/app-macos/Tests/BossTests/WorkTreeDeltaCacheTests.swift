@@ -4,6 +4,7 @@ import XCTest
 final class WorkTreeDeltaCacheTests: XCTestCase {
     func testSnapshotPatchDeletionReorderAndGapRecovery() throws {
         var cache = WorkTreeDeltaCache()
+        cache.startConnection(1)
         let snapshot: [String: Any] = [
             "product_id": "product", "sequence": UInt64(1),
             "changes": ["product": ["id": "product"], "tasks": [
@@ -11,6 +12,7 @@ final class WorkTreeDeltaCacheTests: XCTestCase {
             ], "task_runtimes": [["work_item_id": "revision"]], "dependencies": []]
         ]
         XCTAssertNotNil(cache.apply(snapshot))
+        cache.startConnection(1) // Another frame on the same connection retains the base.
         let patch: [String: Any] = [
             "product_id": "product", "sequence": UInt64(2), "base_sequence": UInt64(1),
             "changes": [
@@ -30,5 +32,14 @@ final class WorkTreeDeltaCacheTests: XCTestCase {
         wrongProduct["product_id"] = "different"
         XCTAssertNil(cache.apply(wrongProduct))
         XCTAssertNotNil(cache.apply(patch), "Rejected patches must not corrupt the base")
+        XCTAssertNotNil(cache.apply(snapshot)) // Old connection's base sequence is one again.
+        cache.startConnection(2)
+        XCTAssertNil(cache.apply(patch), "A lost reconnect snapshot must not match the old connection's sequence")
+        XCTAssertNotNil(cache.apply(snapshot))
+        XCTAssertNotNil(cache.apply(patch))
+        cache.resetBase()
+        XCTAssertNotNil(cache.apply(snapshot))
+        cache.startConnection(2)
+        XCTAssertNotNil(cache.apply(patch), "Full recovery must retain the connection generation")
     }
 }

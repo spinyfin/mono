@@ -78,7 +78,7 @@ Each opted-in connection retains one complete serialized product projection. Its
 
 Every packet carries a session-local sequence and an explicit base sequence. The app applies it only to that exact base and product; a mismatch requests a full tree and resets the engine base. This handles duplicate/missing packets and queue shedding without treating unrelated global topic revisions as gaps. A full reply resets the client cache, so the next opted-in request establishes a fresh base. The existing selected-product apply path receives the reconstructed tree and retains its cache-eviction, selection, popover and history behavior.
 
-Database assembly now uses one read transaction for a consistent projection. The request dispatcher is sequential per connection, and cache advancement plus response enqueue occur under one lock. The cache is bounded to one product per session; it is discarded with the session. Old clients omit the opt-in flag and receive the existing wire response. Worker-tier sanitization removes private idea content from both snapshots and patches.
+Database assembly now uses one read transaction for a consistent projection. The read dispatcher can admit concurrent requests; one session lock covers snapshot acquisition, cache advancement and response enqueue so an older snapshot cannot overtake a newer one. The cache is bounded to one product per session; it is discarded with the session. Old clients omit the opt-in flag and receive the existing wire response. Worker-tier sanitization removes private idea content from both snapshots and patches.
 
 This is a transmission optimization: the engine still assembles all board projections, and the app still applies a reconstructed tree. Initial snapshots retain complete descriptions and expandable history. Measurements distinguish that remaining assembly cost from bytes saved on refresh.
 
@@ -86,7 +86,7 @@ This is a transmission optimization: the engine still assembles all board projec
 
 A fresh October 12 baseline used the reproduction command above on the parent revision: 20 samples, identical fixture and local macOS Bazel fastbuild configuration, no cache overrides. Baseline DB assembly plus full serialization p50/p95 was 3,903.989 / 4,266.569 ms; review-state p50/p95 was 2,184.991 / 2,438.353 ms. Host load remains uncontrolled. The earlier authorized snapshot is historical evidence only; this revision's matched comparison uses the deterministic fixture.
 
-The optimized run passed all fixture cardinality, foreign-key, review-state and delta-size assertions:
+The initial optimized run, before the final main rebase, passed all fixture cardinality, foreign-key, review-state and delta-size assertions:
 
 | Metric                                   |     Before |      After |
 | ---------------------------------------- | ---------: | ---------: |
@@ -110,3 +110,5 @@ The same synthetic harness then performed real name mutations and ran production
 The delta sizes include the product ID, sequence/base, changed records and collection metadata, excluding the outer RPC envelope and newline (as the full-tree body measurement does). One-record refresh transmission falls by approximately 99.987%. These measurements exclude queueing, socket delivery and app decoding. Database work remains product-wide; the unchanged runtime-query count makes that limitation explicit.
 
 Validation covers exact snapshot equality, unchanged refreshes, product moves, deletion, full-response recovery, reconnects, unrelated global revisions, patch ordering and worker idea sanitization. The initial full-suite run exposed a benchmark-only pooled-connection deadlock: the mutation loop retained its connection guard while calling the tree reader. Releasing that guard before the read fixed the root cause; no assertion or ordinary test timeout was relaxed.
+
+A further 20-sample run after rebasing onto current main passed with identical snapshot and delta body sizes. DB assembly plus full serialization p50/p95 was 1,852.617 / 3,440.486 ms; review-state p50/p95 was 204.258 / 466.449 ms (10.7× faster p50 than the fresh baseline). The 1 / 10 / 100-record delta probes took 1,339.380 / 1,327.944 / 1,399.412 ms. The timing variation reinforces the uncontrolled-host-load caveat; byte counts remained exact. Final integration also clears the client's base on a new decode connection generation, preventing an old session's sequence from matching a new session after a lost reconnect snapshot.
