@@ -416,6 +416,7 @@ impl DefaultExternalCheckExecutor {
             self.load_or_compile_component(&package.id, &component_bytes, &component.artifact_sha256)?;
         tracing::debug!(
             check_id = %package.id,
+            artifact_sha256 = %actual_sha256,
             elapsed_ms = load_start.elapsed().as_millis(),
             "component loaded"
         );
@@ -860,6 +861,11 @@ fn resolve_access_scope(
             )
         })?;
 
+    // Base-version reads can invoke VCS subprocesses. Prepare host inputs before
+    // starting the guest deadline, including for declared-files discovery.
+    let config_json =
+        serde_json::to_string(run.config).context("failed to serialize config for declare-required-files")?;
+    let wit_changeset = lower_changeset(run.changeset, run.source_tree);
     let host_state = HostState::with_sandbox_root(temp_sandbox.root.path(), max_memory_bytes).with_context(|| {
         format!(
             "failed to configure WASI context for declare-required-files in check `{}`",
@@ -886,10 +892,6 @@ fn resolve_access_scope(
             run.package.id
         )
     })?;
-
-    let config_json =
-        serde_json::to_string(run.config).context("failed to serialize config for declare-required-files")?;
-    let wit_changeset = lower_changeset(run.changeset, run.source_tree);
 
     let declared =
         wasmtime(bindings.call_declare_required_files(&mut store, run.check_name, &wit_changeset, &config_json))
@@ -937,6 +939,7 @@ struct ComponentRun<'a> {
 }
 
 fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Result<CheckResult> {
+    let setup_start = Instant::now();
     let (timeout_ticks, max_memory_bytes) = resolve_component_limits(run.limits, run.changeset.changed_files.len());
     let linker = build_component_v1_linker(engine)?;
 
@@ -996,6 +999,15 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     let sandbox = create_sandbox(changeset, access_scope, source_tree, &ceiling)
         .with_context(|| format!("failed to create FS sandbox for check `{}`", package.id))?;
 
+    let setup_ms = setup_start.elapsed().as_millis();
+    // Loading base versions may wait on VCS subprocesses under contention.
+    // Charge only instantiation and execution to the guest's wall-clock budget.
+    let input_start = Instant::now();
+    let input = lower_check_input(changeset, source_tree, config)?;
+    let input_ms = input_start.elapsed().as_millis();
+    let file_list = format_file_list(changeset);
+    let instantiate_start = Instant::now();
+
     // Phase 2: re-instantiate with a WASI context that preopens the sandbox
     // root at "/". The guest reads via std::fs with no checkleft-specific
     // call; enforcement is structural (only sandboxed files exist).
@@ -1009,9 +1021,23 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     let bindings = wasmtime(WitCheck::new(&mut store, &instance))
         .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
 
-    let input = lower_check_input(changeset, source_tree, config)?;
-    let file_list = format_file_list(changeset);
-    let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input)).map_err(|err| {
+    tracing::debug!(
+        check_id = %package.id,
+        setup_ms,
+        input_ms,
+        instantiate_ms = instantiate_start.elapsed().as_millis(),
+        timeout_ms = timeout_ticks,
+        "component prepared"
+    );
+    let execute_start = Instant::now();
+    let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input));
+    tracing::debug!(
+        check_id = %package.id,
+        execute_ms = execute_start.elapsed().as_millis(),
+        success = run_result.is_ok(),
+        "component executed"
+    );
+    let run_result = run_result.map_err(|err| {
         if is_interrupt_error(&err) {
             anyhow::anyhow!(
                 "check `{}` in component `{}` exceeded its {} ms wall-clock limit \
@@ -1087,6 +1113,8 @@ fn run_component_fix(engine: &Engine, root: &Path, run: FixRun) -> Result<Compon
         return Ok(ComponentFixOutcome::Applied(CopyBackReport::default()));
     }
 
+    let input = lower_check_input(run.changeset, run.source_tree, run.config)?;
+    let file_list = format_file_list(run.changeset);
     let linker = build_component_v1_linker(engine)?;
     let host_state = HostState::with_sandbox_root(sandbox.root_path(), max_memory_bytes)
         .with_context(|| format!("failed to configure WASI context for fix of check `{}`", run.package.id))?;
@@ -1098,8 +1126,6 @@ fn run_component_fix(engine: &Engine, root: &Path, run: FixRun) -> Result<Compon
     let bindings = wasmtime(WitCheck::new(&mut store, &instance))
         .with_context(|| format!("failed to bind component exports for fix of `{}`", run.package.id))?;
 
-    let input = lower_check_input(run.changeset, run.source_tree, run.config)?;
-    let file_list = format_file_list(run.changeset);
     let fix_result = wasmtime(bindings.call_fix_check(&mut store, run.check_name, &input)).map_err(|err| {
         if is_interrupt_error(&err) {
             anyhow::anyhow!(
