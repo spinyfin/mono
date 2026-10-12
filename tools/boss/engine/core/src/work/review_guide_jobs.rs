@@ -20,8 +20,7 @@ use super::query_ensure::RequireRow;
 use super::*;
 use crate::coordinator::ExecutionPublisher;
 
-#[path = "review_guide_updates.rs"]
-pub(super) mod updates;
+pub(super) use super::review_guide_findings::updates;
 
 /// Lifecycle of one `pr_review_guide_attempts` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
