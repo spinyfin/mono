@@ -1508,8 +1508,23 @@ impl ExecutionCoordinator {
         // above — the PR is MERGED by construction, which `--pr` refuses
         // outright). Both must happen before handing the workspace to the
         // worker. If positioning fails, abort dispatch with a diagnosable stage.
+        let pr_for_reconcile = pr_for_goto.or_else(|| match &work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => task
+                .pr_url
+                .as_deref()
+                .filter(|url| !url.is_empty())
+                .and_then(boss_github::pr_url::pr_number_from_url),
+            _ => None,
+        });
         let recovered = match self
-            .recover_execution_bookmark(execution, &lease, &adapter, &repo.repo_id, pr_for_goto)
+            .recover_execution_bookmark(
+                execution,
+                &lease,
+                &adapter,
+                &repo.repo_id,
+                pr_for_goto,
+                pr_for_reconcile,
+            )
             .await
         {
             Ok(recovered) => recovered,
@@ -1567,7 +1582,7 @@ impl ExecutionCoordinator {
         );
         let recovered_blocked = (is_implementation
             && self.work_db.execution_bookmark_optional(&execution.id)?.is_some())
-            || recovered.as_ref().is_some_and(|(_, has_work)| *has_work)
+            || recovered.as_ref().is_some_and(|recovered| recovered.has_work)
             || self.work_db.execution_restore_report(&execution.id)?.is_some();
         let goto_target = match (pr_for_goto, immutable_target_sha.as_deref()) {
             _ if recovered_blocked => None,
@@ -1804,8 +1819,8 @@ impl ExecutionCoordinator {
             if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
                 let predecessor = recovered
                     .as_ref()
-                    .filter(|(_, has_work)| *has_work)
-                    .map(|(id, _)| self.work_db.execution_bookmark(id))
+                    .filter(|recovered| recovered.has_work)
+                    .map(|recovered| self.work_db.execution_bookmark(&recovered.predecessor))
                     .transpose()?;
                 let report = self.work_db.execution_restore_report(&execution.id)?;
                 let record = adapter
@@ -1818,11 +1833,15 @@ impl ExecutionCoordinator {
                     .await?;
                 self.work_db.record_execution_bookmark(&record)?;
             }
-            if let Some((predecessor, has_work)) = &recovered
-                && predecessor != &execution.id
-            {
-                self.work_db
-                    .record_bookmark_recovery(&execution.id, predecessor, *has_work)?;
+            if let Some(recovered) = &recovered {
+                if recovered.predecessor != execution.id {
+                    self.work_db
+                        .record_bookmark_recovery(&execution.id, &recovered.predecessor, recovered.has_work)?;
+                }
+                if let Some(reconciliation) = &recovered.reconciliation {
+                    self.work_db
+                        .record_bookmark_reconciliation_note(&execution.id, &reconciliation.note())?;
+                }
             }
             Ok::<_, anyhow::Error>(())
         }

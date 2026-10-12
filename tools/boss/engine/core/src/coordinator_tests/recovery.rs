@@ -185,10 +185,14 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
             &coordinator.host_adapter,
             "mono",
             None,
+            None,
         )
         .await
         .unwrap();
-    assert_eq!(restored, Some((dead_id.clone(), true)));
+    assert_eq!(
+        restored.map(|r| (r.predecessor, r.has_work)),
+        Some((dead_id.clone(), true))
+    );
     let report = coordinator
         .work_db
         .execution_restore_report(&resume.id)
@@ -241,10 +245,14 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
             &coordinator.host_adapter,
             "mono",
             None,
+            None,
         )
         .await
         .unwrap();
-    assert_eq!(restored, Some((dead_id.clone(), true)));
+    assert_eq!(
+        restored.map(|r| (r.predecessor, r.has_work)),
+        Some((dead_id.clone(), true))
+    );
     let report = coordinator
         .work_db
         .execution_restore_report(&resume.id)
@@ -264,33 +272,108 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
 }
 
 #[tokio::test]
-async fn missing_baseline_recovery_is_loud_and_legacy_evidence_is_kept() {
+async fn missing_baseline_is_rebuilt_from_the_record_or_retired_loudly_without_a_pr() {
     use boss_engine_test_git::jj::JjRepo;
-    let dir = tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    let (dead_id, resume) = seed_resume_pair(&db);
-    record_recovery_work(&db, &dead_id, &repo.worker).await;
-    JjRepo::run(&repo.repo, &["bookmark", "delete", &format!("boss-base/{dead_id}")]);
-    let patch = dir.path().join(format!("{dead_id}.patch"));
-    std::fs::write(&patch, "legacy evidence").unwrap();
-    let coordinator = recovery_coordinator(db);
-    let error = coordinator
-        .recover_execution_bookmark(
-            &resume,
-            &lease_for(&repo.replacement, None),
-            &coordinator.host_adapter,
-            "mono",
-            None,
+    for recorded_commit in [true, false] {
+        let dir = tempdir().unwrap();
+        let repo = JjRepo::new(dir.path());
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (dead_id, resume) = seed_resume_pair(&db);
+        record_recovery_work(&db, &dead_id, &repo.worker).await;
+        std::fs::write(repo.worker.join("hello.txt"), "recovered work\n").unwrap();
+        JjRepo::run(&repo.worker, &["status"]);
+        JjRepo::run(&repo.repo, &["bookmark", "delete", &format!("boss-base/{dead_id}")]);
+        if !recorded_commit {
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE execution_bookmarks SET base_commit = NULL WHERE execution_id = ?1",
+                    [&dead_id],
+                )
+                .unwrap();
+        }
+        let patch = dir.path().join(format!("{dead_id}.patch"));
+        std::fs::write(&patch, "legacy evidence").unwrap();
+        let coordinator = recovery_coordinator(db.clone());
+        let restored = coordinator
+            .recover_execution_bookmark(
+                &resume,
+                &lease_for(&repo.replacement, None),
+                &coordinator.host_adapter,
+                "mono",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(patch.exists(), "legacy evidence is never consumed");
+        let base_exists = JjRepo::run(
+            &repo.repo,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "list",
+                "-T",
+                "name ++ \"\\n\"",
+                &format!("boss-base/{dead_id}"),
+            ],
         )
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("exactly one"), "{error:#}");
-    assert!(boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(
-        &error
-    ));
-    assert!(patch.exists());
-    assert!(!repo.replacement.join("hello.txt").exists());
+        .lines()
+        .any(|l| l == format!("boss-base/{dead_id}"));
+        let retired: Vec<_> = db
+            .list_attention_items(&dead_id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
+            .collect();
+        if recorded_commit {
+            // The record's own commit vouches for the heads: the bookmark is
+            // rebuilt from it and the work recovered as if nothing happened.
+            assert_eq!(
+                restored.map(|r| (r.predecessor, r.has_work)),
+                Some((dead_id.clone(), true))
+            );
+            assert!(base_exists, "baseline bookmark rebuilt from the recorded commit");
+            assert_eq!(
+                std::fs::read_to_string(repo.replacement.join("hello.txt")).unwrap(),
+                "recovered work\n"
+            );
+            assert!(retired.is_empty());
+            assert!(db.execution_bookmark_optional(&dead_id).unwrap().is_some());
+        } else {
+            // Nothing recorded vouches and the item has no PR: a deliberate,
+            // loud fresh start instead of blocking on the same dead pointer.
+            assert!(restored.is_none(), "{restored:?}");
+            assert!(!base_exists);
+            assert!(!repo.replacement.join("hello.txt").exists());
+            assert_eq!(retired.len(), 1, "{retired:?}");
+            assert!(
+                retired[0].body_markdown.contains("found 0"),
+                "{}",
+                retired[0].body_markdown
+            );
+            assert!(db.execution_bookmark_optional(&dead_id).unwrap().is_none());
+            let reason = db.execution_bookmark_retired_reason(&dead_id).unwrap().unwrap();
+            assert!(reason.contains("no recorded PR"), "{reason}");
+            // The predecessor's pointers are left for inspection.
+            let head = format!("boss-recovery/{dead_id}");
+            assert!(
+                JjRepo::run(
+                    &repo.repo,
+                    &[
+                        "--ignore-working-copy",
+                        "bookmark",
+                        "list",
+                        "-T",
+                        "name ++ \"\\n\"",
+                        &head
+                    ]
+                )
+                .lines()
+                .any(|l| l == head)
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -312,10 +395,11 @@ async fn bookkeeping_only_work_is_not_reported_as_a_recovery() {
             &coordinator.host_adapter,
             "mono",
             None,
+            None,
         )
         .await
         .unwrap();
-    assert_eq!(restored, Some((dead_id, false)));
+    assert_eq!(restored.map(|r| (r.predecessor, r.has_work)), Some((dead_id, false)));
 }
 
 #[tokio::test]
@@ -337,6 +421,7 @@ async fn recovery_is_a_no_op_for_a_non_resume_dispatch() {
             &lease_for(dir.path(), None),
             &coordinator.host_adapter,
             "mono",
+            None,
             None,
         )
         .await

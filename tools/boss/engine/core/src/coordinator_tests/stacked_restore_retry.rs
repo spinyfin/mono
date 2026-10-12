@@ -150,7 +150,7 @@ async fn transient_restore_failure_keeps_the_stacked_parent_base_on_retry() {
     // fallback restage onto main.
     let err = h
         .coordinator
-        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99))
+        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
         .await
         .expect_err("a transient restore failure must propagate, not fall back");
     assert!(
@@ -170,7 +170,7 @@ async fn transient_restore_failure_keeps_the_stacked_parent_base_on_retry() {
 
     // The retry restages onto the same parent and keeps the preserved work.
     h.coordinator
-        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99))
+        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
         .await
         .unwrap();
     let report = h

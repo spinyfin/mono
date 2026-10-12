@@ -167,6 +167,26 @@ pub trait HostAdapter: Send + Sync {
         let _ = (record, workspace, pr_bookmark, base_branch);
         bail!("rebased execution recovery is not supported by this host adapter")
     }
+    /// Repair stranded, diverged or baseline-less pointers from an
+    /// engine-recorded anchor (the `pr/<n>` bookmark cube wrote, the
+    /// record's baseline commit, or the other head). `Ok(None)` when the
+    /// pointers are intact.
+    async fn reconcile_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        pr_bookmark: Option<&str>,
+        trunk: &str,
+    ) -> Result<Option<execution_bookmark::Reconciliation>> {
+        let _ = (record, pr_bookmark, trunk);
+        bail!("execution bookmark reconciliation is not supported by this host adapter")
+    }
+    /// Drop an execution's head bookmarks after a deliberate fresh start so
+    /// the same execution can create fresh pointers; returns what was
+    /// released so the caller can record the commits.
+    async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
+        let _ = record;
+        bail!("execution bookmark release is not supported by this host adapter")
+    }
     /// Stable host identifier (e.g. `"local"`, `"zakalwe"`).
     fn host_id(&self) -> &str;
 
@@ -461,6 +481,27 @@ impl HostAdapter for LocalHostAdapter {
             .map(|(name, _)| name)
             .unwrap_or_else(|| "origin".into());
         execution_bookmark::restore_rebased(&LocalJj, record, workspace, pr_bookmark, base_branch, &remote).await
+    }
+    async fn reconcile_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        pr_bookmark: Option<&str>,
+        trunk: &str,
+    ) -> Result<Option<execution_bookmark::Reconciliation>> {
+        anyhow::ensure!(
+            record.host_id == "local",
+            "recovery bookmark belongs to host {}",
+            record.host_id
+        );
+        execution_bookmark::reconcile(&LocalJj, record, pr_bookmark, trunk).await
+    }
+    async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
+        anyhow::ensure!(
+            record.host_id == "local",
+            "recovery bookmark belongs to host {}",
+            record.host_id
+        );
+        execution_bookmark::release_heads(&LocalJj, record).await
     }
 
     fn host_id(&self) -> &str {
@@ -943,6 +984,25 @@ impl HostAdapter for SshHostAdapter {
             .map(|(name, _)| name)
             .unwrap_or_else(|| "origin".into());
         execution_bookmark::restore_rebased(self, record, workspace, pr_bookmark, base_branch, &remote).await
+    }
+    async fn reconcile_execution_bookmark(
+        &self,
+        record: &ExecutionBookmark,
+        pr_bookmark: Option<&str>,
+        trunk: &str,
+    ) -> Result<Option<execution_bookmark::Reconciliation>> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery store belongs to another host"
+        );
+        execution_bookmark::reconcile(self, record, pr_bookmark, trunk).await
+    }
+    async fn release_execution_bookmark_heads(&self, record: &ExecutionBookmark) -> Result<Vec<(String, String)>> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery store belongs to another host"
+        );
+        execution_bookmark::release_heads(self, record).await
     }
 
     fn host_id(&self) -> &str {

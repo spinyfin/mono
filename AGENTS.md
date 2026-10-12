@@ -44,6 +44,9 @@ root-cause rule as the section below.
   [`tools/boss/docs/attention-lifecycle.md`](tools/boss/docs/attention-lifecycle.md)
 - Post-crash orphan recovery:
   [`tools/boss/docs/post-crash-recovery.md`](tools/boss/docs/post-crash-recovery.md)
+- Execution recovery pointers (the three bookmarks per execution, how they
+  get damaged, and how dispatch reconciles or retires them):
+  [`tools/boss/docs/execution-recovery-pointers.md`](tools/boss/docs/execution-recovery-pointers.md)
 - Self-update attempt log (where the durable update trail lives, how to
   follow one attempt across the old app, the relaunch helper and the new
   app, and where a rollback's reason is recorded):

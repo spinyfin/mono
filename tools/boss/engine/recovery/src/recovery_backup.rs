@@ -183,6 +183,7 @@ mod tests {
             execution_id: "exec_missing".into(),
             repo_path: dir.path().join("missing"),
             host_id: "local".into(),
+            base_commit: None,
         };
         assert!(
             backup_execution_patch(dir.path(), &crate::execution_bookmark::LocalJj, &record)
@@ -199,6 +200,7 @@ mod tests {
             execution_id: "exec_missing".into(),
             repo_path: repo.repo,
             host_id: "local".into(),
+            base_commit: None,
         };
         assert!(
             backup_execution_patch(dir.path(), &crate::execution_bookmark::LocalJj, &record)

@@ -68,7 +68,7 @@ pub async fn restore_rebased(
             "recovery destination belongs to a different shared repository",
         ));
     }
-    diff(jj, record).await?;
+    heal_baseline(jj, record).await?;
     jj.run(workspace, &["git", "fetch", "--remote", upstream]).await?;
     let base_ref = format!(
         "remote_bookmarks(exact:{}, exact:{})",
