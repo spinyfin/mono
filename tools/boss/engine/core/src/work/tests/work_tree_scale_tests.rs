@@ -143,6 +143,37 @@ fn measure(db: &WorkDb, product: &str, expected: Option<usize>) {
         "scale samples={samples} fetch_db_and_serialize_ms p50={:.3} p95={:.3}; ai_review_state_ms p50={:.3} p95={:.3}",
         totals[p50], totals[p95], reviews[p50], reviews[p95]
     );
+    if expected.is_some() {
+        measure_deltas(db, product);
+    }
+}
+
+fn measure_deltas(db: &WorkDb, product: &str) {
+    use boss_protocol::work_tree_delta::WorkTreeCache;
+    let mut cache = WorkTreeCache::default();
+    let tree = db.get_work_tree(product).unwrap();
+    let snapshot = cache.update(&tree).unwrap();
+    println!(
+        "scale snapshot_update_bytes={}",
+        serde_json::to_vec(&snapshot).unwrap().len()
+    );
+    for count in [1, 10, 100] {
+        let conn = db.connect().unwrap();
+        for task in tree.tasks.iter().take(count) {
+            conn.execute("UPDATE tasks SET name = name || ' changed' WHERE id = ?1", [&task.id])
+                .unwrap();
+        }
+        drop(conn);
+        let start = Instant::now();
+        let next = db.get_work_tree(product).unwrap();
+        let update = cache.update(&next).unwrap();
+        let bytes = serde_json::to_vec(&update).unwrap().len();
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        assert!(update.base_sequence.is_some());
+        assert_eq!(update.changes["tasks"]["upserts"].as_array().unwrap().len(), count);
+        assert!(bytes < serde_json::to_vec(&next).unwrap().len() / 10);
+        println!("scale changed_records={count} delta_update_bytes={bytes} db_diff_serialize_ms={elapsed:.3}");
+    }
 }
 
 // Optional authorized snapshot measurement. Copies into Bazel's private tmpdir;

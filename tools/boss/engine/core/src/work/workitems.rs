@@ -1070,7 +1070,9 @@ impl WorkDb {
     /// other caller goes through the wrapper above with a disabled trace, so
     /// the timing is genuinely free off the RPC path.
     pub fn get_work_tree_instrumented(&self, product_id: &str, trace: &mut PopulationTrace) -> Result<WorkTree> {
-        let conn = self.connect()?;
+        let mut connection = self.connect()?;
+        // All projections must describe one consistent database snapshot.
+        let conn = connection.transaction()?;
 
         let t = Instant::now();
         let product = query_product(&conn, product_id).require("product", product_id)?;

@@ -46,6 +46,10 @@ pub enum FrontendEvent {
         product_id: String,
         revisions: Vec<Task>,
     },
+    /// Ordered board update, independent of global topic revisions.
+    WorkTreeUpdate {
+        update: crate::work_tree_delta::WorkTreeUpdate,
+    },
     WorkTree {
         product: Product,
         projects: Vec<Project>,

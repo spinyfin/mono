@@ -506,6 +506,18 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "revisions_list",
         },
         TagCase {
+            label: "WorkTreeUpdate",
+            event: FrontendEvent::WorkTreeUpdate {
+                update: crate::work_tree_delta::WorkTreeUpdate {
+                    product_id: "prod_1".into(),
+                    sequence: 2,
+                    base_sequence: Some(1),
+                    changes: serde_json::json!({}),
+                },
+            },
+            expected_tag: "work_tree_update",
+        },
+        TagCase {
             label: "WorkTree",
             event: FrontendEvent::WorkTree {
                 product: product(),
@@ -2155,6 +2167,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::TasksList { .. }
         | FrontendEvent::ChoresList { .. }
         | FrontendEvent::RevisionsList { .. }
+        | FrontendEvent::WorkTreeUpdate { .. }
         | FrontendEvent::WorkTree { .. }
         | FrontendEvent::WorkItemResult { .. }
         | FrontendEvent::WorkItemsByPrResult { .. }

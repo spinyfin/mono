@@ -334,7 +334,7 @@ fn review_family_cte(placeholders: &str) -> String {
             SELECT DISTINCT id, id, 0 FROM owners
             UNION ALL
             SELECT f.root, t.id, f.depth + 1 FROM family f
-            JOIN tasks t ON t.parent_task_id = f.id
+            JOIN tasks t INDEXED BY idx_tasks_parent_task_id ON t.parent_task_id = f.id
             WHERE t.kind = 'revision' AND f.depth < 64
          )"
     )

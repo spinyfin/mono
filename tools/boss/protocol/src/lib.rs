@@ -17,6 +17,7 @@ mod tmux_worker_status;
 mod types;
 mod wire;
 mod work_item_id;
+pub mod work_tree_delta;
 mod worker_event;
 mod worker_names;
 

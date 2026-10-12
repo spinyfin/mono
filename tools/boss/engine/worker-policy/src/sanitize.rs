@@ -79,6 +79,16 @@ fn sanitize_run(mut run: WorkRun) -> WorkRun {
 /// (belt-and-braces — the verb gate already stopped those).
 pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
     match event {
+        FrontendEvent::WorkTreeUpdate { mut update } => {
+            if let Some(changes) = update.changes.as_object_mut() {
+                if update.base_sequence.is_none() {
+                    changes.insert("ideas".into(), serde_json::json!([]));
+                } else {
+                    changes.remove("ideas");
+                }
+            }
+            FrontendEvent::WorkTreeUpdate { update }
+        }
         FrontendEvent::ExecutionResult { execution } => FrontendEvent::ExecutionResult {
             execution: sanitize_execution(execution),
         },

@@ -1123,6 +1123,9 @@ pub enum FrontendRequest {
 
     GetWorkTree {
         product_id: String,
+        /// Opt in to session-local snapshot/delta replies.
+        #[serde(default)]
+        delta: bool,
         /// App-side per-product population-fetch sequence number. Purely a correlation id: the macOS app mints a 1-based
         /// per-product `fetch_seq` for every `GetWorkTree` it issues and
         /// stamps it on its `population-timing-*.jsonl` lines. Propagating

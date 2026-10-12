@@ -1289,7 +1289,12 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         decode_ms,
         ..
     } = ctx;
-    let FrontendRequest::GetWorkTree { product_id, fetch_seq } = req else {
+    let FrontendRequest::GetWorkTree {
+        product_id,
+        fetch_seq,
+        delta,
+    } = req
+    else {
         unreachable!()
     };
 
@@ -1303,6 +1308,25 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
 
     match work_db.get_work_tree_instrumented(&product_id, &mut trace) {
         Ok(tree) => {
+            if delta {
+                // Enqueue under the cache lock to preserve patch order.
+                let mut cache = sink.work_tree_cache.lock().expect("work tree cache poisoned");
+                match cache.update(&tree) {
+                    Ok(update) => {
+                        trace.mark_enqueued();
+                        sink.stash_population_trace(&request_id, trace);
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            server_state.current_work_revision(),
+                            FrontendEvent::WorkTreeUpdate { update },
+                        );
+                    }
+                    Err(err) => send_work_error(&sink, &request_id, &err),
+                }
+                return;
+            }
+            sink.work_tree_cache.lock().expect("work tree cache poisoned").clear();
             // Mark the handoff instant so the writer task can attribute the
             // time this trace spends sitting in the session's writer queue
             // (queue_wait), then stash BEFORE enqueueing: the writer task

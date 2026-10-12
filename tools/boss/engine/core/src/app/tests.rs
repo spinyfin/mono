@@ -1,4 +1,5 @@
 use super::*;
+mod work_tree_delta;
 use crate::protocol::TopicEventPayload;
 
 fn topic_envelope(topic: &str, revision: u64) -> FrontendEventEnvelope {
