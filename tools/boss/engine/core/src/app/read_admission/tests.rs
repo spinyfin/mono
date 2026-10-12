@@ -283,3 +283,24 @@ async fn refresh_options_share_a_view_but_products_remain_concurrent() {
     drop(first);
     assert!(tokio::time::timeout(Duration::from_secs(1), refresh).await.is_ok());
 }
+
+#[tokio::test]
+async fn work_tree_reads_share_a_turn_regardless_of_fetch_seq() {
+    use boss_protocol::FrontendRequest as R;
+    let mut ordering = ReadOrdering::default();
+    let tree = |product: &str, fetch_seq| R::GetWorkTree {
+        product_id: product.into(),
+        fetch_seq,
+    };
+    let first = ordering.reserve(&tree("a", Some(1))).await.await;
+    let mut later = ordering.reserve(&tree("a", Some(2))).await;
+    let other = ordering.reserve(&tree("b", Some(1))).await;
+    let _other = tokio::time::timeout(Duration::from_secs(1), other).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut later)
+            .await
+            .is_err()
+    );
+    drop(first);
+    assert!(tokio::time::timeout(Duration::from_secs(1), later).await.is_ok());
+}

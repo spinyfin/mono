@@ -39,6 +39,11 @@ impl ReadOrdering {
                     refresh: false,
                 })
             }
+            // `fetch_seq` is a diagnostic correlation id, not part of the view.
+            FrontendRequest::GetWorkTree { product_id, .. } => serde_json::to_string(&FrontendRequest::GetWorkTree {
+                product_id: product_id.clone(),
+                fetch_seq: None,
+            }),
             _ => serde_json::to_string(request),
         }
         .expect("serializable request");

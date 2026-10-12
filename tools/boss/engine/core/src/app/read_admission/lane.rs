@@ -6,11 +6,41 @@ pub(in crate::app) enum ReadLane {
     Live,
     Ordered,
 }
-// Classification and inventory share one definition; the audit is independent.
-macro_rules! define_lanes {
+
+// The Live variants are listed once; the macros below expand that list into the
+// `read_lane` pattern and the audit inventory, so `Live` can only come from here.
+// rustfmt does not format macro bodies, so keep this list (and only this list) in
+// the macro; `read_lane` itself stays an ordinary, formatted function.
+macro_rules! with_live_variants {
+    ($callback:ident) => {
+        $callback! {
+            GetEngineHealth,
+            GetEngineVersion,
+            ListHostedPaneStatuses,
+            ListTmuxWorkerStatuses,
+            ListWorkerLiveStates,
+            MetricsListLive,
+            MetricsShowLive { .. },
+            ProbeStatus { .. },
+            WorkerPoolSummary,
+            WorkspacePoolSummary,
+        }
+    };
+}
+macro_rules! live_pattern {
     ($($live:ident $( { $($fields:tt)* } )?),* $(,)?) => {
-        #[cfg(test)]
-        pub(super) const LIVE_VARIANTS: &[&str] = &[$(stringify!($live)),*];
+        $(R::$live $( { $($fields)* } )?)|*
+    };
+}
+#[cfg(test)]
+macro_rules! live_names {
+    ($($live:ident $( { $($fields:tt)* } )?),* $(,)?) => {
+        &[$(stringify!($live)),*]
+    };
+}
+#[cfg(test)]
+pub(super) const LIVE_VARIANTS: &[&str] = with_live_variants!(live_names);
+
 pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
     match request {
         R::AuditProductEffort { .. }
@@ -96,7 +126,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::TrunkStatus
         | R::ListOperatorQuestions { .. }
         | R::ListCoordinatorGuidance { .. } => ReadLane::Bulk,
-        $(R::$live $( { $($fields)* } )?)|* => ReadLane::Live,
+        with_live_variants!(live_pattern) => ReadLane::Live,
         R::AbandonCiRemediation { .. }
         | R::AbandonConflictResolution { .. }
         | R::AcceptDeferredScopeAttention { .. }
@@ -226,18 +256,4 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::UpdateWorkItem { .. }
         | R::GetPrStatus { refresh: true, .. } => ReadLane::Ordered,
     }
-}
-    };
-}
-define_lanes! {
-    GetEngineHealth,
-    GetEngineVersion,
-    ListHostedPaneStatuses,
-    ListTmuxWorkerStatuses,
-    ListWorkerLiveStates,
-    MetricsListLive,
-    MetricsShowLive { .. },
-    ProbeStatus { .. },
-    WorkerPoolSummary,
-    WorkspacePoolSummary,
 }
