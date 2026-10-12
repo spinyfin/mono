@@ -319,6 +319,8 @@ pub(super) struct PendingProbe {
 /// landed in the transcript afterwards.
 #[derive(Debug, Clone)]
 pub(super) struct InFlightProbe {
+    /// Earlier submitted reply contract retained across a new delivery claim.
+    pub(super) previous_reply: Option<Box<InFlightProbe>>,
     pub(super) probe_id: String,
     /// Transcript path captured at dispatch time. Stashing it here
     /// (rather than re-querying `WorkRun` on the follow-up Stop)
@@ -586,6 +588,7 @@ impl ServerState {
         in_flight.insert(
             run_id.to_owned(),
             InFlightProbe {
+                previous_reply: None,
                 probe_id: probe.probe_id.clone(),
                 transcript_path,
                 offset_bytes,
@@ -614,7 +617,7 @@ impl ServerState {
     ///
     /// A slot held by an already-*submitted* probe (one that only awaits its
     /// reply at the next boundary) does not block this claim: the interrupt
-    /// cuts that reply turn short, so the slot passes to the new probe. A slot
+    /// owns the delivery slot while the earlier reply snapshot is retained. A slot
     /// held by a probe still `Queued`/`Injected` does block it, which is what
     /// keeps a write in progress from being delivered twice.
     ///
@@ -630,21 +633,15 @@ impl ServerState {
         transcript_path: Option<String>,
         offset_bytes: u64,
     ) -> Option<PendingProbe> {
-        // A held slot only blocks this claim while its write is still in
-        // progress (`Queued`/`Injected`) — that is the duplicate-delivery
-        // protection. A probe already *submitted* merely awaits its reply at
-        // the next turn boundary, and this claim interrupts that very reply
-        // turn, so the reply it was waiting for will never be produced as
-        // such. Read the lifecycle before taking the slot lock and re-verify
-        // the holder under it.
+        // Submitted probes retain their reply snapshots while a new claim owns delivery.
         let submitted_holder = self.in_flight_probe_id(run_id).filter(|held| {
             self.probe_lifecycle_state(held)
                 .is_some_and(awaits_reply_after_submission)
         });
         let mut in_flight = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
-        let superseded = match in_flight.get(run_id) {
-            None => None,
-            Some(held) if submitted_holder.as_deref() == Some(held.probe_id.as_str()) => Some(held.probe_id.clone()),
+        match in_flight.get(run_id) {
+            None => {}
+            Some(held) if submitted_holder.as_deref() == Some(held.probe_id.as_str()) => {}
             Some(_) => return None,
         };
         let mut pending = self.pending_probes.lock().expect("pending_probes mutex poisoned");
@@ -654,9 +651,11 @@ impl ServerState {
         if queue.is_empty() {
             pending.remove(run_id);
         }
+        let previous_reply = in_flight.remove(run_id).map(Box::new);
         in_flight.insert(
             run_id.to_owned(),
             InFlightProbe {
+                previous_reply,
                 probe_id: probe.probe_id.clone(),
                 transcript_path,
                 offset_bytes,
@@ -664,15 +663,6 @@ impl ServerState {
         );
         drop(pending);
         drop(in_flight);
-        if let Some(previous) = superseded {
-            tracing::info!(
-                run_id,
-                previous_probe_id = %previous,
-                probe_id,
-                "interrupting delivery superseded a submitted probe still awaiting its reply; its \
-                 reply turn is being cut short, so the in-flight slot passes to the new probe",
-            );
-        }
         Some(probe)
     }
 
@@ -730,10 +720,7 @@ impl ServerState {
     /// requeued, `false` when it was abandoned, so the caller can report the
     /// outcome it actually recorded rather than assuming a requeue.
     pub(super) fn release_probe_reservation(&self, run_id: &str, probe: PendingProbe) -> bool {
-        self.in_flight_probes
-            .lock()
-            .expect("in_flight_probes mutex poisoned")
-            .remove(run_id);
+        self.take_in_flight_probe(run_id);
         self.requeue_probe_front(run_id.to_owned(), probe)
     }
 
@@ -1062,14 +1049,36 @@ impl ServerState {
     }
 
     /// Take and return the in-flight probe for `run_id`, if any.
-    /// Idempotent on the second pop: a duplicate Stop firing for
-    /// the same run gets `None` and the engine emits no second
-    /// `ProbeReplied` for the same probe id.
+    /// Restore any earlier reply contract when releasing a replacement claim.
+    /// Stop dispatch drains those earlier replies separately before taking
+    /// the current claim, so duplicate Stops cannot emit the same reply twice.
     pub(super) fn take_in_flight_probe(&self, run_id: &str) -> Option<InFlightProbe> {
-        self.in_flight_probes
-            .lock()
-            .expect("in_flight_probes mutex poisoned")
-            .remove(run_id)
+        let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let mut claim = claims.remove(run_id)?;
+        if let Some(previous) = claim.previous_reply.take() {
+            claims.insert(run_id.to_owned(), *previous);
+        }
+        Some(claim)
+    }
+
+    /// Take an earlier reply snapshot without releasing exclusive delivery ownership.
+    pub(super) fn take_previous_probe_reply(&self, run_id: &str) -> Option<InFlightProbe> {
+        let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let claim = claims.get_mut(run_id)?;
+        let mut previous = claim.previous_reply.take()?;
+        claim.previous_reply = previous.previous_reply.take();
+        Some(*previous)
+    }
+
+    /// An interrupted boundary may have no assistant text yet; keep its reply contract.
+    pub(super) fn restore_previous_probe_reply(&self, run_id: &str, mut reply: InFlightProbe) {
+        let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        if let Some(claim) = claims.get_mut(run_id) {
+            reply.previous_reply = claim.previous_reply.take();
+            claim.previous_reply = Some(Box::new(reply));
+        } else {
+            claims.insert(run_id.to_owned(), reply);
+        }
     }
 
     /// Record `probe_id`'s current delivery stage. Call sites drive

@@ -146,12 +146,9 @@ use process_signals::{
     register_app_session_trust_ok, resolve_status_actor, signal_shell_pids,
 };
 
-// Re-import pane-op error types so child modules can match on them via
-// `use super::*`. Production code (chore-update notify) matches
-// `SendInputError::NotAcceptingInput` to requeue; tests use the full set.
-use pane_ops::SendInputError;
+// Re-import pane-op error types for child test modules.
 #[cfg(test)]
-use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError, SlotOccupancy};
+use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError, SendInputError, SlotOccupancy};
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{dispatch_probe_now, dispatch_worker_event_fanout};

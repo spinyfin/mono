@@ -1144,3 +1144,150 @@ async fn interrupting_probe_does_not_cut_the_turn_when_tmux_identity_is_missing(
         delivered.detail,
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn failed_second_interrupt_preserves_first_probe_reply() {
+    let (server_state, dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 3, None);
+    let runner = tmux_hosted(&server_state, &run_id, 3);
+    let path = dir.path().join("first-reply.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let first = server_state.queue_probe(run_id.clone(), "first".into(), false);
+    server_state
+        .try_reserve_probe_for_delivery(&run_id, Some(path.to_string_lossy().into_owned()), 0)
+        .unwrap();
+    server_state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+
+    let second = server_state.queue_probe(run_id.clone(), "second".into(), false);
+    let result = super::super::probe_interrupt::deliver_probe_interrupting(&server_state, &run_id, &second).await;
+    assert_eq!(result.state, ProbeDeliveryState::InterruptFailed);
+    assert!(!runner.wrote_text());
+    assert_eq!(server_state.in_flight_probe_id(&run_id), Some(first.clone()));
+    assert_preserved_reply(&server_state, &run_id, &first, &path).await;
+}
+
+async fn assert_preserved_reply(state: &Arc<ServerState>, run_id: &str, first: &str, path: &Path) {
+    let sink = make_session_sink();
+    state
+        .topic_broker
+        .register_session("reply-observer", sink.clone())
+        .await;
+    state
+        .topic_broker
+        .subscribe("reply-observer", &[probe_topic(run_id)])
+        .await;
+    std::fs::write(
+        path,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first answer"}]}}
+"#,
+    )
+    .unwrap();
+    dispatch_probe_reply_on_stop(
+        state,
+        &crate::events_socket::IncomingHookEvent::for_test(
+            WorkerEvent::Stop {
+                session_id: "test-sess".into(),
+                stop_hook_active: false,
+                stop_reason: crate::protocol::StopReason::Completed,
+            },
+            Some(run_id.to_owned()),
+            None,
+        ),
+    )
+    .await;
+    sink.close();
+    match sink.next().await.expect("reply event").payload {
+        FrontendEvent::ProbeReplied { probe_id, text, .. } => {
+            assert_eq!(probe_id, first);
+            assert_eq!(text, "first answer");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    assert_eq!(state.probe_lifecycle_state(first), Some(ProbeDeliveryState::Replied));
+}
+
+#[tokio::test]
+async fn natural_stop_dispatches_previous_reply_without_releasing_new_claim() {
+    let (state, dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&state, 3, None);
+    let path = dir.path().join("previous.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let first = state.queue_probe(run_id.clone(), "first".into(), false);
+    state
+        .try_reserve_probe_for_delivery(&run_id, Some(path.to_string_lossy().into_owned()), 0)
+        .unwrap();
+    state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+    let second = state.queue_probe(run_id.clone(), "second".into(), false);
+    state
+        .try_reserve_specific_probe_for_delivery(&run_id, &second, None, 0)
+        .unwrap();
+    // The interrupt boundary can arrive before the transcript flushes a reply.
+    dispatch_probe_reply_on_stop(
+        &state,
+        &crate::events_socket::IncomingHookEvent::for_test(
+            WorkerEvent::Stop {
+                session_id: "test-sess".into(),
+                stop_hook_active: false,
+                stop_reason: crate::protocol::StopReason::Interrupted,
+            },
+            Some(run_id.clone()),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(state.in_flight_probe_id(&run_id), Some(second.clone()));
+    assert_preserved_reply(&state, &run_id, &first, &path).await;
+    assert_eq!(state.in_flight_probe_id(&run_id), Some(second));
+}
+
+#[tokio::test(start_paused = true)]
+async fn buffered_busy_send_is_an_error_and_must_not_be_requeued() {
+    let (state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&state, 3, None);
+    tmux_hosted(&state, &run_id, 3);
+    // Pane text confirms the interrupt, but live activity is busy at the
+    // write, so the real injection path buffers without submitting.
+    let runner = Arc::new(
+        RecordingPaneRunner::with_identity("boss-probe-interrupt", "probe-interrupt-test-token").capture_text("❯ \n"),
+    );
+    *state.pane_delivery_tmux_override.write().unwrap() = Some(super::tmux_stub::tmux_with_runner(runner.clone()));
+    let err = state
+        .send_input_to_worker_with_receipt(&run_id, "busy send".into())
+        .await
+        .unwrap_err();
+    assert!(runner.escape_presses() > 0);
+    assert!(runner.wrote_text());
+    assert!(err.to_string().contains("submitted=false"));
+    assert!(!err.safe_to_retry_at_boundary());
+    match err {
+        super::super::pane_ops::SendInputError::NudgeDelivery {
+            probe_id,
+            state: delivery_state,
+            ..
+        } => {
+            assert_eq!(delivery_state, "buffered");
+            assert_eq!(state.probe_record(&probe_id).unwrap().submitted, Some(false));
+        }
+        other => panic!("expected buffered error, got {other:?}"),
+    }
+}
+
+#[test]
+fn brief_notice_retries_only_before_write_failures() {
+    for state in ["interrupt_failed", "abandoned", "dropped"] {
+        let err = super::super::pane_ops::SendInputError::NudgeDelivery {
+            probe_id: "probe".into(),
+            state: state.into(),
+            detail: "no write".into(),
+        };
+        assert!(err.safe_to_retry_at_boundary(), "{state}");
+    }
+    for state in ["queued", "unconfirmed", "orphaned", "buffered"] {
+        let err = super::super::pane_ops::SendInputError::NudgeDelivery {
+            probe_id: "probe".into(),
+            state: state.into(),
+            detail: "may be written".into(),
+        };
+        assert!(!err.safe_to_retry_at_boundary(), "{state}");
+    }
+}

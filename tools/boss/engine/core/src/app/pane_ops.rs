@@ -209,6 +209,16 @@ impl SlotOccupancy {
     }
 }
 
+impl SendInputError {
+    pub(super) fn safe_to_retry_at_boundary(&self) -> bool {
+        match self {
+            Self::NotAcceptingInput { .. } => true,
+            Self::NudgeDelivery { state, .. } => matches!(state.as_str(), "interrupt_failed" | "abandoned" | "dropped"),
+            _ => false,
+        }
+    }
+}
+
 impl ServerState {
     /// Resolve `run_id → slot_id` and ask the app to bring that
     /// worker pane to the front. Returns the resolved slot on success
@@ -274,7 +284,7 @@ impl ServerState {
         if posture == PaneInputPosture::MidTurnBuffered {
             let probe_id = self.queue_probe(run_id.to_owned(), text, false);
             let delivery = super::probe_interrupt::deliver_probe_interrupting(self, run_id, &probe_id).await;
-            if delivery.state.is_delivered() {
+            if delivery.state.is_delivered() && delivery.state != boss_protocol::ProbeDeliveryState::Buffered {
                 return Ok((slot_id, Some(probe_id)));
             }
             return Err(SendInputError::NudgeDelivery {

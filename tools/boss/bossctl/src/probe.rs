@@ -279,6 +279,28 @@ pub async fn probe_run(
     }
 }
 
+/// Serialize delivery and submission evidence for probe status.
+fn probe_status_json(
+    probe_id: &str,
+    run_id: &str,
+    state: ProbeDeliveryState,
+    urgent: bool,
+    detail: Option<&str>,
+    submitted: Option<bool>,
+    resumed: Option<boss_protocol::ProbeResumeEvidence>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "probe_id": probe_id,
+        "run_id": run_id,
+        "state": state.as_str(),
+        "urgent": urgent,
+        "delivered": state.is_delivered(),
+        "detail": detail,
+        "submitted": submitted,
+        "resumed": resumed.map(boss_protocol::ProbeResumeEvidence::as_str),
+    })
+}
+
 /// Read the delivery state the engine recorded for `probe_id`.
 ///
 /// The exit code answers "did the read work?", not "did the probe land?": any
@@ -310,27 +332,6 @@ pub async fn probe_run(
 ///
 /// The loud-failure requirement for undeliverable probes is met up front by
 /// [`probe_run`], which refuses before a probe id is ever minted.
-fn probe_status_json(
-    probe_id: &str,
-    run_id: &str,
-    state: ProbeDeliveryState,
-    urgent: bool,
-    detail: Option<&str>,
-    submitted: Option<bool>,
-    resumed: Option<boss_protocol::ProbeResumeEvidence>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "probe_id": probe_id,
-        "run_id": run_id,
-        "state": state.as_str(),
-        "urgent": urgent,
-        "delivered": state.is_delivered(),
-        "detail": detail,
-        "submitted": submitted,
-        "resumed": resumed.map(boss_protocol::ProbeResumeEvidence::as_str),
-    })
-}
-
 pub async fn probe_status(socket_path: &Option<String>, json: bool, probe_id: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client

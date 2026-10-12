@@ -105,6 +105,7 @@ pub(crate) const TEST_SPAWN_TOKEN: &str = "tok-test";
 #[derive(Clone, Copy)]
 enum CaptureBehavior {
     Empty,
+    Fixed(&'static str),
     EchoLastPaste,
 }
 
@@ -188,6 +189,11 @@ impl RecordingPaneRunner {
             on_text_write: StdMutex::new(None),
             started: tokio::sync::Notify::new(),
         }
+    }
+
+    pub(crate) fn capture_text(mut self, text: &'static str) -> Self {
+        self.state.capture = CaptureBehavior::Fixed(text);
+        self
     }
 
     pub(crate) fn echo_last_paste(mut self) -> Self {
@@ -308,6 +314,7 @@ impl RecordingPaneRunner {
         if args.iter().any(|arg| arg == "capture-pane") {
             return match self.state.capture {
                 CaptureBehavior::Empty => Self::success(""),
+                CaptureBehavior::Fixed(text) => Self::success(text),
                 CaptureBehavior::EchoLastPaste => {
                     let last = self.stdin.lock().unwrap().last().cloned().unwrap_or_default();
                     Self::success(String::from_utf8_lossy(&last).into_owned())

@@ -1089,7 +1089,7 @@ pub(super) async fn apply_work_item_patch(
                         tokio::spawn(async move {
                             match server_for_notify.send_input_to_worker(&run_id, msg.clone()).await {
                                 Ok(_) => {}
-                                Err(SendInputError::NotAcceptingInput { activity }) => {
+                                Err(err) if err.safe_to_retry_at_boundary() => {
                                     // Durable deferral: same probe queue
                                     // Stop/idle paths already drain.
                                     let probe_id =
@@ -1097,8 +1097,8 @@ pub(super) async fn apply_work_item_patch(
                                     tracing::info!(
                                         %run_id,
                                         %probe_id,
-                                        activity = activity.map(boss_protocol::WorkerActivity::as_str),
-                                        "chore-update: worker not accepting typed input; \
+                                        ?err,
+                                        "chore-update: notice was not written; \
                                          re-queued notice for Stop/idle delivery",
                                     );
                                 }
