@@ -58,6 +58,8 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::GetAutomation { .. }
         | R::GetAutomationOpenTaskCount { .. }
         | R::GetAutomationState
+        | R::GetBoothbyState
+        | R::ListBoothbyPasses { .. }
         | R::GetCiBudget { .. }
         | R::GetCiRemediation { .. }
         | R::GetConflictHotspots { .. }
