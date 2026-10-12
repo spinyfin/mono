@@ -75,10 +75,17 @@ impl WorkDb {
                   AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u
                       JOIN pr_review_guide_attempts a ON a.id = u.attempt_id
                       WHERE u.previous_version_id = v.id AND a.status IN ('queued', 'running'))
-                  -- The readable version is never collected, whatever the lifecycle.
-                  AND s.readable_version_id IS NOT v.id
+                  -- The readable version is never collected, whatever the lifecycle,
+                  -- until its root is deleted.
+                  AND (s.readable_version_id IS NOT v.id OR t.id IS NULL OR t.deleted_at IS NOT NULL)
             )",
             [cutoff],
+        )?;
+        tx.execute(
+            "UPDATE pr_review_guide_source_series SET readable_version_id = NULL
+             WHERE readable_version_id IS NOT NULL
+               AND readable_version_id NOT IN (SELECT id FROM pr_review_guide_versions)",
+            [],
         )?;
         tx.execute(
             "DELETE FROM pr_review_guide_attempts WHERE id IN (
@@ -94,6 +101,7 @@ impl WorkDb {
                   -- The current request of a series with a readable guide carries
                   -- the update/failure status and is what Retry re-admits from.
                   AND NOT (s.readable_version_id IS NOT NULL
+                      AND t.id IS NOT NULL AND t.deleted_at IS NULL
                       AND a.request_epoch = s.request_epoch
                       AND a.comparison_id IS s.selected_comparison_id)
             )",

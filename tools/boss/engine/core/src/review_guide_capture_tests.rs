@@ -815,3 +815,78 @@ async fn revision_metadata_failure_keeps_revision_status_and_published_guide() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn retry_after_a_failed_source_capture_recaptures_and_resumes_the_update() {
+    let (_dir, db) = open_db();
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "retry after capture failure");
+    let url = "https://github.com/acme/widget/pull/76";
+    let PrSourceCapturePersistOutcome::Stored(capture) = db
+        .persist_pr_review_guide_source_capture(
+            &root,
+            0,
+            PrSourceCaptureTrigger::Creation,
+            &source_capture_packet(url, "base", "published-head"),
+        )
+        .unwrap()
+    else {
+        panic!("capture");
+    };
+    let first = db
+        .create_pr_review_guide_attempt(&capture.series_id, &capture.comparison_id, "test")
+        .unwrap();
+    let PublishReviewGuideOutcome::Published(version) = db
+        .publish_pr_review_guide_version(&first.id, "# Published explanation", "original")
+        .unwrap()
+    else {
+        panic!("publish");
+    };
+    db.record_review_guide_revision_head(&root, url, "revision-head", &root, 5)
+        .unwrap();
+    let failed_at = db.allocate_pr_review_guide_source_observation_sequence().unwrap();
+    db.record_pr_review_guide_source_capture_failure(&root, url, failed_at, "pinned delta unavailable")
+        .unwrap();
+    assert!(
+        db.retry_pr_review_guide(&root, None, boss_review_guide::PROMPT_VERSION)
+            .is_err()
+    );
+    assert!(db.pr_review_guide_capture_error_for_root(&root).unwrap().is_some());
+
+    // The handler's recapture step: the same fresh pinned-source capture as Generate.
+    let packet = source_capture_packet(url, "base", "revision-head");
+    let output = packet.clone();
+    let collect: PacketCollectFn = Arc::new(move |_, _, _, _| {
+        let packet = output.clone();
+        Box::pin(async move { Ok(packet) })
+    });
+    let collector = SourcePacketCollector::fixture(collect, packet);
+    capture_review_guide_source_manually(&db, &root, url, &collector)
+        .await
+        .unwrap();
+    assert!(db.pr_review_guide_capture_error_for_root(&root).unwrap().is_none());
+
+    let crate::work::RetryReviewGuideOutcome::Created(retry) = db
+        .retry_pr_review_guide(&root, Some("retry-1"), boss_review_guide::PROMPT_VERSION)
+        .unwrap()
+    else {
+        panic!("retry");
+    };
+    assert_eq!(retry.prompt_version, boss_review_guide::UPDATE_PROMPT_VERSION);
+    let replay = db
+        .retry_pr_review_guide(&root, Some("retry-1"), boss_review_guide::PROMPT_VERSION)
+        .unwrap();
+    assert!(matches!(
+        replay,
+        crate::work::RetryReviewGuideOutcome::AlreadyRequested(ref a) if a.id == retry.id
+    ));
+    let conn = db.connect().unwrap();
+    let previous: String = conn
+        .query_row(
+            "SELECT previous_version_id FROM pr_review_guide_updates WHERE attempt_id = ?1",
+            [&retry.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(previous, version.id);
+}

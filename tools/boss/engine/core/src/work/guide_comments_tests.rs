@@ -149,8 +149,10 @@ fn guide_comment_context_survives_regeneration_resolution_and_reopen() {
     let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
     let readable = summary.readable_version_id.unwrap();
     assert_eq!(summary.lifecycle, "ready");
-    assert_eq!(readable, old.id);
+    // The current guide stays readable; the commented version is retained too.
+    assert_eq!(readable, new.id);
     assert!(db.get_pr_review_guide_version(&readable).unwrap().is_some());
+    assert!(db.get_pr_review_guide_version(&old.id).unwrap().is_some());
     let reopened = WorkDb::open(dir.path().join("state.db")).unwrap();
     // Reopening must preserve authored evidence even on a resolved comment.
     assert_eq!(
@@ -160,7 +162,7 @@ fn guide_comment_context_survives_regeneration_resolution_and_reopen() {
 }
 
 #[test]
-fn terminal_aged_published_guide_without_comments_is_collected() {
+fn readable_guide_survives_a_done_root_and_is_collected_once_the_root_is_deleted() {
     let (dir, db) = open_db();
     let root = create_active_chore(&db, &create_product(&db), "uncommented guide retention");
     let (series, comparison) = seed_review_guide_series(&db, &root);
@@ -179,6 +181,20 @@ fn terminal_aged_published_guide_without_comments_is_collected() {
             "UPDATE pr_review_guide_versions SET generated_at = '1';
          UPDATE pr_review_guide_attempts SET created_at = '1';",
         )
+        .unwrap();
+    db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
+    // Closed (not deleted) roots keep their readable guide.
+    assert!(db.get_pr_review_guide_version(&version.id).unwrap().is_some());
+    assert_eq!(
+        db.get_pr_review_guide_summary_for_root(&root)
+            .unwrap()
+            .unwrap()
+            .readable_version_id,
+        Some(version.id.clone())
+    );
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET deleted_at = 'now' WHERE id = ?1", [&root])
         .unwrap();
     db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
     assert!(db.get_pr_review_guide_version(&version.id).unwrap().is_none());

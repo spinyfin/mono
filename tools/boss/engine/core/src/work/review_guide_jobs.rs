@@ -1440,7 +1440,11 @@ pub(in crate::work) mod guide_updates {
                        AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u WHERE u.attempt_id = a.id)",
                 )?;
                 stmt.query_map(params![root, pr, head], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
             };
@@ -1559,7 +1563,35 @@ pub(in crate::work) mod guide_updates {
             assert!(db.get_pr_review_guide_version(&old.id).unwrap().is_some());
             let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
             assert_eq!(summary.lifecycle, "failed");
-            assert_eq!(summary.readable_version_id, Some(old.id));
+            assert_eq!(summary.readable_version_id, Some(old.id.clone()));
+            // The failed request and its comparison survive GC, so the status
+            // text and Retry still have something to act on.
+            assert_eq!(summary.selected_comparison_id, Some(new.comparison_id.clone()));
+            assert!(summary.error.is_some());
+            let RetryReviewGuideOutcome::Created(retry) = db
+                .retry_pr_review_guide(&root, None, boss_review_guide::PROMPT_VERSION)
+                .unwrap()
+            else {
+                panic!("retry");
+            };
+            assert_eq!(retry.prompt_version, boss_review_guide::UPDATE_PROMPT_VERSION);
+            // Retried to success: the new guide is readable and survives GC; the
+            // superseded old version is no longer protected and may be reclaimed.
+            let PublishReviewGuideOutcome::Published(newer) = db
+                .publish_pr_review_guide_version(&retry.id, "# Updated", "updated")
+                .unwrap()
+            else {
+                panic!("publish");
+            };
+            db.connect()
+                .unwrap()
+                .execute("UPDATE pr_review_guide_versions SET generated_at = '1'", [])
+                .unwrap();
+            db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
+            assert!(db.get_pr_review_guide_version(&newer.id).unwrap().is_some());
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.lifecycle, "ready");
+            assert_eq!(summary.readable_version_id, Some(newer.id));
         }
 
         #[test]
