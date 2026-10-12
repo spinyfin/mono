@@ -244,8 +244,6 @@ struct WorkTask: Identifiable, Hashable {
     /// prompt/prose retry. Mirrors `Task.review_guide_stale_source` on the
     /// wire. `nil` until a readable version exists.
     var reviewGuideStaleSource: Bool? = nil
-    /// Engine-rendered revision update status for the current PR.
-    var reviewGuideUpdateStatus: String? = nil
     /// Engine-recorded reason the series is `"failed"`. Mirrors
     /// `Task.review_guide_error` on the wire. The app renders this text;
     /// it does not infer a cause. `nil` when lifecycle is not `"failed"`

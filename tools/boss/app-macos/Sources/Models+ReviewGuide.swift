@@ -106,7 +106,6 @@ struct ReviewGuideCardPresentation: Equatable {
     /// as-is; the app does not infer a cause. `nil` unless `kind` is a
     /// failed state and the engine stored a reason.
     var error: String? = nil
-    var updateStatus: String? = nil
 
     var showsDocumentButton: Bool { readableVersionId != nil }
     var showsProgress: Bool { kind == .generating || kind == .refreshing }
@@ -118,19 +117,7 @@ struct ReviewGuideCardPresentation: Equatable {
         Self.summaryLine(of: error)
     }
 
-    /// The revision-update status is appended to the lifecycle text, never a
-    /// replacement for it: the open action and any stored failure reason stay.
     var accessibilityLabel: String {
-        Self.compose(lifecycleAccessibilityLabel, updateStatus)
-    }
-
-    private static func compose(_ base: String, _ updateStatus: String?) -> String {
-        guard let updateStatus, !updateStatus.isEmpty else { return base }
-        let separator = base.hasSuffix(".") || base.hasSuffix("?") || base.hasSuffix("\u{2026}") ? " " : ". "
-        return base + separator + updateStatus
-    }
-
-    private var lifecycleAccessibilityLabel: String {
         switch kind {
         case .generating: return "Generating review guide"
         case .refreshing: return "Open older review guide; updating"
@@ -153,10 +140,6 @@ struct ReviewGuideCardPresentation: Equatable {
     }
 
     var tooltip: String {
-        Self.compose(lifecycleTooltip, updateStatus)
-    }
-
-    private var lifecycleTooltip: String {
         let fullError = error?.trimmingCharacters(in: .whitespacesAndNewlines)
         switch kind {
         case .generating: return "Generating review guide\u{2026}"
@@ -186,8 +169,7 @@ struct ReviewGuideCardPresentation: Equatable {
         lifecycle: String?,
         readableVersionId: String?,
         staleSource: Bool = false,
-        error: String? = nil,
-        updateStatus: String? = nil
+        error: String? = nil
     ) -> ReviewGuideCardPresentation? {
         guard let lifecycle else { return nil }
         let hasContent = readableVersionId != nil
@@ -195,18 +177,16 @@ struct ReviewGuideCardPresentation: Equatable {
         case "queued", "generating":
             return ReviewGuideCardPresentation(
                 kind: hasContent ? .refreshing : .generating,
-                readableVersionId: readableVersionId,
-                updateStatus: updateStatus
+                readableVersionId: readableVersionId
             )
         case "ready":
-            return ReviewGuideCardPresentation(kind: .ready, readableVersionId: readableVersionId, updateStatus: updateStatus)
+            return ReviewGuideCardPresentation(kind: .ready, readableVersionId: readableVersionId)
         case "failed":
             return ReviewGuideCardPresentation(
                 kind: hasContent ? .refreshFailed : .failed,
                 readableVersionId: readableVersionId,
                 staleSource: staleSource,
-                error: error,
-                updateStatus: updateStatus
+                error: error
             )
         default:
             return nil

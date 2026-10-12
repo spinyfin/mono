@@ -479,8 +479,7 @@ struct WorkCardPopoverView: View {
             lifecycle: model.retryingReviewGuideRootTaskIDs.contains(task.id) ? "generating" : task.reviewGuideLifecycle,
             readableVersionId: task.reviewGuideReadableVersionId,
             staleSource: task.reviewGuideStaleSource ?? false,
-            error: task.reviewGuideError,
-            updateStatus: task.reviewGuideUpdateStatus
+            error: task.reviewGuideError
         ) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Review guide")
