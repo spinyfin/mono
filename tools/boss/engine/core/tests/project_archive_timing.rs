@@ -21,11 +21,9 @@
 //! A per-child invalidation (or a per-child `WorkItemUpdated`) would show up
 //! here as extra pushes inside the quiet window and fail the test.
 //!
-//! What this harness does **not** measure: the handler's internal
-//! entry → commit → publish boundaries (the project transaction is roughly
-//! `rpc` minus a priority-only patch's `rpc`, an estimate, not a commit
-//! timestamp), and the app's main-actor apply/re-render after the fetch
-//! (needs the live GUI). Treat those as estimates wherever they are quoted.
+//! Engine tracing records correlated monotonic handler-entry, transaction-begin,
+//! successful commit, and completed work-invalidated publication boundaries.
+//! Only the app's main-actor apply/re-render needs live GUI measurement.
 //!
 //! Timings are printed (`--test_output=all`), not asserted: wall clock on a
 //! shared CI runner is not a stable gate. The event-count pin is the gate.
@@ -39,6 +37,7 @@ use boss_protocol::{
     Project, ProjectStatus, TopicEventPayload, WorkItem, WorkItemPatch, work_product_topic,
 };
 
+mod archive_timing_support;
 mod common;
 mod watcher_support;
 use common::{TestEngine, TestEngineOptions};
@@ -150,7 +149,7 @@ struct ArchiveTimings {
     tree_size: (usize, usize),
 }
 
-async fn measure(child_count: usize) -> Result<ArchiveTimings> {
+async fn measure(child_count: usize, boundaries: &archive_timing_support::Boundaries) -> Result<ArchiveTimings> {
     // On-disk SQLite, as in production — a `:memory:` DB would hide the
     // per-transaction fsync that an on-disk cascade pays per row.
     let engine = TestEngine::spawn_with(TestEngineOptions {
@@ -173,7 +172,9 @@ async fn measure(child_count: usize) -> Result<ArchiveTimings> {
             patch: WorkItemPatch::builder().status("archived").build(),
         })
         .await?;
-    let rpc = started.elapsed();
+    let received = Instant::now();
+    let rpc = received.duration_since(started);
+    boundaries.report(started, received, child_count);
     match reply {
         FrontendEvent::WorkItemUpdated {
             item: WorkItem::Project(project),
@@ -229,33 +230,21 @@ fn ms(d: Duration) -> f64 {
 }
 
 #[tokio::test]
-async fn archiving_a_project_with_50_children_is_one_reply_and_one_invalidation() -> Result<()> {
-    let t = measure(50).await?;
-    eprintln!(
-        "archive[N=50] rpc={:.1}ms invalidation={:.1}ms work_tree(before)={:.1}ms work_tree(after)={:.1}ms \
-         tree_tasks={} tree_task_bytes={}",
-        ms(t.rpc),
-        ms(t.invalidation),
-        ms(t.work_tree_before),
-        ms(t.work_tree_after),
-        t.tree_size.0,
-        t.tree_size.1
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn archiving_a_project_with_500_children_is_one_reply_and_one_invalidation() -> Result<()> {
-    let t = measure(500).await?;
-    eprintln!(
-        "archive[N=500] rpc={:.1}ms invalidation={:.1}ms work_tree(before)={:.1}ms work_tree(after)={:.1}ms \
-         tree_tasks={} tree_task_bytes={}",
-        ms(t.rpc),
-        ms(t.invalidation),
-        ms(t.work_tree_before),
-        ms(t.work_tree_after),
-        t.tree_size.0,
-        t.tree_size.1
-    );
+async fn archive_boundaries_and_bounded_pushes_at_product_scales() -> Result<()> {
+    // One subscriber and sequential requests: each captured handler span
+    // belongs to the one archive under measurement, never a sibling fixture.
+    let boundaries = archive_timing_support::Boundaries::install();
+    for children in [50, 500, 1949] {
+        let t = measure(children, &boundaries).await?;
+        eprintln!(
+            "archive[N={children}] rpc={:.3}ms invalidation={:.3}ms work_tree(before)={:.3}ms work_tree(after)={:.3}ms tree_tasks={} tree_task_bytes={}",
+            ms(t.rpc),
+            ms(t.invalidation),
+            ms(t.work_tree_before),
+            ms(t.work_tree_after),
+            t.tree_size.0,
+            t.tree_size.1
+        );
+    }
     Ok(())
 }

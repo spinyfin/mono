@@ -320,6 +320,7 @@ rust_test(
     size = "small",
     timeout = "moderate",
     srcs = [
+        "tests/archive_timing_support.rs",
         "tests/common/mod.rs",
         "tests/project_archive_timing.rs",
         "tests/watcher_support.rs",
