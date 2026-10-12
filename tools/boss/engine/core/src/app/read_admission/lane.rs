@@ -42,6 +42,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::GetExecution { .. }
         | R::GetHost { .. }
         | R::GetIdea { .. }
+        | R::GetOffsiteBackup
         | R::GetPrBody { .. }
         | R::GetProductDesignDoc { .. }
         | R::GetPrStatus { refresh: false, .. }
@@ -197,6 +198,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::SetFeatureFlag { .. }
         | R::SetHostEnabled { .. }
         | R::SetLiveStatusEnabled { .. }
+        | R::SetOffsiteBackup { .. }
         | R::SetProductDefaultDriver { .. }
         | R::SetProductDefaultModel { .. }
         | R::SetProductEditorialRules { .. }
