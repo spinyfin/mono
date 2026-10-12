@@ -33,7 +33,7 @@ The defaults are deliberately very high pending measurement of normal traffic: t
 
 Each connection also has a pending queue of four times its active limit. Full queues reject immediately. Waiting for the ordering turn has a separate, fixed 60 s deadline (ORDER_WAIT). After that turn is granted, excess requests queue on FIFO admission semaphores and share one configured deadline across the connection and global permits. A connection obtains its local permit before joining the global semaphore, limiting its representation in the global queue. Invalid settings use the default via the shared environment parser; zero or values above one million also log a warning. Multiple separate CLI connections are constrained by the global limit; this is connection fairness, not authenticated per-user accounting.
 
-Both per-connection active settings are clamped to 20 with a warning. With four pending reads per active slot, the two lanes reserve at most 200 replies plus one reader response out of the 256-entry outbound queue. This preserves at least 55 entries of reader headroom even when both settings are raised. Bulk and live wait settings are independent.
+Per-connection active settings use the same validation as global settings, with no additional clamp. Bulk and live wait settings are independent and both default to 60 s. Outbound-queue headroom needs separate measurement of normal traffic before limits can be sized with a generous buffer; assumed reply counts do not justify lowering admission limits.
 
 Rejections produce a correlated `Error` response containing `engine busy, retry: read admission limit exceeded` and a warning identifying the session and whether its queue was full or its deadline expired. No retry loop is added to the CLI. Live status has an independent path rather than consuming the bulk quota.
 
@@ -51,7 +51,7 @@ The app sends every UI read over one long-lived socket. On connect it pipelines 
 
 ## Outbound reply delivery
 
-Busy and other correlated replies share the session's bounded outbound lane. Only uncorrelated pushes can be evicted; pressure that would evict a reply triggers an explicit disconnect. The request reader pauses with headroom derived from the configured active and pending bulk and live limits, reducing pressure before the enqueue-boundary guarantee is needed.
+Busy and other correlated replies share the session's bounded outbound lane. Only uncorrelated pushes can be evicted; pressure that would evict a reply triggers an explicit disconnect. The request reader pauses with headroom derived from the configured active and pending bulk and live limits, reducing pressure before the enqueue-boundary guarantee is needed. When configured outstanding reads exceed outbound capacity, the reader waits for an empty queue; this does not reserve space for every in-flight reply or clamp read admission.
 
 Design-doc foreground reads deliberately retain bulk admission through GitHub fetches and the correlated response, including cache misses and refreshes. Unlike PR-status refresh, they have no separate foreground budget. Background document revalidation coalesces by document before spawning and permits at most four concurrent probe/retry ladders across keys.
 

@@ -61,37 +61,12 @@ fn setting(name: &str, default: usize) -> usize {
     }
 }
 
-/// Outbound entries the reader loop keeps free for non-read replies and pushes.
-const MIN_READER_HEADROOM: usize = 55;
-
-/// Largest per-connection active limit such that both lanes' outstanding
-/// replies still leave [`MIN_READER_HEADROOM`] outbound entries.
-const MAX_PER_CONNECTION: usize =
-    (super::session_queue::MAX_SESSION_QUEUE - MIN_READER_HEADROOM - 1) / (2 * (PENDING_PER_ACTIVE + 1));
-const _: () = assert!(
-    2 * MAX_PER_CONNECTION * (PENDING_PER_ACTIVE + 1) + 1 + MIN_READER_HEADROOM
-        <= super::session_queue::MAX_SESSION_QUEUE
-);
-
 /// Outbound-queue depth the reader loop waits for before reading another
 /// request: every reply both lanes may have outstanding, plus one.
 pub(super) fn reply_headroom(bulk: &ReadAdmission, live: &ReadAdmission) -> usize {
     bulk.outstanding_per_connection()
         .saturating_add(live.outstanding_per_connection())
         .saturating_add(1)
-}
-
-fn connection_setting(name: &str, default: usize) -> usize {
-    let value = setting(name, default);
-    if value > MAX_PER_CONNECTION {
-        tracing::warn!(
-            name,
-            value,
-            MAX_PER_CONNECTION,
-            "clamping read admission setting to preserve reply headroom"
-        );
-    }
-    value.min(MAX_PER_CONNECTION)
 }
 
 impl ReadAdmission {

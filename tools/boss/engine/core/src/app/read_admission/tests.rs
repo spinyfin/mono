@@ -135,21 +135,30 @@ fn live_lane_is_exactly_the_audited_local_only_set() {
 }
 
 #[test]
-fn connection_setting_clamps_values_above_the_headroom_limit() {
-    let name = "BOSS_TEST_READ_ADMISSION_CLAMP";
+fn connection_settings_accept_upstream_limits_without_clamping() {
+    let name = "BOSS_TEST_READ_ADMISSION_LIMIT";
     // SAFETY: this variable name is unique to this test.
-    unsafe { std::env::set_var(name, (MAX_PER_CONNECTION + 50).to_string()) };
-    assert_eq!(connection_setting(name, 2), MAX_PER_CONNECTION);
-    unsafe { std::env::set_var(name, "3") };
-    assert_eq!(connection_setting(name, 2), 3);
+    for value in [1024, 4096, 8192] {
+        unsafe { std::env::set_var(name, value.to_string()) };
+        assert_eq!(setting(name, 2), value);
+    }
     unsafe { std::env::remove_var(name) };
 }
 
 #[test]
-fn maximum_connection_limits_preserve_reader_headroom() {
-    let lane = ReadAdmission::new(32, MAX_PER_CONNECTION, 128, Duration::from_millis(500));
-    let headroom = reply_headroom(&lane, &lane);
-    assert!(super::super::session_queue::MAX_SESSION_QUEUE - headroom >= MIN_READER_HEADROOM);
+fn default_limits_and_waits_match_upstream_policy() {
+    let bulk = ReadAdmission::default();
+    let live = ReadAdmission::live();
+    assert_eq!(bulk.active.available_permits(), 4096);
+    assert_eq!(bulk.per_connection, 4096);
+    assert_eq!(live.active.available_permits(), 1024);
+    assert_eq!(live.per_connection, 1024);
+    for lane in [&bulk, &live] {
+        assert_eq!(lane.pending.available_permits(), 100_000);
+        assert_eq!(lane.wait, Duration::from_secs(60));
+    }
+    assert_eq!(ORDER_WAIT, Duration::from_secs(60));
+    assert_eq!(reply_headroom(&bulk, &live), (4096 + 1024) * 5 + 1);
 }
 
 #[tokio::test]
