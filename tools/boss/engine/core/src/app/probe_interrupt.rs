@@ -209,6 +209,21 @@ pub(super) async fn deliver_probe_interrupting(
         Err(failure) => return settle_interrupt_failure(server_state, run_id, probe, failure).await,
     };
 
+    if interrupt == ProbeInterruptOutcome::Interrupted {
+        for displaced in server_state.settle_interrupted_probe_reply(run_id, probe_id) {
+            server_state
+                .topic_broker
+                .publish(
+                    &probe_topic(run_id),
+                    FrontendEventEnvelope::push(FrontendEvent::ProbeDeliveryEscalated {
+                        run_id: run_id.to_owned(),
+                        probe_id: displaced,
+                        reason: format!("reply turn interrupted by probe {probe_id}"),
+                    }),
+                )
+                .await;
+        }
+    }
     inject_after_interrupt(server_state, run_id, slot_id, probe, interrupt, attempts).await
 }
 
@@ -499,7 +514,7 @@ async fn inject_after_interrupt(
     // Re-snapshot after the turn ended: the reply we want is the worker's
     // answer to *this* text, not the tail of the turn we just cancelled.
     let (transcript_path, offset_bytes) = super::worker_events::transcript_offset_for_run(server_state, run_id).await;
-    server_state.update_in_flight_probe_snapshot(run_id, transcript_path.clone(), offset_bytes);
+    server_state.update_in_flight_probe_snapshot(run_id, &probe.probe_id, transcript_path.clone(), offset_bytes);
 
     let mut posture = server_state.pane_input_posture_for_run(run_id, slot_id);
     if !posture.permits_write() && server_state.pane_text_shows_turn_ended(run_id).await {
@@ -774,7 +789,7 @@ async fn settle_interrupt_failure(
     // Drop the claim without re-queuing: the probe is settled terminally, and
     // leaving it in the pending queue would have a later boundary deliver
     // text the caller has already been told did not arrive.
-    server_state.take_in_flight_probe(run_id);
+    server_state.take_in_flight_probe_if(run_id, &probe_id, |_| true);
     let state = if failure.worker_gone {
         ProbeDeliveryState::Abandoned
     } else {

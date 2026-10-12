@@ -959,8 +959,12 @@ async fn second_nudge_interrupts_a_worker_that_resumed_into_another_long_tool_ca
     );
     assert_eq!(
         server_state.probe_lifecycle_state(&first),
-        Some(ProbeDeliveryState::Consumed),
-        "the superseded probe was already delivered; only its reply slot moved on",
+        Some(ProbeDeliveryState::Orphaned),
+        "the superseded probe was delivered but its reply turn was interrupted",
+    );
+    assert_eq!(
+        server_state.probe_record(&first).unwrap().detail,
+        Some(format!("reply turn interrupted by probe {second}")),
     );
     assert!(server_state.pop_pending_probe(&run_id).is_none());
 }

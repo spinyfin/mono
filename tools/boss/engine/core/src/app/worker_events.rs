@@ -2469,29 +2469,24 @@ pub(super) async fn dispatch_probe_reply_on_stop(
     while let Some(previous) = server_state.take_previous_probe_reply(run_id) {
         previous_replies.push(previous);
     }
-    // Peek before taking. A claim whose probe is still `Queued` has not been
-    // written into the pane yet — the interrupting delivery path holds one
-    // across the whole interrupt, precisely so no other dispatcher can
-    // deliver the same probe on the boundary that interrupt produces. Taking
-    // it here would free the run's delivery slot out from under an in-progress
-    // delivery and let a second one start. Every other state means the write
-    // has at least been issued, which is the case the unconditional take was
-    // written for, so this leaves that behaviour exactly as it was.
-    let current = if server_state
-        .in_flight_probe_id(run_id)
-        .and_then(|probe_id| server_state.probe_lifecycle_state(&probe_id))
-        == Some(ProbeDeliveryState::Queued)
-    {
-        None
-    } else {
-        server_state.take_in_flight_probe(run_id)
-    };
+    // Compare both identity and lifecycle while holding the ownership lock.
+    let current = server_state.in_flight_probe_id(run_id).and_then(|probe_id| {
+        server_state.take_in_flight_probe_if(run_id, &probe_id, |state| {
+            matches!(
+                state,
+                ProbeDeliveryState::Injected
+                    | ProbeDeliveryState::Consumed
+                    | ProbeDeliveryState::Buffered
+                    | ProbeDeliveryState::Unconfirmed
+                    | ProbeDeliveryState::Orphaned
+            )
+        })
+    });
     // Decide which claim this boundary can consume before awaiting transcript
     // reads: the replacement may be submitted while an older reply is read.
     for previous in previous_replies {
-        if !dispatch_one_probe_reply(server_state, run_id, &previous).await {
-            server_state.restore_previous_probe_reply(run_id, previous);
-        }
+        let replied = dispatch_one_probe_reply(server_state, run_id, &previous).await;
+        server_state.finish_previous_probe_reply(run_id, &previous.probe_id, replied);
     }
     if let Some(current) = current {
         dispatch_one_probe_reply(server_state, run_id, &current).await;
