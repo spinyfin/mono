@@ -130,6 +130,9 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::GetAutomation { .. }
         | FrontendRequest::GetAutomationOpenTaskCount { .. }
         | FrontendRequest::GetAutomationState
+        | FrontendRequest::GetBoothbyState
+        | FrontendRequest::ListBoothbyPasses { .. }
+        | FrontendRequest::SetBoothbyMode { .. }
         | FrontendRequest::GetCiBudget { .. }
         | FrontendRequest::GetCiRemediation { .. }
         | FrontendRequest::GetConflictHotspots { .. }
@@ -322,6 +325,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::RetryConflictResolution { .. }
         | FrontendRequest::RetryReviewGuide { .. }
         | FrontendRequest::RunAutomation { .. }
+        | FrontendRequest::RunBoothbyPass
         | FrontendRequest::SendInputToWorker { .. }
         | FrontendRequest::Shutdown { .. }
         | FrontendRequest::SpawnCapabilityRestored

@@ -6,6 +6,24 @@
 
 use super::*;
 
+pub(super) fn spawn_scheduler(server_state: &Arc<ServerState>) -> tokio::task::JoinHandle<()> {
+    // Boothby scheduler (boothby.md, design task 3): adaptive-sleep loop
+    // over the cron `boothby.schedule` setting plus the event-trigger queue
+    // fed by `BoothbyEventSink` and the attention-creation hook. Every pass
+    // today reports `nothing_to_do` via `NothingToDoPassRunner` — the brief
+    // composer and session spawn (design tasks 4/5) aren't wired up yet —
+    // but the pass lifecycle, settings, RPCs, and event triggers are fully
+    // live, so `boss boothby run` / the mode RPCs already work end to end.
+    crate::boothby_scheduler::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.settings.clone(),
+        server_state.boothby_events.clone(),
+        server_state.boothby_kick.clone(),
+        Arc::new(crate::boothby_scheduler::NothingToDoPassRunner),
+        server_state.clone(),
+    )
+}
+
 /// `RunBoothbyPass` / `SetBoothbyMode` mutate Boothby's control state, so —
 /// like the pane-control and probe RPCs — they require an app/Boss-descended
 /// caller. `GetBoothbyState` / `ListBoothbyPasses` are read-only and

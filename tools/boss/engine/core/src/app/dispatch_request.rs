@@ -1,28 +1,23 @@
-//! The dispatch table for `handle_frontend_connection`: one match arm per
-//! [`FrontendRequest`] variant, routing to its handler module. Split out of
-//! `app.rs` to keep that file under the repo's file-size limit.
-
+//! Boxed frontend handler routing shared by live requests and admitted reads.
+use super::*;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::protocol::FrontendRequest;
-
-use super::{
-    Dispatch, attachments, attentions, automations, boothby, ci_remediation, comments, conflict_resolution, context,
-    coordinator_handoff, cost, decisions, dependencies, design_docs, effort, engine_meta, executions, external_tracker,
-    github_auth, hosts, ideas, live_status, metrics, panes, planner_ops, pr_status, products, projects, proposals,
-    review, review_guide, selected_product, sessions, subscriptions, trunk_auth, work_items,
-};
-
-// Box each arm's future individually so the outer match holds a single
-// pointer rather than a generator sized to the sum of every arm. Boxing only
-// the whole `match` as one `async move` block still materializes the summed
-// state machine as a stack temporary before moving it to the heap; the stack
-// requirement grows with every new `FrontendRequest` variant and previously
-// overflowed Linux CI's sandbox thread once Ideas added more variants
-// (`control_verbs_test` aborted with `has overflowed its stack`).
 pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
+    // Box each arm's future individually so the outer match holds a
+    // single pointer rather than a generator sized to the sum of every
+    // arm. Boxing only the whole `match` as one `async move` block (the
+    // prior mitigation here) still materializes the summed state machine
+    // as a stack temporary before moving it to the heap; the stack
+    // requirement grows with every new `FrontendRequest` variant and
+    // previously overflowed Linux CI's sandbox thread once Ideas added
+    // more variants (`control_verbs_test` aborted with `has overflowed
+    // its stack`).
     let dispatch_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match request {
+        r @ FrontendRequest::GetBoothbyState => Box::pin(boothby::handle_get_boothby_state(ctx, r)),
+        r @ FrontendRequest::ListBoothbyPasses { .. } => Box::pin(boothby::handle_list_boothby_passes(ctx, r)),
+        r @ FrontendRequest::RunBoothbyPass => Box::pin(boothby::handle_run_boothby_pass(ctx, r)),
+        r @ FrontendRequest::SetBoothbyMode { .. } => Box::pin(boothby::handle_set_boothby_mode(ctx, r)),
         r @ FrontendRequest::AbandonCiRemediation { .. } => {
             Box::pin(ci_remediation::handle_abandon_ci_remediation(ctx, r))
         }
@@ -37,6 +32,9 @@ pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
         r @ FrontendRequest::AddHost { .. } => Box::pin(hosts::handle_add_host(ctx, r)),
         r @ FrontendRequest::AddHostTag { .. } => Box::pin(hosts::handle_add_host_tag(ctx, r)),
         r @ FrontendRequest::AnswerAttention { .. } => Box::pin(attentions::handle_answer_attention(ctx, r)),
+        r @ FrontendRequest::AnswerOperatorQuestion { .. } | r @ FrontendRequest::ListOperatorQuestions { .. } => {
+            Box::pin(work_items::handle_operator_question(ctx, r))
+        }
         r @ FrontendRequest::AuditProductEffort { .. } => Box::pin(effort::handle_audit_product_effort(ctx, r)),
         r @ FrontendRequest::CancelExecution { .. } => Box::pin(executions::handle_cancel_execution(ctx, r)),
         r @ FrontendRequest::ClassifyCiRemediation { .. } => {
@@ -49,6 +47,9 @@ pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
         r @ FrontendRequest::CommentsList { .. } => Box::pin(comments::handle_comments_list(ctx, r)),
         r @ FrontendRequest::CommentsPostAnswer { .. } => Box::pin(comments::handle_comments_post_answer(ctx, r)),
         r @ FrontendRequest::CommentsPostFollowup { .. } => Box::pin(comments::handle_comments_post_followup(ctx, r)),
+        r @ FrontendRequest::CommentsRecordGuideOutcome { .. } => {
+            Box::pin(comments::handle_comments_record_guide_outcome(ctx, r))
+        }
         r @ FrontendRequest::CommentsResolve { .. } => Box::pin(comments::handle_comments_resolve(ctx, r)),
         r @ FrontendRequest::CommentsReviseDoc { .. } => Box::pin(comments::handle_comments_revise_doc(ctx, r)),
         r @ FrontendRequest::CommentsSetIntent { .. } => Box::pin(comments::handle_comments_set_intent(ctx, r)),
@@ -95,7 +96,6 @@ pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
             Box::pin(automations::handle_get_automation_open_task_count(ctx, r))
         }
         r @ FrontendRequest::GetAutomationState => Box::pin(engine_meta::handle_get_automation_state(ctx, r)),
-        r @ FrontendRequest::GetBoothbyState => Box::pin(boothby::handle_get_boothby_state(ctx, r)),
         r @ FrontendRequest::GetCiBudget { .. } => Box::pin(ci_remediation::handle_get_ci_budget(ctx, r)),
         r @ FrontendRequest::GetDriverQuotaUsage { .. } => Box::pin(engine_meta::handle_get_driver_quota_usage(ctx, r)),
         r @ FrontendRequest::GetDriverTrafficSplit => Box::pin(engine_meta::handle_get_driver_traffic_split(ctx, r)),
@@ -113,6 +113,8 @@ pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
         r @ FrontendRequest::GetDecision { .. } => Box::pin(decisions::handle_get_decision(ctx, r)),
         r @ FrontendRequest::GetDispatchConcurrency => Box::pin(engine_meta::handle_get_dispatch_concurrency(ctx, r)),
         r @ FrontendRequest::GetDispatchState => Box::pin(engine_meta::handle_get_dispatch_state(ctx, r)),
+        r @ FrontendRequest::GetOffsiteBackup => Box::pin(engine_meta::handle_get_offsite_backup(ctx, r)),
+        r @ FrontendRequest::GetEnginePoolConfig => Box::pin(engine_meta::handle_get_engine_pool_config(ctx, r)),
         r @ FrontendRequest::GetEngineHealth => Box::pin(engine_meta::handle_get_engine_health(ctx, r)),
         r @ FrontendRequest::GetEngineVersion => Box::pin(engine_meta::handle_get_engine_version(ctx, r)),
         r @ FrontendRequest::GetExecution { .. } => Box::pin(executions::handle_get_execution(ctx, r)),
@@ -163,11 +165,13 @@ pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
         r @ FrontendRequest::ListAutomationRuns { .. } => Box::pin(automations::handle_list_automation_runs(ctx, r)),
         r @ FrontendRequest::ListAutomations { .. } => Box::pin(automations::handle_list_automations(ctx, r)),
         r @ FrontendRequest::ListAutomationTasks { .. } => Box::pin(automations::handle_list_automation_tasks(ctx, r)),
-        r @ FrontendRequest::ListBoothbyPasses { .. } => Box::pin(boothby::handle_list_boothby_passes(ctx, r)),
         r @ FrontendRequest::ListChores { .. } => Box::pin(work_items::handle_list_chores(ctx, r)),
         r @ FrontendRequest::ListCiRemediations { .. } => Box::pin(ci_remediation::handle_list_ci_remediations(ctx, r)),
         r @ FrontendRequest::ListConflictResolutions { .. } => {
             Box::pin(conflict_resolution::handle_list_conflict_resolutions(ctx, r))
+        }
+        r @ FrontendRequest::ListCoordinatorGuidance { .. } => {
+            Box::pin(coordinator_guidance::handle_list_coordinator_guidance(ctx, r))
         }
         r @ FrontendRequest::ListDecisions { .. } => Box::pin(decisions::handle_list_decisions(ctx, r)),
         r @ FrontendRequest::ListDeferredScopeAttentions { .. } => {
@@ -248,6 +252,9 @@ pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
         r @ FrontendRequest::RemoveHostTag { .. } => Box::pin(hosts::handle_remove_host_tag(ctx, r)),
         r @ FrontendRequest::ReorderProjectTasks { .. } => Box::pin(projects::handle_reorder_project_tasks(ctx, r)),
         r @ FrontendRequest::RequestExecution { .. } => Box::pin(executions::handle_request_execution(ctx, r)),
+        r @ FrontendRequest::RequestWorkerPaneAttach { .. } => {
+            Box::pin(panes::handle_request_worker_pane_attach(ctx, r))
+        }
         r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
             Box::pin(projects::handle_resolve_project_design_doc(ctx, r))
         }
@@ -258,17 +265,17 @@ pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
             Box::pin(conflict_resolution::handle_retry_conflict_resolution(ctx, r))
         }
         r @ FrontendRequest::RetryReviewGuide { .. } => Box::pin(review_guide::handle_retry_review_guide(ctx, r)),
+        r @ FrontendRequest::GenerateReviewGuide { .. } => Box::pin(review_guide::handle_generate_review_guide(ctx, r)),
         r @ FrontendRequest::RevealWorkItem { .. } => Box::pin(work_items::handle_reveal_work_item(ctx, r)),
         r @ FrontendRequest::RevokeDecision { .. } => Box::pin(decisions::handle_revoke_decision(ctx, r)),
         r @ FrontendRequest::RunAutomation { .. } => Box::pin(automations::handle_run_automation(ctx, r)),
-        r @ FrontendRequest::RunBoothbyPass => Box::pin(boothby::handle_run_boothby_pass(ctx, r)),
         r @ FrontendRequest::SendInputToWorker { .. } => Box::pin(panes::handle_send_input_to_worker(ctx, r)),
         r @ FrontendRequest::SetAutomationPaused { .. } => Box::pin(engine_meta::handle_set_automation_paused(ctx, r)),
-        r @ FrontendRequest::SetBoothbyMode { .. } => Box::pin(boothby::handle_set_boothby_mode(ctx, r)),
         r @ FrontendRequest::SetCiBudget { .. } => Box::pin(ci_remediation::handle_set_ci_budget(ctx, r)),
         r @ FrontendRequest::SetDriverTrafficSplit { .. } => {
             Box::pin(engine_meta::handle_set_driver_traffic_split(ctx, r))
         }
+        r @ FrontendRequest::SetOffsiteBackup { .. } => Box::pin(engine_meta::handle_set_offsite_backup(ctx, r)),
         r @ FrontendRequest::SetDispatchConcurrency { .. } => {
             Box::pin(engine_meta::handle_set_dispatch_concurrency(ctx, r))
         }
@@ -307,6 +314,7 @@ pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
         r @ FrontendRequest::SetTaskDocPointer { .. } => Box::pin(work_items::handle_set_task_doc_pointer(ctx, r)),
         r @ FrontendRequest::Shutdown { .. } => Box::pin(sessions::handle_shutdown(ctx, r)),
         r @ FrontendRequest::SpawnCapabilityRestored => Box::pin(sessions::handle_spawn_capability_restored(ctx, r)),
+        r @ FrontendRequest::StartProjectPostmortem { .. } => Box::pin(project_postmortem_ops::handle_start(ctx, r)),
         r @ FrontendRequest::StopRun { .. } => Box::pin(executions::handle_stop_run(ctx, r)),
         r @ FrontendRequest::SubmitAttachment { .. } => Box::pin(attachments::handle_submit_attachment(ctx, r)),
         r @ FrontendRequest::SubmitProposal { .. } => Box::pin(proposals::handle_submit_proposal(ctx, r)),
@@ -316,7 +324,7 @@ pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
             Box::pin(external_tracker::handle_sync_product_external_tracker(ctx, r))
         }
         r @ FrontendRequest::TailRunTranscript { .. } => Box::pin(executions::handle_tail_run_transcript(ctx, r)),
-        r @ FrontendRequest::TriggerPrReview { .. } => Box::pin(review::handle_trigger_pr_review(ctx, r)),
+        r @ FrontendRequest::TriggerPrReview { .. } => Box::pin(review_start::handle_trigger_pr_review(ctx, r)),
         r @ FrontendRequest::TrunkSetToken { .. } => Box::pin(trunk_auth::handle_trunk_set_token(ctx, r)),
         r @ FrontendRequest::TrunkStatus => Box::pin(trunk_auth::handle_trunk_status(ctx, r)),
         r @ FrontendRequest::UnlinkWorkItemExternalRef { .. } => {
@@ -331,11 +339,6 @@ pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest) {
         r @ FrontendRequest::ReportSelectedProduct { .. } => {
             Box::pin(selected_product::handle_report_selected_product(ctx, r))
         }
-        r @ FrontendRequest::ReportWorkerSpawnFailed { .. } => {
-            Box::pin(sessions::handle_report_worker_spawn_failed(ctx, r))
-        }
-        r @ FrontendRequest::UpdateWorkerShellPid { .. } => Box::pin(sessions::handle_update_worker_shell_pid(ctx, r)),
-        r @ FrontendRequest::WorkerPaneDied { .. } => Box::pin(sessions::handle_worker_pane_died(ctx, r)),
         r @ FrontendRequest::WorkerPoolSummary => Box::pin(engine_meta::handle_worker_pool_summary(ctx, r)),
         r @ FrontendRequest::WorkspacePoolSummary => Box::pin(engine_meta::handle_workspace_pool_summary(ctx, r)),
     };

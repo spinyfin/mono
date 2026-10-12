@@ -44,8 +44,9 @@ use crate::protocol::{
     DispatchAdmissionEntryPoint, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput,
     FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
     HostedPaneState, HostedPaneStatus, ListHostedPanesInput, OpenDocumentInput, OrgAuthState, RequestExecutionInput,
-    RevealWorkItemInput, TOPIC_BOOTHBY_ACTIVITY, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES,
-    TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
+    RevealWorkItemInput, TOPIC_BOOTHBY_ACTIVITY, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS,
+    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic,
+    work_product_topic,
 };
 use crate::repo_slug;
 use crate::runner::ExecutionRunner;
@@ -1503,8 +1504,24 @@ impl ServerState {
         // so merge-triggered cancellation and ordinary dispatch share one
         // timeline sink.
         let dispatch_event_root: PathBuf = state_root.clone();
+
+        // Boothby's event-trigger queue (`boothby.md` §"Activation model"):
+        // armed either by a dispatch-stage sink (below, fanned out alongside
+        // the production JSONL sink) or by the attention-creation hook
+        // registered on `work_db` just below. `boothby_kick` doubles as the
+        // scheduler's wake signal for reasons unrelated to an event trigger
+        // (manual run, mode change) — see `app::server::serve`.
+        let boothby_kick = Arc::new(Notify::new());
+        let boothby_events = crate::boothby_events::BoothbyEventQueue::new(boothby_kick.clone());
+        work_db.set_boothby_event_queue(boothby_events.clone());
+        let boothby_events_for_state = boothby_events.clone();
+        let boothby_kick_for_state = boothby_kick.clone();
+
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
-            Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
+            Arc::new(crate::dispatch_events::FanOutDispatchEventSink::new(vec![
+                Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone())),
+                Arc::new(crate::dispatch_events::BoothbyEventSink::new(boothby_events.clone())),
+            ]));
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();
@@ -1654,27 +1671,6 @@ impl ServerState {
         // `state.db`, so an install's data is one directory.
         let attachment_state_root: PathBuf = state_root.clone();
 
-        // Dispatch-event JSONL stream lands next to state.db /
-        // events.sock under the same `state_root` resolved above.
-        let dispatch_event_root: PathBuf = state_root.clone();
-
-        // Boothby's event-trigger queue (`boothby.md` §"Activation model"):
-        // armed either by a dispatch-stage sink (below, fanned out alongside
-        // the production JSONL sink) or by the attention-creation hook
-        // registered on `work_db` just below. `boothby_kick` doubles as the
-        // scheduler's wake signal for reasons unrelated to an event trigger
-        // (manual run, mode change) — see `app::server::serve`.
-        let boothby_kick = Arc::new(Notify::new());
-        let boothby_events = crate::boothby_events::BoothbyEventQueue::new(boothby_kick.clone());
-        work_db.set_boothby_event_queue(boothby_events.clone());
-        let boothby_events_for_state = boothby_events.clone();
-        let boothby_kick_for_state = boothby_kick.clone();
-
-        let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
-            Arc::new(crate::dispatch_events::FanOutDispatchEventSink::new(vec![
-                Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone())),
-                Arc::new(crate::dispatch_events::BoothbyEventSink::new(boothby_events.clone())),
-            ]));
         let dispatch_events_for_state = dispatch_events.clone();
         let dispatch_event_root_for_state = dispatch_event_root.clone();
         let ipc_logger = IpcLogger::new(&dispatch_event_root);
