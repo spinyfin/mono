@@ -713,6 +713,10 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     Use `--description "$(cat <<'EOF' … EOF)"` when the description contains code, file paths, or shell metacharacters.
 
+    ### 5. Run allowlisted mutating commands on their own
+
+    Permission allow rules (e.g. for `boss task delete`) only match when they cover the **whole** Bash command. Chaining an allowlisted command with anything else (`;`, `&&`, `|`, `--help` first, a `show … | python3` read-back) makes it a compound command that the rule doesn't cover, so Claude Code's auto-mode classifier evaluates it and may deny it. Issue mutating `boss`/`bossctl` commands (delete, depend rm, update, work start/cancel) as a single standalone call, and read back in a separate call. Never tell the operator a permission is missing until a standalone invocation has been tried. Soft-deleting stale or superseded work items is coordinator work; do it yourself.
+
     ## Diagnostics
 
     ### Reading engine evidence
