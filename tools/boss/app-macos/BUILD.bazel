@@ -84,6 +84,16 @@ swift_library(
         "-swift-version",
         "6",
         "-strict-concurrency=complete",
+        # Let the Swift driver run its batch-mode frontend jobs in parallel.
+        # Without `-j`, swift-driver executes jobs one at a time, so the eight
+        # ~25-file batches this module splits into compile strictly
+        # sequentially on one core (~36s of CPU serialised into a 65-90s
+        # action, measured; see docs/swift-compile-time.md). Eight matches the
+        # partition count the driver already picks for this module's size, so
+        # batch boundaries are unchanged. Opt (`-c opt`) builds are unaffected:
+        # rules_swift compiles them whole-module with `-num-threads`.
+        "-j",
+        "8",
     ],
     module_name = "Boss",
     deps = [
