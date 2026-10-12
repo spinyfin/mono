@@ -34,8 +34,8 @@ final class ReviewGuideTests: XCTestCase {
         )
         XCTAssertEqual(presentation?.readableVersionId, "previous")
         XCTAssertEqual(presentation?.showsProgress, true)
-        XCTAssertEqual(presentation?.tooltip, status)
-        XCTAssertEqual(presentation?.accessibilityLabel, status)
+        XCTAssertEqual(presentation?.tooltip, "Open older review guide; updating\u{2026} \(status)")
+        XCTAssertEqual(presentation?.accessibilityLabel, "Open older review guide; updating. \(status)")
         let failed = ReviewGuideCardPresentation.from(
             lifecycle: "failed", readableVersionId: "previous", staleSource: true,
             updateStatus: "Update after revision revision-one failed; previous guide retained"
@@ -43,6 +43,31 @@ final class ReviewGuideTests: XCTestCase {
         XCTAssertEqual(failed?.showsDocumentButton, true)
         XCTAssertEqual(failed?.showsRetry, true)
         XCTAssertEqual(failed?.readableVersionId, "previous")
+    }
+
+    func testUpdateStatusComposesWithFailureReasonAndOpenAction() {
+        let status = "Update after revision revision-one failed; previous guide retained"
+        let refreshFailed = ReviewGuideCardPresentation.from(
+            lifecycle: "failed", readableVersionId: "previous", staleSource: true,
+            error: "pinned delta unavailable", updateStatus: status
+        )
+        XCTAssertEqual(
+            refreshFailed?.tooltip,
+            "Guide covers an older revision \u{2014} refresh failed. pinned delta unavailable. \(status)"
+        )
+        XCTAssertEqual(
+            refreshFailed?.accessibilityLabel,
+            "Review guide refresh failed: pinned delta unavailable. \(status)"
+        )
+        let failed = ReviewGuideCardPresentation.from(
+            lifecycle: "failed", readableVersionId: nil, error: "boom", updateStatus: status
+        )
+        XCTAssertEqual(failed?.tooltip, "Review guide failed to generate. boom. \(status)")
+        let ready = ReviewGuideCardPresentation.from(
+            lifecycle: "ready", readableVersionId: "v1", updateStatus: "Updated for revision r at abc"
+        )
+        XCTAssertEqual(ready?.tooltip, "Open review guide. Updated for revision r at abc")
+        XCTAssertEqual(ready?.accessibilityLabel, "Open review guide. Updated for revision r at abc")
     }
 
     func testGenerateMenuVisibilityAndLabelIncludingDoneWork() {

@@ -98,7 +98,7 @@ impl WorkDb {
             tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")?;
         }
         if version < 42 {
-            review_guide_jobs::updates::migrate(&tx)?;
+            review_guide_jobs::guide_updates::migrate(&tx)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -639,6 +639,9 @@ mod floor_tests {
                 conn.execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
                     .unwrap();
             }
+            if version >= 42 {
+                review_guide_jobs::guide_updates::migrate(&conn).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -667,6 +670,7 @@ mod floor_tests {
             expected
                 .execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
                 .unwrap();
+            review_guide_jobs::guide_updates::migrate(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

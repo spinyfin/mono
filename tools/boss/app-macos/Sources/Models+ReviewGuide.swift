@@ -118,8 +118,19 @@ struct ReviewGuideCardPresentation: Equatable {
         Self.summaryLine(of: error)
     }
 
+    /// The revision-update status is appended to the lifecycle text, never a
+    /// replacement for it: the open action and any stored failure reason stay.
     var accessibilityLabel: String {
-        if let updateStatus { return updateStatus }
+        Self.compose(lifecycleAccessibilityLabel, updateStatus)
+    }
+
+    private static func compose(_ base: String, _ updateStatus: String?) -> String {
+        guard let updateStatus, !updateStatus.isEmpty else { return base }
+        let separator = base.hasSuffix(".") || base.hasSuffix("?") || base.hasSuffix("\u{2026}") ? " " : ". "
+        return base + separator + updateStatus
+    }
+
+    private var lifecycleAccessibilityLabel: String {
         switch kind {
         case .generating: return "Generating review guide"
         case .refreshing: return "Open older review guide; updating"
@@ -142,8 +153,11 @@ struct ReviewGuideCardPresentation: Equatable {
     }
 
     var tooltip: String {
+        Self.compose(lifecycleTooltip, updateStatus)
+    }
+
+    private var lifecycleTooltip: String {
         let fullError = error?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let updateStatus { return updateStatus }
         switch kind {
         case .generating: return "Generating review guide\u{2026}"
         case .refreshing: return "Open older review guide; updating\u{2026}"

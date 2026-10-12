@@ -318,17 +318,19 @@ fn untracked_and_deleted_findings_stay_open() {
     assert!(untracked.addendum_markdown.ends_with("- [high] Unchecked index"));
 }
 
-#[test]
-fn updated_guide_marks_the_completed_revision_findings_resolved() {
-    let (_dir, db) = open_db();
-    let product = create_test_product(&db);
-    let root = create_test_chore_manual(&db, product.id, "updated findings");
-    bind_open_pr(&db, &root.id);
-    let revision = apply_findings(&db, &root.id, "head-one");
+/// Seed a published guide at `head-one`, then the revision's `head-two`
+/// capture with its own admitted (queued) incremental update attempt.
+struct UpdatedGuide {
+    revision: String,
+    update_attempt: String,
+}
+
+fn seed_update(db: &WorkDb, root: &str, published_head: &str) -> UpdatedGuide {
+    let revision = apply_findings(db, root, "head-one");
     let capture = |head, sequence| {
         let PrSourceCapturePersistOutcome::Stored(capture) = db
             .persist_pr_review_guide_source_capture(
-                &root.id,
+                root,
                 sequence,
                 PrSourceCaptureTrigger::Completion,
                 &crate::test_support::source_capture_packet(PR_URL, "base", head),
@@ -345,21 +347,99 @@ fn updated_guide_marks_the_completed_revision_findings_resolved() {
         .unwrap();
     db.publish_pr_review_guide_version(&attempt.id, "# Previous", "raw")
         .unwrap();
-    db.record_review_guide_revision_head(&root.id, PR_URL, "head-two", &revision, 2)
+    db.record_review_guide_revision_head(root, PR_URL, "head-two", &revision, 2)
         .unwrap();
-    let new = capture("head-two", 2);
+    let new = capture(published_head, 2);
     let attempt = db
-        .create_pr_review_guide_attempt(&new.series_id, &new.comparison_id, "test")
+        .create_automatic_pr_review_guide_attempt(&new.series_id, &new.comparison_id)
         .unwrap();
-    assert!(
-        !findings(&db, &root.id)
-            .unwrap()
-            .addendum_markdown
-            .contains("(resolved)")
-    );
-    db.publish_pr_review_guide_version(&attempt.id, "# Updated", "raw")
+    UpdatedGuide {
+        revision,
+        update_attempt: attempt.id,
+    }
+}
+
+fn set_status(db: &WorkDb, id: &str, status: &str) {
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![id, status])
         .unwrap();
-    let supplement = findings(&db, &root.id).unwrap();
-    assert!(supplement.addendum_markdown.contains("(resolved)"));
-    assert!(supplement.status_text.contains("fixes complete"));
+}
+
+fn publish_update(db: &WorkDb, guide: &UpdatedGuide) {
+    db.publish_pr_review_guide_version(&guide.update_attempt, "# Updated", "raw")
+        .unwrap();
+}
+
+#[test]
+fn updated_guide_marks_the_completed_revision_findings_resolved() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "updated findings");
+    bind_open_pr(&db, &root.id);
+    let guide = seed_update(&db, &root.id, "head-two");
+    set_status(&db, &guide.revision, "active");
+    let before = findings(&db, &root.id).unwrap();
+    assert!(!before.addendum_markdown.contains("~~"));
+    assert!(before.status_text.contains("0 fixed on PR, 1 in progress, 0 open"));
+    set_status(&db, &guide.revision, "in_review");
+    publish_update(&db, &guide);
+    let after = findings(&db, &root.id).unwrap();
+    assert!(after.addendum_markdown.contains("- ✓ ~~[high] Unchecked index~~"));
+    assert!(after.status_text.contains("1 fixed on PR, 0 in progress, 0 open"));
+}
+
+#[test]
+fn reopened_revision_is_not_fixed_even_when_its_head_was_published() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "reopened findings");
+    bind_open_pr(&db, &root.id);
+    let guide = seed_update(&db, &root.id, "head-two");
+    publish_update(&db, &guide);
+    for status in ["todo", "active", "blocked"] {
+        set_status(&db, &guide.revision, status);
+        let text = findings(&db, &root.id).unwrap();
+        assert!(!text.addendum_markdown.contains("~~"), "{status}");
+        assert!(
+            text.status_text.contains("0 fixed on PR, 1 in progress, 0 open"),
+            "{status}"
+        );
+    }
+}
+
+#[test]
+fn revision_head_replaced_by_a_force_push_is_not_fixed() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "force pushed findings");
+    bind_open_pr(&db, &root.id);
+    // The published head is not the head the revision produced.
+    let guide = seed_update(&db, &root.id, "head-three");
+    set_status(&db, &guide.revision, "archived");
+    publish_update(&db, &guide);
+    let text = findings(&db, &root.id).unwrap();
+    assert!(!text.addendum_markdown.contains("~~"));
+    assert!(text.status_text.contains("0 fixed on PR, 0 in progress, 1 open"));
+}
+
+#[test]
+fn update_waits_while_a_revision_in_the_chain_can_still_write() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "writer wait");
+    bind_open_pr(&db, &root.id);
+    let guide = seed_update(&db, &root.id, "head-two");
+    let has_writer = |db: &WorkDb| {
+        let conn = db.connect().unwrap();
+        super::review_guide_jobs::guide_updates::chain_has_active_writer(&conn, &guide.update_attempt).unwrap()
+    };
+    for status in ["todo", "active", "blocked"] {
+        set_status(&db, &guide.revision, status);
+        assert!(has_writer(&db), "{status}");
+    }
+    for status in ["in_review", "done", "archived"] {
+        set_status(&db, &guide.revision, status);
+        assert!(!has_writer(&db), "{status}");
+    }
 }

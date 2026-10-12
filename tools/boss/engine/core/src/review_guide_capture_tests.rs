@@ -566,6 +566,11 @@ async fn revision_completion_coalesces_from_published_head_and_failure_keeps_pre
                 )
                 .unwrap();
             revision_execution = Some(execution.id.clone());
+            // Completion has moved the revision to review: it is no longer a chain writer.
+            db.connect()
+                .unwrap()
+                .execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", [&revision.id])
+                .unwrap();
             let packet = source_capture_packet(url, "base", head);
             if pre_captured {
                 let sequence = db.allocate_pr_review_guide_source_observation_sequence().unwrap();

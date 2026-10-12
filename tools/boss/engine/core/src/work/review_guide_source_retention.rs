@@ -81,6 +81,8 @@ impl WorkDb {
                   AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u
                       JOIN pr_review_guide_attempts a ON a.id = u.attempt_id
                       WHERE u.previous_version_id = v.id AND a.status IN ('queued', 'running'))
+                  -- A failed update keeps the previous version readable.
+                  AND NOT (s.guide_lifecycle = 'failed' AND s.readable_version_id = v.id)
              )",
             [cutoff],
         )?;
@@ -97,6 +99,8 @@ impl WorkDb {
                   AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u
                       JOIN pr_review_guide_attempts a ON a.id = u.attempt_id
                       WHERE u.previous_version_id = v.id AND a.status IN ('queued', 'running'))
+                  -- A failed update keeps the previous version readable.
+                  AND NOT (s.guide_lifecycle = 'failed' AND s.readable_version_id = v.id)
             )",
             [cutoff],
         )?;

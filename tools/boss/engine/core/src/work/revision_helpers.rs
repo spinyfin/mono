@@ -892,7 +892,7 @@ pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], c
             task.review_guide_stale_source = state.stale_source;
             task.review_guide_error = state.error.clone();
             if let Some(pr) = &task.pr_url {
-                task.review_guide_update_status = super::review_guide_jobs::updates::status(conn, &task.id, pr)?;
+                task.review_guide_update_status = super::review_guide_jobs::guide_updates::status(conn, &task.id, pr)?;
             }
         }
     }
