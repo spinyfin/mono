@@ -167,7 +167,7 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
         }
     };
     let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
-    let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
+    let working_directory = match server_state.coordinator_session_directory() {
         Ok(path) => path,
         Err(error) => {
             tracing::error!(error = %format!("{error:#}"), "failed to resolve coordinator session directory");
@@ -610,7 +610,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             return;
         }
     };
-    let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
+    let working_directory = match server_state.coordinator_session_directory() {
         Ok(path) => path,
         Err(error) => {
             send_response(

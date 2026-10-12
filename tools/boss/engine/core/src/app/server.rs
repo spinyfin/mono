@@ -797,7 +797,7 @@ pub async fn serve_with_overrides(
             // coordinator attach/recreate.
             let (restart, active_tmux) = {
                 let _guard = coordinator_supervisor_state.coordinator_tmux_lock.lock().await;
-                let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
+                let working_directory = match coordinator_supervisor_state.coordinator_session_directory() {
                     Ok(path) => Some(path),
                     Err(error) => {
                         tracing::warn!(
