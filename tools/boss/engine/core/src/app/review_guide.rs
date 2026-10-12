@@ -95,6 +95,30 @@ pub(super) async fn handle_generate_review_guide(ctx: Dispatch, req: FrontendReq
     }
 }
 
+async fn recapture_review_guide_source(
+    db: &crate::work::WorkDb,
+    server_state: &ServerState,
+    task_id: &str,
+) -> anyhow::Result<()> {
+    let root_id = {
+        let conn = db.connect()?;
+        crate::work::chain_root(&conn, task_id)?
+    };
+    let task = match db.get_work_item(&root_id)? {
+        boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task) => task,
+        _ => anyhow::bail!("review guides require a task with a PR"),
+    };
+    let pr_url = task
+        .pr_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("work item has no PR URL; cannot recapture review guide sources"))?;
+    server_state
+        .completion_handler
+        .capture_review_guide_source_manually(&root_id, pr_url)
+        .await
+}
+
 async fn generate_review_guide(
     ctx: &Dispatch,
     task_id: &str,
@@ -202,6 +226,18 @@ pub(super) async fn handle_retry_review_guide(ctx: Dispatch, req: FrontendReques
     else {
         unreachable!()
     };
+    // A failed source capture left the series on the old head. Retry first runs
+    // the same fresh pinned-source capture as Generate, then re-admits the
+    // update from the published version (the revision head is already recorded).
+    let recapture = match work_db.pr_review_guide_capture_error_for_root(&root_task_id) {
+        Ok(Some(_)) => recapture_review_guide_source(&work_db, &server_state, &root_task_id).await,
+        Ok(None) => Ok(()),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = recapture {
+        send_work_error(&sink, &request_id, &err);
+        return;
+    }
     match work_db.retry_pr_review_guide(
         &root_task_id,
         idempotency_token.as_deref(),

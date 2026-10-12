@@ -339,6 +339,10 @@ impl WorkDb {
         // Only the automatic, revision-triggered path may start from the
         // published version; an explicit Generate/Regenerate is a full run.
         if incremental {
+            tx.execute(
+                "INSERT INTO pr_review_guide_automatic_attempts (attempt_id) VALUES (?1)",
+                [&attempt_id],
+            )?;
             guide_updates::snapshot(&tx, &attempt_id, series_id, comparison_id)?;
         }
         let attempt =
@@ -989,6 +993,19 @@ impl WorkDb {
         )
     }
 
+    /// The pending source-capture failure for a root's guide series, if any.
+    pub(crate) fn pr_review_guide_capture_error_for_root(&self, root_task_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let Some(summary) = query_pr_review_guide_summary_for_root(&conn, root_task_id, None, None)? else {
+            return Ok(None);
+        };
+        Ok(conn.query_row(
+            "SELECT last_capture_error FROM pr_review_guide_source_series WHERE id = ?1",
+            [&summary.series_id],
+            |row| row.get(0),
+        )?)
+    }
+
     fn request_pr_review_guide(
         &self,
         root_task_id: &str,
@@ -1014,7 +1031,7 @@ impl WorkDb {
         )?;
         ensure!(
             capture_error.is_none(),
-            "source capture failed: {}; use Generate Review Guide to recapture the current head before retrying",
+            "source capture failed: {}; the current head must be recaptured before retrying",
             capture_error.unwrap_or_default()
         );
         let (attempt, created) = self.admit_pr_review_guide_attempt(
@@ -1278,6 +1295,9 @@ pub(in crate::work) mod guide_updates {
             attempt_id TEXT PRIMARY KEY REFERENCES pr_review_guide_attempts(id) ON DELETE CASCADE,
             previous_version_id TEXT NOT NULL REFERENCES pr_review_guide_versions(id) ON DELETE CASCADE
          );
+         CREATE TABLE IF NOT EXISTS pr_review_guide_automatic_attempts (
+            attempt_id TEXT PRIMARY KEY REFERENCES pr_review_guide_attempts(id) ON DELETE CASCADE
+         );
          CREATE TABLE IF NOT EXISTS pr_review_guide_revision_heads (
             root_task_id TEXT NOT NULL,
             pr_url TEXT NOT NULL,
@@ -1290,15 +1310,23 @@ pub(in crate::work) mod guide_updates {
         Ok(())
     }
 
-    /// True for an incremental update whose root still has a revision that can
-    /// change the PR; the replacement guide waits for that writer to finish.
+    /// True for an automatic (revision-triggered or retried) attempt that would
+    /// replace a readable guide while a revision in the root's chain is still
+    /// actively writing; the replacement waits for that writer to finish. The
+    /// root is resolved from the attempt's series, so an attempt admitted before
+    /// completion attribution arrives is held too. Parked (todo/blocked)
+    /// revisions are not writing and never hold an update.
     pub(in crate::work) fn chain_has_active_writer(conn: &Connection, attempt: &str) -> Result<bool> {
         let root: Option<String> = conn
             .query_row(
-                "SELECT s.root_task_id FROM pr_review_guide_updates u
-                 JOIN pr_review_guide_attempts a ON a.id = u.attempt_id
+                "SELECT s.root_task_id FROM pr_review_guide_attempts a
                  JOIN pr_review_guide_source_series s ON s.id = a.series_id
-                 WHERE u.attempt_id = ?1",
+                 JOIN pr_review_guide_source_comparisons new ON new.id = a.comparison_id
+                 JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+                 JOIN pr_review_guide_source_comparisons old ON old.id = v.comparison_id
+                 WHERE a.id = ?1 AND old.head_sha != new.head_sha
+                   AND (EXISTS (SELECT 1 FROM pr_review_guide_updates u WHERE u.attempt_id = a.id)
+                     OR EXISTS (SELECT 1 FROM pr_review_guide_automatic_attempts m WHERE m.attempt_id = a.id))",
                 [attempt],
                 |row| row.get(0),
             )
@@ -1307,7 +1335,7 @@ pub(in crate::work) mod guide_updates {
         for id in chain_helpers::collect_chain_revision_ids_including_deleted(conn, &root)? {
             if let Some(task) = query_task(conn, &id)?
                 && task.deleted_at.is_none()
-                && task.status.can_still_change_pr()
+                && task.status == TaskStatus::Active
             {
                 return Ok(true);
             }
@@ -1339,10 +1367,16 @@ pub(in crate::work) mod guide_updates {
     }
 
     impl WorkDb {
+        /// True when the comparison already has live work or its guide is the one
+        /// currently readable. A historical version for a head the PR has since
+        /// left (A -> B -> A) does not count: the card would keep opening B.
         pub(crate) fn review_guide_comparison_has_attempt(&self, comparison: &str) -> Result<bool> {
             Ok(self.connect()?.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pr_review_guide_attempts
-                 WHERE comparison_id = ?1 AND status IN ('queued', 'running', 'succeeded'))",
+                 WHERE comparison_id = ?1 AND status IN ('queued', 'running'))
+                 OR EXISTS(SELECT 1 FROM pr_review_guide_source_series s
+                 JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+                 WHERE v.comparison_id = ?1)",
                 [comparison],
                 |row| row.get(0),
             )?)
@@ -1392,6 +1426,27 @@ pub(in crate::work) mod guide_updates {
              WHERE excluded.observation_sequence > observation_sequence",
                 params![root, pr, head, revision, sequence],
             )?;
+            // The poller may have admitted (and held) the attempt before this
+            // attribution arrived: turn it into the incremental update.
+            let conn = self.connect()?;
+            let held = {
+                let mut stmt = conn.prepare(
+                    "SELECT a.id, a.series_id, a.comparison_id FROM pr_review_guide_attempts a
+                     JOIN pr_review_guide_automatic_attempts m ON m.attempt_id = a.id
+                     JOIN pr_review_guide_source_series s ON s.id = a.series_id
+                     JOIN pr_review_guide_source_comparisons c ON c.id = a.comparison_id
+                     WHERE s.root_task_id = ?1 AND s.canonical_pr_url = ?2 AND c.head_sha = ?3
+                       AND a.status = 'queued' AND a.execution_id IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u WHERE u.attempt_id = a.id)",
+                )?;
+                stmt.query_map(params![root, pr, head], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (attempt, series, comparison) in held {
+                snapshot(&conn, &attempt, &series, &comparison)?;
+            }
             Ok(())
         }
     }
