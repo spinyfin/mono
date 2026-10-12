@@ -127,8 +127,12 @@ async fn cached_read_burst(slow_first: bool) {
     if !slow_first {
         svc.open_markdown_doc(FLUNGE, PATH, GIT_REF).await;
     }
-    let (state, _dir) =
-        crate::app::tests::test_server_state_with_overrides(ServerStateOverrides::builder().design_docs(svc).build());
+    let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
+        ServerStateOverrides::builder()
+            .design_docs(svc)
+            .read_admission(Arc::new(ReadAdmission::new(32, 16, 128, Duration::from_millis(500))))
+            .build(),
+    );
     let registry = state.design_doc_revalidation.clone();
     let (client, server) = UnixStream::pair().unwrap();
     let handler = tokio::spawn(handle_frontend_connection(server, state, None));
@@ -139,7 +143,7 @@ async fn cached_read_burst(slow_first: bool) {
     }
     if slow_first {
         wait_started(&source, 1).await;
-        // Exceed the production 500 ms admission wait while all 31
+        // Exceed the explicit 500 ms admission wait while all 31
         // successors queue for their ordering turn on this same view.
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(source.started.load(Ordering::SeqCst), 1);
