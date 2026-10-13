@@ -220,8 +220,10 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::RevealWorkItem { .. }
         | R::RevokeDecision { .. }
         | R::RunAutomation { .. }
+        | R::RunBoothbyPass
         | R::SendInputToWorker { .. }
         | R::SetAutomationPaused { .. }
+        | R::SetBoothbyMode { .. }
         | R::SetCiBudget { .. }
         | R::SetCoordinatorHandoff { .. }
         | R::SetDispatchConcurrency { .. }
