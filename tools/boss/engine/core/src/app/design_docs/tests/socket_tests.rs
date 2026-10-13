@@ -166,6 +166,22 @@ async fn cached_read_burst(slow_first: bool) {
     .await
     .unwrap();
     wait_started(&source, 2).await;
+    // Responses are queued before handlers register with the revalidation
+    // ladder. Keep its fetch blocked until every request has joined; otherwise
+    // the last handler can start a second ladder after the first one finishes.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let registered = registry.in_flight.lock().unwrap()[&key(PATH)]
+                .registered_requests
+                .load(Ordering::SeqCst);
+            if registered == 32 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("not all cached reads joined the revalidation ladder");
     assert_eq!(
         source.started.load(Ordering::SeqCst),
         2,
@@ -180,6 +196,7 @@ async fn cached_read_burst(slow_first: bool) {
     })
     .await
     .unwrap();
+    assert_eq!(source.started.load(Ordering::SeqCst), 2, "no second revalidation fetch");
     drop(lines);
     drop(write);
     handler.await.unwrap().unwrap();

@@ -41,6 +41,8 @@ const MAX_REVALIDATIONS: usize = 4;
 struct LadderCtl {
     wake: Notify,
     sinks: StdMutex<Vec<Arc<SessionSink>>>,
+    #[cfg(test)]
+    registered_requests: AtomicUsize,
 }
 
 impl LadderCtl {
@@ -48,6 +50,8 @@ impl LadderCtl {
         Self {
             wake: Notify::new(),
             sinks: StdMutex::new(vec![sink]),
+            #[cfg(test)]
+            registered_requests: AtomicUsize::new(1),
         }
     }
 
@@ -124,6 +128,8 @@ impl RevalidationRegistry {
         if let Some(ctl) = g.get(&key) {
             ctl.add_sink(sink);
             ctl.wake.notify_waiters();
+            #[cfg(test)]
+            ctl.registered_requests.fetch_add(1, Ordering::SeqCst);
             return Begin::Coalesced;
         }
         if g.len() >= MAX_REVALIDATIONS {
