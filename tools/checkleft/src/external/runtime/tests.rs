@@ -45,6 +45,130 @@ impl SourceTree for NoopSourceTree {
 
 // --- component-v1 error-path tests ---
 
+/// Model arbitrarily slow VCS reads without sleeping or depending on host load.
+/// Advancing the shared engine past the entire budget during input preparation
+/// must not interrupt the guest that is about to run.
+struct EpochAdvancingTree<'a> {
+    tree: LocalSourceTree,
+    engine: &'a wasmtime::Engine,
+}
+
+impl SourceTree for EpochAdvancingTree<'_> {
+    fn read_file(&self, path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+        self.tree.read_file(path)
+    }
+
+    fn read_file_versioned(&self, path: &std::path::Path, version: TreeVersion) -> anyhow::Result<Vec<u8>> {
+        if matches!(version, TreeVersion::Base) {
+            for _ in 0..super::super::timeout::HOST_CEILING_TIMEOUT_MS {
+                self.engine.increment_epoch();
+            }
+        }
+        self.tree.read_file(path)
+    }
+
+    fn exists(&self, path: &std::path::Path) -> bool {
+        self.tree.exists(path)
+    }
+
+    fn list_dir(&self, path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+        self.tree.list_dir(path)
+    }
+
+    fn glob(&self, pattern: &str) -> anyhow::Result<Vec<PathBuf>> {
+        self.tree.glob(pattern)
+    }
+}
+
+#[test]
+fn base_input_preparation_does_not_consume_guest_deadline() {
+    use crate::external::{
+        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackageProvider,
+    };
+    use std::path::Path;
+
+    let temp = tempdir().unwrap();
+    fs::write(
+        temp.path().join("src.rs"),
+        "struct Large { a: u8, b: u8, c: u8, d: u8, e: u8, f: u8 }",
+    )
+    .unwrap();
+    let engine = build_wasmtime_engine().unwrap();
+    let component = giant_structs_component_for_test(&engine);
+    let tree = EpochAdvancingTree {
+        tree: LocalSourceTree::new(temp.path()).unwrap(),
+        engine: &engine,
+    };
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: "src.rs".into(),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+    let config = toml::Value::Table(Default::default());
+    for check_name in ["rust/giant-structs", "file/ifchange"] {
+        let package = BundledExternalCheckPackageProvider
+            .resolve(&ExternalCheckImplementationRef::Bundled(check_name.into()))
+            .unwrap()
+            .unwrap();
+        let result = super::run_component_check(
+            &engine,
+            temp.path(),
+            super::ComponentRun {
+                package: &package,
+                check_name,
+                component: &component,
+                limits: None,
+                changeset: &changeset,
+                source_tree: &tree,
+                config: &config,
+                config_dir: Path::new(""),
+            },
+        )
+        .expect("host input reads must not exhaust the guest budget");
+        if check_name == "rust/giant-structs" {
+            assert_eq!(result.findings.len(), 1, "detection must still run");
+            assert!(result.findings[0].message.contains("Large"));
+        }
+        let outcome = super::run_component_fix(
+            &engine,
+            temp.path(),
+            super::FixRun {
+                package: &package,
+                check_name,
+                component: &component,
+                limits: None,
+                changeset: &changeset,
+                source_tree: &tree,
+                config: &config,
+                fixable: &[PathBuf::from("src.rs")],
+                dest_root: temp.path(),
+            },
+        )
+        .expect("fix input reads must not exhaust the guest budget");
+        assert!(matches!(outcome, crate::fix::ComponentFixOutcome::NotFixable));
+        let exhausted = ExternalCheckLimits {
+            timeout_ms: Some(0),
+            max_memory_mb: None,
+        };
+        let error = super::run_component_check(
+            &engine,
+            temp.path(),
+            super::ComponentRun {
+                package: &package,
+                check_name,
+                component: &component,
+                limits: Some(&exhausted),
+                changeset: &changeset,
+                source_tree: &tree,
+                config: &config,
+                config_dir: Path::new(""),
+            },
+        )
+        .expect_err("an exhausted guest budget must still interrupt execution");
+        assert!(is_interrupt_error(&error) || format!("{error:#}").contains("exceeded"));
+    }
+}
+
 #[test]
 fn component_v1_non_component_bytes_give_compile_error() {
     // Passing core-wasm bytes to the component-v1 path must fail at the compile
