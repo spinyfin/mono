@@ -688,24 +688,6 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
 
 // ── Conflict-resolution revision: stop re-dispatch once the attempt retires ──
 
-/// Insert a `kind=revision` task linked to a merge-conflict attempt.
-/// Mirrors what `conflict_watch::maybe_spawn_conflict_revision` produces:
-/// `created_via = "merge-conflict:<crz_id>"`, parent = the chore, and (as
-/// in the steady-state loop) the row already flipped to `active`.
-fn insert_conflict_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str, crz_id: &str) -> String {
-    let conn = db.connect().unwrap();
-    let id = next_id("task");
-    let now = now_string();
-    let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}{crz_id}");
-    conn.execute(
-        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, created_via, parent_task_id)
-         VALUES (?1, ?2, 'revision', 'Resolve merge conflict against main', '', 'active', ?3, ?3, 0, ?4, ?5)",
-        rusqlite::params![id, product_id, now, created_via, parent_task_id],
-    )
-    .unwrap();
-    id
-}
-
 /// Regression (T906 / PR #970): a merge-conflict revision must stop being
 /// re-dispatched once its `conflict_resolutions` attempt has retired
 /// (`succeeded`), even though the chore PR is still open + `in_review`.
@@ -852,42 +834,12 @@ fn merge_conflict_revision_still_redispatches_while_attempt_active() {
 // ── CI-fix revision: stop re-dispatch once the attempt retires ──
 //
 // Symmetric sibling of the merge-conflict arm above. `reconcile_revision_execution`
-// (via `retired_spawning_attempt_status`) keys on the task's `created_via` prefix:
+// (via `retired_spawning_attempt`) keys on the task's `created_via` prefix:
 // `merge-conflict:<crz_id>` → `conflict_resolutions`, `ci-fix:<id>` → `ci_remediations`.
 // The merge-conflict arm is exercised by the two tests above; these mirror them for
 // the `ci-fix` arm so a regression in *that* branch (a CI-fix revision minting a fresh
 // `revision_implementation` execution on every reconcile tick after its
 // `ci_remediations` attempt retired) can't slip through silently.
-
-/// Insert a `pending` CI remediation attempt linked to `chore_id`, and a
-/// `ci-fix:<id>` revision task parented to it. Returns `(rem_id, revision_id)`.
-fn setup_ci_fix_revision(
-    db: &WorkDb,
-    product_id: &str,
-    chore_id: &str,
-    pr_url: &str,
-    pr_number: i64,
-) -> (String, String) {
-    let rem = db
-        .insert_ci_remediation(CiRemediationInsertInput {
-            product_id: product_id.to_owned(),
-            work_item_id: chore_id.to_owned(),
-            pr_url: pr_url.to_owned(),
-            pr_number,
-            head_branch: "feature".into(),
-            head_sha_at_trigger: "head-1".into(),
-            attempt_kind: "fix".into(),
-            consumes_budget: 1,
-            failed_checks: "[]".into(),
-            failure_kind: "pr_branch_ci".into(),
-            before_commit_sha: None,
-        })
-        .unwrap()
-        .unwrap();
-    let revision_id = insert_ci_fix_revision_row(db, product_id, chore_id, &rem.id);
-    db.set_ci_remediation_revision_task_id(&rem.id, &revision_id).unwrap();
-    (rem.id, revision_id)
-}
 
 /// Regression sibling of `merge_conflict_revision_stops_dispatch_after_attempt_succeeds`
 /// for the `ci-fix` arm: a CI-fix revision must stop being re-dispatched once its

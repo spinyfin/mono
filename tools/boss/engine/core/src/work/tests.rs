@@ -386,6 +386,54 @@ fn insert_ci_fix_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &st
     id
 }
 
+/// Insert a `kind=revision` task linked to a merge-conflict attempt.
+/// Mirrors what `conflict_watch::maybe_spawn_conflict_revision` produces:
+/// `created_via = "merge-conflict:<crz_id>"`, parent = the chore, and (as
+/// in the steady-state loop) the row already flipped to `active`.
+fn insert_conflict_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str, crz_id: &str) -> String {
+    let conn = db.connect().unwrap();
+    let id = next_id("task");
+    let now = now_string();
+    let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}{crz_id}");
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, created_via, parent_task_id)
+         VALUES (?1, ?2, 'revision', 'Resolve merge conflict against main', '', 'active', ?3, ?3, 0, ?4, ?5)",
+        rusqlite::params![id, product_id, now, created_via, parent_task_id],
+    )
+    .unwrap();
+    id
+}
+
+/// Insert a `pending` CI remediation attempt linked to `chore_id`, and a
+/// `ci-fix:<id>` revision task parented to it. Returns `(rem_id, revision_id)`.
+fn setup_ci_fix_revision(
+    db: &WorkDb,
+    product_id: &str,
+    chore_id: &str,
+    pr_url: &str,
+    pr_number: i64,
+) -> (String, String) {
+    let rem = db
+        .insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product_id.to_owned(),
+            work_item_id: chore_id.to_owned(),
+            pr_url: pr_url.to_owned(),
+            pr_number,
+            head_branch: "feature".into(),
+            head_sha_at_trigger: "head-1".into(),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .unwrap();
+    let revision_id = insert_ci_fix_revision_row(db, product_id, chore_id, &rem.id);
+    db.set_ci_remediation_revision_task_id(&rem.id, &revision_id).unwrap();
+    (rem.id, revision_id)
+}
+
 /// (id, status) of every execution bound to `work_item_id`, oldest first.
 fn executions_for(db: &WorkDb, work_item_id: &str) -> Vec<(String, String)> {
     let conn = db.connect().unwrap();
@@ -554,6 +602,7 @@ mod t30;
 mod t31;
 mod t32;
 mod t33;
+mod t34;
 mod tmux_pane_observation_tests;
 mod work_item_tags_tests;
 mod work_item_write_tests;

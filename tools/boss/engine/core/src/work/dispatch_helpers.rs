@@ -670,38 +670,155 @@ pub(crate) fn preferred_workspace_for_chain_root(conn: &Connection, chain_root_i
     .map_err(Into::into)
 }
 
+/// The attempt ledger that spawned an engine-triggered revision, keyed off
+/// its `created_via` prefix: `merge-conflict:<crz_id>` →
+/// `conflict_resolutions`, `ci-fix:<id>` → `ci_remediations`. `None` for a
+/// human/reviewer-filed revision or an empty attempt id. The table name is
+/// selected from this fixed prefix→table map (never from caller data), so
+/// queries formatted with it are not an injection surface.
+pub(crate) fn spawning_attempt_ref(task: &Task) -> Option<(&'static str, &str)> {
+    let created_via = task.created_via.as_str();
+    let (table, attempt_id) = created_via
+        .strip_prefix(CREATED_VIA_MERGE_CONFLICT_PREFIX)
+        .map(|id| ("conflict_resolutions", id))
+        .or_else(|| {
+            created_via
+                .strip_prefix(CREATED_VIA_CI_FIX_PREFIX)
+                .map(|id| ("ci_remediations", id))
+        })?;
+    (!attempt_id.is_empty()).then_some((table, attempt_id))
+}
+
+/// A spawning attempt that has already retired (see
+/// [`retired_spawning_attempt`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetiredSpawningAttempt {
+    /// `conflict_resolutions` or `ci_remediations`.
+    pub table: &'static str,
+    pub attempt_id: String,
+    /// The terminal status the attempt retired with (`succeeded`, `failed`,
+    /// `abandoned`, `retriggered`, …).
+    pub status: String,
+    /// The ledger's `failure_reason`, when the retirement recorded one.
+    pub failure_reason: Option<String>,
+}
+
+impl RetiredSpawningAttempt {
+    /// Human-readable name of the attempt kind for operator-facing text.
+    pub fn kind_label(&self) -> &'static str {
+        if self.table == "conflict_resolutions" {
+            "merge-conflict"
+        } else {
+            "CI-fix"
+        }
+    }
+
+    /// `succeeded` / `failed: <reason>` — how the attempt ended, for
+    /// operator-facing text.
+    pub fn outcome_label(&self) -> String {
+        match self.failure_reason.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+            Some(reason) => format!("{}: {reason}", self.status),
+            None => self.status.clone(),
+        }
+    }
+}
+
 /// For a revision spawned by an engine-triggered conflict / CI-fix
 /// attempt (`created_via` = `merge-conflict:<crz_id>` or `ci-fix:<id>`),
-/// return that attempt's status *iff* it has already retired — i.e. it
-/// reached a terminal status and is no longer `pending` / `running`.
+/// return that attempt *iff* it has already retired — i.e. it reached a
+/// terminal status and is no longer `pending` / `running`.
 ///
 /// Returns `Ok(None)` when the revision was not engine-spawned, the
 /// `created_via` id is empty, the attempt row can't be found, or the
 /// attempt is still active. The dispatcher uses a `Some(_)` answer as the
 /// signal that the revision's fix vehicle is spent and must stop being
-/// re-dispatched. The table name is selected from a fixed prefix→table
-/// map (never from caller data), so the formatted query is not an
-/// injection surface.
-pub(crate) fn retired_spawning_attempt_status(conn: &Connection, task: &Task) -> Result<Option<String>> {
-    let created_via = task.created_via.as_str();
-    let (table, attempt_id) = if let Some(id) = created_via.strip_prefix(CREATED_VIA_MERGE_CONFLICT_PREFIX) {
-        ("conflict_resolutions", id)
-    } else if let Some(id) = created_via.strip_prefix(CREATED_VIA_CI_FIX_PREFIX) {
-        ("ci_remediations", id)
-    } else {
+/// re-dispatched — until an explicit start re-opens it via
+/// [`reopen_retired_spawning_attempt`].
+pub(crate) fn retired_spawning_attempt(conn: &Connection, task: &Task) -> Result<Option<RetiredSpawningAttempt>> {
+    let Some((table, attempt_id)) = spawning_attempt_ref(task) else {
         return Ok(None);
     };
-    if attempt_id.is_empty() {
-        return Ok(None);
-    }
-    let status: Option<String> = conn
+    let row: Option<(String, Option<String>)> = conn
         .query_row(
-            &format!("SELECT status FROM {table} WHERE id = ?1"),
+            &format!("SELECT status, failure_reason FROM {table} WHERE id = ?1"),
             [attempt_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    Ok(status.filter(|s| s.as_str() != "pending" && s.as_str() != "running"))
+    Ok(row
+        .filter(|(status, _)| status.as_str() != "pending" && status.as_str() != "running")
+        .map(|(status, failure_reason)| RetiredSpawningAttempt {
+            table,
+            attempt_id: attempt_id.to_owned(),
+            status,
+            failure_reason,
+        }))
+}
+
+/// Stable `blocked_reason` the revision reconciler settles an engine-spawned
+/// revision to once its spawning attempt retired without success.
+pub(crate) const BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED: &str = "spawning_attempt_retired_unsuccessfully";
+
+/// Re-open the retired attempt that spawned `task`, flipping the ledger row
+/// back to `pending` (the status a revision-backed attempt rests in while
+/// its revision is dispatchable) and clearing its retirement stamps.
+///
+/// This is the explicit-start half of the "spent fix vehicle" contract.
+/// `reconcile_revision_execution` treats a retired attempt as "this
+/// revision is settled": it abandons every pending execution and halts
+/// re-dispatch. Every explicit start — kanban drag-to-Doing, `bossctl work
+/// start`, an operator answering the revision's question with Yes —
+/// funnels through `request_execution_in_tx_with_live_check`, which used to
+/// mint a fresh `ready` execution regardless. The two disagreed: dispatch
+/// handed the row to a worker while the reconciler abandoned it in the
+/// same instant (`pending execution abandoned (work item archived/settled)`
+/// → `claim_lost`), the gate re-blocked the row, and the card bounced
+/// straight back to Backlog with nothing saying why. Re-opening the attempt
+/// on explicit start makes the human's intent the single source of truth
+/// for both halves: the attempt is live again, so the reconciler lets the
+/// run proceed.
+///
+/// Returns the attempt as it was *before* re-opening (for logging), or
+/// `Ok(None)` when there was nothing to re-open — not engine-spawned, the
+/// attempt row is missing, or it is still active. Only `status`,
+/// `failure_reason` and `finished_at` are touched; the attempt's provenance
+/// (trigger SHA, failed checks, budget accounting) and the revision's
+/// `created_via` link are preserved, so this is a resume of the same
+/// attempt, not a new one.
+pub(crate) fn reopen_retired_spawning_attempt(
+    conn: &Connection,
+    task: &Task,
+) -> Result<Option<RetiredSpawningAttempt>> {
+    let Some(retired) = retired_spawning_attempt(conn, task)? else {
+        return Ok(None);
+    };
+    let table = retired.table;
+    let rows = conn.execute(
+        &format!(
+            "UPDATE {table}
+                SET status         = 'pending',
+                    failure_reason = NULL,
+                    finished_at    = NULL
+              WHERE id = ?1
+                AND status NOT IN ('pending', 'running')"
+        ),
+        [retired.attempt_id.as_str()],
+    )?;
+    Ok((rows > 0).then_some(retired))
+}
+
+/// The `blocked_detail` the revision reconciler writes when it settles an
+/// engine-spawned revision to [`BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED`]:
+/// what ended, and exactly how to resume it.
+pub(crate) fn spawning_attempt_retired_blocked_detail(attempt: &RetiredSpawningAttempt) -> String {
+    format!(
+        "The engine's {} attempt that spawned this revision ended ({}) before a fix landed, so the \
+         engine will not dispatch it on its own. Start it explicitly — drag the card to Doing, run \
+         `bossctl work start`, or answer its open question with Yes — to re-open the attempt and \
+         retry on the same branch.",
+        attempt.kind_label(),
+        attempt.outcome_label(),
+    )
 }
 
 /// Dispatch arm for `kind = 'revision'` tasks.
@@ -819,10 +936,19 @@ pub(crate) fn reconcile_revision_execution(
     // Those land on `blocked` with a stable reason so re-dispatch halts
     // without claiming review-ready. A live worker is left alone; it
     // self-retires on Stop.
-    if let Some(attempt_status) = retired_spawning_attempt_status(conn, task)? {
+    //
+    // The explicit-start half of this contract lives in
+    //  `request_execution_in_tx_with_live_check`: a kanban drag, `bossctl
+    // work start` or an answered question re-opens the retired attempt
+    // (`reopen_retired_spawning_attempt`) before minting its execution, so
+    // this gate does not fire for a run a human deliberately started. The
+    // `blocked_detail` written below names that path, so the settled card
+    // explains itself on the board instead of silently bouncing.
+    if let Some(attempt) = retired_spawning_attempt(conn, task)? {
         let now = now_string();
         abandon_pending_executions(pending, conn, &task.id, &now)?;
         if query_live_execution_for_work_item(conn, &task.id)?.is_none() {
+            let attempt_status = attempt.status.clone();
             let attempt_succeeded = attempt_status.as_str() == "succeeded";
             let settled = if attempt_succeeded {
                 conn.execute(
@@ -836,16 +962,18 @@ pub(crate) fn reconcile_revision_execution(
                     params![task.id, now],
                 )?
             } else {
+                let detail = spawning_attempt_retired_blocked_detail(&attempt);
                 conn.execute(
                     "UPDATE tasks
                      SET status = 'blocked',
-                         blocked_reason = 'spawning_attempt_retired_unsuccessfully',
+                         blocked_reason = ?3,
+                         blocked_detail = ?4,
                          last_status_actor = 'engine',
                          updated_at = ?2
                      WHERE id = ?1
                        AND status NOT IN ('in_review', 'done', 'archived', 'blocked')
                        AND deleted_at IS NULL",
-                    params![task.id, now],
+                    params![task.id, now, BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED, detail],
                 )?
             };
             if settled > 0 {
@@ -1291,6 +1419,62 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 work_item_id = %work_item_id,
                 "RequestExecution: approved deferred/future-scope item — cleared `deferred` on explicit start",
             );
+        }
+
+        // Engine-spawned revisions: the explicit start must agree with
+        // `reconcile_revision_execution`'s verdicts, or the row is handed
+        // to a worker here and abandoned by the reconciler in the same
+        // instant (observed as `pending execution abandoned (work item
+        // archived/settled)` → `claim_lost`, the card bouncing back to
+        // Backlog with nothing saying why).
+        if let Some(task) = query_task(conn, &work_item_id)?.filter(|task| task.kind == TaskKind::Revision) {
+            // The reconciler's first gate: a chain root that is `done` /
+            // `archived` means the parent PR merged or closed, and the
+            // reconciler archives or converts the revision on its next
+            // tick. Refuse now with the reason, rather than minting an
+            // execution that tick would strand.
+            if let Some(root) = get_chain_root_task(conn, &task.id)?
+                && matches!(root.status, TaskStatus::Done | TaskStatus::Archived)
+            {
+                bail!(
+                    "cannot start {work_item_id}: its parent PR (chain root {} is `{}`) has already merged \
+                     or closed, so there is nothing left to revise — the engine settles this revision on \
+                     its next reconcile; file a new chore for further work",
+                    root.id,
+                    root.status,
+                );
+            }
+            // The reconciler's second gate: a retired spawning attempt. An
+            // explicit start is the human saying "try again on this
+            // branch", so re-open the attempt — then the reconciler sees a
+            // live attempt and lets the run proceed — and lift the block
+            // that gate left behind so `start_execution_run` can advance
+            // the row to `active`.
+            let reopened = reopen_retired_spawning_attempt(conn, &task)?;
+            let unblocked = conn.execute(
+                "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
+                     last_status_actor = 'engine', updated_at = ?2
+                 WHERE id = ?1 AND status = 'blocked' AND blocked_reason = ?3 AND deleted_at IS NULL",
+                params![work_item_id, now, BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED],
+            )?;
+            if let Some(attempt) = reopened {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    attempt_table = attempt.table,
+                    attempt_id = %attempt.attempt_id,
+                    prior_status = %attempt.status,
+                    prior_failure_reason = ?attempt.failure_reason,
+                    unblocked = unblocked > 0,
+                    "RequestExecution: explicit start of an engine-spawned revision re-opened its retired \
+                     spawning attempt (back to `pending`) so the revision reconciler will not abandon the run",
+                );
+            } else if unblocked > 0 {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    "RequestExecution: cleared stale retired-attempt block on explicit start \
+                     (the attempt is no longer retired or no longer exists)",
+                );
+            }
         }
     }
 
@@ -2105,7 +2289,7 @@ mod tests {
         );
     }
 
-    // ── retired_spawning_attempt_status ─────────────────────────────────────
+    // ── retired_spawning_attempt ────────────────────────────────────────────
 
     /// Build a minimal `Task` carrying only the `created_via` value the
     /// classifier inspects; every other field is a fixed placeholder.
@@ -2128,7 +2312,9 @@ mod tests {
         let db = open_db();
         let conn = db.connect().unwrap();
         assert_eq!(
-            retired_spawning_attempt_status(&conn, &task_with_created_via("human")).unwrap(),
+            retired_spawning_attempt(&conn, &task_with_created_via("human"))
+                .unwrap()
+                .map(|a| a.status),
             None,
         );
     }
@@ -2139,7 +2325,9 @@ mod tests {
         let conn = db.connect().unwrap();
         let created_via = CREATED_VIA_MERGE_CONFLICT_PREFIX.to_string();
         assert_eq!(
-            retired_spawning_attempt_status(&conn, &task_with_created_via(&created_via)).unwrap(),
+            retired_spawning_attempt(&conn, &task_with_created_via(&created_via))
+                .unwrap()
+                .map(|a| a.status),
             None,
         );
     }
@@ -2150,7 +2338,9 @@ mod tests {
         let conn = db.connect().unwrap();
         let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}cir_missing");
         assert_eq!(
-            retired_spawning_attempt_status(&conn, &task_with_created_via(&created_via)).unwrap(),
+            retired_spawning_attempt(&conn, &task_with_created_via(&created_via))
+                .unwrap()
+                .map(|a| a.status),
             None,
         );
     }
@@ -2174,7 +2364,7 @@ mod tests {
 
         // Active statuses are filtered out → None.
         assert_eq!(
-            retired_spawning_attempt_status(&conn, &task).unwrap(),
+            retired_spawning_attempt(&conn, &task).unwrap().map(|a| a.status),
             None,
             "pending attempt is still active",
         );
@@ -2184,7 +2374,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            retired_spawning_attempt_status(&conn, &task).unwrap(),
+            retired_spawning_attempt(&conn, &task).unwrap().map(|a| a.status),
             None,
             "running attempt is still active",
         );
@@ -2196,7 +2386,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            retired_spawning_attempt_status(&conn, &task).unwrap(),
+            retired_spawning_attempt(&conn, &task).unwrap().map(|a| a.status),
             Some("succeeded".to_owned()),
         );
     }
