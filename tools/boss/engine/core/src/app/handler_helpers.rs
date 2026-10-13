@@ -646,7 +646,7 @@ pub(super) async fn publish_work_invalidation(
             .await;
     }
 
-    tracing::debug!(target: "archive_timing", boundary = "published");
+    tracing::debug!(target: "work_write_timing", boundary = "published");
     revision
 }
 

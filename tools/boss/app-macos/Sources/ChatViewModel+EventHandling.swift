@@ -211,11 +211,6 @@ extension ChatViewModel {
             // mark and the message surfaces, with no other state touched.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
-            // Unattributable errors clear every pending archive rather than
-            // risk a row stuck on "Archiving…" for a reply that never comes.
-            if requestId == nil {
-                settleAllArchiveRequests()
-            }
             // The engine's WorkError reply carries no request context, so we
             // can't tell which in-flight list_executions/list_attachments
             // call failed. `hasOtherTrackedAppRequestInFlight` checks every
@@ -232,6 +227,11 @@ extension ChatViewModel {
             // case: one viewer window open, nothing else in flight) do we
             // attribute the error to the waiting viewer(s).
             let otherRequestInFlight = hasOtherTrackedAppRequestInFlight()
+            // Unattributable errors clear every pending archive rather than
+            // risk a row stuck on "Archiving…" for a reply that never comes.
+            if requestId == nil {
+                settleAllArchiveRequests()
+            }
             if let attemptID = engineAttemptDetailRequestID {
                 engineAttemptDetailErrors[attemptID] = message
                 engineAttemptDetailRequestID = nil
@@ -857,6 +857,7 @@ extension ChatViewModel {
         if !openingReviewTerminalIDs.isEmpty { return true }
         if !openingLiveWorkspaceTerminalIDs.isEmpty { return true }
         if !mergingWhenReadyIDs.isEmpty { return true }
+        if !archivingProjectIDs.isEmpty { return true }
         if !retryingReviewGuideRootTaskIDs.isEmpty { return true }
         if !plannerActionInFlightProjectIDs.isEmpty { return true }
         if !deferredScopeActionInFlightIDs.isEmpty { return true }

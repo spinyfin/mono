@@ -223,7 +223,9 @@ extension ChatViewModel {
             // second, un-debounced full fetch would double the cost of every
             // project edit.
             upsertProject(project)
-            settleArchiveRequest(projectID: project.id)
+            if project.status == "archived" {
+                settleArchiveRequest(projectID: project.id)
+            }
         case .task(let updatedTask), .chore(let updatedTask):
             // When the engine confirms an optimistic move, drop the origin record
             // so a subsequent work_error from an unrelated operation won't bounce
