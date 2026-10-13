@@ -135,7 +135,7 @@ fn live_lane_is_exactly_the_audited_local_only_set() {
 }
 
 #[test]
-fn connection_settings_accept_upstream_limits_without_clamping() {
+fn settings_accept_large_per_connection_limits() {
     let name = "BOSS_TEST_READ_ADMISSION_LIMIT";
     // SAFETY: this variable name is unique to this test.
     for value in [1024, 4096, 8192] {
@@ -146,7 +146,7 @@ fn connection_settings_accept_upstream_limits_without_clamping() {
 }
 
 #[test]
-fn default_limits_and_waits_match_upstream_policy() {
+fn default_limits_waits_and_reply_headroom() {
     let bulk = ReadAdmission::default();
     let live = ReadAdmission::live();
     assert_eq!(bulk.active.available_permits(), 4096);
@@ -158,7 +158,10 @@ fn default_limits_and_waits_match_upstream_policy() {
         assert_eq!(lane.wait, Duration::from_secs(60));
     }
     assert_eq!(ORDER_WAIT, Duration::from_secs(60));
-    assert_eq!(reply_headroom(&bulk, &live), (4096 + 1024) * 5 + 1);
+    assert_eq!(reply_headroom(&bulk, &live), MAX_REPLY_RESERVE);
+    assert_eq!(MAX_REPLY_RESERVE, 128);
+    let small = ReadAdmission::new(2, 2, 8, Duration::from_secs(1));
+    assert_eq!(reply_headroom(&small, &small), 2 * 5 * 2 + 1);
 }
 
 #[tokio::test]
@@ -203,7 +206,7 @@ async fn expired_ordering_wait_does_not_release_predecessor_or_leak_capacity() {
             .acquire_ordered(second)
             .await
             .unwrap_err(),
-        BUSY
+        Rejection::OrderingWait
     );
     let mut third = ordering.reserve(&R::ListProducts).await;
     assert!(

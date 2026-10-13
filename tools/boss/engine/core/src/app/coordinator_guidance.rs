@@ -16,8 +16,7 @@
 use super::*;
 
 /// Concurrent guidance fetches, across all connections.
-const MAX_CONCURRENT_FETCHES: usize = 4;
-static FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_FETCHES);
+pub(super) const MAX_CONCURRENT_FETCHES: usize = 4;
 
 pub(super) async fn handle_list_coordinator_guidance(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -52,7 +51,7 @@ pub(super) async fn handle_list_coordinator_guidance(ctx: Dispatch, req: Fronten
         },
     };
 
-    let Ok(permit) = FETCHES.try_acquire() else {
+    let Ok(permit) = server_state.guidance_fetches.clone().try_acquire_owned() else {
         send_work_error(&sink, &request_id, read_admission::BUSY);
         return;
     };
