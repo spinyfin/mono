@@ -386,37 +386,145 @@ fn manual_start_of_ci_fix_revision_refused_when_parent_pr_closed() {
     );
 }
 
-/// Automatic recovery (a plain `request_execution`, as the orphan / dead-pid
-/// sweeps issue) must never re-open a retired spawning attempt, whether it
-/// ended in failure or success.
+/// An `active` CI-fix revision whose worker is gone and whose spawning
+/// attempt retired underneath it (failed or succeeded), with no reconcile
+/// tick in between — the live-worker-lost shape the automatic recovery
+/// paths see. Returns `(product_id, rem_id, revision_id, dead_execution_id)`.
+fn active_revision_with_retired_attempt(db: &WorkDb, label: &str, succeeded: bool) -> (String, String, String, String) {
+    let product_id = make_revision_product(db, label);
+    let pr_url = "https://github.com/spinyfin/mono/pull/3148";
+    let chore_id = make_in_review_chore(db, &product_id, pr_url);
+    let (rem_id, revision_id) = setup_ci_fix_revision(db, &product_id, &chore_id, pr_url, 3148);
+
+    db.reconcile_product_executions(&product_id).unwrap();
+    let exec_id = executions_for(db, &revision_id)[0].0.clone();
+    start_run(db, &exec_id, "worker-1");
+    assert_eq!(task_status(db, &revision_id), "active", "{label}: precondition");
+    // The rescan only honours rows whose single-shot `autostart` is armed.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET autostart = 1 WHERE id = ?1",
+            rusqlite::params![revision_id],
+        )
+        .unwrap();
+    if succeeded {
+        db.mark_ci_remediation_succeeded(&rem_id, Some("sha-after")).unwrap();
+    } else {
+        db.mark_ci_remediation_failed(&rem_id, "ran out of attempts").unwrap();
+    }
+    db.mark_execution_orphaned(&exec_id, "worker died").unwrap();
+    (product_id, rem_id, revision_id, exec_id)
+}
+
+/// Shared post-conditions for the automatic-recovery negatives: the attempt
+/// ledger is still retired exactly as it was, and any block the gate left
+/// behind is intact. A regression that set `explicit_start` on an automatic
+/// caller would flip the attempt to `pending`.
+fn assert_attempt_still_retired(db: &WorkDb, rem_id: &str, revision_id: &str, name: &str, succeeded: bool) {
+    let attempt = db.get_ci_remediation(rem_id).unwrap().unwrap();
+    assert_eq!(
+        attempt.status,
+        if succeeded { "succeeded" } else { "failed" },
+        "{name}: automatic recovery must not re-open the attempt",
+    );
+    assert!(attempt.finished_at.is_some(), "{name}: finished_at must stay set");
+    assert!(
+        !executions_for(db, revision_id)
+            .iter()
+            .any(|(_, status)| matches!(status.as_str(), "running")),
+        "{name}: no run may be live for a retired attempt",
+    );
+}
+
+/// After a reconcile tick the revision is settled, not running: a failed
+/// attempt parks it `blocked` with the retired-attempt reason intact; a
+/// succeeded one is moved out of Doing by the reconciler (its fix landed).
+fn assert_revision_settled(db: &WorkDb, revision_id: &str, name: &str, succeeded: bool) {
+    let status = task_status(db, revision_id);
+    assert!(
+        !matches!(status.as_str(), "active" | "todo"),
+        "{name}: a retired attempt must not leave the revision runnable, got {status}",
+    );
+    if !succeeded {
+        assert_eq!(status, "blocked", "{name}");
+        assert_eq!(
+            blocked_fields(db, revision_id).0.as_deref(),
+            Some("spawning_attempt_retired_unsuccessfully"),
+            "{name}: the retired-attempt block must stay intact",
+        );
+    }
+    assert!(
+        !executions_for(db, revision_id)
+            .iter()
+            .any(|(_, status)| matches!(status.as_str(), "ready" | "running")),
+        "{name}: no runnable execution may survive for a retired attempt",
+    );
+}
+
+#[test]
+fn reconcile_active_dispatch_does_not_reopen_retired_attempt() {
+    for succeeded in [false, true] {
+        let name = if succeeded { "succeeded" } else { "failed" };
+        let db = WorkDb::open(temp_db_path(&format!("ci-fix-reconcile-active-{name}"))).unwrap();
+        let (product_id, rem_id, revision_id, _exec) =
+            active_revision_with_retired_attempt(&db, &format!("rad-{name}"), succeeded);
+
+        // Startup rehydration: no worker is live.
+        db.reconcile_active_dispatch(|_| false).unwrap();
+        assert_attempt_still_retired(&db, &rem_id, &revision_id, name, succeeded);
+
+        // The revision reconciler then settles the row rather than running it.
+        db.reconcile_product_executions(&product_id).unwrap();
+        assert_attempt_still_retired(&db, &rem_id, &revision_id, name, succeeded);
+        assert_revision_settled(&db, &revision_id, name, succeeded);
+    }
+}
+
+#[test]
+fn rescan_active_dispatch_does_not_reopen_retired_attempt() {
+    for succeeded in [false, true] {
+        let name = if succeeded { "succeeded" } else { "failed" };
+        let db = WorkDb::open(temp_db_path(&format!("ci-fix-rescan-active-{name}"))).unwrap();
+        let (product_id, rem_id, revision_id, _exec) =
+            active_revision_with_retired_attempt(&db, &format!("rsc-{name}"), succeeded);
+
+        db.rescan_active_dispatch().unwrap();
+        assert_attempt_still_retired(&db, &rem_id, &revision_id, name, succeeded);
+
+        db.reconcile_product_executions(&product_id).unwrap();
+        assert_attempt_still_retired(&db, &rem_id, &revision_id, name, succeeded);
+        assert_revision_settled(&db, &revision_id, name, succeeded);
+    }
+}
+
+/// Direct `request_execution` (what the dead-pid sweep issues) on a
+/// settled, blocked revision: not explicit, so the attempt stays retired and
+/// the block stays intact.
 #[test]
 fn automatic_request_execution_does_not_reopen_retired_attempt() {
     for succeeded in [false, true] {
         let name = if succeeded { "succeeded" } else { "failed" };
         let db = WorkDb::open(temp_db_path(&format!("ci-fix-auto-no-reopen-{name}"))).unwrap();
-        let product_id = make_revision_product(&db, &format!("ci-fix-auto-{name}"));
-        let pr_url = "https://github.com/spinyfin/mono/pull/3148";
-        let chore_id = make_in_review_chore(&db, &product_id, pr_url);
-        let (rem_id, revision_id) = setup_ci_fix_revision(&db, &product_id, &chore_id, pr_url, 3148);
-
+        let (product_id, rem_id, revision_id, _exec) =
+            active_revision_with_retired_attempt(&db, &format!("auto-{name}"), succeeded);
         db.reconcile_product_executions(&product_id).unwrap();
-        if succeeded {
-            db.mark_ci_remediation_succeeded(&rem_id, Some("sha-after")).unwrap();
-        } else {
-            db.mark_ci_remediation_failed(&rem_id, "ran out of attempts").unwrap();
-        }
-        let status_before = db.get_ci_remediation(&rem_id).unwrap().unwrap().status;
-        assert_ne!(status_before, "pending", "{name}: precondition");
+        assert_revision_settled(&db, &revision_id, name, succeeded);
+        let blocked_before = blocked_fields(&db, &revision_id);
+        let status_before = task_status(&db, &revision_id);
 
-        // Result is irrelevant; only the attempt's state matters.
         let _ = db.request_execution(RequestExecutionInput::builder().work_item_id(&revision_id).build());
+        assert_attempt_still_retired(&db, &rem_id, &revision_id, name, succeeded);
         assert_eq!(
-            db.get_ci_remediation(&rem_id).unwrap().unwrap().status,
-            status_before,
-            "{name}: automatic recovery must not re-open the attempt",
+            blocked_fields(&db, &revision_id),
+            blocked_before,
+            "{name}: a non-explicit request must not lift the retired-attempt block",
         );
-        db.reconcile_product_executions(&product_id).unwrap();
-        assert_ne!(task_status(&db, &revision_id), "active", "{name}");
+        assert_eq!(
+            task_status(&db, &revision_id),
+            status_before,
+            "{name}: a non-explicit request must not move the settled row",
+        );
     }
 }
 
