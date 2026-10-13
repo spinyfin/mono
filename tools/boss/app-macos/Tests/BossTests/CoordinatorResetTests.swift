@@ -27,6 +27,16 @@ final class CoordinatorResetTests: XCTestCase {
         XCTAssertEqual(requests.last?["reason"] as? String, "operator_reset")
     }
 
+    func testNotConnectedResetRequestClearsWaiting() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.attachedCoordinatorSpawnToken = "original"
+        model.resetCoordinator()
+        XCTAssertTrue(model.coordinatorResetWaiting)
+        model.applyEventForTest(.notConnected(requestKind: "recreate_coordinator"))
+        XCTAssertFalse(model.coordinatorResetWaiting)
+        XCTAssertNil(model.pendingCoordinatorReset)
+    }
+
     func testModelMismatchUsesSameWaitAndRetainsReasonForForce() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         model.attachedCoordinatorSpawnToken = "original"

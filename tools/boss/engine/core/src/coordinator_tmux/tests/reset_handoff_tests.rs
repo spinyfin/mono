@@ -109,26 +109,38 @@ async fn missing_old_or_wrong_writer_handoff_times_out_without_killing() {
 
 #[tokio::test]
 async fn force_skips_request_and_labels_even_current_session_handoff_stale() {
-    let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
-    record(&db);
-    db.set_coordinator_handoff(
-        "rolling facts",
-        "token",
-        boss_engine_utils::epoch_time::now_epoch_secs(),
-    )
-    .unwrap();
-    reset(
-        &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe),
-        &Notify::new(),
-        true,
-        CoordinatorRecreateReason::OperatorReset,
-    )
-    .await
-    .unwrap();
-    assert!(send_keys_calls(&server.calls()).is_empty());
-    let brief = start_brief(dir.path());
-    assert!(brief.contains("HANDOFF STALE:"), "{brief}");
-    assert!(brief.contains("rolling facts"), "{brief}");
+    for (reason, expected) in [
+        (
+            CoordinatorRecreateReason::OperatorReset,
+            "reset the coordinator without waiting",
+        ),
+        (
+            CoordinatorRecreateReason::ModelMismatch,
+            "to change its model without waiting",
+        ),
+    ] {
+        let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+        record(&db);
+        db.set_coordinator_handoff(
+            "rolling facts",
+            "token",
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .unwrap();
+        reset(
+            &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe),
+            &Notify::new(),
+            true,
+            reason,
+        )
+        .await
+        .unwrap();
+        assert!(send_keys_calls(&server.calls()).is_empty());
+        let brief = start_brief(dir.path());
+        assert!(brief.contains("HANDOFF STALE:"), "{brief}");
+        assert!(brief.contains("rolling facts"), "{brief}");
+        assert!(brief.contains(expected), "{brief}");
+    }
 }
 
 #[tokio::test]

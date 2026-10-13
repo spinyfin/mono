@@ -285,6 +285,10 @@ extension ChatViewModel {
             // user-facing signal; never a modal.
             appendSystemMessage(message)
         case .notConnected(let requestKind):
+            if requestKind == "recreate_coordinator" {
+                // The request was dropped, so no handoff will ever arrive.
+                clearCoordinatorReset()
+            }
             if requestKind == "update_work_item" {
                 settleAllArchiveRequests()
             }
