@@ -494,7 +494,7 @@ impl ExecutionRunner for FakeExecutionRunner {
         // this runner does>" — including `slot_busy`.
         let fail_this_call = self
             .fail_remaining
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |remaining| remaining.checked_sub(1),
