@@ -187,6 +187,8 @@ mode = "declarative"
 runtime = "declarative-v1"
 api_version = "v1"
 applies_to = ["**/*.rs"]
+[limits]
+timeout_ms = 30000
 [needs.tool.default.npm]
 package = "fixture-check"
 version = "1.0.0"
