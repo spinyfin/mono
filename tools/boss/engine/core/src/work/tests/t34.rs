@@ -2,21 +2,17 @@ use super::*;
 
 // ── Explicit start of an engine-spawned revision whose attempt retired ───
 //
-// Contract: the dispatcher and `reconcile_revision_execution` must agree on
-// what "settled" means for a CI-fix / merge-conflict revision. The reconciler
-// treats a retired `ci_remediations` / `conflict_resolutions` attempt as "the
-// fix vehicle is spent": it abandons pending executions and halts re-dispatch.
-// Every explicit start (kanban drag-to-Doing, `bossctl work start`, an
-// operator answering the revision's question with Yes) funnels through
-// `request_execution`, which used to mint a fresh `ready` execution anyway —
-// the scheduler picked it up while the reconciler abandoned it in the same
-// instant, and the card bounced back to Backlog with nothing saying why.
-//
-// After the fix an explicit start re-opens the retired attempt (back to
-// `pending`) and lifts the block the gate left behind, so the run proceeds;
-// a start that cannot be honoured (parent PR already merged/closed) is
-// refused with a reason the app shows; and the settled card carries a
-// `blocked_detail` naming the resume path.
+// Contract: the dispatcher and `reconcile_revision_execution` agree on what
+// "settled" means for a CI-fix / merge-conflict revision. The reconciler
+// treats a retired `ci_remediations` / `conflict_resolutions` attempt as a
+// spent fix vehicle: it abandons pending executions and halts re-dispatch.
+// An explicit start (kanban drag-to-Doing, `bossctl work start`, an
+// affirmative answer to the revision's question) re-opens the retired
+// attempt (back to `pending`) and lifts the block the gate left behind, so
+// the run proceeds. Automatic recovery never re-opens a retired attempt. A
+// start that cannot be honoured (parent PR already merged/closed) is refused
+// with a reason, and the settled card carries a `blocked_detail` naming the
+// resume path.
 
 fn blocked_fields(db: &WorkDb, task_id: &str) -> (Option<String>, Option<String>) {
     db.connect()
@@ -177,7 +173,12 @@ fn manual_start_of_ci_fix_revision_with_retired_attempt_reopens_it() {
 
     // Explicit start on the blocked row.
     let exec = db
-        .request_execution(RequestExecutionInput::builder().work_item_id(&revision_id).build())
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&revision_id)
+                .explicit_start(true)
+                .build(),
+        )
         .unwrap();
     assert_eq!(exec.status, ExecutionStatus::Ready);
     assert_eq!(exec.kind, ExecutionKind::RevisionImplementation);
@@ -238,7 +239,12 @@ fn kanban_drag_of_ci_fix_revision_with_retired_attempt_wins_the_reconcile_race()
         "precondition: the tick between the two RPCs re-blocks the row (attempt still terminal)",
     );
     let exec = db
-        .request_execution(RequestExecutionInput::builder().work_item_id(&revision_id).build())
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&revision_id)
+                .explicit_start(true)
+                .build(),
+        )
         .unwrap();
     assert_eq!(exec.status, ExecutionStatus::Ready);
     assert_eq!(db.get_ci_remediation(&rem_id).unwrap().unwrap().status, "pending");
@@ -292,7 +298,12 @@ fn manual_start_of_merge_conflict_revision_with_retired_attempt_reopens_it() {
     );
 
     let exec = db
-        .request_execution(RequestExecutionInput::builder().work_item_id(&revision_id).build())
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&revision_id)
+                .explicit_start(true)
+                .build(),
+        )
         .unwrap();
     assert_eq!(exec.status, ExecutionStatus::Ready);
     let attempt = db.get_conflict_resolution(&crz.id).unwrap().unwrap();
@@ -320,7 +331,12 @@ fn manual_start_of_ci_fix_revision_with_active_attempt_leaves_it_alone() {
     let (rem_id, revision_id) = setup_ci_fix_revision(&db, &product_id, &chore_id, pr_url, 3146);
 
     let exec = db
-        .request_execution(RequestExecutionInput::builder().work_item_id(&revision_id).build())
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&revision_id)
+                .explicit_start(true)
+                .build(),
+        )
         .unwrap();
     assert_eq!(exec.status, ExecutionStatus::Ready);
     let attempt = db.get_ci_remediation(&rem_id).unwrap().unwrap();
@@ -348,7 +364,12 @@ fn manual_start_of_ci_fix_revision_refused_when_parent_pr_closed() {
         .unwrap();
 
     let err = db
-        .request_execution(RequestExecutionInput::builder().work_item_id(&revision_id).build())
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&revision_id)
+                .explicit_start(true)
+                .build(),
+        )
         .expect_err("start of a revision whose parent PR closed must be refused");
     let message = err.to_string();
     assert!(
@@ -363,4 +384,64 @@ fn manual_start_of_ci_fix_revision_refused_when_parent_pr_closed() {
         executions_for(&db, &revision_id).is_empty(),
         "a refused start must not strand an execution",
     );
+}
+
+/// Automatic recovery (a plain `request_execution`, as the orphan / dead-pid
+/// sweeps issue) must never re-open a retired spawning attempt, whether it
+/// ended in failure or success.
+#[test]
+fn automatic_request_execution_does_not_reopen_retired_attempt() {
+    for succeeded in [false, true] {
+        let name = if succeeded { "succeeded" } else { "failed" };
+        let db = WorkDb::open(temp_db_path(&format!("ci-fix-auto-no-reopen-{name}"))).unwrap();
+        let product_id = make_revision_product(&db, &format!("ci-fix-auto-{name}"));
+        let pr_url = "https://github.com/spinyfin/mono/pull/3148";
+        let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+        let (rem_id, revision_id) = setup_ci_fix_revision(&db, &product_id, &chore_id, pr_url, 3148);
+
+        db.reconcile_product_executions(&product_id).unwrap();
+        if succeeded {
+            db.mark_ci_remediation_succeeded(&rem_id, Some("sha-after")).unwrap();
+        } else {
+            db.mark_ci_remediation_failed(&rem_id, "ran out of attempts").unwrap();
+        }
+        let status_before = db.get_ci_remediation(&rem_id).unwrap().unwrap().status;
+        assert_ne!(status_before, "pending", "{name}: precondition");
+
+        // Result is irrelevant; only the attempt's state matters.
+        let _ = db.request_execution(RequestExecutionInput::builder().work_item_id(&revision_id).build());
+        assert_eq!(
+            db.get_ci_remediation(&rem_id).unwrap().unwrap().status,
+            status_before,
+            "{name}: automatic recovery must not re-open the attempt",
+        );
+        db.reconcile_product_executions(&product_id).unwrap();
+        assert_ne!(task_status(&db, &revision_id), "active", "{name}");
+    }
+}
+
+/// An explicit start is a human override: it re-opens even a `succeeded`
+/// attempt.
+#[test]
+fn explicit_start_reopens_succeeded_attempt() {
+    let db = WorkDb::open(temp_db_path("ci-fix-explicit-succeeded")).unwrap();
+    let product_id = make_revision_product(&db, "ci-fix-explicit-succ");
+    let pr_url = "https://github.com/spinyfin/mono/pull/3149";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+    let (rem_id, revision_id) = setup_ci_fix_revision(&db, &product_id, &chore_id, pr_url, 3149);
+
+    db.reconcile_product_executions(&product_id).unwrap();
+    db.mark_ci_remediation_succeeded(&rem_id, Some("sha-after")).unwrap();
+    db.reconcile_product_executions(&product_id).unwrap();
+
+    let exec = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&revision_id)
+                .explicit_start(true)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    assert_eq!(db.get_ci_remediation(&rem_id).unwrap().unwrap().status, "pending");
 }

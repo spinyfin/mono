@@ -763,20 +763,12 @@ pub(crate) const BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED: &str = "spawning_attem
 /// back to `pending` (the status a revision-backed attempt rests in while
 /// its revision is dispatchable) and clearing its retirement stamps.
 ///
-/// This is the explicit-start half of the "spent fix vehicle" contract.
-/// `reconcile_revision_execution` treats a retired attempt as "this
-/// revision is settled": it abandons every pending execution and halts
-/// re-dispatch. Every explicit start — kanban drag-to-Doing, `bossctl work
-/// start`, an operator answering the revision's question with Yes —
-/// funnels through `request_execution_in_tx_with_live_check`, which used to
-/// mint a fresh `ready` execution regardless. The two disagreed: dispatch
-/// handed the row to a worker while the reconciler abandoned it in the
-/// same instant (`pending execution abandoned (work item archived/settled)`
-/// → `claim_lost`), the gate re-blocked the row, and the card bounced
-/// straight back to Backlog with nothing saying why. Re-opening the attempt
-/// on explicit start makes the human's intent the single source of truth
-/// for both halves: the attempt is live again, so the reconciler lets the
-/// run proceed.
+/// Called only for an explicit start — kanban drag-to-Doing, `bossctl work
+/// start`, an affirmative answer to the revision's question. The
+/// reconciler's retired-attempt gate abandons every pending execution of a
+/// revision whose spawning attempt retired, so an explicit start must
+/// re-open the attempt for the run to survive that gate. Automatic recovery
+/// sweeps never re-open: a retired attempt stays retired for them.
 ///
 /// Returns the attempt as it was *before* re-opening (for logging), or
 /// `Ok(None)` when there was nothing to re-open — not engine-spawned, the
@@ -938,12 +930,11 @@ pub(crate) fn reconcile_revision_execution(
     // self-retires on Stop.
     //
     // The explicit-start half of this contract lives in
-    //  `request_execution_in_tx_with_live_check`: a kanban drag, `bossctl
-    // work start` or an answered question re-opens the retired attempt
+    // `request_execution_in_tx_with_live_check`: a kanban drag, `bossctl
+    // work start` or an affirmative answer re-opens the retired attempt
     // (`reopen_retired_spawning_attempt`) before minting its execution, so
     // this gate does not fire for a run a human deliberately started. The
-    // `blocked_detail` written below names that path, so the settled card
-    // explains itself on the board instead of silently bouncing.
+    // `blocked_detail` written below names that path.
     if let Some(attempt) = retired_spawning_attempt(conn, task)? {
         let now = now_string();
         abandon_pending_executions(pending, conn, &task.id, &now)?;
@@ -1249,6 +1240,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         entry_point: _,
         observed_pause_since_epoch_s: _,
         allow_dirty,
+        explicit_start,
         // Placement is a coordinator concern. The coordinator validates and
         // installs this onto the one execution after this transaction has
         // created or refreshed it; it must never become a work-item field.
@@ -1421,13 +1413,13 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             );
         }
 
-        // Engine-spawned revisions: the explicit start must agree with
-        // `reconcile_revision_execution`'s verdicts, or the row is handed
-        // to a worker here and abandoned by the reconciler in the same
-        // instant (observed as `pending execution abandoned (work item
-        // archived/settled)` → `claim_lost`, the card bouncing back to
-        // Backlog with nothing saying why).
-        if let Some(task) = query_task(conn, &work_item_id)?.filter(|task| task.kind == TaskKind::Revision) {
+        // Engine-spawned revisions: an explicit start must agree with
+        // `reconcile_revision_execution`'s verdicts. Automatic recovery
+        // callers skip this block, so only a human can revive a settled
+        // revision.
+        if let Some(task) =
+            query_task(conn, &work_item_id)?.filter(|task| explicit_start && task.kind == TaskKind::Revision)
+        {
             // The reconciler's first gate: a chain root that is `done` /
             // `archived` means the parent PR merged or closed, and the
             // reconciler archives or converts the revision on its next

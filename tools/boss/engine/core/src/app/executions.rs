@@ -48,6 +48,9 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
     let FrontendRequest::RequestExecution { mut input } = req else {
         unreachable!()
     };
+    // This RPC is the human-facing start verb (kanban drag, `bossctl work
+    // start`); automatic recovery calls the DB layer directly.
+    input.explicit_start = true;
     input.work_item_id = match server_state.resolve_work_item_id(&input.work_item_id).await {
         Ok(id) => id,
         Err(err) => {

@@ -675,6 +675,15 @@ pub struct RequestExecutionInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_pause_since_epoch_s: Option<u64>,
 
+    /// `true` when a human-initiated start (kanban drag, `bossctl work
+    /// start`, an affirmative answer to the item's question) is asking for
+    /// this execution. Only an explicit start re-opens a retired spawning
+    /// attempt of an engine-spawned revision and lifts the block that
+    /// retirement left; automatic recovery sweeps leave it `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub explicit_start: bool,
+
     pub preferred_workspace_id: Option<String>,
     pub priority: Option<i64>,
     /// Host selected for this one dispatch request. This is intentionally
