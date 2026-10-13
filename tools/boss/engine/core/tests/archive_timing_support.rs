@@ -25,15 +25,12 @@ impl Visit for Boundary {
 impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Boundaries {
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let at = Instant::now();
-        if event.metadata().target() != "archive_timing" {
+        if event.metadata().target() != "work_write_timing" {
             return;
         }
         let Some(scope) = ctx.event_scope(event) else { return };
         let spans: Vec<_> = scope.collect();
-        let Some(handler) = spans
-            .iter()
-            .find(|span| span.metadata().name() == "update_work_item_timing")
-        else {
+        let Some(handler) = spans.iter().find(|span| span.metadata().name() == "update_work_item") else {
             return;
         };
         let mut boundary = Boundary::default();

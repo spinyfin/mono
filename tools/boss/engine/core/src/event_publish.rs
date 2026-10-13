@@ -79,7 +79,7 @@ pub fn commit_and_publish(
     bus: &EventBus,
 ) -> rusqlite::Result<()> {
     tx.commit()?;
-    tracing::debug!(target: "archive_timing", boundary = "commit");
+    tracing::debug!(target: "work_write_timing", boundary = "commit");
     for event in pending.0 {
         bus.publish(event);
     }

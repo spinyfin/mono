@@ -5,7 +5,7 @@ import XCTest
 /// wired to the right-click "Archive" context menu on navigator
 /// project rows — and the reply/error paths that settle it.
 ///
-/// The acceptance criteria ask that:
+/// These tests pin that:
 ///   - calling `archiveProject(id:)` sends `update_work_item` with
 ///     `status = "archived"` for the named project id.
 ///   - the outbound payload carries no extra keys beyond `type`,
@@ -91,6 +91,41 @@ final class ProjectArchiveContextMenuTests: XCTestCase {
         XCTAssertTrue(model.archiveRequestProjectIDs.isEmpty)
         let fetches = recorder.value.filter { ($0["type"] as? String) == "get_work_tree" }
         XCTAssertTrue(fetches.isEmpty, "project reply must not trigger an un-debounced full work-tree fetch")
+    }
+
+    func testActiveProjectReplyPreservesPendingArchiveAndErrorRouting() throws {
+        let model = makeConnectedModel()
+        model.archiveProject(id: "proj_test")
+        let requestID = try XCTUnwrap(model.archiveRequestProjectIDs.keys.first)
+        model.mergingWhenReadyIDs = ["task_merge"]
+
+        model.applyEventForTest(.workItemUpdated(item: .project(makeProject(status: "active"))))
+
+        XCTAssertTrue(model.archivingProjectIDs.contains("proj_test"))
+        XCTAssertEqual(model.archiveRequestProjectIDs[requestID], "proj_test")
+        XCTAssertEqual(model.projectsByProductID["prod_test"]?.first?.status, "active")
+
+        model.applyEventForTest(.workError(message: "archive refused", requestId: requestID))
+
+        XCTAssertTrue(model.archivingProjectIDs.isEmpty)
+        XCTAssertTrue(model.archiveRequestProjectIDs.isEmpty)
+        XCTAssertEqual(model.workErrorMessage, "archive refused")
+        XCTAssertEqual(model.mergingWhenReadyIDs, ["task_merge"])
+        XCTAssertNil(model.mergeErrorNoticesByTaskID["task_merge"])
+    }
+
+    func testUnattributableArchiveErrorDoesNotBlameViewerLoads() {
+        let model = makeConnectedModel()
+        model.archiveProject(id: "proj_test")
+        model.executionsInFlightTaskIDs = ["task_viewer"]
+        model.attachmentsInFlightTaskIDs = ["task_viewer"]
+
+        model.applyEventForTest(.workError(message: "archive refused", requestId: nil))
+
+        XCTAssertTrue(model.archivingProjectIDs.isEmpty)
+        XCTAssertTrue(model.archiveRequestProjectIDs.isEmpty)
+        XCTAssertEqual(model.executionsLoadFailureByTaskID["task_viewer"], "Loading failed. Retry?")
+        XCTAssertEqual(model.attachmentsLoadFailureByTaskID["task_viewer"], "Loading failed. Retry?")
     }
 
     /// A project reply for a project the store has not seen yet is
