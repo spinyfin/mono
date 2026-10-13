@@ -569,6 +569,15 @@ struct ServerStateOverrides {
     source_packet_collector: Option<crate::review_guide_capture::SourcePacketCollector>,
     /// Fake PR detector. `None` uses `CommandPrDetector` (shells out to `gh`).
     pr_detector: Option<Arc<dyn PrDetector>>,
+    /// Coordinator-reset handoff wait. `None` uses the production timeout.
+    coordinator_handoff_timeout: Option<std::time::Duration>,
+    /// Tmux handle used for every coordinator lifecycle path (app-registration
+    /// attach, supervisor, UI-confirmed reset). `None` resolves the preflighted
+    /// executable.
+    coordinator_tmux: Option<boss_tmux::Tmux>,
+    /// Prepared coordinator session directory. `None` uses the production
+    /// directory under Application Support.
+    coordinator_working_directory: Option<PathBuf>,
 }
 
 #[derive(bon::Builder)]
@@ -705,6 +714,25 @@ struct ServerState {
     /// and the independent child-exit supervisor.
     #[builder(default = Arc::new(Mutex::new(())))]
     coordinator_tmux_lock: Arc<Mutex<()>>,
+    #[builder(default)]
+    coordinator_handoff_written: Arc<Notify>,
+    /// How long a UI-confirmed coordinator reset waits for the fresh handoff.
+    /// Tests inject a short value.
+    #[builder(default = crate::coordinator_tmux::reset_handoff::HANDOFF_TIMEOUT)]
+    coordinator_handoff_timeout: std::time::Duration,
+    /// Set while a detached coordinator reset is running, so a repeated
+    /// request is refused instead of stacking a second handoff wait.
+    #[builder(default)]
+    coordinator_reset_in_flight: Arc<AtomicBool>,
+    /// Test seam for the coordinator lifecycle (app-registration attach, the
+    /// child-exit supervisor, and UI-confirmed reset): when set,
+    /// [`ServerState::tmux_from_program`] returns it instead of building a
+    /// handle from the preflighted executable. Distinct from
+    /// `pane_delivery_tmux_override`, which only redirects worker pane delivery.
+    coordinator_tmux_override: Option<boss_tmux::Tmux>,
+    /// Test seam for the coordinator session directory; see
+    /// [`ServerState::coordinator_session_directory`].
+    coordinator_working_directory_override: Option<PathBuf>,
     /// Spawn token for which the current app session has acknowledged a
     /// coordinator viewer. Cleared with the app session so a reconnect gets a
     /// fresh attach request.
@@ -1105,7 +1133,20 @@ impl ServerState {
     }
 
     fn tmux_from_program(&self, program: PathBuf) -> anyhow::Result<boss_tmux::Tmux> {
+        // Test seam: production leaves the override unset.
+        if let Some(tmux) = self.coordinator_tmux_override.clone() {
+            return Ok(tmux);
+        }
         boss_tmux::Tmux::from_path_with_socket(program, self.tmux_socket_path.clone())
+    }
+
+    /// The prepared coordinator session directory: the test override, else the
+    /// production directory under Application Support.
+    fn coordinator_session_directory(&self) -> anyhow::Result<PathBuf> {
+        match &self.coordinator_working_directory_override {
+            Some(path) => Ok(path.clone()),
+            None => crate::coordinator_tmux::coordinator_working_directory(),
+        }
     }
 
     /// Resolve the tmux handle for a run recorded with `server_label`:
@@ -1174,6 +1215,9 @@ impl ServerState {
             branch_verifier: branch_verifier_override,
             source_packet_collector: source_packet_collector_override,
             pr_detector: pr_detector_override,
+            coordinator_handoff_timeout: coordinator_handoff_timeout_override,
+            coordinator_tmux: coordinator_tmux_override,
+            coordinator_working_directory: coordinator_working_directory_override,
         } = overrides;
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
@@ -1629,6 +1673,9 @@ impl ServerState {
 
             ServerState::builder()
                 .work_db(work_db)
+                .maybe_coordinator_handoff_timeout(coordinator_handoff_timeout_override)
+                .maybe_coordinator_tmux_override(coordinator_tmux_override)
+                .maybe_coordinator_working_directory_override(coordinator_working_directory_override)
                 .tmux_socket_path(cfg.work.resolved_tmux_socket_path())
                 .execution_coordinator(execution_coordinator)
                 .completion_handler(completion_handler)

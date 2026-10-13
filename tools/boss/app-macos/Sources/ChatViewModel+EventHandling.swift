@@ -81,6 +81,7 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            clearCoordinatorReset()
             isConnected = false
             stopBackgroundWorkPolling(clearSnapshot: true)
             isAppSessionRegistered = false
@@ -300,6 +301,7 @@ extension ChatViewModel {
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
             handle(.error(message: message))
         case .error(let message):
+            if handleCoordinatorResetError(message) { return }
             if pendingDragAdmissionCheck != nil {
                 // A malformed/undecodable `dispatch_admission_evaluated`
                 // reply (EngineClient emits `.error`, never
@@ -729,6 +731,10 @@ extension ChatViewModel {
             let result = paneAttachHandler.map { $0(attach) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendAttachWorkerPaneResponse(requestId: requestId, result: result)
         case .attachCoordinatorPane(let attach):
+            // A replacement exists even if attaching its viewer fails.
+            if attach.spawnToken != pendingCoordinatorReset?.token {
+                clearCoordinatorReset()
+            }
             let result = coordinatorPaneAttachHandler.map { $0(attach) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             if case .success = result {
                 coordinatorPaneAttached(attach)

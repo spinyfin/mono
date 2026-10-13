@@ -167,7 +167,7 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
         }
     };
     let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
-    let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
+    let working_directory = match server_state.coordinator_session_directory() {
         Ok(path) => path,
         Err(error) => {
             tracing::error!(error = %format!("{error:#}"), "failed to resolve coordinator session directory");
@@ -538,7 +538,7 @@ mod update_available_tests {
 
 /// Replace the durable coordinator only after the UI has confirmed the loss
 /// of the current conversation — either an automatic model-mismatch prompt
-/// or an operator-initiated reset (see `reason`). The app cannot choose a
+/// or a user-initiated reset (see `reason`). The app cannot choose a
 /// session name or model here; both remain engine-owned configuration.
 pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -551,6 +551,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
     let FrontendRequest::RecreateCoordinator {
         expected_spawn_token,
         reason,
+        force_without_handoff,
     } = req
     else {
         unreachable!()
@@ -609,7 +610,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             return;
         }
     };
-    let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
+    let working_directory = match server_state.coordinator_session_directory() {
         Ok(path) => path,
         Err(error) => {
             send_response(
@@ -622,38 +623,135 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             return;
         }
     };
-    let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
-    let replacement = {
-        let _guard = server_state.coordinator_tmux_lock.lock().await;
-        let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
-        crate::coordinator_tmux::recreate_after_confirmation(
-            &crate::coordinator_tmux::CoordinatorSpawn {
-                work_db: server_state.work_db.as_ref(),
-                tmux: active_tmux,
-                create_tmux: &tmux,
-                model: &server_state.coordinator_model,
-                working_directory: &working_directory,
-                version_probe: &crate::coordinator_tmux::RealClaudeVersionProbe,
-                design_docs: &server_state.design_docs,
-            },
-            &expected_spawn_token,
-            reason,
-        )
-        .await
-    };
-    match replacement {
-        // The replacement is always freshly created on the durable socket
-        // (`recreate_after_confirmation`'s `create_tmux` argument, above) —
-        // it never lands on the legacy `-L boss` server, even when the old
-        // session being replaced did, so this attach always targets `tmux`.
-        Ok(record) => request_coordinator_attachment(server_state, &tmux, record).await,
-        Err(error) => send_response(
+    if server_state
+        .coordinator_reset_in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        send_response(
             &sink,
             &request_id,
             FrontendEvent::Error {
-                message: format!("recreate_coordinator: {error:#}"),
+                message: "recreate_coordinator: a coordinator reset is already in progress".to_owned(),
             },
-        ),
+        );
+        return;
+    }
+    // The handoff wait can take minutes. `handle_frontend_connection` awaits
+    // each handler in the connection's read loop, so awaiting it here would
+    // stall every other request on the app connection, including the app's
+    // replies to engine-to-app requests. Detach it; the reply still lands on
+    // the original `request_id`.
+    tokio::spawn(async move {
+        let _in_flight = ResetInFlight(server_state.coordinator_reset_in_flight.clone());
+        CoordinatorReset::builder()
+            .server_state(server_state)
+            .sink(sink)
+            .request_id(request_id)
+            .tmux(tmux)
+            .working_directory(working_directory)
+            .expected_spawn_token(expected_spawn_token)
+            .reason(reason)
+            .force_without_handoff(force_without_handoff)
+            .build()
+            .run()
+            .await;
+    });
+}
+
+/// Clears the in-flight reset flag however the detached reset ends.
+struct ResetInFlight(Arc<AtomicBool>);
+
+impl Drop for ResetInFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Everything the detached tail of `handle_recreate_coordinator` needs.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+struct CoordinatorReset {
+    server_state: Arc<ServerState>,
+    sink: Arc<SessionSink>,
+    request_id: String,
+    tmux: boss_tmux::Tmux,
+    working_directory: std::path::PathBuf,
+    expected_spawn_token: String,
+    reason: boss_protocol::CoordinatorRecreateReason,
+    force_without_handoff: bool,
+}
+
+impl CoordinatorReset {
+    async fn run(self) {
+        let Self {
+            server_state,
+            sink,
+            request_id,
+            tmux,
+            working_directory,
+            expected_spawn_token,
+            reason,
+            force_without_handoff,
+        } = self;
+        let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
+        let replacement = {
+            // The lifecycle lock is held only for the validate-and-send phase
+            // inside `request_and_wait`, so the supervisor stays free to recover
+            // while we await a write.
+            let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
+            if let Err(error) = crate::coordinator_tmux::reset_handoff::request_and_wait(
+                server_state.work_db.as_ref(),
+                active_tmux,
+                &server_state.coordinator_tmux_lock,
+                &server_state.coordinator_handoff_written,
+                &expected_spawn_token,
+                force_without_handoff,
+                server_state.coordinator_handoff_timeout,
+            )
+            .await
+            {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::Error {
+                        message: format!("recreate_coordinator: {error:#}"),
+                    },
+                );
+                return;
+            }
+            let _guard = server_state.coordinator_tmux_lock.lock().await;
+            let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
+            crate::coordinator_tmux::recreate_after_confirmation(
+                &crate::coordinator_tmux::CoordinatorSpawn {
+                    work_db: server_state.work_db.as_ref(),
+                    tmux: active_tmux,
+                    create_tmux: &tmux,
+                    model: &server_state.coordinator_model,
+                    working_directory: &working_directory,
+                    version_probe: &crate::coordinator_tmux::RealClaudeVersionProbe,
+                    design_docs: &server_state.design_docs,
+                },
+                &expected_spawn_token,
+                reason,
+                force_without_handoff,
+            )
+            .await
+        };
+        match replacement {
+            // The replacement is always freshly created on the durable socket
+            // (`recreate_after_confirmation`'s `create_tmux` argument, above) —
+            // it never lands on the legacy `-L boss` server, even when the old
+            // session being replaced did, so this attach always targets `tmux`.
+            Ok(record) => request_coordinator_attachment(server_state, &tmux, record).await,
+            Err(error) => send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::Error {
+                    message: format!("recreate_coordinator: {error:#}"),
+                },
+            ),
+        }
     }
 }
 

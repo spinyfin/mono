@@ -346,6 +346,7 @@ fn coordinator_verbs_stay_closed() {
             work_item_id: "task_1".into(),
         },
         FrontendRequest::RecreateCoordinator {
+            force_without_handoff: false,
             expected_spawn_token: "token".into(),
             reason: CoordinatorRecreateReason::OperatorReset,
         },
