@@ -1282,6 +1282,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 &tmux_host,
                 driver.as_ref(),
                 spawner.live_worker_state_registry(),
+                &self.work_db,
                 &execution.id,
                 composer_timeout,
                 turn_timeout,
@@ -1384,16 +1385,18 @@ impl PaneSpawnRunner {
 }
 
 /// Bounded wait after prompt delivery: driver-specific PTY evidence that
-/// the CLI is up, then a driver hook/session event that the turn started.
+/// the CLI is up, then a driver hook/session event *or* a persisted
+/// `transcript_path` on the current `work_runs` row that the turn started.
 async fn confirm_local_spawn(
     tmux_host: &TmuxWorkerHost,
     driver: &dyn crate::driver::AgentDriver,
     live_states: Option<&crate::live_worker_state::LiveWorkerStateRegistry>,
+    work_db: &WorkDb,
     run_id: &str,
     composer_timeout: StdDuration,
     turn_timeout: StdDuration,
 ) -> Result<()> {
-    use super::spawn_confirmation::{SPAWN_CONFIRM_POLL, confirm_spawn_started};
+    use super::spawn_confirmation::{SPAWN_CONFIRM_POLL, confirm_spawn_started, current_run_has_turn_start_evidence};
 
     let driver_name = driver.descriptor().name;
     let spec = driver.pane_monitor_spec();
@@ -1410,7 +1413,7 @@ async fn confirm_local_spawn(
         || async {
             capture_shows_driver_ready(tmux_host.tmux(), tmux_host.session_name(), spec.as_ref(), &last_capture).await
         },
-        || async { live_states.is_some_and(|registry| registry.has_driver_signal_for_run(run_id)) },
+        || async { current_run_has_turn_start_evidence(work_db, live_states, run_id) },
     )
     .await;
     if result.is_err() {

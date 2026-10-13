@@ -393,6 +393,10 @@ pub(super) struct FakeExecutionRunner {
     /// inner cause under this outer context (`anyhow!(msg).context(ctx)`),
     /// so tests can assert `{err:#}` persistence of the cause chain.
     pub(super) fail_context: Option<String>,
+    /// Typed spawn-confirmation cause. When set, `run_execution` returns
+    /// this error (so the coordinator can downcast it) instead of a
+    /// string-only `fail_message`.
+    pub(super) fail_source: Option<crate::runner::spawn_confirmation::SpawnConfirmationError>,
     /// When `true`, `run_execution` fails with a `SlotBusy` viewer
     /// rejection (wrapped the same way `spawn_flow` wraps it) instead
     /// of the generic `fail` error, so tests can exercise the
@@ -436,6 +440,7 @@ impl Default for FakeExecutionRunner {
             fail: false,
             fail_message: None,
             fail_context: None,
+            fail_source: None,
             slot_busy: false,
             viewer_abort_failed: false,
             pending: false,
@@ -483,6 +488,9 @@ impl ExecutionRunner for FakeExecutionRunner {
                 occupying_run_id: Some("exec_other_occupant".to_owned()),
             };
             return Err(anyhow::Error::new(root).context("failed to spawn worker pane"));
+        }
+        if let Some(source) = self.fail_source.clone() {
+            return Err(anyhow::Error::from(source));
         }
         if self.fail {
             let err = anyhow!("{}", self.fail_message.as_deref().unwrap_or("worker prompt failed"));
