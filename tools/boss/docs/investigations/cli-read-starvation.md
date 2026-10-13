@@ -20,17 +20,20 @@ Environment settings are read when engine state is constructed; restart the engi
 
 The defaults are deliberately very high pending measurement of normal traffic: the original values (32 active, 500 ms wait) rejected the macOS app's own startup reads after a cold engine start. Lower them only from measured data, with a generous buffer above the observed peak.
 
-| Setting                             | Default | Meaning                                             |
-| ----------------------------------- | ------- | --------------------------------------------------- |
-| `BOSS_RPC_READ_CONCURRENCY`         | 4096    | Active bulk handlers across connections             |
-| `BOSS_RPC_READ_PER_CONNECTION`      | 4096    | Active bulk handlers on one connection              |
-| `BOSS_RPC_READ_QUEUE`               | 100000  | Pending reads across connections                    |
-| `BOSS_RPC_READ_WAIT_MS`             | 60000   | Total admission wait across both concurrency limits |
-| `BOSS_RPC_LIVE_READ_CONCURRENCY`    | 1024    | Active status reads, reserved above the bulk limit  |
-| `BOSS_RPC_LIVE_READ_PER_CONNECTION` | 1024    | Active status reads on one connection               |
-| `BOSS_RPC_LIVE_READ_QUEUE`          | 100000  | Pending status reads across connections             |
+| Setting                             | Default | Meaning                                                |
+| ----------------------------------- | ------- | ------------------------------------------------------ |
+| `BOSS_RPC_READ_CONCURRENCY`         | 4096    | Active bulk handlers across connections                |
+| `BOSS_RPC_READ_PER_CONNECTION`      | 4096    | Active bulk handlers on one connection                 |
+| `BOSS_RPC_READ_QUEUE`               | 100000  | Pending reads across connections                       |
+| `BOSS_RPC_READ_WAIT_MS`             | 60000   | Bulk admission wait after the ordering turn is granted |
+| `BOSS_RPC_LIVE_READ_CONCURRENCY`    | 1024    | Active status reads, reserved above the bulk limit     |
+| `BOSS_RPC_LIVE_READ_PER_CONNECTION` | 1024    | Active status reads on one connection                  |
+| `BOSS_RPC_LIVE_READ_QUEUE`          | 100000  | Pending status reads across connections                |
+| `BOSS_RPC_LIVE_READ_WAIT_MS`        | 60000   | Live admission wait after the ordering turn is granted |
 
-Each connection also has a pending queue of four times its active limit. Full queues reject immediately. Other excess requests queue on FIFO semaphores and expire at a single deadline. A connection obtains its local permit before joining the global semaphore, limiting its representation in the global queue. Invalid settings use the default via the shared environment parser; zero or values above one million also log a warning. Multiple separate CLI connections are constrained by the global limit; this is connection fairness, not authenticated per-user accounting.
+Each connection also has a pending queue of four times its active limit. Full queues reject immediately. Waiting for the ordering turn has a separate, fixed 60 s deadline (ORDER_WAIT). After that turn is granted, excess requests queue on FIFO admission semaphores and share one configured deadline across the connection and global permits. A connection obtains its local permit before joining the global semaphore, limiting its representation in the global queue. Invalid settings use the default via the shared environment parser; zero or values above one million also log a warning. Multiple separate CLI connections are constrained by the global limit; this is connection fairness, not authenticated per-user accounting.
+
+Per-connection active settings use the same validation as global settings, with no additional clamp. Bulk and live wait settings are independent and both default to 60 s. Outbound-queue headroom needs separate measurement of normal traffic before limits can be sized with a generous buffer; assumed reply counts do not justify lowering admission limits.
 
 Rejections produce a correlated `Error` response containing `engine busy, retry: read admission limit exceeded` and a warning identifying the session and whether its queue was full or its deadline expired. No retry loop is added to the CLI. Live status has an independent path rather than consuming the bulk quota.
 
@@ -44,10 +47,16 @@ Rejections produce a correlated `Error` response containing `engine busy, retry:
 
 The app sends every UI read over one long-lived socket. On connect it pipelines roughly a dozen bulk reads (products, settings, work tree, attention groups and items, deferred scopes, planner runs, engine attempts, disabled live-status slots) plus comment reads per open viewer, and invalidation refetch adds one `ListExecutions` per visible history. The original per-connection budget of 4 active reads and a 250 ms deadline rejected reads 5 and onward whenever a slow `GetWorkTree` held its slot, and the app turns the busy reply into a generic error event with no retry. The defaults were then raised to 16 active, 64 pending and 500 ms per connection under a global cap of 32 active and 128 queued reads. That still rejected the app's startup reads after a cold engine start, so the defaults are now far higher (see Limits); the global cap remains the bound on a runaway CLI burst (each CLI process holds one socket and one request). `one_socket_pipelining_sixteen_bulk_reads_never_sees_busy` and `default_budget_admits_app_session_fan_out_behind_a_slow_read` pin this.
 
-`GetPrStatus` with `refresh: true` awaits a GitHub probe and is not a bulk read; it is bounded by its per-execution refresh budget so network latency cannot occupy bulk slots. Design-document reads await their response inside the admission permits; only the follow-up revalidation is detached.
+`GetPrStatus` with `refresh: true` awaits a GitHub probe and is not a bulk read; it is bounded by its per-execution refresh budget so network latency cannot occupy bulk slots.
 
 ## Outbound reply delivery
 
-Busy and other correlated replies share the session's bounded outbound lane. Only uncorrelated pushes can be evicted; pressure that would evict a reply triggers an explicit disconnect. The request reader pauses with headroom derived from the configured active and pending bulk and live limits, reducing pressure before the enqueue-boundary guarantee is needed.
+Busy and other correlated replies share the session's bounded outbound lane. Only uncorrelated pushes can be evicted; pressure that would evict a reply triggers an explicit disconnect. The request reader pauses with headroom derived from the configured active and pending bulk and live limits, reducing pressure before the enqueue-boundary guarantee is needed. When configured outstanding reads exceed outbound capacity, the reader waits for an empty queue; this does not reserve space for every in-flight reply or clamp read admission.
 
-Design-doc foreground reads deliberately retain bulk admission through GitHub fetches and the correlated response, including cache misses and refreshes. Unlike PR-status refresh, they have no separate foreground budget. Background document revalidation coalesces by document before spawning and permits at most four concurrent probe/retry ladders across keys. Response pressure disconnects explicitly if eviction would lose a correlated reply; reader headroom derives from configured bulk and live admission limits.
+Design-doc foreground reads deliberately retain bulk admission through GitHub fetches and the correlated response, including cache misses and refreshes. Unlike PR-status refresh, they have no separate foreground budget. Background document revalidation coalesces by document before spawning and permits at most four concurrent probe/retry ladders across keys.
+
+## Read ordering and lane classification
+
+Every frontend verb is classified by an exhaustive match; adding a verb requires choosing Bulk, Live or Ordered. Operator-question lists and coordinator-guidance reads use Bulk. Trunk status probes are awaited within Bulk admission. Guidance fetches (up to 45 s per product, fetched concurrently) await completion and send their correlated response while retaining bulk permits and the ordering turn. An additional global limit allows four guidance handlers; saturation replies with the busy error. GitHub authorization rechecks remain detached and bounded to one recheck. The Live lane is reserved for local status reads.
+
+Admitted reads targeting the same response view on one connection reserve FIFO turns before dispatch; reads of different keys never wait on each other for ordering, and turns for completed keys are not retained. Design-doc listings key by product, excluding the refresh option; quota snapshots similarly exclude refresh. Other filters identify the requested result set and remain in the key. The turn is held through the correlated response and any blocking work; later snapshots of the same view therefore cannot overtake earlier ones. Waiting for a turn has its own 60 s deadline, separate from the lane's admission deadline (which starts once the turn is granted), and does not consume an active engine permit. Queue-full and deadline errors may overtake successful responses, but carry no snapshot to overwrite UI state.

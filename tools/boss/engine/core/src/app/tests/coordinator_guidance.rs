@@ -53,8 +53,7 @@ fn product(state: &ServerState, name: &str, repo: Option<&str>) -> String {
         .id
 }
 
-/// The handler spawns its GitHub work, so the response lands on the sink
-/// asynchronously; `next()` waits for it.
+/// Handler completion includes delivery of its correlated response.
 async fn list(state: &Arc<ServerState>, product_id: Option<&str>) -> FrontendEvent {
     let sink = make_session_sink();
     coordinator_guidance::handle_list_coordinator_guidance(

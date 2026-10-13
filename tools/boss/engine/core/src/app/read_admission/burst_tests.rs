@@ -425,3 +425,37 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
         .unwrap()
         .unwrap();
 }
+
+/// End to end: identical pipelined reads on one socket are answered in the
+/// order they were received.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_reads_on_one_socket_reply_in_receive_order() {
+    let (state, _dir) = crate::app::tests::test_server_state();
+    let (client, server) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(handle_frontend_connection(server, state, None));
+    let (read, mut write) = client.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let ids: Vec<String> = (0..8).map(|i| format!("order-{i}")).collect();
+    for id in &ids {
+        let envelope = FrontendRequestEnvelope {
+            request_id: id.clone(),
+            payload: FrontendRequest::ListProducts,
+        };
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&envelope).unwrap()).as_bytes())
+            .await
+            .unwrap();
+    }
+    let mut seen = Vec::new();
+    while seen.len() < ids.len() {
+        let line = lines.next_line().await.unwrap().unwrap();
+        let event: FrontendEventEnvelope = serde_json::from_str(&line).unwrap();
+        if let Some(id) = event.request_id.filter(|id| id.starts_with("order-")) {
+            seen.push(id);
+        }
+    }
+    assert_eq!(seen, ids);
+    drop(lines);
+    drop(write);
+    handler.await.unwrap().unwrap();
+}

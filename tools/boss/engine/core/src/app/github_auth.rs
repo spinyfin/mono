@@ -7,6 +7,9 @@
 
 use super::*;
 
+/// Bounds the detached org/SSO re-checks started by `GitHubAuthStatus`.
+static ORG_RECHECK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 pub(super) async fn handle_git_hub_auth_start(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -104,13 +107,17 @@ pub(super) async fn handle_git_hub_auth_status(ctx: Dispatch, req: FrontendReque
         // re-auth needed. `update_org_state` only notifies on a real
         // change, which the forwarder then pushes on `github.auth`.
         if let GitHubAuthState::Authorized { record, .. } = current {
-            let server_state = server_state.clone();
-            let token = record.token.clone();
+            // Detached so the bulk permits and ordering turn are released once
+            // the reply is sent; at most one re-check runs at a time.
+            let Ok(permit) = ORG_RECHECK.try_acquire() else {
+                return;
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 let controller = server_state.github_auth.clone();
                 let flow = controller.device_flow();
                 let org_sink = WorkDbOrgStateSink::new(server_state.work_db.as_ref());
-                let resolved = probe_and_record_org_state(&org_sink, flow.as_ref(), &token).await;
+                let resolved = probe_and_record_org_state(&org_sink, flow.as_ref(), &record.token).await;
                 controller.update_org_state(resolved);
             });
         }
