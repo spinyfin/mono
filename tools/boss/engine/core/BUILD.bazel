@@ -313,6 +313,34 @@ rust_test(
     ),
 )
 
+# Socket-level measurement + pin for archiving a project with N children:
+# one WorkItemUpdated reply and one WorkInvalidated push regardless of N.
+rust_test(
+    name = "project_archive_timing_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = [
+        "tests/archive_timing_support.rs",
+        "tests/common/mod.rs",
+        "tests/project_archive_timing.rs",
+        "tests/watcher_support.rs",
+    ],
+    crate_root = "tests/project_archive_timing.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 # End-to-end auto-populate fixtures (design task 11). Drives the deterministic
 # Populator -> validate -> Materializer pipeline over real design-doc breakdowns
 # checked in under tests/fixtures/planner/ (embedded via include_str!, hence the

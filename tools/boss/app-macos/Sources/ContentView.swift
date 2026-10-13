@@ -758,6 +758,7 @@ struct ContentView: View {
                     ForEach(model.projectsForSelectedProduct) { project in
                         let isOn = model.selectedProjectFilterIDs.contains(project.id)
                         let isArchived = project.status == "archived"
+                        let isArchiving = model.archivingProjectIDs.contains(project.id)
                         let unblocked = model.unblockedTaskCount(forProjectID: project.id)
                         let blocked = model.blockedTaskCount(forProjectID: project.id)
                         let docPresentation = ProjectDesignDocAffordancePresentation.from(
@@ -765,13 +766,13 @@ struct ContentView: View {
                         )
                         WorkSidebarFilterRow(
                             title: project.name,
-                            subtitle: project.sidebarSubtitle,
+                            subtitle: isArchiving ? "Archiving…" : project.sidebarSubtitle,
                             systemImage: project.sidebarSystemImage,
                             isSelected: isOn,
                             trailing: nil,
                             showsCheckbox: true,
                             isCheckboxOn: isOn,
-                            dimmed: isArchived,
+                            dimmed: isArchived || isArchiving,
                             unblockedCount: unblocked > 0 ? unblocked : nil,
                             blockedCount: blocked > 0 ? blocked : nil,
                             designDocPresentation: docPresentation,
@@ -788,6 +789,7 @@ struct ContentView: View {
                                 Button("Archive") {
                                     model.archiveProject(id: project.id)
                                 }
+                                .disabled(isArchiving)
                             }
                         }
                     }

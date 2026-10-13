@@ -371,6 +371,7 @@ mod pause_bypass_recheck;
 mod pr_status;
 mod probe_delivery;
 mod probe_interrupt;
+mod project_archive_cascade;
 mod proposals;
 mod reveal_deadline;
 mod review_guide;

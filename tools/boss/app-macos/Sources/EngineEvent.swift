@@ -28,6 +28,10 @@ enum EngineEvent {
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
     case workError(message: String, requestId: String?)
+    /// A `work_item_updated` reply whose payload failed to decode. Carries
+    /// the envelope request id so a pending request waiting on that reply
+    /// (e.g. a project archive) can settle instead of waiting forever.
+    case workItemUpdateDecodeFailed(message: String, requestId: String?)
     /// Typed refusal of an `answer_operator_question` request (`not_found`,
     /// `conflict`, `validation_failed`). `message` is user-readable;
     /// `requestId` is the envelope id of the answer request it refuses.

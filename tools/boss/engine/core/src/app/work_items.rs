@@ -459,10 +459,13 @@ pub(super) async fn handle_create_many_chores(ctx: Dispatch, req: FrontendReques
     }
 }
 
+#[tracing::instrument(name = "update_work_item_timing", skip_all, fields(request_id = %ctx.request_id, item_id = tracing::field::Empty))]
 pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest) {
     let FrontendRequest::UpdateWorkItem { id, patch } = req else {
         unreachable!()
     };
+    tracing::Span::current().record("item_id", &id);
+    tracing::debug!(target: "archive_timing", boundary = "handler_entry");
     apply_work_item_patch(ctx, id, patch, None).await;
 }
 

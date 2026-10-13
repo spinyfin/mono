@@ -141,7 +141,7 @@ serde_yaml = "0.9.34"
 serde_urlencoded = "0.7"
 shlex = "1.3.0"
 syn = { version = "2.0.117", features = ["full"] }
-rusqlite = { version = "0.37.0", features = ["bundled"] }
+rusqlite = { version = "0.37.0", features = ["bundled", "hooks", "trace"] }
 sha2 = { version = "0.10.9", features = ["asm"] }
 shell-words = "1.0"
 tempfile = "3.25.0"

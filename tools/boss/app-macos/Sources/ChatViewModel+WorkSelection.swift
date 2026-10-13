@@ -88,8 +88,50 @@ extension ChatViewModel {
         selectedWorkCardID = nil
     }
 
+    /// Navigator right-click → Archive. Sends the status patch and marks
+    /// the project as archiving so the row reacts immediately; the engine's
+    /// `work_item_updated` reply (see `handleUpdatedWorkItem`) applies the
+    /// archived project in place and clears the pending state. A second
+    /// click while the first is in flight is a no-op rather than a second
+    /// RPC.
     func archiveProject(id: String) {
-        engine.sendUpdateWorkItem(id: id, patch: ["status": "archived"])
+        guard !archivingProjectIDs.contains(id) else { return }
+        archivingProjectIDs.insert(id)
+        guard let requestID = engine.sendUpdateWorkItem(id: id, patch: ["status": "archived"]) else {
+            // Not sent (socket down): the `.notConnected` event reports it;
+            // there is nothing in flight to wait for.
+            archivingProjectIDs.remove(id)
+            return
+        }
+        archiveRequestProjectIDs[requestID] = id
+    }
+
+    /// Clear the pending-archive mark for `projectID` (and any request id
+    /// that pointed at it). Called on the engine's reply, on an error for
+    /// that request, and on paths where no reply can ever arrive.
+    func settleArchiveRequest(projectID: String) {
+        archivingProjectIDs.remove(projectID)
+        archiveRequestProjectIDs = archiveRequestProjectIDs.filter { $0.value != projectID }
+    }
+
+    /// A `work_error` (or undecodable reply) carrying a pending archive's own
+    /// request id belongs to that archive alone: drop its pending mark and
+    /// surface the message, without touching any other in-flight state.
+    /// Returns whether the request id matched an archive.
+    func settleArchiveWorkError(message: String, requestId: String?) -> Bool {
+        guard let requestId, let projectID = archiveRequestProjectIDs[requestId] else { return false }
+        abandonBackgroundWorkRequest(requestId: requestId)
+        settleArchiveRequest(projectID: projectID)
+        workErrorMessage = message
+        return true
+    }
+
+    /// Clear every pending archive: used when the link drops or an error
+    /// arrives that cannot be attributed to one request.
+    func settleAllArchiveRequests() {
+        guard !archivingProjectIDs.isEmpty || !archiveRequestProjectIDs.isEmpty else { return }
+        archivingProjectIDs.removeAll()
+        archiveRequestProjectIDs.removeAll()
     }
 
     func setIncludeChores(_ value: Bool) {

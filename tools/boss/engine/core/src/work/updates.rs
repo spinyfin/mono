@@ -281,8 +281,10 @@ impl WorkDb {
         Ok(WorkItem::Product(updated))
     }
 
+    #[tracing::instrument(name = "project_transaction", skip_all)]
     pub(crate) fn update_project(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
+        tracing::debug!(target: "archive_timing", boundary = "transaction_begin");
         let tx = conn.transaction()?;
         let mut project = query_project(&tx, id).require("project", id)?;
         // Pre-image for the Boothby audit trail. Cloned unconditionally
