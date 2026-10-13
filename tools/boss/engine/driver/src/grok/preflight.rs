@@ -1,9 +1,17 @@
 //! Fail-fast capability checks for the scoped Grok worker environment.
+//!
+//! Every subprocess here is bounded: a wall-clock timeout kills the child and
+//! its whole process group, and a timeout is a loud preflight failure naming
+//! the command — never a silent pass. These calls run synchronously, so the
+//! caller ([`super::GrokDriver::provision_workspace`]) must keep them off the
+//! async worker threads with `spawn_blocking`; an unbounded call here once
+//! pinned two runtime threads for hours and stopped the engine from exiting.
 
-use std::io::Read;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::process::{Command, Output};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
 
@@ -11,6 +19,42 @@ use super::environment::GrokProcessEnvironment;
 
 /// Wall-clock limit for the OAuth-sensitive `grok models` probe.
 const GROK_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wall-clock limit for every other preflight subprocess. Generous enough for
+/// `cube workspace status` to reach the git remote, short enough that a hung
+/// remote fails the dispatch instead of holding a thread for hours.
+pub(super) const PREFLIGHT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Preflight subprocesses currently running, keyed by pid (which is also the
+/// process-group id), so an engine shutdown can reap and report them.
+#[derive(Default)]
+struct InFlight(Mutex<BTreeMap<u32, String>>);
+
+impl InFlight {
+    fn map(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, String>> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Kill every registered process group and return the command lines.
+    fn abandon(&self) -> Vec<String> {
+        std::mem::take(&mut *self.map())
+            .into_iter()
+            .map(|(pgid, command)| {
+                boss_command_runner::kill_process_group(pgid);
+                command
+            })
+            .collect()
+    }
+}
+
+static IN_FLIGHT: InFlight = InFlight(Mutex::new(BTreeMap::new()));
+
+/// Kill every preflight subprocess still running and return their command
+/// lines. Called when the engine gives up waiting for blocking tasks at
+/// shutdown, so abandoned probes do not outlive the engine as orphans.
+pub fn abandon_in_flight_preflight_commands() -> Vec<String> {
+    IN_FLIGHT.abandon()
+}
 
 struct PreflightOutput {
     success: bool,
@@ -46,18 +90,14 @@ impl PreflightRunner for RealPreflightRunner {
         }
         let mut command = Command::new(program);
         command.args(args).current_dir(workspace);
-        if program == "grok" {
+        let timeout = if program == "grok" {
             environment.apply_to_command(&mut command);
+            GROK_MODELS_TIMEOUT
         } else {
             environment.apply_tool_sandbox_environment(&mut command);
-        }
-        let output = if program == "grok" {
-            run_grok_models_with_timeout(&mut command, GROK_MODELS_TIMEOUT)?
-        } else {
-            command
-                .output()
-                .with_context(|| format!("starting Grok worker preflight capability `{program}`"))?
+            PREFLIGHT_COMMAND_TIMEOUT
         };
+        let output = run_bounded(&mut command, timeout)?;
         Ok(PreflightOutput {
             success: output.status.success(),
             status: output.status.to_string(),
@@ -67,69 +107,47 @@ impl PreflightRunner for RealPreflightRunner {
     }
 }
 
-/// Run `command` with a wall-clock deadline, capturing stdout/stderr.
+/// Human-readable `program arg arg` for errors and the in-flight registry.
+fn render_command(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Run `command` capturing stdout/stderr, killing it and its process group if
+/// it has not finished within `timeout`.
 ///
-/// `Command::spawn` inherits stdio by default; pipes must be set explicitly so
-/// the OAuth affirmation in stdout is available to the caller. Pipes are drained
-/// on dedicated threads while the parent only polls exit status — otherwise a
-/// child that fills the ~64KiB pipe buffer deadlocks against a non-reading wait.
-fn run_grok_models_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .context("starting Grok worker preflight capability `grok`")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("missing stdout pipe for Grok worker preflight capability `grok`")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("missing stderr pipe for Grok worker preflight capability `grok`")?;
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut reader = stdout;
-        reader.read_to_end(&mut buf).map(|_| buf)
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut reader = stderr;
-        reader.read_to_end(&mut buf).map(|_| buf)
-    });
+/// A timeout is an error that names the command; it is never mapped to an
+/// empty success. Output is drained concurrently with the wait (see
+/// [`boss_command_runner::output_blocking_timeout_in_group`]) so a chatty child
+/// cannot deadlock against a non-reading parent.
+pub(super) fn run_bounded(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+    run_bounded_in(&IN_FLIGHT, command, timeout)
+}
 
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .context("waiting for Grok worker preflight capability `grok`")?
-        {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child
-                .kill()
-                .context("killing timed-out Grok worker preflight capability `grok`")?;
-            let _ = child.wait();
-            // Reap drain threads so a timed-out probe does not leak join handles.
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            bail!(
-                "grok models did not complete while waiting for OAuth refresh coordination within {}s",
+fn run_bounded_in(in_flight: &InFlight, command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+    let rendered = render_command(command);
+    let registered = std::cell::Cell::new(None);
+    let result = boss_command_runner::output_blocking_timeout_in_group(command, timeout, |pid| {
+        in_flight.map().insert(pid, rendered.clone());
+        registered.set(Some(pid));
+    });
+    if let Some(pid) = registered.get() {
+        in_flight.map().remove(&pid);
+    }
+    result.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::TimedOut {
+            anyhow::anyhow!(
+                "Grok worker preflight failed: `{rendered}` did not complete within {}s and was killed \
+                 along with its process group",
                 timeout.as_secs()
-            );
+            )
+        } else {
+            anyhow::Error::new(err).context(format!("running Grok worker preflight capability `{rendered}`"))
         }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-
-    let stdout = stdout_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("stdout drain thread panicked for Grok preflight"))?
-        .context("reading stdout from Grok worker preflight capability `grok`")?;
-    let stderr = stderr_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("stderr drain thread panicked for Grok preflight"))?
-        .context("reading stderr from Grok worker preflight capability `grok`")?;
-    Ok(Output { status, stdout, stderr })
+    })
 }
 
 /// Prove that every capability the worker needs is usable before the pane is
@@ -626,10 +644,10 @@ mod tests {
     }
 
     #[test]
-    fn run_grok_models_with_timeout_captures_stdout() {
+    fn run_bounded_captures_stdout() {
         let mut command = Command::new("/bin/echo");
         command.arg("You are logged in with grok.com.");
-        let output = run_grok_models_with_timeout(&mut command, Duration::from_secs(5)).unwrap();
+        let output = run_bounded(&mut command, Duration::from_secs(5)).unwrap();
         assert!(output.status.success(), "status={}", output.status);
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("You are logged in with grok.com."),
@@ -638,29 +656,80 @@ mod tests {
         );
     }
 
+    /// A hung preflight command is killed at the timeout and surfaces as a
+    /// preflight failure that names the command — it is not a silent pass.
     #[test]
-    fn run_grok_models_with_timeout_kills_and_reports_deadline() {
+    fn a_hung_command_is_killed_and_fails_the_preflight_naming_it() {
         let mut command = Command::new("/bin/sleep");
-        command.arg("5");
-        let error = run_grok_models_with_timeout(&mut command, Duration::from_millis(200))
+        command.arg("60");
+        let started = std::time::Instant::now();
+        let registry = InFlight::default();
+        let error = run_bounded_in(&registry, &mut command, Duration::from_millis(300))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("within"), "{error}");
-        assert!(error.contains("0s") || error.contains("OAuth refresh"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "timeout did not bound the call"
+        );
+        assert!(error.contains("Grok worker preflight failed"), "{error}");
+        assert!(error.contains("`/bin/sleep 60`"), "{error}");
+        assert!(error.contains("did not complete within"), "{error}");
+        assert!(registry.map().is_empty(), "timed-out command must leave the registry");
+    }
+
+    /// The real hang: a child wedged on a grandchild (`cube` → `git ls-remote`)
+    /// must not leave that grandchild behind.
+    #[test]
+    fn a_timeout_kills_the_grandchild_too() {
+        let pid_file = std::env::temp_dir().join(format!("boss-preflight-grandchild-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 60 & echo $! > {}; wait", pid_file.display()));
+        run_bounded(&mut command, Duration::from_millis(500)).unwrap_err();
+        let grandchild: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        let _ = std::fs::remove_file(&pid_file);
+        let alive = || unsafe { libc::kill(grandchild, 0) == 0 };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(), "grandchild {grandchild} survived the preflight timeout");
     }
 
     #[test]
-    fn run_grok_models_with_timeout_drains_large_stdout() {
+    fn abandoning_in_flight_commands_kills_and_reports_them() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("61");
+        let registry = std::sync::Arc::new(InFlight::default());
+        let runner = {
+            let registry = registry.clone();
+            std::thread::spawn(move || run_bounded_in(&registry, &mut command, Duration::from_secs(120)))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while registry.map().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let abandoned = registry.abandon();
+        assert!(abandoned.iter().any(|c| c == "/bin/sleep 61"), "{abandoned:?}");
+        // The killed child exits with a signal status rather than hanging.
+        let output = runner.join().unwrap().unwrap();
+        assert!(!output.status.success());
+    }
+
+    #[test]
+    fn run_bounded_drains_large_stdout() {
         // ~200KiB exceeds the typical 64KiB pipe buffer; without concurrent drain
-        // this would deadlock the try_wait poll loop. Prefer pure shell so the
-        // Bazel sandbox need not grant /dev/zero or PATH-resolved helpers.
+        // this would deadlock the wait. Prefer pure shell so the Bazel sandbox
+        // need not grant /dev/zero or PATH-resolved helpers.
         let mut command = Command::new("/bin/sh");
         command.args([
             "-c",
             // 4000 * 50 = 200_000 bytes of stdout.
             "i=0; while [ \"$i\" -lt 4000 ]; do printf '%050d' \"$i\"; i=$((i + 1)); done",
         ]);
-        let output = run_grok_models_with_timeout(&mut command, Duration::from_secs(30)).unwrap();
+        let output = run_bounded(&mut command, Duration::from_secs(30)).unwrap();
         assert!(
             output.status.success(),
             "status={} stderr={:?}",
