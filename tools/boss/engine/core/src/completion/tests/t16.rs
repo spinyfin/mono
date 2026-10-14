@@ -550,7 +550,8 @@ mod stop_boundary {
     async fn overlapping_stops_for_one_execution_are_serialized() {
         let workspace = tempdir().unwrap();
         let pr = "https://github.com/spinyfin/mono/pull/2082";
-        let (_dir, db, _product_id, _revision_id, execution_id) = revision_fixture(workspace.path(), pr, "unchanged-head");
+        let (_dir, db, _product_id, _revision_id, execution_id) =
+            revision_fixture(workspace.path(), pr, "unchanged-head");
         declare_no_changes_needed(&db, &execution_id);
 
         let inner = StubBranchVerifier::ok("boss/exec_parent");
