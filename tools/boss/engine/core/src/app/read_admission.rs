@@ -16,6 +16,7 @@ const ORDER_WAIT: Duration = Duration::from_secs(60);
 const QUEUE_FULL: &str = "engine busy, retry: read admission queue full";
 const DEADLINE: &str = "engine busy, retry: read admission deadline expired";
 mod diagnostics;
+pub(super) use diagnostics::Identity;
 use diagnostics::{Diagnostics, TrackedRead, Wait};
 
 pub(super) struct ReadAdmission {
@@ -113,14 +114,33 @@ impl ReadAdmission {
 
     /// Bound task allocation as well as active handlers. Full queues reject
     /// immediately; accepted waiters share one deadline across both limits.
+    #[cfg(test)]
     pub(super) fn enqueue(self: &Arc<Self>, connection: &Arc<ConnectionReads>) -> Result<WaitingRead, &'static str> {
-        let full = |_| {
+        self.enqueue_as(connection, None)
+    }
+
+    /// Like [`Self::enqueue`], naming the request so a queue-full dump can
+    /// identify the rejected read, which is not yet tracked.
+    pub(super) fn enqueue_as(
+        self: &Arc<Self>,
+        connection: &Arc<ConnectionReads>,
+        identity: Option<Identity<'_>>,
+    ) -> Result<WaitingRead, &'static str> {
+        let full = |wait: Wait| {
             self.diagnostics
-                .report(QUEUE_FULL, Wait::Queue, None, Arc::as_ptr(connection) as usize);
+                .report(QUEUE_FULL, wait, None, identity, Arc::as_ptr(connection) as usize);
             QUEUE_FULL
         };
-        let local = connection.pending.clone().try_acquire_owned().map_err(full)?;
-        let global = self.pending.clone().try_acquire_owned().map_err(full)?;
+        let local = connection
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| full(Wait::ConnectionQueue))?;
+        let global = self
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| full(Wait::EngineQueue))?;
         Ok(WaitingRead {
             engine: self.clone(),
             connection: connection.clone(),
@@ -162,6 +182,7 @@ impl WaitingRead {
                 Rejection::OrderingWait.message(),
                 Wait::Ordering,
                 self.tracked.as_ref(),
+                None,
                 self.connection_id(),
             );
             Rejection::OrderingWait
@@ -216,9 +237,13 @@ impl WaitingRead {
                 })
             }
             Err(message) => {
-                self.engine
-                    .diagnostics
-                    .report(message, Wait::Permit, self.tracked.as_ref(), self.connection_id());
+                self.engine.diagnostics.report(
+                    message,
+                    Wait::Permit,
+                    self.tracked.as_ref(),
+                    None,
+                    self.connection_id(),
+                );
                 Err(message)
             }
         }

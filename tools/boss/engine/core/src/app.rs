@@ -2480,11 +2480,19 @@ async fn handle_frontend_connection(
             read_admission::ReadLane::Ordered => None,
         };
         let waiting_read = if let Some((admission, connection)) = read_lane {
-            match admission.enqueue(connection) {
+            let verb = variant_name(&request);
+            match admission.enqueue_as(
+                connection,
+                Some(read_admission::Identity {
+                    session: &session_id,
+                    request: &request_id,
+                    verb: &verb,
+                }),
+            ) {
                 Ok(waiting) => Some(waiting.identify(
                     &session_id,
                     &request_id,
-                    variant_name(&request),
+                    verb,
                     read_admission::ReadOrdering::key_id(&request),
                 )),
                 Err(message) => {

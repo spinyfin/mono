@@ -10,16 +10,17 @@ use std::{
 
 /// Most blockers named in one holder dump.
 const MAX_BLOCKERS: usize = 16;
-/// Holder dumps are rate limited so a queue-full flood adds neither lock
-/// contention nor log volume of its own.
+/// Holder dumps are rate limited per wait kind so a queue-full flood adds
+/// neither lock contention nor log volume of its own, yet cannot suppress the
+/// rare deadline dump that names the real blocker.
 const DUMP_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
 pub(super) struct Diagnostics {
     next: AtomicU64,
     reads: Mutex<BTreeMap<u64, Entry>>,
-    last_dump: Mutex<Option<Instant>>,
-    suppressed: AtomicU64,
+    last_dump: Mutex<[Option<Instant>; Wait::KINDS]>,
+    suppressed: [AtomicU64; Wait::KINDS],
 }
 
 #[derive(Clone, Debug, bon::Builder)]
@@ -41,12 +42,35 @@ struct Entry {
 /// What the rejected read was waiting for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Wait {
-    /// Per-connection or engine pending queue was full.
-    Queue,
+    /// The rejected connection's own pending queue was full.
+    ConnectionQueue,
+    /// The engine-wide pending queue was full.
+    EngineQueue,
     /// An earlier read with the same ordering key held the turn.
     Ordering,
     /// Connection or engine active permits; the entry's stage says which.
     Permit,
+}
+
+impl Wait {
+    const KINDS: usize = 4;
+
+    fn index(self) -> usize {
+        match self {
+            Self::ConnectionQueue => 0,
+            Self::EngineQueue => 1,
+            Self::Ordering => 2,
+            Self::Permit => 3,
+        }
+    }
+}
+
+/// Identity of a read rejected before it was tracked (queue full).
+#[derive(Clone, Copy, Debug)]
+pub(in crate::app) struct Identity<'a> {
+    pub(in crate::app) session: &'a str,
+    pub(in crate::app) request: &'a str,
+    pub(in crate::app) verb: &'a str,
 }
 
 #[derive(Debug)]
@@ -83,16 +107,24 @@ impl Diagnostics {
     }
 
     /// Logs the reads that were actually holding up the rejected one.
-    /// `rejected` is `None` for queue-full rejections, which happen before
-    /// the read is tracked; `connection` then scopes the selection.
-    pub(super) fn report(&self, reason: &str, wait: Wait, rejected: Option<&TrackedRead>, connection: usize) {
+    /// Queue-full rejections happen before the read is tracked, so the
+    /// caller passes its `identity` instead; `connection` scopes selection.
+    pub(super) fn report(
+        &self,
+        reason: &str,
+        wait: Wait,
+        rejected: Option<&TrackedRead>,
+        identity: Option<Identity<'_>>,
+        connection: usize,
+    ) {
+        let kind = wait.index();
         {
             let mut last = self.last_dump.lock().unwrap();
-            if last.is_some_and(|at| at.elapsed() < DUMP_INTERVAL) {
-                self.suppressed.fetch_add(1, Ordering::Relaxed);
+            if last[kind].is_some_and(|at| at.elapsed() < DUMP_INTERVAL) {
+                self.suppressed[kind].fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            *last = Some(Instant::now());
+            last[kind] = Some(Instant::now());
         }
         // Copy under the lock; select and format after releasing it.
         let snapshot: Vec<(u64, Entry)> = self
@@ -112,13 +144,22 @@ impl Diagnostics {
             .into_iter()
             .map(|(id, entry)| describe(*id, entry))
             .collect();
-        let rejected = rejected_id.and_then(|id| {
-            snapshot
-                .iter()
-                .find(|(entry_id, _)| *entry_id == id)
-                .map(|(id, entry)| describe(*id, entry))
-        });
-        let suppressed = self.suppressed.swap(0, Ordering::Relaxed);
+        let rejected = rejected_id
+            .and_then(|id| {
+                snapshot
+                    .iter()
+                    .find(|(entry_id, _)| *entry_id == id)
+                    .map(|(id, entry)| describe(*id, entry))
+            })
+            .or_else(|| {
+                identity.map(|who| {
+                    format!(
+                        "untracked: session={} request={:?} verb={}",
+                        who.session, who.request, who.verb
+                    )
+                })
+            });
+        let suppressed = self.suppressed[kind].swap(0, Ordering::Relaxed);
         tracing::warn!(
             reason,
             ?wait,
@@ -154,11 +195,15 @@ fn select_blockers(
     connection: usize,
 ) -> Vec<&(u64, Entry)> {
     let rejected_entry = rejected.and_then(|id| snapshot.iter().find(|(entry_id, _)| *entry_id == id));
+    // Pending permits are released once a read is admitted, so only reads
+    // still waiting for admission fill a pending queue.
+    let holds_pending = |stage: &str| matches!(stage, "ordering" | "connection permit" | "engine permit");
     let holds_connection_permit = |stage: &str| matches!(stage, "engine permit" | "blocking queue" | "handler");
     let holds_engine_permit = |stage: &str| matches!(stage, "blocking queue" | "handler");
     // Engine permits are shared across connections; everything else is
     // scoped to the rejected read's own connection.
-    let engine_wide = wait == Wait::Permit && rejected_entry.is_some_and(|(_, r)| r.stage == "engine permit");
+    let engine_wide = wait == Wait::EngineQueue
+        || (wait == Wait::Permit && rejected_entry.is_some_and(|(_, r)| r.stage == "engine permit"));
     snapshot
         .iter()
         .filter(|(id, entry)| {
@@ -166,7 +211,7 @@ fn select_blockers(
                 return false;
             }
             match wait {
-                Wait::Queue => true,
+                Wait::ConnectionQueue | Wait::EngineQueue => holds_pending(entry.stage),
                 Wait::Ordering => rejected_entry.is_some_and(|(rejected_id, r)| id < rejected_id && entry.key == r.key),
                 Wait::Permit if engine_wide => holds_engine_permit(entry.stage),
                 Wait::Permit => holds_connection_permit(entry.stage),
@@ -274,17 +319,42 @@ mod tests {
         assert_eq!(blockers.len(), MAX_BLOCKERS);
         assert!(blockers.iter().all(|(_, e)| e.stage == "handler"));
 
-        // Queue full is scoped to the offending connection.
-        let blockers = select_blockers(&snapshot, Wait::Queue, None, 1);
-        assert!(blockers.iter().all(|(_, e)| e.connection == 1));
+        // Connection queue full: only that connection's still-pending reads,
+        // not its older admitted handlers.
+        let blockers = select_blockers(&snapshot, Wait::ConnectionQueue, None, 1);
+        assert_eq!(blockers.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![22, 23, 24]);
+    }
+
+    /// Other connections exhausting the engine queue, behind more than
+    /// `MAX_BLOCKERS` older admitted handlers, must still be named.
+    #[test]
+    fn engine_queue_full_names_pending_holders_on_other_connections() {
+        let mut snapshot: Vec<(u64, Entry)> = (0..20).map(|id| (id, entry("old", "handler", 7, 2))).collect();
+        snapshot.push((20, entry("other", "connection permit", 8, 2)));
+        snapshot.push((21, entry("third", "engine permit", 9, 3)));
+        snapshot.push((22, entry("other", "ordering", 9, 3)));
+        // The rejected connection (1) has nothing pending at all.
+        let blockers = select_blockers(&snapshot, Wait::EngineQueue, None, 1);
+        assert_eq!(blockers.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![20, 21, 22]);
+        let blockers = select_blockers(&snapshot, Wait::ConnectionQueue, None, 1);
+        assert!(blockers.is_empty());
     }
 
     #[tokio::test]
-    async fn holder_dumps_are_rate_limited_and_count_suppressed_reports() {
+    async fn holder_dumps_are_rate_limited_per_kind_and_count_suppressed_reports() {
         let diagnostics = Arc::new(Diagnostics::default());
-        diagnostics.report("first", Wait::Queue, None, 1);
-        diagnostics.report("second", Wait::Queue, None, 1);
-        diagnostics.report("third", Wait::Queue, None, 1);
-        assert_eq!(diagnostics.suppressed.load(Ordering::Relaxed), 2);
+        diagnostics.report("first", Wait::ConnectionQueue, None, None, 1);
+        diagnostics.report("second", Wait::ConnectionQueue, None, None, 1);
+        diagnostics.report("third", Wait::ConnectionQueue, None, None, 1);
+        let counts = |d: &Diagnostics| d.suppressed.each_ref().map(|c| c.load(Ordering::Relaxed));
+        assert_eq!(counts(&diagnostics), [2, 0, 0, 0]);
+
+        // A deadline report right after a queue-full flood is not suppressed.
+        diagnostics.report("ordering", Wait::Ordering, None, None, 1);
+        diagnostics.report("permit", Wait::Permit, None, None, 1);
+        assert_eq!(counts(&diagnostics), [2, 0, 0, 0]);
+        // A second report of the same deadline kind still is, and is attributed to it.
+        diagnostics.report("permit again", Wait::Permit, None, None, 1);
+        assert_eq!(counts(&diagnostics), [2, 0, 0, 1]);
     }
 }
