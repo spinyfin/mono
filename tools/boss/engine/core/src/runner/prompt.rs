@@ -634,7 +634,7 @@ pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done
          - If a CI workflow file exists (`.github/workflows/*.yml`), open it and mirror the exact bazel target set it builds/tests (these repos typically run `bazel build //...` or a curated rollup). Run that same command locally so your gate matches what CI will enforce.\n\
          {clean_bullet}\
          \n\
-         Prefer to run every long-running build-class command (Bazel, checkleft, tests, etc.) in the FOREGROUND and read its exit code directly. For a tool that yields a session, FOREGROUND means keep polling that session until it returns `exit_code`; it does not mean issue one invocation and discard its session handle. If you instead background one (a trailing shell `&` or a backgrounded/asynchronous invocation), you MUST run `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` before ending your turn, and must not idle in a self-paced wait-loop \"until the gate is green\" without one. A wait-loop with no declared bound never terminates if the command wedges (host contention, a hung toolchain) and strands your slot. {timeout_clause} To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.\n\
+         Prefer to run every long-running build-class command (Bazel, checkleft, tests, etc.) in the FOREGROUND and read its exit code directly. For a tool that yields a session, FOREGROUND means keep polling that session until it returns `exit_code`; it does not mean issue one invocation and discard its session handle. If you instead background one (a trailing shell `&` or a backgrounded/asynchronous invocation), you MUST run `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` before ending your turn, and must not idle in a self-paced wait-loop \"until the gate is green\" without one. {timeout_clause} To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.\n\
          \n\
          {failure_sentence}"
     )
@@ -668,6 +668,8 @@ fn bazel_conflict_resolution_gate_block(workspace_path: &Path, seam_enabled: boo
 /// for why this is build-before-push rather than build-and-test-before-push,
 /// and [`bazel_prepush_gate_text`] for what `seam_enabled` selects.
 pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String {
+    let background_wait =
+        crate::prompt_fragments::background_wait_declaration(boss_engine_worker_bin::WORKER_BOSS_INVOCATION);
     let failure_sentence = if seam_enabled {
         "If `bazel build` fails or times out, do NOT push. A successful build is required before delivery. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop.\n"
     } else {
@@ -681,7 +683,7 @@ pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String 
          Required BEFORE you push (step 4):\n\
          - Regenerate any generated/lock artifact the rebase invalidated and include it in your commit. The common one is `MODULE.bazel.lock`: run `bazel mod deps --lockfile_mode=update` (or build any target, which refreshes it) and stage the result.\n\
          - `bazel build` the targets your resolution touched AND the targets the rebased-in upstream change touches. Use `bazel query` to resolve labels if unsure. The merged code MUST COMPILE — a conflict resolution that does not build is wrong and must not be pushed.\n\
-         - Run the build in the FOREGROUND with a timeout (e.g. `timeout 1800 bazel build <targets>`) and read its exit code directly. If you background it instead, declare the wait with `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` before ending your turn; never idle in a wait-loop without one.\n\
+         - Run the build in the FOREGROUND with a timeout (e.g. `timeout 1800 bazel build <targets>`) and read its exit code directly. {background_wait}\n\
          \n\
          Then PUSH (step 4) as soon as the build is clean. Do NOT block the push on a full `bazel test //...`.\n\
          \n\
@@ -863,9 +865,9 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
         );
     }
     if seam_enabled {
-        out.push_str(&format!("You will NOT get another turn after `{boss} propose done` (see below) — not after `gh pr create` / `{cube} pr create` / `{cube} pr update` themselves, those still give you a turn so you can go on to declare done. Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
+        out.push_str(&format!("You will NOT get another turn after `{boss} propose done` (see below) — not after `gh pr create` / `{cube} pr create` / `{cube} pr update` themselves, those still give you a turn so you can go on to declare done. Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR until every gate, build, test run, review and sub-agent run you started has returned its real result — the PR comes after those results, never in place of them.\n\n"));
     } else {
-        out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
+        out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR until every gate, build, test run, review and sub-agent run you started has returned its real result — the PR comes after those results, never in place of them.\n\n"));
     }
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
     out

@@ -293,15 +293,24 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// cannot observe, so a worker that reaches for them gets a hard block. Saying
 /// so up front turns a wasted turn into a known constraint.
 ///
-/// The long-command rule is also Codex-specific. `exec_command`'s initial
-/// yield is capped at 30 seconds by codex-cli 0.145.0 and has no config/env/CLI
-/// override (`--strict-config` rejects the corresponding candidate keys).
-/// Unified exec does, however, return a session id and supports empty
-/// `write_stdin` polls up to 300 seconds. The injected example keeps those
-/// polls inside the originating JavaScript cell: the rollout correlator
-/// observes that cell through its `wait` continuations and ultimately receives
-/// the command's real `exit_code`; a separate polling cell has no attributable
-/// command.
+/// The long-command rule is also Codex-specific, and it exists for one reason:
+/// the rollout correlator needs the command's real `exit_code`. `exec_command`'s
+/// initial yield is capped at 30 seconds by codex-cli 0.145.0 and has no
+/// config/env/CLI override (`--strict-config` rejects the corresponding
+/// candidate keys). Unified exec does, however, return a session id and
+/// supports empty `write_stdin` polls up to 300 seconds. The injected example
+/// keeps those polls inside the originating JavaScript cell: the rollout
+/// correlator observes that cell through its `wait` continuations and
+/// ultimately receives the command's real `exit_code`; a separate polling cell
+/// has no attributable command. Without it the call stays open, drains as
+/// abandoned at the turn boundary (`RolloutCallTracker::observe_output` /
+/// `drain_open_calls`), surfaces as an `UNOBSERVED_COMMAND_MARKER`, and the
+/// engine refuses the run's `no-changes-needed` declaration
+/// (`refuse_no_op_declaration`).
+///
+/// The block says nothing to discourage backgrounding: a job deliberately left
+/// running is covered by the engine-wide `propose wait` rule, which the block
+/// points at in one sentence.
 const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via the Codex rollout JSONL file in this run's isolated CODEX_HOME.\n\
@@ -326,7 +335,8 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      never infer ownership or blockage from global process-name matches.\n\
      \n\
      For any ordinary command expected to exceed roughly ten seconds, keep its\n\
-     session handle and poll it to completion in the same JavaScript cell.\n\
+     session handle and poll it to completion in the same JavaScript cell,\n\
+     until the result carries `exit_code`.\n\
      `exec_command` yields after at most 30 seconds; a result containing\n\
      `session_id` means the command is still running — never that it passed or\n\
      failed. `text(r.output)` discards that handle, so use this pattern instead:\n\
@@ -341,13 +351,14 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      text(JSON.stringify(r));\n\
      ```\n\
      \n\
-     Empty `write_stdin(session_id, chars: \"\")` polling is explicitly\n\
-     allowed for a session started by an ordinary command; repeat the poll in\n\
-     that same cell with its returned `session_id` until the terminal result\n\
-     carries `exit_code`. Writing commands through stdin is not. Do not end the\n\
-     turn or claim a gate result without the real `exit_code`. Give a command\n\
-     that might hang its own foreground timeout so expiry returns a nonzero\n\
-     status instead of polling forever.\n\
+     Empty `write_stdin(session_id, chars: \"\")` polling is allowed for a\n\
+     session started by an ordinary command; writing commands through stdin\n\
+     is not. Do not claim a gate result without the real `exit_code`. Give a\n\
+     command that might hang its own foreground timeout so expiry returns a\n\
+     nonzero status. A job you deliberately leave running rather than polling\n\
+     it to completion must be declared with\n\
+     `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>`\n\
+     before you end the turn.\n\
      \n\
      **Do not invent a budget.** Nothing in this session meters your runtime,\n\
      your turns, or your tokens, and you are not the accountant for any of\n\

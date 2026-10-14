@@ -354,6 +354,7 @@ exists — that is a normal, expected outcome on most runs.\n\n\
 /// `boss propose automation-outcome` instead.
 fn render_decision_section(create_cmd: &str, decision_artifact_path: &str, seam_enabled: bool) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
+    let background_wait = crate::prompt_fragments::background_wait_declaration(boss);
     if !seam_enabled {
         return format!(
             "## You MUST report exactly one decision\n\n\
@@ -411,9 +412,10 @@ soon as you can tell whether actionable work exists. Do NOT run \"one more \
 confirming check\": re-proving a verdict you already hold is exactly how these \
 runs burn their whole budget and end with no marker.\n\
 - **Do NOT launch repo-wide or whole-repo build / clippy / lint / checkleft / \
-test sweeps, and do NOT run a long build in the background and then idle-poll \
-waiting for it.** Waiting in a loop on a backgrounded build consumes the entire \
-session and produces no decision — this is the dominant reason these runs fail.\n\
+test sweeps.** A sweep that has to be waited on consumes the entire session and \
+produces no decision — this is the dominant reason these runs fail. Run any \
+check you do launch in the foreground and read its exit code directly. \
+{background_wait}\n\
 - **If you cannot cheaply confirm that actionable work exists, `skip`.** An \
 inconclusive quick check is grounds to skip, not to escalate to a heavier \
 sweep — the automation fires again on its next schedule. A `skip` is a \
@@ -486,9 +488,10 @@ soon as you can tell whether actionable work exists. Do NOT run \"one more \
 confirming check\": re-proving a verdict you already hold is exactly how these \
 runs burn their whole budget and end with no declaration.\n\
 - **Do NOT launch repo-wide or whole-repo build / clippy / lint / checkleft / \
-test sweeps, and do NOT run a long build in the background and then idle-poll \
-waiting for it.** Waiting in a loop on a backgrounded build consumes the entire \
-session and produces no decision — this is the dominant reason these runs fail.\n\
+test sweeps.** A sweep that has to be waited on consumes the entire session and \
+produces no decision — this is the dominant reason these runs fail. Run any \
+check you do launch in the foreground and read its exit code directly. \
+{background_wait}\n\
 - **If you cannot cheaply confirm that actionable work exists, `skip`.** An \
 inconclusive quick check is grounds to skip, not to escalate to a heavier \
 sweep — the automation fires again on its next schedule. A `skip` is a \
@@ -637,6 +640,7 @@ pub fn render_triage_claude_md(lease_id: &str, automation_outcome_proposals_seam
 fn claude_md_decision_contract(seam_enabled: bool) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
+    let background_wait = crate::prompt_fragments::background_wait_declaration(boss);
     if !seam_enabled {
         return format!(
             "## Triage mandate (HARD CONSTRAINT)\n\
@@ -688,9 +692,10 @@ fn claude_md_decision_contract(seam_enabled: bool) -> String {
            already hold is how these runs burn their whole budget and stop\n\
            with no marker.\n\
          - **Do NOT launch repo-wide build / clippy / lint / checkleft / test\n\
-           sweeps, and do NOT background a long build and idle-poll waiting on\n\
-           it.** Waiting in a loop on a backgrounded build consumes the whole\n\
+           sweeps.** A sweep that has to be waited on consumes the whole\n\
            session and yields no decision — the dominant failure mode here.\n\
+           Run any check you do launch in the foreground and read its exit\n\
+           code directly. {background_wait}\n\
          - **If you cannot cheaply confirm actionable work exists, `skip`.**\n\
            An inconclusive quick check is grounds to skip, not to escalate to\n\
            a heavier sweep — the automation re-fires on its schedule. A skip\n\
@@ -773,9 +778,10 @@ fn claude_md_decision_contract(seam_enabled: bool) -> String {
            already hold is how these runs burn their whole budget and stop\n\
            with no declaration.\n\
          - **Do NOT launch repo-wide build / clippy / lint / checkleft / test\n\
-           sweeps, and do NOT background a long build and idle-poll waiting on\n\
-           it.** Waiting in a loop on a backgrounded build consumes the whole\n\
+           sweeps.** A sweep that has to be waited on consumes the whole\n\
            session and yields no decision — the dominant failure mode here.\n\
+           Run any check you do launch in the foreground and read its exit\n\
+           code directly. {background_wait}\n\
          - **If you cannot cheaply confirm actionable work exists, `--skip`.**\n\
            An inconclusive quick check is grounds to skip, not to escalate to\n\
            a heavier sweep — the automation re-fires on its schedule. A skip\n\
@@ -1124,14 +1130,10 @@ mod tests {
             md.contains("one more confirming check"),
             "triage CLAUDE.md must forbid re-proving a verdict with \"one more confirming check\"",
         );
-        // The budget-burn anti-pattern: repo-wide sweeps + backgrounded-build idle polling.
+        // The budget-burn anti-pattern: repo-wide sweeps.
         assert!(
             lower.contains("repo-wide"),
             "triage CLAUDE.md must forbid repo-wide build/lint sweeps",
-        );
-        assert!(
-            lower.contains("idle-poll"),
-            "triage CLAUDE.md must forbid idle-polling a backgrounded build",
         );
         // Bias to a decision under uncertainty rather than escalating verification.
         assert!(
@@ -1217,17 +1219,8 @@ mod tests {
             preamble.contains("one more confirming check"),
             "preamble must forbid re-proving a verdict with \"one more confirming check\"",
         );
-        // No repo-wide sweeps / no backgrounded-build idle polling (the field-evidence
-        // budget-burn shape).
+        // No repo-wide sweeps (the field-evidence budget-burn shape).
         assert!(lower.contains("repo-wide"), "preamble must forbid repo-wide sweeps");
-        assert!(
-            lower.contains("idle-poll"),
-            "preamble must forbid idle-polling a backgrounded build",
-        );
-        assert!(
-            lower.contains("background"),
-            "preamble must name the backgrounded-build trap"
-        );
         // Bias to a decision under uncertainty.
         assert!(
             preamble.contains("`skip`"),
@@ -1237,6 +1230,53 @@ mod tests {
             lower.contains("heavier sweep"),
             "preamble must forbid escalating an inconclusive check to a heavier sweep",
         );
+    }
+
+    /// Every triage prompt variant carries the same background-work rule as the
+    /// main worker prompt — foreground preferred, a backgrounded command
+    /// declared with `propose wait` — and none carries a blanket ban on
+    /// backgrounding.
+    #[test]
+    fn triage_prompts_use_the_propose_wait_rule_not_a_background_ban() {
+        let automation = Automation::builder()
+            .id("auto_bg")
+            .short_id(3i64)
+            .product_id("prod_1")
+            .name("clippy sweep")
+            .trigger(boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+            })
+            .standing_instruction("fix any clippy warnings")
+            .created_at("2026-01-01")
+            .updated_at("2026-01-01")
+            .build();
+        let declaration =
+            crate::prompt_fragments::background_wait_declaration(boss_engine_worker_bin::WORKER_BOSS_INVOCATION);
+        for seam_enabled in [false, true] {
+            let preamble = render_triage_preamble(
+                &automation,
+                "My Product",
+                &[],
+                &TriageContext::default(),
+                ARTIFACT_PATH,
+                seam_enabled,
+            );
+            let claude_md = render_triage_claude_md("lease_bg", seam_enabled);
+            for (label, text) in [("preamble", preamble), ("CLAUDE.md", claude_md)] {
+                // The markdown renderer hard-wraps; compare on collapsed whitespace.
+                let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(
+                    flat.contains(&declaration),
+                    "triage {label} (seam_enabled={seam_enabled}) must carry the shared propose-wait rule:\n{text}",
+                );
+                let lower = flat.to_lowercase();
+                assert!(
+                    !lower.contains("idle-poll") && !lower.contains("do not run a long build in the background"),
+                    "triage {label} (seam_enabled={seam_enabled}) must not ban backgrounding outright:\n{text}",
+                );
+            }
+        }
     }
 
     #[test]

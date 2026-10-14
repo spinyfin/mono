@@ -128,7 +128,7 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         "let r = await tools.exec_command",
         "session_id: r.session_id",
         "yield_time_ms: 300000",
-        "carries `exit_code`.",
+        "until the result carries `exit_code`.",
         "own foreground timeout",
     ] {
         assert!(
@@ -152,6 +152,32 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         preamble.contains("without the real `exit_code`"),
         "the worker must not infer success from a missing exit status: {preamble}"
     );
+}
+
+#[test]
+fn agent_rules_point_a_deliberate_background_job_at_propose_wait_without_banning_it() {
+    let preamble = CodexDriver::default().agent_rules_preamble();
+    let flat = preamble.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "must be declared with `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` \
+             before you end the turn."
+        ),
+        "a deliberately backgrounded job must be pointed at `propose wait`: {preamble}"
+    );
+    let lower = flat.to_lowercase();
+    for banned in [
+        "do not background",
+        "never background",
+        "do not run a long build in the background",
+        "idle-poll",
+        "instead of polling forever",
+    ] {
+        assert!(
+            !lower.contains(banned),
+            "the Codex worker rules must not carry a blanket background prohibition ({banned:?}): {preamble}"
+        );
+    }
 }
 
 #[test]
