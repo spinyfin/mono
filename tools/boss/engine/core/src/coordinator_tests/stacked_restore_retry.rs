@@ -18,8 +18,14 @@ impl HostAdapter for FlakyRestoreAdapter {
         self.inner.checkpoint_execution_baseline(record).await
     }
 
-    async fn prepare_recovery_pr(&self, record: &ExecutionBookmark, workspace: &Path, pr: u64) -> Result<bool> {
-        self.inner.prepare_recovery_pr(record, workspace, pr).await
+    async fn prepare_recovery_pr(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        repo_id: &str,
+        pr: u64,
+    ) -> Result<bool> {
+        self.inner.prepare_recovery_pr(record, workspace, repo_id, pr).await
     }
 
     async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {

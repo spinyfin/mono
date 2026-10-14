@@ -110,7 +110,34 @@ pub(crate) async fn fetch_recovery_pr_base(origin: &str, pr: u64) -> Result<Stri
     let slug = git_utils::repo_slug::parse_github_slug(origin).ok_or_else(|| {
         execution_bookmark::base_unresolvable_error(format!("origin `{origin}` is not a GitHub repository"))
     })?;
-    git_utils::gh_cli::fetch_pr_base_ref(&slug, pr).await
+    git_utils::gh_cli::fetch_open_pr_base(&slug, pr)
+        .await?
+        .ok_or_else(closed_recovery_pr_error)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("PR is not open")]
+struct ClosedRecoveryPr;
+
+pub(crate) fn closed_recovery_pr_error() -> anyhow::Error {
+    ClosedRecoveryPr.into()
+}
+
+/// Check the structured PR lookup before cube positioning, on either host.
+async fn recovery_pr_is_open(adapter: &dyn HostAdapter, repo_id: &str, pr: u64) -> Result<bool> {
+    let repos = adapter.list_repos().await?;
+    let repo = repos
+        .iter()
+        .find(|repo| repo.repo_id == repo_id)
+        .ok_or_else(|| anyhow::anyhow!("recovery repository {repo_id} is absent from cube repo list"))?;
+    match adapter.recovery_pr_base(&repo.origin, pr).await {
+        Ok(_) => Ok(true),
+        Err(err) if err.is::<ClosedRecoveryPr>() => Ok(false),
+        // An unavailable base keeps the existing repository-main fallback;
+        // it does not establish that the PR itself is closed.
+        Err(err) if execution_bookmark::is_base_unresolvable_error(&err) => Ok(true),
+        Err(err) => Err(err),
+    }
 }
 
 /// Abstracts all host-specific operations: workspace lifecycle and
@@ -174,8 +201,14 @@ pub trait HostAdapter: Send + Sync {
     }
     /// Resolve an open PR while preserving the pre-checkout recovery pointers.
     /// Returns false for a closed or merged PR, which cannot anchor recovery.
-    async fn prepare_recovery_pr(&self, record: &ExecutionBookmark, workspace: &Path, pr: u64) -> Result<bool> {
-        let _ = (record, workspace, pr);
+    async fn prepare_recovery_pr(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        repo_id: &str,
+        pr: u64,
+    ) -> Result<bool> {
+        let _ = (record, workspace, repo_id, pr);
         bail!("recovery PR preparation is not supported by this host adapter")
     }
     /// Repair stranded, diverged or baseline-less pointers from an
@@ -498,19 +531,24 @@ impl HostAdapter for LocalHostAdapter {
         );
         execution_bookmark::checkpoint_baseline(&LocalJj, record).await
     }
-    async fn prepare_recovery_pr(&self, record: &ExecutionBookmark, workspace: &Path, pr: u64) -> Result<bool> {
+    async fn prepare_recovery_pr(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        repo_id: &str,
+        pr: u64,
+    ) -> Result<bool> {
         anyhow::ensure!(
             record.host_id == self.host_id(),
             "recovery store belongs to another host"
         );
+        if !recovery_pr_is_open(self, repo_id, pr).await? {
+            return Ok(false);
+        }
         let saved = execution_bookmark::snapshot_pointers(&LocalJj, record).await?;
         let result = self.goto_workspace(workspace, pr).await;
         execution_bookmark::restore_pointers(&LocalJj, record, &saved).await?;
-        match result {
-            Ok(_) => Ok(true),
-            Err(err) if format!("{err:#}").contains("cannot position on a non-open PR") => Ok(false),
-            Err(err) => Err(err),
-        }
+        result.map(|_| true)
     }
     async fn reconcile_execution_bookmark(
         &self,
@@ -1022,19 +1060,24 @@ impl HostAdapter for SshHostAdapter {
         );
         execution_bookmark::checkpoint_baseline(self, record).await
     }
-    async fn prepare_recovery_pr(&self, record: &ExecutionBookmark, workspace: &Path, pr: u64) -> Result<bool> {
+    async fn prepare_recovery_pr(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        repo_id: &str,
+        pr: u64,
+    ) -> Result<bool> {
         anyhow::ensure!(
             record.host_id == self.host_id(),
             "recovery store belongs to another host"
         );
+        if !recovery_pr_is_open(self, repo_id, pr).await? {
+            return Ok(false);
+        }
         let saved = execution_bookmark::snapshot_pointers(self, record).await?;
         let result = self.goto_workspace(workspace, pr).await;
         execution_bookmark::restore_pointers(self, record, &saved).await?;
-        match result {
-            Ok(_) => Ok(true),
-            Err(err) if format!("{err:#}").contains("cannot position on a non-open PR") => Ok(false),
-            Err(err) => Err(err),
-        }
+        result.map(|_| true)
     }
     async fn reconcile_execution_bookmark(
         &self,

@@ -143,7 +143,9 @@ impl ExecutionCoordinator {
             let positioning_pr = match reconciled_pr.or(pr_for_goto).or(pr_for_reconcile) {
                 Some(pr)
                     if reconciled_pr.is_some()
-                        || adapter.prepare_recovery_pr(&record, &lease.workspace_path, pr).await? =>
+                        || adapter
+                            .prepare_recovery_pr(&record, &lease.workspace_path, repo_id, pr)
+                            .await? =>
                 {
                     Some(pr)
                 }
@@ -277,7 +279,7 @@ impl ExecutionCoordinator {
         );
         let pr_bookmark = match pr_for_reconcile {
             Some(pr) => adapter
-                .prepare_recovery_pr(record, &lease.workspace_path, pr)
+                .prepare_recovery_pr(record, &lease.workspace_path, repo_id, pr)
                 .await?
                 .then(|| format!("pr/{pr}")),
             None => None,

@@ -1,26 +1,57 @@
 use super::*;
-use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
+use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, PointerSnapshot};
 
 impl WorkDb {
-    /// Complete an engine-driven rewrite by checkpointing its baseline
-    /// bookmarks and their database provenance before reporting success.
-    pub(crate) async fn checkpoint_rewritten_baselines(&self, work_item_id: &str) -> Result<()> {
-        use boss_engine_recovery::execution_bookmark::{LocalJj, checkpoint_baseline, is_missing_pointer_error};
+    /// Preserve recovery identities across cube's shared-store pointer rewrites.
+    pub(crate) async fn snapshot_rebase_pointers(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Vec<(ExecutionBookmark, PointerSnapshot)>> {
+        use boss_engine_recovery::execution_bookmark::{LocalJj, snapshot_pointers};
+        let mut saved = Vec::new();
         for execution in self.list_executions(Some(work_item_id))? {
-            let Some(record) = self.execution_bookmark_optional(&execution.id)? else {
-                continue;
-            };
-            // Engine-direct cube rewrites run on the engine host. Other
-            // hosts' repositories are independent and were not rewritten.
-            if record.host_id != "local" {
-                continue;
+            if let Some(record) = self.execution_bookmark_optional(&execution.id)?
+                && record.host_id == "local"
+            {
+                let pointers = snapshot_pointers(&LocalJj, &record).await?;
+                saved.push((record, pointers));
             }
-            let base = match checkpoint_baseline(&LocalJj, &record).await {
-                Ok(base) => base,
-                Err(err) if is_missing_pointer_error(&err) => continue,
-                Err(err) => return Err(err),
-            };
-            self.update_execution_bookmark_base(&execution.id, &base)?;
+        }
+        Ok(saved)
+    }
+
+    /// Attempt every restore even if one repository is unavailable. A published
+    /// rebase must still pass the deletion gate when maintenance fails.
+    pub(crate) async fn restore_rebase_pointers(&self, saved: &[(ExecutionBookmark, PointerSnapshot)]) -> bool {
+        use boss_engine_recovery::execution_bookmark::{LocalJj, restore_pointers};
+        let mut restored = true;
+        for (record, pointers) in saved {
+            if let Err(err) = restore_pointers(&LocalJj, record, pointers).await {
+                restored = false;
+                tracing::error!(execution_id = %record.execution_id, ?err, "could not restore recovery pointers after cube rebase");
+            }
+        }
+        restored
+    }
+
+    /// Checkpoint intact records independently without changing ladder outcomes.
+    pub(crate) async fn checkpoint_rewritten_baselines(&self, work_item_id: &str) -> Result<()> {
+        use boss_engine_recovery::execution_bookmark::{LocalJj, checkpoint_baseline};
+        for execution in self.list_executions(Some(work_item_id))? {
+            let result: Result<()> = async {
+                let Some(record) = self.execution_bookmark_optional(&execution.id)? else {
+                    return Ok(());
+                };
+                if record.host_id != "local" {
+                    return Ok(());
+                }
+                let base = checkpoint_baseline(&LocalJj, &record).await?;
+                self.update_execution_bookmark_base(&execution.id, &base)
+            }
+            .await;
+            if let Err(err) = result {
+                tracing::warn!(execution_id = %execution.id, ?err, "rebase baseline checkpoint failed; keeping recorded baseline");
+            }
         }
         Ok(())
     }

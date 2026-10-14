@@ -30,8 +30,6 @@ pub use reconcile::{
 };
 
 #[cfg(test)]
-mod amendment_tests;
-#[cfg(test)]
 mod reconcile_tests;
 
 /// Which invariant a damaged pointer broke. The engine repairs the first

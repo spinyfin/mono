@@ -279,7 +279,7 @@ crate::stub_cube_client! { FakeCubeClient {
             .await
             .push((workspace_path.display().to_string(), pr));
         if self.closed_pr {
-            return Err(anyhow!("cannot position on a non-open PR"));
+            return Err(anyhow!("unexpected goto of a closed PR"));
         }
         if self.fail_goto {
             return Err(anyhow!("cube workspace goto failed"));
@@ -363,6 +363,9 @@ crate::stub_cube_client! { FakeCubeClient {
         Ok(repos)
     }
     async fn recovery_pr_base(&self, _origin: &str, _pr: u64) -> Result<String> {
+        if self.closed_pr {
+            return Err(crate::host_adapter::closed_recovery_pr_error());
+        }
         if self.fail_pr_base.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(boss_engine_recovery::execution_bookmark::base_unresolvable_error("PR base unavailable"));
         }
