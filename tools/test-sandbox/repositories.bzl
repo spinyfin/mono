@@ -47,6 +47,22 @@ _RUNTIME_TOOLS = [
     "wc",
 ]
 
+_REQUIRED_RUNTIME_TOOLS = [
+    "bash",
+    "env",
+    "git",
+    "git-receive-pack",
+    "git-upload-pack",
+    "kill",
+    "mkdir",
+    "mktemp",
+    "perl",
+    "rm",
+    "sed",
+    "sh",
+    "sleep",
+]
+
 def _configured_developer_dir(repository_ctx):
     developer_dir = repository_ctx.os.environ.get("DEVELOPER_DIR", "")
     if not developer_dir:
@@ -70,7 +86,9 @@ def _configured_developer_dir(repository_ctx):
 def _test_runtime_repository_impl(repository_ctx):
     developer_dir = _configured_developer_dir(repository_ctx)
     resolved = {}
-    for tool in _RUNTIME_TOOLS:
+    runtime_tools = repository_ctx.attr.tools or _RUNTIME_TOOLS
+    runtime_tools = runtime_tools + repository_ctx.attr.tools_by_os.get(repository_ctx.os.name, [])
+    for tool in runtime_tools:
         candidates = ["/usr/bin/" + tool, "/bin/" + tool]
         if tool == "git":
             candidates = ([
@@ -109,21 +127,7 @@ def _test_runtime_repository_impl(repository_ctx):
                         resolved["python3-tree"] = str(path.dirname.dirname.realpath)
                 break
 
-    required = [
-        "bash",
-        "env",
-        "git",
-        "git-receive-pack",
-        "git-upload-pack",
-        "kill",
-        "mkdir",
-        "mktemp",
-        "perl",
-        "rm",
-        "sed",
-        "sh",
-        "sleep",
-    ]
+    required = repository_ctx.attr.required or _REQUIRED_RUNTIME_TOOLS
     missing = [tool for tool in required if tool not in resolved]
     if missing:
         fail("required audited test runtime tools are missing: {}".format(", ".join(missing)))
@@ -148,9 +152,9 @@ filegroup(
         "developer_dir",
         "manifest",
     ],
-    visibility = ["//visibility:public"],
+    visibility = {visibility},
 )
-""",
+""".format(visibility = repr(repository_ctx.attr.runtime_visibility)),
     )
 
 def _codex_probe_runtime(repository_ctx):
@@ -196,6 +200,14 @@ codex_probe_runtime_repository = repository_rule(
 
 test_runtime_repository = repository_rule(
     implementation = _test_runtime_repository_impl,
+    attrs = {
+        # Defaults to the shared audited runtime. A narrower consumer lists its
+        # own host tools (and which are mandatory) and its own visibility.
+        "tools": attr.string_list(),
+        "tools_by_os": attr.string_list_dict(),
+        "required": attr.string_list(),
+        "runtime_visibility": attr.string_list(default = ["//visibility:public"]),
+    },
     configure = True,
     environ = ["DEVELOPER_DIR"],
     local = True,

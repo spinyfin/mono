@@ -278,9 +278,19 @@ use_repo(
 )
 
 # Utilities declared by the Node archive integration tests.
-node_test_tools = use_repo_rule("//tools/checkleft:node_test_tools.bzl", "node_test_tools")
-
-node_test_tools(name = "checkleft_node_test_tools")
+test_runtime_repository(
+    name = "checkleft_node_test_tools",
+    required = [
+        "gzip",
+        "tar",
+    ],
+    runtime_visibility = ["@@//tools/checkleft:__pkg__"],
+    tools = [
+        "gzip",
+        "tar",
+    ],
+    tools_by_os = {"linux": ["getconf"]},
+)
 
 # Prebuilt GhosttyKit.xcframework for the Bazel installer.
 # Rebuild procedure: tools/boss/docs/runbooks/update-ghostty-prebuilt.md

@@ -43,7 +43,9 @@ pub async fn get_bytes_with_retry(
     policy: &GetRetryPolicy<'_>,
 ) -> Result<Vec<u8>> {
     let mut last_error = None;
+    let mut attempts = 0;
     for attempt in 1..=policy.max_attempts {
+        attempts = attempt;
         info!(url = %url, attempt, max_attempts = policy.max_attempts, "fetching {what}");
         let mut request = client.get(url.clone());
         if let Some(remaining) = policy.remaining {
@@ -84,7 +86,13 @@ pub async fn get_bytes_with_retry(
         tokio::time::sleep(delay).await;
     }
     let message = last_error.unwrap_or_else(|| format!("failed to retrieve {what}"));
-    bail!("{message} after {} attempts", policy.max_attempts)
+    if attempts < policy.max_attempts {
+        bail!(
+            "{message} after {attempts} of {} attempts (deadline exhausted)",
+            policy.max_attempts
+        )
+    }
+    bail!("{message} after {attempts} attempts")
 }
 
 #[cfg(test)]
@@ -135,15 +143,23 @@ mod tests {
             .mount(&server)
             .await;
 
-        let remaining = || Duration::from_millis(1);
+        // The first retry delay (60 s) exceeds the budget (5 s), so the loop
+        // stops after one attempt without depending on request timing.
+        let remaining = || Duration::from_secs(5);
         let policy = GetRetryPolicy {
+            base_delay: Duration::from_secs(60),
             remaining: Some(&remaining),
             ..policy(None)
         };
         let error = get_bytes_with_retry(&reqwest::Client::new(), &url(&server), "thing", &policy)
             .await
             .expect_err("503 should fail");
-        assert!(error.to_string().contains("503"), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("503"), "{message}");
+        assert!(
+            message.contains("after 1 of 3 attempts (deadline exhausted)"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

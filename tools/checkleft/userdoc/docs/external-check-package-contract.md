@@ -182,8 +182,11 @@ checks:
   - id: format/prettier
     config:
       environment:
-        NODE_EXTRA_CA_CERTS: "/etc/company/ca.pem"
+        npm_config_registry: "https://registry.example.com/"
 ```
+
+Allowlisted variables listed above need no declaration. Declared values are applied
+after the framework's npm settings, so this one takes effect.
 
 This escape hatch can also set HOME when user configuration is intentional.
 PATH is framework-owned and cannot be overridden. Linux npm checks require glibc

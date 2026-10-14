@@ -179,8 +179,7 @@ fn lint_biome_npm_version_override_repins() {
     )
     .expect("resolve");
     assert_eq!(
-        resolved["biome"].display_invocation,
-        "env PATH='/fake:/usr/bin:/bin:/usr/sbin:/sbin' '/fake/npx' --yes '@biomejs/biome@2.6.0'",
+        resolved["biome"].display_invocation, "npx --yes '@biomejs/biome@2.6.0'",
         "version override must update display_invocation to the pinned runtime npx for @biomejs/biome@2.6.0"
     );
 }
