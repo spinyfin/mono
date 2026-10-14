@@ -371,27 +371,60 @@ fn publish_update(db: &WorkDb, guide: &UpdatedGuide) {
         .unwrap();
 }
 
+const RESOLVED: &str = "resolved in published guide";
+
 #[test]
-fn updated_guide_marks_the_completed_revision_findings_resolved() {
+fn done_fix_not_yet_in_the_published_guide_shows_the_live_badge_but_is_not_resolved() {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
     let root = create_test_chore_manual(&db, product.id, "updated findings");
     bind_open_pr(&db, &root.id);
     let guide = seed_update(&db, &root.id, "head-two");
-    // `archived` does not count as fixed on its own: only publication of the
-    // revision's exact head can resolve the finding.
+    // `archived` is neither a live fix nor resolved.
     set_status(&db, &guide.revision, "archived");
+    let archived = findings(&db, &root.id).unwrap();
+    assert!(!archived.addendum_markdown.contains("~~"));
+    assert!(archived.status_text.contains("0 fixed on PR, 0 in progress, 1 open"));
+    // Done, but the published guide still covers head-one.
+    set_status(&db, &guide.revision, "done");
     let before = findings(&db, &root.id).unwrap();
-    assert!(!before.addendum_markdown.contains("~~"));
-    assert!(before.status_text.contains("0 fixed on PR, 0 in progress, 1 open"));
-    publish_update(&db, &guide);
-    let after = findings(&db, &root.id).unwrap();
-    assert!(after.addendum_markdown.contains("- ✓ ~~[high] Unchecked index~~"));
-    assert!(after.status_text.contains("1 fixed on PR, 0 in progress, 0 open"));
+    assert!(before.addendum_markdown.contains("- ✓ ~~[high] Unchecked index~~"));
+    assert!(!before.addendum_markdown.contains(RESOLVED));
+    assert!(!before.status_text.contains("resolved"));
+    assert!(before.status_text.contains("1 fixed on PR, 0 in progress, 0 open"));
 }
 
 #[test]
-fn reopened_revision_is_not_fixed_even_when_its_head_was_published() {
+fn done_revision_contained_in_the_published_head_is_resolved() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "updated findings");
+    bind_open_pr(&db, &root.id);
+    let guide = seed_update(&db, &root.id, "head-two");
+    for status in ["in_review", "done"] {
+        set_status(&db, &guide.revision, status);
+        assert!(!findings(&db, &root.id).unwrap().addendum_markdown.contains(RESOLVED));
+    }
+    publish_update(&db, &guide);
+    for status in ["in_review", "done"] {
+        set_status(&db, &guide.revision, status);
+        let after = findings(&db, &root.id).unwrap();
+        assert!(
+            after.addendum_markdown.contains("- ✓ ~~[high] Unchecked index~~"),
+            "{status}"
+        );
+        assert!(after.addendum_markdown.contains(RESOLVED), "{status}");
+        assert!(
+            after
+                .status_text
+                .contains("1 fixed on PR, 0 in progress, 0 open (1 resolved in published guide)"),
+            "{status}"
+        );
+    }
+}
+
+#[test]
+fn reopened_revision_is_not_resolved_even_when_its_head_was_published() {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
     let root = create_test_chore_manual(&db, product.id, "reopened findings");
@@ -402,6 +435,7 @@ fn reopened_revision_is_not_fixed_even_when_its_head_was_published() {
         set_status(&db, &guide.revision, status);
         let text = findings(&db, &root.id).unwrap();
         assert!(!text.addendum_markdown.contains("~~"), "{status}");
+        assert!(!text.addendum_markdown.contains(RESOLVED), "{status}");
         assert!(
             text.status_text.contains("0 fixed on PR, 1 in progress, 0 open"),
             "{status}"
@@ -410,18 +444,37 @@ fn reopened_revision_is_not_fixed_even_when_its_head_was_published() {
 }
 
 #[test]
-fn revision_head_replaced_by_a_force_push_is_not_fixed() {
+fn non_descendant_published_head_is_not_resolved_but_keeps_the_live_badge() {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
     let root = create_test_chore_manual(&db, product.id, "force pushed findings");
     bind_open_pr(&db, &root.id);
-    // The published head is not the head the revision produced.
+    // The published head is not the head the revision produced, and no push
+    // ancestry connects them (a force-push).
     let guide = seed_update(&db, &root.id, "head-three");
-    set_status(&db, &guide.revision, "archived");
+    set_status(&db, &guide.revision, "done");
     publish_update(&db, &guide);
     let text = findings(&db, &root.id).unwrap();
-    assert!(!text.addendum_markdown.contains("~~"));
-    assert!(text.status_text.contains("0 fixed on PR, 0 in progress, 1 open"));
+    assert!(text.addendum_markdown.contains("- ✓ ~~[high] Unchecked index~~"));
+    assert!(!text.addendum_markdown.contains(RESOLVED));
+    assert!(text.status_text.contains("1 fixed on PR, 0 in progress, 0 open"));
+    assert!(!text.status_text.contains("resolved"));
+}
+
+#[test]
+fn recorded_push_ancestry_lets_a_later_published_head_contain_the_fix() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "descendant findings");
+    bind_open_pr(&db, &root.id);
+    let guide = seed_update(&db, &root.id, "head-three");
+    set_status(&db, &guide.revision, "done");
+    publish_update(&db, &guide);
+    assert!(!findings(&db, &root.id).unwrap().addendum_markdown.contains(RESOLVED));
+    // A later revision pushed head-three on top of head-two.
+    db.record_review_guide_head_ancestry(&root.id, PR_URL, "head-two", "head-three")
+        .unwrap();
+    assert!(findings(&db, &root.id).unwrap().addendum_markdown.contains(RESOLVED));
 }
 
 #[test]

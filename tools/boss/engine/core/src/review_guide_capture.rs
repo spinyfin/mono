@@ -317,9 +317,12 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
             if let Some(revision) = &revision
                 && let Some(head) = &revision.head_after
                 && revision.head_before.as_ref() != Some(head)
-                && let Err(error) = work_db.record_review_guide_revision_head(
-                    &root_task_id, &pr_url, head, &revision.task_id, observation_sequence,
-                )
+                && let Err(error) = work_db
+                    .record_review_guide_revision_head(&root_task_id, &pr_url, head, &revision.task_id, observation_sequence)
+                    .and_then(|()| match &revision.head_before {
+                        Some(before) => work_db.record_review_guide_head_ancestry(&root_task_id, &pr_url, before, head),
+                        None => Ok(()),
+                    })
             {
                 record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
                 return;
@@ -349,9 +352,20 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
             if let Some(revision) = &revision
                 && revision.head_before.as_deref() != Some(metadata.head_sha.as_str())
                 && revision.head_after.as_deref().is_none_or(|head| head == metadata.head_sha)
-                && let Err(error) = work_db.record_review_guide_revision_head(
-                    &root_task_id, &pr_url, &metadata.head_sha, &revision.task_id, observation_sequence,
-                )
+                && let Err(error) = work_db
+                    .record_review_guide_revision_head(
+                        &root_task_id,
+                        &pr_url,
+                        &metadata.head_sha,
+                        &revision.task_id,
+                        observation_sequence,
+                    )
+                    .and_then(|()| match &revision.head_before {
+                        Some(before) => {
+                            work_db.record_review_guide_head_ancestry(&root_task_id, &pr_url, before, &metadata.head_sha)
+                        }
+                        None => Ok(()),
+                    })
             {
                 record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
                 return;

@@ -81,31 +81,19 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
             continue;
         }
         let label = boss_protocol::short_id_label(short_id).or(id.clone());
-        // A published head only vouches for a revision that is not currently
-        // reopened: live todo/active/blocked status always wins.
-        let reopened = matches!(status.as_deref(), Some("todo" | "active" | "blocked"));
-        let resolved: bool = match &id {
-            Some(id) if !reopened => conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pr_review_guide_revision_heads r
-                 JOIN pr_review_guide_source_series s ON s.root_task_id = r.root_task_id AND s.canonical_pr_url = r.pr_url
-                 JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
-                 JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
-                 WHERE r.revision_task_id = ?1 AND r.pr_url = ?2
-                   AND r.head_sha = c.head_sha)",
-                params![id, pr_url],
-                |row| row.get(0),
-            )?,
+        // Two separate facts. The live badge is the revision's own state and
+        // never depends on the guide. "Resolved" is stricter: the revision
+        // completed successfully (not reopened) and the published guide's
+        // head actually contains the head it produced.
+        let resolved = match (&id, status.as_deref()) {
+            (Some(id), Some("in_review" | "done")) if deleted_at.is_none() => {
+                published_guide_contains_revision(conn, id, pr_url)?
+            }
             _ => false,
         };
-        let status = if deleted_at.is_some() {
-            None
-        } else if resolved {
-            Some("resolved")
-        } else {
-            status.as_deref()
-        };
+        let status = if deleted_at.is_some() { None } else { status.as_deref() };
         for (severity, title) in findings {
-            text.push(&severity, &title, label.as_deref(), status);
+            text.push(&severity, &title, label.as_deref(), status, resolved);
         }
     }
     let update = super::review_guide_jobs::guide_updates::status(conn, root_id, pr_url)?;
@@ -123,24 +111,53 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
     Ok(findings)
 }
 
+/// True when the revision's head is the published guide's comparison head, or
+/// an ancestor of it per the recorded push ancestry. Observation order alone
+/// proves only that a probe is fresh, never that a fix is included.
+fn published_guide_contains_revision(conn: &Connection, revision_id: &str, pr_url: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "WITH RECURSIVE published(root_task_id, sha) AS (
+             SELECT s.root_task_id, c.head_sha FROM pr_review_guide_source_series s
+             JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+             JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
+             WHERE s.canonical_pr_url = ?2
+             UNION
+             SELECT p.root_task_id, a.parent_sha FROM published p
+             JOIN pr_review_guide_head_ancestry a
+               ON a.root_task_id = p.root_task_id AND a.pr_url = ?2 AND a.child_sha = p.sha
+         )
+         SELECT EXISTS(SELECT 1 FROM pr_review_guide_revision_heads r
+             JOIN published p ON p.root_task_id = r.root_task_id AND p.sha = r.head_sha
+             WHERE r.revision_task_id = ?1 AND r.pr_url = ?2)",
+        params![revision_id, pr_url],
+        |row| row.get(0),
+    )?)
+}
+
 #[derive(Default)]
 struct FindingsText {
     lines: Vec<String>,
     fixed: usize,
+    resolved: usize,
     in_progress: usize,
     open: usize,
 }
 
 impl FindingsText {
-    fn push(&mut self, severity: &str, title: &str, label: Option<&str>, status: Option<&str>) {
+    fn push(&mut self, severity: &str, title: &str, label: Option<&str>, status: Option<&str>, resolved: bool) {
         let finding = format!("[{}] {}", severity, escape_markdown_line(title));
         let tracker = label
             .map(|label| format!(" — ID {}", escape_markdown_line(label)))
             .unwrap_or_default();
         let line = match status {
-            Some("in_review" | "done" | "resolved") => {
+            Some("in_review" | "done") => {
                 self.fixed += 1;
-                format!("- ✓ ~~{finding}~~{tracker}")
+                if resolved {
+                    self.resolved += 1;
+                    format!("- ✓ ~~{finding}~~{tracker} — resolved in published guide")
+                } else {
+                    format!("- ✓ ~~{finding}~~{tracker}")
+                }
             }
             // Task rows use todo/active; accept the queue/run vocabulary too.
             Some("todo" | "active" | "queued" | "blocked" | "running") => {
@@ -156,9 +173,14 @@ impl FindingsText {
     }
 
     fn finish(self) -> ReviewGuideFindings {
+        let resolved = if self.resolved > 0 {
+            format!(" ({} resolved in published guide)", self.resolved)
+        } else {
+            String::new()
+        };
         ReviewGuideFindings {
             status_text: format!(
-                "{} finding{}: {} fixed on PR, {} in progress, {} open",
+                "{} finding{}: {} fixed on PR, {} in progress, {} open{resolved}",
                 self.lines.len(),
                 if self.lines.len() == 1 { "" } else { "s" },
                 self.fixed,
@@ -211,7 +233,7 @@ mod tests {
             (None, "- [high]", "0 fixed on PR, 0 in progress, 1 open"),
         ] {
             let mut text = FindingsText::default();
-            text.push("high", "Finding", None, status);
+            text.push("high", "Finding", None, status, false);
             let result = text.finish();
             assert_eq!(result.status_text, format!("1 finding: {counts}"));
             assert!(result.addendum_markdown.lines().last().unwrap().starts_with(prefix));

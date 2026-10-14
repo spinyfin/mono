@@ -1305,6 +1305,13 @@ pub(in crate::work) mod guide_updates {
             revision_task_id TEXT NOT NULL,
             observation_sequence INTEGER NOT NULL,
             PRIMARY KEY(root_task_id, pr_url, head_sha)
+         );
+         CREATE TABLE IF NOT EXISTS pr_review_guide_head_ancestry (
+            root_task_id TEXT NOT NULL,
+            pr_url TEXT NOT NULL,
+            parent_sha TEXT NOT NULL,
+            child_sha TEXT NOT NULL,
+            PRIMARY KEY(root_task_id, pr_url, parent_sha, child_sha)
          );",
         )?;
         Ok(())
@@ -1406,6 +1413,24 @@ pub(in crate::work) mod guide_updates {
                 "incremental guide starting version is missing"
             );
             Ok(context)
+        }
+
+        /// A revision pushed `child` on top of `parent`, so `child` contains
+        /// `parent`. A force-push never records an edge, which is what keeps a
+        /// replaced head from counting as contained.
+        pub(crate) fn record_review_guide_head_ancestry(
+            &self,
+            root: &str,
+            pr: &str,
+            parent: &str,
+            child: &str,
+        ) -> Result<()> {
+            self.connect()?.execute(
+                "INSERT OR IGNORE INTO pr_review_guide_head_ancestry
+                 (root_task_id, pr_url, parent_sha, child_sha) VALUES (?1, ?2, ?3, ?4)",
+                params![root, pr, parent, child],
+            )?;
+            Ok(())
         }
 
         pub(crate) fn record_review_guide_revision_head(
@@ -1625,6 +1650,16 @@ pub(in crate::work) mod guide_updates {
                 .create_pr_review_guide_attempt_with_token(&series, &new.comparison_id, "test", Some("click"))
                 .unwrap();
             assert_ne!(manual.prompt_version, boss_review_guide::UPDATE_PROMPT_VERSION);
+            let updates: i64 = db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM pr_review_guide_updates WHERE attempt_id = ?1",
+                    [&manual.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(updates, 0, "manual generation after a head change is a full run");
         }
 
         #[test]
@@ -1662,6 +1697,9 @@ pub(in crate::work) mod guide_updates {
                 .unwrap()
                 .unwrap()
                 .canonical_pr_url;
+            // The failed observation concerns a revision head the guide does not cover.
+            db.record_review_guide_revision_head(&root, &url, "new-head", "revision", 10)
+                .unwrap();
             db.record_pr_review_guide_source_capture_failure(&root, &url, 10, "pinned delta unavailable")
                 .unwrap();
             assert_eq!(
@@ -1677,6 +1715,84 @@ pub(in crate::work) mod guide_updates {
                     .to_string()
                     .contains("recapture")
             );
+        }
+
+        #[test]
+        fn transient_capture_failure_on_the_published_head_keeps_the_guide_ready() {
+            let (_dir, db) = open_db();
+            let product = create_product(&db);
+            let root = create_active_chore(&db, &product, "transient failure");
+            let (series, comparison) = seed_review_guide_series(&db, &root);
+            let first = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            db.publish_pr_review_guide_version(&first.id, "# Original", "original")
+                .unwrap();
+            let live = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            let url = db
+                .get_pr_review_guide_summary_for_root(&root)
+                .unwrap()
+                .unwrap()
+                .canonical_pr_url;
+            // A metadata error on a recheck of the unchanged head: no revision
+            // attribution for another head, so nothing is failed or fenced.
+            db.record_pr_review_guide_source_capture_failure(&root, &url, 10, "gh metadata unavailable")
+                .unwrap();
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.lifecycle, "queued");
+            assert!(db.pr_review_guide_capture_error_for_root(&root).unwrap().is_some());
+            assert!(matches!(
+                db.publish_pr_review_guide_version(&live.id, "# Regenerated", "raw")
+                    .unwrap(),
+                PublishReviewGuideOutcome::Published(_)
+            ));
+            // The next successful capture of the same comparison clears the error.
+            db.persist_pr_review_guide_source_capture(
+                &root,
+                11,
+                PrSourceCaptureTrigger::Completion,
+                &review_guide_source_packet("base", "head"),
+            )
+            .unwrap();
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.lifecycle, "ready");
+            assert!(db.pr_review_guide_capture_error_for_root(&root).unwrap().is_none());
+        }
+
+        #[test]
+        fn recapturing_the_published_comparison_restores_a_failed_guide_to_ready() {
+            let (_dir, db) = open_db();
+            let product = create_product(&db);
+            let root = create_active_chore(&db, &product, "restore ready");
+            let (series, comparison) = seed_review_guide_series(&db, &root);
+            let first = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            db.publish_pr_review_guide_version(&first.id, "# Original", "original")
+                .unwrap();
+            let url = db
+                .get_pr_review_guide_summary_for_root(&root)
+                .unwrap()
+                .unwrap()
+                .canonical_pr_url;
+            db.record_review_guide_revision_head(&root, &url, "new-head", "revision", 10)
+                .unwrap();
+            db.record_pr_review_guide_source_capture_failure(&root, &url, 10, "pinned delta unavailable")
+                .unwrap();
+            assert_eq!(
+                db.get_pr_review_guide_summary_for_root(&root)
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle,
+                "failed"
+            );
+            // The PR head went back to the head the guide already covers.
+            db.persist_pr_review_guide_source_capture(
+                &root,
+                11,
+                PrSourceCaptureTrigger::Poller,
+                &review_guide_source_packet("base", "head"),
+            )
+            .unwrap();
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.lifecycle, "ready");
+            assert!(db.pr_review_guide_capture_error_for_root(&root).unwrap().is_none());
         }
     }
 }
