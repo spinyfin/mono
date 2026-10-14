@@ -362,8 +362,9 @@ pub(crate) async fn check_merge_queue_rebounce(
         // A verified requeue archives only the newest queue construction's
         // dedup key, so older coalesced failures at this head no longer match
         // any row. They are pre-requeue history: ignore every dequeue at or
-        // before the time the requeue was accepted (unknown times too, since
-        // they cannot be proven to postdate it).
+        // before the creation of the retired attempt (the boundary is the
+        // episode, not the delivery time, so a failure of the requeued
+        // construction landing before the proposal is applied still mints).
         match work_db.verified_requeue_boundary(&candidate.work_item_id, pr_head_sha) {
             Ok(Some(boundary)) => {
                 let created = event
@@ -371,7 +372,7 @@ pub(crate) async fn check_merge_queue_rebounce(
                     .as_deref()
                     .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
                     .map(|t| t.timestamp());
-                if created.is_none_or(|created| created <= boundary) {
+                if created.is_some_and(|created| created <= boundary) {
                     tracing::debug!(
                         work_item_id = %candidate.work_item_id,
                         pr_head_sha,

@@ -25,7 +25,7 @@ pub(super) async fn handle_classify_ci_remediation(ctx: Dispatch, req: FrontendR
     // `triage_class` is free-form, so gate everything but the one
     // non-give-up verdict instead of denying a list of known spellings.
     if triage_class != "tractable"
-        && let Err(err) = work_db.validate_queue_ci_failure(&attempt_id, queue_ci_evidence.as_ref())
+        && let Err(err) = work_db.validate_queue_ci_failure(&attempt_id, queue_ci_evidence.as_ref(), &triage_class)
     {
         send_work_error(&sink, &request_id, &err);
         return;
@@ -65,11 +65,7 @@ pub(super) async fn handle_mark_ci_remediation_failed(ctx: Dispatch, req: Fronte
     else {
         unreachable!()
     };
-    if let Err(err) = work_db.validate_queue_ci_failure(&attempt_id, queue_ci_evidence.as_ref()) {
-        send_work_error(&sink, &request_id, &err);
-        return;
-    }
-    if let Err(err) = work_db.validate_trunk_no_build_give_up(&attempt_id, queue_ci_evidence.as_ref(), &reason) {
+    if let Err(err) = work_db.validate_queue_ci_failure(&attempt_id, queue_ci_evidence.as_ref(), &reason) {
         send_work_error(&sink, &request_id, &err);
         return;
     }

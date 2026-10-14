@@ -34,7 +34,46 @@ pub(crate) fn validate(attempt: &CiRemediation, evidence: Option<&QueueCiEvidenc
     if !queue_ci_verification_required(attempt) {
         return Ok(());
     }
-    let evidence = evidence.context(REQUIRED)?;
+    validate_evidence(attempt, evidence.context(REQUIRED)?)
+}
+
+/// True when `text` names one of [`NO_BUILD_REASONS`], bare or as a prefix
+/// followed by `:` or whitespace (so a summary may elaborate on the reason).
+fn names_no_build_reason(text: &str) -> bool {
+    let text = text.trim();
+    NO_BUILD_REASONS.iter().any(|reason| {
+        text.strip_prefix(reason)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with(char::is_whitespace))
+    })
+}
+
+/// Gate for any terminal give-up (classify with a non-`tractable` class,
+/// mark-failed, run_done blocked) on a queue-side attempt. Verified-evidence
+/// attempts always need full evidence. A Trunk eviction with an empty capture
+/// may have no build to verify: evidence, when supplied, is fully validated;
+/// without it the give-up must name a [`NO_BUILD_REASONS`] reason.
+pub(crate) fn validate_give_up(
+    attempt: &CiRemediation,
+    evidence: Option<&QueueCiEvidence>,
+    reason: &str,
+) -> Result<()> {
+    if is_trunk_empty_capture(attempt) {
+        return match evidence {
+            Some(evidence) => validate_evidence(attempt, evidence),
+            None => {
+                anyhow::ensure!(
+                    names_no_build_reason(reason),
+                    "Giving up on a Trunk eviction requires --queue-ci-evidence-file when a failing trunk-merge/pr-N/* build exists (verify it with Bazel on a rebased tree). Without a failing build, the reason must be one of: {}.",
+                    NO_BUILD_REASONS.join(", ")
+                );
+                Ok(())
+            }
+        };
+    }
+    validate(attempt, evidence)
+}
+
+fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Result<()> {
     for sha in [
         &evidence.main_sha,
         &evidence.verified_head_sha,
@@ -129,6 +168,15 @@ pub(crate) fn validate_declaration(
         return Ok(());
     };
     if !queue_ci_verification_required(&attempt) {
+        // Trunk empty capture: only a give-up is gated; supplied evidence is
+        // always validated in full.
+        if is_trunk_empty_capture(&attempt) {
+            if payload.outcome == RunDoneOutcome::Blocked {
+                validate_give_up(&attempt, payload.queue_ci_evidence.as_ref(), &payload.summary)?;
+            } else if let Some(evidence) = &payload.queue_ci_evidence {
+                validate_evidence(&attempt, evidence)?;
+            }
+        }
         return Ok(());
     }
     validate(&attempt, payload.queue_ci_evidence.as_ref())?;
@@ -190,30 +238,14 @@ pub(crate) fn record_delivery(conn: &Connection, execution_id: &str, payload: &R
 }
 
 impl WorkDb {
-    /// A Trunk eviction with an empty capture is not gated on evidence because
-    /// it may have no build. A give-up there must either carry evidence (the
-    /// worker found a failing build and verified it) or name a no-build reason.
-    pub(crate) fn validate_trunk_no_build_give_up(
+    pub(crate) fn validate_queue_ci_failure(
         &self,
         attempt_id: &str,
         evidence: Option<&QueueCiEvidence>,
         reason: &str,
     ) -> Result<()> {
         let attempt = self.get_ci_remediation(attempt_id)?.context("unknown CI attempt")?;
-        if !is_trunk_empty_capture(&attempt) || evidence.is_some() {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            NO_BUILD_REASONS.contains(&reason.trim()),
-            "Giving up on a Trunk eviction requires --queue-ci-evidence-file when a failing trunk-merge/pr-N/* build exists (verify it with Bazel on a rebased tree). Without a failing build, --reason must be one of: {}.",
-            NO_BUILD_REASONS.join(", ")
-        );
-        Ok(())
-    }
-
-    pub(crate) fn validate_queue_ci_failure(&self, attempt_id: &str, evidence: Option<&QueueCiEvidence>) -> Result<()> {
-        let attempt = self.get_ci_remediation(attempt_id)?.context("unknown CI attempt")?;
-        validate(&attempt, evidence)
+        validate_give_up(&attempt, evidence, reason)
     }
 
     pub(crate) fn has_verified_queue_delivery(&self, execution_id: &str, head_sha: &str) -> Result<bool> {
@@ -312,7 +344,7 @@ mod tests {
             assert!(rejected.decision_reason.unwrap().contains("origin/main"));
             assert_eq!(db.execution_run_done_outcome(&execution.id).unwrap(), None);
         }
-        assert!(db.validate_queue_ci_failure(&attempt.id, None).is_err());
+        assert!(db.validate_queue_ci_failure(&attempt.id, None, "x").is_err());
         let mut proof = evidence();
         for bad in [
             "exit",
@@ -336,11 +368,11 @@ mod tests {
                 _ => invalid.runs.clear(),
             }
             assert!(
-                db.validate_queue_ci_failure(&attempt.id, Some(&invalid)).is_err(),
+                db.validate_queue_ci_failure(&attempt.id, Some(&invalid), "x").is_err(),
                 "{bad}"
             );
         }
-        assert!(db.validate_queue_ci_failure(&attempt.id, Some(&proof)).is_ok());
+        assert!(db.validate_queue_ci_failure(&attempt.id, Some(&proof), "x").is_ok());
         let mut incomplete = attempt.clone();
         incomplete.failed_checks = serde_json::json!([{"name": "bazel-build-test", "target_url": ""}]).to_string();
         assert!(validate(&incomplete, Some(&proof)).is_ok());
@@ -389,5 +421,85 @@ mod tests {
             submit("changed-head-auto-merge", &payload).state,
             ProposalState::Applied
         );
+    }
+
+    #[test]
+    fn trunk_empty_capture_give_ups_need_evidence_or_a_no_build_reason() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let revision = crate::test_support::create_test_chore(&db, product.id.clone(), "Trunk eviction");
+        let execution = crate::test_support::create_ready_chore_execution(&db, revision.id.clone());
+        let attempt = db
+            .insert_ci_remediation(CiRemediationInsertInput {
+                product_id: product.id,
+                work_item_id: revision.id.clone(),
+                pr_url: "https://github.com/spinyfin/mono/pull/3146".into(),
+                pr_number: 3146,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: "trunk:entry_1@2026-07-27T23:07:13.000Z".into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+                failure_kind: "trunk_queue_eviction".into(),
+                before_commit_sha: None,
+            })
+            .unwrap()
+            .unwrap();
+        db.set_ci_remediation_revision_task_id(&attempt.id, &revision.id)
+            .unwrap();
+        let give_up = |evidence: Option<&QueueCiEvidence>, reason: &str| {
+            db.validate_queue_ci_failure(&attempt.id, evidence, reason)
+        };
+        // mark-failed / classify path.
+        assert!(give_up(None, "flaky").is_err());
+        assert!(give_up(None, "").is_err());
+        assert!(give_up(None, "no-failing-build-found-ish").is_err());
+        for reason in NO_BUILD_REASONS {
+            assert!(give_up(None, reason).is_ok(), "{reason}");
+        }
+        assert!(give_up(None, "no-failing-build-found: checked pr-3146 builds").is_ok());
+        // Supplied evidence is fully validated, whatever the reason says.
+        let good = evidence();
+        assert!(give_up(Some(&good), "flaky").is_ok());
+        for bad in ["sha", "exit", "command", "empty"] {
+            let mut invalid = good.clone();
+            match bad {
+                "sha" => invalid.queue_sha = "not-a-sha".into(),
+                "exit" => invalid.runs[0].exit_code = 1,
+                "command" => invalid.runs[0].command = "make test".into(),
+                _ => invalid.runs.clear(),
+            }
+            assert!(give_up(Some(&invalid), "no-failing-build-found").is_err(), "{bad}");
+        }
+        // run_done: blocked is a give-up; delivered with bad evidence is refused.
+        let submit = |key: &str, payload: &RunDoneProposalPayload| {
+            db.submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &revision.id,
+                kind: ProposalKind::RunDone,
+                payload_json: &serde_json::to_string(payload).unwrap(),
+                idempotency_key: key,
+            })
+            .unwrap()
+            .unwrap()
+            .proposal
+            .state
+        };
+        let mut payload = RunDoneProposalPayload {
+            outcome: RunDoneOutcome::Blocked,
+            summary: String::new(),
+            question: None,
+            queue_ci_evidence: None,
+        };
+        assert_eq!(submit("blocked-empty", &payload), ProposalState::Rejected);
+        payload.summary = "flaky infra".into();
+        assert_eq!(submit("blocked-prose", &payload), ProposalState::Rejected);
+        let mut invalid = good.clone();
+        invalid.runs[0].exit_code = 1;
+        payload.queue_ci_evidence = Some(invalid);
+        assert_eq!(submit("blocked-bad-evidence", &payload), ProposalState::Rejected);
+        payload.queue_ci_evidence = None;
+        payload.summary = "merge-conflict: rebased and resolved by the queue".into();
+        assert_eq!(submit("blocked-no-build", &payload), ProposalState::Applied);
     }
 }

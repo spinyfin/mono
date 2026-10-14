@@ -1561,6 +1561,16 @@ async fn verified_same_head_requeue_allows_a_later_queue_failure() {
         .await
     );
     let attempt = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
+    // The attempt was detected well before the proposal is applied (now), so
+    // a failure of the requeued construction can land between the two.
+    const ATTEMPT_CREATED: i64 = 1_700_000_000; // 2023-11-14T22:13:20Z
+    rusqlite::Connection::open(db.path())
+        .unwrap()
+        .execute(
+            "UPDATE ci_remediations SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![attempt.id, ATTEMPT_CREATED.to_string()],
+        )
+        .unwrap();
     let revision = attempt.revision_task_id.as_ref().unwrap();
     let execution = crate::test_support::create_ready_chore_execution(&db, revision.clone());
     let payload = RunDoneProposalPayload {
@@ -1654,7 +1664,8 @@ async fn verified_same_head_requeue_allows_a_later_queue_failure() {
     check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &replay(&timeline), &mut outcome).await;
     assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
-    timeline.push(event(&next_queue, "2099-01-01T00:00:00Z"));
+    // After the attempt was detected but long before the proposal applied.
+    timeline.push(event(&next_queue, "2024-01-01T00:00:00Z"));
     check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &replay(&timeline), &mut outcome).await;
     check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &replay(&timeline), &mut outcome).await;
     let next = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();

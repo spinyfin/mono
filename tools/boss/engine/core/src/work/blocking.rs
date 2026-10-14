@@ -1031,14 +1031,18 @@ impl WorkDb {
         Ok(exists)
     }
 
-    /// Epoch-seconds time the latest verified same-head requeue of this PR
-    /// head was accepted. Verified requeues archive only the newest queue
-    /// construction's dedup key, so every queue failure at or before this
-    /// boundary is pre-requeue history and must not mint a new attempt.
+    /// Epoch-seconds time the latest retired (verified-requeue) attempt for
+    /// this PR head was created. Verified requeues archive only the newest
+    /// queue construction's dedup key, so every older coalesced failure at
+    /// this head is pre-requeue history. All of those failures were already
+    /// on the timeline when the attempt was detected, so they precede its
+    /// creation; anchoring to the episode (not the delivery time) keeps a real
+    /// failure of the requeued construction, which lands after detection but
+    /// possibly before the proposal is applied, from being skipped.
     pub fn verified_requeue_boundary(&self, work_item_id: &str, pr_head_sha: &str) -> Result<Option<i64>> {
         let conn = self.connect()?;
         let boundary: Option<i64> = conn.query_row(
-            "SELECT MAX(CAST(finished_at AS INTEGER)) FROM ci_remediations
+            "SELECT MAX(CAST(created_at AS INTEGER)) FROM ci_remediations
               WHERE work_item_id = ?1
                 AND failure_kind = 'merge_queue_rebounce'
                 AND failure_reason = 'verified_requeue'

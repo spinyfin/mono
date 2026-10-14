@@ -889,6 +889,21 @@ async fn mark_ci_remediation_retriggered_rejects_queue_side_failures() -> Result
                 })
                 .await?;
             assert!(matches!(response, FrontendEvent::WorkError { .. }));
+            // The give-up gate is "anything but tractable", so a class the
+            // engine has never heard of must not bypass it.
+            for class in ["infra", "flaky", "cannot_complete"] {
+                let response = client
+                    .send_request(&FrontendRequest::ClassifyCiRemediation {
+                        attempt_id: attempt.id.clone(),
+                        triage_class: class.into(),
+                        queue_ci_evidence: None,
+                    })
+                    .await?;
+                assert!(matches!(response, FrontendEvent::WorkError { .. }), "{class}");
+                let row = work_db.get_ci_remediation(&attempt.id)?.unwrap();
+                assert_eq!(row.status, "pending", "{class}");
+                assert_eq!(row.triage_class.as_deref(), Some("tractable"), "{class}");
+            }
             let evidence = boss_protocol::QueueCiEvidence::builder()
                 .main_sha("a".repeat(40))
                 .verified_head_sha("b".repeat(40))
@@ -903,6 +918,14 @@ async fn mark_ci_remediation_retriggered_rejects_queue_side_failures() -> Result
                     coverage: "full job".into(),
                 }])
                 .build();
+            let response = client
+                .send_request(&FrontendRequest::ClassifyCiRemediation {
+                    attempt_id: attempt.id.clone(),
+                    triage_class: "infra".into(),
+                    queue_ci_evidence: Some(evidence.clone()),
+                })
+                .await?;
+            assert!(matches!(response, FrontendEvent::CiRemediationClassified { .. }));
             client
                 .send_request(&FrontendRequest::MarkCiRemediationFailed {
                     attempt_id: attempt.id.clone(),
