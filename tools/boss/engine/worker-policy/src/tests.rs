@@ -108,10 +108,12 @@ fn conflict_worker_telemetry_verbs_stay_allowed() {
 fn ci_remediation_worker_marks_stay_allowed() {
     // Every `boss engine ci …` verb the CI worker prompt instructs.
     assert_allowed(FrontendRequest::ClassifyCiRemediation {
+        queue_ci_evidence: None,
         attempt_id: "ci_1".into(),
         triage_class: "tractable".into(),
     });
     assert_allowed(FrontendRequest::MarkCiRemediationFailed {
+        queue_ci_evidence: None,
         attempt_id: "ci_1".into(),
         reason: "unfixable".into(),
     });

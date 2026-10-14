@@ -1572,6 +1572,9 @@ pub(crate) struct EngineAttemptsListArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct EngineCiClassifyArgs {
+    /// Successful main-rebased Bazel verification, required for queue CI verdicts.
+    #[arg(long)]
+    pub(crate) queue_ci_evidence_file: Option<std::path::PathBuf>,
     /// Attempt id from the `ci_remediations` table (`cir_…`).
     #[arg(long = "attempt-id")]
     pub(crate) attempt_id: String,
@@ -1589,6 +1592,9 @@ pub(crate) struct EngineCiMarkFailedArgs {
     /// Free-form failure reason. Stored verbatim on the attempt row.
     #[arg(long)]
     pub(crate) reason: String,
+    /// JSON evidence of successful Bazel verification after rebasing onto current main.
+    #[arg(long)]
+    pub(crate) queue_ci_evidence_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]

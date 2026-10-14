@@ -16,6 +16,7 @@ use super::work_item::{project_details, work_item_details, work_item_name, work_
 mod block_boundary;
 mod ci_monitoring;
 mod design;
+mod queue_ci;
 use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
@@ -2097,6 +2098,12 @@ fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> Strin
 /// bespoke `compose_ci_remediation_prompt` except that the branch/push spine
 /// is already covered by the shared revision directive.
 fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
+    if attempt.failure_kind.as_deref() == Some("merge_queue_rebounce")
+        || (attempt.failure_kind.as_deref() == Some("trunk_queue_eviction")
+            && render_failed_checks_markdown(&attempt.failed_checks).is_some())
+    {
+        return queue_ci::fragment(attempt);
+    }
     let is_rebounce = attempt.failure_kind.as_deref() == Some("merge_queue_rebounce");
     let is_trunk_eviction = attempt.failure_kind.as_deref() == Some("trunk_queue_eviction");
     // Both share the "PR's own head-branch CI is green" property — see
@@ -2594,6 +2601,14 @@ fn compose_ci_remediation_prompt(
         prompt.push_str(&format!("**Local change**: `{change}`\n"));
     }
     prompt.push_str(&format!("**Work item**: `{}`\n\n", work_item_name(work_item),));
+
+    if attempt.failure_kind.as_deref() == Some("merge_queue_rebounce")
+        || (attempt.failure_kind.as_deref() == Some("trunk_queue_eviction")
+            && render_failed_checks_markdown(&attempt.failed_checks).is_some())
+    {
+        prompt.push_str(&queue_ci::fragment(attempt));
+        return prompt;
+    }
 
     // Failing-check list — same JSON the engine seeded on the row at
     // detection time. Rendered as a bulleted summary; the worker has the

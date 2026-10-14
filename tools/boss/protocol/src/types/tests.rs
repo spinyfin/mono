@@ -2009,6 +2009,7 @@ fn run_done_outcome_display_and_parse_are_inverses() {
 #[test]
 fn run_done_payload_roundtrips() {
     let payload = RunDoneProposalPayload {
+        queue_ci_evidence: None,
         outcome: RunDoneOutcome::Delivered,
         summary: "opened https://github.com/foo/bar/pull/1 with the md5 crate swap".into(),
         question: None,

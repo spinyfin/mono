@@ -976,6 +976,10 @@ fn apply_run_done(
     let payload: RunDoneProposalPayload =
         serde_json::from_str(payload_json).context("run_done proposal payload_json did not deserialize")?;
 
+    if let Err(err) = super::queue_ci_evidence::validate_declaration(tx, execution_id, &payload) {
+        return Ok(ApplyDecision::Rejected(err.to_string()));
+    }
+
     let affected = tx.execute(
         "UPDATE work_executions SET run_done_declared_at = ?2, run_done_outcome = ?3 WHERE id = ?1",
         params![execution_id, now_string(), payload.outcome.as_str()],

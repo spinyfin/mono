@@ -472,6 +472,8 @@ pub struct RunDoneProposalPayload {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<super::OperatorQuestion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_ci_evidence: Option<super::QueueCiEvidence>,
 }
 
 /// Payload for [`ProposalKind::Wait`]. Auto-applies to a time-bounded
@@ -791,6 +793,7 @@ mod tests {
             explanation: "The requested change exceeds the current limit.".into(),
         };
         let payload = super::RunDoneProposalPayload {
+            queue_ci_evidence: None,
             outcome: super::RunDoneOutcome::Blocked,
             summary: "A decision is required.".into(),
             question: Some(question),

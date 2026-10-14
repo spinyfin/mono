@@ -360,6 +360,9 @@ pub(crate) struct ReviewVerdictArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RunDoneArgs {
+    /// JSON evidence required to finish a merge-queue CI-fix revision.
+    #[arg(long)]
+    queue_ci_evidence_file: Option<PathBuf>,
     /// How the run ended. `delivered` = the deliverable exists;
     /// `no-changes-needed` = you verified there was nothing to produce;
     /// `blocked` = you are stopping without delivering. Explain the
@@ -722,6 +725,7 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
         ProposeCommand::Done(args) => (
             ProposalKind::RunDone,
             serde_json::to_value(RunDoneProposalPayload {
+                queue_ci_evidence: read_queue_ci_evidence(args.queue_ci_evidence_file)?,
                 outcome: RunDoneOutcome::from(args.outcome),
                 summary: args.summary,
                 question: operator_question_from_flags(
@@ -749,6 +753,16 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             )
         }
     })
+}
+
+pub(crate) fn read_queue_ci_evidence(
+    path: Option<PathBuf>,
+) -> Result<Option<boss_protocol::QueueCiEvidence>, CliError> {
+    path.map(|path| {
+        let value = read_json_object_file("queue CI evidence", path)?;
+        serde_json::from_value(value).map_err(|err| CliError::usage(format!("invalid queue CI evidence: {err}")))
+    })
+    .transpose()
 }
 
 /// Assemble the blocked declaration's question from its flags. clap has
@@ -833,12 +847,13 @@ async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result
 
     match response {
         FrontendEvent::ProposalSubmitted { proposal, .. }
-            if kind == ProposalKind::ReviewGuide && proposal.state == ProposalState::Rejected =>
+            if matches!(kind, ProposalKind::ReviewGuide | ProposalKind::RunDone)
+                && proposal.state == ProposalState::Rejected =>
         {
             Err(CliError::application(
                 proposal
                     .decision_reason
-                    .unwrap_or_else(|| "review-guide submission was rejected".to_owned()),
+                    .unwrap_or_else(|| format!("{kind} submission was rejected")),
             ))
         }
         FrontendEvent::ProposalSubmitted {

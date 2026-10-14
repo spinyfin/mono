@@ -1070,6 +1070,27 @@ pub async fn on_merge_queue_rebounce_detected(
     labels: &[String],
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    on_merge_queue_rebounce_with_base(
+        work_db,
+        publisher,
+        candidate,
+        pr_head_sha,
+        (before_commit_sha, None),
+        labels,
+        failures,
+    )
+    .await
+}
+
+pub async fn on_merge_queue_rebounce_with_base(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    pr_head_sha: &str,
+    queue_commit: (&str, Option<&str>),
+    labels: &[String],
+    failures: &[RequiredCheckFailure],
+) -> bool {
     let discriminator = merge_queue_rebounce_discriminator(pr_head_sha);
     on_queue_side_failure_detected(
         work_db,
@@ -1083,7 +1104,7 @@ pub async fn on_merge_queue_rebounce_detected(
             // suppression migration below.
             discriminator: &discriminator,
             suppression_discriminator: pr_head_sha,
-            before_commit_sha: Some(before_commit_sha),
+            before_commit_sha: Some(queue_commit),
             failure_kind: "merge_queue_rebounce",
             labels,
         },
@@ -1105,7 +1126,7 @@ struct QueueSideFailureEpisode<'a> {
     /// The `ci_remediations.before_commit_sha` provenance column — `Some`
     /// for a merge-queue rebounce (the synthetic merge SHA), `None` for a
     /// Trunk eviction (no equivalent commit is persisted).
-    before_commit_sha: Option<&'a str>,
+    before_commit_sha: Option<(&'a str, Option<&'a str>)>,
     failure_kind: &'a str,
     /// PR labels, for the auto-pr-maintenance-disabled gate. Trunk evictions
     /// have none available at the call site, so callers pass `&[]`.
@@ -1135,6 +1156,8 @@ async fn on_queue_side_failure_detected(
         failure_kind,
         labels,
     } = episode;
+    let queue_base_sha = before_commit_sha.and_then(|(_, base)| base);
+    let before_commit_sha = before_commit_sha.map(|(sha, _)| sha);
     if failures.is_empty() {
         // Confirmed queue rejection with no construction-build / check-run
         // names attached. GitHub-native rebounce hits this when evidence
@@ -1322,7 +1345,7 @@ async fn on_queue_side_failure_detected(
         head_sha_at_trigger: discriminator.to_owned(),
         attempt_kind: "fix".to_owned(),
         consumes_budget: 1,
-        failed_checks: encode_failed_checks(failures),
+        failed_checks: encode_queue_failed_checks(failures, queue_base_sha),
         failure_kind: failure_kind.to_owned(),
         before_commit_sha: before_commit_sha.map(str::to_owned),
     });
@@ -2570,6 +2593,17 @@ pub fn classify_noop_validation(probe: &PrLifecycleProbe) -> NoopValidation {
             status: "PR is closed and unmerged — not a validated-green state".to_owned(),
         },
     }
+}
+
+fn encode_queue_failed_checks(failures: &[RequiredCheckFailure], base: Option<&str>) -> String {
+    let mut records: Vec<serde_json::Value> =
+        serde_json::from_str(&encode_failed_checks(failures)).expect("encoded checks");
+    if let Some(base) = base {
+        for record in &mut records {
+            record["queue_base_sha"] = serde_json::json!(base);
+        }
+    }
+    serde_json::to_string(&records).expect("serializable checks")
 }
 
 fn encode_failed_checks(failures: &[RequiredCheckFailure]) -> String {

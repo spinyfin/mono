@@ -315,3 +315,31 @@ pub struct ConflictClassCount {
     pub class: String,
     pub count: u64,
 }
+/// Worker-reported verification of the tree rebased onto current origin/main.
+/// Each failed queue job must be covered by successful Bazel invocations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct QueueCiEvidence {
+    pub main_sha: String,
+    pub verified_head_sha: String,
+    pub queue_sha: String,
+    pub queue_base_sha: String,
+    pub runs: Vec<QueueCiRun>,
+    /// GitHub enqueuePullRequest receipt, required for an unchanged-head delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_entry_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct QueueCiRun {
+    pub check_name: String,
+    /// The captured failing check's target_url (including job fragment, if present).
+    pub source_url: String,
+    /// Complete Bazel command, including every failed target, or the whole job.
+    pub command: String,
+    pub exit_code: i32,
+    pub output: String,
+    /// Explains target coverage; whole-job failures must reproduce the full invocation.
+    pub coverage: String,
+}

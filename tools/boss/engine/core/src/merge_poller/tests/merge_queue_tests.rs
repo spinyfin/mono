@@ -9,11 +9,12 @@ fn parse_dequeue_event_nodes_accepts_lowercase_failed_checks() {
     // synthetic commit in the ordered connection.
     let nodes = serde_json::json!([
         {"__typename": "PullRequestCommit", "commit": {"oid": "0d9dab33152f553bfe6072ccbd6f33fad7dd9d2d"}},
-        {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks", "beforeCommit": {"oid": "e005ddece2a840a944f5ffdfa7bad640d54af9c1"}}
+        {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks", "beforeCommit": {"oid": "e005ddece2a840a944f5ffdfa7bad640d54af9c1", "parents": {"nodes": [{"oid": "queue-base"}]}}}
     ]);
     let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
     assert_eq!(events.len(), 1, "lowercase 'failed_checks' must be surfaced");
     assert_eq!(events[0].reason, "failed_checks");
+    assert_eq!(events[0].queue_base_oid.as_deref(), Some("queue-base"));
     assert_eq!(
         events[0].pr_head_oid.as_deref(),
         Some("0d9dab33152f553bfe6072ccbd6f33fad7dd9d2d")
@@ -413,6 +414,7 @@ async fn rebounce_at_a_head_with_branch_ci_remediation_still_mints_attempt() {
 #[tokio::test]
 async fn dequeue_event_head_gate_skips_superseded_and_admits_current_head() {
     let stale = MergeQueueDequeueEvent {
+        queue_base_oid: None,
         reason: "failed_checks".to_owned(),
         created_at: Some("2026-01-01T00:00:00Z".to_owned()),
         pr_head_oid: Some("head-1".to_owned()),
@@ -451,6 +453,7 @@ async fn dequeue_event_head_gate_skips_superseded_and_admits_current_head() {
     );
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
     let current = MergeQueueDequeueEvent {
+        queue_base_oid: None,
         pr_head_oid: Some("head-2".to_owned()),
         ..stale
     };
@@ -1250,6 +1253,7 @@ async fn observed_github_dequeue_retires_intent_and_clears_merging() {
     events.insert(
         candidate.pr_url.clone(),
         vec![MergeQueueDequeueEvent {
+            queue_base_oid: None,
             reason: "manual_removal".to_owned(),
             created_at: Some(event_created_at),
             pr_head_oid: Some("head-2".to_owned()),
@@ -1303,6 +1307,7 @@ async fn historical_github_dequeue_does_not_retire_newer_intent() {
     events.insert(
         candidate.pr_url.clone(),
         vec![MergeQueueDequeueEvent {
+            queue_base_oid: None,
             reason: "manual_removal".to_owned(),
             created_at: Some("1970-01-01T00:00:00Z".to_owned()),
             pr_head_oid: Some("head-3".to_owned()),

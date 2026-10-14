@@ -17,6 +17,8 @@ pub struct MergeQueueDequeueEvent {
     /// `beforeCommit.oid` — the synthetic merge SHA that failed CI.
     /// `None` when GitHub omitted it (edge case for non-CI reasons).
     pub before_commit_oid: Option<String>,
+    /// First parent of the failed queue construction, possibly including queued siblings.
+    pub queue_base_oid: Option<String>,
 }
 
 /// Timeline-events selection set for [`build_batch_query`]'s `fields`
@@ -31,7 +33,7 @@ pub(crate) const DEQUEUE_EVENTS_FIELDS: &str = concat!(
     "REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) { nodes { __typename ",
     "... on PullRequestCommit { commit { oid } } ",
     "... on HeadRefForcePushedEvent { afterCommit { oid } } ",
-    "... on RemovedFromMergeQueueEvent { reason createdAt beforeCommit { oid } } } }",
+    "... on RemovedFromMergeQueueEvent { reason createdAt beforeCommit { oid parents(first: 1) { nodes { oid } } } } } }",
 );
 
 /// Batch-fetch merge-queue dequeue events for every PR in `pr_urls` with
@@ -176,6 +178,9 @@ pub(crate) fn parse_dequeue_event_nodes(nodes: &[serde_json::Value]) -> Vec<Merg
             created_at: node["createdAt"].as_str().map(str::to_owned),
             pr_head_oid: pr_head_oid.clone(),
             before_commit_oid,
+            queue_base_oid: node["beforeCommit"]["parents"]["nodes"][0]["oid"]
+                .as_str()
+                .map(str::to_owned),
         });
     }
     events
@@ -405,12 +410,12 @@ pub(crate) async fn check_merge_queue_rebounce(
             failing_checks = failures.len(),
             "merge poller: fetched failing checks for merge-queue commit",
         );
-        if ci_watch::on_merge_queue_rebounce_detected(
+        if ci_watch::on_merge_queue_rebounce_with_base(
             work_db,
             publisher,
             candidate,
             pr_head_sha,
-            before_commit_sha,
+            (before_commit_sha, event.queue_base_oid.as_deref()),
             &[], // labels not available here; opt-out check uses product flag only
             &failures,
         )
