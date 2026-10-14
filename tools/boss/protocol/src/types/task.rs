@@ -8,6 +8,7 @@ use super::common::{
 };
 use super::execution::ExecutionStatus;
 use super::project::ProjectDesignDocState;
+use super::review_section::ReviewSection;
 use super::work_item::WorkItemExternalRef;
 use serde::{Deserialize, Serialize};
 
@@ -1126,6 +1127,20 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "is_false")]
     #[builder(default)]
     pub ready_for_review: bool,
+
+    /// The labelled Review-column section this card is grouped under:
+    /// `ready` / `in_revision` / `ai_review` / `pending` / `blocked`. `None`
+    /// for a row that is not a Review-lane card.
+    ///
+    /// A derived projection set by the engine's `get_work_tree` path (not a
+    /// stored DB column), resolved after `ready_for_review`,
+    /// `has_in_progress_revision` and `ai_review_state` because it reads all
+    /// three. Each card lands in exactly one section by first match, in the
+    /// order blocked, in revision, AI review, ready, pending — see
+    /// `classify_review_section` in the engine for the rule and why it is in
+    /// that order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_section: Option<ReviewSection>,
 
     /// Resolved doc-link state for this work item, derived from the
     /// task's own `doc_*` columns. Independent of `kind`: any work item

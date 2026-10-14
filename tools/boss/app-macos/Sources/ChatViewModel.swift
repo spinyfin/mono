@@ -288,14 +288,6 @@ final class ChatViewModel: ObservableObject {
     @Published var showArchivedProjects: Bool = false {
         didSet { notePublishedWorkInputChanged() }
     }
-    /// When true, the Review column shows only `readyForReview` cards —
-    /// waiting on the user and nothing else: no block, no in-progress
-    /// revision, CI green, no merge conflict. Sticky across app restarts
-    /// (persisted like the other board filters below), scoped to the
-    /// Review column only.
-    @Published var reviewReadyOnly: Bool = false {
-        didSet { notePublishedWorkInputChanged() }
-    }
     @Published var selectedWorkCardID: String?
     /// Task id that the reveal animation is currently highlighting.
     /// Set after viewport confirmation; cleared after 1.5 s. Views observe
@@ -810,7 +802,6 @@ final class ChatViewModel: ObservableObject {
     let includeChoresDefaultsKey = "boss.work.includeChores"
     let showBlockedOnlyDefaultsKey = "boss.work.showBlockedOnly"
     let showArchivedProjectsDefaultsKey = "boss.work.showArchivedProjects"
-    let reviewReadyOnlyDefaultsKey = "boss.work.reviewReadyOnly"
     let workBoardGroupingDefaultsKey = "boss.work.grouping"
     let bossPanelCollapsedDefaultsKey = "boss.work.bossPanelCollapsed"
     let bossPanelWidthDefaultsKey = "boss.work.bossPanelWidth"
@@ -864,7 +855,9 @@ final class ChatViewModel: ObservableObject {
         }
         showBlockedOnly = defaults.bool(forKey: showBlockedOnlyDefaultsKey)
         showArchivedProjects = defaults.bool(forKey: showArchivedProjectsDefaultsKey)
-        reviewReadyOnly = defaults.bool(forKey: reviewReadyOnlyDefaultsKey)
+        // The Review column's "Ready" filter became a section; drop the
+        // persisted toggle so it does not linger in the defaults domain.
+        defaults.removeObject(forKey: "boss.work.reviewReadyOnly")
         if let groupingRaw = defaults.string(forKey: workBoardGroupingDefaultsKey),
            let grouping = WorkBoardGrouping(rawValue: groupingRaw) {
             workBoardGrouping = grouping

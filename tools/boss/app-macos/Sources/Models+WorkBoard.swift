@@ -87,6 +87,39 @@ enum WorkBoardGroupKey: String {
     }
 }
 
+/// The labelled sections the Review column is grouped into, in display order
+/// (`allCases` order is the order the sections render in).
+///
+/// Mirrors `boss_protocol::ReviewSection` — the raw values come off the wire
+/// as `Task.review_section`. The engine owns the classification (see
+/// `classify_review_section`); this type only names the sections and their
+/// headers.
+enum ReviewSection: String, CaseIterable {
+    /// Nothing left for an agent to do; waiting only on the operator.
+    case ready
+    /// A revision is running or queued on the PR.
+    case inRevision = "in_revision"
+    /// An AI review is queued or running, or reported findings no revision
+    /// has started on yet.
+    case aiReview = "ai_review"
+    /// Open PR that is not ready yet and has nothing wrong: required CI is
+    /// still running or unpolled, or mergeability is unknown.
+    case pending
+    /// Needs a human or a fix: blocked work item, failing CI, merge
+    /// conflict, or only blocked revisions.
+    case blocked
+
+    var title: String {
+        switch self {
+        case .ready: return "Ready"
+        case .inRevision: return "In Revision"
+        case .aiReview: return "AI Review"
+        case .pending: return "Pending"
+        case .blocked: return "Blocked"
+        }
+    }
+}
+
 enum WorkBoardGrouping: String, CaseIterable, Identifiable {
     case none
     case project

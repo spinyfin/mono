@@ -152,12 +152,6 @@ extension ChatViewModel {
         defaults.set(value, forKey: showArchivedProjectsDefaultsKey)
     }
 
-    func setReviewReadyOnly(_ value: Bool) {
-        guard reviewReadyOnly != value else { return }
-        reviewReadyOnly = value
-        defaults.set(value, forKey: reviewReadyOnlyDefaultsKey)
-    }
-
     /// Persist (or clear, when `nil`) the selected product so the next
     /// launch restores the board the operator left open.
     func persistSelectedProductID(_ productID: String?) {
@@ -299,7 +293,6 @@ extension ChatViewModel {
         showBlockedOnly = false
         filterToChoresOnly = false
         includeChores = true
-        reviewReadyOnly = false
     }
 
     func setWorkBoardGrouping(_ grouping: WorkBoardGrouping) {

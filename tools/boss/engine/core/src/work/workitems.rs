@@ -1186,6 +1186,11 @@ impl WorkDb {
         }
         trace.record_plain(segment::DB_AI_REVIEW_STATE, elapsed_ms(t));
 
+        // Resolve which labelled Review-column section each card is grouped
+        // under. Reads ready_for_review, has_in_progress_revision and
+        // ai_review_state, so it must run after all three attaches above.
+        attach_review_section(&mut tasks, &mut chores);
+
         // Resolve has_attachments for every task/chore so the kanban card can
         // gate its screenshot-viewer affordance without a per-card query.
         // Errors are non-fatal — log and leave the field at its default
