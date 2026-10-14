@@ -152,6 +152,7 @@ _SHARD1_SRCS = [
     "Tests/BossTests/AttachmentAffordanceTests.swift",
     "Tests/BossTests/DesignsTests.swift",
     "Tests/BossTests/EngineAutoChoreKanbanTests.swift",
+    "Tests/BossTests/EngineClientLifecycleOrderingTests.swift",
     "Tests/BossTests/KanbanExternalRefLinkTests.swift",
     "Tests/BossTests/KanbanRepoChipTests.swift",
     "Tests/BossTests/KanbanShortIDBadgeTests.swift",

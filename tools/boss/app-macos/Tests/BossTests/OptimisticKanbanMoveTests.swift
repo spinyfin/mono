@@ -305,7 +305,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         XCTAssertEqual(sent.first?["type"] as? String, "move_work_item_on_board")
     }
 
-    func testDragWhileDisconnectedBouncesBackWithoutModal() {
+    func testDragWhileDisconnectedPreservesRetryAndDiscardBouncesBack() {
         let model = makeModel()
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
@@ -314,7 +314,12 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         model.applyEventForTest(.notConnected(requestKind: "evaluate_dispatch_admission"))
 
         XCTAssertNil(model.workErrorMessage, "disconnect must not raise the modal")
-        XCTAssertNotNil(model.dragRefusalNotice, "bounce shows the inline notice")
+        XCTAssertNotNil(model.pendingDragAdmissionCheck, "Retry must retain the continuation")
+        XCTAssertEqual(model.engine.unsentActionCountForTesting, 1)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+        model.dismissDisconnectedActions()
+        XCTAssertNil(model.pendingDragAdmissionCheck)
+        XCTAssertFalse(model.engine.hasUnsentActions)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
     }
 
@@ -330,6 +335,22 @@ final class OptimisticKanbanMoveTests: XCTestCase {
             XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
             XCTAssertNil(model.dragRefusalNotice)
         }
+    }
+
+    func testDiscardingUnrelatedQueuedActionPreservesLiveDrag() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+        model.engine.simulateConnectedForTesting = true
+        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: nil))
+        model.engine.simulateConnectedForTesting = false
+        model.engine.sendLine(["type": "create_product", "name": "Queued product"])
+
+        model.dismissDisconnectedActions()
+
+        XCTAssertNotNil(model.pendingDragAdmissionCheck)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+        XCTAssertFalse(model.engine.hasUnsentActions)
     }
 
     // MARK: - Helpers

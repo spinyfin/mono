@@ -19,13 +19,12 @@ extension ChatViewModel {
     /// immediately (instead of silently doing nothing) when disconnected.
     func acceptDeferredScopeAttention(id: String) {
         guard !deferredScopeActionInFlightIDs.contains(id) else { return }
-        guard isConnected else {
-            showDisconnectedActionNotice()
-            return
-        }
+        guard canSubmitUserActions() else { return }
         deferredScopeActionInFlightIDs.insert(id)
         if engine.sendAcceptDeferredScopeAttention(id: id) == nil {
             deferredScopeActionInFlightIDs.remove(id)
+            refreshUnsentActions()
+            showDisconnectedActionNotice()
         }
     }
 
@@ -34,13 +33,12 @@ extension ChatViewModel {
     /// engine's `work_invalidated` push that the conversion RPC also fires.
     func createTaskFromDeferredScopeAttention(attentionID: String) {
         guard !deferredScopeActionInFlightIDs.contains(attentionID) else { return }
-        guard isConnected else {
-            showDisconnectedActionNotice()
-            return
-        }
+        guard canSubmitUserActions() else { return }
         deferredScopeActionInFlightIDs.insert(attentionID)
         if engine.sendCreateTaskFromDeferredScopeAttention(attentionID: attentionID) == nil {
             deferredScopeActionInFlightIDs.remove(attentionID)
+            refreshUnsentActions()
+            showDisconnectedActionNotice()
         }
     }
 

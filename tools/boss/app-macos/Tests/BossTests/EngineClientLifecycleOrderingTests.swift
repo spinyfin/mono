@@ -7,6 +7,272 @@ import os
 /// asserting that lifecycle events (`.disconnected`, `.connected`) are
 /// delivered behind the replies already handed to the decoder.
 final class EngineClientLifecycleOrderingTests: XCTestCase {
+    func testAcceptedQueuedWritesReserveCapacityAcrossDisconnect() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let client = EngineClient(socketPath: path)
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let rejected = OSAllocatedUnfairLock(initialState: 0)
+        client.onEvent = { event in
+            if case .actionNotSaved = event { rejected.withLock { $0 += 1 } }
+        }
+        client.start()
+        defer { release.signal(); client.stop() }
+        let first = try XCTUnwrap(server.accept(timeout: 5))
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        client.setBeforeWriteHookForTesting { _, _ in
+            entered.signal()
+            _ = release.wait(timeout: .now() + 10)
+        }
+        client.sendLine(["type": "create_chore", "name": "attempted"])
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        // Teardown is ordered ahead of these writes, but the caller still sees ready.
+        client.stop()
+        for index in 0..<EngineClient.maxUnsentActions {
+            XCTAssertNotNil(client.sendLine(["type": "create_chore", "name": "reserved-\(index)"]))
+        }
+        XCTAssertNil(client.sendLine(["type": "create_chore", "name": "rejected"]))
+        client.setBeforeWriteHookForTesting(nil)
+        release.signal()
+        XCTAssertTrue(waitUntil(5) { client.unsentActionCountForTesting == EngineClient.maxUnsentActions })
+        XCTAssertTrue(waitUntil(5) { rejected.withLock { $0 == 1 } })
+        first.close()
+        client.start()
+        let second = try XCTUnwrap(server.accept(timeout: 5))
+        defer { second.close() }
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        XCTAssertTrue(client.retryUnsentActions())
+        var names: Set<String> = []
+        for _ in 0..<EngineClient.maxUnsentActions {
+            let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(second.readLine(timeout: 5))) as? [String: Any])
+            let payload = try XCTUnwrap(envelope["payload"] as? [String: Any])
+            names.insert(try XCTUnwrap(payload["name"] as? String))
+        }
+        XCTAssertEqual(names, Set((0..<EngineClient.maxUnsentActions).map { "reserved-\($0)" }))
+        XCTAssertNil(second.readLine(timeout: 0.2))
+    }
+
+    func testBufferedEngineRequestAfterSocketLossCannotEnterRetryBatch() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let client = EngineClient(socketPath: path)
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let answered = OSAllocatedUnfairLock(initialState: false)
+        client.setDecodeHookForTesting { data in
+            if String(decoding: data, as: UTF8.self).contains("engine_request") {
+                started.signal()
+                _ = release.wait(timeout: .now() + 10)
+            }
+        }
+        client.onEvent = { event in
+            if case .engineRequest(let id, _) = event {
+                client.sendListHostedPanesResponse(requestId: id, panes: [])
+                answered.withLock { $0 = true }
+            }
+        }
+        client.start()
+        defer { release.signal(); client.stop() }
+        let first = try XCTUnwrap(server.accept(timeout: 5))
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        var request = try JSONSerialization.data(withJSONObject: [
+            "payload": ["type": "engine_request", "request_id": "old-rpc", "request": ["kind": "list_hosted_panes"]],
+        ])
+        request.append(0x0A)
+        first.sendBytes(request)
+        XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+        first.close()
+        XCTAssertTrue(waitUntil(5) { !client.isReachable })
+        client.sendLine(["type": "create_chore", "name": "the-only-mutation"])
+        client.sendLine(["type": "list_products"])
+        release.signal()
+        XCTAssertTrue(waitUntil(5) { answered.withLock { $0 } })
+        XCTAssertEqual(client.unsentActionCountForTesting, 1)
+        XCTAssertTrue(client.uncertainActionsForTesting.isEmpty)
+        let second = try XCTUnwrap(server.accept(timeout: 10))
+        defer { second.close() }
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        XCTAssertTrue(client.retryUnsentActions())
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(second.readLine(timeout: 5))) as? [String: Any])
+        XCTAssertEqual((envelope["payload"] as? [String: Any])?["type"] as? String, "create_chore")
+        XCTAssertNil(second.readLine(timeout: 0.2))
+    }
+
+    @MainActor
+    func testMixedSocketOutcomesKeepUncertaintyAfterRetryAcknowledgment() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let model = ChatViewModel(socketPath: path)
+        let client = model.engine
+        client.onEvent = { event in
+            if case .connected = event { model.isConnected = true }
+            else { model.applyEventForTest(event) }
+        }
+        client.start()
+        defer { client.stop() }
+        let first = try XCTUnwrap(server.accept(timeout: 5))
+        XCTAssertTrue(waitUntil(5) { model.isConnected })
+        let uncertainID = try XCTUnwrap(client.sendLine(["type": "update_work_item", "id": "task", "patch": [:]]))
+        XCTAssertNotNil(first.readLine(timeout: 5))
+        first.close()
+        XCTAssertTrue(waitUntil(5) { !model.isConnected })
+        client.sendLine(["type": "create_chore", "name": "queued"])
+        XCTAssertTrue(waitUntil(2) { model.hasUnsentActions })
+        XCTAssertTrue(model.disconnectedActionNotice?.contains(uncertainID) == true)
+        let second = try XCTUnwrap(server.accept(timeout: 10))
+        defer { second.close() }
+        XCTAssertTrue(waitUntil(5) { model.isConnected })
+        model.retryDisconnectedActions()
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(second.readLine(timeout: 5))) as? [String: Any])
+        var reply = try JSONSerialization.data(withJSONObject: [
+            "request_id": try XCTUnwrap(envelope["request_id"] as? String),
+            "payload": ["type": "work_error", "message": "fixture refusal"],
+        ])
+        reply.append(0x0A)
+        second.sendBytes(reply)
+        XCTAssertTrue(waitUntil(5) { !model.retryingDisconnectedActions })
+        XCTAssertTrue(model.disconnectedActionNotice?.contains(uncertainID) == true)
+        model.dismissDisconnectedActions()
+        XCTAssertTrue(model.disconnectedActionNotice?.contains(uncertainID) == true)
+        XCTAssertEqual(client.uncertainActionsForTesting, [uncertainID: "update_work_item"])
+    }
+
+    func testSessionReplyWithoutDirectResponseDoesNotAwaitConfirmation() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let client = EngineClient(socketPath: path)
+        client.start()
+        defer { client.stop() }
+        let peer = try XCTUnwrap(server.accept(timeout: 5))
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        client.sendLine(["type": "engine_response", "request_id": "rpc", "response": ["kind": "pane_state"]])
+        XCTAssertNotNil(peer.readLine(timeout: 5))
+        client.sendLine(["type": "release_review_terminal", "lease_id": "closed-window"])
+        XCTAssertNotNil(peer.readLine(timeout: 5))
+        XCTAssertEqual(client.awaitingReplyCountForTesting, 0)
+        peer.close()
+        XCTAssertTrue(waitUntil(5) { !client.isReachable })
+        XCTAssertTrue(client.uncertainActionsForTesting.isEmpty)
+        XCTAssertFalse(client.hasUnsentActions)
+    }
+
+    @MainActor
+    func testDisconnectedDragRetriesAdmissionThenExactlyOneMove() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let model = ChatViewModel(socketPath: path)
+        let client = model.engine
+        client.onEvent = { event in
+            if case .connected = event { model.isConnected = true }
+            else {
+                if case .dispatchAdmissionEvaluated = event {
+                    // Discard must not erase the already-started semantic retry.
+                    model.dismissDisconnectedActions()
+                    XCTAssertTrue(client.hasRetriedActions)
+                }
+                model.applyEventForTest(event)
+            }
+        }
+        let task = WorkTask(id: "drag-task", productID: "product", projectID: nil, kind: "chore",
+                            name: "Drag me", description: "", status: "todo", priority: "medium",
+                            ordinal: nil, prURL: nil, deletedAt: nil, createdAt: "", updatedAt: "", autostart: false)
+        model.choresByProductID = ["product": [task]]
+        model.applyEventForTest(.disconnected)
+        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: nil))
+        XCTAssertTrue(waitUntil(2) { model.hasUnsentActions })
+        XCTAssertNotNil(model.pendingDragAdmissionCheck)
+        client.start()
+        defer { client.stop() }
+        let peer = try XCTUnwrap(server.accept(timeout: 5))
+        defer { peer.close() }
+        XCTAssertTrue(waitUntil(5) { model.isConnected })
+        model.retryDisconnectedActions()
+        let admission = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(peer.readLine(timeout: 5))) as? [String: Any])
+        XCTAssertEqual((admission["payload"] as? [String: Any])?["type"] as? String, "evaluate_dispatch_admission")
+        var reply = try JSONSerialization.data(withJSONObject: [
+            "request_id": try XCTUnwrap(admission["request_id"] as? String),
+            "payload": ["type": "dispatch_admission_evaluated", "admission": [
+                "work_item_id": task.id, "would_dispatch": true,
+                "pause": ["active": false, "overridable": false], "blockers": [],
+            ]],
+        ])
+        reply.append(0x0A)
+        peer.sendBytes(reply)
+        XCTAssertTrue(waitUntil(5) { model.pendingDragAdmissionCheck == nil })
+        XCTAssertTrue(model.retryingDisconnectedActions, "admission is not completion of the move")
+        let move = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(peer.readLine(timeout: 5))) as? [String: Any])
+        XCTAssertEqual((move["payload"] as? [String: Any])?["type"] as? String, "move_work_item_on_board")
+        XCTAssertNil(peer.readLine(timeout: 0.2), "exactly one move follows admission")
+        var acknowledgment = try JSONSerialization.data(withJSONObject: [
+            "request_id": try XCTUnwrap(move["request_id"] as? String),
+            "payload": ["type": "work_error", "message": "fixture refusal"],
+        ])
+        acknowledgment.append(0x0A)
+        peer.sendBytes(acknowledgment)
+        XCTAssertTrue(waitUntil(5) { !model.retryingDisconnectedActions })
+        XCTAssertNil(model.disconnectedActionNotice)
+    }
+
+    func testPeerClosesImmediatelyBeforeAttemptedMutationWrite() throws {
+        for kind in ["create_chore", "update_work_item", "answer_operator_question"] {
+            let path = socketPath()
+            defer { unlink(path) }
+            let server = try TestSocketServer(path: path)
+            let client = EngineClient(socketPath: path)
+            let entered = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            let generation = OSAllocatedUnfairLock(initialState: 0)
+            client.start()
+            defer { release.signal(); client.stop() }
+            let first = try XCTUnwrap(server.accept(timeout: 5))
+            XCTAssertTrue(waitUntil(5) { client.isReachable })
+            client.setBeforeWriteHookForTesting { _, value in
+                generation.withLock { $0 = value }
+                entered.signal()
+                _ = release.wait(timeout: .now() + 10)
+            }
+            let id = try XCTUnwrap(client.sendLine(["type": kind, "id": "example"]))
+            XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+            XCTAssertTrue(client.isReachable, "the old connection must still appear live at submit")
+            XCTAssertGreaterThan(generation.withLock { $0 }, 0)
+            first.close()
+            client.setBeforeWriteHookForTesting(nil)
+            release.signal()
+            XCTAssertTrue(waitUntil(5) { client.uncertainActionsForTesting[id] == kind })
+            XCTAssertTrue(waitUntil(5) { client.failedWriteCompletionsForTesting == 1 }, "exercise the failed completion path")
+            XCTAssertEqual(client.uncertainActionsForTesting, [id: kind])
+            XCTAssertFalse(client.hasUnsentActions, "an attempted write cannot safely be replayed")
+            let second = try XCTUnwrap(server.accept(timeout: 10))
+            defer { second.close() }
+            XCTAssertNil(second.readLine(timeout: 0.2))
+        }
+    }
+
+    func testDisconnectedEditRetainsItsExactPatch() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let client = EngineClient(socketPath: path)
+        XCTAssertNil(client.sendUpdateWorkItem(id: "task", patch: ["description": "unsaved text"]))
+        client.start()
+        defer { client.stop() }
+        let peer = try XCTUnwrap(server.accept(timeout: 5))
+        defer { peer.close() }
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        XCTAssertTrue(client.retryUnsentActions())
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(peer.readLine(timeout: 5))) as? [String: Any])
+        let payload = try XCTUnwrap(envelope["payload"] as? [String: Any])
+        XCTAssertEqual(payload["type"] as? String, "update_work_item")
+        XCTAssertEqual((payload["patch"] as? [String: String])?["description"], "unsaved text")
+        XCTAssertNil(peer.readLine(timeout: 0.2))
+    }
+
     func testActionDuringDisconnectIsRetriedExactlyOnce() throws {
         let path = socketPath()
         defer { unlink(path) }
@@ -44,16 +310,12 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
 
     func testOnlyUserMutationsAreRetainedWhileDisconnected() {
         let client = EngineClient(socketPath: "/nonexistent/boss-retention.sock")
-        // Replies to a dead session's RPCs, reads, and actions whose
-        // `.notConnected` handler rolls back view-model state are not retained.
+        // Replies to a dead session and reads must never enter the retry batch.
         XCTAssertNil(client.sendLine([
             "type": "engine_response", "request_id": "r1", "response": ["kind": "pane_state"],
         ]))
         XCTAssertNil(client.sendLine(["type": "get_work_tree", "product_id": "p"]))
         XCTAssertNil(client.sendLine(["type": "list_products"]))
-        XCTAssertNil(client.sendLine(["type": "evaluate_dispatch_admission", "work_item_id": "t"]))
-        XCTAssertNil(client.sendLine(["type": "move_work_item_on_board", "work_item_id": "t"]))
-        XCTAssertNil(client.sendLine(["type": "recreate_coordinator"]))
         XCTAssertFalse(client.hasUnsentActions)
         XCTAssertEqual(client.unsentActionCountForTesting, 0)
 
@@ -73,7 +335,7 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         let server = try TestSocketServer(path: path)
         let client = EngineClient(socketPath: path)
         client.sendLine(["type": "engine_response", "request_id": "r1", "response": ["kind": "k"]])
-        client.sendLine(["type": "move_work_item_on_board", "work_item_id": "t"])
+        client.sendLine(["type": "get_work_tree", "product_id": "p"])
         client.sendLine(["type": "create_chore", "name": "real"])
         client.start()
         defer { client.stop() }

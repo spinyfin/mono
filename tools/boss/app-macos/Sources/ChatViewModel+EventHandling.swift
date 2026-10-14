@@ -84,7 +84,11 @@ extension ChatViewModel {
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
             disconnectOffsiteBackupEdit()
-            clearCoordinatorReset()
+            if engine.hasUnsentAction(kind: "recreate_coordinator") {
+                coordinatorResetWaiting = false
+            } else {
+                clearCoordinatorReset()
+            }
             isConnected = false
             if refreshUnsentActions() { showDisconnectedActionNotice() }
             stopBackgroundWorkPolling(clearSnapshot: true)
@@ -118,7 +122,7 @@ extension ChatViewModel {
             // flight: the socket drop means no `dispatch_admission_evaluated`
             // reply is ever coming, so nothing else would clear
             // `pendingDragAdmissionCheck` or the optimistic move it guards.
-            if pendingDragAdmissionCheck != nil {
+            if pendingDragAdmissionCheck != nil && !engine.hasUnsentAction(kind: "evaluate_dispatch_admission") {
                 pendingDragAdmissionCheck = nil
                 bounceBackOptimisticMoves(message: nil)
             }
@@ -290,26 +294,36 @@ extension ChatViewModel {
             // user-facing signal; never a modal.
             appendSystemMessage(message)
         case .retriedActionsStatus(let message):
-            if let message { uncertainActionNotice = message }
+            if let message {
+                uncertainActionNotice = message
+                if !engine.hasUnsentAction(kind: "move_work_item_on_board") && !engine.hasUnsentAction(kind: "evaluate_dispatch_admission") {
+                    bounceBackOptimisticMoves(message: nil)
+                }
+            }
             retryingDisconnectedActions = false
             refreshUnsentActions()
             showDisconnectedActionNotice()
         case .notConnected(let requestKind):
             if requestKind == "recreate_coordinator" {
-                // The request was dropped, so no handoff will ever arrive.
-                clearCoordinatorReset()
+                if engine.hasUnsentAction(kind: requestKind) {
+                    coordinatorResetWaiting = false
+                } else {
+                    clearCoordinatorReset()
+                }
             }
             if requestKind == "update_work_item" {
                 settleAllArchiveRequests()
             }
             // Only the drag's own requests may clear admission/optimistic state.
-            if requestKind == "evaluate_dispatch_admission" || requestKind == "move_work_item_on_board" {
+            if (requestKind == "evaluate_dispatch_admission" || requestKind == "move_work_item_on_board") && !engine.hasUnsentAction(kind: requestKind) {
                 pendingDragAdmissionCheck = nil
                 bounceBackOptimisticMoves(message: "Not connected to the engine — reconnect and try again.")
             }
             // Only kinds retained for Retry earn the "your actions are saved" notice.
             if refreshUnsentActions() { showDisconnectedActionNotice() }
             appendSystemMessage("Not connected to the engine; \(requestKind) was not sent.", alwaysShow: true)
+        case .actionNotSaved(let requestKind):
+            showActionNotSaved(requestKind: requestKind)
         case .workItemUpdateDecodeFailed(let message, let requestId):
             // The reply a pending archive was waiting on arrived undecodable;
             // it is the only reply that request gets, so settle it here.
@@ -317,7 +331,8 @@ extension ChatViewModel {
             handle(.error(message: message))
         case .error(let message):
             if handleCoordinatorResetError(message) { return }
-            if pendingDragAdmissionCheck != nil {
+            if let pending = pendingDragAdmissionCheck {
+                engine.finishAdmissionRetry(taskID: pending.taskID)
                 // A malformed/undecodable `dispatch_admission_evaluated`
                 // reply (EngineClient emits `.error`, never
                 // `.dispatchAdmissionEvaluated`, when the payload fails to

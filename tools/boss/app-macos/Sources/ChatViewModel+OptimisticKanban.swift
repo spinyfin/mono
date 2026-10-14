@@ -67,6 +67,7 @@ extension ChatViewModel {
     /// its groups. That is strictly less intent than a group-qualified drop,
     /// and the engine treats it as such.
     func attemptDrop(_ taskID: String, onColumn column: WorkBoardColumnKey, group: WorkBoardGroupKey?) -> Bool {
+        guard canSubmitUserActions() else { return false }
         guard let task = task(withID: taskID) else { return false }
         let group = group.flatMap { $0.isEngineBoardGroup ? $0 : nil }
 
@@ -152,6 +153,7 @@ extension ChatViewModel {
     /// back — see `attemptDrop`'s Doing-column branch for what queued this.
     func handleDispatchAdmissionEvaluated(_ admission: DispatchAdmission) {
         guard let pending = pendingDragAdmissionCheck, pending.taskID == admission.workItemID else {
+            engine.finishAdmissionRetry(taskID: admission.workItemID)
             // Stale reply (superseded by a later drag) or an evaluation the
             // app requested for some other reason — nothing to forward.
             return
@@ -182,11 +184,13 @@ extension ChatViewModel {
         // force never lifts a hard blocker either.
         let hardBlockers = admission.hardBlockers
         if !hardBlockers.isEmpty {
+            engine.finishAdmissionRetry(taskID: pending.taskID)
             bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "))
             return
         }
 
         if !admission.pause.overridable {
+            engine.finishAdmissionRetry(taskID: pending.taskID)
             let reason = "dispatch is paused" + (admission.pause.reason.map { ": \($0)" } ?? "")
                 + " — this pause is not overridable"
             bounceBackOptimisticMoves(message: reason)
@@ -222,7 +226,8 @@ extension ChatViewModel {
     /// Operator cancelled the pause-override dialog: bounce the
     /// optimistically-placed card back to its origin column.
     func cancelPauseOverrideDrag() {
-        guard pendingPauseOverrideConfirmation != nil else { return }
+        guard let confirmation = pendingPauseOverrideConfirmation else { return }
+        engine.finishAdmissionRetry(taskID: confirmation.taskID)
         pendingPauseOverrideConfirmation = nil
         bounceBackOptimisticMoves(message: nil)
     }

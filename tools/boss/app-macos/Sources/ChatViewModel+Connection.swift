@@ -5,10 +5,26 @@ import Foundation
 /// banner scheduling. See `showConnectionLostBanner` in `ChatViewModel.swift`
 /// for why the banner is debounced rather than tied directly to `isConnected`.
 extension ChatViewModel {
+    /// Leave the initiating sheet or gesture intact when the retry queue is full.
+    func canSubmitUserActions(_ count: Int = 1) -> Bool {
+        guard engine.hasRoomForDisconnectedActions(count) else {
+            showActionNotSaved(requestKind: "This action")
+            return false
+        }
+        unsavedActionNotice = nil
+        showDisconnectedActionNotice()
+        return true
+    }
+
+    func showActionNotSaved(requestKind: String) {
+        unsavedActionNotice = "Too many pending actions; \(requestKind) was not saved. Keep your draft and retry after sending or discarding pending actions."
+        showDisconnectedActionNotice()
+    }
     /// Retained actions require an explicit retry after automatic reconnect.
     func showDisconnectedActionNotice() {
         var notices = [String]()
         if let uncertainActionNotice { notices.append(uncertainActionNotice) }
+        if let unsavedActionNotice { notices.append(unsavedActionNotice) }
         if retryingDisconnectedActions { notices.append("Sending pending actions…") }
         if engine.hasUnsentActions {
             notices.append(isConnected
@@ -29,7 +45,9 @@ extension ChatViewModel {
 
     func retryDisconnectedActions() {
         guard refreshUnsentActions() else { return }
+        let retryingCoordinatorReset = engine.hasUnsentAction(kind: "recreate_coordinator") && pendingCoordinatorReset != nil
         if engine.retryUnsentActions() {
+            if retryingCoordinatorReset { coordinatorResetWaiting = true }
             retryingDisconnectedActions = true
             showDisconnectedActionNotice()
         } else {
@@ -39,7 +57,15 @@ extension ChatViewModel {
     }
 
     func dismissDisconnectedActions() {
+        let discardingDrag = engine.hasUnsentAction(kind: "evaluate_dispatch_admission") || engine.hasUnsentAction(kind: "move_work_item_on_board")
+        let discardingCoordinatorReset = engine.hasUnsentAction(kind: "recreate_coordinator")
         engine.discardUnsentActions()
+        retryingDisconnectedActions = engine.hasRetriedActions
+        if discardingDrag {
+            pendingDragAdmissionCheck = nil
+            bounceBackOptimisticMoves(message: nil)
+        }
+        if discardingCoordinatorReset { clearCoordinatorReset() }
         refreshUnsentActions()
         showDisconnectedActionNotice()
     }

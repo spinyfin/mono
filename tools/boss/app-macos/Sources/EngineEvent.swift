@@ -44,6 +44,7 @@ enum EngineEvent {
     /// for explicit Retry, never automatically replayed. `requestKind` is
     /// the wire `type`.
     case notConnected(requestKind: String)
+    case actionNotSaved(requestKind: String)
     /// A retried batch was acknowledged (nil) or its delivery is uncertain.
     case retriedActionsStatus(message: String?)
     /// Snapshot of every allocated worker slot's live runtime state.

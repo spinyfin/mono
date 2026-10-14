@@ -64,6 +64,7 @@ extension ChatViewModel {
         goal: String = "",
         setAsProductDefault: Bool = false
     ) {
+        guard canSubmitUserActions(setAsProductDefault ? 2 : 1) else { return }
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
 
@@ -186,6 +187,7 @@ extension ChatViewModel {
         workerBranchPrefix: String = "",
         docsRepo: String = ""
     ) {
+        guard canSubmitUserActions() else { return }
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
 
@@ -217,8 +219,10 @@ extension ChatViewModel {
             }
         }
 
-        engine.sendUpdateWorkItem(id: id, patch: patch)
-        pendingWorkEditRequest = nil
+        let requestID = engine.sendUpdateWorkItem(id: id, patch: patch)
+        if requestID != nil || engine.hasUnsentAction(kind: "update_work_item") {
+            pendingWorkEditRequest = nil
+        }
     }
 
     func setProductExternalTracker(

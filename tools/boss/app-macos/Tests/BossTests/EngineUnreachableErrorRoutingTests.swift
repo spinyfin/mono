@@ -10,6 +10,24 @@ import XCTest
 /// drive the modal.
 @MainActor
 final class EngineUnreachableErrorRoutingTests: XCTestCase {
+    func testOverflowPreservesCreateSheetAndReportsUnsavedAction() async {
+        let model = makeModel()
+        model.applyEventForTest(.retriedActionsStatus(message: "Unconfirmed earlier action"))
+        for index in 0..<EngineClient.maxUnsentActions {
+            model.engine.sendLine(["type": "create_product", "name": "pending-\(index)"])
+        }
+        let request = WorkCreateRequest(kind: .product)
+        model.pendingWorkCreateRequest = request
+        model.submitWorkCreateRequest(request, name: "draft title", description: "draft body")
+        XCTAssertEqual(model.pendingWorkCreateRequest?.id, request.id, "the sheet and its text stay open")
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("was not saved") == true)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("Unconfirmed earlier action") == true)
+        XCTAssertEqual(model.engine.unsentActionCountForTesting, EngineClient.maxUnsentActions)
+        model.engine.sendLine(["type": "create_product", "name": "first-overflow"])
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("was not saved") == true)
+    }
+
     /// `socket waiting:` is what `NWConnection`'s `.waiting` state
     /// emits while the unix socket can't be opened. It must not set
     /// `workErrorMessage` — the disconnected banner is what
@@ -56,12 +74,12 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
         XCTAssertEqual(model.workErrorMessage, "work item could not be created")
     }
 
-    func testNotConnectedForUnretainedKindShowsNoRetryNotice() {
+    func testDisconnectedBoardMoveIsSavedForRetry() {
         let model = makeModel()
         XCTAssertNil(model.engine.sendLine(["type": "move_work_item_on_board", "work_item_id": "t"]))
         model.applyEventForTest(.notConnected(requestKind: "move_work_item_on_board"))
-        XCTAssertNil(model.disconnectedActionNotice)
-        XCTAssertFalse(model.hasUnsentActions)
+        XCTAssertNotNil(model.disconnectedActionNotice)
+        XCTAssertTrue(model.hasUnsentActions)
     }
 
     /// Even after a transport burst, the message stays clear so the
