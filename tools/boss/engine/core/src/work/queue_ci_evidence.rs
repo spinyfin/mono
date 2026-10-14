@@ -15,6 +15,14 @@ pub(crate) fn queue_ci_verification_required(attempt: &CiRemediation) -> bool {
                 .map_or(true, |checks| !checks.is_empty()))
 }
 
+/// Reasons a give-up on a Trunk eviction with no captured failing build may
+/// cite without verification evidence: no build exists to verify.
+pub(crate) const NO_BUILD_REASONS: [&str; 3] = ["no-failing-build-found", "merge-conflict", "sibling-collision"];
+
+fn is_trunk_empty_capture(attempt: &CiRemediation) -> bool {
+    attempt.failure_kind.as_deref() == Some("trunk_queue_eviction") && !queue_ci_verification_required(attempt)
+}
+
 fn is_lint_check(name: &str) -> bool {
     matches!(
         name.rsplit('/').next(),
@@ -81,12 +89,6 @@ pub(crate) fn validate(attempt: &CiRemediation, evidence: Option<&QueueCiEvidenc
         );
     }
     for check in checks {
-        if let Some(base) = check["queue_base_sha"].as_str() {
-            anyhow::ensure!(
-                evidence.queue_base_sha == base,
-                "{REQUIRED} queue_base_sha differs from the captured queue base."
-            );
-        }
         let url = check["target_url"].as_str().filter(|s| !s.is_empty());
         let name = check["name"].as_str().filter(|s| !s.is_empty()).context(REQUIRED)?;
         anyhow::ensure!(
@@ -188,6 +190,27 @@ pub(crate) fn record_delivery(conn: &Connection, execution_id: &str, payload: &R
 }
 
 impl WorkDb {
+    /// A Trunk eviction with an empty capture is not gated on evidence because
+    /// it may have no build. A give-up there must either carry evidence (the
+    /// worker found a failing build and verified it) or name a no-build reason.
+    pub(crate) fn validate_trunk_no_build_give_up(
+        &self,
+        attempt_id: &str,
+        evidence: Option<&QueueCiEvidence>,
+        reason: &str,
+    ) -> Result<()> {
+        let attempt = self.get_ci_remediation(attempt_id)?.context("unknown CI attempt")?;
+        if !is_trunk_empty_capture(&attempt) || evidence.is_some() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            NO_BUILD_REASONS.contains(&reason.trim()),
+            "Giving up on a Trunk eviction requires --queue-ci-evidence-file when a failing trunk-merge/pr-N/* build exists (verify it with Bazel on a rebased tree). Without a failing build, --reason must be one of: {}.",
+            NO_BUILD_REASONS.join(", ")
+        );
+        Ok(())
+    }
+
     pub(crate) fn validate_queue_ci_failure(&self, attempt_id: &str, evidence: Option<&QueueCiEvidence>) -> Result<()> {
         let attempt = self.get_ci_remediation(attempt_id)?.context("unknown CI attempt")?;
         validate(&attempt, evidence)
@@ -245,19 +268,22 @@ mod tests {
         let revision = crate::test_support::create_test_chore(&db, product.id.clone(), "Fix queue CI");
         let execution = crate::test_support::create_ready_chore_execution(&db, revision.id.clone());
         let attempt = db
-            .insert_ci_remediation(CiRemediationInsertInput {
-                product_id: product.id,
-                work_item_id: revision.id.clone(),
-                pr_url: "https://github.com/spinyfin/mono/pull/3145".into(),
-                pr_number: 3145,
-                head_branch: "feature".into(),
-                head_sha_at_trigger: "b".repeat(40),
-                attempt_kind: "fix".into(),
-                consumes_budget: 1,
-                failed_checks: serde_json::json!([{"name": "bazel-build-test", "target_url": URL, "queue_base_sha": "d".repeat(40)}]).to_string(),
-                failure_kind: "merge_queue_rebounce".into(),
-                before_commit_sha: Some("c".repeat(40)),
-            })
+            .insert_ci_remediation_with_queue_base(
+                CiRemediationInsertInput {
+                    product_id: product.id,
+                    work_item_id: revision.id.clone(),
+                    pr_url: "https://github.com/spinyfin/mono/pull/3145".into(),
+                    pr_number: 3145,
+                    head_branch: "feature".into(),
+                    head_sha_at_trigger: "b".repeat(40),
+                    attempt_kind: "fix".into(),
+                    consumes_budget: 1,
+                    failed_checks: serde_json::json!([{"name": "bazel-build-test", "target_url": URL}]).to_string(),
+                    failure_kind: "merge_queue_rebounce".into(),
+                    before_commit_sha: Some("c".repeat(40)),
+                },
+                Some(&"d".repeat(40)),
+            )
             .unwrap()
             .unwrap();
         db.set_ci_remediation_revision_task_id(&attempt.id, &revision.id)

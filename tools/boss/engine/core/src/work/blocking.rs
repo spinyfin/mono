@@ -1031,6 +1031,24 @@ impl WorkDb {
         Ok(exists)
     }
 
+    /// Epoch-seconds time the latest verified same-head requeue of this PR
+    /// head was accepted. Verified requeues archive only the newest queue
+    /// construction's dedup key, so every queue failure at or before this
+    /// boundary is pre-requeue history and must not mint a new attempt.
+    pub fn verified_requeue_boundary(&self, work_item_id: &str, pr_head_sha: &str) -> Result<Option<i64>> {
+        let conn = self.connect()?;
+        let boundary: Option<i64> = conn.query_row(
+            "SELECT MAX(CAST(finished_at AS INTEGER)) FROM ci_remediations
+              WHERE work_item_id = ?1
+                AND failure_kind = 'merge_queue_rebounce'
+                AND failure_reason = 'verified_requeue'
+                AND head_sha_at_trigger LIKE 'mq:' || ?2 || '@%'",
+            params![work_item_id, pr_head_sha],
+            |row| row.get(0),
+        )?;
+        Ok(boundary)
+    }
+
     /// Read a `ci_remediations` row by id, terminal or not. Returns
     /// `Ok(None)` for an unknown id. Used by the worker-marker
     /// handlers in `app.rs` to echo the post-update row back to the

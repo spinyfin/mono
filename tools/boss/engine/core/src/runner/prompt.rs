@@ -1834,14 +1834,7 @@ fn compose_queue_ci_fragment(attempt: &CiRemediation) -> String {
     if let Some(commands) = render_bk_log_commands(&attempt.failed_checks) {
         out.push_str(&commands);
     }
-    let legacy_base = serde_json::from_str::<Vec<serde_json::Value>>(&attempt.failed_checks)
-        .ok()
-        .and_then(|checks| {
-            checks
-                .iter()
-                .find_map(|c| c["queue_base_sha"].as_str().map(str::to_owned))
-        });
-    if let Some(base) = attempt.queue_base_sha.as_ref().or(legacy_base.as_ref()) {
+    if let Some(base) = &attempt.queue_base_sha {
         out.push_str(&format!(
             "\nQueue base commit (first parent of the failing construction): `{base}`\n"
         ));
@@ -1874,7 +1867,7 @@ Write a JSON evidence file, for example `/tmp/queue-ci-evidence.json`:
   }]
 }
 ```
-For a failing lint job, record `checkleft run` and its output as that job's verification command. Include every failing check name and job URL and every required build/test invocation. Only successful verification of this tree permits a terminal declaration. The engine rejects missing, incomplete, wrong-queue or failing evidence every time; repeating the declaration does not waive the gate. Do not classify from green PR-head checks, hand back coordinator resubmission, or use branch-CI noop/retrigger shortcuts for this queue failure. `engine ci classify` requires `--queue-ci-evidence-file` for `flaky_or_infra` and `unfixable` verdicts; `tractable` is metadata and can be recorded before verification.
+For a failing lint job, record `checkleft run` and its output as that job's verification command. Include every failing check name and job URL and every required build/test invocation. Only successful verification of this tree permits a terminal declaration. The engine rejects missing, incomplete, wrong-queue or failing evidence every time; repeating the declaration does not waive the gate. Do not classify from green PR-head checks, hand back coordinator resubmission, or use branch-CI noop/retrigger shortcuts for this queue failure. `engine ci classify` requires `--queue-ci-evidence-file` for every class except `tractable`; `tractable` is metadata and can be recorded before verification.
 
 If verification passed but a genuine external blocker prevents recovery, both `"$BOSS_BIN" engine ci mark-failed --attempt-id <attempt> --reason <reason> --queue-ci-evidence-file /tmp/queue-ci-evidence.json` and `"$BOSS_BIN" propose done --outcome blocked --summary <reason> --queue-ci-evidence-file /tmp/queue-ci-evidence.json` require that evidence. State the main SHA, targets and results in the summary too. An unsatisfied gate must stay loud; do not claim completion.
 "#);
@@ -2219,7 +2212,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     // authoritative even with no construction build); this STOP section
     // is what keeps the worker from inventing a fix. Merge-queue rebounce
     // *may* land with empty checks when evidence enrichment misses; that
-    // path uses the generic directive below rather than the Trunk bail-out.
+    // path returns early into the queue CI fragment, never the Trunk bail-out.
     let trunk_eviction_without_evidence = is_trunk_eviction && captured_checks.is_none();
     match captured_checks {
         Some(md) => out.push_str(&md),
@@ -2286,11 +2279,16 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              If every one of these says the PR is clean — no conflict, no sibling-in-queue collision, \
              and no failing `trunk-merge/pr-{pr_num}/*` build after an exhaustive search — that is your \
              answer: Trunk never got as far as testing, or the eviction has already cleared. Record it \
-             and stop:\n\n\
+             and stop. The engine accepts a give-up without evidence only with `--reason` one of \
+             `no-failing-build-found`, `merge-conflict` or `sibling-collision`:\n\n\
              ```\n\
-             \"$BOSS_BIN\" engine ci classify --attempt-id {attempt} --class unfixable\n\
              \"$BOSS_BIN\" engine ci mark-failed --attempt-id {attempt} --reason no-failing-build-found\n\
              ```\n\n\
+             **If the search DOES find a failing `trunk-merge/pr-{pr_num}/*` build**, this is a real \
+             merge-queue CI failure: rebase onto current `main@origin`, run every failed target with \
+             Bazel (the full job invocation for whole-job failures), and give up or deliver only \
+             with `--queue-ci-evidence-file` (main_sha, verified_head_sha, queue_sha, queue_base_sha \
+             and successful runs). Without that file the engine rejects the give-up.\n\n\
              **Do NOT** rebase, reset, force-push, or \"resolve\" anything unless one of the checks \
              above found something concrete on **this PR** for you to act on. A revision whose head \
              ends up with an empty diff has destroyed the PR's contents, not fixed them. If your work \

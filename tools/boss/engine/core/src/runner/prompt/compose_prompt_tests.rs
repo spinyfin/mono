@@ -1671,8 +1671,8 @@ fn ci_remediation_prompt_omits_mark_noop_for_rebounce() {
     // commit, so the PR's head-branch checks always read green. The
     // engine REJECTS a rebounce noop outright
     // (`handle_mark_ci_remediation_noop`), so the brief must NOT
-    // surface it — mirroring the `!is_rebounce` gate in the sibling
-    // `compose_ci_remediation_fragment`. (A rebounce normally
+    // surface it — as `compose_ci_remediation_fragment` also omits it by
+    // routing every rebounce into the queue CI fragment. (A rebounce normally
     // delivers via a revision; the stranded-rescue path can still
     // re-dispatch one through this bespoke prompt.)
     let mut attempt = sample_ci_attempt();
@@ -1703,7 +1703,8 @@ fn merge_queue_brief_names_failure_source_and_requires_rebased_bazel_evidence() 
     let mut attempt = sample_ci_attempt();
     attempt.failure_kind = Some("merge_queue_rebounce".into());
     attempt.before_commit_sha = Some("queue-commit".into());
-    attempt.failed_checks = r#"[{"name":"bazel-build-test","conclusion":"FAILURE","target_url":"https://buildkite.com/flunge/mono/builds/20619","provider":"buildkite","queue_base_sha":"historical-base"}]"#.into();
+    attempt.failed_checks = r#"[{"name":"bazel-build-test","conclusion":"FAILURE","target_url":"https://buildkite.com/flunge/mono/builds/20619","provider":"buildkite"}]"#.into();
+    attempt.queue_base_sha = Some("historical-base".into());
     let prompt = compose_ci_remediation_fragment(&attempt);
     for required in [
         "Failure source: the failing merge-queue build",

@@ -359,6 +359,33 @@ pub(crate) async fn check_merge_queue_rebounce(
             );
             continue;
         }
+        // A verified requeue archives only the newest queue construction's
+        // dedup key, so older coalesced failures at this head no longer match
+        // any row. They are pre-requeue history: ignore every dequeue at or
+        // before the time the requeue was accepted (unknown times too, since
+        // they cannot be proven to postdate it).
+        match work_db.verified_requeue_boundary(&candidate.work_item_id, pr_head_sha) {
+            Ok(Some(boundary)) => {
+                let created = event
+                    .created_at
+                    .as_deref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| t.timestamp());
+                if created.is_none_or(|created| created <= boundary) {
+                    tracing::debug!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_head_sha,
+                        before_commit_sha,
+                        "merge poller: rebounce event predates verified requeue; skipping",
+                    );
+                    continue;
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(work_item_id = %candidate.work_item_id, ?err, "merge poller: failed to read requeue boundary; continuing");
+            }
+        }
         // Per-episode dedup *before* the check-runs/status round trip.
         // The timeline keeps historical `RemovedFromMergeQueueEvent`s
         // forever (including on PRs that have since re-queued and
@@ -368,8 +395,9 @@ pub(crate) async fn check_merge_queue_rebounce(
         // live (historically 1000+ re-fetches for a single PR episode).
         // Match PR head *or* synthetic before_commit so pre-transition
         // rows (synthetic stored in `head_sha_at_trigger`) still hit.
-        // `on_merge_queue_rebounce_detected`'s INSERT OR IGNORE is the
-        // authoritative no-op; this just avoids the surrounding work.
+        // `on_merge_queue_rebounce_detected` repeats this same episode
+        // check as its own guard (the insert alone cannot dedup archived
+        // `mq:<head>@<queue>` rows), so this just avoids the surrounding work.
         match work_db.ci_remediation_exists_for_merge_queue_episode(
             &candidate.work_item_id,
             pr_head_sha,

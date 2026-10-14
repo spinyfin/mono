@@ -1634,10 +1634,29 @@ async fn verified_same_head_requeue_allows_a_later_queue_failure() {
         !db.ci_remediation_exists_for_merge_queue_episode(&chore, &head, &next_queue)
             .unwrap()
     );
-    assert!(
-        ci_watch::on_merge_queue_rebounce_detected(&db, publisher.as_ref(), &candidate, &head, &next_queue, None, &[],)
-            .await
-    );
+    // Replay the whole timeline: two coalesced pre-requeue failures at this
+    // head (one archived, one never given a row) mint nothing; only the
+    // post-requeue failure mints exactly one attempt.
+    let event = |queue: &String, created_at: &str| MergeQueueDequeueEvent {
+        queue_base_oid: None,
+        reason: "failed_checks".to_owned(),
+        created_at: Some(created_at.to_owned()),
+        pr_head_oid: Some(head.clone()),
+        before_commit_oid: Some(queue.clone()),
+    };
+    let older_queue = "e".repeat(40);
+    let mut timeline = vec![
+        event(&older_queue, "2020-01-01T00:00:00Z"),
+        event(&queue, "2020-01-02T00:00:00Z"),
+    ];
+    let mut outcome = SweepOutcome::default();
+    let replay = |timeline: &Vec<MergeQueueDequeueEvent>| HashMap::from([(pr.to_owned(), timeline.clone())]);
+    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &replay(&timeline), &mut outcome).await;
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+    timeline.push(event(&next_queue, "2099-01-01T00:00:00Z"));
+    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &replay(&timeline), &mut outcome).await;
+    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &replay(&timeline), &mut outcome).await;
     let next = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
     assert_ne!(next.id, attempt.id);
     assert_eq!(next.before_commit_sha.as_deref(), Some(next_queue.as_str()));
