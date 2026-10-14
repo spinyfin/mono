@@ -1158,7 +1158,7 @@ pub(crate) async fn sweep_pending_pr(
         | StopOutcome::ReviewPassRevisionCreated { .. }
         | StopOutcome::ReviewPassAwaitingResult
         // The no-op terminal is only reachable on the on-Stop path
-        // (it reads the worker's transcript for the NO_CHANGES_NEEDED marker),
+        // (it reads the worker's `run_done` declaration),
         // never from a PR-detection recheck.
         | StopOutcome::NoChangesNeeded { .. }
         // EscalationPending is only reachable via `nudge_or_park` on the

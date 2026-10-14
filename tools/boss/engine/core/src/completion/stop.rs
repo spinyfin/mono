@@ -63,6 +63,22 @@ impl WorkerCompletionHandler {
         turn_end: Option<&crate::driver::TurnEnd>,
         defer_finalization: bool,
     ) -> StopOutcome {
+        // Serialize boundary decisions for each execution, including refusal
+        // (which consumes a declaration) and acceptance. Weak entries let the
+        // lock go away after the last in-flight boundary finishes.
+        let lock = {
+            let mut locks = self.stop_locks.lock().expect("stop locks poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(execution_id).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(execution_id.to_owned(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _boundary = lock.lock().await;
         let outcome = self.on_stop_inner(execution_id, turn_end, defer_finalization).await;
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
         // revision_implementation) gets the catch-all finalizer on Stop.
@@ -524,6 +540,24 @@ impl WorkerCompletionHandler {
                 tracing::warn!(execution_id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the driver-terminal-error failure");
             }
             return self.finalize_driver_terminal_error(&execution, &detail).await;
+        }
+
+        // No-op submission waits for this boundary so the driver's abandoned
+        // command notifications have been staged. Read the durable declaration
+        // here, never a payload cached by an in-flight submit finalizer.
+        if !defer_finalization
+            && self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("run_done_proposals_seam")
+            && self.worker_signalled_no_op(execution_id)
+        {
+            self.detect_and_file_unobserved_command_signal(&execution).await;
+            if self.refuse_no_op_declaration(&execution) {
+                return self.nudge_refused_no_op(&execution).await;
+            }
+            let (contribution, attention) = self.declared_run_done_no_op_inputs(&execution);
+            return self
+                .finalize_no_op_completion(&execution, contribution, attention)
+                .await;
         }
 
         // Maint task 6: an `automation_triage` execution never opens a PR.
@@ -1125,7 +1159,7 @@ impl WorkerCompletionHandler {
                 };
                 // Sanctioned no-op terminal for a revision (the honest exit
                 // the gate above deliberately no longer manufactures). A
-                // revision that pushed nothing and emitted NO_CHANGES_NEEDED
+                // revision that pushed nothing and declared no-changes-needed
                 // is making an explicit, checkable claim — "the finding I
                 // was dispatched for needs no code change" — rather than
                 // having that conclusion inferred for it from a PR whose
@@ -1414,19 +1448,17 @@ must not be asked to open one",
                 // boundary (`waiting_human`), there is no PR on this branch
                 // (PrStatus::None) and none bound to the chore (the
                 // resolve_bound_pr_url branch above returned), so the structural
-                // state confirms an empty contribution. If the worker emitted the
-                // sanctioned NO_CHANGES_NEEDED marker, this is a SUCCESS, not a
+                // state confirms an empty contribution. If the worker declared
+                // `propose done --outcome no-changes-needed`, this is a SUCCESS, not a
                 // failure to be nudged: close the task as done without a PR.
                 //
-                // Requiring the explicit marker is what distinguishes "verified
+                // Requiring the explicit declaration is what distinguishes "verified
                 // already done" from "gave up without trying": a worker that
-                // stopped with no marker still falls through to the legitimate
+                // stopped with no declaration still falls through to the legitimate
                 // produce-a-PR nudge below (and the breaker that bounds it). We
                 // must NOT globally suppress that nudge, and we must NOT push an
                 // empty PR — both are the band-aids the incident forbids.
-                if should_enqueue_reviewer_for_primary(&execution.kind)
-                    && self.worker_signalled_no_op(execution_id).await
-                {
+                if should_enqueue_reviewer_for_primary(&execution.kind) && self.worker_signalled_no_op(execution_id) {
                     // "validation passed / nothing to do" is exactly the
                     // claim an unobserved command undermines: Boss never saw
                     // whether that command actually succeeded, so it cannot
@@ -1444,23 +1476,15 @@ must not be asked to open one",
                     // times, would refuse every later no-op claim for the
                     // rest of the run over one abandoned command from turns
                     // ago. This read also clears the flag, so a clean turn
-                    // that follows gets a fair NO_CHANGES_NEEDED evaluation.
-                    if self.staged_unobserved_commands.consume_unresolved(execution_id) {
-                        tracing::warn!(
-                            execution_id,
-                            expected_branch = %expected_branch,
-                            kind = %execution.kind,
-                            "stop event: worker emitted NO_CHANGES_NEEDED but this run left at least \
-                             one Codex command_execution unobserved since the gate last checked \
-                             (item.started with no item.completed) — refusing the no-op claim; \
-                             falling through to the produce-a-PR nudge instead",
-                        );
+                    // that follows gets a fair no-changes-needed evaluation.
+                    if self.refuse_no_op_declaration(&execution) {
+                        return self.nudge_refused_no_op(&execution).await;
                     } else {
                         tracing::info!(
                             execution_id,
                             expected_branch = %expected_branch,
                             kind = %execution.kind,
-                            "stop event: worker emitted NO_CHANGES_NEEDED with no PR produced — \
+                            "stop event: worker declared no-changes-needed with no PR produced — \
                              work already done; closing task as a no-op (no PR, no nudge)"
                         );
                         return self.finalize_no_op_completion(&execution, None, None).await;

@@ -1390,36 +1390,8 @@ async fn accepted_run_done_delivered_without_a_resolvable_pr_still_terminalizes(
     );
 }
 
-/// `no-changes-needed` closes the task as `done` without a PR, synchronously
-/// at submit — the same terminal `record_worker_no_op_completion` already
-/// reaches from a Stop boundary, now reached from the declaration itself.
-#[tokio::test]
-async fn accepted_run_done_no_changes_needed_immediately_closes_the_task() {
-    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
-    let peer_pid = std::process::id() as libc::pid_t;
-
-    let (proposal, _) = submitted(
-        call_with_peer(
-            &server_state,
-            Some(peer_pid),
-            submit_request(
-                &execution_id,
-                ProposalKind::RunDone,
-                json!({"outcome": "no_changes_needed", "summary": "Already fixed on main"}),
-            ),
-        )
-        .await,
-    );
-    assert_eq!(proposal.state, ProposalState::Applied);
-    assert_eq!(
-        server_state.work_db.get_execution(&execution_id).unwrap().status,
-        boss_protocol::ExecutionStatus::Completed
-    );
-    assert_eq!(
-        task_status(&server_state, &work_item_id),
-        boss_protocol::TaskStatus::Done
-    );
-}
+#[path = "no_op_declarations.rs"]
+mod no_op_declarations;
 
 /// A mandated stop fails visibly, without bypassing a check or cycling workers.
 #[tokio::test]

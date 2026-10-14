@@ -669,6 +669,61 @@ impl WorkDb {
         }
     }
 
+    /// Identify the applied declaration that currently authorizes a no-op.
+    /// Callers must revalidate this id in the terminal write transaction.
+    pub fn current_no_op_declaration_id(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT p.id FROM worker_proposals p JOIN work_executions e ON e.id = p.execution_id
+             WHERE e.id = ?1 AND e.run_done_outcome = 'no_changes_needed'
+               AND p.kind = 'run_done' AND p.state = 'applied'
+             ORDER BY p.rowid DESC LIMIT 1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Consume a refused `no-changes-needed` declaration: clear the durable
+    /// stamp so a later Stop boundary cannot re-accept it without the worker
+    /// declaring again, and supersede the applied `run_done` proposal that
+    /// made it. Superseding also renames the proposal's idempotency key, so
+    /// a fresh declaration with an identical payload is a new submission
+    /// that re-stamps, not a replay that returns the dead row. Only a
+    /// `no_changes_needed` stamp is touched — a `delivered`/`blocked`
+    /// declaration never is. Returns whether a stamp was cleared.
+    pub fn clear_no_changes_needed_declaration(&self, execution_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cleared = tx.execute(
+            "UPDATE work_executions SET run_done_declared_at = NULL, run_done_outcome = NULL \
+             WHERE id = ?1 AND run_done_outcome = ?2",
+            params![execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded.as_str()],
+        )? > 0;
+        if cleared {
+            tx.execute(
+                "UPDATE worker_proposals
+                 SET state = ?2, decided_by = ?3, decided_at = ?4,
+                     decision_reason = 'no-changes-needed declaration refused by the no-op guard; declare again',
+                     idempotency_key = idempotency_key || '#refused-' || id
+                 WHERE id = (SELECT id FROM worker_proposals
+                             WHERE execution_id = ?1 AND kind = ?5 AND state = ?6
+                             ORDER BY rowid DESC LIMIT 1)",
+                params![
+                    execution_id,
+                    ProposalState::Superseded.as_str(),
+                    boss_protocol::ProposalDecider::Policy.as_str(),
+                    now_string(),
+                    ProposalKind::RunDone.as_str(),
+                    ProposalState::Applied.as_str(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(cleared)
+    }
+
     /// Stamp the backstop's "this run ended without ever declaring" marker.
     pub fn mark_execution_run_undeclared(&self, execution_id: &str) -> Result<()> {
         let conn = self.connect()?;

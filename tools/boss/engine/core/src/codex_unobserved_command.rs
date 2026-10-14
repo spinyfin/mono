@@ -16,7 +16,7 @@
 //! `app/worker_events.rs` stages it here (mirroring
 //! [`crate::proposal_channel_error`]'s staging pattern); `on_stop_inner`
 //! consumes the staged state to file an attention item AND to refuse the
-//! worker's `NO_CHANGES_NEEDED` ("validation passed, nothing to do") claim
+//! worker's `no-changes-needed` ("validation passed, nothing to do") claim
 //! for the rest of the run — an unobserved command means Boss never actually
 //! confirmed that command's outcome, so a downstream claim resting on it is
 //! unconfirmed, not verified.
@@ -43,7 +43,7 @@ pub const UNOBSERVED_COMMAND_OVERFLOW_ATTENTION_KIND: &str = "codex_unobserved_c
 /// distinct abandoned commands across an entire multi-turn Codex session is
 /// already a deeply pathological run, so the original sizing holds — what
 /// was wrong (see [`UnobservedCommandTracker`]) was never this cap, it was
-/// letting the list's mere non-emptiness gate `NO_CHANGES_NEEDED` forever.
+/// letting the list's mere non-emptiness gate `no-changes-needed` forever.
 /// Hitting this cap no longer degrades that gate at all (`unresolved` below
 /// is tracked independently of it) — it only stops growing the audit trail,
 /// and does so loudly: [`RecordOutcome::CapExceeded`] is logged at `error`
@@ -66,7 +66,7 @@ pub enum RecordOutcome {
     /// abandons a command with identical text to one already recorded. Does
     /// NOT arm the completion-gate signal: a redelivered notification for an
     /// abandonment the gate has already consumed must not spuriously refuse
-    /// a later, genuinely clean turn's `NO_CHANGES_NEEDED` claim. The
+    /// a later, genuinely clean turn's `no-changes-needed` claim. The
     /// trade-off this accepts: a command abandoned again on a later turn,
     /// using text identical to an earlier abandonment, will not re-arm the
     /// gate either — the audit trail cannot distinguish "redelivery" from
@@ -75,7 +75,7 @@ pub enum RecordOutcome {
     /// [`MAX_COMMANDS_PER_EXECUTION`] was already reached; the command is
     /// NOT added to the audit trail. The completion-gate signal
     /// (`unresolved`) is still set — overflowing the audit trail must never
-    /// silently weaken the `NO_CHANGES_NEEDED` refusal it feeds.
+    /// silently weaken the `no-changes-needed` refusal it feeds.
     CapExceeded,
 }
 
@@ -104,7 +104,7 @@ struct ExecutionState {
 /// `WorkerEvent::Notification` carries
 /// [`boss_engine_driver::codex::UNOBSERVED_COMMAND_MARKER`]; read by
 /// [`crate::completion::WorkerCompletionHandler`]'s unobserved-command pass
-/// (the permanent audit trail, via [`Self::list`]) and its `NO_CHANGES_NEEDED`
+/// (the permanent audit trail, via [`Self::list`]) and its `no-changes-needed`
 /// refusal gate (the self-clearing signal, via [`Self::consume_unresolved`]).
 ///
 /// **Why this is two views, not [`crate::proposal_channel_error::ProposalChannelErrorTracker`]'s
@@ -119,13 +119,13 @@ struct ExecutionState {
 /// Under a session with many `Stop`s it stopped being the same question: an
 /// abandoned command staged on turn 1 made `has_any` (the old, single-view
 /// API this replaced) permanently `true`, so it refused *every* later
-/// `NO_CHANGES_NEEDED` claim for the rest of the run — turns 2..N included,
+/// `no-changes-needed` claim for the rest of the run — turns 2..N included,
 /// however cleanly they completed, and with no way for the run to ever
 /// recover trust.
 ///
 /// The corrected question the gate must ask is scoped to what it can
 /// actually vouch for: "has this run left a command unobserved *since the
-/// gate last acted on that fact*?" The first `NO_CHANGES_NEEDED` claim after
+/// gate last acted on that fact*?" The first `no-changes-needed` claim after
 /// an abandonment is still correctly refused — Boss cannot confirm that
 /// command's outcome, so it falls through to the normal produce-a-PR nudge,
 /// exactly as before. What no longer happens is every *subsequent*,
@@ -156,7 +156,7 @@ impl UnobservedCommandTracker {
     /// it. Deliberately does NOT arm the gate on [`RecordOutcome::Duplicate`]:
     /// the audit trail never clears, so a redelivered notification for an
     /// abandonment the gate already consumed would otherwise spuriously
-    /// refuse a later, genuinely clean turn's `NO_CHANGES_NEEDED` claim —
+    /// refuse a later, genuinely clean turn's `no-changes-needed` claim —
     /// see [`RecordOutcome::Duplicate`]'s doc for the trade-off this accepts.
     /// Appends to the capped audit trail unless the command text is already
     /// present or [`MAX_COMMANDS_PER_EXECUTION`] is reached.
@@ -207,7 +207,7 @@ impl UnobservedCommandTracker {
     /// Read-and-clear: has an abandoned command been staged for
     /// `execution_id` since the last call to this method (or since the
     /// execution's first staged command, if this is the first call)? This is
-    /// the `NO_CHANGES_NEEDED` refusal gate's signal — see the type-level
+    /// the `no-changes-needed` refusal gate's signal — see the type-level
     /// doc for why it must self-clear rather than latch for the life of the
     /// run.
     ///
@@ -217,9 +217,10 @@ impl UnobservedCommandTracker {
     /// notification (`WorkerEvent::Notification` carrying
     /// `UNOBSERVED_COMMAND_MARKER`), not an ongoing per-turn health signal —
     /// there is no "this turn's commands all completed cleanly" fact
-    /// available to gate the clear on. The consequence: a worker only has to
-    /// re-emit the identical `NO_CHANGES_NEEDED` claim at the next `Stop` to
-    /// get it accepted, with Boss no better informed about the original
+    /// available to gate the clear on. The consequence: a refusal also
+    /// consumes the worker's `no-changes-needed` declaration, so the worker
+    /// only has to declare again (a fresh `propose done`) to get the claim
+    /// accepted, with Boss no better informed about the original
     /// abandoned command's outcome than at the first refusal. That is a
     /// weaker guarantee than "the run demonstrated it recovered," but it is
     /// still strictly better than the permanent latch this replaced (see
@@ -250,7 +251,7 @@ crate::register_counter!(
     CODEX_UNOBSERVED_COMMAND_OVERFLOW,
     "codex.unobserved_command_overflow",
     "A Codex execution abandoned more than MAX_COMMANDS_PER_EXECUTION distinct commands in one \
-     run; the audit trail stopped growing (the NO_CHANGES_NEEDED refusal gate is unaffected — it \
+     run; the audit trail stopped growing (the no-changes-needed refusal gate is unaffected — it \
      does not depend on this cap).",
 );
 
@@ -318,7 +319,7 @@ mod tests {
         assert_eq!(tracker.record("exec_1", "cmd-overflow"), RecordOutcome::CapExceeded);
         assert!(
             tracker.consume_unresolved("exec_1"),
-            "an audit-trail overflow must not silently weaken the NO_CHANGES_NEEDED refusal gate"
+            "an audit-trail overflow must not silently weaken the no-changes-needed refusal gate"
         );
     }
 
@@ -338,7 +339,7 @@ mod tests {
             !tracker.consume_unresolved("exec_1"),
             "a second read with nothing new staged since must NOT re-refuse — this is exactly \
              the multi-turn-session bug: a command abandoned once must not permanently refuse \
-             every later NO_CHANGES_NEEDED claim for the rest of the run"
+             every later no-changes-needed claim for the rest of the run"
         );
         assert!(
             !tracker.consume_unresolved("exec_2"),
@@ -362,7 +363,7 @@ mod tests {
         assert!(
             !tracker.consume_unresolved("exec_1"),
             "a duplicate hook delivery for an already-consumed abandonment must not spuriously \
-             refuse a later, genuinely clean turn's NO_CHANGES_NEEDED claim"
+             refuse a later, genuinely clean turn's no-changes-needed claim"
         );
     }
 

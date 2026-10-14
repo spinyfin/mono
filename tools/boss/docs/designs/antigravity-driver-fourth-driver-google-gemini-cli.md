@@ -202,7 +202,7 @@ One requirement is stated more strongly than Grok's: **an unrecognised verdict, 
 
 ### Soft-deny detection (Risk 3b)
 
-A worker that soft-denies its tools and exits 0 produces a clean turn boundary on a run that accomplished nothing. Boss already has a pattern for exactly this class of lie, built for Codex: `UNOBSERVED_COMMAND_MARKER` is emitted on the progress stream ahead of the `Stop` it precedes, staged by the event dispatcher, and consumed by `on_stop_inner` to file an attention item **and** to refuse the worker's `NO_CHANGES_NEEDED` claim for the rest of the run (`codex_unobserved_command.rs`).
+A worker that soft-denies its tools and exits 0 produces a clean turn boundary on a run that accomplished nothing. Boss already has a pattern for exactly this class of lie, built for Codex: `UNOBSERVED_COMMAND_MARKER` is emitted on the progress stream ahead of the `Stop` it precedes, staged by the event dispatcher, and consumed by `on_stop_inner` to file an attention item **and** to refuse the worker's `no-changes-needed` `run_done` declaration (the retired `NO_CHANGES_NEEDED` text marker's successor), consuming it so the worker must declare again (`codex_unobserved_command.rs`).
 
 `agy`'s soft-deny detection reuses that shape rather than inventing one: a marker-carrying `Notification` from the progress session, staged and consumed by the same mechanism. Whether the interactive path soft-denies the way headless does is itself a characterisation question.
 
@@ -381,7 +381,7 @@ Implement `write_permission_config` to render, into the per-run `HOME`, the `too
 
 ### Soft-deny and no-op-worker detection
 
-Detect the Risk 3b failure — an ungranted tool soft-denied while the turn boundary still reports clean — by reusing Boss's existing pattern rather than inventing one: emit a marker-carrying `Notification` from the progress session ahead of the `Stop` it precedes, stage it in the event dispatcher, and consume it in `on_stop_inner` to file an attention item and refuse the worker's `NO_CHANGES_NEEDED` claim for the rest of the run, exactly as `codex_unobserved_command.rs` does. Includes the bounded audit trail and overflow attention that pattern already defines.
+Detect the Risk 3b failure — an ungranted tool soft-denied while the turn boundary still reports clean — by reusing Boss's existing pattern rather than inventing one: emit a marker-carrying `Notification` from the progress session ahead of the `Stop` it precedes, stage it in the event dispatcher, and consume it in `on_stop_inner` to file an attention item and refuse the worker's `no-changes-needed` `run_done` declaration (marker retired; now the run_done declaration), consuming it so the worker must declare again, exactly as `codex_unobserved_command.rs` does. Includes the bounded audit trail and overflow attention that pattern already defines.
 
 - **Effort:** medium
 - **Dependencies:** Progress normaliser and conversation-identity filtering; Permission config rendering per worker kind
