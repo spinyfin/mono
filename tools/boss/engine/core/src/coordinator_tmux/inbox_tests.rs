@@ -49,7 +49,7 @@ fn callback_addresses_preserve_separators_and_escape_path_data() {
 
 #[tokio::test]
 async fn only_a_correlated_delivery_receipt_succeeds() {
-    for status in ["delivered", "held", "denied", "expired", "refused", "dropped"] {
+    for status in ["delivered", "denied", "expired", "refused", "dropped"] {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.path().join("coordinator.sock");
@@ -88,6 +88,94 @@ async fn only_a_correlated_delivery_receipt_succeeds() {
             "receipt socket must be removed"
         );
     }
+}
+
+/// Connects to the receipt address in the delivered frame and writes `lines`.
+async fn answer_with(listener: UnixListener, statuses: &[&str], junk_first: bool) {
+    let (stream, _) = listener.accept().await.unwrap();
+    let line = BufReader::new(stream).lines().next_line().await.unwrap().unwrap();
+    let frame: Value = serde_json::from_str(&line).unwrap();
+    let reply = frame["from"].as_str().unwrap().strip_prefix("uds:").unwrap().to_owned();
+    if junk_first {
+        // A stray connection that sends garbage then closes must not fail delivery.
+        let mut stray = UnixStream::connect(&reply).await.unwrap();
+        stray.write_all(b"not json\n{\"partial\":").await.unwrap();
+        drop(stray);
+    }
+    for status in statuses {
+        let mut stream = UnixStream::connect(&reply).await.unwrap();
+        let receipt = json!({"action": "peer_message_status", "orig_msg_id": frame["msg_id"], "status": status});
+        stream.write_all(format!("{receipt}\n").as_bytes()).await.unwrap();
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn private_inbox() -> (tempfile::TempDir, PathBuf, UnixListener, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.path().join("coordinator.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let transcript = directory.path().join("transcript.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+    (directory, path, listener, transcript)
+}
+
+#[tokio::test]
+async fn held_is_pending_until_a_delivered_receipt_arrives() {
+    let (_directory, path, listener, transcript) = private_inbox();
+    let (result, ()) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            deliver(
+                &path,
+                std::process::id() as libc::pid_t,
+                "session",
+                "prompt",
+                &transcript
+            )
+        ),
+        answer_with(listener, &["held", "delivered"], false)
+    );
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn held_alone_never_counts_as_failure() {
+    let (_directory, path, listener, transcript) = private_inbox();
+    let (result, ()) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_millis(700),
+            deliver(
+                &path,
+                std::process::id() as libc::pid_t,
+                "session",
+                "prompt",
+                &transcript
+            )
+        ),
+        answer_with(listener, &["held"], false)
+    );
+    assert!(result.is_err(), "held must stay pending, got {result:?}");
+}
+
+#[tokio::test]
+async fn a_malformed_receipt_line_does_not_abort_delivery() {
+    let (_directory, path, listener, transcript) = private_inbox();
+    let (result, ()) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            deliver(
+                &path,
+                std::process::id() as libc::pid_t,
+                "session",
+                "prompt",
+                &transcript
+            )
+        ),
+        answer_with(listener, &["delivered"], true)
+    );
+    result.unwrap().unwrap();
 }
 
 #[tokio::test]

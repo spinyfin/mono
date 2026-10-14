@@ -345,3 +345,81 @@ async fn validate_and_send_wait_for_the_lifecycle_lock_so_a_replacement_never_ge
     assert!(request.await.is_err());
     assert!(send_keys_calls(&server.calls()).is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_turn_that_ends_without_a_write_replaces_before_the_deadline() {
+    struct TurnEndsAfterDelivery;
+    #[async_trait::async_trait]
+    impl crate::coordinator_tmux::inbox::HandoffDelivery for TurnEndsAfterDelivery {
+        async fn deliver(&self, _: &Tmux, _: &CoordinatorTmuxRecord, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn turn_ended(&self, _: &Tmux, _: &CoordinatorTmuxRecord) {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+    let (db, tmux, _server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let lock = tokio::sync::Mutex::new(());
+    let written = Notify::new();
+    let started = tokio::time::Instant::now();
+    let fresh = crate::coordinator_tmux::reset_handoff::request_and_wait(
+        HandoffRequest::builder()
+            .work_db(&db)
+            .tmux(&tmux)
+            .lifecycle_lock(&lock)
+            .written(&written)
+            .expected_token("token")
+            .force(false)
+            .timeout(crate::coordinator_tmux::reset_handoff::HANDOFF_TIMEOUT)
+            .delivery(&TurnEndsAfterDelivery)
+            .build(),
+    )
+    .await
+    .unwrap();
+    assert!(!fresh, "no handoff was written, so the missing-context path applies");
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn delivery_failure_leaves_the_session_and_reports_a_forceable_error() {
+    struct Refuses;
+    #[async_trait::async_trait]
+    impl crate::coordinator_tmux::inbox::HandoffDelivery for Refuses {
+        async fn deliver(&self, _: &Tmux, _: &CoordinatorTmuxRecord, _: &str) -> Result<()> {
+            bail!("held by inbound policy")
+        }
+    }
+    let (db, tmux, server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let lock = tokio::sync::Mutex::new(());
+    let written = Notify::new();
+    let request = |force| {
+        crate::coordinator_tmux::reset_handoff::request_and_wait(
+            HandoffRequest::builder()
+                .work_db(&db)
+                .tmux(&tmux)
+                .lifecycle_lock(&lock)
+                .written(&written)
+                .expected_token("token")
+                .force(force)
+                .timeout(Duration::from_millis(100))
+                .delivery(&Refuses)
+                .build(),
+        )
+    };
+    let error = request(false).await.unwrap_err().to_string();
+    assert!(
+        error.starts_with(crate::coordinator_tmux::reset_handoff::DELIVERY_FAILED_PREFIX),
+        "{error}"
+    );
+    assert!(
+        !server
+            .calls()
+            .iter()
+            .any(|c| c.get(2).map(String::as_str) == Some("kill-session")),
+        "a failed delivery must leave the session running"
+    );
+    // The force path never consults delivery, so the operator is not stuck.
+    assert!(!request(true).await.unwrap());
+}

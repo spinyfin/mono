@@ -734,9 +734,16 @@ impl CoordinatorReset {
                 }
             };
             if !fresh_handoff && !force_without_handoff {
-                send_response(&sink, &request_id, FrontendEvent::Error {
-                    message: "Coordinator reset: no fresh handoff was written within 30s. Restarting with potentially missing context.".into(),
-                });
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::Error {
+                        message: format!(
+                            "Coordinator reset: no fresh handoff was written within {}s (or the coordinator's turn ended without one). Restarting with potentially missing context.",
+                            server_state.coordinator_handoff_timeout.as_secs()
+                        ),
+                    },
+                );
             }
             let _guard = server_state.coordinator_tmux_lock.lock().await;
             let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;

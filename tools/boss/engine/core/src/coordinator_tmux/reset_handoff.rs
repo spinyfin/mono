@@ -3,6 +3,14 @@ use super::*;
 
 pub(crate) const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Leads the error returned when the request could not be delivered. The app
+/// matches this text to keep the reset UI alive and offer a forced reset.
+pub(crate) const DELIVERY_FAILED_PREFIX: &str = "coordinator did not receive the handoff request";
+
+/// The `[Boss reset request]` marker lets the coordinator recognise this as
+/// engine-originated despite Claude attributing it to another session.
+const HANDOFF_REQUEST_PROMPT: &str = "[Boss reset request] Boss is about to reset this session at the operator's request. Write your handoff now with `boss handoff write -`, then stop.";
+
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub(crate) struct HandoffRequest<'a> {
@@ -87,16 +95,21 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
         HandoffState::Present(h) => h.write_id,
         _ => String::new(),
     };
-    delivery.deliver(tmux, &record,
-        "Boss is about to reset this session at the operator's request. Write your handoff now with `boss handoff write -`, then stop."
-    ).await.map_err(|error| {
-        audit::record_event("coordinator_handoff_delivery_failed", &json!({
-            "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(),
-            "spawn_token": expected_token, "elapsed_ms": started.elapsed().as_millis(),
-            "error": format!("{error:#}"),
-        }));
-        error
-    })?;
+    delivery
+        .deliver(tmux, &record, HANDOFF_REQUEST_PROMPT)
+        .await
+        .map_err(|error| {
+            audit::record_event(
+                "coordinator_handoff_delivery_failed",
+                &json!({
+                    "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(),
+                    "spawn_token": expected_token, "elapsed_ms": started.elapsed().as_millis(),
+                    "error": format!("{error:#}"),
+                }),
+            );
+            // The session is untouched, so the operator may still force the reset.
+            anyhow!("{DELIVERY_FAILED_PREFIX}: {error:#}. The coordinator session is still running.")
+        })?;
     audit::record_event(
         "coordinator_handoff_requested",
         &json!({
@@ -111,25 +124,42 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
             "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(), "spawn_token": expected_token, "timeout_ms": timeout.as_millis(),
         }),
     );
-    let result = tokio::time::timeout(timeout, async {
+    let wait_for_write = async {
         loop {
             // Register before checking storage so a write between the check
             // and await cannot be lost, including concurrent reset waiters.
             let notified = written.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if matches!(work_db.coordinator_handoff_state(), HandoffState::Present(h)
-                if h.writer_spawn_token == expected_token && h.written_at >= requested_at && h.write_id != previous_write)
-            {
+            if fresh_write(work_db, expected_token, requested_at, &previous_write) {
                 break;
             }
             notified.await;
         }
-    })
-    .await;
-    if result.is_err() {
+    };
+    // The turn is the one the delivered request started, so idleness from
+    // before delivery cannot end the wait early.
+    let outcome = tokio::select! {
+        () = wait_for_write => GraceOutcome::Written,
+        () = delivery.turn_ended(tmux, &record) => {
+            if fresh_write(work_db, expected_token, requested_at, &previous_write) {
+                GraceOutcome::Written
+            } else {
+                GraceOutcome::TurnEndedWithoutWrite
+            }
+        }
+        () = tokio::time::sleep(timeout) => GraceOutcome::Expired,
+    };
+    if outcome != GraceOutcome::Written {
+        let (event, why) = match outcome {
+            GraceOutcome::TurnEndedWithoutWrite => (
+                "coordinator_handoff_turn_ended_without_write",
+                "the coordinator's turn ended without writing a handoff",
+            ),
+            _ => ("coordinator_handoff_timeout", "grace period expired"),
+        };
         audit::record_event(
-            "coordinator_handoff_timeout",
+            event,
             &json!({
                 "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(), "spawn_token": expected_token, "requested_at": requested_at,
             }),
@@ -137,7 +167,7 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
         tracing::error!(
             spawn_token = expected_token,
             timeout_secs = timeout.as_secs(),
-            "coordinator reset proceeding WITHOUT a fresh handoff: grace period expired"
+            "coordinator reset proceeding WITHOUT a fresh handoff: {why}"
         );
         return Ok(false);
     }
@@ -148,4 +178,16 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
         }),
     );
     Ok(true)
+}
+
+#[derive(PartialEq, Eq)]
+enum GraceOutcome {
+    Written,
+    TurnEndedWithoutWrite,
+    Expired,
+}
+
+fn fresh_write(work_db: &WorkDb, expected_token: &str, requested_at: i64, previous_write: &str) -> bool {
+    matches!(work_db.coordinator_handoff_state(), HandoffState::Present(h)
+        if h.writer_spawn_token == expected_token && h.written_at >= requested_at && h.write_id != previous_write)
 }

@@ -21,7 +21,28 @@ mod tests;
 #[async_trait::async_trait]
 pub(crate) trait HandoffDelivery: Send + Sync {
     async fn deliver(&self, tmux: &Tmux, record: &CoordinatorTmuxRecord, prompt: &str) -> Result<()>;
+
+    /// Resolves once the turn that began with the delivered request has ended.
+    /// Implementations that cannot observe turn boundaries never resolve, so
+    /// the grace deadline remains the only exit besides a fresh write.
+    async fn turn_ended(&self, _tmux: &Tmux, _record: &CoordinatorTmuxRecord) {
+        std::future::pending::<()>().await
+    }
 }
+
+/// Bound on registration lookup, connect and delivery confirmation. Delivery
+/// has its own deadline and never consumes the handoff grace period. It is
+/// deliberately generous: a coordinator mid-turn may hold the message until
+/// the turn reaches an input boundary.
+pub const DELIVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Interval at which the live registration is polled for turn boundaries.
+const TURN_POLL: Duration = Duration::from_millis(250);
+
+/// `--settings` JSON the production coordinator launches with. Delivery
+/// confirms only when the coordinator accepts cross-session input, so this is
+/// set explicitly rather than inherited from user or default configuration.
+pub const COORDINATOR_INBOUND_SETTINGS: &str = r#"{"crossSessionInbound":"accept"}"#;
 
 pub(crate) struct ClaudeInbox;
 
@@ -35,24 +56,36 @@ struct Registration {
     cwd: PathBuf,
 }
 
+/// Returns the pane pid, the Claude config directory, the registration, and
+/// the session's reported `status` (`idle` between turns).
+async fn read_registration(
+    tmux: &Tmux,
+    record: &CoordinatorTmuxRecord,
+) -> Result<(libc::pid_t, PathBuf, Registration, Option<String>)> {
+    let pid = super::pane_pid(tmux, record).await?;
+    let config = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .context("Claude config directory is unavailable")?;
+    let bytes = tokio::fs::read(config.join("sessions").join(format!("{pid}.json")))
+        .await
+        .context("reading the live coordinator's Claude inbox registration")?;
+    let registration: Registration =
+        serde_json::from_slice(&bytes).context("coordinator does not advertise a supported local inbox")?;
+    let status = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|value| value["status"].as_str().map(str::to_owned));
+    if registration.pid != pid || registration.peer_protocol != 1 || registration.session_id.is_empty() {
+        bail!("coordinator inbox registration does not match the live process or supported protocol");
+    }
+    Ok((pid, config, registration, status))
+}
+
 #[async_trait::async_trait]
 impl HandoffDelivery for ClaudeInbox {
     async fn deliver(&self, tmux: &Tmux, record: &CoordinatorTmuxRecord, prompt: &str) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let pid = super::pane_pid(tmux, record).await?;
-            let config = std::env::var_os("CLAUDE_CONFIG_DIR")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
-                .context("Claude config directory is unavailable")?;
-            let registration: Registration = serde_json::from_slice(
-                &tokio::fs::read(config.join("sessions").join(format!("{pid}.json")))
-                    .await
-                    .context("reading the live coordinator's Claude inbox registration")?,
-            )
-            .context("coordinator does not advertise a supported local inbox")?;
-            if registration.pid != pid || registration.peer_protocol != 1 || registration.session_id.is_empty() {
-                bail!("coordinator inbox registration does not match the live process or supported protocol");
-            }
+        tokio::time::timeout(DELIVERY_TIMEOUT, async {
+            let (pid, config, registration, _) = read_registration(tmux, record).await?;
             deliver(
                 &registration.messaging_socket_path,
                 pid,
@@ -64,7 +97,29 @@ impl HandoffDelivery for ClaudeInbox {
             .await
         })
         .await
-        .context("coordinator prompt delivery was not acknowledged within 1s; grace period has not started")?
+        .with_context(|| {
+            format!(
+                "coordinator prompt delivery was not acknowledged within {}s; grace period has not started",
+                DELIVERY_TIMEOUT.as_secs()
+            )
+        })?
+    }
+
+    async fn turn_ended(&self, tmux: &Tmux, record: &CoordinatorTmuxRecord) {
+        // The request is delivered at an input boundary, so the registration
+        // goes busy for the turn it starts and returns to idle when it ends.
+        // Unreadable registrations are treated as "not yet observed".
+        let mut saw_busy = false;
+        loop {
+            if let Ok((_, _, _, status)) = read_registration(tmux, record).await {
+                match status.as_deref() {
+                    Some("idle") if saw_busy => return,
+                    Some("idle") | None => {}
+                    Some(_) => saw_busy = true,
+                }
+            }
+            tokio::time::sleep(TURN_POLL).await;
+        }
     }
 }
 
@@ -72,10 +127,13 @@ struct ReceiptSocket(PathBuf);
 
 fn receipt_address(path: &Path) -> Result<String> {
     let path = path.to_str().context("Claude inbox paths must be UTF-8")?;
-    let encoded = crate::driver::grok::percent_encode_path_component(path)
-        .replace("%2F", "/")
-        .replace("%3A", ":")
-        .replace('~', "%7E");
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'/' | b':' => encoded.push(byte as char),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
     Ok(format!("uds:{encoded}"))
 }
 
@@ -164,9 +222,17 @@ async fn wait_for_input_record(file: tokio::fs::File, message_id: &str, prompt: 
     }
 }
 
+/// Waits for a correlated terminal receipt. `held` is pending, not failure:
+/// the coordinator may release a message at its next input boundary, and the
+/// transcript or a later `delivered` receipt decides. Stray connections and
+/// unparseable lines are skipped; only an explicit, correlated non-delivery
+/// status fails.
 async fn wait_for_receipt(listener: UnixListener, pid: libc::pid_t, message_id: &str) -> Result<()> {
     loop {
-        let (receipt, _) = listener.accept().await?;
+        let Ok((receipt, _)) = listener.accept().await else {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        };
         // On macOS LOCAL_PEERPID may be unavailable after the sender closes
         // its one-shot connection. The private callback socket and correlated,
         // unpredictable message ID still authenticate that receipt. Reject a
@@ -176,14 +242,16 @@ async fn wait_for_receipt(listener: UnixListener, pid: libc::pid_t, message_id: 
             continue;
         }
         let mut lines = BufReader::new(receipt).lines();
-        while let Some(line) = lines.next_line().await? {
-            let value: Value = serde_json::from_str(&line)?;
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if value["action"] != "peer_message_status" || value["orig_msg_id"] != message_id {
                 continue;
             }
             match value["status"].as_str() {
                 Some("delivered") => return Ok(()),
-                Some("held" | "denied" | "expired" | "refused" | "dropped") => {
+                Some("denied" | "expired" | "refused" | "dropped") => {
                     bail!("coordinator prompt was not delivered: {}", value["status"])
                 }
                 _ => continue,

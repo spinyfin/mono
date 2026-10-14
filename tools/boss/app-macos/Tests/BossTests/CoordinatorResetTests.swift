@@ -28,7 +28,7 @@ final class CoordinatorResetTests: XCTestCase {
         XCTAssertTrue(model.coordinatorResetWaiting)
         XCTAssertEqual(model.pendingCoordinatorReset?.token, "original")
         XCTAssertEqual(requests.last?["force_without_handoff"] as? Bool, false)
-        model.applyEventForTest(.error(message: "recreate_coordinator: coordinator did not write a handoff within 120s"))
+        model.applyEventForTest(.error(message: "recreate_coordinator: coordinator did not receive the handoff request: delivery timed out. The coordinator session is still running."))
         XCTAssertFalse(model.coordinatorResetWaiting)
         XCTAssertTrue(model.coordinatorResetTimedOut)
         XCTAssertNil(model.workErrorMessage)
@@ -61,7 +61,7 @@ final class CoordinatorResetTests: XCTestCase {
         model.confirmCoordinatorModelRecreate()
         XCTAssertTrue(model.coordinatorResetWaiting)
         XCTAssertEqual(model.pendingCoordinatorReset?.reason, .modelMismatch)
-        model.applyEventForTest(.error(message: "recreate_coordinator: coordinator did not write a handoff within 120s"))
+        model.applyEventForTest(.error(message: "recreate_coordinator: coordinator did not receive the handoff request: delivery timed out. The coordinator session is still running."))
         model.forceCoordinatorReset()
         XCTAssertEqual(model.pendingCoordinatorReset?.reason, .modelMismatch)
     }

@@ -94,7 +94,7 @@ async fn installed_claude_acknowledges_a_separate_inbox_message() -> Result<()> 
             "--setting-sources",
             "",
             "--settings",
-            "{\"crossSessionInbound\":\"accept\"}",
+            boss_engine::COORDINATOR_INBOUND_SETTINGS,
         ])
         .current_dir(root.path())
         .env("CLAUDE_CONFIG_DIR", &config)
@@ -147,7 +147,7 @@ async fn installed_claude_acknowledges_a_separate_inbox_message() -> Result<()> 
     let transcript = fixture_transcript(&config, &registration)?;
     let delivered_at = Instant::now();
     tokio::time::timeout(
-        Duration::from_secs(1),
+        boss_engine::COORDINATOR_DELIVERY_TIMEOUT,
         boss_engine::deliver_coordinator_handoff_to_inbox(
             &socket,
             pid as libc::pid_t,
@@ -157,7 +157,7 @@ async fn installed_claude_acknowledges_a_separate_inbox_message() -> Result<()> 
         ),
     )
     .await
-    .with_context(|| format!("native Claude did not confirm delivery within one second; registration={registration}; errors={}; inputs={}",
+    .with_context(|| format!("native Claude did not confirm delivery within the production delivery deadline; registration={registration}; errors={}; inputs={}",
         std::fs::read_to_string(&errors).unwrap_or_default(),
         std::fs::read_to_string(&transcript).unwrap_or_default().lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|record| record["type"] == "user").map(|record| record.to_string()).collect::<Vec<_>>().join("\n")))??;
     eprintln!(

@@ -75,7 +75,7 @@ async fn native_terminal_delivers_prompt_without_submitting_or_erasing_draft() -
             "--setting-sources",
             "",
             "--settings",
-            "{\"crossSessionInbound\":\"accept\"}",
+            boss_engine::COORDINATOR_INBOUND_SETTINGS,
             "fixture startup",
         ])
         .output()
@@ -117,7 +117,7 @@ async fn native_terminal_delivers_prompt_without_submitting_or_erasing_draft() -
     let transcript = fixture_transcript(&config, &registration)?;
     let delivery_started = Instant::now();
     tokio::time::timeout(
-        Duration::from_secs(1),
+        boss_engine::COORDINATOR_DELIVERY_TIMEOUT,
         boss_engine::deliver_coordinator_handoff_to_inbox(
             Path::new(registration["messagingSocketPath"].as_str().unwrap()),
             registration["pid"].as_i64().unwrap() as libc::pid_t,
@@ -127,7 +127,7 @@ async fn native_terminal_delivers_prompt_without_submitting_or_erasing_draft() -
         ),
     )
     .await
-    .context("terminal inbox delivery exceeded one second")??;
+    .context("terminal inbox delivery exceeded the production delivery deadline")??;
     eprintln!(
         "native terminal with unsent draft: prompt confirmed in {}ms",
         delivery_started.elapsed().as_millis()

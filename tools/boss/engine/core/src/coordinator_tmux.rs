@@ -1045,8 +1045,12 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
     // same shape worker panes use for `.claude/initial-prompt.txt` — so the
     // incoming session consumes it on its first turn with no pane injection
     // and no dependence on it choosing to read a file.
+    // Reset requests reach the coordinator through Claude's local inbox, which
+    // only delivers when cross-session input is accepted. Set it explicitly
+    // rather than inheriting whatever user or default configuration says.
+    let quoted_inbound = boss_ssh_transport::shell_quote(inbox::COORDINATOR_INBOUND_SETTINGS);
     let command = format!(
-        "{}unset ANTHROPIC_API_KEY; exec claude --model {quoted_model} --permission-mode auto {initial_prompt}",
+        "{}unset ANTHROPIC_API_KEY; exec claude --model {quoted_model} --permission-mode auto --settings {quoted_inbound} {initial_prompt}",
         crate::runner::pane_spawn::path_prepend_clause("BOSS_BIN_DIR")
     );
     crate::tmux_session_options::prepare_server(tmux)
@@ -2358,6 +2362,11 @@ mod tests {
                 .any(|arg| arg.contains("exec claude --model") && arg.contains("sonnet")),
             "the replacement must launch the current claude binary with the requested model, got {new_session:?}"
         );
+        assert!(
+            new_session.iter().any(|arg| arg.contains("--settings")
+                && arg.contains(&boss_ssh_transport::shell_quote(inbox::COORDINATOR_INBOUND_SETTINGS))),
+            "the coordinator must explicitly accept cross-session input for reset delivery, got {new_session:?}"
+        );
     }
 
     #[tokio::test]
@@ -2669,7 +2678,8 @@ mod tests {
             .join(".claude")
             .join(coordinator_handoff::START_BRIEF_FILENAME);
         let expected_fragment = format!(
-            "--permission-mode auto \"$(cat {})\"",
+            "--permission-mode auto --settings {} \"$(cat {})\"",
+            boss_ssh_transport::shell_quote(inbox::COORDINATOR_INBOUND_SETTINGS),
             boss_ssh_transport::shell_quote(&brief_path.to_string_lossy())
         );
         assert!(

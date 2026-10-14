@@ -83,7 +83,7 @@ extension ChatViewModel {
     func handleCoordinatorResetError(_ message: String) -> Bool {
         guard message.hasPrefix("recreate_coordinator:"), pendingCoordinatorReset != nil else { return false }
         coordinatorResetWaiting = false
-        if message.contains("coordinator did not write a handoff within") {
+        if message.contains("coordinator did not receive the handoff request") {
             coordinatorResetTimedOut = true
             return true
         }
