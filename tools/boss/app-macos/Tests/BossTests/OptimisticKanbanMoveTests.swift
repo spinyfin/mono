@@ -323,6 +323,32 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
     }
 
+    func testTwoDisconnectedDragsKeepIndependentContinuations() {
+        let model = makeModel()
+        let first = makeTask(status: "todo")
+        let second = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [first, second]]
+        _ = model.attemptDrop(first.id, onColumn: .doing, group: nil)
+        _ = model.attemptDrop(second.id, onColumn: .doing, group: nil)
+        XCTAssertEqual(Set(model.pendingDragAdmissionChecks.keys), [first.id, second.id])
+
+        model.engine.simulateConnectedForTesting = true
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+        for task in [first, second] {
+            model.handleDispatchAdmissionEvaluated(DispatchAdmission(
+                workItemID: task.id,
+                wouldDispatch: true,
+                pause: DispatchPauseSnapshot(active: false, origin: nil, reason: nil, pausedSinceEpochS: nil, overridable: false),
+                blockers: []
+            ))
+        }
+        let moved = sent.filter { $0["type"] as? String == "move_work_item_on_board" }.compactMap { $0["id"] as? String }
+        XCTAssertEqual(Set(moved), [first.id, second.id])
+        XCTAssertEqual(moved.count, 2, "exactly one move per task")
+        XCTAssertTrue(model.pendingDragAdmissionChecks.isEmpty)
+    }
+
     func testUnrelatedDroppedRequestsPreservePendingDrag() {
         let model = makeModel()
         let task = makeTask(status: "todo")

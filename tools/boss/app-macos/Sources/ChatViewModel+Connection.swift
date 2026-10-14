@@ -6,9 +6,9 @@ import Foundation
 /// for why the banner is debounced rather than tied directly to `isConnected`.
 extension ChatViewModel {
     /// Leave the initiating sheet or gesture intact when the retry queue is full.
-    func canSubmitUserActions(_ count: Int = 1) -> Bool {
+    func canSubmitUserActions(_ count: Int = 1, describing action: String = "This action") -> Bool {
         guard engine.hasRoomForDisconnectedActions(count) else {
-            showActionNotSaved(requestKind: "This action")
+            showActionNotSaved(requestKind: action)
             return false
         }
         unsavedActionNotice = nil
@@ -56,13 +56,22 @@ extension ChatViewModel {
         refreshUnsentActions()
     }
 
+    /// The user has checked the reported uncertain outcomes. Queued and
+    /// retried actions are untouched; only the uncertainty is cleared.
+    func acknowledgeUncertainActions() {
+        engine.acknowledgeUncertainActions()
+        uncertainActionMessages.removeAll()
+        uncertainActionNotice = nil
+        showDisconnectedActionNotice()
+    }
+
     func dismissDisconnectedActions() {
         let discardingDrag = engine.hasUnsentAction(kind: "evaluate_dispatch_admission") || engine.hasUnsentAction(kind: "move_work_item_on_board")
         let discardingCoordinatorReset = engine.hasUnsentAction(kind: "recreate_coordinator")
         engine.discardUnsentActions()
         retryingDisconnectedActions = engine.hasRetriedActions
         if discardingDrag {
-            pendingDragAdmissionCheck = nil
+            pendingDragAdmissionChecks.removeAll()
             bounceBackOptimisticMoves(message: nil)
         }
         if discardingCoordinatorReset { clearCoordinatorReset() }

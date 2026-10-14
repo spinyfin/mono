@@ -336,6 +336,9 @@ final class ChatViewModel: ObservableObject {
     @Published var workErrorMessage: String?
     @Published var disconnectedActionNotice: String?
     var uncertainActionNotice: String?
+    /// One entry per drop that left actions unconfirmed; cleared only by
+    /// `acknowledgeUncertainActions`.
+    var uncertainActionMessages: [String] = []
     var unsavedActionNotice: String?
     var retryingDisconnectedActions = false
     /// Mirror of `engine.hasUnsentActions`, refreshed on connection and
@@ -848,6 +851,9 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func commonInit() {
+        commentBridge.onSubmissionRejected = { [weak self] action in
+            self?.showActionNotSaved(requestKind: action)
+        }
 
         if let rawMode = defaults.string(forKey: navigationModeDefaultsKey),
            let persistedMode = NavigationMode(rawValue: rawMode) {
@@ -1228,11 +1234,15 @@ final class ChatViewModel: ObservableObject {
     /// previous notice is replaced when a new refusal fires.
     @Published var dragRefusalNotice: DragRefusalNotice?
 
-    /// A drag-to-Doing whose `EvaluateDispatchAdmission` reply is still
-    /// in flight. Single-slot, like `dragRefusalNotice` — a second drag
-    /// landing before the first's reply arrives simply supersedes it; the
-    /// stale reply is dropped by `taskID` mismatch in the event handler.
-    var pendingDragAdmissionCheck: PendingDragAdmissionCheck?
+    /// Drag-to-Doing gestures whose `EvaluateDispatchAdmission` reply is
+    /// still in flight, keyed by task id so several drags queued during a
+    /// connection gap each keep their own continuation through Retry. A
+    /// newer drag of the same task supersedes its earlier entry.
+    var pendingDragAdmissionChecks: [String: PendingDragAdmissionCheck] = [:]
+    /// Any in-flight admission check (nil when none).
+    var pendingDragAdmissionCheck: PendingDragAdmissionCheck? { pendingDragAdmissionChecks.values.first }
+    /// Confirmations that arrived while another pause-override alert was up.
+    var queuedPauseOverrideConfirmations: [PauseOverrideConfirmation] = []
 
     /// Set once `EvaluateDispatchAdmission` reports an active, overridable
     /// pause and no other blocker — the confirmation dialog binds to this.

@@ -330,8 +330,7 @@ private struct FollowupComposer: View {
 
     private func send() {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        layer.postFollowup(body: text, for: comment)
-        text = ""
+        if layer.postFollowup(body: text, for: comment) { text = "" }
     }
 }
 

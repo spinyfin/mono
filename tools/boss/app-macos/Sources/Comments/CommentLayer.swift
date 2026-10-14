@@ -451,6 +451,9 @@ final class CommentLayer: NSObject, ObservableObject {
     func addComment(quoted: String, body: String) {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, guideVersionId == nil || !quoted.isEmpty else { return }
+        // Leave the composer (and its draft) open when the retry queue is full.
+        if backend != nil, !artifactId.isEmpty,
+           backend?.canAcceptUserSubmission(describing: "Your comment") == false { return }
 
         // Build the W3C anchor from the plain-text projection: locate the
         // selected occurrence, take the verbatim `exact` span plus ~64 chars of
@@ -809,14 +812,18 @@ final class CommentLayer: NSObject, ObservableObject {
     /// push, which `reload()` picks up, so no local mutation is needed here.
     /// Artifact-less fallback (no engine to persist to): simulates the same
     /// transition locally so that surface keeps working.
-    func postFollowup(body: String, for comment: Comment) {
+    /// Returns whether the reply was accepted; the composer keeps its text
+    /// when it was not (retry queue full).
+    @discardableResult
+    func postFollowup(body: String, for comment: Comment) -> Bool {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, comment.status == .answered else { return }
+        guard !trimmed.isEmpty, comment.status == .answered else { return false }
         if let backend, isEngineBacked {
+            guard backend.canAcceptUserSubmission(describing: "Your follow-up reply") else { return false }
             backend.postFollowup(commentId: comment.id, body: trimmed)
-            return
+            return true
         }
-        guard let index = comments.firstIndex(where: { $0.id == comment.id }) else { return }
+        guard let index = comments.firstIndex(where: { $0.id == comment.id }) else { return false }
         comments[index].threadEntries.append(
             CommentThreadEntry(
                 id: UUID().uuidString,
@@ -827,6 +834,7 @@ final class CommentLayer: NSObject, ObservableObject {
             )
         )
         comments[index].status = .awaitingFollowup
+        return true
     }
 
     // MARK: - `[Revise]` banner + chips

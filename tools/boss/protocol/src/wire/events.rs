@@ -1408,6 +1408,11 @@ pub enum FrontendEvent {
     /// well-defined "accepted, you should now wait for the socket to
     /// close" signal.
     ShutdownAccepted,
+    /// Response to [`FrontendRequest::RecreateCoordinator`] once the
+    /// replacement coordinator session exists. Carries the request's id so
+    /// the app can settle its in-flight/retry ledger; the attachment itself
+    /// is a separate engine->app request.
+    CoordinatorRecreated,
     /// Response to [`FrontendRequest::Shutdown`] when the supplied
     /// token did not match. The engine logs an audit record and keeps
     /// running. `reason` is a short stable label

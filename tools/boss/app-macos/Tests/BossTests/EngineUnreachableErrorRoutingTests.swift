@@ -148,6 +148,20 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
         XCTAssertEqual(model.disconnectedActionNotice, uncertain)
     }
 
+    func testAcknowledgeClearsUncertaintyNoticeOnly() {
+        let model = makeModel()
+        model.applyEventForTest(.retriedActionsStatus(message: "first"))
+        model.engine.sendLine(["type": "create_product", "name": "pending"])
+        model.applyEventForTest(.notConnected(requestKind: "create_product"))
+        model.acknowledgeUncertainActions()
+        XCTAssertNil(model.uncertainActionNotice)
+        XCTAssertFalse(model.disconnectedActionNotice?.contains("first") == true)
+        XCTAssertTrue(model.engine.hasUnsentActions, "queued actions are not affected by acknowledging")
+        // A later drop reports only its own actions.
+        model.applyEventForTest(.retriedActionsStatus(message: "second"))
+        XCTAssertEqual(model.uncertainActionNotice, "second")
+    }
+
     func testDiscardExplicitlyRemovesRetainedActions() {
         let model = makeModel()
         XCTAssertNil(model.engine.sendLine(["type": "create_product", "name": "discard-me"]))

@@ -540,6 +540,9 @@ struct ContentView: View {
                     Spacer()
                     Button("Retry") { model.retryDisconnectedActions() }
                         .disabled(!model.isConnected || !model.hasUnsentActions)
+                    if model.uncertainActionNotice != nil {
+                        Button("Checked") { model.acknowledgeUncertainActions() }
+                    }
                     Button("Discard") { model.dismissDisconnectedActions() }
                 }
                 .padding(8)

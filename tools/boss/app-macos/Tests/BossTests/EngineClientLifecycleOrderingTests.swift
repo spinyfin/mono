@@ -122,7 +122,7 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         XCTAssertTrue(waitUntil(5) { !model.isConnected })
         client.sendLine(["type": "create_chore", "name": "queued"])
         XCTAssertTrue(waitUntil(2) { model.hasUnsentActions })
-        XCTAssertTrue(model.disconnectedActionNotice?.contains(uncertainID) == true)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("update work item") == true)
         let second = try XCTUnwrap(server.accept(timeout: 10))
         defer { second.close() }
         XCTAssertTrue(waitUntil(5) { model.isConnected })
@@ -135,10 +135,69 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         reply.append(0x0A)
         second.sendBytes(reply)
         XCTAssertTrue(waitUntil(5) { !model.retryingDisconnectedActions })
-        XCTAssertTrue(model.disconnectedActionNotice?.contains(uncertainID) == true)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("update work item") == true)
         model.dismissDisconnectedActions()
-        XCTAssertTrue(model.disconnectedActionNotice?.contains(uncertainID) == true)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("update work item") == true)
         XCTAssertEqual(client.uncertainActionsForTesting, [uncertainID: "update_work_item"])
+    }
+
+    @MainActor
+    private func connectedModel(server: TestSocketServer, path: String) throws -> (ChatViewModel, TestSocketServer.Peer) {
+        let model = ChatViewModel(socketPath: path)
+        model.engine.onEvent = { event in
+            if case .connected = event { model.isConnected = true }
+            else { model.applyEventForTest(event) }
+        }
+        model.engine.start()
+        let peer = try XCTUnwrap(server.accept(timeout: 5))
+        XCTAssertTrue(waitUntil(5) { model.isConnected })
+        return (model, peer)
+    }
+
+    @MainActor
+    func testAcknowledgeClearsUncertaintyAndSecondDropDoesNotRelistReportedActions() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let (model, first) = try connectedModel(server: server, path: path)
+        let client = model.engine
+        defer { client.stop() }
+        client.sendLine(["type": "update_work_item", "id": "task", "patch": [:]])
+        XCTAssertNotNil(first.readLine(timeout: 5))
+        first.close()
+        XCTAssertTrue(waitUntil(5) { model.uncertainActionNotice != nil })
+        let second = try XCTUnwrap(server.accept(timeout: 10))
+        XCTAssertTrue(waitUntil(5) { model.isConnected })
+        client.sendLine(["type": "create_chore", "name": "second"])
+        XCTAssertNotNil(second.readLine(timeout: 5))
+        second.close()
+        XCTAssertTrue(waitUntil(5) { model.uncertainActionNotice?.contains("create chore") == true })
+        let notice = try XCTUnwrap(model.uncertainActionNotice)
+        XCTAssertEqual(notice.components(separatedBy: "update work item").count - 1, 1, "earlier id must not be re-listed")
+        XCTAssertFalse(notice.contains("-"), "raw ids must not be shown")
+        XCTAssertEqual(client.uncertainActionsForTesting.count, 2)
+
+        model.acknowledgeUncertainActions()
+        XCTAssertNil(model.uncertainActionNotice)
+        XCTAssertNil(model.disconnectedActionNotice)
+        XCTAssertTrue(client.uncertainActionsForTesting.isEmpty)
+    }
+
+    @MainActor
+    func testReadOnlyEvaluationDroppedBeforeReplyIsNotUncertain() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let (model, first) = try connectedModel(server: server, path: path)
+        let client = model.engine
+        defer { client.stop() }
+        client.sendEvaluateDispatchAdmission(workItemId: "task")
+        XCTAssertNotNil(first.readLine(timeout: 5))
+        first.close()
+        XCTAssertTrue(waitUntil(5) { !model.isConnected })
+        XCTAssertTrue(waitUntil(5) { client.awaitingReplyCountForTesting == 0 })
+        XCTAssertTrue(client.uncertainActionsForTesting.isEmpty)
+        XCTAssertNil(model.uncertainActionNotice)
     }
 
     func testSessionReplyWithoutDirectResponseDoesNotAwaitConfirmation() throws {

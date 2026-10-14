@@ -279,9 +279,9 @@ final class PauseOverrideConfirmationTests: XCTestCase {
                        "an undecodable admission reply must bounce the card back")
     }
 
-    // MARK: - Stale reply: superseded by a later drag
+    // MARK: - Several drags in flight
 
-    func testStaleReplyForASupersededDragIsIgnored() {
+    func testEachInFlightDragKeepsItsOwnConfirmation() {
         let model = makeModel()
         let taskA = makeTask(status: "todo", id: "task_a")
         let taskB = makeTask(status: "todo", id: "task_b")
@@ -290,13 +290,23 @@ final class PauseOverrideConfirmationTests: XCTestCase {
         _ = model.attemptDrop(taskA.id, onColumn: .doing, group: nil)
         _ = model.attemptDrop(taskB.id, onColumn: .doing, group: nil)
 
-        // A's reply arrives after B's drag superseded the pending check.
-        model.applyEventForTest(.dispatchAdmissionEvaluated(admission: admission(
-            workItemID: taskA.id, wouldDispatch: false, pauseActive: true, overridable: true
-        )))
+        for task in [taskA, taskB] {
+            model.applyEventForTest(.dispatchAdmissionEvaluated(admission: admission(
+                workItemID: task.id, wouldDispatch: false, pauseActive: true, overridable: true
+            )))
+        }
+        XCTAssertEqual(model.pendingPauseOverrideConfirmation?.taskID, taskA.id)
+        model.cancelPauseOverrideDrag()
+        XCTAssertEqual(model.pendingPauseOverrideConfirmation?.taskID, taskB.id,
+                       "the second drag's confirmation must be presented after the first settles")
+    }
 
-        XCTAssertNil(model.pendingPauseOverrideConfirmation,
-                     "a stale reply for a superseded drag must not surface a confirmation")
+    func testReplyForTaskWithoutPendingDragIsIgnored() {
+        let model = makeModel()
+        model.applyEventForTest(.dispatchAdmissionEvaluated(admission: admission(
+            workItemID: "unknown", wouldDispatch: false, pauseActive: true, overridable: true
+        )))
+        XCTAssertNil(model.pendingPauseOverrideConfirmation)
     }
 
     // MARK: - Helpers

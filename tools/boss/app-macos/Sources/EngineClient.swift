@@ -36,6 +36,18 @@ final class EngineClient: @unchecked Sendable {
         isUserMutation(payload)
     }
 
+    /// Read-only evaluations are tracked for reply correlation but can never
+    /// have completed an action, so a drop before their reply is not an
+    /// uncertain delivery.
+    static func isSideEffectFree(kind: String) -> Bool {
+        kind == "evaluate_dispatch_admission" || kind == "evaluate_editorial_rules"
+    }
+
+    /// "update_work_item" -> "update work item" for user-facing text.
+    static func describeAction(kind: String) -> String {
+        kind.replacingOccurrences(of: "_", with: " ")
+    }
+
     /// Reads and session housekeeping have no user mutation to recover.
     static func isUserMutation(_ payload: [String: Any]) -> Bool {
         guard let kind = payload["type"] as? String else { return false }
@@ -418,6 +430,11 @@ final class EngineClient: @unchecked Sendable {
         if finished { emit(.retriedActionsStatus(message: nil)) }
     }
 
+    /// The user has checked the outcome of every action reported uncertain.
+    func acknowledgeUncertainActions() {
+        ledger.withLock { $0.uncertain.removeAll() }
+    }
+
     var hasUnsentActions: Bool { ledger.withLock { !$0.unsent.isEmpty } }
     var hasRetriedActions: Bool { ledger.withLock { !$0.retried.isEmpty || !$0.retryAdmissionTasks.isEmpty } }
 
@@ -592,20 +609,30 @@ final class EngineClient: @unchecked Sendable {
         let generation = connectionGeneration
         handoff.afterPendingLines { [weak self] in
             guard let self else { return }
-            let uncertain = self.ledger.withLock { state -> [String: String] in
+            // Only ids that became uncertain on THIS drop are reported; earlier
+            // ones were already surfaced and stay until acknowledged.
+            let (fresh, hadPending) = self.ledger.withLock { state -> ([(id: String, kind: String)], Bool) in
                 let pending = state.awaiting.filter { $0.value.generation == generation }
-                for id in pending.keys {
+                var fresh = [(id: String, kind: String)]()
+                for id in pending.keys.sorted() {
                     if let data = state.awaiting.removeValue(forKey: id)?.data,
                        let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-                        state.uncertain[id] = payload["type"] as? String ?? "action"
+                        let kind = payload["type"] as? String ?? "action"
+                        if !Self.isSideEffectFree(kind: kind) {
+                            state.uncertain[id] = kind
+                            fresh.append((id, kind))
+                        }
                     }
                     state.retried.remove(id)
                 }
-                return pending.isEmpty ? [:] : state.uncertain
+                return (fresh, !pending.isEmpty)
             }
-            if !uncertain.isEmpty {
-                let actions = uncertain.sorted { $0.key < $1.key }.map { "\($0.value) (\($0.key))" }.joined(separator: ", ")
+            if !fresh.isEmpty {
+                let actions = fresh.map { Self.describeAction(kind: $0.kind) }.joined(separator: ", ")
                 self.emit(.retriedActionsStatus(message: "Connection lost before confirmation: \(actions). Check whether these actions completed before trying again."))
+            } else if hadPending {
+                // Only read-only evaluations were in flight: settle the retry state.
+                self.emit(.retriedActionsStatus(message: nil))
             }
             self.emit(.disconnected)
         }

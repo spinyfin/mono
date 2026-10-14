@@ -122,8 +122,8 @@ extension ChatViewModel {
             // flight: the socket drop means no `dispatch_admission_evaluated`
             // reply is ever coming, so nothing else would clear
             // `pendingDragAdmissionCheck` or the optimistic move it guards.
-            if pendingDragAdmissionCheck != nil && !engine.hasUnsentAction(kind: "evaluate_dispatch_admission") {
-                pendingDragAdmissionCheck = nil
+            if !pendingDragAdmissionChecks.isEmpty && !engine.hasUnsentAction(kind: "evaluate_dispatch_admission") {
+                pendingDragAdmissionChecks.removeAll()
                 bounceBackOptimisticMoves(message: nil)
             }
             scheduleConnectionLostBannerCheck()
@@ -295,7 +295,8 @@ extension ChatViewModel {
             appendSystemMessage(message)
         case .retriedActionsStatus(let message):
             if let message {
-                uncertainActionNotice = message
+                uncertainActionMessages.append(message)
+                uncertainActionNotice = uncertainActionMessages.joined(separator: "\n")
                 if !engine.hasUnsentAction(kind: "move_work_item_on_board") && !engine.hasUnsentAction(kind: "evaluate_dispatch_admission") {
                     bounceBackOptimisticMoves(message: nil)
                 }
@@ -316,7 +317,7 @@ extension ChatViewModel {
             }
             // Only the drag's own requests may clear admission/optimistic state.
             if (requestKind == "evaluate_dispatch_admission" || requestKind == "move_work_item_on_board") && !engine.hasUnsentAction(kind: requestKind) {
-                pendingDragAdmissionCheck = nil
+                pendingDragAdmissionChecks.removeAll()
                 bounceBackOptimisticMoves(message: "Not connected to the engine — reconnect and try again.")
             }
             // Only kinds retained for Retry earn the "your actions are saved" notice.
@@ -331,8 +332,8 @@ extension ChatViewModel {
             handle(.error(message: message))
         case .error(let message):
             if handleCoordinatorResetError(message) { return }
-            if let pending = pendingDragAdmissionCheck {
-                engine.finishAdmissionRetry(taskID: pending.taskID)
+            if !pendingDragAdmissionChecks.isEmpty {
+                for pending in pendingDragAdmissionChecks.values { engine.finishAdmissionRetry(taskID: pending.taskID) }
                 // A malformed/undecodable `dispatch_admission_evaluated`
                 // reply (EngineClient emits `.error`, never
                 // `.dispatchAdmissionEvaluated`, when the payload fails to
@@ -341,7 +342,7 @@ extension ChatViewModel {
                 // `pendingDragAdmissionCheck` for a reply that never
                 // arrives in the expected shape. Bounce it back exactly as
                 // a hard-blocker refusal would.
-                pendingDragAdmissionCheck = nil
+                pendingDragAdmissionChecks.removeAll()
                 bounceBackOptimisticMoves(message: message)
                 return
             }
@@ -899,7 +900,7 @@ extension ChatViewModel {
         if !deferredScopeActionInFlightIDs.isEmpty { return true }
         if !operatorAnswerInFlightByTaskID.isEmpty { return true }
         if !pendingMoveOriginByTaskID.isEmpty { return true }
-        if pendingDragAdmissionCheck != nil { return true }
+        if !pendingDragAdmissionChecks.isEmpty { return true }
         if engineAttemptDetailRequestID != nil { return true }
         // `pendingReviewGuideVersionId` is retained after a successful load
         // (it is the displayed version), so pair it with `.loading`.
