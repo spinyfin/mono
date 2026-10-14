@@ -1224,6 +1224,10 @@ impl RecordingPublisher {
 
 #[async_trait]
 impl ExecutionPublisher for RecordingPublisher {
+    async fn snapshot_queue_ci_contract(&self, _: &str, checks: &str) -> anyhow::Result<String> {
+        Ok(checks.to_owned())
+    }
+
     async fn publish(&self, execution_id: &str, work_item_id: &str, status: &str, reason: &str) {
         self.publish_calls.lock().await.push((
             execution_id.to_owned(),

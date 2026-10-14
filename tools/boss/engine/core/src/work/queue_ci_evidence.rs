@@ -4,7 +4,7 @@
 use super::*;
 use boss_protocol::{QueueCiEvidence, RunDoneOutcome, RunDoneProposalPayload};
 
-pub(crate) const REQUIRED: &str = "Merge-queue CI verification required: fetch origin, rebase the PR onto current origin/main, and run every failed target with Bazel (the full job invocation for whole-job failures; `checkleft run` for a lint job; the job's own npm/pnpm/yarn invocation for a non-Bazel job). Supply --queue-ci-evidence-file with main_sha, verified_head_sha, queue_sha, queue_base_sha and successful runs (check_name, source_url, command, exit_code, output, coverage). A requeue of an unchanged head also needs queue_entry_id and queue_entry_enqueued_at from the enqueuePullRequest receipt (mergeQueueEntry { id enqueuedAt }). PR-head checks or isolated un-rebased reruns are not evidence. This gate does not expire; continue verification before declaring failure.";
+pub(crate) const REQUIRED: &str = "Merge-queue CI verification required: fetch origin, rebase the PR onto current origin/main, and run every command in each failed job's captured verification contract (BOSS_CI_VERIFICATION.json). For jobs without a declaration, run every failed target with Bazel (the full job invocation for whole-job failures; `checkleft run` for a lint job; the job's own npm/pnpm/yarn invocation for a non-Bazel job). Supply --queue-ci-evidence-file with main_sha, verified_head_sha, queue_sha, queue_base_sha and successful runs (check_name, source_url, command, exit_code, output, coverage). A requeue of an unchanged head also needs queue_entry_id and queue_entry_enqueued_at from the enqueuePullRequest receipt (mergeQueueEntry { id enqueuedAt }). PR-head checks or isolated un-rebased reruns are not evidence. This gate does not expire; continue verification before declaring failure.";
 
 pub(crate) fn queue_ci_verification_required(attempt: &CiRemediation) -> bool {
     // A Trunk construction rejection with no failing build is a conflict or
@@ -66,7 +66,7 @@ fn job_needs(name: &str) -> JobNeeds {
     needs
 }
 
-/// What one run demonstrates. `test` implies `build`.
+/// What one run demonstrates. Only Bazel tests also demonstrate a build.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RunCaps {
     lint: bool,
@@ -107,16 +107,21 @@ fn is_project_command(command: &str) -> bool {
     segments.peek().is_some()
         && segments.all(|segment| {
             let mut words = segment.split_whitespace();
-            matches!(words.next(), Some("npm" | "npx" | "pnpm" | "yarn")) && !words.any(is_filter_flag)
+            matches!(words.next(), Some("npm" | "pnpm" | "yarn")) && !words.any(is_filter_flag)
         })
 }
 
 /// True when the command runs script `name` or a `name:*` variant
 /// (`npm run test:unit`).
 fn runs_script(words: &[&str], name: &str) -> bool {
-    words
-        .iter()
-        .any(|w| *w == name || w.strip_prefix(name).is_some_and(|rest| rest.starts_with(':')))
+    words.split(|w| *w == "&&").any(|segment| {
+        let script = match segment {
+            ["npm" | "pnpm" | "yarn", "run", script, ..] => Some(*script),
+            ["npm" | "pnpm" | "yarn", script, ..] => Some(*script),
+            _ => None,
+        };
+        script.is_some_and(|w| w == name || w.strip_prefix(name).is_some_and(|rest| rest.starts_with(':')))
+    })
 }
 
 fn run_caps(command: &str, bazel_job: bool) -> RunCaps {
@@ -138,7 +143,7 @@ fn run_caps(command: &str, bazel_job: bool) -> RunCaps {
         let test = runs_script(&words, "test");
         return RunCaps {
             test,
-            build: test || runs_script(&words, "build"),
+            build: runs_script(&words, "build"),
             ..RunCaps::default()
         };
     }
@@ -214,18 +219,30 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
             "{REQUIRED} queue_sha must identify the failing queue commit."
         );
     }
-    anyhow::ensure!(!evidence.runs.is_empty(), "{REQUIRED} No Bazel results supplied.");
+    anyhow::ensure!(
+        !evidence.runs.is_empty(),
+        "{REQUIRED} No verification results supplied."
+    );
+    let checks: Vec<serde_json::Value> = serde_json::from_str(&attempt.failed_checks).unwrap_or_default();
     for run in &evidence.runs {
         let needs = job_needs(&run.check_name);
         let caps = run_caps(&run.command, needs.bazel);
+        let declared = checks.iter().any(|check| {
+            check["name"] == run.check_name
+                && check["target_url"]
+                    .as_str()
+                    .filter(|u| !u.is_empty())
+                    .is_none_or(|u| u == run.source_url)
+                && check.get("verification").is_some()
+        });
         anyhow::ensure!(
-            (caps.test || caps.build || (caps.lint && needs.lint))
+            (declared || caps.test || caps.build || (caps.lint && needs.lint))
                 && !run.check_name.trim().is_empty()
                 && run.exit_code == 0
                 && !run.output.trim().is_empty()
                 && !run.coverage.trim().is_empty()
                 && run.source_url.starts_with("https://"),
-            "{REQUIRED} Every run must report a successful complete invocation for its job (a Bazel build/test of the job's targets, `checkleft run` for a lint job, or the job's own npm/pnpm/yarn build/test script for a non-Bazel job; no test filters), its output and coverage."
+            "{REQUIRED} Every run must report a successful complete invocation declared for its job, or for undeclared jobs (a Bazel build/test of the job's targets, `checkleft run` for a lint job, or the job's own npm/pnpm/yarn build/test script for a non-Bazel job; no test filters), its output and coverage."
         );
     }
     if let Some(base) = &attempt.queue_base_sha {
@@ -235,7 +252,6 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
         );
     }
     // Malformed captures require resolving the build, like missing captures.
-    let checks: Vec<serde_json::Value> = serde_json::from_str(&attempt.failed_checks).unwrap_or_default();
     if checks.is_empty() {
         anyhow::ensure!(
             evidence.runs.iter().any(|r| is_test_run(&r.command)),
@@ -245,6 +261,29 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
     for check in checks {
         let url = check["target_url"].as_str().filter(|s| !s.is_empty());
         let name = check["name"].as_str().filter(|s| !s.is_empty()).context(REQUIRED)?;
+        if let Some(contract) = check.get("verification") {
+            let job_key = check["job_key"]
+                .as_str()
+                .filter(|key| !key.is_empty())
+                .context("Declared verification is missing its stable job key")?;
+            let required: Vec<crate::queue_ci_contract::RequiredRun> = serde_json::from_value(contract.clone())?;
+            crate::queue_ci_contract::validate_contract(&required)?;
+            let runs: Vec<_> = evidence
+                .runs
+                .iter()
+                .filter(|r| r.check_name == name && url.is_none_or(|u| r.source_url == u))
+                .collect();
+            anyhow::ensure!(
+                required
+                    .iter()
+                    .all(|required| runs.iter().any(|r| r.command.trim() == required.command.trim()))
+                    && runs.iter().all(|r| required
+                        .iter()
+                        .any(|required| r.command.trim() == required.command.trim())),
+                "{REQUIRED} Missing or mismatched declared command for {name} (job {job_key})."
+            );
+            continue;
+        }
         let needs = job_needs(name);
         let covering = || {
             evidence
@@ -256,7 +295,7 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
         anyhow::ensure!(
             (!needs.lint || covering().any(|c| c.lint))
                 && (!needs.test || covering().any(|c| c.test))
-                && (!needs.build || needs.test || covering().any(|c| c.build)),
+                && (!needs.build || covering().any(|c| c.build)),
             "{REQUIRED} Missing complete verification for check {name} (source: {url:?})."
         );
     }
@@ -380,12 +419,13 @@ pub(crate) fn record_delivery(conn: &Connection, execution_id: &str, payload: &R
         let head = super::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger);
         conn.execute(
             "UPDATE ci_remediations SET status = 'abandoned', finished_at = ?2,
-             failure_reason = 'verified_requeue', head_sha_at_trigger = ?3, head_sha_after = ?4 WHERE id = ?1",
+             failure_reason = 'verified_requeue', head_sha_at_trigger = ?3, head_sha_after = ?4, requeue_enqueued_at = ?5 WHERE id = ?1",
             params![
                 attempt.id,
                 now_string(),
                 format!("mq:{head}@{}", evidence.queue_sha),
-                evidence.verified_head_sha
+                evidence.verified_head_sha,
+                evidence.queue_entry_enqueued_at.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.timestamp())
             ],
         )?;
         conn.execute(
@@ -750,6 +790,99 @@ mod tests {
     }
 
     #[test]
+    fn superseding_blocked_declarations_cannot_replace_a_persisted_requeue_boundary() {
+        let (_dir, db) = crate::test_support::open_db();
+        let attempt = job_attempt(&db, serde_json::json!([{"name":"bazel-build-test","target_url":URL}]));
+        let revision = &attempt.work_item_id;
+        let execution = crate::test_support::create_ready_chore_execution(&db, revision.clone());
+        db.set_ci_remediation_revision_task_id(&attempt.id, revision).unwrap();
+        db.connect().unwrap().execute(
+            "UPDATE ci_remediations SET failure_kind = 'merge_queue_rebounce', head_sha_at_trigger = ?2, before_commit_sha = ?3 WHERE id = ?1",
+            params![attempt.id, "b".repeat(40), "c".repeat(40)],
+        ).unwrap();
+        let now = epoch_now();
+        let at = |offset| chrono::DateTime::from_timestamp(now + offset, 0).unwrap().to_rfc3339();
+        let mut proof = evidence();
+        proof.queue_entry_id = Some("MQE_receipt".into());
+        proof.queue_entry_enqueued_at = Some(at(0));
+        let mut payload = RunDoneProposalPayload {
+            outcome: RunDoneOutcome::Delivered,
+            summary: "Verified and requeued".into(),
+            question: None,
+            queue_ci_evidence: Some(proof),
+        };
+        let submit = |key: &str, payload: &RunDoneProposalPayload| {
+            db.submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: revision,
+                kind: ProposalKind::RunDone,
+                payload_json: &serde_json::to_string(payload).unwrap(),
+                idempotency_key: key,
+            })
+            .unwrap()
+            .unwrap()
+            .proposal
+            .state
+        };
+        assert_eq!(submit("delivered", &payload), ProposalState::Applied);
+        let boundary = db.verified_requeue_boundary(revision, &"b".repeat(40)).unwrap();
+        assert_eq!(boundary, Some(now));
+        payload.outcome = RunDoneOutcome::Blocked;
+        payload.queue_ci_evidence.as_mut().unwrap().queue_entry_enqueued_at = None;
+        assert_eq!(submit("supersede-without-receipt", &payload), ProposalState::Applied);
+        assert_eq!(
+            db.verified_requeue_boundary(revision, &"b".repeat(40)).unwrap(),
+            boundary
+        );
+        payload.queue_ci_evidence.as_mut().unwrap().queue_entry_enqueued_at = Some(at(86_400));
+        assert_eq!(submit("supersede-future-receipt", &payload), ProposalState::Applied);
+        assert_eq!(
+            db.verified_requeue_boundary(revision, &"b".repeat(40)).unwrap(),
+            boundary
+        );
+        db.correct_requeue_boundary(&attempt.id, now - 10).unwrap();
+        assert_eq!(
+            db.verified_requeue_boundary(revision, &"b".repeat(40)).unwrap(),
+            Some(now - 10)
+        );
+    }
+
+    #[test]
+    fn declared_job_commands_require_every_step_and_the_exact_tool() {
+        let (_dir, db) = crate::test_support::open_db();
+        for (name, tool, commands, wrong) in [
+            ("make-suite", "project", vec![("test", "make test")], "npm test"),
+            (
+                "mac-app-build",
+                "bazel",
+                vec![("build", "bazel build //app/...")],
+                "npm run build",
+            ),
+            (
+                "frontend",
+                "project",
+                vec![("build", "npm run build"), ("test", "npm run test")],
+                "npx arbitrary test",
+            ),
+        ] {
+            let contract: Vec<_> = commands
+                .iter()
+                .map(|(kind, command)| serde_json::json!({"kind":kind,"tool":tool,"command":command}))
+                .collect();
+            let attempt = job_attempt(
+                &db,
+                serde_json::json!([{"name":name,"target_url":URL,"job_key":name,"provider_job_id":"uuid","verification":contract}]),
+            );
+            let required: Vec<_> = commands.iter().map(|(_, command)| *command).collect();
+            assert!(validate(&attempt, Some(&job_proof(name, &required))).is_ok());
+            assert!(validate(&attempt, Some(&job_proof(name, &[wrong]))).is_err());
+            if required.len() > 1 {
+                assert!(validate(&attempt, Some(&job_proof(name, &required[1..]))).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn verification_is_decided_per_job_from_whole_label_tokens() {
         let (_dir, db) = crate::test_support::open_db();
         let check = |name: &str| serde_json::json!([{"name": name, "target_url": URL}]);
@@ -784,8 +917,8 @@ mod tests {
         assert!(accepts(build_only, &["npm ci && npm run build"]));
         assert!(accepts(build_only, &["bazel build //tools/boss/..."]));
         assert!(!accepts(build_only, &["npm ci"]));
-        // Tests cover a build job; a build does not cover a test job.
-        assert!(accepts(build_only, &["npm run test"]));
+        // Project tests and builds require separate invocations.
+        assert!(!accepts(build_only, &["npm run test"]));
         assert!(!accepts(frontend, &["npm run build"]));
     }
 

@@ -2627,6 +2627,8 @@ fn render_failed_checks_markdown(failed_checks_json: &str) -> Option<String> {
         provider: String,
         #[serde(default)]
         provider_job_id: Option<String>,
+        #[serde(default)]
+        verification: Vec<crate::queue_ci_contract::RequiredRun>,
     }
     let entries: Vec<Entry> = serde_json::from_str(failed_checks_json).ok()?;
     if entries.is_empty() {
@@ -2645,6 +2647,12 @@ fn render_failed_checks_markdown(failed_checks_json: &str) -> Option<String> {
             out.push_str(&format!(" (job `{job_id}`)"));
         }
         out.push('\n');
+        for run in &e.verification {
+            out.push_str(&format!(
+                "  Required {:?} verification ({:?}): `{}`\n",
+                run.kind, run.tool, run.command
+            ));
+        }
     }
     Some(out)
 }

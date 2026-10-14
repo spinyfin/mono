@@ -1035,39 +1035,27 @@ impl WorkDb {
     /// pre-requeue history. A verified requeue archives only the newest queue
     /// construction's dedup key, so older failures coalesced into the retired
     /// attempt after its detection no longer match any row. The boundary is
-    /// the requeue itself: the receipt's `enqueuedAt` from the applied
-    /// evidence, so a failure of the requeued construction (whose dequeue
+    /// the requeue itself: the persisted receipt's `enqueuedAt`, so a failure of the requeued construction (whose dequeue
     /// follows `enqueuedAt`) still mints. Rows without a recorded receipt time
     /// fall back to the attempt's creation, the best pre-receipt anchor.
     pub fn verified_requeue_boundary(&self, work_item_id: &str, pr_head_sha: &str) -> Result<Option<i64>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT CAST(created_at AS INTEGER), revision_task_id, head_sha_at_trigger FROM ci_remediations
-              WHERE work_item_id = ?1
-                AND failure_kind = 'merge_queue_rebounce'
-                AND failure_reason = 'verified_requeue'
-                AND head_sha_at_trigger LIKE 'mq:' || ?2 || '@%'",
+        Ok(conn.query_row(
+            "SELECT MAX(COALESCE(requeue_enqueued_at, CAST(created_at AS INTEGER))) FROM ci_remediations
+             WHERE work_item_id = ?1 AND failure_kind = 'merge_queue_rebounce'
+             AND failure_reason = 'verified_requeue' AND head_sha_at_trigger LIKE 'mq:' || ?2 || '@%'",
+            params![work_item_id, pr_head_sha],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Replace the delivery-time receipt boundary with GitHub's authoritative time.
+    pub(crate) fn correct_requeue_boundary(&self, attempt_id: &str, enqueued_at: i64) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE ci_remediations SET requeue_enqueued_at = ?2 WHERE id = ?1 AND failure_reason = 'verified_requeue'",
+            params![attempt_id, enqueued_at],
         )?;
-        let rows = stmt
-            .query_map(params![work_item_id, pr_head_sha], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut boundary: Option<i64> = None;
-        for (created, revision_task_id, trigger) in rows {
-            let queue_sha = trigger.rsplit('@').next().unwrap_or_default();
-            let enqueued = match revision_task_id {
-                Some(revision) => requeue_enqueued_at(&conn, &revision, queue_sha)?,
-                None => None,
-            };
-            let candidate = enqueued.map_or(created, |e| e.max(created));
-            boundary = Some(boundary.map_or(candidate, |b| b.max(candidate)));
-        }
-        Ok(boundary)
+        Ok(())
     }
 
     /// Read a `ci_remediations` row by id, terminal or not. Returns
@@ -2245,29 +2233,6 @@ impl WorkDb {
 // ordering and the `deleted_at` guard on the attempts-used writers. This
 // module is intentionally narrow: it holds only the unknown-work-item
 // fallbacks for those same methods, which none of the external tests cover.
-/// Epoch seconds of the `enqueuedAt` receipt in the applied `run_done`
-/// evidence that retired the attempt for queue commit `queue_sha`.
-fn requeue_enqueued_at(conn: &Connection, revision_task_id: &str, queue_sha: &str) -> Result<Option<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT p.payload_json FROM worker_proposals p JOIN work_executions e ON e.id = p.execution_id
-          WHERE e.work_item_id = ?1 AND p.kind = 'run_done' AND p.state = 'applied'
-          ORDER BY p.created_at DESC",
-    )?;
-    let payloads = stmt
-        .query_map(params![revision_task_id], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(payloads
-        .iter()
-        .filter_map(|p| serde_json::from_str::<boss_protocol::RunDoneProposalPayload>(p).ok())
-        .filter_map(|p| p.queue_ci_evidence)
-        .filter(|e| e.queue_sha == queue_sha)
-        .find_map(|e| {
-            chrono::DateTime::parse_from_rfc3339(e.queue_entry_enqueued_at.as_deref()?)
-                .ok()
-                .map(|t| t.timestamp())
-        }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2307,8 +2272,8 @@ mod tests {
             .unwrap();
         let conn = db.connect().unwrap();
         conn.execute(
-            "UPDATE ci_remediations SET created_at = ?2, failure_reason = 'verified_requeue', revision_task_id = ?3 WHERE id = ?1",
-            params![attempt.id, created.to_string(), revision.id],
+            "UPDATE ci_remediations SET created_at = ?2, failure_reason = 'verified_requeue', revision_task_id = ?3, requeue_enqueued_at = ?4 WHERE id = ?1",
+            params![attempt.id, created.to_string(), revision.id, enqueued_at.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.timestamp())],
         )
         .unwrap();
         let mut evidence = boss_protocol::QueueCiEvidence::builder()
@@ -2358,8 +2323,8 @@ mod tests {
             Some("1970-01-01T00:30:00Z"),
         );
         assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), Some(1_800));
-        // The newest boundary across attempts wins, and an enqueuedAt before
-        // creation never lowers an attempt's own floor.
+        // The newest boundary across attempts wins; authoritative enqueue
+        // times are not raised to a later detection time.
         retired_requeue(
             &db,
             &product.id,
@@ -2368,7 +2333,7 @@ mod tests {
             &"e".repeat(40),
             Some("1970-01-01T00:01:00Z"),
         );
-        assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), Some(5_000));
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), Some(1_800));
         assert_eq!(db.verified_requeue_boundary(&parent.id, &"f".repeat(40)).unwrap(), None);
     }
 

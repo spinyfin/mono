@@ -721,6 +721,14 @@ pub trait BranchVerifier: Send + Sync {
         Err(anyhow!("ancestry lookup unsupported by this verifier"))
     }
 
+    async fn fetch_queue_dequeues(
+        &self,
+        _repo_slug: &str,
+        _pr_number: u64,
+    ) -> Result<Vec<crate::merge_poller::MergeQueueDequeueEvent>> {
+        Err(anyhow!("queue timeline lookup unsupported by this verifier"))
+    }
+
     /// The PR's state, head OID and live merge-queue entry (id, enqueuedAt)
     /// in one read. Used by the queue-CI evidence audit to check a
     /// worker-supplied `enqueuePullRequest` receipt against GitHub.
@@ -783,6 +791,16 @@ impl BranchVerifier for CommandBranchVerifier {
     async fn fetch_is_ancestor(&self, repo_slug: &str, base: &str, head: &str) -> Result<bool> {
         let status = gh_scope(callers::COMPLETION, gh_compare_jq(repo_slug, base, head, ".status")).await?;
         Ok(matches!(status.as_str(), "ahead" | "identical"))
+    }
+
+    async fn fetch_queue_dequeues(
+        &self,
+        repo_slug: &str,
+        pr_number: u64,
+    ) -> Result<Vec<crate::merge_poller::MergeQueueDequeueEvent>> {
+        let url = format!("https://github.com/{repo_slug}/pull/{pr_number}");
+        let mut events = crate::merge_poller::fetch_merge_queue_dequeue_events_batch(std::slice::from_ref(&url)).await;
+        events.remove(&url).context("queue timeline unavailable")
     }
 
     async fn fetch_pr_merge_queue_snapshot(

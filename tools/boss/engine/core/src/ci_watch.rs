@@ -1328,6 +1328,19 @@ async fn on_queue_side_failure_detected(
     // duplicate detection must not spend another remediation budget. Verified
     // requeue delivery archives that key by queue SHA, admitting a later failed
     // construction at the same head while preserving dedup of the old episode.
+    let failed_checks = match publisher
+        .snapshot_queue_ci_contract(&candidate.pr_url, &encode_failed_checks(failures))
+        .await
+    {
+        Ok(checks) => checks,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "cannot resolve queue CI verification contract; retry on next poll"
+            );
+            return false;
+        }
+    };
     let insert_result = work_db.insert_ci_remediation_with_queue_base(
         CiRemediationInsertInput {
             product_id: candidate.product_id.clone(),
@@ -1338,7 +1351,7 @@ async fn on_queue_side_failure_detected(
             head_sha_at_trigger: discriminator.to_owned(),
             attempt_kind: "fix".to_owned(),
             consumes_budget: 1,
-            failed_checks: encode_failed_checks(failures),
+            failed_checks,
             failure_kind: failure_kind.to_owned(),
             before_commit_sha: before_commit_sha.map(str::to_owned),
         },

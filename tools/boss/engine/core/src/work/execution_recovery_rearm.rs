@@ -226,7 +226,7 @@ mod tests {
                     .unwrap();
                 db.connect()
                     .unwrap()
-                    .execute_batch("ALTER TABLE ci_remediations DROP COLUMN queue_base_sha; UPDATE metadata SET value = '38' WHERE key = 'schema_version';")
+                    .execute_batch("ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at; ALTER TABLE ci_remediations DROP COLUMN queue_base_sha; UPDATE metadata SET value = '38' WHERE key = 'schema_version';")
                     .unwrap();
                 (product_id, id, failed.id, prerequisite)
             };
@@ -310,7 +310,7 @@ mod tests {
                 .unwrap();
             db.connect()
                 .unwrap()
-                .execute_batch("ALTER TABLE ci_remediations DROP COLUMN queue_base_sha; UPDATE metadata SET value = '38' WHERE key = 'schema_version';")
+                .execute_batch("ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at; ALTER TABLE ci_remediations DROP COLUMN queue_base_sha; UPDATE metadata SET value = '38' WHERE key = 'schema_version';")
                 .unwrap();
             (product_id, id, pending.id, failed.id, prerequisite)
         };
@@ -373,7 +373,7 @@ mod tests {
             let wedged = insert_blocked(&db, &product_id, "wedged", "execution_recovery_failed", &stale);
             db.connect()
                 .unwrap()
-                .execute_batch("ALTER TABLE ci_remediations DROP COLUMN queue_base_sha; UPDATE metadata SET value = '38' WHERE key = 'schema_version';")
+                .execute_batch("ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at; ALTER TABLE ci_remediations DROP COLUMN queue_base_sha; UPDATE metadata SET value = '38' WHERE key = 'schema_version';")
                 .unwrap();
             (product_id, wedged)
         };

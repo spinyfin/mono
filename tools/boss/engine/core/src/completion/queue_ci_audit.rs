@@ -1,4 +1,4 @@
-//! Post-hoc audit of a queue-side CI-fix `delivered` declaration. The
+//! Post-hoc audit of a queue-side CI-fix `delivered` or `blocked` declaration. The
 //! declaration gate is purely local (it runs on the termination path), so the
 //! facts it cannot check without GitHub are checked here, off that path:
 //! the verified head is the PR's head and contains the stated `main_sha`, and
@@ -55,6 +55,21 @@ async fn find_contradiction(
         .fetch_pr_merge_queue_snapshot(repo_slug, pr_number)
         .await
         .ok()?;
+    if snapshot.pr_state == "OPEN" && snapshot.entry_id.is_none() {
+        let enqueued = evidence.queue_entry_enqueued_at.as_deref().and_then(rfc3339_epoch)?;
+        let events = branch_verifier.fetch_queue_dequeues(repo_slug, pr_number).await.ok()?;
+        if events.iter().any(|event| {
+            event.reason == "FAILED_CHECKS"
+                && event.pr_head_oid.as_deref() == Some(&evidence.verified_head_sha)
+                && event
+                    .created_at
+                    .as_deref()
+                    .and_then(rfc3339_epoch)
+                    .is_some_and(|t| t > enqueued)
+        }) {
+            return None;
+        }
+    }
     receipt_contradiction(
         &snapshot,
         receipt,
@@ -81,6 +96,7 @@ fn receipt_contradiction(
                 "the requeue receipt `{receipt}` does not correspond to a live queue entry; the PR is open and not in the queue."
             ),
             rearm: true,
+            corrected_boundary: None,
         });
     };
     let live_enqueued_at = snapshot.entry.as_ref().and_then(|e| e.enqueued_at.as_deref());
@@ -96,11 +112,15 @@ fn receipt_contradiction(
             )));
         }
         return match (receipt_t, live_t) {
-            (Some(r), Some(l)) if r != l => Some(Contradiction::plain(format!(
-                "the receipt claims entry `{receipt}` was enqueued at `{}` but GitHub says `{}`.",
-                receipt_enqueued_at.unwrap_or_default(),
-                live_enqueued_at.unwrap_or_default()
-            ))),
+            (Some(r), Some(l)) if r != l => Some(Contradiction {
+                corrected_boundary: Some(l),
+                rearm: false,
+                detail: format!(
+                    "the receipt claims entry `{receipt}` was enqueued at `{}` but GitHub says `{}`.",
+                    receipt_enqueued_at.unwrap_or_default(),
+                    live_enqueued_at.unwrap_or_default()
+                ),
+            }),
             _ => None,
         };
     }
@@ -122,11 +142,16 @@ struct Contradiction {
     /// The retired attempt's failure signal should resurface: the PR was left
     /// out of the queue with no active attempt.
     rearm: bool,
+    corrected_boundary: Option<i64>,
 }
 
 impl Contradiction {
     fn plain(detail: String) -> Self {
-        Self { detail, rearm: false }
+        Self {
+            detail,
+            rearm: false,
+            corrected_boundary: None,
+        }
     }
 }
 
@@ -195,21 +220,38 @@ pub(super) async fn audit_queue_ci_delivery(
     let Some(found) = find_contradiction(branch_verifier, &repo_slug, pr_number, &input).await else {
         return;
     };
-    tracing::warn!(execution_id, work_item_id, pr_url, detail = %found.detail, "queue CI evidence audit: delivery contradicted");
+    tracing::warn!(execution_id, work_item_id, pr_url, detail = %found.detail, "queue CI evidence audit: declaration contradicted");
+    if let Some(boundary) = found.corrected_boundary
+        && let Err(err) = work_db.correct_requeue_boundary(&input.attempt.id, boundary)
+    {
+        tracing::warn!(?err, "failed to correct authoritative requeue boundary");
+    }
     if found.rearm {
         rearm_parent_failure_signal(work_db, execution_id, &input);
     }
-    let body = format!(
-        "This execution declared a verified queue-CI delivery for {pr_url}, and the declaration was accepted on local checks alone. A post-hoc audit against GitHub found: {}\n\n\
+    let body = if input.delivered {
+        format!(
+            "This execution declared a verified queue-CI delivery for {pr_url}, and the declaration was accepted on local checks alone. A post-hoc audit against GitHub found: {}\n\n\
          The completion stands, but the queue-failure evidence is contradicted. Check that the PR is in the merge queue at the tested head and decide whether to re-run the verification.",
-        found.detail
-    );
+            found.detail
+        )
+    } else {
+        format!(
+            "The blocked declaration for {pr_url} supplied verification evidence whose main_sha ancestry was contradicted: {}. Nothing was delivered. Check the rebased tree and repeat verification.",
+            found.detail
+        )
+    };
     match work_db.create_attention_item(CreateAttentionItemInput {
         execution_id: Some(execution_id.to_owned()),
         work_item_id: None,
         kind: RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND.to_owned(),
         status: None,
-        title: "Queue CI delivery evidence contradicted by GitHub".to_owned(),
+        title: if input.delivered {
+            "Queue CI delivery evidence contradicted by GitHub"
+        } else {
+            "Blocked declaration verification evidence contradicted by GitHub"
+        }
+        .to_owned(),
         body_markdown: body,
         resolved_at: None,
     }) {
@@ -245,10 +287,19 @@ mod tests {
         head: Result<String, String>,
         ancestor: Result<bool, String>,
         snapshot: Result<PrMergeQueueSnapshot, String>,
+        dequeues: Vec<crate::merge_poller::MergeQueueDequeueEvent>,
     }
 
     #[async_trait]
     impl BranchVerifier for Stub {
+        async fn fetch_queue_dequeues(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<Vec<crate::merge_poller::MergeQueueDequeueEvent>> {
+            Ok(self.dequeues.clone())
+        }
+
         async fn fetch_pr_head_ref(&self, _: &str, _: u64) -> Result<String> {
             unimplemented!()
         }
@@ -296,6 +347,7 @@ mod tests {
             head: Ok(HEAD.into()),
             ancestor: Ok(true),
             snapshot: Ok(snapshot),
+            dequeues: vec![],
         }
     }
 
@@ -370,6 +422,7 @@ mod tests {
             head: Err("boom".into()),
             ancestor: Err("boom".into()),
             snapshot: Err("boom".into()),
+            dequeues: vec![],
         };
         assert!(contradiction(&verifier, &input("p", true)).await.is_none());
     }
@@ -393,6 +446,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newer_same_head_dequeue_consumes_the_receipt_before_next_attempt() {
+        let mut verifier = stub(snapshot("OPEN", HEAD, None));
+        verifier.dequeues.push(crate::merge_poller::MergeQueueDequeueEvent {
+            reason: "FAILED_CHECKS".into(),
+            created_at: Some("2026-07-27T23:11:00Z".into()),
+            pr_head_oid: Some(HEAD.into()),
+            before_commit_oid: None,
+            queue_base_oid: None,
+        });
+        assert!(contradiction(&verifier, &input("p", true)).await.is_none());
+        verifier.dequeues[0].pr_head_oid = Some("other-head".into());
+        assert!(contradiction(&verifier, &input("p", true)).await.unwrap().rearm);
+        verifier.dequeues[0].pr_head_oid = Some(HEAD.into());
+        verifier.dequeues[0].created_at = Some("2026-07-27T23:09:00Z".into());
+        assert!(contradiction(&verifier, &input("p", true)).await.unwrap().rearm);
+    }
+
+    #[tokio::test]
     async fn mismatched_entries_are_contradictions_unless_strictly_newer() {
         let other = |at| stub(snapshot("OPEN", HEAD, Some(("MQE_other", at))));
         let found = contradiction(&other(ENQUEUED), &input("p", true)).await.unwrap();
@@ -407,6 +478,7 @@ mod tests {
         let wrong_time = stub(snapshot("OPEN", HEAD, Some(("MQE_receipt", "2026-07-27T22:00:00Z"))));
         let found = contradiction(&wrong_time, &input("p", true)).await.unwrap();
         assert!(found.detail.contains("enqueued at"));
+        assert_eq!(found.corrected_boundary, rfc3339_epoch("2026-07-27T22:00:00Z"));
     }
 
     #[test]

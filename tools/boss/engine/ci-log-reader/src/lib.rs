@@ -482,6 +482,31 @@ pub struct TrunkEvictionBuild {
 /// lookup that is already degrading gracefully to an empty result.
 const MAX_EVICTION_BUILD_SEARCH_PAGES: u32 = 3;
 
+/// Resolve a provider job UUID to the stable pipeline step key.
+pub async fn fetch_buildkite_step_key(binary: &str, url: &str, job_id: &str) -> Result<String> {
+    let path = url
+        .strip_prefix("https://buildkite.com/")
+        .context("invalid Buildkite URL")?;
+    let parts: Vec<_> = path.split('#').next().unwrap_or_default().split('/').collect();
+    anyhow::ensure!(parts.len() == 4 && parts[2] == "builds", "invalid Buildkite build URL");
+    let endpoint = format!("/organizations/{}/pipelines/{}/builds/{}", parts[0], parts[1], parts[3]);
+    let output = run_capture(binary, &["api", &endpoint]).await?;
+    parse_buildkite_step_key(&output, job_id)
+}
+
+fn parse_buildkite_step_key(output: &str, job_id: &str) -> Result<String> {
+    let build: serde_json::Value = serde_json::from_str(output)?;
+    build["jobs"]
+        .as_array()
+        .context("missing jobs")?
+        .iter()
+        .find(|job| job["id"].as_str() == Some(job_id))
+        .and_then(|job| job["step_key"].as_str())
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .context("missing stable Buildkite step key")
+}
+
 /// Discover the newest failed/failing Buildkite build whose branch is the
 /// gating `trunk-merge/pr-<pr_number>/*` construction branch for a Trunk
 /// merge-queue eviction.
@@ -1306,5 +1331,21 @@ exit 2
             let msg = format!("{err:#}");
             assert!(msg.contains("auth required"), "stderr missing: {msg}");
         }
+    }
+}
+
+#[cfg(test)]
+mod verification_identity_tests {
+    #[test]
+    fn step_key_is_resolved_by_job_id_never_by_display_label() {
+        let build = r#"{"jobs":[{"id":"other","step_key":"frontend"},{"id":"failed","name":"Friendly label","step_key":"mac-app-build"}]}"#;
+        assert_eq!(
+            super::parse_buildkite_step_key(build, "failed").unwrap(),
+            "mac-app-build"
+        );
+        assert!(super::parse_buildkite_step_key(build, "absent").is_err());
+        assert!(
+            super::parse_buildkite_step_key(r#"{"jobs":[{"id":"failed","name":"label-only"}]}"#, "failed").is_err()
+        );
     }
 }
