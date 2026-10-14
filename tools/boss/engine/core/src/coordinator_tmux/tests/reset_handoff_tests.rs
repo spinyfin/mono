@@ -420,6 +420,6 @@ async fn delivery_failure_leaves_the_session_and_reports_a_forceable_error() {
             .any(|c| c.get(2).map(String::as_str) == Some("kill-session")),
         "a failed delivery must leave the session running"
     );
-    // The force path never consults delivery, so the operator is not stuck.
+    // Forced reset bypasses delivery, so a failed delivery cannot block it.
     assert!(!request(true).await.unwrap());
 }

@@ -195,3 +195,32 @@ async fn a_reused_socket_cannot_receive_a_prompt_for_another_process() {
     );
     assert!(result.unwrap_err().to_string().contains("peer does not match"));
 }
+
+#[tokio::test]
+async fn frame_send_releases_lifecycle_lock_before_confirmation() {
+    let (_directory, path, listener, transcript) = private_inbox();
+    let lock = tokio::sync::Mutex::new(());
+    let guard = lock.lock().await;
+    let (result, ()) = tokio::join!(
+        deliver_observed(
+            &path,
+            std::process::id() as libc::pid_t,
+            "session",
+            "prompt",
+            &transcript,
+            || drop(guard)
+        ),
+        async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let line = BufReader::new(stream).lines().next_line().await.unwrap().unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            // Confirmation is withheld until another lifecycle operation acquires the lock.
+            let _guard = tokio::time::timeout(Duration::from_secs(1), lock.lock()).await.unwrap();
+            let reply = frame["from"].as_str().unwrap().strip_prefix("uds:").unwrap();
+            let mut receipt = UnixStream::connect(reply).await.unwrap();
+            let response = json!({"action":"peer_message_status", "orig_msg_id":frame["msg_id"], "status":"delivered"});
+            receipt.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+        }
+    );
+    assert!(result.is_ok());
+}

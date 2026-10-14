@@ -57,15 +57,15 @@ extension ChatViewModel {
         guard !coordinatorResetWaiting else { return }
         pendingCoordinatorReset = (token, reason)
         coordinatorResetForced = false
-        coordinatorResetTimedOut = false
+        coordinatorResetDeliveryFailed = false
         coordinatorResetWaiting = true
         engine.sendRecreateCoordinator(expectedSpawnToken: token, reason: reason)
     }
 
     func forceCoordinatorReset() {
-        guard coordinatorResetTimedOut, let pending = pendingCoordinatorReset else { return }
+        guard coordinatorResetDeliveryFailed, let pending = pendingCoordinatorReset else { return }
         coordinatorResetForced = true
-        coordinatorResetTimedOut = false
+        coordinatorResetDeliveryFailed = false
         coordinatorResetWaiting = true
         engine.sendRecreateCoordinator(
             expectedSpawnToken: pending.token, reason: pending.reason, forceWithoutHandoff: true
@@ -75,16 +75,16 @@ extension ChatViewModel {
     func clearCoordinatorReset() {
         coordinatorResetForced = false
         coordinatorResetWaiting = false
-        coordinatorResetTimedOut = false
+        coordinatorResetDeliveryFailed = false
         pendingCoordinatorReset = nil
     }
 
-    /// Returns true only when the reset UI owns the timeout error.
+    /// Returns true only when the reset UI owns the delivery failure.
     func handleCoordinatorResetError(_ message: String) -> Bool {
         guard message.hasPrefix("recreate_coordinator:"), pendingCoordinatorReset != nil else { return false }
         coordinatorResetWaiting = false
         if message.contains("coordinator did not receive the handoff request") {
-            coordinatorResetTimedOut = true
+            coordinatorResetDeliveryFailed = true
             return true
         }
         clearCoordinatorReset()

@@ -1064,7 +1064,7 @@ final class ChatViewModel: ObservableObject {
     var declinedCoordinatorRecreateToken: String?
     @Published var coordinatorModelRecreateConfirmation: CoordinatorModelRecreateConfirmation?
     @Published var coordinatorResetWaiting = false
-    @Published var coordinatorResetTimedOut = false
+    @Published var coordinatorResetDeliveryFailed = false
     @Published var coordinatorResetForced = false
     var pendingCoordinatorReset: (token: String, reason: CoordinatorRecreateReason)?
 

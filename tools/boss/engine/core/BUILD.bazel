@@ -632,6 +632,34 @@ rust_test(
     ),
 )
 
+# Opt-in real-model behavior check. The hermetic wrapper strips API credentials;
+# running this requires an approved credential fixture and must fail without one.
+rust_test(
+    name = "coordinator_inbox_real_model_test",
+    size = "medium",
+    timeout = "moderate",
+    srcs = [
+        "tests/coordinator_inbox_live.rs",
+        "tests/coordinator_inbox_real_model.rs",
+        "tests/coordinator_inbox_tui.rs",
+    ],
+    crate_root = "tests/coordinator_inbox_real_model.rs",
+    data = [
+        "@host_claude//:claude",
+        "@host_tmux//:tmux",
+    ],
+    edition = "2024",
+    rustc_flags = ["--cfg=boss_real_model_test"],
+    tags = ["manual"],
+    deps = [
+        ":engine_lib",
+        ":tmux_fixture",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 # Drives the production local spawn and recovery chain against a private tmux
 # server. The fixture redraws continuously with a non-driver process title,
 # then exercises restart adoption, token-verified stale reaping, lease/slot

@@ -14,6 +14,10 @@ use tokio::net::{UnixListener, UnixStream};
 
 use super::{CoordinatorTmuxRecord, Tmux};
 
+#[path = "inbox_turn.rs"]
+mod turn;
+pub use turn::TurnObserver;
+
 #[cfg(test)]
 #[path = "inbox_tests.rs"]
 mod tests;
@@ -21,6 +25,18 @@ mod tests;
 #[async_trait::async_trait]
 pub(crate) trait HandoffDelivery: Send + Sync {
     async fn deliver(&self, tmux: &Tmux, record: &CoordinatorTmuxRecord, prompt: &str) -> Result<()>;
+
+    async fn deliver_locked<'a>(
+        &'a self,
+        tmux: &'a Tmux,
+        record: &'a CoordinatorTmuxRecord,
+        prompt: &str,
+        guard: tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>> {
+        self.deliver(tmux, record, prompt).await?;
+        drop(guard);
+        Ok(Box::pin(self.turn_ended(tmux, record)))
+    }
 
     /// Resolves once the turn that began with the delivered request has ended.
     /// Implementations that cannot observe turn boundaries never resolve, so
@@ -36,13 +52,20 @@ pub(crate) trait HandoffDelivery: Send + Sync {
 /// the turn reaches an input boundary.
 pub const DELIVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Interval at which the live registration is polled for turn boundaries.
-const TURN_POLL: Duration = Duration::from_millis(250);
-
 /// `--settings` JSON the production coordinator launches with. Delivery
 /// confirms only when the coordinator accepts cross-session input, so this is
 /// set explicitly rather than inherited from user or default configuration.
 pub const COORDINATOR_INBOUND_SETTINGS: &str = r#"{"crossSessionInbound":"accept"}"#;
+
+/// Shared production command; `initial_prompt` is an already quoted shell expression.
+pub fn coordinator_launch_command(executable: &str, model: &str, initial_prompt: &str) -> String {
+    format!(
+        "exec {} --model {} --permission-mode auto --settings {} {initial_prompt}",
+        boss_ssh_transport::shell_quote(executable),
+        boss_ssh_transport::shell_quote(model),
+        boss_ssh_transport::shell_quote(COORDINATOR_INBOUND_SETTINGS)
+    )
+}
 
 pub(crate) struct ClaudeInbox;
 
@@ -56,12 +79,11 @@ struct Registration {
     cwd: PathBuf,
 }
 
-/// Returns the pane pid, the Claude config directory, the registration, and
-/// the session's reported `status` (`idle` between turns).
+/// Returns the pane pid, Claude config directory, and live session registration.
 async fn read_registration(
     tmux: &Tmux,
     record: &CoordinatorTmuxRecord,
-) -> Result<(libc::pid_t, PathBuf, Registration, Option<String>)> {
+) -> Result<(libc::pid_t, PathBuf, Registration)> {
     let pid = super::pane_pid(tmux, record).await?;
     let config = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
@@ -72,20 +94,17 @@ async fn read_registration(
         .context("reading the live coordinator's Claude inbox registration")?;
     let registration: Registration =
         serde_json::from_slice(&bytes).context("coordinator does not advertise a supported local inbox")?;
-    let status = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|value| value["status"].as_str().map(str::to_owned));
     if registration.pid != pid || registration.peer_protocol != 1 || registration.session_id.is_empty() {
         bail!("coordinator inbox registration does not match the live process or supported protocol");
     }
-    Ok((pid, config, registration, status))
+    Ok((pid, config, registration))
 }
 
 #[async_trait::async_trait]
 impl HandoffDelivery for ClaudeInbox {
     async fn deliver(&self, tmux: &Tmux, record: &CoordinatorTmuxRecord, prompt: &str) -> Result<()> {
         tokio::time::timeout(DELIVERY_TIMEOUT, async {
-            let (pid, config, registration, _) = read_registration(tmux, record).await?;
+            let (pid, config, registration) = read_registration(tmux, record).await?;
             deliver(
                 &registration.messaging_socket_path,
                 pid,
@@ -105,21 +124,34 @@ impl HandoffDelivery for ClaudeInbox {
         })?
     }
 
-    async fn turn_ended(&self, tmux: &Tmux, record: &CoordinatorTmuxRecord) {
-        // The request is delivered at an input boundary, so the registration
-        // goes busy for the turn it starts and returns to idle when it ends.
-        // Unreadable registrations are treated as "not yet observed".
-        let mut saw_busy = false;
-        loop {
-            if let Ok((_, _, _, status)) = read_registration(tmux, record).await {
-                match status.as_deref() {
-                    Some("idle") if saw_busy => return,
-                    Some("idle") | None => {}
-                    Some(_) => saw_busy = true,
-                }
-            }
-            tokio::time::sleep(TURN_POLL).await;
-        }
+    async fn deliver_locked<'a>(
+        &'a self,
+        tmux: &'a Tmux,
+        record: &'a CoordinatorTmuxRecord,
+        prompt: &str,
+        guard: tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>> {
+        let started = std::time::Instant::now();
+        let observer = tokio::time::timeout(DELIVERY_TIMEOUT, async {
+            let (pid, config, registration) = read_registration(tmux, record).await?;
+            delivery_stage("registration_read", started);
+            deliver_observed(
+                &registration.messaging_socket_path,
+                pid,
+                &registration.session_id,
+                prompt,
+                &crate::coordinator_handoff::transcript_projects_dir_in_config(&config, &registration.cwd)
+                    .join(format!("{}.jsonl", registration.session_id)),
+                || {
+                    drop(guard);
+                    delivery_stage("lifecycle_lock_released", started);
+                },
+            )
+            .await
+        })
+        .await
+        .context("coordinator prompt delivery deadline expired")??;
+        Ok(Box::pin(observer.wait()))
     }
 }
 
@@ -146,10 +178,49 @@ impl Drop for ReceiptSocket {
 /// Deliver to a known local Claude session and confirm its input or receipt.
 /// The caller supplies a deadline. Used by the reset adapter and native compatibility test.
 pub async fn deliver(path: &Path, pid: libc::pid_t, session_id: &str, prompt: &str, transcript: &Path) -> Result<()> {
+    deliver_observed(path, pid, session_id, prompt, transcript, || {})
+        .await
+        .map(|_| ())
+}
+
+/// Deliver and retain the pre-injection transcript cursor for turn completion.
+pub async fn deliver_with_turn(
+    path: &Path,
+    pid: libc::pid_t,
+    session_id: &str,
+    prompt: &str,
+    transcript: &Path,
+) -> Result<TurnObserver> {
+    deliver_observed(path, pid, session_id, prompt, transcript, || {}).await
+}
+
+fn delivery_stage(stage: &str, started: std::time::Instant) {
+    crate::audit::record_event(
+        "coordinator_inbox_delivery_stage",
+        &json!({"stage": stage, "elapsed_ms": started.elapsed().as_millis(), "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms()}),
+    );
+    tracing::info!(
+        stage,
+        elapsed_ms = started.elapsed().as_millis(),
+        "coordinator inbox delivery"
+    );
+}
+
+async fn deliver_observed(
+    path: &Path,
+    pid: libc::pid_t,
+    session_id: &str,
+    prompt: &str,
+    transcript: &Path,
+    sent: impl FnOnce() + Send,
+) -> Result<TurnObserver> {
+    let started = std::time::Instant::now();
     let mut transcript_file = tokio::fs::File::open(transcript)
         .await
         .context("opening coordinator transcript for delivery confirmation")?;
-    transcript_file.seek(std::io::SeekFrom::End(0)).await?;
+    let cursor = transcript_file.seek(std::io::SeekFrom::End(0)).await?;
+    let mut turn_file = tokio::fs::File::open(transcript).await?;
+    turn_file.seek(std::io::SeekFrom::Start(cursor)).await?;
     let directory = path.parent().context("inbox has no parent directory")?;
     let metadata = std::fs::symlink_metadata(directory)?;
     let uid = unsafe { libc::geteuid() };
@@ -163,6 +234,7 @@ pub async fn deliver(path: &Path, pid: libc::pid_t, session_id: &str, prompt: &s
         bail!("coordinator inbox peer does not match the live pane pid");
     }
 
+    delivery_stage("connected", started);
     let token = crate::engine_control::generate_token();
     let message_id = format!(
         "{}-{}-4{}-8{}-{}",
@@ -187,6 +259,8 @@ pub async fn deliver(path: &Path, pid: libc::pid_t, session_id: &str, prompt: &s
         "priority": "now",
     });
     stream.write_all(format!("{frame}\n").as_bytes()).await?;
+    delivery_stage("frame_written", started);
+    sent();
     // Match Claude's macOS transport: immediate half-close can lose the last frame.
     #[cfg(target_os = "macos")]
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -198,9 +272,13 @@ pub async fn deliver(path: &Path, pid: libc::pid_t, session_id: &str, prompt: &s
         return Err(error).context("closing the coordinator inbox write half");
     }
     tokio::select! {
-        result = wait_for_input_record(transcript_file, &message_id, prompt) => result,
-        result = wait_for_receipt(listener, pid, &message_id) => result,
-    }
+        result = wait_for_input_record(transcript_file, &message_id, prompt) => { delivery_stage(if result.is_ok() { "transcript_confirmed" } else { "transcript_failed" }, started); result },
+        result = wait_for_receipt(listener, pid, &message_id) => { delivery_stage(if result.is_ok() { "receipt_confirmed" } else { "receipt_failed" }, started); result },
+    }?;
+    Ok(TurnObserver {
+        file: turn_file,
+        message_id,
+    })
 }
 
 async fn wait_for_input_record(file: tokio::fs::File, message_id: &str, prompt: &str) -> Result<()> {

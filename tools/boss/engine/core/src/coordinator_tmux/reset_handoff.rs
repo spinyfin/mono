@@ -95,8 +95,8 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
         HandoffState::Present(h) => h.write_id,
         _ => String::new(),
     };
-    delivery
-        .deliver(tmux, &record, HANDOFF_REQUEST_PROMPT)
+    let turn_ended = delivery
+        .deliver_locked(tmux, &record, HANDOFF_REQUEST_PROMPT, guard)
         .await
         .map_err(|error| {
             audit::record_event(
@@ -107,7 +107,7 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
                     "error": format!("{error:#}"),
                 }),
             );
-            // The session is untouched, so the operator may still force the reset.
+            // Delivery failure preserves the session and leaves a forced reset available.
             anyhow!("{DELIVERY_FAILED_PREFIX}: {error:#}. The coordinator session is still running.")
         })?;
     audit::record_event(
@@ -117,7 +117,6 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
             "delivery_elapsed_ms": started.elapsed().as_millis(),
         }),
     );
-    drop(guard);
     audit::record_event(
         "coordinator_handoff_grace_started",
         &json!({
@@ -141,7 +140,7 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
     // before delivery cannot end the wait early.
     let outcome = tokio::select! {
         () = wait_for_write => GraceOutcome::Written,
-        () = delivery.turn_ended(tmux, &record) => {
+        () = turn_ended => {
             if fresh_write(work_db, expected_token, requested_at, &previous_write) {
                 GraceOutcome::Written
             } else {

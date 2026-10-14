@@ -75,6 +75,7 @@ async fn model_fixture() -> Result<std::net::SocketAddr> {
 
 #[tokio::test]
 async fn installed_claude_acknowledges_a_separate_inbox_message() -> Result<()> {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let root = tempfile::tempdir()?;
     let config = root.path().join("config");
     std::fs::create_dir(&config)?;
@@ -164,6 +165,10 @@ async fn installed_claude_acknowledges_a_separate_inbox_message() -> Result<()> 
         "native Claude inbox delivered in {}ms",
         delivered_at.elapsed().as_millis()
     );
+    anyhow::ensure!(
+        delivered_at.elapsed() < Duration::from_secs(1),
+        "idle inbox delivery exceeded 1s"
+    );
     child.kill().await?;
     child.wait().await?;
     Ok(())
@@ -180,4 +185,9 @@ fn fixture_transcript(config: &Path, registration: &Value) -> Result<PathBuf> {
         })
         .find(|path| path.exists())
         .context("fixture transcript is absent")
+}
+
+#[cfg(boss_real_model_test)]
+pub(super) async fn real_model_handoff() -> Result<()> {
+    tui::terminal_handoff(true).await
 }

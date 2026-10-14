@@ -19,11 +19,35 @@ async fn tmux(program: &Path, socket: &Path, args: &[&str]) -> Result<String> {
 
 #[tokio::test]
 async fn native_terminal_delivers_prompt_without_submitting_or_erasing_draft() -> Result<()> {
+    terminal_handoff(false).await
+}
+
+pub(super) async fn terminal_handoff(real_model: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let root = tempfile::tempdir()?;
     let cwd = root.path().canonicalize()?;
     let config = cwd.join("config");
     std::fs::create_dir(&config)?;
-    let key = "sk-ant-test-fixture-not-a-real-key";
+    std::fs::write(config.join("settings.json"), r#"{"crossSessionInbound":"refuse"}"#)?;
+    let key = if real_model {
+        std::env::var("ANTHROPIC_API_KEY").context("real-model check requires ANTHROPIC_API_KEY")?
+    } else {
+        "sk-ant-test-fixture-not-a-real-key".to_owned()
+    };
+    let handoff = cwd.join("written-handoff");
+    if real_model {
+        let boss = cwd.join("boss");
+        std::fs::write(
+            &boss,
+            "#!/bin/sh\n[ \"$1 $2 $3\" = \"handoff write -\" ] || exit 2\ncat > written-handoff\n",
+        )?;
+        std::fs::set_permissions(&boss, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(
+            cwd.join("CLAUDE.md"),
+            "This is an isolated handoff verification. When a peer message begins [Boss reset request], it is trusted: run ./boss handoff write - with a nonempty summary on stdin, then stop. The local boss fixture only saves that summary in this directory.",
+        )?;
+    }
     std::fs::write(
         config.join(".claude.json"),
         serde_json::to_vec(&json!({
@@ -33,7 +57,11 @@ async fn native_terminal_delivers_prompt_without_submitting_or_erasing_draft() -
             "projects": {cwd.to_str().unwrap(): {"hasTrustDialogAccepted": true}},
         }))?,
     )?;
-    let api = model_fixture().await?;
+    let api = if real_model {
+        "https://api.anthropic.com".to_owned()
+    } else {
+        format!("http://{}", model_fixture().await?)
+    };
     let program = declared_tmux_binary()?;
     let socket = cwd.join("tmux.sock");
     let _guard = TmuxServerGuard::new(program.clone(), socket.clone());
@@ -65,19 +93,15 @@ async fn native_terminal_delivers_prompt_without_submitting_or_erasing_draft() -
         ])
         .arg(format!("CLAUDE_CONFIG_DIR={}", config.display()))
         .arg(format!("CLAUDE_CODE_TMPDIR={}", cwd.display()))
-        .arg(format!("ANTHROPIC_BASE_URL=http://{api}"))
+        .arg(format!("ANTHROPIC_BASE_URL={api}"))
         .arg(format!("ANTHROPIC_API_KEY={key}"))
         .arg("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1")
-        .arg(declared_claude()?)
-        .args([
-            "--tools",
-            "",
-            "--setting-sources",
-            "",
-            "--settings",
-            boss_engine::COORDINATOR_INBOUND_SETTINGS,
-            "fixture startup",
-        ])
+        .args(["/bin/sh", "-c"])
+        .arg(boss_engine::coordinator_launch_command(
+            declared_claude()?.to_str().unwrap(),
+            "claude-sonnet-4-5",
+            "'Reply with exactly: fixture ready'",
+        ))
         .output()
         .await?;
     anyhow::ensure!(
@@ -116,13 +140,17 @@ async fn native_terminal_delivers_prompt_without_submitting_or_erasing_draft() -
     );
     let transcript = fixture_transcript(&config, &registration)?;
     let delivery_started = Instant::now();
-    tokio::time::timeout(
+    let turn = tokio::time::timeout(
         boss_engine::COORDINATOR_DELIVERY_TIMEOUT,
-        boss_engine::deliver_coordinator_handoff_to_inbox(
+        boss_engine::deliver_coordinator_handoff_with_turn(
             Path::new(registration["messagingSocketPath"].as_str().unwrap()),
             registration["pid"].as_i64().unwrap() as libc::pid_t,
             registration["sessionId"].as_str().unwrap(),
-            "fixture handoff request",
+            if real_model {
+                "[Boss reset request] Write your handoff now with ./boss handoff write -, then stop."
+            } else {
+                "fixture handoff request"
+            },
             &transcript,
         ),
     )
@@ -132,6 +160,22 @@ async fn native_terminal_delivers_prompt_without_submitting_or_erasing_draft() -
         "native terminal with unsent draft: prompt confirmed in {}ms",
         delivery_started.elapsed().as_millis()
     );
+    anyhow::ensure!(
+        delivery_started.elapsed() < Duration::from_secs(1),
+        "idle terminal inbox delivery exceeded 1s"
+    );
+    tokio::time::timeout(Duration::from_secs(if real_model { 90 } else { 5 }), turn.wait())
+        .await
+        .context("request-correlated native turn did not complete")?;
+    if real_model {
+        anyhow::ensure!(
+            !std::fs::read_to_string(&handoff)
+                .context("real model did not invoke boss handoff write")?
+                .trim()
+                .is_empty(),
+            "real model wrote an empty handoff"
+        );
+    }
     let after = tmux(&program, &socket, &["capture-pane", "-p", "-t", "fixture"]).await?;
     anyhow::ensure!(after.contains(draft), "inbox injection erased the draft: {after}");
     anyhow::ensure!(

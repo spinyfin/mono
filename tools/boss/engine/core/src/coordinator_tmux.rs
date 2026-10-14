@@ -1040,7 +1040,6 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         environment.insert("BOSS_BIN".to_owned(), format!("{bin_dir}/boss"));
     }
     insert_color_environment(&mut environment);
-    let quoted_model = boss_ssh_transport::shell_quote(model);
     // The brief rides along as `claude`'s positional initial prompt — the
     // same shape worker panes use for `.claude/initial-prompt.txt` — so the
     // incoming session consumes it on its first turn with no pane injection
@@ -1048,9 +1047,9 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
     // Reset requests reach the coordinator through Claude's local inbox, which
     // only delivers when cross-session input is accepted. Set it explicitly
     // rather than inheriting whatever user or default configuration says.
-    let quoted_inbound = boss_ssh_transport::shell_quote(inbox::COORDINATOR_INBOUND_SETTINGS);
+    let launch = inbox::coordinator_launch_command("claude", model, &initial_prompt);
     let command = format!(
-        "{}unset ANTHROPIC_API_KEY; exec claude --model {quoted_model} --permission-mode auto --settings {quoted_inbound} {initial_prompt}",
+        "{}unset ANTHROPIC_API_KEY; {launch}",
         crate::runner::pane_spawn::path_prepend_clause("BOSS_BIN_DIR")
     );
     crate::tmux_session_options::prepare_server(tmux)
@@ -2318,7 +2317,7 @@ mod tests {
         assert!(
             record_line["relaunch_command"]
                 .as_str()
-                .is_some_and(|command| command.contains("exec claude"))
+                .is_some_and(|command| command.contains("exec 'claude'"))
         );
     }
 
@@ -2359,7 +2358,7 @@ mod tests {
         assert!(
             new_session
                 .iter()
-                .any(|arg| arg.contains("exec claude --model") && arg.contains("sonnet")),
+                .any(|arg| arg.contains("exec 'claude' --model") && arg.contains("sonnet")),
             "the replacement must launch the current claude binary with the requested model, got {new_session:?}"
         );
         assert!(
