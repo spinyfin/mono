@@ -96,6 +96,9 @@ If already queued, read its existing entry ID with `gh api graphql -f query='que
 /// bespoke `compose_ci_remediation_prompt` except that the branch/push spine
 /// is already covered by the shared revision directive.
 pub(super) fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
+    if crate::work::queue_ci_evidence::queue_ci_verification_required(attempt) {
+        return compose_queue_ci_fragment(attempt);
+    }
     let is_rebounce = attempt.failure_kind.as_deref() == Some("merge_queue_rebounce");
     let is_trunk_eviction = attempt.failure_kind.as_deref() == Some("trunk_queue_eviction");
 
