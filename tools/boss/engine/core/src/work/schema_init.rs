@@ -618,6 +618,7 @@ mod floor_tests {
             38,
             40,
             41,
+            42,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {

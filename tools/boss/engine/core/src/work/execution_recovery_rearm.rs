@@ -9,7 +9,7 @@
 //!
 //! Schema 39 re-armed the false "not descended" failure (the ancestry check
 //! compared change ids, so a divergent change made a pointer that really
-//! descends from its baseline look unrelated). Schema 42 re-arms the three
+//! descends from its baseline look unrelated). Schema 43 re-arms the three
 //! failures dispatch now reconciles against engine-recorded pointers: a
 //! stranded baseline, diverged heads, and a missing baseline bookmark.
 
@@ -132,12 +132,12 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
         UPDATE metadata SET value = '38' WHERE key = 'schema_version';";
 
-    /// Undo only schema 42 so reopening replays its re-arm.
-    const RESET_TO_41: &str = "ALTER TABLE execution_bookmarks DROP COLUMN base_commit;
+    /// Undo only schema 43 so reopening replays its re-arm.
+    const RESET_TO_42: &str = "ALTER TABLE execution_bookmarks DROP COLUMN base_commit;
         ALTER TABLE execution_bookmarks DROP COLUMN reconciliation_note;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
-        UPDATE metadata SET value = '41' WHERE key = 'schema_version';";
+        UPDATE metadata SET value = '42' WHERE key = 'schema_version';";
 
     /// Create a chore under a fresh product and park it the way the
     /// coordinator does after a pointer-integrity failure.
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_42_rearms_every_now_reconcilable_shape_and_nothing_else() {
+    fn schema_43_rearms_every_now_reconcilable_shape_and_nothing_else() {
         let db = WorkDb::open_in_memory().unwrap();
         let product = product(&db);
         let id = "exec_18dd8e49b9602c50_16a";
@@ -530,7 +530,7 @@ mod tests {
                 "execution_recovery_failed",
                 &format!("preserved pointers boss-recovery/{id} and boss/{id} {DIVERGED_MESSAGE}"),
             );
-            db.connect().unwrap().execute_batch(RESET_TO_41).unwrap();
+            db.connect().unwrap().execute_batch(RESET_TO_42).unwrap();
             (product_id, wedged, diverged)
         };
         let db = WorkDb::open(path.clone()).unwrap();
