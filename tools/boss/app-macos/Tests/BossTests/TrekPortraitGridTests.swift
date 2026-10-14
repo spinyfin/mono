@@ -1,4 +1,5 @@
 import CoreGraphics
+import ImageIO
 import XCTest
 @testable import Boss
 
@@ -183,6 +184,85 @@ final class TrekPortraitGridTests: XCTestCase {
         let alphas = try alphaColumns(of: slice)
         XCTAssertEqual(alphas.last, 0, "detached sliver is cleared")
         XCTAssertEqual(alphas.first, 255, "own bust is kept")
+    }
+
+    /// Against the real bundled sheet: every sliced portrait is exactly
+    /// one connected bust, so no slice (Dukat / Martok especially)
+    /// keeps a neighbour's pixels.
+    func testEveryRealPortraitIsASingleConnectedBust() throws {
+        let sheet = try realSheet()
+        for row in 0..<TrekPortraitGrid.names.count {
+            for column in 0..<TrekPortraitGrid.names[row].count {
+                let cell = TrekPortraitGrid.Cell(row: row, column: column)
+                let image = try XCTUnwrap(
+                    TrekIconAssets.slice(sheet, cell: cell),
+                    "no portrait for row \(row) column \(column)"
+                )
+                XCTAssertEqual(
+                    try opaqueComponentCount(of: image), 1,
+                    "row \(row) column \(column) has stray opaque pixels"
+                )
+            }
+        }
+    }
+
+    /// The bundled sheet: from Bazel runfiles under `bazel test`, else
+    /// relative to this source file (SwiftPM / Xcode).
+    private func realSheet() throws -> CGImage {
+        let relative = "Sources/Resources/TrekIcons/trek-crew-grid.png"
+        let env = ProcessInfo.processInfo.environment
+        var candidates = [
+            URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent(relative),
+        ]
+        if let srcdir = env["TEST_SRCDIR"], let workspace = env["TEST_WORKSPACE"] {
+            candidates.insert(
+                URL(fileURLWithPath: srcdir).appendingPathComponent(workspace)
+                    .appendingPathComponent("tools/boss/app-macos").appendingPathComponent(relative),
+                at: 0
+            )
+        }
+        let url = try XCTUnwrap(
+            candidates.first { FileManager.default.fileExists(atPath: $0.path) },
+            "trek-crew-grid.png not found"
+        )
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+        return try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+    }
+
+    private func opaqueComponentCount(of image: CGImage) throws -> Int {
+        let width = image.width, height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        try pixels.withUnsafeMutableBytes { buffer in
+            let context = try XCTUnwrap(CGContext(
+                data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                bytesPerRow: width * 4, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ))
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        var seen = [Bool](repeating: false, count: width * height)
+        var count = 0
+        for start in 0..<(width * height) where !seen[start] && pixels[start * 4 + 3] != 0 {
+            count += 1
+            seen[start] = true
+            var stack = [start]
+            while let index = stack.popLast() {
+                let x = index % width, y = index / width
+                for ny in max(y - 1, 0)...min(y + 1, height - 1) {
+                    for nx in max(x - 1, 0)...min(x + 1, width - 1) {
+                        let n = ny * width + nx
+                        if !seen[n], pixels[n * 4 + 3] != 0 {
+                            seen[n] = true
+                            stack.append(n)
+                        }
+                    }
+                }
+            }
+        }
+        return count
     }
 
     private func alphaColumns(of image: CGImage) throws -> [UInt8] {
