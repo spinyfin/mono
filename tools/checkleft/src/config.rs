@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use crate::bypass::bypass_name_for_check_id;
 use crate::external::ExternalCheckImplementationRef;
+use crate::http_retry::{GetRetryPolicy, get_bytes_with_retry};
 use crate::output::{Location, Severity};
 use crate::path::validate_relative_path;
 use crate::path_scope::PathScope;
 use anyhow::{Context, Result, bail};
-use reqwest::StatusCode;
 use serde::Deserialize;
 use tracing::info;
 
@@ -1940,95 +1940,27 @@ fn validate_external_root_check_implementation(
 }
 
 async fn fetch_external_checks_file(client: &reqwest::Client, url: reqwest::Url) -> Result<LoadedChecksFile> {
-    let mut last_retryable_error = None;
-
-    for attempt in 1..=EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
-        info!(
-            url = %url,
-            attempt,
-            max_attempts = EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS,
-            "fetching external checks config"
-        );
-        match client.get(url.clone()).send().await {
-            Ok(response) => {
-                let status = response.status();
-                if status == StatusCode::NOT_FOUND {
-                    if attempt == EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
-                        bail!(
-                            "external checks config {} returned 404 Not Found after {} attempts",
-                            url,
-                            EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS
-                        );
-                    }
-                    tokio::time::sleep(external_checks_retry_delay(attempt, status)).await;
-                    continue;
-                }
-
-                if !status.is_success() {
-                    let response_error = format!("external checks config {} returned {}", url, status);
-                    if is_retryable_http_status(status) {
-                        last_retryable_error = Some(response_error);
-                        if attempt == EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
-                            break;
-                        }
-                        tokio::time::sleep(external_checks_retry_delay(attempt, status)).await;
-                        continue;
-                    }
-                    bail!("{response_error}");
-                }
-
-                let contents = match response.text().await {
-                    Ok(contents) => contents,
-                    Err(error) => {
-                        last_retryable_error = Some(format!(
-                            "failed to read external checks config {} response body: {error}",
-                            url
-                        ));
-                        if attempt == EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
-                            break;
-                        }
-                        tokio::time::sleep(external_checks_retry_delay(attempt, status)).await;
-                        continue;
-                    }
-                };
-                let extension = Path::new(url.path())
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .unwrap_or("");
-                let parsed = parse_checks_contents(&contents, extension, url.as_str())
-                    .with_context(|| format!("failed to parse external checks config {url}"))?;
-                return Ok(LoadedChecksFile {
-                    origin: CheckConfigOrigin::ExternalUrl,
-                    source_label: url.to_string(),
-                    source_path: PathBuf::from(url.as_str()),
-                    parsed,
-                });
-            }
-            Err(error) => {
-                last_retryable_error = Some(format!("failed to retrieve external checks config {}: {error}", url));
-                if attempt == EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
-                    break;
-                }
-                tokio::time::sleep(external_checks_retry_delay(attempt, StatusCode::REQUEST_TIMEOUT)).await;
-            }
-        }
-    }
-
-    let message = last_retryable_error.unwrap_or_else(|| format!("failed to retrieve external checks config {}", url));
-    bail!("{message} after {} attempts", EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS)
-}
-
-fn is_retryable_http_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
-fn external_checks_retry_delay(attempt: u32, status: StatusCode) -> Duration {
-    let base_delay = if status == StatusCode::NOT_FOUND {
-        EXTERNAL_CHECKS_FETCH_404_BASE_DELAY
-    } else {
-        EXTERNAL_CHECKS_FETCH_BASE_DELAY
+    let policy = GetRetryPolicy {
+        max_attempts: EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS,
+        base_delay: EXTERNAL_CHECKS_FETCH_BASE_DELAY,
+        not_found_base_delay: Some(EXTERNAL_CHECKS_FETCH_404_BASE_DELAY),
+        remaining: None,
     };
-    base_delay.saturating_mul(2_u32.saturating_pow(attempt.saturating_sub(1)))
+    let bytes = get_bytes_with_retry(client, &url, &format!("external checks config {url}"), &policy).await?;
+    let contents = String::from_utf8(bytes)
+        .with_context(|| format!("external checks config {url} response body is not valid UTF-8"))?;
+    let extension = Path::new(url.path())
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+    let parsed = parse_checks_contents(&contents, extension, url.as_str())
+        .with_context(|| format!("failed to parse external checks config {url}"))?;
+    Ok(LoadedChecksFile {
+        origin: CheckConfigOrigin::ExternalUrl,
+        source_label: url.to_string(),
+        source_path: PathBuf::from(url.as_str()),
+        parsed,
+    })
 }
 
 fn resolve_checks_file_path(dir: &Path) -> Result<Option<PathBuf>, ConfigDiagnostic> {

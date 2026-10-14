@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::external::timeout::{CheckDeadline, output_with_timeout};
+use crate::http_retry::{GetRetryPolicy, get_bytes_with_retry};
 
 const VERSION: &str = "24.8.0";
 
@@ -63,7 +64,7 @@ pub(super) fn provision(check_id: &str, deadline: CheckDeadline) -> Result<PathB
     if npx.is_file() && destination.join("bin/node").is_file() {
         return Ok(npx);
     }
-    let url = format!("https://nodejs.org/dist/v{VERSION}/{name}.tar.gz");
+    let url: reqwest::Url = format!("https://nodejs.org/dist/v{VERSION}/{name}.tar.gz").parse()?;
     // Resolution is synchronous, and may itself be called inside a Tokio runtime.
     // Use an owned runtime on a scoped thread, as opposed to nesting block_on.
     let bytes = std::thread::scope(|scope| {
@@ -75,33 +76,14 @@ pub(super) fn provision(check_id: &str, deadline: CheckDeadline) -> Result<PathB
                     .build()?
                     .block_on(async {
                         let client = reqwest::Client::builder().build()?;
-                        for attempt in 0..4 {
-                            let result = async {
-                                Ok::<_, reqwest::Error>(
-                                    client
-                                        .get(&url)
-                                        .timeout(Duration::from_millis(deadline.remaining_ms().max(1)))
-                                        .send()
-                                        .await?
-                                        .error_for_status()?
-                                        .bytes()
-                                        .await?
-                                        .to_vec(),
-                                )
-                            }
-                            .await;
-                            match result {
-                                Ok(bytes) => return Ok(bytes),
-                                Err(error) => {
-                                    let delay_ms = 500 * (1 << attempt);
-                                    if attempt == 3 || deadline.remaining_ms() <= delay_ms {
-                                        return Err(error).context("download pinned Node");
-                                    }
-                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                }
-                            }
-                        }
-                        unreachable!("bounded download attempts")
+                        let remaining = || Duration::from_millis(deadline.remaining_ms());
+                        let policy = GetRetryPolicy {
+                            max_attempts: 4,
+                            base_delay: Duration::from_millis(500),
+                            not_found_base_delay: None,
+                            remaining: Some(&remaining),
+                        };
+                        get_bytes_with_retry(&client, &url, "pinned Node download", &policy).await
                     })
             })
             .join()

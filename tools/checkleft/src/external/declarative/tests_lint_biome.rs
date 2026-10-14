@@ -163,7 +163,7 @@ fn lint_biome_npm_default_resolves_to_npx_with_pinned_version() {
     assert_eq!(
         biome.prefix_args,
         vec!["--yes".to_owned(), "@biomejs/biome@2.5.0".to_owned()],
-        "default pin must produce `npx --yes @biomejs/biome@2.5.0`"
+        "default pin must resolve through the pinned runtime npx for @biomejs/biome@2.5.0"
     );
 }
 
@@ -181,7 +181,7 @@ fn lint_biome_npm_version_override_repins() {
     assert_eq!(
         resolved["biome"].display_invocation,
         "env PATH='/fake:/usr/bin:/bin:/usr/sbin:/sbin' '/fake/npx' --yes '@biomejs/biome@2.6.0'",
-        "version override must update display_invocation to `npx --yes @biomejs/biome@2.6.0`"
+        "version override must update display_invocation to the pinned runtime npx for @biomejs/biome@2.6.0"
     );
 }
 

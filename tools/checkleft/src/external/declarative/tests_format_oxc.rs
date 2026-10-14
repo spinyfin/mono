@@ -162,7 +162,7 @@ fn format_oxc_npm_default_resolves_to_npx_with_pinned_version() {
     assert_eq!(
         oxfmt.prefix_args,
         vec!["--yes".to_owned(), "oxfmt@0.55.0".to_owned()],
-        "default pin must produce `npx --yes oxfmt@0.55.0`"
+        "default pin must resolve through the pinned runtime npx for oxfmt@0.55.0"
     );
     assert_eq!(
         oxfmt.display_invocation,

@@ -163,7 +163,7 @@ fn lint_oxc_npm_default_resolves_to_npx_with_pinned_version() {
     assert_eq!(
         oxlint.prefix_args,
         vec!["--yes".to_owned(), "oxlint@1.70.0".to_owned()],
-        "default pin must produce `npx --yes oxlint@1.70.0`"
+        "default pin must resolve through the pinned runtime npx for oxlint@1.70.0"
     );
     assert_eq!(
         oxlint.display_invocation,
