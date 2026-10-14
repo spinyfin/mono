@@ -538,7 +538,9 @@ struct ContentView: View {
                 HStack {
                     Label(notice, systemImage: "exclamationmark.triangle")
                     Spacer()
-                    Button("Dismiss") { model.disconnectedActionNotice = nil }
+                    Button("Retry") { model.retryDisconnectedActions() }
+                        .disabled(!model.isConnected || !model.engine.hasUnsentActions)
+                    Button("Discard") { model.dismissDisconnectedActions() }
                 }
                 .padding(8)
                 .background(Color.orange.opacity(0.12))

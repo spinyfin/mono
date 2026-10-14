@@ -9,6 +9,8 @@ final class EngineClient: @unchecked Sendable {
     private var socketIndex = 0
     private let queue = DispatchQueue(label: "Boss.EngineClient")
     private var connection: NWConnection?
+    private var unsentActions: [[String: Any]] = []
+    private let retriedActionIDs = OSAllocatedUnfairLock(initialState: [String: Int]())
     private var buffer = Data()
     /// Connection whose read loop is suspended by decode backpressure.
     private var readPause = ReadLoopPauseGate<NWConnection>()
@@ -80,6 +82,7 @@ final class EngineClient: @unchecked Sendable {
     /// above the largest observed single reply (~25 MB `work_tree`) so
     /// backpressure only engages under a genuine decode backlog.
     static let maxPendingDecodeBytes = 128 * 1024 * 1024
+    private var pendingDecodeByteLimit = EngineClient.maxPendingDecodeBytes
     // Accessed only on the serial decode queue.
     private var decodingGeneration = 0
     private var rejectedDecodeGeneration: Int?
@@ -87,7 +90,7 @@ final class EngineClient: @unchecked Sendable {
     private var workTreeCache = WorkTreeDeltaCache()
 
     private lazy var handoff = LineDecodeHandoff(
-        maxPendingBytes: Self.maxPendingDecodeBytes,
+        maxPendingBytes: pendingDecodeByteLimit,
         decode: { [weak self] data, recvNanos in
             self?.decodeHook.withLock { $0 }?(data)
             self?.decodeLine(data, lineRecvNanos: recvNanos)
@@ -103,8 +106,9 @@ final class EngineClient: @unchecked Sendable {
         }
     )
 
-    init(socketPath: String) {
+    init(socketPath: String, pendingDecodeByteLimit: Int = EngineClient.maxPendingDecodeBytes) {
         self.socketPaths = [socketPath]
+        self.pendingDecodeByteLimit = pendingDecodeByteLimit
     }
 
     init(socketPaths: [String]) {
@@ -218,6 +222,12 @@ final class EngineClient: @unchecked Sendable {
     /// user actions must either queue or report a visible failure.
     @discardableResult
     func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true) -> String? {
+        queue.sync {
+            sendLineOnQueue(payload, queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
+        }
+    }
+
+    private func sendLineOnQueue(_ payload: [String: Any], queueIfDisconnected: Bool, reportIfDisconnected: Bool) -> String? {
         let envelopeRequestId = UUID().uuidString
         outboundRecorder?(payload)
 
@@ -236,12 +246,12 @@ final class EngineClient: @unchecked Sendable {
         }
 
         if simulateConnectedForTesting { return envelopeRequestId }
-        guard connection != nil else {
+        guard reachableState.withLock({ $0 }) else {
             // A send while the socket is down is a transport condition,
             // not an engine-reported error. Idempotent reads are held and
             // delivered on reconnect when the caller opts in with
-            // `queueIfDisconnected`; anything else is failed back to the
-            // app as a typed `.notConnected`.
+            // `queueIfDisconnected`; other reported actions are retained
+            // for explicit Retry and reported as typed `.notConnected`.
             let kind = (payload["type"] as? String) ?? "unknown"
             if queueIfDisconnected {
                 Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
@@ -263,12 +273,38 @@ final class EngineClient: @unchecked Sendable {
                 Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
                 return nil
             }
-            Self.log.info("dropped \(kind, privacy: .public) while disconnected; reporting not-connected")
+            unsentActions.append(payload)
+            Self.log.info("retained \(kind, privacy: .public) while disconnected; awaiting explicit retry")
             emit(.notConnected(requestKind: kind))
             return nil
         }
         return write(payload, envelopeRequestId: envelopeRequestId)
     }
+
+    /// Only actions never handed to Network.framework are eligible. Once a
+    /// write is attempted its delivery is uncertain, so it must not be replayed.
+    func retryUnsentActions() -> Bool {
+        queue.sync {
+            guard reachableState.withLock({ $0 }) else { return false }
+            let actions = unsentActions.map { (id: UUID().uuidString, payload: $0) }
+            unsentActions.removeAll()
+            let actionIDs = actions.map(\.id)
+            let generation = connectionGeneration
+            retriedActionIDs.withLock { ids in
+                for id in actionIDs { ids[id] = generation }
+            }
+            for action in actions {
+                write(action.payload, envelopeRequestId: action.id)
+            }
+            return true
+        }
+    }
+
+    func discardUnsentActions() {
+        queue.sync { unsentActions.removeAll() }
+    }
+
+    var hasUnsentActions: Bool { queue.sync { !unsentActions.isEmpty } }
 
     private static let log = Logger(subsystem: "Boss", category: "EngineClient")
     private static let maxQueuedReads = 64
@@ -318,6 +354,7 @@ final class EngineClient: @unchecked Sendable {
                 guard let self, self.connection === connection else { return }
                 if let error {
                     self.emit(.transportError(message: "socket send failed: \(error.localizedDescription)"))
+                    self.closeConnection()
                 }
             })
             return envelopeRequestId
@@ -384,7 +421,19 @@ final class EngineClient: @unchecked Sendable {
     /// have been decoded and emitted, so stale replies from the dropped
     /// connection never arrive after the disconnect.
     private func emitDisconnectedAfterPendingLines() {
-        handoff.afterPendingLines { [weak self] in self?.emit(.disconnected) }
+        let generation = connectionGeneration
+        handoff.afterPendingLines { [weak self] in
+            guard let self else { return }
+            let uncertain = self.retriedActionIDs.withLock { ids in
+                let pending = ids.filter { $0.value == generation }
+                for id in pending.keys { ids.removeValue(forKey: id) }
+                return !pending.isEmpty
+            }
+            if uncertain {
+                self.emit(.retriedActionsStatus(message: "Connection lost before confirmation. Check whether your actions completed before trying again."))
+            }
+            self.emit(.disconnected)
+        }
     }
 
     /// Pull every complete line out of `buffer`. Framing only — no JSON
@@ -445,6 +494,12 @@ final class EngineClient: @unchecked Sendable {
             workTreeCache.resetBase()
         }
         let envelopeRequestId = envelope["request_id"] as? String
+        if let id = envelopeRequestId {
+            let finished = retriedActionIDs.withLock { ids in
+                ids.removeValue(forKey: id) != nil && ids.isEmpty
+            }
+            if finished { emit(.retriedActionsStatus(message: nil)) }
+        }
 
         switch type {
         case "topic_event":

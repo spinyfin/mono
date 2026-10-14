@@ -33,6 +33,7 @@ extension ChatViewModel {
             UpdateLifecycle.recordStartup("engine-connected")
             markConnected()
             resetConnectionLostBanner()
+            if engine.hasUnsentActions { showDisconnectedActionNotice() }
             // A quota request in flight when the socket dropped will never be
             // answered, so clear the pending flag rather than leaving the
             // pane's Refresh button disabled for the rest of the session.
@@ -85,6 +86,7 @@ extension ChatViewModel {
             disconnectOffsiteBackupEdit()
             clearCoordinatorReset()
             isConnected = false
+            if engine.hasUnsentActions { showDisconnectedActionNotice() }
             stopBackgroundWorkPolling(clearSnapshot: true)
             isAppSessionRegistered = false
             subscribedWorkTopics.removeAll()
@@ -287,6 +289,9 @@ extension ChatViewModel {
             // debounced banner (`showConnectionLostBanner`) is the
             // user-facing signal; never a modal.
             appendSystemMessage(message)
+        case .retriedActionsStatus(let message):
+            disconnectedActionNotice = message
+            if engine.hasUnsentActions { showDisconnectedActionNotice() }
         case .notConnected(let requestKind):
             if requestKind == "recreate_coordinator" {
                 // The request was dropped, so no handoff will ever arrive.

@@ -7,10 +7,47 @@ import os
 /// asserting that lifecycle events (`.disconnected`, `.connected`) are
 /// delivered behind the replies already handed to the decoder.
 final class EngineClientLifecycleOrderingTests: XCTestCase {
+    func testActionDuringDisconnectIsRetriedExactlyOnce() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let connected = OSAllocatedUnfairLock(initialState: 0)
+        let disconnected = OSAllocatedUnfairLock(initialState: false)
+        let client = EngineClient(socketPath: path)
+        client.onEvent = { event in
+            if case .connected = event { connected.withLock { $0 += 1 } }
+            if case .disconnected = event {
+                XCTAssertNil(client.sendLine(["type": "create_chore", "name": "retained action"]))
+                XCTAssertFalse(client.retryUnsentActions(), "retry during the gap keeps the action")
+                disconnected.withLock { $0 = true }
+            }
+        }
+        client.start()
+        defer { client.stop() }
+        let first = try XCTUnwrap(server.accept(timeout: 5))
+        XCTAssertTrue(waitUntil(5) { connected.withLock { $0 == 1 } })
+        first.close()
+        XCTAssertTrue(waitUntil(5) { disconnected.withLock { $0 } })
+        let second = try XCTUnwrap(server.accept(timeout: 10))
+        defer { second.close() }
+        XCTAssertTrue(waitUntil(5) { connected.withLock { $0 == 2 } })
+        XCTAssertNil(second.readLine(timeout: 0.1), "mutations are not automatically replayed")
+        XCTAssertTrue(client.retryUnsentActions())
+        XCTAssertTrue(client.retryUnsentActions(), "a second click cannot resend the drained action")
+        let data = try XCTUnwrap(second.readLine(timeout: 5))
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let payload = try XCTUnwrap(envelope["payload"] as? [String: Any])
+        XCTAssertEqual(payload["type"] as? String, "create_chore")
+        XCTAssertEqual(payload["name"] as? String, "retained action")
+        XCTAssertNil(second.readLine(timeout: 0.2), "exactly one mutation reached the peer")
+    }
+
     private enum Seen: Equatable {
         case reply(String)
         case connected
         case disconnected
+        case retryConfirmed
+        case retryUncertain
     }
 
     private func line(_ message: String) throws -> Data {
@@ -44,6 +81,8 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
             case .connected: seen.withLock { $0.append(.connected) }
             case .disconnected: seen.withLock { $0.append(.disconnected) }
             case .error(let message): seen.withLock { $0.append(.reply(message)) }
+            case .retriedActionsStatus(let message):
+                seen.withLock { $0.append(message == nil ? .retryConfirmed : .retryUncertain) }
             default: break
             }
         }
@@ -75,12 +114,12 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
 
         let first = try XCTUnwrap(server.accept(timeout: 5))
         XCTAssertTrue(waitUntil(5) { seen.withLock { $0 } == [.connected] })
-        first.write(try line("old-reply"))
+        first.sendBytes(try line("old-reply"))
         XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
         first.close()  // EOF while the old decode is blocked
 
         let second = try XCTUnwrap(server.accept(timeout: 10), "client reconnected")
-        second.write(try line("new-reply"))
+        second.sendBytes(try line("new-reply"))
         // Neither lifecycle event may overtake the blocked old reply.
         RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         XCTAssertEqual(seen.withLock { $0 }, [.connected])
@@ -92,6 +131,44 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         XCTAssertTrue(waitUntil(5) { seen.withLock { $0.count >= expected.count } })
         XCTAssertEqual(seen.withLock { $0 }, expected)
         second.close()
+    }
+
+    func testDelayedDisconnectDoesNotInvalidateRetryOnReplacementConnection() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let seen = OSAllocatedUnfairLock(initialState: [Seen]())
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let client = makeClient(
+            path: path, seen: seen, blocking: "old-reply", started: started, release: release)
+        XCTAssertNil(client.sendLine(["type": "create_product", "name": "pending"]))
+        client.start()
+        defer { client.stop() }
+        defer { release.signal() }
+        let first = try XCTUnwrap(server.accept(timeout: 5))
+        XCTAssertTrue(waitUntil(5) { seen.withLock { $0 == [.connected] } })
+        first.sendBytes(try line("old-reply"))
+        XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+        first.close()
+        let second = try XCTUnwrap(server.accept(timeout: 10))
+        defer { second.close() }
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        XCTAssertTrue(client.retryUnsentActions())
+        let data = try XCTUnwrap(second.readLine(timeout: 5))
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let id = try XCTUnwrap(envelope["request_id"] as? String)
+        var response = try JSONSerialization.data(withJSONObject: [
+            "request_id": id, "payload": ["type": "error", "message": "new-reply"],
+        ])
+        response.append(0x0A)
+        second.sendBytes(response)
+        release.signal()
+        let expected: [Seen] = [
+            .connected, .reply("old-reply"), .disconnected, .connected, .retryConfirmed, .reply("new-reply"),
+        ]
+        XCTAssertTrue(waitUntil(5) { seen.withLock { $0.count >= expected.count } })
+        XCTAssertEqual(seen.withLock { $0 }, expected)
     }
 
     func testDelayedMalformedFrameCannotCloseReplacementConnection() throws {
@@ -109,18 +186,18 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
 
         let first = try XCTUnwrap(server.accept(timeout: 5))
         XCTAssertTrue(waitUntil(5) { seen.withLock { $0 } == [.connected] })
-        first.write(Data("invalid-frame\n".utf8) + (try line("rejected-reply")))
+        first.sendBytes(Data("invalid-frame\n".utf8) + (try line("rejected-reply")))
         XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
         first.close()
         let second = try XCTUnwrap(server.accept(timeout: 10))
         defer { second.close() }
-        second.write(try line("new-reply"))
+        second.sendBytes(try line("new-reply"))
         release.signal()
 
         let expected: [Seen] = [.connected, .disconnected, .connected, .reply("new-reply")]
         XCTAssertTrue(waitUntil(5) { seen.withLock { $0.count >= expected.count } })
         XCTAssertEqual(seen.withLock { $0 }, expected)
-        second.write(try line("still-connected"))
+        second.sendBytes(try line("still-connected"))
         XCTAssertTrue(waitUntil(5) { seen.withLock { $0.contains(.reply("still-connected")) } })
         XCTAssertEqual(seen.withLock { $0 }, expected + [.reply("still-connected")])
     }
@@ -140,7 +217,7 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
 
         let conn = try XCTUnwrap(server.accept(timeout: 5))
         XCTAssertTrue(waitUntil(5) { seen.withLock { $0 } == [.connected] })
-        conn.write(try line("old-reply"))
+        conn.sendBytes(try line("old-reply"))
         XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
         client.stop()  // cancels the connection → .cancelled state callback
 
@@ -160,7 +237,20 @@ private final class TestSocketServer {
     final class Peer {
         private let fd: Int32
         init(fd: Int32) { self.fd = fd }
-        func write(_ data: Data) {
+        func readLine(timeout: TimeInterval) -> Data? {
+            let deadline = Date().addingTimeInterval(timeout)
+            var data = Data()
+            while Date() < deadline {
+                var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                guard poll(&pfd, 1, Int32(max(1, deadline.timeIntervalSinceNow * 1000))) > 0 else { return nil }
+                var byte: UInt8 = 0
+                guard Darwin.read(fd, &byte, 1) == 1 else { return nil }
+                if byte == 0x0A { return data }
+                data.append(byte)
+            }
+            return nil
+        }
+        func sendBytes(_ data: Data) {
             data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
                 var offset = 0
                 while let base = buf.baseAddress, offset < buf.count {

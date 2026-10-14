@@ -107,4 +107,25 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
     private func makeModel() -> ChatViewModel {
         ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
     }
+
+    func testRetryConfirmationClearsNoticeAndUncertainDeliverySurvivesReconnect() {
+        let model = makeModel()
+        model.showDisconnectedActionNotice()
+        model.applyEventForTest(.retriedActionsStatus(message: nil))
+        XCTAssertNil(model.disconnectedActionNotice)
+        let uncertain = "Connection lost before confirmation. Check whether your actions completed before trying again."
+        model.applyEventForTest(.retriedActionsStatus(message: uncertain))
+        model.applyEventForTest(.connected)
+        XCTAssertEqual(model.disconnectedActionNotice, uncertain)
+    }
+
+    func testDiscardExplicitlyRemovesRetainedActions() {
+        let model = makeModel()
+        XCTAssertNil(model.engine.sendLine(["type": "create_product", "name": "discard-me"]))
+        XCTAssertTrue(model.engine.hasUnsentActions)
+        model.showDisconnectedActionNotice()
+        model.dismissDisconnectedActions()
+        XCTAssertFalse(model.engine.hasUnsentActions)
+        XCTAssertNil(model.disconnectedActionNotice)
+    }
 }
