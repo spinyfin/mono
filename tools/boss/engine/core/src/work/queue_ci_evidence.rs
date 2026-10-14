@@ -4,7 +4,7 @@
 use super::*;
 use boss_protocol::{QueueCiEvidence, RunDoneOutcome, RunDoneProposalPayload};
 
-pub(crate) const REQUIRED: &str = "Merge-queue CI verification required: fetch origin, rebase the PR onto current origin/main, and run every failed target with Bazel (the full job invocation for whole-job failures). Supply --queue-ci-evidence-file with main_sha, verified_head_sha, queue_sha, queue_base_sha and successful runs (check_name, source_url, command, exit_code, output, coverage). PR-head checks or isolated un-rebased reruns are not evidence. This gate does not expire; continue verification before declaring failure.";
+pub(crate) const REQUIRED: &str = "Merge-queue CI verification required: fetch origin, rebase the PR onto current origin/main, and run every failed target with Bazel (the full job invocation for whole-job failures; `checkleft run` for a lint job; the job's own npm/pnpm/yarn invocation for a non-Bazel job). Supply --queue-ci-evidence-file with main_sha, verified_head_sha, queue_sha, queue_base_sha and successful runs (check_name, source_url, command, exit_code, output, coverage). A requeue of an unchanged head also needs queue_entry_id and queue_entry_enqueued_at from the enqueuePullRequest receipt (mergeQueueEntry { id enqueuedAt }). PR-head checks or isolated un-rebased reruns are not evidence. This gate does not expire; continue verification before declaring failure.";
 
 pub(crate) fn queue_ci_verification_required(attempt: &CiRemediation) -> bool {
     // A Trunk construction rejection with no failing build is a conflict or
@@ -23,11 +23,42 @@ fn is_trunk_empty_capture(attempt: &CiRemediation) -> bool {
     attempt.failure_kind.as_deref() == Some("trunk_queue_eviction") && !queue_ci_verification_required(attempt)
 }
 
+/// Classify a failed check by its job label: the last `/` segment, which for
+/// a Trunk capture is the Buildkite step key or job name (see
+/// `ci_watch::trunk_eviction_failures_from_build`) and for a GitHub queue
+/// capture is the check name. Leading `:emoji:` tokens are ignored.
 fn is_lint_check(name: &str) -> bool {
-    matches!(
-        name.rsplit('/').next(),
-        Some("checks" | "checkleft" | "lint" | "clippy")
-    )
+    let segment = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    let label = segment
+        .split_whitespace()
+        .filter(|w| !(w.len() > 1 && w.starts_with(':') && w.ends_with(':')))
+        .collect::<Vec<_>>()
+        .join(" ");
+    ["lint", "clippy", "checkleft"].iter().any(|k| label.contains(k)) || label == "check" || label.starts_with("checks")
+}
+
+fn is_bazel_command(words: &[&str]) -> bool {
+    words.first() == Some(&"bazel")
+        && matches!(words.get(1), Some(&"build" | &"test"))
+        && words.iter().any(|w| w.starts_with("//"))
+        && !words.iter().any(|w| w.starts_with("--test_filter"))
+}
+
+/// A non-Bazel job's own invocation, e.g. flunge's
+/// `npm ci && npm run build && npm run test`: every `&&` segment must be an
+/// npm/pnpm/yarn command.
+fn is_project_command(command: &str) -> bool {
+    let mut segments = command.split("&&").map(str::trim).peekable();
+    segments.peek().is_some()
+        && segments.all(|segment| matches!(segment.split_whitespace().next(), Some("npm" | "npx" | "pnpm" | "yarn")))
+}
+
+/// A run that can cover a failed non-lint job: a Bazel test, or a project
+/// command that runs the job's tests.
+fn is_test_run(command: &str) -> bool {
+    let words: Vec<_> = command.split_whitespace().collect();
+    (is_bazel_command(&words) && words.get(1) == Some(&"test"))
+        || (is_project_command(command) && words.contains(&"test"))
 }
 
 pub(crate) fn validate(attempt: &CiRemediation, evidence: Option<&QueueCiEvidence>) -> Result<()> {
@@ -96,18 +127,16 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
     anyhow::ensure!(!evidence.runs.is_empty(), "{REQUIRED} No Bazel results supplied.");
     for run in &evidence.runs {
         let words: Vec<_> = run.command.split_whitespace().collect();
-        let bazel = words.first() == Some(&"bazel")
-            && matches!(words.get(1), Some(&"build" | &"test"))
-            && words.iter().any(|w| w.starts_with("//"))
-            && !words.iter().any(|w| w.starts_with("--test_filter"));
         anyhow::ensure!(
-            (bazel || (is_lint_check(&run.check_name) && words == ["checkleft", "run"]))
+            (is_bazel_command(&words)
+                || is_project_command(&run.command)
+                || (is_lint_check(&run.check_name) && words == ["checkleft", "run"]))
                 && !run.check_name.trim().is_empty()
                 && run.exit_code == 0
                 && !run.output.trim().is_empty()
                 && !run.coverage.trim().is_empty()
                 && run.source_url.starts_with("https://"),
-            "{REQUIRED} Every run must report a successful complete Bazel invocation (or checkleft run for lint), its output and coverage."
+            "{REQUIRED} Every run must report a successful complete Bazel invocation (or checkleft run for lint, or the job's npm/pnpm/yarn invocation), its output and coverage."
         );
     }
     if let Some(base) = &attempt.queue_base_sha {
@@ -120,11 +149,8 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
     let checks: Vec<serde_json::Value> = serde_json::from_str(&attempt.failed_checks).unwrap_or_default();
     if checks.is_empty() {
         anyhow::ensure!(
-            evidence
-                .runs
-                .iter()
-                .any(|r| r.command.split_whitespace().take(2).eq(["bazel", "test"])),
-            "{REQUIRED} Incomplete captures require Bazel test evidence for the resolved queue build."
+            evidence.runs.iter().any(|r| is_test_run(&r.command)),
+            "{REQUIRED} Incomplete captures require test evidence for the resolved queue build."
         );
     }
     for check in checks {
@@ -133,7 +159,7 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
         anyhow::ensure!(
             evidence.runs.iter().any(|r| url.is_none_or(|url| r.source_url == url)
                 && r.check_name == name
-                && (is_lint_check(name) || r.command.split_whitespace().nth(1) == Some("test"))),
+                && (is_lint_check(name) || is_test_run(&r.command))),
             "{REQUIRED} Missing complete verification for check {name} (source: {url:?})."
         );
     }
@@ -157,6 +183,15 @@ pub(crate) fn attempt_for_execution(conn: &Connection, execution_id: &str) -> Re
     id.map(|id| super::mappers::query_ci_remediation(conn, &id))
         .transpose()
         .map(Option::flatten)
+}
+
+/// A requeue receipt names the queue entry and when it was enqueued.
+fn requeue_receipt_present(evidence: &QueueCiEvidence) -> bool {
+    evidence.queue_entry_id.as_ref().is_some_and(|id| !id.trim().is_empty())
+        && evidence
+            .queue_entry_enqueued_at
+            .as_deref()
+            .is_some_and(|t| chrono::DateTime::parse_from_rfc3339(t).is_ok())
 }
 
 pub(crate) fn validate_declaration(
@@ -191,12 +226,8 @@ pub(crate) fn validate_declaration(
         })
     {
         anyhow::ensure!(
-            payload
-                .queue_ci_evidence
-                .as_ref()
-                .and_then(|e| e.queue_entry_id.as_deref())
-                .is_some_and(|id| !id.trim().is_empty()),
-            "Re-enqueue the verified PR head with enqueuePullRequest and include its queue_entry_id receipt. No new SHA or empty commit is required."
+            payload.queue_ci_evidence.as_ref().is_some_and(requeue_receipt_present),
+            "Re-enqueue the verified PR head with enqueuePullRequest and include its queue_entry_id and queue_entry_enqueued_at (mergeQueueEntry {{ id enqueuedAt }}) receipt. No new SHA or empty commit is required."
         );
     }
     Ok(())
@@ -214,7 +245,7 @@ pub(crate) fn record_delivery(conn: &Connection, execution_id: &str, payload: &R
         && attempt.failure_kind.as_deref() == Some("merge_queue_rebounce")
         && let Some(evidence) = &payload.queue_ci_evidence
         && attempt.failure_reason.as_deref() != Some("verified_requeue")
-        && evidence.queue_entry_id.as_ref().is_some_and(|id| !id.trim().is_empty())
+        && requeue_receipt_present(evidence)
     {
         let head = super::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger);
         conn.execute(
@@ -246,6 +277,29 @@ impl WorkDb {
     ) -> Result<()> {
         let attempt = self.get_ci_remediation(attempt_id)?.context("unknown CI attempt")?;
         validate_give_up(&attempt, evidence, reason)
+    }
+
+    /// The queue-side attempt and evidence behind this execution's applied
+    /// `delivered` declaration, for the post-hoc evidence audit.
+    pub(crate) fn queue_ci_delivery_for_audit(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<(CiRemediation, QueueCiEvidence)>> {
+        let conn = self.connect()?;
+        let payload: Option<String> = conn.query_row(
+            "SELECT payload_json FROM worker_proposals WHERE execution_id = ?1 AND kind = 'run_done' AND state = 'applied' ORDER BY created_at DESC LIMIT 1",
+            [execution_id], |row| row.get(0),
+        ).optional()?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let payload: RunDoneProposalPayload = serde_json::from_str(&payload)?;
+        let (RunDoneOutcome::Delivered, Some(evidence)) = (payload.outcome, payload.queue_ci_evidence) else {
+            return Ok(None);
+        };
+        Ok(attempt_for_execution(&conn, execution_id)?
+            .filter(|a| crate::ci_watch::is_queue_side_failure_kind(a.failure_kind.as_deref()))
+            .map(|a| (a, evidence)))
     }
 
     pub(crate) fn has_verified_queue_delivery(&self, execution_id: &str, head_sha: &str) -> Result<bool> {
@@ -410,6 +464,12 @@ mod tests {
         payload.queue_ci_evidence = Some(proof.clone());
         assert_eq!(submit("missing-requeue", &payload).state, ProposalState::Rejected);
         proof.queue_entry_id = Some("MQE_receipt".into());
+        assert!(
+            !requeue_receipt_present(&proof),
+            "a receipt id alone does not anchor the requeue"
+        );
+        proof.queue_entry_enqueued_at = Some("2026-07-27T23:10:00Z".into());
+        assert!(requeue_receipt_present(&proof));
         payload.queue_ci_evidence = Some(proof);
         assert_eq!(submit("same-head-requeued", &payload).state, ProposalState::Applied);
         assert!(db.has_verified_queue_delivery(&execution.id, &"b".repeat(40)).unwrap());
@@ -417,10 +477,76 @@ mod tests {
         let changed = payload.queue_ci_evidence.as_mut().unwrap();
         changed.verified_head_sha = "e".repeat(40);
         changed.queue_entry_id = None;
+        changed.queue_entry_enqueued_at = None;
         assert_eq!(
             submit("changed-head-auto-merge", &payload).state,
             ProposalState::Applied
         );
+    }
+
+    /// Trunk captures name each failed job `Trunk merge queue: <pipeline>/<label>`
+    /// (see `ci_watch::trunk_eviction_failures_from_build`), differing by the
+    /// `#job` fragment. A lint job and a non-Bazel job must be evidenceable.
+    #[test]
+    fn trunk_shaped_lint_and_non_bazel_jobs_are_evidenceable() {
+        let build = boss_ci_log_reader::TrunkEvictionBuild {
+            pipeline_slug: "flunge-ci".into(),
+            build_number: "7".into(),
+            web_url: "https://buildkite.com/flunge/flunge-ci/builds/7".into(),
+            failed_job_ids: vec!["job-lint".into(), "job-fe".into()],
+            failed_job_labels: vec![":mag: checks-framework".into(), "frontend-tests".into()],
+        };
+        let failures = crate::ci_watch::trunk_eviction_failures_from_build(&build);
+        let checks: Vec<_> = failures
+            .iter()
+            .map(|f| serde_json::json!({"name": f.name, "target_url": f.target_url}))
+            .collect();
+        assert!(is_lint_check(&failures[0].name));
+        assert!(!is_lint_check(&failures[1].name));
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let revision = crate::test_support::create_test_chore(&db, product.id.clone(), "Trunk CI");
+        let mut attempt = db
+            .insert_ci_remediation(CiRemediationInsertInput {
+                product_id: product.id,
+                work_item_id: revision.id.clone(),
+                pr_url: "https://github.com/spinyfin/mono/pull/3150".into(),
+                pr_number: 3150,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: "trunk:entry_2@2026-07-27T23:07:13.000Z".into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: serde_json::Value::Array(checks).to_string(),
+                failure_kind: "trunk_queue_eviction".into(),
+                before_commit_sha: None,
+            })
+            .unwrap()
+            .unwrap();
+        let run = |i: usize, command: &str| QueueCiRun {
+            check_name: failures[i].name.clone(),
+            source_url: failures[i].target_url.clone(),
+            command: command.into(),
+            exit_code: 0,
+            output: "ok".into(),
+            coverage: "whole job".into(),
+        };
+        let mut proof = evidence();
+        proof.runs = vec![
+            run(0, "checkleft run"),
+            run(1, "npm ci && npm run build && npm run test"),
+        ];
+        assert!(validate(&attempt, Some(&proof)).is_ok());
+        // Each job still needs its own successful, matching verification.
+        proof.runs[1] = run(1, "checkleft run");
+        assert!(validate(&attempt, Some(&proof)).is_err());
+        proof.runs[1] = run(1, "npm ci && make test");
+        assert!(validate(&attempt, Some(&proof)).is_err());
+        proof.runs = vec![run(0, "checkleft run")];
+        assert!(validate(&attempt, Some(&proof)).is_err());
+        // A GitHub-style `checks-framework` lint name is also a lint job.
+        assert!(is_lint_check("checks-framework"));
+        attempt.failed_checks = "[]".into();
+        assert!(!is_lint_check("bazel-build-test"));
     }
 
     #[test]

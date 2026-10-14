@@ -1031,25 +1031,42 @@ impl WorkDb {
         Ok(exists)
     }
 
-    /// Epoch-seconds time the latest retired (verified-requeue) attempt for
-    /// this PR head was created. Verified requeues archive only the newest
-    /// queue construction's dedup key, so every older coalesced failure at
-    /// this head is pre-requeue history. All of those failures were already
-    /// on the timeline when the attempt was detected, so they precede its
-    /// creation; anchoring to the episode (not the delivery time) keeps a real
-    /// failure of the requeued construction, which lands after detection but
-    /// possibly before the proposal is applied, from being skipped.
+    /// Epoch-seconds boundary below which same-head queue failures are
+    /// pre-requeue history. A verified requeue archives only the newest queue
+    /// construction's dedup key, so older failures coalesced into the retired
+    /// attempt after its detection no longer match any row. The boundary is
+    /// the requeue itself: the receipt's `enqueuedAt` from the applied
+    /// evidence, so a failure of the requeued construction (whose dequeue
+    /// follows `enqueuedAt`) still mints. Rows without a recorded receipt time
+    /// fall back to the attempt's creation, the best pre-receipt anchor.
     pub fn verified_requeue_boundary(&self, work_item_id: &str, pr_head_sha: &str) -> Result<Option<i64>> {
         let conn = self.connect()?;
-        let boundary: Option<i64> = conn.query_row(
-            "SELECT MAX(CAST(created_at AS INTEGER)) FROM ci_remediations
+        let mut stmt = conn.prepare(
+            "SELECT CAST(created_at AS INTEGER), revision_task_id, head_sha_at_trigger FROM ci_remediations
               WHERE work_item_id = ?1
                 AND failure_kind = 'merge_queue_rebounce'
                 AND failure_reason = 'verified_requeue'
                 AND head_sha_at_trigger LIKE 'mq:' || ?2 || '@%'",
-            params![work_item_id, pr_head_sha],
-            |row| row.get(0),
         )?;
+        let rows = stmt
+            .query_map(params![work_item_id, pr_head_sha], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut boundary: Option<i64> = None;
+        for (created, revision_task_id, trigger) in rows {
+            let queue_sha = trigger.rsplit('@').next().unwrap_or_default();
+            let enqueued = match revision_task_id {
+                Some(revision) => requeue_enqueued_at(&conn, &revision, queue_sha)?,
+                None => None,
+            };
+            let candidate = enqueued.map_or(created, |e| e.max(created));
+            boundary = Some(boundary.map_or(candidate, |b| b.max(candidate)));
+        }
         Ok(boundary)
     }
 
@@ -2228,6 +2245,29 @@ impl WorkDb {
 // ordering and the `deleted_at` guard on the attempts-used writers. This
 // module is intentionally narrow: it holds only the unknown-work-item
 // fallbacks for those same methods, which none of the external tests cover.
+/// Epoch seconds of the `enqueuedAt` receipt in the applied `run_done`
+/// evidence that retired the attempt for queue commit `queue_sha`.
+fn requeue_enqueued_at(conn: &Connection, revision_task_id: &str, queue_sha: &str) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.payload_json FROM worker_proposals p JOIN work_executions e ON e.id = p.execution_id
+          WHERE e.work_item_id = ?1 AND p.kind = 'run_done' AND p.state = 'applied'
+          ORDER BY p.created_at DESC",
+    )?;
+    let payloads = stmt
+        .query_map(params![revision_task_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(payloads
+        .iter()
+        .filter_map(|p| serde_json::from_str::<boss_protocol::RunDoneProposalPayload>(p).ok())
+        .filter_map(|p| p.queue_ci_evidence)
+        .filter(|e| e.queue_sha == queue_sha)
+        .find_map(|e| {
+            chrono::DateTime::parse_from_rfc3339(e.queue_entry_enqueued_at.as_deref()?)
+                .ok()
+                .map(|t| t.timestamp())
+        }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

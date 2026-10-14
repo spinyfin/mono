@@ -1764,8 +1764,16 @@ pub(crate) fn trunk_eviction_failures_from_build(
     build
         .failed_job_ids
         .iter()
-        .map(|job_id| RequiredCheckFailure {
-            name: format!("Trunk merge queue: {}", build.pipeline_slug),
+        .enumerate()
+        .map(|(i, job_id)| RequiredCheckFailure {
+            // The job label is the last `/` segment, which is what the queue
+            // evidence gate classifies (lint vs. test) a failed job by.
+            name: match build.failed_job_labels.get(i).map(|l| l.replace('/', "-")) {
+                Some(label) if !label.trim().is_empty() => {
+                    format!("Trunk merge queue: {}/{}", build.pipeline_slug, label.trim())
+                }
+                _ => format!("Trunk merge queue: {}", build.pipeline_slug),
+            },
             conclusion: "failure".to_owned(),
             target_url: format!("{}#{job_id}", build.web_url),
             provider: crate::merge_poller::CiProvider::Buildkite,

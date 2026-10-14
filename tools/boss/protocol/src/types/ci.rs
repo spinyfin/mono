@@ -331,6 +331,10 @@ pub struct QueueCiEvidence {
     /// GitHub enqueuePullRequest receipt, required for an unchanged-head delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_entry_id: Option<String>,
+    /// RFC 3339 `mergeQueueEntry.enqueuedAt` from the same receipt. Anchors
+    /// the dedup boundary: queue failures at or before it are superseded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_entry_enqueued_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]

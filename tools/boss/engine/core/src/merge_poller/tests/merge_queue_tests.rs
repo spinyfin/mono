@@ -1584,6 +1584,7 @@ async fn verified_same_head_requeue_allows_a_later_queue_failure() {
                 .queue_sha(queue.clone())
                 .queue_base_sha(base.clone())
                 .queue_entry_id("receipt")
+                .queue_entry_enqueued_at("2023-12-01T00:00:00Z")
                 .runs(vec![QueueCiRun {
                     check_name: "bazel-build-test".into(),
                     source_url: "https://buildkite.com/foo/bar/builds/42".into(),
@@ -1658,6 +1659,9 @@ async fn verified_same_head_requeue_allows_a_later_queue_failure() {
     let mut timeline = vec![
         event(&older_queue, "2020-01-01T00:00:00Z"),
         event(&queue, "2020-01-02T00:00:00Z"),
+        // Coalesced into the active attempt after it was created, but before
+        // the requeue: the verified requeue supersedes it too.
+        event(&"f".repeat(40), "2023-11-20T00:00:00Z"),
     ];
     let mut outcome = SweepOutcome::default();
     let replay = |timeline: &Vec<MergeQueueDequeueEvent>| HashMap::from([(pr.to_owned(), timeline.clone())]);

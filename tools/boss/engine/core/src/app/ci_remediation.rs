@@ -202,13 +202,16 @@ pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: F
             // comes.
             let resubmit_sentence = match failure_kind.as_deref() {
                 Some("trunk_queue_eviction") => {
-                    "Push a fix onto the PR branch instead — the engine resubmits the PR to the \
-                     queue once this revision comes to rest and head CI is green."
+                    "Verify the fix on a main-rebased tree and declare it delivered with the evidence \
+                     — the engine resubmits the PR to the queue once this revision comes to rest and \
+                     head CI is green."
                 }
                 _ => {
-                    "Push a fix onto the PR branch instead — the PR re-enters GitHub's merge queue \
-                     on its own once a fix lands and its checks pass; there is no engine-side \
-                     resubmit for this failure kind."
+                    "Verify the fix on a main-rebased tree, push it, and requeue explicitly: \
+                     `gh pr merge --auto --squash --match-head-commit <verified head>` for a changed \
+                     head, or `enqueuePullRequest` (keeping its queue_entry_id and enqueuedAt receipt) \
+                     for an unchanged head. GitHub does not re-enter the queue on its own and there is \
+                     no engine-side resubmit for this failure kind."
                 }
             };
             send_response(
@@ -222,8 +225,10 @@ pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: F
                          green already and re-running it proves nothing. `mark-retriggered` is \
                          terminal and would leave the PR permanently out of its merge queue. \
                          {resubmit_sentence} If the failure is genuinely not fixable from this PR, \
-                         use `boss engine ci mark-failed --attempt-id {attempt_id} --reason <reason>`.",
+                         use `boss engine ci mark-failed --attempt-id {attempt_id} --reason <reason> \
+                         --queue-ci-evidence-file <path>`. {required}",
                         kind = failure_kind.as_deref().unwrap_or("queue-side"),
+                        required = crate::work::queue_ci_evidence::REQUIRED,
                     ),
                 },
             );
@@ -385,12 +390,15 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
                     attempt_id: attempt.id.clone(),
                     work_item_id: attempt.work_item_id.clone(),
                     pr_url: attempt.pr_url.clone(),
-                    status: "This attempt's failure lives on a synthetic/ephemeral commit, not the PR head, so \
-                             head-branch CI going green proves nothing about it. If post-rebase CI is green, do \
-                             not retry this verb — push the fix and get the PR resubmitted to its queue (Trunk \
-                             or GitHub's merge queue as applicable) and stop; the poller retires the attempt when \
-                             the queue outcome is observed. If CI is still red, fix the semantic conflict and push."
-                        .to_owned(),
+                    status: format!(
+                        "This attempt's failure lives on a synthetic/ephemeral commit, not the PR head, so \
+                         head-branch CI going green proves nothing about it. Do not retry this verb. {} Then \
+                         requeue as documented in tools/boss/docs/runbooks/merge-queue-ci-verification.md \
+                         (GitHub: `gh pr merge --auto --match-head-commit` or `enqueuePullRequest` with its \
+                         receipt; Trunk: declare delivered and the engine resubmits) and stop; the poller \
+                         retires the attempt when the queue outcome is observed.",
+                        crate::work::queue_ci_evidence::REQUIRED
+                    ),
                     live_sha: None,
                 },
             );
@@ -627,10 +635,13 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
                     attempt_id: attempt.id.clone(),
                     work_item_id: attempt.work_item_id.clone(),
                     pr_url: attempt.pr_url.clone(),
-                    status: "This attempt's failure lives on a synthetic/ephemeral commit, not the PR head, so \
-                             head-branch CI cannot validate it. Fix the failure and get the PR resubmitted to its \
-                             queue, or use `boss engine ci mark-failed`."
-                        .to_owned(),
+                    status: format!(
+                        "This attempt's failure lives on a synthetic/ephemeral commit, not the PR head, so \
+                         head-branch CI cannot validate it. {} Fix the failure and requeue as documented in \
+                         tools/boss/docs/runbooks/merge-queue-ci-verification.md, or use `boss engine ci \
+                         mark-failed --queue-ci-evidence-file <path>`.",
+                        crate::work::queue_ci_evidence::REQUIRED
+                    ),
                     live_sha: None,
                     observed_sha,
                 },
