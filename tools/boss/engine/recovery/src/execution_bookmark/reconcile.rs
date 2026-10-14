@@ -560,3 +560,48 @@ pub async fn reconcile(
         ),
     ))
 }
+
+/// Move an execution's whole pointer set onto a commit that was just pushed
+/// as the PR head, after an engine rebase rewrote the lineage the pointers
+/// sit on. Adopts only when that commit already carries every preserved
+/// change of both heads (ancestry, or a content-equivalent rewrite), so a
+/// later recovery stages nothing the PR already has and no pointer ends up
+/// on a different lineage from the others. Otherwise nothing moves and the
+/// uncontained changes are named in the error.
+pub async fn adopt_pushed_head(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    pushed_head: &str,
+    trunk: &str,
+) -> Result<Anchor> {
+    let heads = resolve_heads(jj, record).await?;
+    let (base, _) = resolve_base(jj, record, &heads).await?;
+    let named = heads.named(record);
+    let superseded = superseded_pointers(jj, record, &named, Some(&base), pushed_head, trunk).await?;
+    if superseded.iter().any(|pointer| !pointer.containment.is_contained()) {
+        return Err(not_contained_error(
+            record,
+            Some(&base),
+            "the pushed PR head",
+            pushed_head,
+            &superseded,
+            "an engine rebase rewrote the PR branch",
+        ));
+    }
+    let mut bookmarks = vec![record.base()];
+    bookmarks.extend(named.iter().map(|(bookmark, _)| bookmark.clone()));
+    set_bookmarks(jj, record, &bookmarks, pushed_head).await?;
+    Ok(Anchor::PrHead {
+        bookmark: "pushed PR head".to_owned(),
+        commit: pushed_head.to_owned(),
+    })
+}
+
+/// The commit a bookmark currently resolves to, if it exists unambiguously.
+pub async fn resolve_bookmark_commit(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    bookmark: &str,
+) -> Result<Option<String>> {
+    resolve_optional(jj, &record.repo_path, bookmark).await
+}

@@ -386,16 +386,7 @@ pub(crate) async fn run_rung1_in_lease(
     pr_number: u64,
     lease: &crate::coordinator::CubeWorkspaceLease,
 ) -> LadderOutcome {
-    let saved = match work_db.snapshot_rebase_pointers(&candidate.work_item_id).await {
-        Ok(saved) => saved,
-        Err(err) => {
-            tracing::warn!(?err, "cannot snapshot recovery pointers before rebase");
-            return LadderOutcome::FellThrough {
-                residual_conflict_files: None,
-                reason: "cannot snapshot recovery pointers",
-            };
-        }
-    };
+    let saved = work_db.snapshot_rebase_pointers(&candidate.work_item_id).await;
     if let Err(err) = cube_client.goto_workspace(&lease.workspace_path, pr_number).await {
         work_db.restore_rebase_pointers(&saved).await;
         tracing::warn!(
@@ -431,12 +422,9 @@ pub(crate) async fn run_rung1_in_lease(
         }
     };
 
-    let restored = work_db.restore_rebase_pointers(&saved).await;
-    if restored && let Err(err) = work_db.checkpoint_rewritten_baselines(&candidate.work_item_id).await {
-        tracing::warn!(?err, "rebase baseline checkpoint unavailable");
-    }
-
     if rebase.clean {
+        // A clean push is the whole operation: adopt the pushed PR head.
+        finish_rebase_pointers(work_db, &saved, attempt, candidate, rebase.pushed).await;
         if rebase.pushed {
             // Vet rung 1's pushed resolution against the
             // both-parents deletion tripwire before auto-retiring.
@@ -538,11 +526,15 @@ pub(crate) async fn run_rung1_in_lease(
         // "did not resolve every residual file" message previously
         // misdiagnosed a resolved-but-push-rejected result as an unresolved
         // one.
+        // Any non-fall-through outcome means rung 0 pushed its resolution.
+        let pushed = !matches!(rung0_outcome, LadderOutcome::FellThrough { .. });
+        finish_rebase_pointers(work_db, &saved, attempt, candidate, pushed).await;
         match rung0_outcome {
             LadderOutcome::FellThrough { reason, .. } => reason,
             other => return other,
         }
     } else {
+        finish_rebase_pointers(work_db, &saved, attempt, candidate, false).await;
         // Rung 0 is compile-time gated off (see `RUNG0_APPLY_LIVE`). Emit one
         // line so the engine trace records *why* the deterministic resolvers
         // show zero activity — a config fact, not a dispatch/logging bug
@@ -582,6 +574,29 @@ pub(crate) async fn run_rung1_in_lease(
     LadderOutcome::FellThrough {
         residual_conflict_files: Some(residual_conflict_files),
         reason: rung0_fallthrough_reason,
+    }
+}
+
+/// Close the pointer-protection window opened before cube's goto/rebase:
+/// restore the saved recovery pointers and, when the operation pushed a PR
+/// head, adopt it for every record whose work it already carries.
+async fn finish_rebase_pointers(
+    work_db: &WorkDb,
+    saved: &[(
+        boss_engine_recovery::execution_bookmark::ExecutionBookmark,
+        boss_engine_recovery::execution_bookmark::PointerSnapshot,
+    )],
+    attempt: &ConflictResolution,
+    candidate: &PendingMergeCheck,
+    pushed: bool,
+) {
+    let branch = pushed.then_some(attempt.head_branch.as_str());
+    if work_db
+        .finish_rebase_pointers(saved, branch, &attempt.base_branch)
+        .await
+        && let Err(err) = work_db.checkpoint_rewritten_baselines(&candidate.work_item_id).await
+    {
+        tracing::warn!(?err, "rebase baseline checkpoint unavailable");
     }
 }
 
@@ -908,7 +923,7 @@ async fn verify_deletion_tripwire(
 /// regardless of which rung produced it. Does NOT publish
 /// `ConflictResolutionSucceeded` (this is not a success) and does not spawn
 /// any worker (there is no automatic remediation for a flagged deletion —
-/// the operator must approve the flagged deletion).
+/// flagged deletions require explicit human approval).
 async fn halt_attempt_for_deletion_signoff(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,

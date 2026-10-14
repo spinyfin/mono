@@ -270,13 +270,7 @@ pub(crate) async fn run_in_lease(
     pr_number: u64,
     workspace_path: &Path,
 ) {
-    let saved = match work_db.snapshot_rebase_pointers(&candidate.work_item_id).await {
-        Ok(saved) => saved,
-        Err(err) => {
-            tracing::warn!(?err, "cannot snapshot recovery pointers before rebase");
-            return;
-        }
-    };
+    let saved = work_db.snapshot_rebase_pointers(&candidate.work_item_id).await;
     if let Err(err) = cube_client.goto_workspace(workspace_path, pr_number).await {
         work_db.restore_rebase_pointers(&saved).await;
         tracing::warn!(

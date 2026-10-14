@@ -391,3 +391,377 @@ async fn speculative_rewrite_restores_original_baseline_before_next_goto() {
     assert!(patch.contains("revision.txt"));
     assert!(!patch.contains("upstream.txt"));
 }
+
+/// Recovery pointers across the engine's own mechanical rebases: the saved
+/// identities are kept across the whole operation (including rung 0's push),
+/// a pushed PR head is adopted by every record that already carries its work,
+/// and revision executions on the same PR branch are protected too.
+mod rebase_adoption {
+    use super::*;
+    use crate::conflict_ladder::{LadderOutcome, run_rung1_in_lease};
+    use crate::work::{
+        ConflictResolution, ConflictResolutionInsertInput, CreateRevisionInput, FakePrStateChecker, PrOpenState,
+    };
+    use recovery::ExecutionBookmark;
+
+    #[derive(bon::Builder)]
+    struct Fixture {
+        dir: tempfile::TempDir,
+        db: WorkDb,
+        candidate: crate::work::PendingMergeCheck,
+        chore_id: String,
+        attempt: ConflictResolution,
+        repo: JjRepo,
+        root: ExecutionBookmark,
+    }
+
+    async fn fixture() -> Fixture {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let (candidate, chore_id) = rebase_candidate(&db);
+        db.mark_chore_blocked_merge_conflict(&chore_id, &candidate.pr_url)
+            .unwrap();
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&chore_id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        let repo = JjRepo::new(dir.path());
+        JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
+        JjRepo::run(&repo.worker, &["new", "main", "-m", "PR work"]);
+        std::fs::write(repo.worker.join("pr.txt"), "implementation").unwrap();
+        JjRepo::run(&repo.worker, &["new", "-m", "Revision"]);
+        let root = recovery::create(&LocalJj, &repo.worker, &execution.id, "local")
+            .await
+            .unwrap();
+        db.record_execution_bookmark(&root).unwrap();
+        std::fs::write(repo.worker.join("revision.txt"), "revision").unwrap();
+        JjRepo::run(&repo.worker, &["status"]);
+        JjRepo::run(&repo.repo, &["new", "main", "-m", "Upstream"]);
+        std::fs::write(repo.repo.join("upstream.txt"), "upstream").unwrap();
+        JjRepo::run(&repo.repo, &["bookmark", "set", "upstream", "-r", "@"]);
+        // The PR branch is the root execution's publication bookmark, as it is
+        // when cube publishes a worker's branch.
+        let attempt = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: candidate.product_id.clone(),
+                work_item_id: chore_id.clone(),
+                pr_url: candidate.pr_url.clone(),
+                pr_number: 42,
+                head_branch: root.publication(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base".into()),
+                head_sha_before: Some("head".into()),
+            })
+            .unwrap()
+            .unwrap();
+        Fixture::builder()
+            .dir(dir)
+            .db(db)
+            .candidate(candidate)
+            .chore_id(chore_id)
+            .attempt(attempt)
+            .repo(repo)
+            .root(root)
+            .build()
+    }
+
+    /// A revision execution on the same PR branch: a separate work item with its own record.
+    async fn add_revision_record(fx: &Fixture) -> ExecutionBookmark {
+        let revision = fx
+            .db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(fx.chore_id.clone())
+                    .description("Revision of the PR")
+                    .created_via("test")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        let execution = fx
+            .db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision.id)
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        let record = recovery::create(&LocalJj, &fx.repo.worker, &execution.id, "local")
+            .await
+            .unwrap();
+        fx.db.record_execution_bookmark(&record).unwrap();
+        record
+    }
+
+    /// Cube's shared-store effects: the rebase rewrites the PR branch, and the
+    /// publication step moves the PR branch bookmark before it can fail.
+    struct RewritingCube {
+        root: ExecutionBookmark,
+        lease_dir: std::path::PathBuf,
+        conflicted: bool,
+        push_fails: bool,
+    }
+
+    impl RewritingCube {
+        fn rebase(&self) {
+            JjRepo::run(
+                &self.root.repo_path,
+                &["rebase", "-b", &self.root.head(), "-d", "upstream"],
+            );
+        }
+    }
+
+    crate::stub_cube_client! { RewritingCube {
+        async fn goto_workspace(&self, _workspace: &std::path::Path, _pr: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn rebase_workspace(&self, _workspace: &std::path::Path, _pr: u64) -> anyhow::Result<crate::coordinator::RebaseOutcome> {
+            self.rebase();
+            if self.conflicted {
+                std::fs::write(
+                    self.lease_dir.join("lib.rs"),
+                    "<<<<<<< Conflict 1 of 1\n%%%%%%% Changes from base to side #1\n+mod a;\n+++++++ Contents of side #2\nmod b;\n>>>>>>> Conflict 1 of 1 ends\n",
+                ).unwrap();
+                return Ok(crate::coordinator::RebaseOutcome { clean: false, pushed: false, conflicted_files: vec!["lib.rs".into()], linearized_commits: 0, linearize_decline: None });
+            }
+            Ok(crate::coordinator::RebaseOutcome { clean: true, pushed: true, conflicted_files: vec![], linearized_commits: 0, linearize_decline: None })
+        }
+        async fn rebase_workspace_no_push(&self, _workspace: &std::path::Path, _pr: u64) -> anyhow::Result<crate::coordinator::RebaseOutcome> {
+            self.rebase();
+            Ok(crate::coordinator::RebaseOutcome { clean: true, pushed: false, conflicted_files: vec![], linearized_commits: 0, linearize_decline: None })
+        }
+        async fn push_resolution(&self, _workspace: &std::path::Path, _pr: u64) -> anyhow::Result<()> {
+            JjRepo::run(&self.root.repo_path, &["bookmark", "set", &self.root.publication(), "-r", &self.root.head(), "--allow-backwards"]);
+            if self.push_fails { anyhow::bail!("push rejected") }
+            Ok(())
+        }
+        async fn verify_deletion_tripwire(&self, _repo: &str, _head: &str, _base: &str, _pr: u64) -> Vec<String> {
+            vec![]
+        }
+    } }
+
+    fn lease(fx: &Fixture) -> CubeWorkspaceLease {
+        CubeWorkspaceLease {
+            lease_id: "lease".into(),
+            workspace_id: "workspace".into(),
+            workspace_path: fx.repo.replacement.clone(),
+            dirty_verified: None,
+        }
+    }
+
+    fn cube(fx: &Fixture, conflicted: bool, push_fails: bool) -> RewritingCube {
+        RewritingCube {
+            root: fx.root.clone(),
+            lease_dir: fx.repo.replacement.clone(),
+            conflicted,
+            push_fails,
+        }
+    }
+
+    async fn run_ladder(fx: &Fixture, cube: &RewritingCube) -> LadderOutcome {
+        run_rung1_in_lease(
+            &fx.db,
+            &RecordingPublisher::default(),
+            cube,
+            &fx.candidate,
+            &fx.attempt,
+            42,
+            &lease(fx),
+        )
+        .await
+    }
+
+    async fn commits(record: &ExecutionBookmark) -> Vec<Option<String>> {
+        recovery::snapshot_pointers(&LocalJj, record)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, commit)| commit)
+            .collect()
+    }
+
+    async fn pushed_head(fx: &Fixture) -> String {
+        // The PR branch bookmark was restored; the pushed head is what the
+        // adopted records now sit on.
+        let record = fx.db.execution_bookmark(&fx.root.execution_id).unwrap();
+        record.base_commit.unwrap()
+    }
+
+    async fn assert_adopted(fx: &Fixture, record: &ExecutionBookmark, before: &[Option<String>]) {
+        let reloaded = fx.db.execution_bookmark(&record.execution_id).unwrap();
+        let adopted = reloaded.base_commit.clone().unwrap();
+        assert_eq!(commits(record).await, vec![Some(adopted.clone()); 3], "one lineage");
+        assert_ne!(commits(record).await, before, "moved off the pre-rebase lineage");
+        assert!(
+            recovery::unpublished_diff(&LocalJj, &reloaded)
+                .await
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        assert!(
+            recovery::reconcile(&LocalJj, &reloaded, None, "main")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_pushed_rebase_moves_root_and_revision_records_onto_pushed_head() {
+        let fx = fixture().await;
+        let revision = add_revision_record(&fx).await;
+        let before = commits(&fx.root).await;
+        let outcome = run_ladder(&fx, &cube(&fx, false, false)).await;
+        assert_eq!(outcome, LadderOutcome::Retired);
+        assert_adopted(&fx, &fx.root, &before).await;
+        assert_adopted(&fx, &revision, &before).await;
+        assert_eq!(
+            pushed_head(&fx).await,
+            fx.db
+                .execution_bookmark(&revision.execution_id)
+                .unwrap()
+                .base_commit
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn rung0_push_after_residual_conflicts_keeps_one_lineage() {
+        let fx = fixture().await;
+        let revision = add_revision_record(&fx).await;
+        let before = commits(&fx.root).await;
+        let outcome = run_ladder(&fx, &cube(&fx, true, false)).await;
+        assert_eq!(outcome, LadderOutcome::Retired);
+        assert_eq!(
+            fx.db
+                .get_conflict_resolution(&fx.attempt.id)
+                .unwrap()
+                .unwrap()
+                .resolved_by_rung,
+            Some(0)
+        );
+        assert_adopted(&fx, &fx.root, &before).await;
+        assert_adopted(&fx, &revision, &before).await;
+    }
+
+    #[tokio::test]
+    async fn publication_only_work_survives_rung0_success_and_failure() {
+        for push_fails in [false, true] {
+            let fx = fixture().await;
+            JjRepo::run(&fx.repo.repo, &["new", &fx.root.base(), "-m", "Publication-only work"]);
+            std::fs::write(fx.repo.repo.join("unique.txt"), "unique unpublished content").unwrap();
+            JjRepo::run(
+                &fx.repo.repo,
+                &[
+                    "bookmark",
+                    "set",
+                    &fx.root.publication(),
+                    "-r",
+                    "@",
+                    "--allow-backwards",
+                ],
+            );
+            let before = commits(&fx.root).await;
+            let outcome = run_ladder(&fx, &cube(&fx, true, push_fails)).await;
+            assert_eq!(
+                matches!(outcome, LadderOutcome::Retired),
+                !push_fails,
+                "rung 0 outcome with push_fails={push_fails}: {outcome:?}"
+            );
+            assert_eq!(
+                commits(&fx.root).await,
+                before,
+                "saved identities kept (push_fails={push_fails})"
+            );
+            assert_eq!(
+                fx.db.execution_bookmark(&fx.root.execution_id).unwrap().base_commit,
+                fx.root.base_commit
+            );
+        }
+    }
+
+    /// An older record whose store cannot be read must not stop the others.
+    fn add_damaged_record(fx: &Fixture) {
+        let execution = fx
+            .db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&fx.chore_id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Failed)
+                    .build(),
+            )
+            .unwrap();
+        fx.db
+            .record_execution_bookmark(&ExecutionBookmark {
+                execution_id: execution.id,
+                repo_path: fx.dir.path().join("missing-store"),
+                host_id: "local".into(),
+                base_commit: None,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_damaged_historical_record_does_not_disable_rung1_or_speculation() {
+        let fx = fixture().await;
+        add_damaged_record(&fx);
+        let before = commits(&fx.root).await;
+        let outcome = run_ladder(&fx, &cube(&fx, false, false)).await;
+        assert_eq!(outcome, LadderOutcome::Retired);
+        assert_adopted(&fx, &fx.root, &before).await;
+
+        let fx = fixture().await;
+        add_damaged_record(&fx);
+        let saved = commits(&fx.root).await;
+        let metrics = crate::metrics::Registry::new();
+        crate::speculative_conflict::init(&metrics);
+        crate::speculative_conflict::run_in_lease(
+            &fx.db,
+            &cube(&fx, false, false),
+            &metrics,
+            &fx.candidate,
+            42,
+            &fx.repo.replacement,
+        )
+        .await;
+        assert_eq!(metrics.counter_value("speculative_conflict.clean"), Some(1));
+        assert_eq!(commits(&fx.root).await, saved);
+    }
+
+    #[tokio::test]
+    async fn speculative_rebase_protects_revision_records_through_baseline_loss() {
+        let fx = fixture().await;
+        let revision = add_revision_record(&fx).await;
+        let saved_root = commits(&fx.root).await;
+        let saved_revision = commits(&revision).await;
+        let metrics = crate::metrics::Registry::new();
+        crate::speculative_conflict::init(&metrics);
+        crate::speculative_conflict::run_in_lease(
+            &fx.db,
+            &cube(&fx, false, false),
+            &metrics,
+            &fx.candidate,
+            42,
+            &fx.repo.replacement,
+        )
+        .await;
+        assert_eq!(metrics.counter_value("speculative_conflict.clean"), Some(1));
+        assert_eq!(commits(&fx.root).await, saved_root);
+        assert_eq!(commits(&revision).await, saved_revision);
+        let reloaded = fx.db.execution_bookmark(&revision.execution_id).unwrap();
+        assert_eq!(reloaded.base_commit, revision.base_commit);
+        JjRepo::run(&fx.repo.repo, &["bookmark", "delete", &revision.base()]);
+        let patch = recovery::diff(&LocalJj, &reloaded).await.unwrap();
+        assert!(patch.contains("revision.txt"));
+        assert!(!patch.contains("upstream.txt"));
+    }
+}

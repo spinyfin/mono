@@ -26,7 +26,8 @@ mod redispatch_tests;
 
 mod reconcile;
 pub use reconcile::{
-    Anchor, Containment, MissingChange, Reconciliation, RewrittenChange, SupersededPointer, reconcile,
+    Anchor, Containment, MissingChange, Reconciliation, RewrittenChange, SupersededPointer, adopt_pushed_head,
+    reconcile, resolve_bookmark_commit,
 };
 
 #[cfg(test)]

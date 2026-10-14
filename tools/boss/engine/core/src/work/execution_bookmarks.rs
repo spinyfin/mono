@@ -2,22 +2,56 @@ use super::*;
 use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, PointerSnapshot};
 
 impl WorkDb {
-    /// Preserve recovery identities across cube's shared-store pointer rewrites.
-    pub(crate) async fn snapshot_rebase_pointers(
-        &self,
-        work_item_id: &str,
-    ) -> Result<Vec<(ExecutionBookmark, PointerSnapshot)>> {
-        use boss_engine_recovery::execution_bookmark::{LocalJj, snapshot_pointers};
-        let mut saved = Vec::new();
-        for execution in self.list_executions(Some(work_item_id))? {
-            if let Some(record) = self.execution_bookmark_optional(&execution.id)?
-                && record.host_id == "local"
-            {
-                let pointers = snapshot_pointers(&LocalJj, &record).await?;
-                saved.push((record, pointers));
+    /// Live local recovery records of the PR-owning chain: the root item and
+    /// every revision share the PR branch in the shared store, so an engine
+    /// rebase moves all of their pointers.
+    fn chain_bookmark_records(&self, chain_root_id: &str) -> Vec<ExecutionBookmark> {
+        let executions = match self.list_executions_for_chain(chain_root_id) {
+            Ok(executions) => executions,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    chain_root_id,
+                    "cannot list chain executions for recovery pointers"
+                );
+                return Vec::new();
+            }
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut records = Vec::new();
+        for execution in executions {
+            if !seen.insert(execution.id.clone()) {
+                continue;
+            }
+            match self.execution_bookmark_optional(&execution.id) {
+                Ok(Some(record)) if record.host_id == "local" => records.push(record),
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(execution_id = %execution.id, ?err, "cannot read recovery bookmark record");
+                }
             }
         }
-        Ok(saved)
+        records
+    }
+
+    /// Preserve recovery identities across cube's shared-store pointer
+    /// rewrites. Best-effort per record: one damaged historical record is
+    /// logged and left out so it cannot disable the rebase for the others.
+    pub(crate) async fn snapshot_rebase_pointers(
+        &self,
+        chain_root_id: &str,
+    ) -> Vec<(ExecutionBookmark, PointerSnapshot)> {
+        use boss_engine_recovery::execution_bookmark::{LocalJj, snapshot_pointers};
+        let mut saved = Vec::new();
+        for record in self.chain_bookmark_records(chain_root_id) {
+            match snapshot_pointers(&LocalJj, &record).await {
+                Ok(pointers) => saved.push((record, pointers)),
+                Err(err) => {
+                    tracing::warn!(execution_id = %record.execution_id, ?err, "cannot snapshot recovery pointers; leaving this record unprotected");
+                }
+            }
+        }
+        saved
     }
 
     /// Attempt every restore even if one repository is unavailable. A published
@@ -34,23 +68,59 @@ impl WorkDb {
         restored
     }
 
-    /// Checkpoint intact records independently without changing ladder outcomes.
-    pub(crate) async fn checkpoint_rewritten_baselines(&self, work_item_id: &str) -> Result<()> {
-        use boss_engine_recovery::execution_bookmark::{LocalJj, checkpoint_baseline};
-        for execution in self.list_executions(Some(work_item_id))? {
-            let result: Result<()> = async {
-                let Some(record) = self.execution_bookmark_optional(&execution.id)? else {
-                    return Ok(());
-                };
-                if record.host_id != "local" {
-                    return Ok(());
+    /// End of a mechanical rebase operation: put every saved pointer back, then,
+    /// when the operation pushed a new PR head (`pushed_branch`), move each
+    /// record whose preserved work that head already carries onto it as one set
+    /// and persist the baseline. Records with unpublished work keep their saved
+    /// identities. Never fails the caller; maintenance problems are logged.
+    pub(crate) async fn finish_rebase_pointers(
+        &self,
+        saved: &[(ExecutionBookmark, PointerSnapshot)],
+        pushed_branch: Option<&str>,
+        trunk: &str,
+    ) -> bool {
+        use boss_engine_recovery::execution_bookmark::{LocalJj, adopt_pushed_head, resolve_bookmark_commit};
+        // The branch moved with the rebase, so read it before restoring.
+        let mut pushed = Vec::new();
+        if let Some(branch) = pushed_branch {
+            for (record, _) in saved {
+                match resolve_bookmark_commit(&LocalJj, record, branch).await {
+                    Ok(Some(commit)) => pushed.push((record, commit)),
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(execution_id = %record.execution_id, ?err, "cannot resolve pushed PR head; keeping saved pointers");
+                    }
                 }
-                let base = checkpoint_baseline(&LocalJj, &record).await?;
-                self.update_execution_bookmark_base(&execution.id, &base)
+            }
+        }
+        let restored = self.restore_rebase_pointers(saved).await;
+        if !restored {
+            return false;
+        }
+        for (record, commit) in pushed {
+            let result: Result<()> = async {
+                adopt_pushed_head(&LocalJj, record, &commit, trunk).await?;
+                self.update_execution_bookmark_base(&record.execution_id, &commit)
             }
             .await;
             if let Err(err) = result {
-                tracing::warn!(execution_id = %execution.id, ?err, "rebase baseline checkpoint failed; keeping recorded baseline");
+                tracing::warn!(execution_id = %record.execution_id, ?err, "recovery pointers not moved onto the pushed PR head; keeping saved pointers");
+            }
+        }
+        true
+    }
+
+    /// Checkpoint intact records independently without changing ladder outcomes.
+    pub(crate) async fn checkpoint_rewritten_baselines(&self, chain_root_id: &str) -> Result<()> {
+        use boss_engine_recovery::execution_bookmark::{LocalJj, checkpoint_baseline};
+        for record in self.chain_bookmark_records(chain_root_id) {
+            let result: Result<()> = async {
+                let base = checkpoint_baseline(&LocalJj, &record).await?;
+                self.update_execution_bookmark_base(&record.execution_id, &base)
+            }
+            .await;
+            if let Err(err) = result {
+                tracing::warn!(execution_id = %record.execution_id, ?err, "rebase baseline checkpoint failed; keeping recorded baseline");
             }
         }
         Ok(())
