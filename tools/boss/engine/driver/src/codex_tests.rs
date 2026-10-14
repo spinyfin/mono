@@ -124,11 +124,10 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         "tools.write_stdin",
         "chars: \"\"",
         "text(JSON.stringify(r))",
-        "completion in the same JavaScript cell",
+        "poll it with `write_stdin` until the result carries\n`exit_code`.",
         "let r = await tools.exec_command",
         "session_id: r.session_id",
         "yield_time_ms: 300000",
-        "carries `exit_code`.",
         "own foreground timeout",
     ] {
         assert!(
@@ -145,6 +144,10 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         "the worker must retain its session handle for polling: {preamble}"
     );
     assert!(
+        !preamble.contains("same JavaScript cell"),
+        "polling is correlated by shell session, so the rules must not demand a single cell: {preamble}"
+    );
+    assert!(
         preamble.contains("only that invocation's output and logs") && preamble.contains("global process-name matches"),
         "the worker must not attribute unrelated global processes to its command: {preamble}"
     );
@@ -152,6 +155,32 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         preamble.contains("without the real `exit_code`"),
         "the worker must not infer success from a missing exit status: {preamble}"
     );
+}
+
+#[test]
+fn agent_rules_point_a_deliberate_background_job_at_propose_wait_without_banning_it() {
+    let preamble = CodexDriver::default().agent_rules_preamble();
+    let flat = preamble.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "must be declared with `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` \
+             before you end the turn."
+        ),
+        "a deliberately backgrounded job must be pointed at `propose wait`: {preamble}"
+    );
+    let lower = flat.to_lowercase();
+    for banned in [
+        "do not background",
+        "never background",
+        "do not run a long build in the background",
+        "idle-poll",
+        "instead of polling forever",
+    ] {
+        assert!(
+            !lower.contains(banned),
+            "the Codex worker rules must not carry a blanket background prohibition ({banned:?}): {preamble}"
+        );
+    }
 }
 
 #[test]

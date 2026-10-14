@@ -39,6 +39,22 @@ pub(crate) fn boundaries_and_coordinator_fragment() -> &'static str {
      as questions from a human reviewer — short, specific answers.\n"
 }
 
+/// The one-sentence rule for a command a worker deliberately runs in the
+/// background: declare the wait, and never idle in a wait-loop without one.
+///
+/// This is the single copy of that wording for the prompts that do not carry
+/// the full `## If you are waiting on a long-running job` section (triage, the
+/// conflict-resolution gate). Callers put
+/// their own "prefer the foreground" sentence in front of it, since what
+/// counts as a long command differs per prompt. `boss` is the worker's
+/// invocation of the boss binary
+/// ([`boss_engine_worker_bin::WORKER_BOSS_INVOCATION`]).
+pub(crate) fn background_wait_declaration(boss: &str) -> String {
+    format!(
+        "If you do background a long-running command, declare it with `{boss} propose wait --reason \"<what you are waiting on>\" --duration <bound>` before ending your turn, and never idle in a wait-loop without that declaration."
+    )
+}
+
 /// The `## Always use absolute paths` block shared verbatim by every worker
 /// prompt (standard, reviewer, triage, answer-agent).
 ///

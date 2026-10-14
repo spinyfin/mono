@@ -748,7 +748,7 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
             && prompt.contains("FOREGROUND")
             && prompt.contains("keep polling that session until it returns `exit_code`")
             && prompt.contains("backgrounded/asynchronous invocation")
-            && prompt.contains("MUST run `\"$BOSS_BIN\" propose wait --reason")
+            && prompt.contains(&crate::prompt_fragments::background_wait_declaration("\"$BOSS_BIN\""))
             && prompt.contains("global process-name matches"),
         "gate must define foreground session polling, require a declared wait when backgrounding, and prohibit ambiguous global-process attribution:\n{prompt}",
     );
@@ -776,6 +776,28 @@ fn chore_prompt_teaches_propose_wait() {
     assert!(
         prompt.contains("## If you are waiting on a long-running job"),
         "chore prompt must include the wait section:\n{prompt}",
+    );
+}
+
+#[test]
+fn terminal_directive_gates_the_pr_on_real_results_without_reading_as_a_background_ban() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains(
+            "do not open the PR until every gate, build, test run, review and sub-agent run you started has returned its real result"
+        ),
+        "the PR must still not be opened before a gate has a real result:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("backgrounded builds"),
+        "the PR-timing rule must not read as a ban on backgrounding:\n{prompt}",
     );
 }
 
@@ -1288,7 +1310,7 @@ fn conflict_revision_gate_points_at_boss_propose_blocked_when_seam_is_on() {
     );
     assert!(
         prompt.contains(
-            "If you background it instead, declare the wait with `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` before ending your turn"
+            "If you do background a long-running command, declare it with `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` before ending your turn, and never idle in a wait-loop without that declaration."
         ),
         "conflict-resolution gate must require a declared wait when the build is backgrounded:\n{prompt}",
     );
