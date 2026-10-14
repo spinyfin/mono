@@ -1005,6 +1005,7 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         Ok(products) => {
             crate::coordinator_guidance::load_product_guidance(
                 design_docs,
+                work_db,
                 &products,
                 crate::coordinator_guidance::SESSION_START_FETCH_BUDGET,
                 boss_engine_utils::epoch_time::now_epoch_secs(),

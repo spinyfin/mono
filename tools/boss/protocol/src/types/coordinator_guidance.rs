@@ -45,6 +45,23 @@ pub enum CoordinatorGuidanceState {
     /// limited, repo not found, or the launch-time budget ran out).
     /// `reason` says which. Nothing about the file is known.
     Failed { reason: String },
+    /// GitHub could not be read, so this is the engine's last-known-good
+    /// result for the product instead: what an earlier successful read
+    /// saw at `git_ref`. It is never fresh and never passed off as such;
+    /// `fetch_error` is the failure that caused the fallback and
+    /// `read_at` says how stale the copy is.
+    Cached {
+        /// The commit sha the cached read resolved to.
+        git_ref: String,
+        /// RFC 3339 timestamp of the successful read the copy came from.
+        read_at: String,
+        /// Why the fresh read failed (the [`Self::Failed`] reason).
+        fetch_error: String,
+        /// The cached file text, or `None` when the cached read found no
+        /// file at `git_ref` (a cached [`Self::Missing`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markdown: Option<String>,
+    },
     /// The product has no `repo_remote_url`, so there is nowhere to read
     /// guidance from.
     NoRepoConfigured,
@@ -61,6 +78,7 @@ impl CoordinatorGuidanceState {
             Self::Missing { .. } => "missing",
             Self::OverCap { .. } => "over_cap",
             Self::Failed { .. } => "failed",
+            Self::Cached { .. } => "cached",
             Self::NoRepoConfigured => "no_repo_configured",
             Self::NotGitHub { .. } => "not_github",
         }
@@ -70,7 +88,10 @@ impl CoordinatorGuidanceState {
     /// reachable.
     pub fn git_ref(&self) -> Option<&str> {
         match self {
-            Self::Loaded { git_ref, .. } | Self::Missing { git_ref } | Self::OverCap { git_ref, .. } => Some(git_ref),
+            Self::Loaded { git_ref, .. }
+            | Self::Missing { git_ref }
+            | Self::OverCap { git_ref, .. }
+            | Self::Cached { git_ref, .. } => Some(git_ref),
             Self::Failed { .. } | Self::NoRepoConfigured | Self::NotGitHub { .. } => None,
         }
     }
@@ -97,6 +118,18 @@ pub struct CoordinatorGuidanceView {
 }
 
 impl CoordinatorGuidanceView {
+    /// The guidance text to show, if this view has any: the freshly
+    /// loaded file, or a cached copy of it. Callers render it inside
+    /// begin/end fences after [`Self::describe_state`], which says
+    /// whether it is cached.
+    pub fn body(&self) -> Option<&str> {
+        match &self.state {
+            CoordinatorGuidanceState::Loaded { markdown, .. } => Some(markdown),
+            CoordinatorGuidanceState::Cached { markdown, .. } => markdown.as_deref(),
+            _ => None,
+        }
+    }
+
     /// One-line, operator-readable statement of this product's guidance
     /// state. Shared by the coordinator's session-start brief and by
     /// `boss guidance show`, so the two never describe a state differently.
@@ -126,6 +159,27 @@ impl CoordinatorGuidanceView {
                  {}`.",
                 self.path, self.product_id
             ),
+            CoordinatorGuidanceState::Cached {
+                git_ref,
+                read_at,
+                fetch_error,
+                markdown,
+            } => {
+                let what = match markdown {
+                    Some(text) => format!(
+                        "the last-known-good `{}` from {repo} @ {git_ref} ({} bytes)",
+                        self.path,
+                        text.len()
+                    ),
+                    None => format!("the last-known-good result: {repo} @ {git_ref} had no `{}`", self.path),
+                };
+                format!(
+                    "CACHED (NOT freshly loaded): GitHub could not be read just now, so this is {what}, as read at \
+                     {read_at}. The fetch error was: {fetch_error}. The rules may be newer upstream; retry with `boss \
+                     guidance show --product {}`.",
+                    self.product_id
+                )
+            }
             CoordinatorGuidanceState::NoRepoConfigured => {
                 "NO REPO: this product has no repo_remote_url, so there is nowhere to read coordinator guidance from."
                     .to_owned()
@@ -135,6 +189,51 @@ impl CoordinatorGuidanceView {
                  GitHub path. Nothing is known about this product's guidance.",
                 self.path
             ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cached(markdown: Option<&str>) -> CoordinatorGuidanceView {
+        CoordinatorGuidanceView::builder()
+            .product_id("prod_boss")
+            .fetched_at("2026-10-14T10:00:00Z")
+            .path(COORDINATOR_GUIDANCE_PATH)
+            .product_name("Boss")
+            .state(CoordinatorGuidanceState::Cached {
+                git_ref: "abc123".to_owned(),
+                read_at: "2026-10-13T09:00:00Z".to_owned(),
+                fetch_error: "could not reach GitHub".to_owned(),
+                markdown: markdown.map(str::to_owned),
+            })
+            .owner_repo("spinyfin/mono")
+            .build()
+    }
+
+    #[test]
+    fn cached_state_is_labelled_with_sha_read_time_and_the_fetch_error() {
+        let view = cached(Some("# rules\n"));
+        let line = view.describe_state();
+        assert!(line.starts_with("CACHED (NOT freshly loaded)"), "{line}");
+        assert!(line.contains("spinyfin/mono @ abc123"), "{line}");
+        assert!(line.contains("2026-10-13T09:00:00Z"), "{line}");
+        assert!(line.contains("could not reach GitHub"), "{line}");
+        assert!(line.contains("boss guidance show --product prod_boss"), "{line}");
+        assert_eq!(view.body(), Some("# rules\n"));
+        assert_eq!(view.state.tag(), "cached");
+        assert_eq!(view.state.git_ref(), Some("abc123"));
+    }
+
+    #[test]
+    fn cached_state_round_trips_with_and_without_a_body() {
+        for markdown in [Some("# rules\n"), None] {
+            let view = cached(markdown);
+            let json = serde_json::to_string(&view).unwrap();
+            assert!(json.contains("\"state\":\"cached\""), "{json}");
+            assert_eq!(serde_json::from_str::<CoordinatorGuidanceView>(&json).unwrap(), view);
         }
     }
 }
