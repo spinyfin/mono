@@ -532,8 +532,10 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 ),
                 _ => false,
             };
-            // A `run_done` declaration's acceptance is itself the completion
-            // signal for the WHOLE execution — not just a batch member, the
+            // A `delivered`/`blocked` `run_done` declaration's acceptance is
+            // itself the completion signal for the WHOLE execution (a
+            // `no-changes-needed` declaration is not: it is accepted or
+            // refused only at the driver's Stop boundary) — not just a batch member, the
             // way a review report/verdict is — mirroring the block above for
             // exactly the reason its comment gives: do not wait for another,
             // driver-specific turn boundary that may never arrive after the
@@ -720,7 +722,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                             outcome = %run_done_payload.outcome,
                             delivered = matches!(delivery_outcome, Ok(Ok(true))),
                             ?stop_outcome,
-                            "run_done proposal accepted: finalized synchronously at submit",
+                            "run_done proposal accepted: delivered/blocked finalized synchronously at submit (no-changes-needed waits for Stop)",
                         );
                     }
                     Err(err) => tracing::error!(

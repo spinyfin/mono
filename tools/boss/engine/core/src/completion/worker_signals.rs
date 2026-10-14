@@ -707,7 +707,7 @@ impl WorkerCompletionHandler {
                  Boss cannot confirm this command's outcome (exit code, output). Any claim in this \
                  run that depends on it — tests passing, a build succeeding, a `no-changes-needed` \
                  declaration — is treated as unconfirmed: the next no-changes-needed claim after this \
-                 abandonment is refused and the worker gets the normal produce-a-PR nudge instead.",
+                 abandonment is refused: the declaration is discarded and the worker is asked to re-verify and declare again.",
                 execution_id = execution.id,
                 work_item_id = execution.work_item_id,
             );
@@ -816,8 +816,8 @@ impl WorkerCompletionHandler {
     /// (`boss propose done --outcome no-changes-needed`), read from the
     /// durable stamp `apply_run_done` writes unconditionally — so this does
     /// not depend on the `run_done_proposals_seam` flag, which only governs
-    /// whether the declaration additionally finalizes the run synchronously
-    /// at submit. The worker's prose is never consulted: a run that stops
+    /// whether the early Stop-boundary branch accepts the declaration for
+    /// every execution kind (revisions take their own gated path). The worker's prose is never consulted: a run that stops
     /// without declaring is "gave up / not done" and falls through to the
     /// normal produce-a-PR nudge (and, if the worker cannot reach the
     /// engine at all, to the nudge breaker's visible failure — never to a

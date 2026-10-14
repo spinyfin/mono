@@ -545,7 +545,11 @@ impl WorkerCompletionHandler {
         // No-op submission waits for this boundary so the driver's abandoned
         // command notifications have been staged. Read the durable declaration
         // here, never a payload cached by an in-flight submit finalizer.
+        // Revisions are excluded: they reach `try_revision_no_op` only after
+        // the SHA-delta gate, the conflict refusal and the satisfied-deliverable
+        // gate, so a declaration can never launder a conflict GitHub still reports.
         if !defer_finalization
+            && execution.kind != ExecutionKind::RevisionImplementation
             && self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("run_done_proposals_seam")
             && self.worker_signalled_no_op(execution_id)
@@ -1287,7 +1291,7 @@ impl WorkerCompletionHandler {
                         SatisfiedDeliverableOutcome::AwaitingDeclaration => true,
                         SatisfiedDeliverableOutcome::NotSatisfied => false,
                     };
-                    // Keep merged/queued completion precedence, but read the transcript
+                    // Keep merged/queued completion precedence, but read the run_done
                     // declaration before either waiting for proposals or requesting a retry.
                     tracing::info!(
                         execution_id,

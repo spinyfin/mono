@@ -303,7 +303,9 @@ async fn revision_run_done_no_changes_needed_files_declined_finding_record() {
     ));
     flags.set("worker_proposals", true).unwrap();
     flags.set("run_done_proposals_seam", true).unwrap();
-    let handler = handler.with_feature_flags(flags);
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Err("network unavailable".into())).await;
+    let handler = handler.with_feature_flags(flags).with_branch_verifier(verifier);
     assert_eq!(
         handler
             .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)

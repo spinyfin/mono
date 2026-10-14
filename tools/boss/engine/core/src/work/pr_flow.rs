@@ -236,6 +236,7 @@ impl WorkDb {
     /// the whole transaction rolls back and the execution is left live,
     /// exactly as if this call had never been made. The caller reads the
     /// filed item back from [`WorkerPrCompletion::filed_attention_item`].
+    #[cfg(test)]
     pub fn record_worker_no_op_completion(
         &self,
         execution_id: &str,
