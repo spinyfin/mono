@@ -423,3 +423,14 @@ async fn delivery_failure_leaves_the_session_and_reports_a_forceable_error() {
     // Forced reset bypasses delivery, so a failed delivery cannot block it.
     assert!(!request(true).await.unwrap());
 }
+
+#[test]
+fn handoff_request_expires_after_delivery_deadline() {
+    let prompt = super::reset_handoff::handoff_request_prompt(1000);
+    let expiry = 1000 + super::inbox::DELIVERY_TIMEOUT.as_secs() + 15;
+    assert!(
+        prompt.starts_with(&format!("[Boss reset request expires={expiry}]")),
+        "{prompt}"
+    );
+    assert!(prompt.contains("ignore it"), "{prompt}");
+}

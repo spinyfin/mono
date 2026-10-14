@@ -9,7 +9,17 @@ pub(crate) const DELIVERY_FAILED_PREFIX: &str = "coordinator did not receive the
 
 /// The `[Boss reset request]` marker lets the coordinator recognise this as
 /// engine-originated despite Claude attributing it to another session.
-const HANDOFF_REQUEST_PROMPT: &str = "[Boss reset request] Boss is about to reset this session at the operator's request. Write your handoff now with `boss handoff write -`, then stop.";
+///
+/// The request carries an expiry (epoch seconds). A message that Claude Code
+/// held past the delivery deadline can be released later, after Boss has
+/// reported failure and no reset is pending; the coordinator ignores a request
+/// whose expiry has passed.
+pub(crate) fn handoff_request_prompt(now_epoch_secs: i64) -> String {
+    let expires = now_epoch_secs + (super::inbox::DELIVERY_TIMEOUT.as_secs() + 15) as i64;
+    format!(
+        "[Boss reset request expires={expires}] Boss is about to reset this session on a user request. Write your handoff now with `boss handoff write -`, then stop. If `date +%s` is already past the expiry, the request was withdrawn: ignore it and continue your work."
+    )
+}
 
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
@@ -96,7 +106,7 @@ pub(crate) async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool
         _ => String::new(),
     };
     let turn_ended = delivery
-        .deliver_locked(tmux, &record, HANDOFF_REQUEST_PROMPT, guard)
+        .deliver_locked(tmux, &record, &handoff_request_prompt(requested_at), guard)
         .await
         .map_err(|error| {
             audit::record_event(
