@@ -124,11 +124,10 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         "tools.write_stdin",
         "chars: \"\"",
         "text(JSON.stringify(r))",
-        "completion in the same JavaScript cell",
+        "poll it with `write_stdin` until the result carries\n`exit_code`.",
         "let r = await tools.exec_command",
         "session_id: r.session_id",
         "yield_time_ms: 300000",
-        "until the result carries `exit_code`.",
         "own foreground timeout",
     ] {
         assert!(
@@ -143,6 +142,10 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
     assert!(
         preamble.contains("`text(r.output)` discards that handle"),
         "the worker must retain its session handle for polling: {preamble}"
+    );
+    assert!(
+        !preamble.contains("same JavaScript cell"),
+        "polling is correlated by shell session, so the rules must not demand a single cell: {preamble}"
     );
     assert!(
         preamble.contains("only that invocation's output and logs") && preamble.contains("global process-name matches"),

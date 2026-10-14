@@ -395,10 +395,11 @@ mechanism — the session will hang waiting for a result that never returns.\n\
 next\", \"Let me investigate further\", or \"I'll wait for the agent to finish\". \
 If you state an intent like \"Let me create the task\", you must follow through \
 immediately in that same turn — do not stop before you do.\n\
-- **Do NOT wait for any external process or event.** All investigation must \
-happen inline using read-only actions (shell commands like `grep`/`find`/`cat`, \
-file reads, web searches). Finish the investigation before you make your \
-decision.\n\
+- **Do NOT wait on external events** (CI, a PR merge, another run). All \
+investigation must happen inline using read-only actions (shell commands like \
+`grep`/`find`/`cat`, file reads, web searches). A command you run yourself is \
+governed by the build-command rule below, not by this one. Finish the \
+investigation before you make your decision.\n\
 - **If you create a task** with `{boss} task create --automation`, emit the \
 `automation: task <id>` marker **in the same response**, immediately after the \
 tool call returns with the task id. Do not stop between the tool call and the \
@@ -472,9 +473,11 @@ mechanism — the session will hang waiting for a result that never returns.\n\
 next\", \"Let me investigate further\", or \"I'll wait for the agent to finish\". \
 If you state an intent like \"Let me create the task\", you must follow through \
 immediately in that same turn — do not stop before you do.\n\
-- **Do NOT wait for any external process or event.** All investigation must \
-happen inline using read-only tool calls (`grep`/`find`/`cat`, `Bash`, `Read`, \
-`WebSearch`). Finish the investigation before you make your decision.\n\
+- **Do NOT wait on external events** (CI, a PR merge, another run). All \
+investigation must happen inline using read-only tool calls (`grep`/`find`/`cat`, \
+`Bash`, `Read`, `WebSearch`). A command you run yourself is governed by the \
+build-command rule below, not by this one. Finish the investigation before you \
+make your decision.\n\
 - **If you create a task** with `{boss} task create --automation`, declare it with \
 `{boss} propose automation-outcome --produced-task <id>` **in the same response**, \
 immediately after the tool call returns with the task id. Do not stop between the \
@@ -1271,6 +1274,10 @@ mod tests {
                     "triage {label} (seam_enabled={seam_enabled}) must carry the shared propose-wait rule:\n{text}",
                 );
                 let lower = flat.to_lowercase();
+                assert!(
+                    !lower.contains("wait for any external process"),
+                    "triage {label} (seam_enabled={seam_enabled}) must not carry the unconditional no-wait rule:\n{text}",
+                );
                 assert!(
                     !lower.contains("idle-poll") && !lower.contains("do not run a long build in the background"),
                     "triage {label} (seam_enabled={seam_enabled}) must not ban backgrounding outright:\n{text}",

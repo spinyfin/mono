@@ -298,15 +298,24 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// initial yield is capped at 30 seconds by codex-cli 0.145.0 and has no
 /// config/env/CLI override (`--strict-config` rejects the corresponding
 /// candidate keys). Unified exec does, however, return a session id and
-/// supports empty `write_stdin` polls up to 300 seconds. The injected example
-/// keeps those polls inside the originating JavaScript cell: the rollout
-/// correlator observes that cell through its `wait` continuations and
-/// ultimately receives the command's real `exit_code`; a separate polling cell
-/// has no attributable command. Without it the call stays open, drains as
-/// abandoned at the turn boundary (`RolloutCallTracker::observe_output` /
-/// `drain_open_calls`), surfaces as an `UNOBSERVED_COMMAND_MARKER`, and the
-/// engine refuses the run's `no-changes-needed` declaration
-/// (`refuse_no_op_declaration`).
+/// supports empty `write_stdin` polls up to 300 seconds.
+///
+/// The rule deliberately does **not** require the polls to stay in the
+/// originating JavaScript cell. The correlator uses the shell session, not the
+/// cell, as its durable unit (`driver/src/codex/rollout_calls.rs` module docs,
+/// L21-26): the chunk's `session_id` binds every later polling cell to the
+/// originating command (`RolloutCallTracker::observe_output`, covered by
+/// `multi_cell_session_is_observed_when_a_later_poll_reports_an_exit_code` in
+/// `rollout_calls.rs` and
+/// `multi_cell_session_is_not_flagged_after_a_later_poll_reports_its_exit_code`
+/// in `progress.rs`). What does need the worker's cooperation is getting a
+/// structured `exit_code` onto some chunk of that session: `text(r.output)`
+/// discards the `session_id`, so the call stays open, drains as abandoned at
+/// the turn boundary (`RolloutCallTracker::drain_open_calls`), surfaces as an
+/// `UNOBSERVED_COMMAND_MARKER`, and the engine refuses the run's
+/// `no-changes-needed` declaration (`refuse_no_op_declaration` in
+/// `core/src/completion/no_op.rs`). The injected example polls in one cell
+/// only because that is the simplest loop to write.
 ///
 /// The block says nothing to discourage backgrounding: a job deliberately left
 /// running is covered by the engine-wide `propose wait` rule, which the block
@@ -335,11 +344,12 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      never infer ownership or blockage from global process-name matches.\n\
      \n\
      For any ordinary command expected to exceed roughly ten seconds, keep its\n\
-     session handle and poll it to completion in the same JavaScript cell,\n\
-     until the result carries `exit_code`.\n\
+     session handle and poll it with `write_stdin` until the result carries\n\
+     `exit_code`.\n\
      `exec_command` yields after at most 30 seconds; a result containing\n\
      `session_id` means the command is still running — never that it passed or\n\
-     failed. `text(r.output)` discards that handle, so use this pattern instead:\n\
+     failed. `text(r.output)` discards that handle, so use this pattern instead\n\
+     (a later cell may keep polling the same `session_id`):\n\
      \n\
      ```js\n\
      let r = await tools.exec_command({cmd: \"bazel test //backend/blob:blob_test //backend/admintasks:admintasks_test\",\n\
