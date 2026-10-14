@@ -1089,7 +1089,10 @@ pub(super) async fn apply_work_item_patch(
                         tokio::spawn(async move {
                             match server_for_notify.send_input_to_worker(&run_id, msg.clone()).await {
                                 Ok(_) => {}
-                                Err(err) if err.safe_to_retry_at_boundary() => {
+                                Err(err)
+                                    if err.safe_to_retry_at_boundary()
+                                        && server_for_notify.worker_registry.slot_for_run(&run_id).is_some() =>
+                                {
                                     // Durable deferral: same probe queue
                                     // Stop/idle paths already drain.
                                     let probe_id =

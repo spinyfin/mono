@@ -319,9 +319,11 @@ pub(super) struct PendingProbe {
 /// waiting for the next `Stop` boundary so we can emit
 /// `FrontendEvent::ProbeReplied` with the assistant turn that
 /// landed in the transcript afterwards.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub(super) struct InFlightProbe {
     /// A Stop reader holds this snapshot; keep it tracked until that read settles.
+    #[builder(default)]
     reply_reading: bool,
     /// Earlier submitted reply contract retained across a new delivery claim.
     pub(super) previous_reply: Option<Box<InFlightProbe>>,
@@ -337,6 +339,10 @@ pub(super) struct InFlightProbe {
     /// new JSONL line — anything earlier already pre-dated the probe
     /// and isn't part of the reply.
     pub(super) offset_bytes: u64,
+    /// Exclusive upper bound of this probe's reply window. Set when a
+    /// replacement probe displaces it: anything the transcript gains from the
+    /// replacement's own snapshot onward answers the replacement, not this probe.
+    pub(super) end_offset: Option<u64>,
 }
 
 /// Everything the engine knows about one probe id after it was accepted:
@@ -588,13 +594,11 @@ impl ServerState {
         }
         in_flight.insert(
             run_id.to_owned(),
-            InFlightProbe {
-                reply_reading: false,
-                previous_reply: None,
-                probe_id: probe.probe_id.clone(),
-                transcript_path,
-                offset_bytes,
-            },
+            InFlightProbe::builder()
+                .probe_id(&probe.probe_id)
+                .maybe_transcript_path(transcript_path)
+                .offset_bytes(offset_bytes)
+                .build(),
         );
         Some(probe)
     }
@@ -653,13 +657,12 @@ impl ServerState {
         let previous_reply = in_flight.remove(run_id).map(Box::new);
         in_flight.insert(
             run_id.to_owned(),
-            InFlightProbe {
-                reply_reading: false,
-                previous_reply,
-                probe_id: probe.probe_id.clone(),
-                transcript_path,
-                offset_bytes,
-            },
+            InFlightProbe::builder()
+                .maybe_previous_reply(previous_reply)
+                .probe_id(&probe.probe_id)
+                .maybe_transcript_path(transcript_path)
+                .offset_bytes(offset_bytes)
+                .build(),
         );
         drop(pending);
         drop(in_flight);
@@ -696,6 +699,10 @@ impl ServerState {
         {
             entry.transcript_path = transcript_path;
             entry.offset_bytes = offset_bytes;
+            // The displaced reply's window runs up to the replacement's write.
+            if let Some(previous) = entry.previous_reply.as_deref_mut() {
+                previous.end_offset.get_or_insert(offset_bytes);
+            }
         }
     }
 
@@ -861,40 +868,49 @@ impl ServerState {
     /// path settled — only the delivered-but-unanswered states are re-stated.
     /// The in-flight *slot* is freed either way: the run is going away, so a
     /// slot held against it can only pin a probe that no longer has anywhere
-    /// to go. Returns the probe id when a state was actually re-stated, so
-    /// the caller surfaces exactly the ones it changed.
-    pub(super) fn orphan_in_flight_probe_for_terminated_run(&self, run_id: &str, cause: &str) -> Option<String> {
-        let in_flight = self.take_in_flight_probe(run_id)?;
-        let probe_id = in_flight.probe_id;
-        match self.probe_lifecycle_state(&probe_id) {
-            Some(ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Unconfirmed) => {}
-            // `Replied` already has the worker's answer; `Injected` means the
-            // write is still in flight on another task and that task records
-            // its own outcome — via `record_pane_write_outcome`, which
-            // rechecks the run's slot mapping before it claims
-            // `Consumed`/`Buffered` and downgrades to `Orphaned` when this
-            // very teardown has already cleared it, so the in-flight
-            // reservation `take_in_flight_probe` just removed above is not
-            // the only thing standing between that write and a
-            // `Consumed`-forever record; anything else is already settled.
-            _ => return None,
+    /// to go. Walks the whole retained reply chain and returns every probe id
+    /// that was actually re-stated, so the caller surfaces exactly the ones it changed.
+    pub(super) fn orphan_in_flight_probe_for_terminated_run(&self, run_id: &str, cause: &str) -> Vec<String> {
+        let mut chain = self
+            .in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .remove(run_id)
+            .map(Box::new);
+        let mut restated = Vec::new();
+        while let Some(mut in_flight) = chain {
+            chain = in_flight.previous_reply.take();
+            let probe_id = in_flight.probe_id;
+            match self.probe_lifecycle_state(&probe_id) {
+                Some(ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Unconfirmed) => {
+                }
+                // `Replied` already has the worker's answer; `Injected` means the
+                // write is still in flight on another task and that task records
+                // its own outcome — via `record_pane_write_outcome`, which
+                // rechecks the run's slot mapping before it claims
+                // `Consumed`/`Buffered` and downgrades to `Orphaned` when this
+                // very teardown has already cleared it; anything else is already
+                // settled.
+                _ => continue,
+            }
+            tracing::warn!(
+                run_id,
+                probe_id = %probe_id,
+                cause,
+                "run terminated with a delivered probe still unanswered; recording orphaned rather \
+                 than leaving it reading as consumed",
+            );
+            self.set_probe_lifecycle_detail(
+                &probe_id,
+                ProbeDeliveryState::Orphaned,
+                Some(format!(
+                    "{cause}; the text reached the pane but the run ended before the worker produced \
+                     the turn boundary its reply would have arrived on"
+                )),
+            );
+            restated.push(probe_id);
         }
-        tracing::warn!(
-            run_id,
-            probe_id = %probe_id,
-            cause,
-            "run terminated with a delivered probe still unanswered; recording orphaned rather \
-             than leaving it reading as consumed",
-        );
-        self.set_probe_lifecycle_detail(
-            &probe_id,
-            ProbeDeliveryState::Orphaned,
-            Some(format!(
-                "{cause}; the text reached the pane but the run ended before the worker produced \
-                 the turn boundary its reply would have arrived on"
-            )),
-        );
-        Some(probe_id)
+        restated
     }
 
     /// Tell somebody that `probe_id` will not be delivered.
@@ -1050,10 +1066,10 @@ impl ServerState {
         )
     }
 
-    /// Take and return the in-flight probe for `run_id`, if any.
-    /// Restore any earlier reply contract when releasing a replacement claim.
-    /// Stop dispatch drains those earlier replies separately before taking
-    /// the current claim, so duplicate Stops cannot emit the same reply twice.
+    /// Take and return the in-flight probe for `run_id`, restoring any
+    /// earlier reply contract. Production teardown walks the chain itself in
+    /// [`Self::orphan_in_flight_probe_for_terminated_run`].
+    #[cfg(test)]
     pub(super) fn take_in_flight_probe(&self, run_id: &str) -> Option<InFlightProbe> {
         let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
         let mut claim = claims.remove(run_id)?;

@@ -1985,7 +1985,7 @@ impl ServerState {
         .await;
         // The probe past the queue, if any. Its reply would have arrived at
         // the worker's next turn boundary, and there is not going to be one.
-        if let Some(orphaned) = self.orphan_in_flight_probe_for_terminated_run(run_id, "worker pane released") {
+        for orphaned in self.orphan_in_flight_probe_for_terminated_run(run_id, "worker pane released") {
             self.surface_undelivered_probe(
                 run_id,
                 &orphaned,

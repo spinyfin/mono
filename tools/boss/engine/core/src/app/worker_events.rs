@@ -2539,7 +2539,14 @@ async fn dispatch_one_probe_reply(
         return false;
     };
     let driver = crate::driver_transcript::driver_for_execution(&server_state.work_db, run_id);
-    let text = match read_assistant_reply(driver.as_deref(), transcript_path, in_flight.offset_bytes).await {
+    let text = match read_assistant_reply(
+        driver.as_deref(),
+        transcript_path,
+        in_flight.offset_bytes,
+        in_flight.end_offset,
+    )
+    .await
+    {
         Ok(Some(text)) => text,
         Ok(None) => {
             tracing::warn!(
@@ -2582,7 +2589,7 @@ async fn dispatch_one_probe_reply(
     true
 }
 
-/// Read transcript bytes from `offset_bytes` to the end of the file
+/// Read transcript bytes from `offset_bytes` to `end_offset` (or the end of the file)
 /// at `transcript_path`, normalize each new JSONL line through `driver`,
 /// and return the last assistant-turn text found. Returns `Ok(None)` when
 /// no assistant turn appears in the new region (e.g. the worker
@@ -2595,16 +2602,18 @@ async fn read_assistant_reply(
     driver: Option<&dyn crate::driver::AgentDriver>,
     transcript_path: &str,
     offset_bytes: u64,
+    end_offset: Option<u64>,
 ) -> std::io::Result<Option<String>> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
     let mut file = tokio::fs::File::open(transcript_path).await?;
     let metadata = file.metadata().await?;
-    if metadata.len() <= offset_bytes {
+    let end = end_offset.map_or(metadata.len(), |end| end.min(metadata.len()));
+    if end <= offset_bytes {
         return Ok(None);
     }
     file.seek(SeekFrom::Start(offset_bytes)).await?;
-    let mut buf = Vec::with_capacity((metadata.len() - offset_bytes) as usize);
-    file.read_to_end(&mut buf).await?;
+    let mut buf = Vec::with_capacity((end - offset_bytes) as usize);
+    file.take(end - offset_bytes).read_to_end(&mut buf).await?;
     let chunk = match String::from_utf8(buf) {
         Ok(chunk) => chunk,
         Err(_) => {

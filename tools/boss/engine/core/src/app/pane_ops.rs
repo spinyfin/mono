@@ -33,10 +33,10 @@ pub enum FocusPaneError {
 pub enum SendInputError {
     #[error("no worker pane mapped for that run id")]
     UnknownRun,
-    #[error("nudge {probe_id} settled as {state}: {detail}")]
+    #[error("nudge {probe_id} settled as {}: {detail}", state.as_str())]
     NudgeDelivery {
         probe_id: String,
-        state: String,
+        state: boss_protocol::ProbeDeliveryState,
         detail: String,
     },
     /// Live worker activity does not accept typed input (or is
@@ -213,7 +213,9 @@ impl SendInputError {
     pub(super) fn safe_to_retry_at_boundary(&self) -> bool {
         match self {
             Self::NotAcceptingInput { .. } => true,
-            Self::NudgeDelivery { state, .. } => matches!(state.as_str(), "interrupt_failed" | "abandoned" | "dropped"),
+            // `Abandoned`/`Dropped` mean the run is gone or the engine deliberately
+            // discarded the probe; requeueing would strand or resurrect it.
+            Self::NudgeDelivery { state, .. } => *state == boss_protocol::ProbeDeliveryState::InterruptFailed,
             _ => false,
         }
     }
@@ -289,7 +291,7 @@ impl ServerState {
             }
             return Err(SendInputError::NudgeDelivery {
                 probe_id,
-                state: delivery.state.as_str().to_owned(),
+                state: delivery.state,
                 detail: delivery
                     .detail
                     .unwrap_or_else(|| "delivery is not confirmed; inspect probe-status before retrying".to_owned()),

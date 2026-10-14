@@ -809,7 +809,7 @@ async fn send_input_fails_visibly_when_the_long_tool_call_does_not_stop() {
     let SendInputError::NudgeDelivery { probe_id, state, .. } = err else {
         panic!("expected a queryable failed nudge, got {err:?}");
     };
-    assert_eq!(state, "interrupt_failed");
+    assert_eq!(state, ProbeDeliveryState::InterruptFailed);
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeDeliveryState::InterruptFailed)
@@ -997,7 +997,7 @@ async fn nudge_reports_its_state_when_a_sibling_probe_holds_the_slot() {
     else {
         panic!("expected NudgeDelivery, got {err:?}");
     };
-    assert_eq!(state, "queued");
+    assert_eq!(state, ProbeDeliveryState::Queued);
     assert!(detail.contains("another delivery path"), "detail: {detail}");
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),

@@ -1240,6 +1240,90 @@ async fn natural_stop_dispatches_previous_reply_without_releasing_new_claim() {
     assert_eq!(state.in_flight_probe_id(&run_id), Some(second));
 }
 
+fn interrupted_stop(run_id: &str) -> crate::events_socket::IncomingHookEvent {
+    crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "test-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Interrupted,
+        },
+        Some(run_id.to_owned()),
+        None,
+    )
+}
+
+/// Probe A restored at an empty interrupted boundary must not be answered with
+/// the reply that belongs to the replacement probe B.
+#[tokio::test]
+async fn restored_earlier_reply_does_not_read_replacement_answer() {
+    let (state, dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&state, 3, None);
+    let path = dir.path().join("restored.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let path_str = path.to_string_lossy().into_owned();
+    let first = state.queue_probe(run_id.clone(), "first".into(), false);
+    state
+        .try_reserve_probe_for_delivery(&run_id, Some(path_str.clone()), 0)
+        .unwrap();
+    state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+    let second = state.queue_probe(run_id.clone(), "second".into(), false);
+    state
+        .try_reserve_specific_probe_for_delivery(&run_id, &second, Some(path_str.clone()), 0)
+        .unwrap();
+    // Interrupted boundary with no assistant text: A keeps its retained snapshot.
+    dispatch_probe_reply_on_stop(&state, &interrupted_stop(&run_id)).await;
+    assert_eq!(state.in_flight_probe_id(&run_id), Some(second.clone()));
+    // B is re-snapshotted and written; its prompt and answer land after.
+    state.update_in_flight_probe_snapshot(&run_id, &second, Some(path_str.clone()), 0);
+    state.set_probe_lifecycle(&second, ProbeDeliveryState::Consumed);
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"user","message":{"content":"second"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"second answer"}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let sink = make_session_sink();
+    state.topic_broker.register_session("obs", sink.clone()).await;
+    state.topic_broker.subscribe("obs", &[probe_topic(&run_id)]).await;
+    dispatch_probe_reply_on_stop(&state, &interrupted_stop(&run_id)).await;
+    sink.close();
+    let mut replies = Vec::new();
+    while let Some(event) = sink.next().await {
+        if let FrontendEvent::ProbeReplied { probe_id, text, .. } = event.payload {
+            replies.push((probe_id, text));
+        }
+    }
+    assert_eq!(replies, vec![(second.clone(), "second answer".to_owned())]);
+    assert_ne!(state.probe_lifecycle_state(&first), Some(ProbeDeliveryState::Replied));
+}
+
+/// Teardown restates the whole retained reply chain, not just the top claim.
+#[tokio::test]
+async fn teardown_orphans_retained_previous_reply() {
+    let (state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&state, 3, None);
+    let first = state.queue_probe(run_id.clone(), "first".into(), false);
+    state.try_reserve_probe_for_delivery(&run_id, None, 0).unwrap();
+    state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+    let second = state.queue_probe(run_id.clone(), "second".into(), false);
+    state
+        .try_reserve_specific_probe_for_delivery(&run_id, &second, None, 0)
+        .unwrap();
+    state.set_probe_lifecycle(&second, ProbeDeliveryState::Consumed);
+    let mut orphaned = state.orphan_in_flight_probe_for_terminated_run(&run_id, "test teardown");
+    orphaned.sort();
+    let mut expected = vec![first.clone(), second.clone()];
+    expected.sort();
+    assert_eq!(orphaned, expected);
+    assert_eq!(state.probe_lifecycle_state(&first), Some(ProbeDeliveryState::Orphaned));
+    assert_eq!(state.probe_lifecycle_state(&second), Some(ProbeDeliveryState::Orphaned));
+    assert!(!state.has_in_flight_probe(&run_id));
+}
+
 #[tokio::test(start_paused = true)]
 async fn buffered_busy_send_is_an_error_and_must_not_be_requeued() {
     let (state, _dir) = test_server_state();
@@ -1265,7 +1349,7 @@ async fn buffered_busy_send_is_an_error_and_must_not_be_requeued() {
             state: delivery_state,
             ..
         } => {
-            assert_eq!(delivery_state, "buffered");
+            assert_eq!(delivery_state, boss_protocol::ProbeDeliveryState::Buffered);
             assert_eq!(state.probe_record(&probe_id).unwrap().submitted, Some(false));
         }
         other => panic!("expected buffered error, got {other:?}"),
@@ -1274,21 +1358,22 @@ async fn buffered_busy_send_is_an_error_and_must_not_be_requeued() {
 
 #[test]
 fn brief_notice_retries_only_before_write_failures() {
-    for state in ["interrupt_failed", "abandoned", "dropped"] {
-        let err = super::super::pane_ops::SendInputError::NudgeDelivery {
-            probe_id: "probe".into(),
-            state: state.into(),
-            detail: "no write".into(),
-        };
-        assert!(err.safe_to_retry_at_boundary(), "{state}");
-    }
-    for state in ["queued", "unconfirmed", "orphaned", "buffered"] {
-        let err = super::super::pane_ops::SendInputError::NudgeDelivery {
-            probe_id: "probe".into(),
-            state: state.into(),
-            detail: "may be written".into(),
-        };
-        assert!(!err.safe_to_retry_at_boundary(), "{state}");
+    use boss_protocol::ProbeDeliveryState as S;
+    let nudge = |state| super::super::pane_ops::SendInputError::NudgeDelivery {
+        probe_id: "probe".into(),
+        state,
+        detail: "no write".into(),
+    };
+    assert!(nudge(S::InterruptFailed).safe_to_retry_at_boundary());
+    for state in [
+        S::Queued,
+        S::Unconfirmed,
+        S::Orphaned,
+        S::Buffered,
+        S::Abandoned,
+        S::Dropped,
+    ] {
+        assert!(!nudge(state).safe_to_retry_at_boundary(), "{state:?}");
     }
 }
 
