@@ -316,8 +316,7 @@ impl WorkerCompletionHandler {
 
     /// Override the working-copy diff verifier. Tests use this to exercise
     /// the no-op completion gate without spawning `jj`.
-    #[cfg(test)]
-    pub(super) fn with_workspace_diff_verifier(mut self, verifier: Arc<dyn WorkspaceDiffVerifier>) -> Self {
+    pub(crate) fn with_workspace_diff_verifier(mut self, verifier: Arc<dyn WorkspaceDiffVerifier>) -> Self {
         self.workspace_diff_verifier = verifier;
         self
     }
