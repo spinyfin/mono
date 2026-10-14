@@ -1,4 +1,5 @@
 pub use boss_transcript_markdown as transcript_markdown;
+pub use coordinator_tmux::inbox::deliver as deliver_coordinator_handoff_to_inbox;
 
 pub mod abandoned_branch_pr_sweep;
 mod abandoned_execution_bookmarks;

@@ -6,6 +6,11 @@ import Foundation
 /// itself; the visible tmux client is only a viewer and cannot be its
 /// trust root.
 extension ChatViewModel {
+    func logCoordinatorReset(_ stage: String, source: String) {
+        IpcLog.shared.log(requestId: attachedCoordinatorSpawnToken ?? "unattached",
+                          direction: "app", kind: "coordinator_reset_\(stage)",
+                          body: ["source": source])
+    }
     func coordinatorModelConfigured(_ model: String) {
         let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !model.isEmpty else { return }
@@ -25,6 +30,7 @@ extension ChatViewModel {
 
     func confirmCoordinatorModelRecreate() {
         guard let confirmation = coordinatorModelRecreateConfirmation else { return }
+        logCoordinatorReset("confirmed", source: "model_change")
         coordinatorModelRecreateConfirmation = nil
         beginCoordinatorReset(token: confirmation.expectedSpawnToken, reason: .modelMismatch)
     }
@@ -43,6 +49,7 @@ extension ChatViewModel {
     /// currently attached (nothing to reset).
     func resetCoordinator() {
         guard let token = attachedCoordinatorSpawnToken else { return }
+        logCoordinatorReset("confirmed", source: "operator_reset")
         beginCoordinatorReset(token: token, reason: .operatorReset)
     }
 

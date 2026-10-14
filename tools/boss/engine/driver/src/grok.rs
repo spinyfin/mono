@@ -51,6 +51,7 @@ mod preflight;
 mod progress;
 mod transcript;
 mod turn_end_recovery;
+pub use turn_end_recovery::percent_encode_path_component;
 
 pub(crate) use home::GROK_HOMES_DIR_NAME;
 pub use home::{

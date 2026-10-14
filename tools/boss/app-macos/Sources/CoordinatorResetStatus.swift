@@ -21,7 +21,7 @@ struct CoordinatorResetStatus: ViewModifier {
                     .background(.regularMaterial)
                 } else if model.coordinatorResetTimedOut {
                     VStack(spacing: 8) {
-                        Text("The coordinator did not write a handoff within 120s. Its session is still running.")
+                        Text("The coordinator's handoff deadline expired. Its session is still running.")
                         HStack {
                             Button("Reset anyway (no fresh handoff)") { confirmForce = true }
                             Button("Keep session") { model.clearCoordinatorReset() }

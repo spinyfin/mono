@@ -24,6 +24,7 @@ use crate::spawn_flow::TMUX_SESSION_SCHEMA;
 use crate::tmux_session_options::insert_color_environment;
 use crate::work::{CoordinatorTmuxRecord, WorkDb};
 
+pub(crate) mod inbox;
 pub(crate) mod reset_handoff;
 
 pub const COORDINATOR_SESSION_NAME: &str = "boss-coordinator";

@@ -541,6 +541,13 @@ mod update_available_tests {
 /// or a user-initiated reset (see `reason`). The app cannot choose a
 /// session name or model here; both remain engine-owned configuration.
 pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequest) {
+    crate::audit::record_event(
+        "coordinator_reset_handler_started",
+        &serde_json::json!({
+            "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(),
+        "request_id": ctx.request_id, "since_rpc_received_ms": ctx.recv_instant.elapsed().as_millis(),
+        }),
+    );
     let Dispatch {
         server_state,
         sink,
@@ -637,7 +644,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
         );
         return;
     }
-    // The handoff wait can take minutes. `handle_frontend_connection` awaits
+    // The handoff wait can take 30 seconds. `handle_frontend_connection` awaits
     // each handler in the connection's read loop, so awaiting it here would
     // stall every other request on the app connection, including the app's
     // replies to engine-to-app requests. Detach it; the reply still lands on
@@ -700,25 +707,36 @@ impl CoordinatorReset {
             // inside `request_and_wait`, so the supervisor stays free to recover
             // while we await a write.
             let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
-            if let Err(error) = crate::coordinator_tmux::reset_handoff::request_and_wait(
-                server_state.work_db.as_ref(),
-                active_tmux,
-                &server_state.coordinator_tmux_lock,
-                &server_state.coordinator_handoff_written,
-                &expected_spawn_token,
-                force_without_handoff,
-                server_state.coordinator_handoff_timeout,
+            let fresh_handoff = match crate::coordinator_tmux::reset_handoff::request_and_wait(
+                crate::coordinator_tmux::reset_handoff::HandoffRequest::builder()
+                    .work_db(server_state.work_db.as_ref())
+                    .tmux(active_tmux)
+                    .lifecycle_lock(&server_state.coordinator_tmux_lock)
+                    .written(&server_state.coordinator_handoff_written)
+                    .expected_token(&expected_spawn_token)
+                    .force(force_without_handoff)
+                    .timeout(server_state.coordinator_handoff_timeout)
+                    .delivery(server_state.coordinator_handoff_delivery.as_ref())
+                    .build(),
             )
             .await
             {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::Error {
-                        message: format!("recreate_coordinator: {error:#}"),
-                    },
-                );
-                return;
+                Ok(fresh) => fresh,
+                Err(error) => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            message: format!("recreate_coordinator: {error:#}"),
+                        },
+                    );
+                    return;
+                }
+            };
+            if !fresh_handoff && !force_without_handoff {
+                send_response(&sink, &request_id, FrontendEvent::Error {
+                    message: "Coordinator reset: no fresh handoff was written within 30s. Restarting with potentially missing context.".into(),
+                });
             }
             let _guard = server_state.coordinator_tmux_lock.lock().await;
             let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
@@ -734,7 +752,7 @@ impl CoordinatorReset {
                 },
                 &expected_spawn_token,
                 reason,
-                force_without_handoff,
+                !fresh_handoff,
             )
             .await
         };

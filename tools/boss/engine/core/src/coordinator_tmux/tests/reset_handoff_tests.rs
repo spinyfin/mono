@@ -1,6 +1,91 @@
 use super::*;
-use crate::coordinator_tmux::reset_handoff::request_and_wait;
+use crate::coordinator_tmux::reset_handoff::HandoffRequest;
+
+struct TestDelivery;
+#[async_trait::async_trait]
+impl crate::coordinator_tmux::inbox::HandoffDelivery for TestDelivery {
+    async fn deliver(&self, tmux: &Tmux, record: &CoordinatorTmuxRecord, prompt: &str) -> Result<()> {
+        tmux.set_option(&record.session_name, "@test_handoff_delivered", prompt)
+            .await
+    }
+}
+
+async fn request_and_wait(
+    work_db: &WorkDb,
+    tmux: &Tmux,
+    lifecycle_lock: &tokio::sync::Mutex<()>,
+    written: &Notify,
+    expected_token: &str,
+    force: bool,
+    timeout: Duration,
+) -> Result<bool> {
+    crate::coordinator_tmux::reset_handoff::request_and_wait(
+        HandoffRequest::builder()
+            .work_db(work_db)
+            .tmux(tmux)
+            .lifecycle_lock(lifecycle_lock)
+            .written(written)
+            .expected_token(expected_token)
+            .force(force)
+            .timeout(timeout)
+            .delivery(&TestDelivery)
+            .build(),
+    )
+    .await
+}
+
 use tokio::sync::Notify;
+
+#[tokio::test(start_paused = true)]
+async fn the_full_thirty_second_grace_period_starts_only_after_delivery() {
+    struct DelayedDelivery(Notify);
+    #[async_trait::async_trait]
+    impl crate::coordinator_tmux::inbox::HandoffDelivery for DelayedDelivery {
+        async fn deliver(&self, _: &Tmux, _: &CoordinatorTmuxRecord, _: &str) -> Result<()> {
+            self.0.notified().await;
+            Ok(())
+        }
+    }
+    let (db, tmux, server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let delivery = DelayedDelivery(Notify::new());
+    let lock = tokio::sync::Mutex::new(());
+    let written = Notify::new();
+    let request = crate::coordinator_tmux::reset_handoff::request_and_wait(
+        HandoffRequest::builder()
+            .work_db(&db)
+            .tmux(&tmux)
+            .lifecycle_lock(&lock)
+            .written(&written)
+            .expected_token("token")
+            .force(false)
+            .timeout(crate::coordinator_tmux::reset_handoff::HANDOFF_TIMEOUT)
+            .delivery(&delivery)
+            .build(),
+    );
+    tokio::pin!(request);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(31), &mut request)
+            .await
+            .is_err()
+    );
+    delivery.0.notify_one();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(29), &mut request)
+            .await
+            .is_err()
+    );
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(2), &mut request)
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    assert!(
+        send_keys_calls(&server.calls()).is_empty(),
+        "the composer is never an injection channel"
+    );
+}
 
 async fn reset(
     spawn: &CoordinatorSpawn<'_>,
@@ -8,7 +93,7 @@ async fn reset(
     force: bool,
     reason: CoordinatorRecreateReason,
 ) -> Result<CoordinatorTmuxRecord> {
-    request_and_wait(
+    let fresh = request_and_wait(
         spawn.work_db,
         spawn.tmux,
         &tokio::sync::Mutex::new(()),
@@ -18,7 +103,7 @@ async fn reset(
         Duration::from_millis(100),
     )
     .await?;
-    recreate_after_confirmation(spawn, "token", reason, force).await
+    recreate_after_confirmation(spawn, "token", reason, force || !fresh).await
 }
 
 fn record(db: &WorkDb) {
@@ -29,9 +114,11 @@ fn record(db: &WorkDb) {
 
 async fn prompt_submitted(server: &FakeTmux) {
     tokio::time::timeout(Duration::from_secs(2), async {
-        while !server.calls().iter().any(|call| {
-            call.get(2).map(String::as_str) == Some("send-keys") && call.last().map(String::as_str) == Some("C-m")
-        }) {
+        while !server
+            .calls()
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "@test_handoff_delivered"))
+        {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
@@ -51,7 +138,10 @@ async fn fresh_write_wakes_reset_and_replacement_receives_present_brief_for_both
         let spawn = spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe);
         let (result, ()) = tokio::join!(reset(&spawn, &written, false, reason), async {
             prompt_submitted(&server).await;
-            assert!(!send_keys_calls(&server.calls()).is_empty());
+            assert!(
+                send_keys_calls(&server.calls()).is_empty(),
+                "handoff delivery must not touch the composer"
+            );
             assert!(
                 !server
                     .calls()
@@ -75,8 +165,12 @@ async fn fresh_write_wakes_reset_and_replacement_receives_present_brief_for_both
 }
 
 #[tokio::test]
-async fn missing_old_or_wrong_writer_handoff_times_out_without_killing() {
-    for handoff in [None, Some(("token", 0)), Some(("other", i64::MAX))] {
+async fn missing_old_or_wrong_writer_handoff_times_out_and_restarts_with_stale_context() {
+    for handoff in [
+        None,
+        Some(("token", 0)),
+        Some(("other", boss_engine_utils::epoch_time::now_epoch_secs())),
+    ] {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
         record(&db);
         let written = Notify::new();
@@ -91,19 +185,18 @@ async fn missing_old_or_wrong_writer_handoff_times_out_without_killing() {
                 }
             }
         );
+        assert_ne!(result.unwrap().spawn_token, "token");
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("did not write a handoff within")
-        );
-        assert_eq!(db.coordinator_tmux_record().unwrap().unwrap().spawn_token, "token");
-        assert!(
-            !server
+            server
                 .calls()
                 .iter()
-                .any(|c| matches!(c.get(2).map(String::as_str), Some("kill-session" | "new-session")))
+                .any(|c| c.get(2).map(String::as_str) == Some("kill-session"))
         );
+        if handoff.is_some() {
+            assert!(start_brief(dir.path()).contains("HANDOFF STALE:"));
+        } else {
+            assert!(start_brief(dir.path()).contains("NO HANDOFF AVAILABLE"));
+        }
     }
 }
 
@@ -159,6 +252,38 @@ async fn dead_and_missing_sessions_skip_request_and_recreate() {
         assert_ne!(replacement.spawn_token, "token");
         assert!(send_keys_calls(&server.calls()).is_empty());
     }
+}
+
+#[tokio::test]
+async fn a_previous_write_cannot_satisfy_reset_even_with_the_same_timestamp_and_body() {
+    let (db, tmux, server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    // A future timestamp makes this independent of crossing a wall-clock second.
+    let old = db.set_coordinator_handoff("same facts", "token", i64::MAX).unwrap();
+    let lock = tokio::sync::Mutex::new(());
+    let written = Notify::new();
+    let request = request_and_wait(&db, &tmux, &lock, &written, "token", false, Duration::from_secs(1));
+    tokio::pin!(request);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut request)
+            .await
+            .is_err()
+    );
+    assert!(
+        server
+            .calls()
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "@test_handoff_delivered"))
+    );
+    let new = db.set_coordinator_handoff("same facts", "token", i64::MAX).unwrap();
+    assert_ne!(old.write_id, new.write_id);
+    written.notify_waiters();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), request)
+            .await
+            .unwrap()
+            .unwrap()
+    );
 }
 
 #[tokio::test]

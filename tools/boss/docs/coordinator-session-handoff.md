@@ -19,7 +19,11 @@ Unannounced termination gives the outgoing session no chance to run anything. Ev
 
 A shutdown-only write cannot protect against unannounced termination. Instead the coordinator keeps a **rolling handoff** and rewrites it at natural boundaries: whenever the operator states a fact that changes the world (a host taken down or brought back, a flag or setting flipped, dispatch paused or resumed), makes a decision, or says not to do something; when an open thread starts or resolves; and before acknowledging a request to restart, update, or reset it. Each write replaces the whole handoff, carrying forward what is still true. The "Session handoff" section of the coordinator prompt (`bossSystemPrompt` in `tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift`) is what binds the coordinator to this.
 
-Confirmed resets (including model changes) additionally ask the live coordinator to write a fresh handoff, then wait up to 120 seconds for a write stamped with the outgoing spawn token and a timestamp at or after the request. A timeout leaves the session running and offers “Reset anyway (no fresh handoff)”. This explicit override skips the wait and labels any saved handoff STALE in the new brief. Dead or missing sessions skip the request because there is nothing left to ask.
+Confirmed resets (including model changes) deliver a separate message through Claude Code's local inbox, without typing into, clearing, or submitting the terminal composer. Boss verifies that the socket peer is the live coordinator pane process and confirms a newly recorded user input with the injected message UUID and exact prompt (or a correlated `delivered` receipt). A socket write alone is not delivery: a held, denied, expired, unavailable, or unacknowledged delivery is reported to the operator and leaves the session running. There is no fallback to typing into the composer.
+
+After confirmed delivery, Boss waits up to **30 seconds** for a new handoff write from the outgoing spawn token. Each persisted write has a unique `write_id`, so a saved handoff from before the request cannot satisfy the wait even when both writes have identical bodies and second-resolution timestamps. A fresh write wakes the reset immediately. On timeout Boss logs an error, displays a missing-context warning, and replaces the session; any previously saved handoff is labeled STALE. Dead or missing sessions skip delivery because there is no live coordinator to ask. The app retains the older engine's explicit “Reset anyway” error flow for compatibility.
+
+The inbox transport uses Claude Code's [local session messaging](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket). Its inbox protocol is version-sensitive. Immediately accepted messages do not produce a delivery receipt in Claude Code 2.1.300, so Boss watches only the new tail of the matching session transcript for the exact input; it never treats a successful socket write as proof. Held messages can produce receipts. Boss reads only the live pane PID's Claude registration to obtain its session ID, exact inbox path, and protocol version; it does not guess a socket path or enumerate other sessions. Inbound settings still apply; Boss does not override a refusal or claim a held message was delivered. Delivery has a separate one-second confirmation bound, which never consumes the handoff grace period.
 
 The handoff is written by the coordinator session itself. The engine never synthesizes one from logs or transcripts.
 
@@ -28,7 +32,7 @@ The handoff is written by the coordinator session itself. The engine never synth
 One JSON value in the `metadata` table of the engine's own database, under the key `coordinator.handoff`:
 
 ```json
-{ "body": "...", "written_at": 1756800000, "writer_spawn_token": "…" }
+{ "body": "...", "written_at": 1756800000, "writer_spawn_token": "…", "write_id": "…" }
 ```
 
 `written_at` is Unix epoch seconds; `writer_spawn_token` is the spawn token of the coordinator record that was live when the write happened. This is coordinator-private state — it never enters a repo — and it is engine-owned, so it survives app restarts and is reachable only through the engine's RPC surface (`boss handoff …`), never by reading the database.
@@ -95,9 +99,13 @@ boss handoff show --json
 
 ## Forensics
 
-Two `engine-audit.log` events (see [forensic-surfaces.md](forensic-surfaces.md)):
+The handoff's durable `engine-audit.log` events (see [forensic-surfaces.md](forensic-surfaces.md)) include:
 
 - `coordinator_handoff_written` — every successful write: byte count, writer spawn token, `written_at`.
 - `coordinator_handoff_brief` — every fresh coordinator launch: `outcome` (`present` / `missing` / `unreadable`, or `brief_unwritable` when the file could not be written), `start_reason`, the previous session's spawn token and start time, and whether the handoff was written by that previous session.
 
 Together they answer "was a handoff available when session X started, and who wrote it?" without opening the database.
+
+Reset timing is also recorded at each boundary. The app's IPC JSONL records `coordinator_reset_gesture` (Settings or update banner), `coordinator_reset_confirmed`, and `coordinator_reset_rpc_send`. These carry millisecond wall-clock timestamps. Engine audit records `coordinator_reset_rpc_received`, `coordinator_reset_handler_started`, `coordinator_handoff_delivery_started`, `coordinator_handoff_lock_acquired`, `coordinator_handoff_requested` (confirmed delivery), `coordinator_handoff_grace_started`, and `coordinator_handoff_received` or `coordinator_handoff_timeout` (grace end), with millisecond timestamps and elapsed delivery/lock timing. Join the app's RPC send and engine receipt by request ID, then the handoff events by spawn token. Draft text and inbox authentication data are never logged.
+
+The reported October 14 reset has request and transcript arrival in the same second, followed by a handoff nine seconds later. It has no recorded gesture or RPC-send timestamp, so it cannot establish where the preceding time was spent. Both reset UI entry points use the same RPC path, and the grace timer follows delivery; the timing regression test explicitly holds delivery longer than a grace period and then verifies the full 30 seconds remain. The new trace distinguishes an upstream delay from an inbox-delivery delay or time actually spent waiting for a handoff.

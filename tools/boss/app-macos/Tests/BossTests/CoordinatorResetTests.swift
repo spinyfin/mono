@@ -3,6 +3,22 @@ import XCTest
 
 @MainActor
 final class CoordinatorResetTests: XCTestCase {
+    func testMissingHandoffWarningSurvivesReplacement() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.attachedCoordinatorSpawnToken = "original"
+        model.resetCoordinator()
+        let warning = "Coordinator reset: no fresh handoff was written within 30s. Restarting with potentially missing context."
+        model.applyEventForTest(.error(message: warning))
+        XCTAssertEqual(model.workErrorMessage, warning)
+        model.coordinatorPaneAttached(EngineCoordinatorAttachRequest(
+            sessionName: "boss-coordinator", spawnToken: "replacement", model: "opus",
+            tmuxProgram: "/usr/bin/tmux", tmuxSocketPath: "/tmp/boss-test.sock",
+            newerInstalledClaudeVersion: nil
+        ))
+        XCTAssertFalse(model.coordinatorResetWaiting)
+        XCTAssertEqual(model.workErrorMessage, warning)
+    }
+
     func testResetWaitsThenTimeoutOffersForceWithoutGenericError() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         var requests: [[String: Any]] = []

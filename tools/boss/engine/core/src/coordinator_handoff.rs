@@ -37,8 +37,8 @@
 //! the world, a decision, or a prohibition — so a handoff always exists
 //! as of the last such boundary, and the brief's writer/age stamps make
 //! any gap visible. UI-confirmed resets additionally request a fresh
-//! handoff and wait up to 120 seconds before replacing a live session. A
-//! timeout leaves it running unless a forced reset is confirmed.
+//! handoff through its inbox and wait up to 30 seconds after delivery before
+//! replacing a live session. A timeout is reported as missing context.
 //! See `tools/boss/docs/coordinator-session-handoff.md`.
 
 use std::path::{Path, PathBuf};
@@ -67,6 +67,9 @@ pub(crate) const START_BRIEF_FILENAME: &str = "handoff-brief.txt";
 /// The stored handoff record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CoordinatorHandoff {
+    /// Distinguishes two writes even when their timestamp and body are equal.
+    #[serde(default)]
+    pub(crate) write_id: String,
     pub(crate) body: String,
     /// Unix epoch seconds.
     pub(crate) written_at: i64,
@@ -209,6 +212,7 @@ impl WorkDb {
         now_epoch_secs: i64,
     ) -> Result<CoordinatorHandoff> {
         let handoff = CoordinatorHandoff {
+            write_id: crate::engine_control::generate_token(),
             body: body.to_owned(),
             written_at: now_epoch_secs,
             writer_spawn_token: writer_spawn_token.to_owned(),
@@ -417,12 +421,16 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
 /// character outside `[A-Za-z0-9]` with `-`. Pure; the caller decides
 /// whether the directory actually exists.
 pub(crate) fn transcript_projects_dir(home: &Path, working_directory: &Path) -> PathBuf {
+    transcript_projects_dir_in_config(&home.join(".claude"), working_directory)
+}
+
+pub(crate) fn transcript_projects_dir_in_config(config: &Path, working_directory: &Path) -> PathBuf {
     let encoded: String = working_directory
         .to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    home.join(".claude").join("projects").join(encoded)
+    config.join("projects").join(encoded)
 }
 
 /// [`transcript_projects_dir`] for the real `$HOME`, only when it exists.
@@ -467,6 +475,7 @@ mod tests {
 
     fn present(written_at: i64, writer: &str) -> HandoffState {
         HandoffState::Present(CoordinatorHandoff {
+            write_id: String::new(),
             body: "- greyarea is shut down (operator, 19:22 PDT)\n- tmux hosting re-enabled\n".to_owned(),
             written_at,
             writer_spawn_token: writer.to_owned(),
@@ -526,6 +535,7 @@ mod tests {
     fn view_marks_current_session_only_on_exact_token_match() {
         let handoff = CoordinatorHandoff {
             body: "- fact".to_owned(),
+            write_id: String::new(),
             written_at: NOW - 240,
             writer_spawn_token: "token-a".to_owned(),
         };

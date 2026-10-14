@@ -914,7 +914,10 @@ struct ContentView: View {
             if model.isConnected, let installedVersion = model.coordinatorUpdateAvailable {
                 CoordinatorUpdateBanner(
                     installedVersion: installedVersion,
-                    onReset: { showCoordinatorResetConfirmFromBanner = true },
+                    onReset: {
+                        model.logCoordinatorReset("gesture", source: "update_banner")
+                        showCoordinatorResetConfirmFromBanner = true
+                    },
                     isCollapsed: isCollapsed
                 )
             }
