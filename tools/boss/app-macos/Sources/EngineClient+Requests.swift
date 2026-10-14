@@ -149,7 +149,8 @@ extension EngineClient {
     }
 
     /// Fetch the persisted off-machine backup configuration.
-    func sendGetOffsiteBackup() {
+    @discardableResult
+    func sendGetOffsiteBackup() -> String? {
         sendLine(["type": "get_offsite_backup"], queueIfDisconnected: true)
     }
 

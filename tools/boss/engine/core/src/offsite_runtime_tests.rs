@@ -66,6 +66,24 @@ fn offsite_disabled_by_default() {
 }
 
 #[test]
+fn disabled_runtime_leaves_age_gauge_untouched() {
+    let tmp = TempDir::new().unwrap();
+    let db = open_file_db(tmp.path());
+    let registry = Arc::new(Registry::new());
+    register_metrics(&registry);
+    OFFSITE_LAST_SUCCESS_AGE_SECS.set(&registry, 12345);
+    let rt = OffsiteRuntime::from_settings(&tmp.path().join("settings.toml"), registry.clone());
+    rt.validate_at_startup();
+    run_backup_with_offsite(&db, &tmp.path().join("backups"), 24, Some(&rt));
+    wait_for_worker(&rt);
+    rt.refresh_age_gauge();
+    assert_eq!(
+        registry.gauge_value("database_backup.offsite.last_success_age_secs"),
+        Some(12345)
+    );
+}
+
+#[test]
 fn offsite_enabled_without_destination_fails_loudly() {
     let tmp = TempDir::new().unwrap();
     let settings = tmp.path().join("settings.toml");
@@ -198,6 +216,25 @@ fn success_record_write_failure_is_not_a_failed_copy() {
     assert_eq!(
         registry.counter_value("database_backup.offsite.copies_succeeded"),
         Some(1)
+    );
+    let success = rt.last_success.load(Ordering::Relaxed);
+    assert!(success > 0);
+    std::fs::remove_dir_all(&dest).unwrap();
+    rt.copy_and_prune(rt.open_snapshot(&snap).unwrap());
+    assert_eq!(rt.last_success.load(Ordering::Relaxed), success);
+    rt.refresh_age_gauge_at(success + 60);
+    assert_eq!(
+        registry.gauge_value("database_backup.offsite.last_success_age_secs"),
+        Some(60)
+    );
+    let mut changed = rt.load_config().unwrap();
+    changed.destination = Some(tmp.path().join("different"));
+    write_config(&rt.settings_path, &changed);
+    rt.load_config().unwrap();
+    rt.refresh_age_gauge();
+    assert_eq!(
+        registry.gauge_value("database_backup.offsite.last_success_age_secs"),
+        Some(-1)
     );
 }
 

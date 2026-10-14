@@ -53,6 +53,7 @@ extension ChatViewModel {
             // Settings reflects the engine immediately after connecting
             // rather than waiting until Settings is opened.
             engine.sendGetSettings()
+            refreshOffsiteBackup()
             // Pull the current GitHub OAuth auth state so the "GitHub
             // account" settings subsection reflects a token persisted by a
             // prior session (the engine restores it from the keychain at
@@ -81,7 +82,7 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
-            rejectOffsiteBackupEdit("Disconnected from the engine. Reconnect and try again.")
+            disconnectOffsiteBackupEdit()
             clearCoordinatorReset()
             isConnected = false
             stopBackgroundWorkPolling(clearSnapshot: true)

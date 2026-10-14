@@ -41,7 +41,7 @@ struct BackupSettingsPane: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .disabled(chatModel.offsiteEdit.requestID != nil)
+            .disabled(chatModel.offsiteEdit.requestID != nil || chatModel.offsiteEdit.needsReconciliation)
         }
         .formStyle(.grouped)
         .padding()

@@ -27,7 +27,7 @@ extension ChatViewModel {
 
     /// Ask the engine for the stored off-machine backup configuration.
     func refreshOffsiteBackup() {
-        engine.sendGetOffsiteBackup()
+        offsiteEdit.refreshID = engine.sendGetOffsiteBackup()
     }
 
     /// Ask the engine for a fresh engine-health snapshot. Also called

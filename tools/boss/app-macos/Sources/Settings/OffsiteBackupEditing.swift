@@ -9,6 +9,8 @@ struct OffsiteBackupEdit {
     var controls: Set<OffsiteBackupControl> = []
     var errors: [OffsiteBackupControl: String] = [:]
     var requestID: String?
+    var refreshID: String?
+    var needsReconciliation = false
     var debounce: Task<Void, Never>?
 }
 
@@ -25,7 +27,7 @@ extension ChatViewModel {
         control: OffsiteBackupControl,
         debounce: Bool = false
     ) {
-        guard offsiteEdit.requestID == nil, var next = displayedOffsiteBackup else { return }
+        guard !offsiteEdit.needsReconciliation, offsiteEdit.requestID == nil, var next = displayedOffsiteBackup else { return }
         offsiteEdit.debounce?.cancel()
         next[keyPath: keyPath] = value
         next.loadError = nil
@@ -53,9 +55,26 @@ extension ChatViewModel {
     }
 
     func receiveOffsiteBackup(_ settings: OffsiteBackupSettings, requestID: String?) {
+        if offsiteEdit.needsReconciliation {
+            guard let refresh = offsiteEdit.refreshID, requestID == refresh else { return }
+            offsiteBackup = settings
+            offsiteEdit = OffsiteBackupEdit()
+            return
+        }
         offsiteBackup = settings
         if let pending = offsiteEdit.requestID, requestID == pending {
             offsiteEdit = OffsiteBackupEdit()
+        }
+    }
+
+    func disconnectOffsiteBackupEdit() {
+        offsiteEdit.debounce?.cancel()
+        offsiteEdit.debounce = nil
+        offsiteEdit.requestID = nil
+        offsiteEdit.refreshID = nil
+        offsiteEdit.needsReconciliation = true
+        for control in offsiteEdit.controls {
+            offsiteEdit.errors[control] = "Connection lost. Waiting to confirm stored settings."
         }
     }
 

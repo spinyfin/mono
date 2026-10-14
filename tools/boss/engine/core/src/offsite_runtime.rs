@@ -3,8 +3,8 @@ use boss_engine_offsite_backup::{CONFIG_SECTION, OffsiteConfig};
 use boss_metrics::Registry;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 // ── Off-machine copy metrics ──────────────────────────────────────────────
 
 crate::register_counter!(
@@ -70,6 +70,9 @@ pub struct OffsiteRuntime {
     registry: Arc<Registry>,
     success_path: PathBuf,
     in_flight: AtomicBool,
+    enabled: AtomicBool,
+    // Outer None means startup; only a new destination reloads the durable record.
+    loaded_destination: Mutex<Option<Option<PathBuf>>>,
     /// Epoch seconds of the last successful copy; 0 = no durable success.
     last_success: AtomicI64,
 }
@@ -84,6 +87,9 @@ impl OffsiteRuntime {
                 .registry(registry)
                 .success_path(settings_path.with_file_name("offsite-last-success"))
                 .in_flight(AtomicBool::new(false))
+                // An unreadable startup configuration must still report unknown success.
+                .enabled(AtomicBool::new(true))
+                .loaded_destination(Mutex::new(None))
                 .last_success(AtomicI64::new(0))
                 .build(),
         );
@@ -94,11 +100,17 @@ impl OffsiteRuntime {
     }
 
     fn restore_success(&self, config: &OffsiteConfig) {
+        self.enabled.store(config.enabled, Ordering::Relaxed);
+        let mut loaded = self.loaded_destination.lock().unwrap();
+        if loaded.as_ref() == Some(&config.destination) {
+            return;
+        }
+        *loaded = Some(config.destination.clone());
         let last = std::fs::read_to_string(&self.success_path)
             .ok()
             .and_then(|record| {
                 let (timestamp, destination) = record.split_once('\n')?;
-                (config.enabled && destination == format!("{:?}", config.destination))
+                (destination == format!("{:?}", config.destination))
                     .then(|| timestamp.parse::<i64>().ok())
                     .flatten()
             })
@@ -107,12 +119,13 @@ impl OffsiteRuntime {
     }
 
     fn load_config(&self) -> anyhow::Result<OffsiteConfig> {
-        OffsiteConfig::load(&self.settings_path).inspect_err(|err| {
-            OFFSITE_CONFIG_INVALID.inc(&self.registry);
-            self.last_success.store(0, Ordering::Relaxed);
-            tracing::error!(error = %format!("{err:#}"), settings = %self.settings_path.display(),
+        OffsiteConfig::load(&self.settings_path)
+            .inspect(|config| self.restore_success(config))
+            .inspect_err(|err| {
+                OFFSITE_CONFIG_INVALID.inc(&self.registry);
+                tracing::error!(error = %format!("{err:#}"), settings = %self.settings_path.display(),
                 "database-backup: cannot read {CONFIG_SECTION}; skipping off-machine copy");
-        })
+            })
     }
 
     /// Validate independently of local snapshot success, without waiting on the mount.
@@ -209,7 +222,6 @@ impl OffsiteRuntime {
                 return;
             }
         };
-        self.restore_success(&config);
         if !config.enabled {
             self.refresh_age_gauge();
             return;
@@ -286,7 +298,9 @@ impl OffsiteRuntime {
     }
 
     fn refresh_age_gauge_at(&self, now: i64) {
-        OFFSITE_LAST_SUCCESS_AGE_SECS.set(&self.registry, self.age_secs_at(now));
+        if self.enabled.load(Ordering::Relaxed) {
+            OFFSITE_LAST_SUCCESS_AGE_SECS.set(&self.registry, self.age_secs_at(now));
+        }
     }
 }
 

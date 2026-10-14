@@ -70,7 +70,7 @@ final class OffsiteBackupEditingTests: XCTestCase {
         XCTAssertEqual(payloads.first?["keep_daily"] as? Int, 15)
     }
 
-    func testImmediateEditIncludesPendingRetentionAndDisconnectRollsBack() async {
+    func testImmediateEditIncludesPendingRetentionAndDisconnectWaitsForReconciliation() async {
         let model = model()
         var payloads: [[String: Any]] = []
         model.outboundRecorder = { payloads.append($0) }
@@ -79,9 +79,33 @@ final class OffsiteBackupEditingTests: XCTestCase {
         XCTAssertEqual(payloads.count, 1)
         XCTAssertEqual(payloads.first?["keep_hourly"] as? Int, 25)
         model.applyEventForTest(.disconnected)
-        XCTAssertEqual(model.displayedOffsiteBackup?.keepHourly, 24)
+        XCTAssertEqual(model.displayedOffsiteBackup?.keepHourly, 25)
+        XCTAssertTrue(model.offsiteEdit.needsReconciliation)
         XCTAssertNotNil(model.offsiteEdit.errors[.hourly])
         try? await Task.sleep(for: .milliseconds(500))
         XCTAssertEqual(payloads.count, 1)
+    }
+
+    func testLostAcknowledgementReconcilesBeforeSubsequentEdit() throws {
+        let model = model()
+        var payloads: [[String: Any]] = []
+        model.outboundRecorder = { payloads.append($0) }
+        model.changeOffsiteBackup(\.destination, to: "/persisted-sync", control: .destination)
+        let persisted = try XCTUnwrap(model.displayedOffsiteBackup)
+        let lostID = try XCTUnwrap(model.offsiteEdit.requestID)
+        model.applyEventForTest(.disconnected)
+        model.applyEventForTest(.connected)
+        XCTAssertTrue(payloads.contains { $0["type"] as? String == "get_offsite_backup" })
+        let refreshID = try XCTUnwrap(model.offsiteEdit.refreshID)
+        model.changeOffsiteBackup(\.keepHourly, to: 30, control: .hourly)
+        XCTAssertEqual(payloads.filter { $0["type"] as? String == "set_offsite_backup" }.count, 1)
+        model.applyEventForTest(.offsiteBackupSettings(persisted, requestId: lostID))
+        XCTAssertTrue(model.offsiteEdit.needsReconciliation)
+        model.applyEventForTest(.offsiteBackupSettings(persisted, requestId: refreshID))
+        XCTAssertFalse(model.offsiteEdit.needsReconciliation)
+        XCTAssertTrue(model.offsiteEdit.errors.isEmpty)
+        model.changeOffsiteBackup(\.keepHourly, to: 30, control: .hourly)
+        XCTAssertEqual(payloads.last?["destination"] as? String, "/persisted-sync")
+        XCTAssertEqual(payloads.last?["keep_hourly"] as? Int, 30)
     }
 }
