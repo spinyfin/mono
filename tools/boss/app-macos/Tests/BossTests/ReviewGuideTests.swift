@@ -233,6 +233,44 @@ final class ReviewGuideTests: XCTestCase {
         XCTAssertNil(model.asyncMarkdownViewerVM.reviewGuideRootTaskId)
     }
 
+    // MARK: - Loading-state title
+
+    private func loadingTitle(_ model: ChatViewModel, file: StaticString = #filePath, line: UInt = #line) -> String? {
+        guard case .loading(let title) = model.asyncMarkdownViewerVM.state else {
+            XCTFail("expected .loading; got \(model.asyncMarkdownViewerVM.state)", file: file, line: line)
+            return nil
+        }
+        return title
+    }
+
+    /// The loading window names the document kind from the first frame
+    /// (not a generic placeholder) and keeps the same title once loaded.
+    func testReviewGuideLoadingTitleMatchesLoadedTitle() {
+        let model = makeModel()
+        model.openReviewGuide(versionId: "prgv_1", rootTaskId: "missing_task")
+        XCTAssertEqual(loadingTitle(model), "Review guide")
+        XCTAssertEqual(model.reviewGuideViewerTitle(rootTaskId: "missing_task"), "Review guide")
+    }
+
+    func testDesignDocLoadingTitleIsDocumentName() {
+        let model = makeModel()
+        model.openDesignDocViaEngine(
+            ref: DesignDocRef(repoRemoteURL: "https://github.com/x/y", path: "docs/a.md", gitRef: "main"),
+            title: "My Project",
+            artifact: nil,
+            projectShortID: "1"
+        )
+        XCTAssertEqual(loadingTitle(model), "My Project")
+        model.applyProductDesignDocContent(
+            ref: DesignDocRef(repoRemoteURL: "https://github.com/x/y", path: "docs/a.md", gitRef: "main"),
+            content: .loaded(markdown: "# A")
+        )
+        guard case .loaded(let title, _, _) = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("expected .loaded")
+        }
+        XCTAssertEqual(title, "My Project")
+    }
+
     // MARK: - Response-identity guard / old-content retention
 
     /// A late reply for a version the user has since navigated away from

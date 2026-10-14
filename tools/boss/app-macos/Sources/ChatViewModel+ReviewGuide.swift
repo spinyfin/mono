@@ -32,7 +32,7 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.reviewGuideRootTaskId = rootTaskId
         asyncMarkdownViewerVM.reviewGuideGeneratedAt = nil
         asyncMarkdownViewerVM.reviewGuideComparisonId = nil
-        asyncMarkdownViewerVM.state = .loading
+        asyncMarkdownViewerVM.state = .loading(title: reviewGuideViewerTitle(rootTaskId: rootTaskId))
         asyncMarkdownViewerVM.staleReason = nil
         asyncMarkdownViewerVM.canRetry = false
         asyncMarkdownViewerVM.onRetry = { [weak self] in
@@ -41,6 +41,13 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
         asyncMarkdownViewerOpener?()
         pendingReviewGuideRequestId = engine.sendGetReviewGuideContent(versionID: versionId)
+    }
+
+    /// Window title for a review guide, shared by the loading and loaded
+    /// states so the title does not change while the content arrives.
+    @MainActor
+    func reviewGuideViewerTitle(rootTaskId: String?) -> String {
+        rootTaskId.flatMap { task(withID: $0) }.map { "Review guide: \($0.name)" } ?? "Review guide"
     }
 
     /// Apply a `review_guide_content` reply. Dropped when `versionId` no
@@ -61,7 +68,7 @@ extension ChatViewModel {
             return
         }
         let rootTaskId = pendingReviewGuideRootTaskId
-        let title = rootTaskId.flatMap { task(withID: $0) }.map { "Review guide: \($0.name)" } ?? "Review guide"
+        let title = reviewGuideViewerTitle(rootTaskId: rootTaskId)
         asyncMarkdownViewerVM.renderStartTime = Date()
         asyncMarkdownViewerVM.renderContentID = UUID()
         asyncMarkdownViewerVM.staleReason = nil

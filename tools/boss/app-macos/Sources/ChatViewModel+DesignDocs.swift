@@ -93,7 +93,7 @@ extension ChatViewModel {
         if let existing = designDocContentByRef[ref] {
             applyContentToAsyncViewerIfPending(ref: ref, content: existing)
         } else {
-            asyncMarkdownViewerVM.state = .loading
+            asyncMarkdownViewerVM.state = .loading(title: title)
             asyncMarkdownViewerVM.staleReason = nil
             asyncMarkdownViewerVM.canRetry = false
         }
@@ -195,7 +195,7 @@ extension ChatViewModel {
                     // Open the window immediately, then resolve through
                     // the engine (cache + revalidate). App-side `gh api`
                     // is no longer on this path.
-                    asyncMarkdownViewerVM.state = .loading
+                    asyncMarkdownViewerVM.state = .loading(title: projectName)
                     asyncMarkdownViewerVM.clickStartTime = clickStart
                     let openWindowStart = Date()
                     opener()

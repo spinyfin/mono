@@ -77,7 +77,7 @@ extension ChatViewModel {
                     // Open the window immediately, then resolve through
                     // the engine (cache + revalidate). Parity with the
                     // project path; no app-side `gh api`.
-                    asyncMarkdownViewerVM.state = .loading
+                    asyncMarkdownViewerVM.state = .loading(title: displayName)
                     asyncMarkdownViewerVM.clickStartTime = Date()
                     opener()
                     openDesignDocViaEngine(

@@ -101,7 +101,7 @@ struct BossMacApp: App {
         // [[ChatViewModel.asyncMarkdownViewerVM]] (injected via
         // environmentObject) rather than a value-type payload so the window
         // content can be updated after it opens.
-        Window("Design Doc", id: "async-markdown-viewer") {
+        Window("Document", id: "async-markdown-viewer") {
             AsyncMarkdownViewerView()
         }
         // Inject the viewer VM directly so the window observes its
