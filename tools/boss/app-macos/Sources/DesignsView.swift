@@ -645,7 +645,9 @@ private extension View {
 enum MarkdownDocLoadState {
     /// `title` is the same name the loaded state will use, so the window
     /// reads correctly from the first frame and never changes kind on load.
-    case loading(title: String)
+    /// `nil` before any opener has set a title (e.g. window restoration),
+    /// in which case no navigation title is applied.
+    case loading(title: String?)
     case loaded(title: String, markdown: String, artifact: CommentArtifactRef?)
     case failed(title: String, message: String)
 }
@@ -657,7 +659,7 @@ enum MarkdownDocLoadState {
 /// after the window opens).
 @MainActor
 final class AsyncMarkdownViewerViewModel: ObservableObject {
-    @Published var state: MarkdownDocLoadState = .loading(title: "")
+    @Published var state: MarkdownDocLoadState = .loading(title: nil)
     /// Set by the fetch path just before transitioning to `.loaded` so the
     /// render-complete log entry can report the full parse+layout duration.
     var renderStartTime: Date? = nil
@@ -742,7 +744,7 @@ struct AsyncMarkdownViewerView: View {
             case .loading(let title):
                 ProgressView("Loading…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .navigationTitle(title)
+                    .navigationTitle(title ?? "Boss")
             case .loaded(let title, let markdown, let artifact):
                 VStack(spacing: 0) {
                     if let rootTaskId = vm.reviewGuideRootTaskId {

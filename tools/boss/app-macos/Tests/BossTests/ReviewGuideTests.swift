@@ -247,9 +247,34 @@ final class ReviewGuideTests: XCTestCase {
     /// (not a generic placeholder) and keeps the same title once loaded.
     func testReviewGuideLoadingTitleMatchesLoadedTitle() {
         let model = makeModel()
+        let task = Self.makeTask(id: "task_1", readableVersionId: "prgv_1", name: "Fix widgets")
+        model.tasksByProjectID["proj_1"] = [task]
+        model.openReviewGuide(versionId: "prgv_1", rootTaskId: "task_1")
+        XCTAssertEqual(loadingTitle(model), "Review guide: Fix widgets")
+
+        model.applyReviewGuideContent(
+            versionId: "prgv_1",
+            content: ReviewGuideVersionContent(
+                id: "prgv_1",
+                seriesId: "prgs_1",
+                comparisonId: "prgc_1",
+                attemptId: "prga_1",
+                markdown: "# Guide",
+                contentHash: "hash",
+                promptVersion: "review-guide-v1",
+                generatedAt: "2026-09-01T00:00:00Z"
+            )
+        )
+        guard case .loaded(let title, _, _) = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("expected .loaded")
+        }
+        XCTAssertEqual(title, "Review guide: Fix widgets")
+    }
+
+    func testReviewGuideLoadingTitleFallsBackForUnknownTask() {
+        let model = makeModel()
         model.openReviewGuide(versionId: "prgv_1", rootTaskId: "missing_task")
         XCTAssertEqual(loadingTitle(model), "Review guide")
-        XCTAssertEqual(model.reviewGuideViewerTitle(rootTaskId: "missing_task"), "Review guide")
     }
 
     func testDesignDocLoadingTitleIsDocumentName() {
