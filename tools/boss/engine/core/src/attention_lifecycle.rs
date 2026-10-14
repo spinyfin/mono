@@ -494,6 +494,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          evidence the unhealthy host recovered.",
     ),
     entry(
+        crate::queue_ci_contract::SNAPSHOT_ERROR_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Contract capture failed; an operator must inspect configuration or provider access and re-check the dequeued PR.",
+    ),
+    entry(
         crate::ci_watch::CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "The attempt budget is spent. Clearing it on a later run would silently hand the item a \
@@ -720,6 +725,7 @@ mod tests {
             crate::proposal_channel_error::PROPOSAL_CHANNEL_ERROR_ATTENTION_KIND,
             crate::spawn_health::SPAWN_CAPABILITY_ATTENTION_KIND,
             crate::ci_watch::CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND,
+            crate::queue_ci_contract::SNAPSHOT_ERROR_ATTENTION_KIND,
             crate::trunk_queue_poller::TRUNK_QUEUE_UNREACHABLE_ATTENTION_KIND,
             crate::trunk_queue_poller::TRUNK_TOKEN_REJECTED_ATTENTION_KIND,
             crate::trunk_queue_poller::TRUNK_QUEUE_NOT_RUNNING_ATTENTION_KIND,

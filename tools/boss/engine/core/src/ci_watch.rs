@@ -1336,8 +1336,9 @@ async fn on_queue_side_failure_detected(
         Err(err) => {
             tracing::warn!(
                 ?err,
-                "cannot resolve queue CI verification contract; retry on next poll"
+                "cannot resolve queue CI verification contract; surfacing attention"
             );
+            crate::queue_ci_contract::surface_error(work_db, publisher, candidate, &err).await;
             return false;
         }
     };

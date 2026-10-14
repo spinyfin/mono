@@ -2,6 +2,7 @@
 //! the concern each module exercises. Shared fixtures live in [`helpers`].
 
 mod back_to_back;
+mod contract_capture;
 mod detection;
 mod helpers;
 mod log_excerpt;

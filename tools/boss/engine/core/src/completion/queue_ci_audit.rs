@@ -59,7 +59,7 @@ async fn find_contradiction(
         let enqueued = evidence.queue_entry_enqueued_at.as_deref().and_then(rfc3339_epoch)?;
         let events = branch_verifier.fetch_queue_dequeues(repo_slug, pr_number).await.ok()?;
         if events.iter().any(|event| {
-            event.reason == "FAILED_CHECKS"
+            event.reason.eq_ignore_ascii_case("failed_checks")
                 && event.pr_head_oid.as_deref() == Some(&evidence.verified_head_sha)
                 && event
                     .created_at
@@ -449,7 +449,7 @@ mod tests {
     async fn newer_same_head_dequeue_consumes_the_receipt_before_next_attempt() {
         let mut verifier = stub(snapshot("OPEN", HEAD, None));
         verifier.dequeues.push(crate::merge_poller::MergeQueueDequeueEvent {
-            reason: "FAILED_CHECKS".into(),
+            reason: "failed_checks".into(),
             created_at: Some("2026-07-27T23:11:00Z".into()),
             pr_head_oid: Some(HEAD.into()),
             before_commit_oid: None,

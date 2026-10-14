@@ -50,13 +50,45 @@ pub(crate) fn validate_contract(runs: &[RequiredRun]) -> Result<()> {
     Ok(())
 }
 
+#[async_trait::async_trait]
+pub(crate) trait ContractFetcher: Send + Sync {
+    async fn config(&self, pr_url: &str) -> Result<Option<String>>;
+    async fn step_key(&self, url: &str, id: &str) -> Result<String>;
+}
+
+struct ProviderFetcher;
+
+#[async_trait::async_trait]
+impl ContractFetcher for ProviderFetcher {
+    async fn config(&self, pr_url: &str) -> Result<Option<String>> {
+        let (owner, repo, _) = boss_github::pr_url::parse_pr_url_parts(pr_url).context("invalid PR URL")?;
+        Ok(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            boss_github::contents::fetch_repo_file(owner, repo, "BOSS_CI_VERIFICATION.json", "main"),
+        )
+        .await
+        .context("contract fetch timed out")??)
+    }
+
+    async fn step_key(&self, url: &str, id: &str) -> Result<String> {
+        Ok(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            boss_ci_log_reader::fetch_buildkite_step_key("bk", url, id),
+        )
+        .await
+        .context("step lookup timed out")??)
+    }
+}
+
 pub(crate) async fn snapshot(pr_url: &str, encoded_checks: &str) -> Result<String> {
+    snapshot_with(&ProviderFetcher, pr_url, encoded_checks).await
+}
+
+pub(crate) async fn snapshot_with(fetcher: &dyn ContractFetcher, pr_url: &str, encoded_checks: &str) -> Result<String> {
     if encoded_checks == "[]" {
         return Ok(encoded_checks.to_owned());
     }
-    let (owner, repo, _) = boss_github::pr_url::parse_pr_url_parts(pr_url).context("invalid PR URL")?;
-    let Some(config) = boss_github::contents::fetch_repo_file(owner, repo, "BOSS_CI_VERIFICATION.json", "main").await?
-    else {
+    let Some(config) = fetcher.config(pr_url).await? else {
         return Ok(encoded_checks.to_owned());
     };
     let contracts: BTreeMap<String, Vec<RequiredRun>> = serde_json::from_str(&config)?;
@@ -68,18 +100,35 @@ pub(crate) async fn snapshot(pr_url: &str, encoded_checks: &str) -> Result<Strin
     }
     let mut checks: Vec<serde_json::Value> = serde_json::from_str(encoded_checks)?;
     for check in &mut checks {
-        let url = check["target_url"].as_str().context("missing build URL")?;
-        let id = check["provider_job_id"]
-            .as_str()
-            .context("missing provider job identity")?;
-        let key = if check["provider"] == "buildkite" {
-            let pipeline = boss_ci_log_reader::parse_buildkite_pipeline_slug(url).context("missing pipeline")?;
-            let step = boss_ci_log_reader::fetch_buildkite_step_key("bk", url, id).await?;
-            format!("{pipeline}/{step}")
-        } else {
-            id.to_owned()
+        check
+            .as_object_mut()
+            .context("invalid failed check")?
+            .remove("verification");
+        check["job_key"] = serde_json::Value::Null;
+        // Only Buildkite has a stable declaration identity. Actions job IDs
+        // identify one run, not a job a product can declare ahead of time.
+        if check["provider"] != "buildkite" {
+            continue;
+        }
+        let (Some(url), Some(id)) = (check["target_url"].as_str(), check["provider_job_id"].as_str()) else {
+            continue;
         };
-        attach(check, &key, &contracts)?;
+        let Some(pipeline) = boss_ci_log_reader::parse_buildkite_pipeline_slug(url) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        // One bounded lookup per check: provider errors must not suppress
+        // this failure or a declared sibling's contract.
+        let step = match fetcher.step_key(url, id).await {
+            Ok(step) if !step.is_empty() => step,
+            result => {
+                tracing::warn!(?result, "queue CI identity unresolved; using heuristic verification");
+                continue;
+            }
+        };
+        attach(check, &format!("{pipeline}/{step}"), &contracts)?;
     }
     Ok(serde_json::to_string(&checks)?)
 }
@@ -92,29 +141,48 @@ fn attach(check: &mut serde_json::Value, key: &str, contracts: &BTreeMap<String,
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) const SNAPSHOT_ERROR_ATTENTION_KIND: &str = "queue_ci_contract_error";
 
-    #[test]
-    fn snapshot_mapping_uses_stable_key_and_retains_provider_identity() {
-        let contracts: BTreeMap<String, Vec<RequiredRun>> =
-            serde_json::from_str(r#"{"backend":[{"kind":"test","tool":"project","command":"make test"}]}"#).unwrap();
-        let mut check = serde_json::json!({"name":"Renamed display label","provider_job_id":"uuid"});
-        attach(&mut check, "backend", &contracts).unwrap();
-        assert_eq!(check["job_key"], "backend");
-        assert_eq!(check["provider_job_id"], "uuid");
-        assert_eq!(check["verification"][0]["command"], "make test");
-        let mut unknown = serde_json::json!({"name":"backend"});
-        attach(&mut unknown, "other-key", &contracts).unwrap();
-        assert!(unknown.get("verification").is_none());
-    }
-
-    #[test]
-    fn invalid_declared_contract_is_not_a_heuristic_fallback() {
-        assert!(validate_contract(&[]).is_err());
-        let runs: Vec<RequiredRun> =
-            serde_json::from_str(r#"[{"kind":"build","tool":"bazel","command":"npm run build"}]"#).unwrap();
-        assert!(validate_contract(&runs).is_err());
+pub(crate) async fn surface_error(
+    db: &crate::work::WorkDb,
+    publisher: &dyn crate::coordinator::ExecutionPublisher,
+    candidate: &crate::work::PendingMergeCheck,
+    error: &anyhow::Error,
+) {
+    // Polling may retry after configuration or credentials are repaired; one
+    // open attention is enough to keep the failed capture visible meanwhile.
+    let result = (|| -> Result<Option<boss_protocol::WorkAttentionItem>> {
+        if db
+            .list_attention_items_for_work_item(&candidate.work_item_id)?
+            .iter()
+            .any(|item| item.kind == SNAPSHOT_ERROR_ATTENTION_KIND && item.status == "open")
+        {
+            return Ok(None);
+        }
+        Ok(Some(db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+            execution_id: None,
+            work_item_id: Some(candidate.work_item_id.clone()),
+            kind: SNAPSHOT_ERROR_ATTENTION_KIND.to_owned(),
+            status: None,
+            title: "Queue CI verification contract could not be captured".to_owned(),
+            body_markdown: format!("Capture for {} failed: {error:#}. Check BOSS_CI_VERIFICATION.json on main and provider access, then re-check the dequeued PR. No remediation attempt was spent.", candidate.pr_url),
+            resolved_at: None,
+        })?))
+    })();
+    match result {
+        Ok(Some(item)) => {
+            publisher
+                .publish_frontend_event_on_product(
+                    &candidate.product_id,
+                    boss_protocol::FrontendEvent::AttentionItemCreated { item },
+                )
+                .await
+        }
+        Ok(None) => {}
+        Err(err) => tracing::error!(?err, "could not surface queue CI contract failure"),
     }
 }
+
+#[cfg(test)]
+#[path = "queue_ci_contract_tests.rs"]
+pub(crate) mod tests;
