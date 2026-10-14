@@ -132,7 +132,13 @@ impl CoordinatorStartReason {
                 "the previous coordinator's claude process exited (a crash, `/exit`, or a Claude Code update \
                  ending the process) while its tmux session survived"
             }
-            Self::RecreateWithoutHandoff(_) => "the operator reset the coordinator without waiting for a fresh handoff",
+            Self::RecreateWithoutHandoff(CoordinatorRecreateReason::ModelMismatch) => {
+                "the operator replaced the previous coordinator to change its model without waiting for a fresh \
+                 handoff"
+            }
+            Self::RecreateWithoutHandoff(CoordinatorRecreateReason::OperatorReset) => {
+                "the operator reset the coordinator without waiting for a fresh handoff"
+            }
             Self::Recreate(CoordinatorRecreateReason::ModelMismatch) => {
                 "the operator confirmed replacing the previous coordinator to change its model"
             }
@@ -145,7 +151,12 @@ impl CoordinatorStartReason {
 
     pub(crate) fn audit_label(self) -> &'static str {
         match self {
-            Self::RecreateWithoutHandoff(_) => "recreate_without_handoff",
+            Self::RecreateWithoutHandoff(CoordinatorRecreateReason::ModelMismatch) => {
+                "recreate_model_mismatch_without_handoff"
+            }
+            Self::RecreateWithoutHandoff(CoordinatorRecreateReason::OperatorReset) => {
+                "recreate_operator_reset_without_handoff"
+            }
             Self::FirstCreation => "first_creation",
             Self::SessionMissing => "session_missing",
             Self::PaneDead => "pane_dead",
