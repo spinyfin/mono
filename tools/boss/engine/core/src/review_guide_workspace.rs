@@ -9,6 +9,22 @@ mod tests;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Run subprocess-spawning verification without pinning a Tokio worker.
+///
+/// `verify` and `validate` shell out to `git` and `jj` and wait for them.
+/// Their async callers (`run_execution`, the review-guide finalizer and the
+/// proposal handler) run on runtime workers, so on the production multithread
+/// runtime this hands the worker's core back first. Synchronous callers and
+/// current-thread test runtimes run the closure inline.
+pub(crate) fn off_runtime_worker<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
 fn require_sha(sha: &str) -> Result<()> {
     ensure!(
         sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
