@@ -1256,13 +1256,18 @@ async fn accepted_review_report_reaps_a_real_worker_process() {
 /// declaring `run_done` are plain implementation workers with no batch
 /// machinery at all).
 fn live_chore_execution() -> (Arc<ServerState>, tempfile::TempDir, String, String) {
+    live_chore_execution_with_pr_status(crate::completion::PrStatus::None)
+}
+
+fn live_chore_execution_with_pr_status(
+    status: crate::completion::PrStatus,
+) -> (Arc<ServerState>, tempfile::TempDir, String, String) {
     // The `delivered` path resolves an unbound PR by the execution's own
     // branch. A detector that definitively finds none there is what makes
     // "no resolvable PR" a visible failure; the sandbox's denied `gh` would
     // instead read as "GitHub unreachable", which the engine (correctly)
     // defers rather than fails.
-    let (server_state, dir) =
-        test_server_state_with_fakes_and_pr_detector(Arc::new(FixedPrDetector(crate::completion::PrStatus::None)));
+    let (server_state, dir) = test_server_state_with_fakes_and_pr_detector(Arc::new(FixedPrDetector(status)));
     // Every test using this fixture exercises the `run_done` synchronous
     // finalize path, which `handle_submit_proposal` only takes with both
     // halves of the seam's kill switch on — see
@@ -1318,9 +1323,11 @@ fn task_status(server_state: &Arc<ServerState>, work_item_id: &str) -> boss_prot
 /// that release. Mirrors `accepted_review_report_immediately_terminalizes_its_live_leaf`
 /// for the whole-execution (not batch-member) finalize path.
 #[tokio::test]
-async fn accepted_run_done_delivered_immediately_terminalizes_a_bound_pr() {
-    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
-    set_task_pr_url(&server_state, &work_item_id, "https://github.com/example/repo/pull/9");
+async fn accepted_run_done_delivered_immediately_terminalizes_a_resolved_pr() {
+    let (server_state, _dir, execution_id, work_item_id) =
+        live_chore_execution_with_pr_status(crate::completion::PrStatus::Fresh {
+            url: "https://github.com/example/repo/pull/9".into(),
+        });
     let peer_pid = std::process::id() as libc::pid_t;
 
     let (proposal, already_submitted) = submitted(
@@ -1475,19 +1482,16 @@ async fn mandated_check_approval_stop_fails_visibly_without_replacement_workers(
     assert!(shown["blocked_detail"].as_str().unwrap().contains(reason));
 }
 
-/// The end-to-end proof the incidents demand: submitting `run_done` reaps a
-/// REAL worker process — not a fake, not a later Stop boundary — and does so
-/// without ever touching the network. This test's own `branch_verifier` and
-/// `merge_probe` are the real production collaborators (`test_server_state_with_fakes`
-/// only fakes `cube`/pane-spawn); if the synchronous finalize path made a
-/// live `gh` call, this test would hang or fail in a sandboxed CI run with
-/// no GitHub credentials. It doesn't, because it never calls either
-/// collaborator — see `completion::run_done_declaration`'s module doc.
+/// Submitting delivered reaps a real worker process immediately after the
+/// branch-keyed detector identifies its PR. GitHub discovery is stubbed;
+/// the process teardown and the submission path remain real.
 /// Mirrors `accepted_review_report_reaps_a_real_worker_process`.
 #[tokio::test]
 async fn accepted_run_done_delivered_reaps_a_real_worker_process_without_network() {
-    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
-    set_task_pr_url(&server_state, &work_item_id, "https://github.com/example/repo/pull/9");
+    let (server_state, _dir, execution_id, _work_item_id) =
+        live_chore_execution_with_pr_status(crate::completion::PrStatus::Fresh {
+            url: "https://github.com/example/repo/pull/9".into(),
+        });
     let peer_pid = std::process::id() as libc::pid_t;
 
     let mut child = crate::test_support::spawn_group_leader_sleeper();
@@ -1514,6 +1518,16 @@ async fn accepted_run_done_delivered_reaps_a_real_worker_process_without_network
         .await,
     );
     assert_eq!(proposal.state, ProposalState::Applied);
+
+    assert_eq!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .pr_url
+            .as_deref(),
+        Some("https://github.com/example/repo/pull/9")
+    );
 
     let status = tokio::task::spawn_blocking(move || child.wait())
         .await

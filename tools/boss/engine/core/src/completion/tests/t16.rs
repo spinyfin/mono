@@ -261,9 +261,10 @@ async fn followup_citing_a_merged_origin_pr_binds_its_own_pr_on_run_done() {
 }
 
 /// A staged entry the capture-time verification already confirmed is
-/// trusted without another GitHub call on the `run_done` path.
+/// reused without another head-ref fetch on the `run_done` path; lifecycle
+/// state is checked separately.
 #[tokio::test]
-async fn run_done_delivered_trusts_a_branch_verified_staged_entry_without_a_network_call() {
+async fn run_done_delivered_reuses_cached_branch_verification() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
     let detector = StubPrDetector::ok(None);
@@ -627,4 +628,85 @@ mod stop_boundary {
             "expired stop lock entry must be swept by the next Stop"
         );
     }
+}
+
+#[tokio::test]
+async fn staged_own_pr_lifecycle_controls_declared_delivery() {
+    for state in [
+        crate::work::PrOpenState::Merged,
+        crate::work::PrOpenState::ClosedUnmerged,
+    ] {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _, task_id, execution_id) = fixture(workspace.path());
+        let staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged.record_command_observation(&execution_id, OWN_PR, true);
+        // Capture-time verification does not freeze the lifecycle state.
+        staged.mark_branch_verified(&execution_id, OWN_PR);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+        let handler = handler
+            .with_staged_pr_urls(staged)
+            .with_pr_state_checker(Arc::new(crate::work::FakePrStateChecker::always(state.clone())));
+        let outcome = handler
+            .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+            .await;
+        if state == crate::work::PrOpenState::Merged {
+            assert!(matches!(outcome, StopOutcome::PrMerged { .. }), "{outcome:?}");
+            assert_eq!(task_row(&db, &task_id).status, TaskStatus::Done);
+        } else {
+            assert!(
+                matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail } if detail.contains("closed without merging")),
+                "{outcome:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn wrong_stored_pr_falls_back_to_own_branch_on_declared_delivery() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, task_id, execution_id) = fixture(workspace.path());
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, ORIGIN_PR],
+        )
+        .unwrap();
+    let detector = StubPrDetector::ok(Some(OWN_PR));
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler.with_branch_verifier(two_pr_verifier(&execution_id));
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == OWN_PR),
+        "{outcome:?}"
+    );
+    assert_eq!(task_row(&db, &task_id).pr_url.as_deref(), Some(OWN_PR));
+    assert_eq!(detector.call_count(), 1);
+}
+
+#[tokio::test]
+async fn stored_pr_with_equivalent_branch_is_kept_without_detection() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, task_id, execution_id) = fixture(workspace.path());
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, OWN_PR],
+        )
+        .unwrap();
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler.with_branch_verifier(StubBranchVerifier::ok(&format!("custom/{execution_id}")));
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == OWN_PR),
+        "{outcome:?}"
+    );
+    assert_eq!(task_row(&db, &task_id).pr_url.as_deref(), Some(OWN_PR));
+    assert_eq!(detector.call_count(), 0);
 }

@@ -500,6 +500,9 @@ impl TestHarness {
         // harness hermetic; tests that exercise branch-specific behaviour
         // replace this with their own verifier.
         .with_branch_verifier(StubBranchVerifier::ok("boss/test"))
+        .with_pr_state_checker(Arc::new(crate::work::FakePrStateChecker::always(
+            crate::work::PrOpenState::Open,
+        )))
         // Auto-advancing by default: most tests drive several `on_stop`
         // calls back-to-back to exercise the circuit breaker's *count*,
         // not its timing, and a synchronous test loop would otherwise

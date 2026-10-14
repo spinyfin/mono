@@ -50,14 +50,15 @@
 //!
 //! - Resolving the PR a `delivered` declaration binds to
 //!   ([`WorkerCompletionHandler::resolve_declared_pr_url`]) first reads
-//!   already-stored state (the task/chore's own `pr_url`, the
-//!   revision-chain-root lookup). With no bound PR it runs the same Layer-2
+//!   already-stored state and verifies primary bindings by head branch
+//!   (revisions retain their chain-root lookup). With no verified bound PR it runs the same Layer-2
 //!   branch check the Stop boundary uses
 //!   ([`WorkerCompletionHandler::verified_staged_pr_url`]) over every staged
 //!   candidate, then the branch-keyed detector — each under
 //!   [`DECLARED_DELIVERY_NETWORK_BUDGET`]. The capture-time verification the
 //!   hook dispatcher spawns usually leaves the staged entry already verified,
-//!   so the common case is still an in-memory read.
+//!   so branch verification can reuse that cache; lifecycle state is read
+//!   fresh before deciding between review, completion, and refusal.
 //! - A timeout or transient `gh` failure binds nothing and leaves the
 //!   execution live with its declaration stamped; the Stop boundary and the
 //!   merge-poller recheck — both network-capable, both honouring the stamp —
@@ -171,7 +172,7 @@ impl WorkerCompletionHandler {
     ///
     /// 1. The task/chore's own bound PR ([`Self::resolve_bound_pr_url`]:
     ///    `task.pr_url`, or `execution.pr_url` / the chain-root lookup for a
-    ///    revision) — DB reads only, no network.
+    ///    revision), with branch verification for primary executions.
     /// 2. A **branch-verified** staged candidate: the hook-stream staging
     ///    cache (a *publish-armed* `PostToolUse` `gh pr create` / `cube pr
     ///    create|update` hit) plus the structured-output PR-URL artifact the
@@ -200,19 +201,41 @@ impl WorkerCompletionHandler {
     /// finalize it. That keeps the module's rule that a GitHub hang can never
     /// hold a slot indefinitely, without binding anything unverified.
     async fn resolve_declared_pr_url(&self, execution: &crate::work::WorkExecution) -> DeclaredPrResolution {
-        if let Some(url) = self.resolve_bound_pr_url(execution) {
-            return DeclaredPrResolution::Bound {
-                pr_url: url,
-                merged: false,
-            };
+        let mut transient_detail: Option<String> = None;
+        let stored_url = self.resolve_bound_pr_url(execution);
+        if let Some(url) = stored_url.clone() {
+            if execution.kind == ExecutionKind::RevisionImplementation {
+                return self.resolve_verified_pr_state(url).await;
+            }
+            let expected = expected_branch_name(
+                &execution.id,
+                &execution.branch_naming,
+                execution.worker_branch_prefix.as_deref(),
+            );
+            if let (Ok(slug), Some(number)) = (parse_repo_slug(&execution.repo_remote_url), pr_number_from_url(&url)) {
+                match tokio::time::timeout(
+                    DECLARED_DELIVERY_NETWORK_BUDGET,
+                    self.branch_verifier.fetch_pr_head_ref(&slug, number),
+                )
+                .await
+                {
+                    Ok(Ok(head)) if branches_identify_same_work_item(&head, &expected) => {
+                        return self.resolve_verified_pr_state(url).await;
+                    }
+                    Ok(Ok(_)) => {}
+                    _ => transient_detail = Some(format!("could not verify stored PR {url}")),
+                }
+            }
         }
         self.stage_pr_url_from_artifact(execution);
-        let candidates_before = self.staged_pr_urls.candidates(&execution.id);
+        let mut candidates_before = self.staged_pr_urls.candidates(&execution.id);
+        if let Some(url) = stored_url {
+            candidates_before.push(url);
+        }
         let staged_armed = self
             .staged_pr_urls
             .get_entry(&execution.id)
             .is_some_and(|entry| entry.finalization_armed);
-        let mut transient_detail: Option<String> = None;
         if staged_armed {
             match tokio::time::timeout(
                 DECLARED_DELIVERY_NETWORK_BUDGET,
@@ -221,10 +244,7 @@ impl WorkerCompletionHandler {
             .await
             {
                 Ok(Some(url)) => {
-                    return DeclaredPrResolution::Bound {
-                        pr_url: url,
-                        merged: false,
-                    };
+                    return self.resolve_verified_pr_state(url).await;
                 }
                 Ok(None) => {
                     // Candidates that survived are transient failures the next
@@ -257,7 +277,7 @@ impl WorkerCompletionHandler {
             "The worker's hook stream and structured-output artifact carried no PR URL.".to_owned()
         } else {
             format!(
-                "PR URL(s) the worker's output carried, none of which is on this execution's branch: {}.",
+                "Stored or staged PR URL(s) that could not be verified on this execution's branch: {}.",
                 candidates_before.join(", ")
             )
         };
@@ -303,6 +323,24 @@ impl WorkerCompletionHandler {
                     "branch-keyed PR detection for `{expected_branch}` did not finish within {}s",
                     DECLARED_DELIVERY_NETWORK_BUDGET.as_secs()
                 ),
+            },
+        }
+    }
+
+    /// Branch identity is already verified; read lifecycle fresh because a
+    /// capture-time branch cache cannot certify that a PR is still open.
+    async fn resolve_verified_pr_state(&self, pr_url: String) -> DeclaredPrResolution {
+        let checker = Arc::clone(&self.pr_state_checker);
+        let url = pr_url.clone();
+        let check = tokio::task::spawn_blocking(move || checker.check(&url));
+        match tokio::time::timeout(DECLARED_DELIVERY_NETWORK_BUDGET, check).await {
+            Ok(Ok(Ok(crate::work::PrOpenState::Open))) => DeclaredPrResolution::Bound { pr_url, merged: false },
+            Ok(Ok(Ok(crate::work::PrOpenState::Merged))) => DeclaredPrResolution::Bound { pr_url, merged: true },
+            Ok(Ok(Ok(crate::work::PrOpenState::ClosedUnmerged))) => DeclaredPrResolution::NoneFound {
+                detail: format!("PR {pr_url} is closed without merging"),
+            },
+            result => DeclaredPrResolution::Transient {
+                detail: format!("could not determine state of PR {pr_url}: {result:?}"),
             },
         }
     }

@@ -85,11 +85,11 @@ pub const MAX_ATTEMPTS_PER_TASK: u32 = 3;
 /// GitHub failures).
 pub const ATTENTION_KIND_PR_BINDING_REPAIR: &str = "pr_binding_repair";
 
-/// Re-derives a task's doc pointer from a PR. A trait so tests can stub the
-/// GitHub scan `design_detector::on_task_doc_pr_detected` performs.
+/// Scans without mutating so a failed GitHub read preserves the repair signal.
+/// A successful scan may contain no unambiguous doc path.
 #[async_trait]
 pub(crate) trait DocPointerRefresher: Send + Sync {
-    async fn refresh(&self, work_db: &WorkDb, task_id: &str, product_id: &str, pr_url: &str);
+    async fn scan(&self, task_id: &str, pr_url: &str) -> Option<crate::design_detector::PrScanResult>;
 }
 
 /// Production [`DocPointerRefresher`]: the same detector the completion
@@ -98,8 +98,8 @@ struct DesignDetectorDocPointerRefresher;
 
 #[async_trait]
 impl DocPointerRefresher for DesignDetectorDocPointerRefresher {
-    async fn refresh(&self, work_db: &WorkDb, task_id: &str, product_id: &str, pr_url: &str) {
-        crate::design_detector::on_task_doc_pr_detected(work_db, task_id, product_id, pr_url).await;
+    async fn scan(&self, task_id: &str, pr_url: &str) -> Option<crate::design_detector::PrScanResult> {
+        crate::design_detector::scan_pr_for_task_doc(task_id, pr_url).await
     }
 }
 
@@ -306,15 +306,18 @@ async fn repair_candidate(
 
     if bound_is_own {
         if doc_suspect {
+            let scan = doc_refresher
+                .scan(&candidate.task_id, &candidate.bound_pr_url)
+                .await
+                .ok_or_else(|| Inconclusive::GitHub("doc scan failed".into()))?;
             clear_foreign_doc_pointer(work_db, candidate);
-            doc_refresher
-                .refresh(
-                    work_db,
-                    &candidate.task_id,
-                    &candidate.product_id,
-                    &candidate.bound_pr_url,
-                )
-                .await;
+            crate::design_detector::apply_task_doc_scan(
+                work_db,
+                &candidate.task_id,
+                &candidate.product_id,
+                &candidate.bound_pr_url,
+                scan,
+            );
             outcome.doc_repaired += 1;
             tracing::info!(
                 task_id = %candidate.task_id,
@@ -370,6 +373,10 @@ async fn repair_candidate(
         );
         return park_unresolved(work_db, candidate, &detail, outcome);
     }
+    let scan = doc_refresher
+        .scan(&candidate.task_id, &own_pr_url)
+        .await
+        .ok_or_else(|| Inconclusive::GitHub("doc scan failed".into()))?;
     match work_db.rebind_task_pr_from_execution_branch(
         &candidate.task_id,
         &candidate.execution_id,
@@ -412,12 +419,8 @@ async fn repair_candidate(
     ) {
         tracing::warn!(task_id = %candidate.task_id, ?err, "pr-binding-repair sweep: audit line append failed (non-fatal)");
     }
-    if doc_suspect {
-        clear_foreign_doc_pointer(work_db, candidate);
-    }
-    doc_refresher
-        .refresh(work_db, &candidate.task_id, &candidate.product_id, &own_pr_url)
-        .await;
+    clear_foreign_doc_pointer(work_db, candidate);
+    crate::design_detector::apply_task_doc_scan(work_db, &candidate.task_id, &candidate.product_id, &own_pr_url, scan);
     let _ = work_db.resolve_external_tracker_attention(&candidate.task_id, ATTENTION_KIND_PR_BINDING_REPAIR);
     if merged {
         // The merge poller owns the `in_review` → `done` transition for a
@@ -607,8 +610,13 @@ mod tests {
 
     #[async_trait]
     impl DocPointerRefresher for RecordingDocRefresher {
-        async fn refresh(&self, _: &WorkDb, _: &str, _: &str, pr_url: &str) {
+        async fn scan(&self, _: &str, pr_url: &str) -> Option<crate::design_detector::PrScanResult> {
             self.0.lock().unwrap().push(pr_url.to_owned());
+            Some(crate::design_detector::PrScanResult {
+                doc_path: None,
+                head_ref_name: None,
+                base_ref_name: None,
+            })
         }
     }
 
@@ -739,9 +747,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebind_clears_the_foreign_doc_path() {
+    async fn rebind_clears_the_foreign_doc_path_even_on_main() {
         let (_dir, db) = open_db();
         let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET doc_branch = 'main' WHERE id = ?1", [&task_id])
+            .unwrap();
         let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_18dad2723a80ed10_23".to_owned())]));
         let detector = FixedDetector(PrStatus::Fresh { url: OWN.to_owned() }, StdMutex::default());
         let mut attempts = HashMap::new();
@@ -813,5 +825,51 @@ mod tests {
                 .iter()
                 .any(|a| a.kind == ATTENTION_KIND_PR_BINDING_REPAIR)
         );
+    }
+    struct RetryDocScanner(std::sync::atomic::AtomicBool);
+    #[async_trait]
+    impl DocPointerRefresher for RetryDocScanner {
+        async fn scan(&self, _: &str, _: &str) -> Option<crate::design_detector::PrScanResult> {
+            self.0
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+                .then(|| crate::design_detector::PrScanResult {
+                    doc_path: Some("docs/designs/own.md".into()),
+                    head_ref_name: Some("main".into()),
+                    base_ref_name: Some("main".into()),
+                })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_doc_scan_preserves_signal_and_pointer_until_retry_succeeds() {
+        for bound in [OWN, ORIGIN] {
+            let (_dir, db) = open_db();
+            let (_, task_id, exec_id) = mis_bound_followup(&db, bound);
+            let verifier = MapVerifier(HashMap::from([
+                (1764, expected_branch_name(&exec_id, &Default::default(), None)),
+                (1757, "boss/exec_foreign".into()),
+            ]));
+            let detector = FixedDetector(PrStatus::Fresh { url: OWN.into() }, StdMutex::default());
+            let docs = RetryDocScanner(std::sync::atomic::AtomicBool::new(false));
+            let mut attempts = HashMap::new();
+            let checker = FakePrStateChecker::always(PrOpenState::Open);
+            let first = run_one_pass(&db, &detector, &verifier, &checker, &docs, &mut attempts).await;
+            assert_eq!(first.inconclusive, 1);
+            assert_eq!(first.doc_repaired + first.rebound, 0);
+            assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(bound));
+            assert_eq!(
+                db.task_doc_path(&task_id).unwrap().as_deref(),
+                Some("docs/designs/origin.md")
+            );
+            assert_eq!(db.list_pr_binding_repair_candidates().unwrap().len(), 1);
+            let second = run_one_pass(&db, &detector, &verifier, &checker, &docs, &mut attempts).await;
+            assert_eq!(second.inconclusive, 0);
+            assert_eq!(second.doc_repaired + second.rebound, 1);
+            assert_eq!(
+                db.task_doc_path(&task_id).unwrap().as_deref(),
+                Some("docs/designs/own.md")
+            );
+            assert!(db.list_pr_binding_repair_candidates().unwrap().is_empty());
+        }
     }
 }
