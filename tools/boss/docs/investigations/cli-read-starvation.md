@@ -35,7 +35,21 @@ Each connection also has a pending queue of four times its active limit. Full qu
 
 Per-connection active settings use the same validation as global settings, with no additional clamp. Bulk and live wait settings are independent and both default to 60 s. Outbound-queue headroom needs separate measurement of normal traffic before limits can be sized with a generous buffer; assumed reply counts do not justify lowering admission limits.
 
-Rejections produce a correlated `Error` response containing `engine busy, retry: read admission limit exceeded` and a warning identifying the session and whether its queue was full or its deadline expired. No retry loop is added to the CLI. Live status has an independent path rather than consuming the bulk quota.
+Rejections produce a correlated `Error` response distinguishing a full admission queue, an admission deadline, and an ordering deadline behind an earlier read. The macOS app passes this message through to its Work Error alert. No retry loop is added to the client. Live status has an independent path rather than consuming the bulk quota.
+
+## Background database contention and the October 14 report
+
+The `boss-v1.0.747` release tag points to `ae3055fd04bb`. In that version, `acquire_ordered` returned the same error for both its ordering timeout and its permit timeout, and the socket dispatcher logged both as `admission deadline expired`. Thus the two supplied log lines do not establish exhausted permits, or even a permit wait: an earlier identical read could have held the ordering turn. The app does not translate this error; `ChatViewModel+EventHandling.swift` assigns the engine's message to `workErrorMessage`.
+
+One reproducible starvation path is the shared `WorkDb` connection mutex. Background sweeps synchronously acquire it on Tokio runtime workers. With a slow holder, concurrent waiters can occupy the workers needed to schedule admission, timers and socket IO even when read permits are available. The contended acquisition now uses `block_in_place` on the production multithread runtime, handing the runtime worker core back before waiting. The mutex still serializes SQL, and neither admission capacity nor deadlines change. Synchronous callers and current-thread test runtimes retain synchronous acquisition. Waits and holds of at least 100 ms log their duration and calling source location.
+
+`background_database_contention_keeps_read_admission_running` holds the real database connection on a separate thread, starts a background database operation on a one-worker runtime, and verifies an independently scheduled read can obtain its ordering turn and admission while the database remains locked. The holder has an independent wall-clock escape so regressions cannot hang the test. Temporarily restoring the old synchronous acquisition made the regression fail after that five-second escape: even the runtime timer could not progress. With the handoff in place, admission completes before the holder is released.
+
+Admission diagnostics retain session/request IDs, verb, stage and age until the read's permits leave the blocking handler. Rejections log the outstanding count, active count, and up to sixteen oldest entries. Stages distinguish ordering, connection permits, engine permits, the blocking queue, and handler execution; these make retained permits and delayed execution visible without logging request payloads.
+
+The SSH hypothesis is not established by the supplied timing. `open_control_master` awaits a Tokio subprocess with a timeout; the adapter provider holds its async cache mutex during that operation, but admission does not use that mutex. Failed adapter creation is not cached, so subsequent leases and passes can repeat DNS failures. Heartbeat cleanup intentionally requires evidence that the worker is dead (or its host disabled), rather than treating network failure as proof. Old retained remote leases can therefore continue being heartbeated while unreachable. No leases are deleted by this change.
+
+Runtime starvation could also delay the coordinator-reset request, but the supplied logs cannot prove that it caused the reported delay or identify the historical database holder. The reset flow is unchanged. The new read and DB wait diagnostics are intended to distinguish these cases on recurrence.
 
 ## Regression evidence
 

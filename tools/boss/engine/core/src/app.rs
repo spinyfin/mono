@@ -2481,9 +2481,9 @@ async fn handle_frontend_connection(
         };
         let waiting_read = if let Some((admission, connection)) = read_lane {
             match admission.enqueue(connection) {
-                Ok(waiting) => Some(waiting),
+                Ok(waiting) => Some(waiting.identify(&session_id, &request_id, variant_name(&request))),
                 Err(message) => {
-                    tracing::warn!(%session_id, "read RPC rejected: queue full");
+                    tracing::warn!(%session_id, %request_id, ?lane, "read RPC rejected: queue full");
                     send_response(
                         &sink,
                         &request_id,
@@ -2528,6 +2528,7 @@ async fn handle_frontend_connection(
                         // client disconnects; cancellation cannot inflate capacity.
                         let runtime = tokio::runtime::Handle::current();
                         let result = tokio::task::spawn_blocking(move || {
+                            permits.0.started();
                             let _permits = permits;
                             runtime.block_on(dispatch_fut);
                         })
@@ -2547,10 +2548,10 @@ async fn handle_frontend_connection(
                         let message = rejection.message();
                         match rejection {
                             read_admission::Rejection::OrderingWait => {
-                                tracing::warn!(%session_id, "read RPC rejected: ordering wait expired");
+                                tracing::warn!(%session_id, %request_id, ?lane, wait_ms = recv_instant.elapsed().as_millis() as u64, "read RPC rejected: ordering deadline expired");
                             }
                             read_admission::Rejection::AdmissionWait => {
-                                tracing::warn!(%session_id, "read RPC rejected: admission deadline expired");
+                                tracing::warn!(%session_id, %request_id, ?lane, wait_ms = recv_instant.elapsed().as_millis() as u64, "read RPC rejected: admission deadline expired");
                             }
                         }
                         send_response(

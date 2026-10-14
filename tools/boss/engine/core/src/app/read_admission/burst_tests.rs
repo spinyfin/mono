@@ -185,7 +185,7 @@ async fn saturated_reads_return_busy_over_the_wire_while_status_works() {
     )
     .await
     .expect("over-limit read hung");
-    assert!(matches!(response, FrontendEvent::Error { message } if message == BUSY));
+    assert!(matches!(response, FrontendEvent::Error { message } if message == DEADLINE));
     assert!(start.elapsed() < Duration::from_secs(2));
     assert!(matches!(
         call(state.clone(), FrontendRequest::ListWorkerLiveStates, None).await,
@@ -223,7 +223,7 @@ async fn saturated_reads_return_busy_over_the_wire_while_status_works() {
     .await
     .expect("pipelined reads hung");
     assert_eq!(replies[0].0, "live");
-    assert!(matches!(&replies[1].1, FrontendEvent::Error { message } if message == BUSY));
+    assert!(matches!(&replies[1].1, FrontendEvent::Error { message } if message == DEADLINE));
     drop(lines);
     drop(write);
     handler.await.unwrap().unwrap();
@@ -261,7 +261,7 @@ async fn one_socket_pipelining_sixteen_bulk_reads_never_sees_busy() {
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
             if event.request_id.is_some() {
                 assert!(
-                    !matches!(&event.payload, FrontendEvent::Error { message } if message == BUSY),
+                    !matches!(&event.payload, FrontendEvent::Error { .. }),
                     "pipelined read rejected as busy: {event:?}"
                 );
                 replies += 1;
@@ -396,7 +396,7 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
                     let env: FrontendEventEnvelope = serde_json::from_str(&line).unwrap();
                     if let Some(id) = env.request_id {
                         assert!(id.starts_with("saturated-"));
-                        assert!(matches!(env.payload, FrontendEvent::Error { message } if message == BUSY));
+                        assert!(matches!(env.payload, FrontendEvent::Error { message } if message == DEADLINE || message == QUEUE_FULL));
                         assert!(replies.insert(id), "duplicate correlated reply");
                         if replies.len() == 320 {
                             break false;
