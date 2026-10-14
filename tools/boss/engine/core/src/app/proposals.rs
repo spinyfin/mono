@@ -534,13 +534,13 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             };
             // A `delivered`/`blocked` `run_done` declaration's acceptance is
             // itself the completion signal for the WHOLE execution, not just
-            // a batch member the way a review report/verdict is. A
-            // `no-changes-needed` declaration is the exception: it is
-            // accepted or refused only at the driver's Stop boundary.
-            // This mirrors the block above for exactly the reason its
-            // comment gives: do not wait for another,
-            // driver-specific turn boundary that may never arrive after the
-            // worker has delivered its declaration. Evidence checks stay in
+            // a batch member the way a review report/verdict is. This
+            // mirrors the block above for exactly the reason its comment
+            // gives: do not wait for another, driver-specific turn boundary
+            // that may never arrive after the worker has delivered its
+            // declaration. A `no-changes-needed` declaration is the
+            // exception: it is accepted or refused only at the driver's
+            // Stop boundary. Evidence checks stay in
             // place, but move off this path entirely (never a network call
             // here — see `completion::run_done_declaration`'s module doc).
             //

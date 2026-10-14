@@ -815,9 +815,9 @@ impl WorkerCompletionHandler {
     /// carrying [`boss_protocol::RunDoneOutcome::NoChangesNeeded`]
     /// (`boss propose done --outcome no-changes-needed`), read from the
     /// durable stamp `apply_run_done` writes unconditionally — so this does
-    /// not depend on the `run_done_proposals_seam` flag, which only governs
-    /// whether the early Stop-boundary branch accepts the declaration for
-    /// every execution kind (revisions take their own gated path).
+    /// not depend on the `run_done_proposals_seam` flag. That flag only
+    /// governs whether the early Stop-boundary branch accepts the
+    /// declaration; revisions take their own gated path.
     ///
     /// The worker's prose is never consulted: a run that stops
     /// without declaring is "gave up / not done" and falls through to the
