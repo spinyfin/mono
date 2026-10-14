@@ -2140,6 +2140,7 @@ impl WorkDb {
                         .work_item_id(&task.id)
                         .maybe_preferred_workspace_id(asking.preferred_workspace_id)
                         .entry_point(DispatchAdmissionEntryPoint::OperatorAnswer)
+                        .explicit_start(true)
                         .build(),
                     // Match request_execution's conservative behavior when
                     // no live-worker oracle is supplied.

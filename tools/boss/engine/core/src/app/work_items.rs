@@ -876,6 +876,7 @@ pub(super) async fn apply_work_item_patch(
                         let dispatch_input = RequestExecutionInput::builder()
                             .work_item_id(work_item_id_for_event.clone())
                             .bypass_dispatch_pause(true)
+                            .explicit_start(true)
                             .entry_point(DispatchAdmissionEntryPoint::AppDrag)
                             .maybe_observed_pause_since_epoch_s(bypass.observed_pause_since_epoch_s)
                             .build();
@@ -910,6 +911,7 @@ pub(super) async fn apply_work_item_patch(
                         let live_states = server_state.live_worker_states.clone();
                         let dispatch_input = RequestExecutionInput::builder()
                             .work_item_id(work_item_id_for_event.clone())
+                            .explicit_start(true)
                             .build();
                         match work_db
                             .request_execution_with_live_check(dispatch_input, |run_id| live_states.is_run_live(run_id))

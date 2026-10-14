@@ -383,6 +383,7 @@ enum WorkBlockedBadge {
         case "ci_failure_exhausted": return "CI Failed"
         case "review_feedback": return "Review"
         case "awaiting_operator_answer": return "Needs Answer"
+        case "spawning_attempt_retired_unsuccessfully": return "Fix Attempt Ended"
         default: return reason.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
@@ -395,7 +396,7 @@ enum WorkBlockedBadge {
     /// exactly the case that can be truncated prose).
     private static let knownReasons: Set<String> = [
         "dependency", "merge_conflict", "ci_failure", "ci_failure_exhausted", "review_feedback",
-        "awaiting_operator_answer",
+        "awaiting_operator_answer", "spawning_attempt_retired_unsuccessfully",
     ]
 
     /// Whether the blocked pill has meaningfully more to say than its
