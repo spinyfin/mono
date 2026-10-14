@@ -291,6 +291,7 @@ async fn work_tree_reads_share_a_turn_regardless_of_fetch_seq() {
     let tree = |product: &str, fetch_seq| R::GetWorkTree {
         product_id: product.into(),
         fetch_seq,
+        delta: false,
     };
     let first = ordering.reserve(&tree("a", Some(1))).await.await;
     let mut later = ordering.reserve(&tree("a", Some(2))).await;
@@ -303,4 +304,40 @@ async fn work_tree_reads_share_a_turn_regardless_of_fetch_seq() {
     );
     drop(first);
     assert!(tokio::time::timeout(Duration::from_secs(1), later).await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_and_delta_work_tree_reads_keep_arrival_order() {
+    use boss_protocol::FrontendRequest as R;
+    for first_delta in [false, true] {
+        let mut ordering = ReadOrdering::default();
+        let tree = |delta| R::GetWorkTree {
+            product_id: "product".into(),
+            fetch_seq: None,
+            delta,
+        };
+        let first = ordering.reserve(&tree(first_delta)).await;
+        let mut second = ordering.reserve(&tree(!first_delta)).await;
+        let mut third = ordering.reserve(&tree(first_delta)).await;
+        // Polling later requests first must not let either encoding overtake.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut third)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+        drop(first.await);
+        let second_guard = tokio::time::timeout(Duration::from_secs(1), second).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut third)
+                .await
+                .is_err()
+        );
+        drop(second_guard);
+        assert!(tokio::time::timeout(Duration::from_secs(1), third).await.is_ok());
+    }
 }

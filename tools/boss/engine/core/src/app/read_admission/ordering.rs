@@ -39,10 +39,11 @@ impl ReadOrdering {
                     refresh: false,
                 })
             }
-            // `fetch_seq` is a diagnostic correlation id, not part of the view.
+            // Sequence ids and snapshot/delta encoding do not change the product view.
             FrontendRequest::GetWorkTree { product_id, .. } => serde_json::to_string(&FrontendRequest::GetWorkTree {
                 product_id: product_id.clone(),
                 fetch_seq: None,
+                delta: false,
             }),
             _ => serde_json::to_string(request),
         }
