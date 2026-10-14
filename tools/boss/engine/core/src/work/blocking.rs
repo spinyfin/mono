@@ -2277,6 +2277,101 @@ mod tests {
         WorkDb::open(PathBuf::from(":memory:")).unwrap()
     }
 
+    /// A retired `verified_requeue` attempt created at `created`, with an
+    /// applied `delivered` declaration carrying `enqueued_at` (when given).
+    fn retired_requeue(
+        db: &WorkDb,
+        product_id: &str,
+        parent: &str,
+        created: i64,
+        queue_sha: &str,
+        enqueued_at: Option<&str>,
+    ) {
+        let revision = crate::test_support::create_test_chore(db, product_id.to_owned(), format!("CI fix {queue_sha}"));
+        let execution = crate::test_support::create_ready_chore_execution(db, revision.id.clone());
+        let attempt = db
+            .insert_ci_remediation(crate::work::CiRemediationInsertInput {
+                product_id: product_id.to_owned(),
+                work_item_id: parent.to_owned(),
+                pr_url: "https://github.com/spinyfin/mono/pull/9".into(),
+                pr_number: 9,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: format!("mq:{}@{queue_sha}", "b".repeat(40)),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+                failure_kind: "merge_queue_rebounce".into(),
+                before_commit_sha: Some(queue_sha.to_owned()),
+            })
+            .unwrap()
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE ci_remediations SET created_at = ?2, failure_reason = 'verified_requeue', revision_task_id = ?3 WHERE id = ?1",
+            params![attempt.id, created.to_string(), revision.id],
+        )
+        .unwrap();
+        let mut evidence = boss_protocol::QueueCiEvidence::builder()
+            .main_sha("a".repeat(40))
+            .verified_head_sha("b".repeat(40))
+            .queue_sha(queue_sha)
+            .queue_base_sha("d".repeat(40))
+            .runs(vec![])
+            .build();
+        evidence.queue_entry_enqueued_at = enqueued_at.map(str::to_owned);
+        let payload = boss_protocol::RunDoneProposalPayload {
+            outcome: boss_protocol::RunDoneOutcome::Delivered,
+            summary: String::new(),
+            question: None,
+            queue_ci_evidence: Some(evidence),
+        };
+        conn.execute(
+            "INSERT INTO worker_proposals (id, execution_id, work_item_id, kind, payload_json, idempotency_key, state, created_at)
+             VALUES (?1, ?2, ?3, 'run_done', ?4, 'k', 'applied', '1')",
+            params![
+                format!("prop-{}", attempt.id),
+                execution.id,
+                revision.id,
+                serde_json::to_string(&payload).unwrap()
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verified_requeue_boundary_follows_enqueued_at_with_creation_fallback_and_max() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let parent = crate::test_support::create_test_chore(&db, product.id.clone(), "Parent");
+        let head = "b".repeat(40);
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), None);
+        // No recorded enqueuedAt: fall back to the attempt's creation.
+        retired_requeue(&db, &product.id, &parent.id, 1_000, &"c".repeat(40), None);
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), Some(1_000));
+        // A recorded enqueuedAt after creation moves the boundary to it.
+        retired_requeue(
+            &db,
+            &product.id,
+            &parent.id,
+            1_100,
+            &"d".repeat(40),
+            Some("1970-01-01T00:30:00Z"),
+        );
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), Some(1_800));
+        // The newest boundary across attempts wins, and an enqueuedAt before
+        // creation never lowers an attempt's own floor.
+        retired_requeue(
+            &db,
+            &product.id,
+            &parent.id,
+            5_000,
+            &"e".repeat(40),
+            Some("1970-01-01T00:01:00Z"),
+        );
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), Some(5_000));
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &"f".repeat(40)).unwrap(), None);
+    }
+
     #[test]
     fn set_ci_attempt_budget_unknown_task_returns_none() {
         let db = mem_db();

@@ -23,42 +23,132 @@ fn is_trunk_empty_capture(attempt: &CiRemediation) -> bool {
     attempt.failure_kind.as_deref() == Some("trunk_queue_eviction") && !queue_ci_verification_required(attempt)
 }
 
-/// Classify a failed check by its job label: the last `/` segment, which for
-/// a Trunk capture is the Buildkite step key or job name (see
-/// `ci_watch::trunk_eviction_failures_from_build`) and for a GitHub queue
-/// capture is the check name. Leading `:emoji:` tokens are ignored.
-fn is_lint_check(name: &str) -> bool {
-    let segment = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
-    let label = segment
+/// Lowercased alphanumeric tokens of a failed check's job label: the last `/`
+/// segment, which for a Trunk capture is the Buildkite step key or job name
+/// (see `ci_watch::trunk_eviction_failures_from_build`) and for a GitHub queue
+/// capture is the check name. Leading `:emoji:` words are ignored, and tokens
+/// are whole words so `lint` never matches inside another word.
+fn job_tokens(name: &str) -> Vec<String> {
+    let segment = name.rsplit('/').next().unwrap_or(name);
+    segment
         .split_whitespace()
         .filter(|w| !(w.len() > 1 && w.starts_with(':') && w.ends_with(':')))
-        .collect::<Vec<_>>()
-        .join(" ");
-    ["lint", "clippy", "checkleft"].iter().any(|k| label.contains(k)) || label == "check" || label.starts_with("checks")
+        .flat_map(|w| w.split(|c: char| !c.is_ascii_alphanumeric()))
+        .filter(|t| !t.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// What a failed job's label says its verification must cover. A combined job
+/// (`frontend-lint-and-test`) needs every part; a label that names none of
+/// them is treated as a test job.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct JobNeeds {
+    lint: bool,
+    test: bool,
+    build: bool,
+    /// A Bazel job is verified with Bazel only: a project command never
+    /// covers it.
+    bazel: bool,
+}
+
+fn job_needs(name: &str) -> JobNeeds {
+    let tokens = job_tokens(name);
+    let has = |words: &[&str]| tokens.iter().any(|t| words.contains(&t.as_str()));
+    let mut needs = JobNeeds {
+        lint: has(&["lint", "linting", "clippy", "checkleft"])
+            || matches!(tokens.first().map(String::as_str), Some("check" | "checks")),
+        test: has(&["test", "tests", "testing", "e2e"]),
+        build: has(&["build", "builds"]),
+        bazel: has(&["bazel"]),
+    };
+    needs.test |= !needs.lint && !needs.build;
+    needs
+}
+
+/// What one run demonstrates. `test` implies `build`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RunCaps {
+    lint: bool,
+    test: bool,
+    build: bool,
+}
+
+/// Flags that narrow a run to a subset of the job's tests, for the npm-style
+/// runners (Bazel's `--test_filter` is rejected separately).
+fn is_filter_flag(word: &str) -> bool {
+    matches!(word, "-t" | "-g")
+        || [
+            "--grep",
+            "--testPathPattern",
+            "--testNamePattern",
+            "--test-name-pattern",
+            "--test-path-pattern",
+            "--filter",
+            "--only",
+            "--test_filter",
+        ]
+        .iter()
+        .any(|f| word.starts_with(f))
 }
 
 fn is_bazel_command(words: &[&str]) -> bool {
     words.first() == Some(&"bazel")
         && matches!(words.get(1), Some(&"build" | &"test"))
         && words.iter().any(|w| w.starts_with("//"))
-        && !words.iter().any(|w| w.starts_with("--test_filter"))
+        && !words.iter().any(|w| is_filter_flag(w))
 }
 
 /// A non-Bazel job's own invocation, e.g. flunge's
 /// `npm ci && npm run build && npm run test`: every `&&` segment must be an
-/// npm/pnpm/yarn command.
+/// npm/pnpm/yarn command and none may narrow the run with a filter.
 fn is_project_command(command: &str) -> bool {
     let mut segments = command.split("&&").map(str::trim).peekable();
     segments.peek().is_some()
-        && segments.all(|segment| matches!(segment.split_whitespace().next(), Some("npm" | "npx" | "pnpm" | "yarn")))
+        && segments.all(|segment| {
+            let mut words = segment.split_whitespace();
+            matches!(words.next(), Some("npm" | "npx" | "pnpm" | "yarn")) && !words.any(is_filter_flag)
+        })
+}
+
+/// True when the command runs script `name` or a `name:*` variant
+/// (`npm run test:unit`).
+fn runs_script(words: &[&str], name: &str) -> bool {
+    words
+        .iter()
+        .any(|w| *w == name || w.strip_prefix(name).is_some_and(|rest| rest.starts_with(':')))
+}
+
+fn run_caps(command: &str, bazel_job: bool) -> RunCaps {
+    let words: Vec<_> = command.split_whitespace().collect();
+    if words == ["checkleft", "run"] {
+        return RunCaps {
+            lint: true,
+            ..RunCaps::default()
+        };
+    }
+    if is_bazel_command(&words) {
+        return RunCaps {
+            test: words.get(1) == Some(&"test"),
+            build: true,
+            ..RunCaps::default()
+        };
+    }
+    if !bazel_job && is_project_command(command) {
+        let test = runs_script(&words, "test");
+        return RunCaps {
+            test,
+            build: test || runs_script(&words, "build"),
+            ..RunCaps::default()
+        };
+    }
+    RunCaps::default()
 }
 
 /// A run that can cover a failed non-lint job: a Bazel test, or a project
 /// command that runs the job's tests.
 fn is_test_run(command: &str) -> bool {
-    let words: Vec<_> = command.split_whitespace().collect();
-    (is_bazel_command(&words) && words.get(1) == Some(&"test"))
-        || (is_project_command(command) && words.contains(&"test"))
+    run_caps(command, false).test
 }
 
 pub(crate) fn validate(attempt: &CiRemediation, evidence: Option<&QueueCiEvidence>) -> Result<()> {
@@ -126,17 +216,16 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
     }
     anyhow::ensure!(!evidence.runs.is_empty(), "{REQUIRED} No Bazel results supplied.");
     for run in &evidence.runs {
-        let words: Vec<_> = run.command.split_whitespace().collect();
+        let needs = job_needs(&run.check_name);
+        let caps = run_caps(&run.command, needs.bazel);
         anyhow::ensure!(
-            (is_bazel_command(&words)
-                || is_project_command(&run.command)
-                || (is_lint_check(&run.check_name) && words == ["checkleft", "run"]))
+            (caps.test || caps.build || (caps.lint && needs.lint))
                 && !run.check_name.trim().is_empty()
                 && run.exit_code == 0
                 && !run.output.trim().is_empty()
                 && !run.coverage.trim().is_empty()
                 && run.source_url.starts_with("https://"),
-            "{REQUIRED} Every run must report a successful complete Bazel invocation (or checkleft run for lint, or the job's npm/pnpm/yarn invocation), its output and coverage."
+            "{REQUIRED} Every run must report a successful complete invocation for its job (a Bazel build/test of the job's targets, `checkleft run` for a lint job, or the job's own npm/pnpm/yarn build/test script for a non-Bazel job; no test filters), its output and coverage."
         );
     }
     if let Some(base) = &attempt.queue_base_sha {
@@ -156,14 +245,30 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
     for check in checks {
         let url = check["target_url"].as_str().filter(|s| !s.is_empty());
         let name = check["name"].as_str().filter(|s| !s.is_empty()).context(REQUIRED)?;
+        let needs = job_needs(name);
+        let covering = || {
+            evidence
+                .runs
+                .iter()
+                .filter(|r| url.is_none_or(|url| r.source_url == url) && r.check_name == name)
+                .map(|r| run_caps(&r.command, needs.bazel))
+        };
         anyhow::ensure!(
-            evidence.runs.iter().any(|r| url.is_none_or(|url| r.source_url == url)
-                && r.check_name == name
-                && (is_lint_check(name) || is_test_run(&r.command))),
+            (!needs.lint || covering().any(|c| c.lint))
+                && (!needs.test || covering().any(|c| c.test))
+                && (!needs.build || needs.test || covering().any(|c| c.build)),
             "{REQUIRED} Missing complete verification for check {name} (source: {url:?})."
         );
     }
     Ok(())
+}
+
+/// What the post-hoc audit needs from an applied queue-CI declaration.
+pub(crate) struct QueueCiAuditInput {
+    pub attempt: CiRemediation,
+    pub evidence: QueueCiEvidence,
+    /// `delivered` (the receipt is checked too) rather than `blocked`.
+    pub delivered: bool,
 }
 
 pub(crate) fn attempt_for_execution(conn: &Connection, execution_id: &str) -> Result<Option<CiRemediation>> {
@@ -185,13 +290,35 @@ pub(crate) fn attempt_for_execution(conn: &Connection, execution_id: &str) -> Re
         .map(Option::flatten)
 }
 
-/// A requeue receipt names the queue entry and when it was enqueued.
-fn requeue_receipt_present(evidence: &QueueCiEvidence) -> bool {
+/// How far a receipt's `enqueuedAt` may sit outside the attempt's lifetime
+/// (before its creation, or ahead of now) to absorb clock skew.
+const RECEIPT_CLOCK_SKEW_SECS: i64 = 300;
+
+/// Whether `enqueued_at` can be the time of a requeue made for an attempt
+/// created at `created_epoch`, judged at `now_epoch`. The timestamp is a dedup
+/// suppression boundary, so a future or pre-attempt value must not be accepted.
+fn receipt_time_plausible(enqueued_at: &str, created_epoch: Option<i64>, now_epoch: i64) -> bool {
+    let Ok(t) = chrono::DateTime::parse_from_rfc3339(enqueued_at) else {
+        return false;
+    };
+    let t = t.timestamp();
+    t <= now_epoch + RECEIPT_CLOCK_SKEW_SECS && created_epoch.is_none_or(|c| t >= c - RECEIPT_CLOCK_SKEW_SECS)
+}
+
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// A requeue receipt names the queue entry and when it was enqueued, within
+/// the attempt's lifetime.
+fn requeue_receipt_present(evidence: &QueueCiEvidence, attempt: &CiRemediation) -> bool {
     evidence.queue_entry_id.as_ref().is_some_and(|id| !id.trim().is_empty())
         && evidence
             .queue_entry_enqueued_at
             .as_deref()
-            .is_some_and(|t| chrono::DateTime::parse_from_rfc3339(t).is_ok())
+            .is_some_and(|t| receipt_time_plausible(t, attempt.created_at.trim().parse().ok(), epoch_now()))
 }
 
 pub(crate) fn validate_declaration(
@@ -226,8 +353,11 @@ pub(crate) fn validate_declaration(
         })
     {
         anyhow::ensure!(
-            payload.queue_ci_evidence.as_ref().is_some_and(requeue_receipt_present),
-            "Re-enqueue the verified PR head with enqueuePullRequest and include its queue_entry_id and queue_entry_enqueued_at (mergeQueueEntry {{ id enqueuedAt }}) receipt. No new SHA or empty commit is required."
+            payload
+                .queue_ci_evidence
+                .as_ref()
+                .is_some_and(|e| requeue_receipt_present(e, &attempt)),
+            "Re-enqueue the verified PR head with enqueuePullRequest and include its queue_entry_id and queue_entry_enqueued_at (mergeQueueEntry {{ id enqueuedAt }}) receipt, with enqueuedAt after the attempt was created and not in the future. No new SHA or empty commit is required."
         );
     }
     Ok(())
@@ -245,7 +375,7 @@ pub(crate) fn record_delivery(conn: &Connection, execution_id: &str, payload: &R
         && attempt.failure_kind.as_deref() == Some("merge_queue_rebounce")
         && let Some(evidence) = &payload.queue_ci_evidence
         && attempt.failure_reason.as_deref() != Some("verified_requeue")
-        && requeue_receipt_present(evidence)
+        && requeue_receipt_present(evidence, &attempt)
     {
         let head = super::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger);
         conn.execute(
@@ -280,11 +410,8 @@ impl WorkDb {
     }
 
     /// The queue-side attempt and evidence behind this execution's applied
-    /// `delivered` declaration, for the post-hoc evidence audit.
-    pub(crate) fn queue_ci_delivery_for_audit(
-        &self,
-        execution_id: &str,
-    ) -> Result<Option<(CiRemediation, QueueCiEvidence)>> {
+    /// `delivered` or `blocked` declaration, for the post-hoc evidence audit.
+    pub(crate) fn queue_ci_delivery_for_audit(&self, execution_id: &str) -> Result<Option<QueueCiAuditInput>> {
         let conn = self.connect()?;
         let payload: Option<String> = conn.query_row(
             "SELECT payload_json FROM worker_proposals WHERE execution_id = ?1 AND kind = 'run_done' AND state = 'applied' ORDER BY created_at DESC LIMIT 1",
@@ -294,12 +421,36 @@ impl WorkDb {
             return Ok(None);
         };
         let payload: RunDoneProposalPayload = serde_json::from_str(&payload)?;
-        let (RunDoneOutcome::Delivered, Some(evidence)) = (payload.outcome, payload.queue_ci_evidence) else {
+        let (outcome @ (RunDoneOutcome::Delivered | RunDoneOutcome::Blocked), Some(evidence)) =
+            (payload.outcome, payload.queue_ci_evidence)
+        else {
             return Ok(None);
         };
         Ok(attempt_for_execution(&conn, execution_id)?
             .filter(|a| crate::ci_watch::is_queue_side_failure_kind(a.failure_kind.as_deref()))
-            .map(|a| (a, evidence)))
+            .map(|attempt| QueueCiAuditInput {
+                attempt,
+                evidence,
+                delivered: outcome == RunDoneOutcome::Delivered,
+            }))
+    }
+
+    /// True when the work item has a CI attempt other than `attempt_id`
+    /// created at or after `created_at` (epoch seconds): the failure signal
+    /// has already been picked up again.
+    pub(crate) fn has_newer_ci_remediation(
+        &self,
+        work_item_id: &str,
+        attempt_id: &str,
+        created_at: &str,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ci_remediations WHERE work_item_id = ?1 AND id != ?2
+              AND CAST(created_at AS INTEGER) >= CAST(?3 AS INTEGER))",
+            params![work_item_id, attempt_id, created_at],
+            |row| row.get(0),
+        )?)
     }
 
     pub(crate) fn has_verified_queue_delivery(&self, execution_id: &str, head_sha: &str) -> Result<bool> {
@@ -326,6 +477,10 @@ impl WorkDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_lint_check(name: &str) -> bool {
+        job_needs(name).lint
+    }
     use boss_protocol::{ProposalKind, ProposalState, QueueCiRun};
 
     const URL: &str = "https://buildkite.com/flunge/mono/builds/20619#failed-job";
@@ -465,11 +620,20 @@ mod tests {
         assert_eq!(submit("missing-requeue", &payload).state, ProposalState::Rejected);
         proof.queue_entry_id = Some("MQE_receipt".into());
         assert!(
-            !requeue_receipt_present(&proof),
+            !requeue_receipt_present(&proof, &attempt),
             "a receipt id alone does not anchor the requeue"
         );
-        proof.queue_entry_enqueued_at = Some("2026-07-27T23:10:00Z".into());
-        assert!(requeue_receipt_present(&proof));
+        let at = |offset: i64| {
+            chrono::DateTime::from_timestamp(epoch_now() + offset, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        for (bad, when) in [("future", at(86_400)), ("pre-attempt", at(-86_400))] {
+            proof.queue_entry_enqueued_at = Some(when);
+            assert!(!requeue_receipt_present(&proof, &attempt), "{bad}");
+        }
+        proof.queue_entry_enqueued_at = Some(at(0));
+        assert!(requeue_receipt_present(&proof, &attempt));
         payload.queue_ci_evidence = Some(proof);
         assert_eq!(submit("same-head-requeued", &payload).state, ProposalState::Applied);
         assert!(db.has_verified_queue_delivery(&execution.id, &"b".repeat(40)).unwrap());
@@ -547,6 +711,82 @@ mod tests {
         assert!(is_lint_check("checks-framework"));
         attempt.failed_checks = "[]".into();
         assert!(!is_lint_check("bazel-build-test"));
+    }
+
+    fn job_attempt(db: &WorkDb, checks: serde_json::Value) -> CiRemediation {
+        let product = crate::test_support::create_test_product(db);
+        let revision = crate::test_support::create_test_chore(db, product.id.clone(), "Job CI");
+        db.insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product.id,
+            work_item_id: revision.id,
+            pr_url: "https://github.com/spinyfin/mono/pull/3160".into(),
+            pr_number: 3160,
+            head_branch: "feature".into(),
+            head_sha_at_trigger: "trunk:entry_3@2026-07-27T23:07:13.000Z".into(),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: checks.to_string(),
+            failure_kind: "trunk_queue_eviction".into(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .unwrap()
+    }
+
+    fn job_proof(name: &str, commands: &[&str]) -> QueueCiEvidence {
+        let mut proof = evidence();
+        proof.runs = commands
+            .iter()
+            .map(|command| QueueCiRun {
+                check_name: name.into(),
+                source_url: URL.into(),
+                command: (*command).into(),
+                exit_code: 0,
+                output: "ok".into(),
+                coverage: "whole job".into(),
+            })
+            .collect();
+        proof
+    }
+
+    #[test]
+    fn verification_is_decided_per_job_from_whole_label_tokens() {
+        let (_dir, db) = crate::test_support::open_db();
+        let check = |name: &str| serde_json::json!([{"name": name, "target_url": URL}]);
+        let accepts = |name: &str, commands: &[&str]| {
+            validate(&job_attempt(&db, check(name)), Some(&job_proof(name, commands))).is_ok()
+        };
+        // Whole-token lint detection: a substring never counts.
+        assert!(!is_lint_check("Trunk merge queue: ci/splinter-suite"));
+        assert!(is_lint_check("Trunk merge queue: ci/:mag: lint"));
+        assert!(!is_lint_check("ci/:white_check_mark: frontend-tests"));
+        // A combined job needs both its lint and its test evidence.
+        let combined = "Trunk merge queue: ci/frontend-lint-and-test";
+        assert!(!accepts(combined, &["checkleft run"]));
+        assert!(!accepts(combined, &["npm ci && npm run test"]));
+        assert!(accepts(combined, &["checkleft run", "npm ci && npm run test"]));
+        // A Bazel job is covered by Bazel only, never by a project command.
+        let bazel = "Trunk merge queue: ci/bazel-build-test";
+        assert!(!accepts(bazel, &["npm test"]));
+        assert!(accepts(bazel, &["bazel test //tools/boss/..."]));
+        // Narrowing flags are rejected for npm-style runners as for Bazel.
+        let frontend = "Trunk merge queue: ci/frontend-tests";
+        for filtered in [
+            "npm test -- --grep login",
+            "npm test -- --testPathPattern=auth",
+            "npm run test -- -t login",
+        ] {
+            assert!(!accepts(frontend, &[filtered]), "{filtered}");
+        }
+        // `test:*` scripts and build-only jobs are evidenceable.
+        assert!(accepts(frontend, &["npm ci && npm run test:unit"]));
+        let build_only = "Trunk merge queue: ci/frontend-build";
+        assert!(accepts(build_only, &["npm ci && npm run build"]));
+        assert!(accepts(build_only, &["bazel build //tools/boss/..."]));
+        assert!(!accepts(build_only, &["npm ci"]));
+        // Tests cover a build job; a build does not cover a test job.
+        assert!(accepts(build_only, &["npm run test"]));
+        assert!(!accepts(frontend, &["npm run build"]));
     }
 
     #[test]

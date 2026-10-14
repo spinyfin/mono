@@ -721,10 +721,14 @@ pub trait BranchVerifier: Send + Sync {
         Err(anyhow!("ancestry lookup unsupported by this verifier"))
     }
 
-    /// The PR's current GitHub merge-queue entry id and PR head OID, or
-    /// `None` when the PR is not in the queue. Used by the queue-CI evidence
-    /// audit to check a worker-supplied `enqueuePullRequest` receipt.
-    async fn fetch_pr_merge_queue_entry(&self, _repo_slug: &str, _pr_number: u64) -> Result<Option<(String, String)>> {
+    /// The PR's state, head OID and live merge-queue entry (id, enqueuedAt)
+    /// in one read. Used by the queue-CI evidence audit to check a
+    /// worker-supplied `enqueuePullRequest` receipt against GitHub.
+    async fn fetch_pr_merge_queue_snapshot(
+        &self,
+        _repo_slug: &str,
+        _pr_number: u64,
+    ) -> Result<boss_github::gh_runner::PrMergeQueueSnapshot> {
         Err(anyhow!("merge-queue entry lookup unsupported by this verifier"))
     }
 }
@@ -781,38 +785,19 @@ impl BranchVerifier for CommandBranchVerifier {
         Ok(matches!(status.as_str(), "ahead" | "identical"))
     }
 
-    async fn fetch_pr_merge_queue_entry(&self, repo_slug: &str, pr_number: u64) -> Result<Option<(String, String)>> {
+    async fn fetch_pr_merge_queue_snapshot(
+        &self,
+        repo_slug: &str,
+        pr_number: u64,
+    ) -> Result<boss_github::gh_runner::PrMergeQueueSnapshot> {
         let (owner, name) = repo_slug
             .split_once('/')
             .with_context(|| format!("invalid repo slug `{repo_slug}`"))?;
-        let query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid mergeQueueEntry{id}}}}";
-        let number = pr_number.to_string();
-        let out = gh_scope(
+        gh_scope(
             callers::COMPLETION,
-            run_gh(
-                &[
-                    "api",
-                    "graphql",
-                    "-f",
-                    &format!("query={query}"),
-                    "-f",
-                    &format!("owner={owner}"),
-                    "-f",
-                    &format!("name={name}"),
-                    "-F",
-                    &format!("number={number}"),
-                    "--jq",
-                    ".data.repository.pullRequest | [.mergeQueueEntry.id, .headRefOid] | @tsv",
-                ],
-                &format!("gh api graphql mergeQueueEntry {repo_slug}#{pr_number}"),
-            ),
+            boss_github::gh_runner::pr_merge_queue_snapshot(owner, name, pr_number),
         )
-        .await?;
-        let mut parts = out.trim().split('\t');
-        Ok(match (parts.next(), parts.next()) {
-            (Some(id), Some(head)) if !id.is_empty() && id != "null" => Some((id.to_owned(), head.to_owned())),
-            _ => None,
-        })
+        .await
     }
 }
 
