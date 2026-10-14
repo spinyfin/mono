@@ -98,15 +98,38 @@ pub(crate) async fn load_product_guidance(
         .into_iter()
         .zip(products)
         .map(|(view, product)| {
-            view.unwrap_or_else(|| {
-                failed_view(
-                    product,
-                    fetched_at.clone(),
-                    format!("the engine's read of `{COORDINATOR_GUIDANCE_PATH}` panicked; see the engine log"),
-                )
-            })
+            view.unwrap_or_else(|| panicked_view(work_db, product, fetched_at.clone(), now_epoch_secs))
         })
         .collect()
+}
+
+/// The view for a product whose read task panicked. It is a `Failed` read
+/// like any other, so the last-known-good cache still answers for it.
+fn panicked_view(
+    work_db: &WorkDb,
+    product: &Product,
+    fetched_at: String,
+    now_epoch_secs: i64,
+) -> CoordinatorGuidanceView {
+    let owner_repo = owner_repo_of(product);
+    let state = settle_with_cache(
+        work_db,
+        product,
+        owner_repo.as_deref(),
+        CoordinatorGuidanceState::Failed {
+            reason: format!("the engine's read of `{COORDINATOR_GUIDANCE_PATH}` panicked; see the engine log"),
+        },
+        now_epoch_secs,
+    );
+    CoordinatorGuidanceView::builder()
+        .product_id(product.id.clone())
+        .fetched_at(fetched_at)
+        .path(COORDINATOR_GUIDANCE_PATH)
+        .product_name(product.name.clone())
+        .state(state)
+        .maybe_owner_repo(owner_repo)
+        .maybe_repo_remote_url(product.repo_remote_url.clone())
+        .build()
 }
 
 async fn load_one(
@@ -240,17 +263,6 @@ fn save_cache(
             "coordinator guidance: could not save the last-known-good cache"
         );
     }
-}
-
-fn failed_view(product: &Product, fetched_at: String, reason: String) -> CoordinatorGuidanceView {
-    CoordinatorGuidanceView::builder()
-        .product_id(product.id.clone())
-        .fetched_at(fetched_at)
-        .path(COORDINATOR_GUIDANCE_PATH)
-        .product_name(product.name.clone())
-        .state(CoordinatorGuidanceState::Failed { reason })
-        .maybe_repo_remote_url(product.repo_remote_url.clone())
-        .build()
 }
 
 /// Compact per-product summary for the `coordinator_guidance_brief` audit

@@ -10,7 +10,7 @@
 //! time travels with the entry so its age stays visible.
 
 use anyhow::{Context, Result};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use super::WorkDb;
@@ -37,26 +37,26 @@ fn key(product_id: &str) -> String {
 }
 
 impl WorkDb {
-    /// Replace the product's cached guidance with `entry`.
-    pub(crate) fn save_coordinator_guidance_cache(&self, product_id: &str, entry: &CachedGuidance) -> Result<()> {
+    /// Save `entry` as the product's cached guidance unless a read that
+    /// started later has already saved one. Concurrent reads of the same
+    /// product can finish out of order; a slow, older read must not put
+    /// superseded rules back over a newer entry. The comparison happens
+    /// inside the one upsert so it is atomic. Equal read times replace.
+    /// Returns whether the entry was written.
+    pub(crate) fn save_coordinator_guidance_cache(&self, product_id: &str, entry: &CachedGuidance) -> Result<bool> {
         let value = serde_json::to_string(entry).context("serialize cached coordinator guidance")?;
-        self.connect()?.execute(
+        let changed = self.connect()?.execute(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE json_extract(metadata.value, '$.read_at') <= json_extract(excluded.value, '$.read_at')",
             params![key(product_id), value],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     /// The product's cached guidance, if a read ever succeeded.
     pub(crate) fn load_coordinator_guidance_cache(&self, product_id: &str) -> Result<Option<CachedGuidance>> {
-        let value: Option<String> = self
-            .connect()?
-            .query_row("SELECT value FROM metadata WHERE key = ?1", [key(product_id)], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        value
+        self.get_metadata(&key(product_id))?
             .map(|value| serde_json::from_str(&value).context("parse cached coordinator guidance"))
             .transpose()
     }
@@ -100,5 +100,21 @@ mod tests {
             Some(entry("shaB", None)),
             "another product's entry is untouched"
         );
+    }
+
+    #[test]
+    fn an_older_read_finishing_late_does_not_replace_a_newer_entry() {
+        let db = WorkDb::open_in_memory().unwrap();
+        let newer = CachedGuidance {
+            read_at: 2_000,
+            ..entry("shaB", Some("# B"))
+        };
+        let older = CachedGuidance {
+            read_at: 1_000,
+            ..entry("shaA", Some("# A"))
+        };
+        assert!(db.save_coordinator_guidance_cache("prod_a", &newer).unwrap());
+        assert!(!db.save_coordinator_guidance_cache("prod_a", &older).unwrap());
+        assert_eq!(db.load_coordinator_guidance_cache("prod_a").unwrap(), Some(newer));
     }
 }

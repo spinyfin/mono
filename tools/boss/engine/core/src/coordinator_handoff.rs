@@ -398,8 +398,9 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
          1. Your first reply states which handoff state applies (present / stale / missing / unreadable) in one \
          line, then summarizes the handoff in a few lines if there is one. In the same reply, list each product's \
          guidance state from the section above in one line per product (loaded @ sha / missing / over cap / fetch \
-         failed / no repo) — a fetch failure is something the operator needs to hear, not something to work around \
-         silently.\n\
+         failed / cached @ sha, read <time> / no repo) — a fetch failure is something the operator needs to hear, \
+         not something to work around silently. A CACHED entry is a fetch failure served from the last copy read \
+         successfully: report it as \"fetch failed, serving cached @ sha read <time>\", never as loaded.\n\
          2. Treat every infrastructure, host, flag, tmux, or pause fact from the handoff as \"as of the time it was \
          written\". Before filing work, briefing an agent, or raising an alarm that depends on such a fact, \
          confirm it is still true (a fresh read, or ask the operator).\n\
@@ -665,6 +666,9 @@ mod tests {
         assert!(handoff_at < guidance_at && guidance_at < steps_at, "{text}");
         assert!(text.contains("# Boss rules"), "{text}");
         assert!(text.contains("list each product's guidance state"), "{text}");
+        let steps = &text[steps_at..];
+        assert!(steps.contains("cached @ sha, read <time>"), "{text}");
+        assert!(steps.contains("never as loaded"), "{text}");
     }
 
     #[test]
