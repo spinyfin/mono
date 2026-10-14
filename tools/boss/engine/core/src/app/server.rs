@@ -1630,10 +1630,10 @@ pub async fn serve_with_overrides(
         crate::database_backup::backup_interval(),
         crate::database_backup::retention_count(),
         // Off-machine copies: off unless `[backup.offsite]` enables them.
-        crate::database_backup::OffsiteRuntime::from_settings(
+        Some(crate::database_backup::OffsiteRuntime::from_settings(
             &crate::settings::SettingsStore::default_path(&db_backup_state_root),
             server_state.metrics.clone(),
-        ),
+        )),
     );
 
     // Install the auto-populate capability before the merge poller starts,

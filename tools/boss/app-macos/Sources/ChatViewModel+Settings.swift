@@ -30,13 +30,6 @@ extension ChatViewModel {
         engine.sendGetOffsiteBackup()
     }
 
-    /// Persist the off-machine backup configuration. The engine's
-    /// `offsite_backup_settings` echo updates `offsiteBackup`; a rejection
-    /// arrives as a work error alert and leaves it unchanged.
-    func saveOffsiteBackup(_ settings: OffsiteBackupSettings) {
-        engine.sendSetOffsiteBackup(settings)
-    }
-
     /// Ask the engine for a fresh engine-health snapshot. Also called
     /// on every reconnect from the `.connected` arm of `handle`; this
     /// wrapper exists so the Settings pane can re-poll on appear

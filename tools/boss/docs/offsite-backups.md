@@ -12,7 +12,7 @@ Boss can copy each finished local backup into a directory that a sync agent repl
 
 ### Settings
 
-In the Boss app: **Settings → Backups**. Turn on "Copy backups off this machine", choose the synced folder with **Choose…**, set the hourly/daily retention, and press **Save**. The engine validates the values (an enabled config needs an absolute folder and at least one retained copy), writes `[backup.offsite]` to `settings.toml`, and the pane offers **Restart engine to apply**, because the section is read at engine start.
+In the Boss app: **Settings → Backups**. Choose the synced folder with **Choose…**, turn on "Copy backups off this machine", and set the hourly/daily retention. Controls apply immediately, with a brief debounce for retention clicks. The engine validates the values (an enabled config needs an absolute folder and at least one retained copy) and writes `[backup.offsite]` to `settings.toml`. Rejected edits show an inline error and restore the stored value.
 
 Or edit `<state_root>/settings.toml` by hand:
 
@@ -32,7 +32,7 @@ enabled = true
 destination = "/Users/<you>/Library/CloudStorage/GoogleDrive-<account>/My Drive/boss-backups"
 ```
 
-The settings are read once at engine start; restart the engine after editing. The `[backup]` table is preserved when the engine rewrites `settings.toml` for other settings.
+The settings are read before each off-machine copy, so changes need no engine restart. If settings cannot be loaded, that copy is skipped, logged as an error, and counted as a failed copy; stale settings are never used. The `[backup]` table is preserved when the engine rewrites `settings.toml` for other settings.
 
 Copies land in `<destination>/<hostname>/state.db.bak-YYYYMMDD-HHMMSS`, so several machines can share one destination. The destination directory itself must already exist (Boss only creates the per-host subfolder); a missing destination usually means the sync folder is not mounted.
 

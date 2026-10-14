@@ -910,7 +910,7 @@ final class EngineClient: @unchecked Sendable {
                 keepHourly: (payload["keep_hourly"] as? NSNumber)?.intValue ?? OffsiteBackupSettings.defaultKeepHourly,
                 keepDaily: (payload["keep_daily"] as? NSNumber)?.intValue ?? OffsiteBackupSettings.defaultKeepDaily,
                 loadError: payload["load_error"] as? String
-            )))
+            ), requestId: envelopeRequestId))
         case "setting_set":
             let key = payload["key"] as? String ?? ""
             let enabled = (payload["enabled"] as? NSNumber)?.boolValue ?? false
