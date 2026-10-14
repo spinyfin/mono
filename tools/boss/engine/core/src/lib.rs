@@ -13,6 +13,7 @@ pub mod attention_reconcile_sweep;
 pub mod attentions_detector;
 pub mod audit;
 pub mod audit_effort;
+pub mod pr_binding_repair_sweep;
 pub use boss_engine_automation_schedule as automation_schedule;
 pub mod automation_scheduler;
 pub mod automation_triage;

@@ -323,6 +323,9 @@ impl WorkerCompletionHandler {
             // finalizer's `outcome` can never be this variant. Covered for
             // exhaustiveness like the other unreachable arms above.
             StopOutcome::RunDoneDeclaredWithoutDelivery { .. } => false,
+            // The foreign-PR guard already failed the execution visibly;
+            // the attempt it belonged to is retired as unsuccessful.
+            StopOutcome::ForeignPrRefused { .. } => true,
         };
         if !should_mark_failed {
             return;

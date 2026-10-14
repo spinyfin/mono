@@ -1256,7 +1256,13 @@ async fn accepted_review_report_reaps_a_real_worker_process() {
 /// declaring `run_done` are plain implementation workers with no batch
 /// machinery at all).
 fn live_chore_execution() -> (Arc<ServerState>, tempfile::TempDir, String, String) {
-    let (server_state, dir) = test_server_state_with_fakes();
+    // The `delivered` path resolves an unbound PR by the execution's own
+    // branch. A detector that definitively finds none there is what makes
+    // "no resolvable PR" a visible failure; the sandbox's denied `gh` would
+    // instead read as "GitHub unreachable", which the engine (correctly)
+    // defers rather than fails.
+    let (server_state, dir) =
+        test_server_state_with_fakes_and_pr_detector(Arc::new(FixedPrDetector(crate::completion::PrStatus::None)));
     // Every test using this fixture exercises the `run_done` synchronous
     // finalize path, which `handle_submit_proposal` only takes with both
     // halves of the seam's kill switch on — see

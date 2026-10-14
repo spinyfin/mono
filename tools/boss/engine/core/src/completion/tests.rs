@@ -36,6 +36,12 @@ struct DetectCall {
 struct StubPrDetector {
     result: Mutex<Result<PrStatus, String>>,
     calls: std::sync::Mutex<Vec<DetectCall>>,
+    /// Per-branch `Fresh` URLs consulted before `result`. A branch-keyed
+    /// detector returns a different PR for every execution branch; tests
+    /// with several executions use this so each binds its own PR (binding
+    /// the same PR to several work items is refused by the foreign-PR
+    /// guard, as it should be).
+    fresh_url_by_branch: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl StubPrDetector {
@@ -44,16 +50,14 @@ impl StubPrDetector {
             Some(url) => PrStatus::Fresh { url: url.to_owned() },
             None => PrStatus::None,
         };
-        Arc::new(Self {
-            result: Mutex::new(Ok(status)),
-            calls: std::sync::Mutex::new(Vec::new()),
-        })
+        Self::ok_status(status)
     }
 
     fn ok_status(status: PrStatus) -> Arc<Self> {
         Arc::new(Self {
             result: Mutex::new(Ok(status)),
             calls: std::sync::Mutex::new(Vec::new()),
+            fresh_url_by_branch: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -61,6 +65,7 @@ impl StubPrDetector {
         Arc::new(Self {
             result: Mutex::new(Err(message.to_owned())),
             calls: std::sync::Mutex::new(Vec::new()),
+            fresh_url_by_branch: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -69,6 +74,14 @@ impl StubPrDetector {
     /// and then finally opens a PR.
     async fn set_result(&self, status: PrStatus) {
         *self.result.lock().await = Ok(status);
+    }
+
+    /// Make `detect_pr` report `Fresh { url }` for `expected_branch` only.
+    fn set_fresh_for_branch(&self, expected_branch: &str, url: &str) {
+        self.fresh_url_by_branch
+            .lock()
+            .expect("fresh_url_by_branch mutex poisoned")
+            .insert(expected_branch.to_owned(), url.to_owned());
     }
 
     fn call_count(&self) -> usize {
@@ -90,6 +103,14 @@ impl PrDetector for StubPrDetector {
                 repo_remote_url: repo_remote_url.to_owned(),
                 expected_branch: expected_branch.to_owned(),
             });
+        if let Some(url) = self
+            .fresh_url_by_branch
+            .lock()
+            .expect("fresh_url_by_branch mutex poisoned")
+            .get(expected_branch)
+        {
+            return Ok(PrStatus::Fresh { url: url.clone() });
+        }
         let guard = self.result.lock().await;
         match &*guard {
             Ok(value) => Ok(value.clone()),
@@ -155,9 +176,35 @@ struct StubBranchVerifier {
     /// gate requested, not just the resulting skip/no-skip outcome.
     #[builder(default = Mutex::new(Vec::new()))]
     diff_signature_calls: Mutex<Vec<(String, String)>>,
+    /// Per-PR `headRefName` overrides consulted by `fetch_pr_head_ref`
+    /// before `result`. Lets a test stage several candidate URLs whose PRs
+    /// live on different branches — the multi-URL publish-output shape the
+    /// branch check must pick through — instead of one branch for every PR.
+    #[builder(default = std::sync::Mutex::new(HashMap::new()))]
+    head_ref_by_pr: std::sync::Mutex<HashMap<u64, String>>,
+    /// Every PR number `fetch_pr_head_ref` was asked about, in call order.
+    #[builder(default = std::sync::Mutex::new(Vec::new()))]
+    head_ref_calls: std::sync::Mutex<Vec<u64>>,
 }
 
 impl StubBranchVerifier {
+    /// Make `fetch_pr_head_ref` report `branch` for PR `pr_number` only;
+    /// other PRs keep falling through to `result`.
+    fn set_head_ref_for(&self, pr_number: u64, branch: &str) {
+        self.head_ref_by_pr
+            .lock()
+            .expect("head_ref_by_pr mutex poisoned")
+            .insert(pr_number, branch.to_owned());
+    }
+
+    /// PR numbers `fetch_pr_head_ref` was called with, in order.
+    fn head_ref_calls_snapshot(&self) -> Vec<u64> {
+        self.head_ref_calls
+            .lock()
+            .expect("head_ref_calls mutex poisoned")
+            .clone()
+    }
+
     /// Verifier that always reports the given branch name for
     /// `fetch_pr_head_ref`; every other field takes its builder default.
     fn ok(branch: &str) -> Arc<Self> {
@@ -225,6 +272,18 @@ impl StubBranchVerifier {
 #[async_trait]
 impl BranchVerifier for StubBranchVerifier {
     async fn fetch_pr_head_ref(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+        self.head_ref_calls
+            .lock()
+            .expect("head_ref_calls mutex poisoned")
+            .push(_pr_number);
+        if let Some(branch) = self
+            .head_ref_by_pr
+            .lock()
+            .expect("head_ref_by_pr mutex poisoned")
+            .get(&_pr_number)
+        {
+            return Ok(branch.clone());
+        }
         match &self.result {
             Ok(branch) => Ok(branch.clone()),
             Err(msg) => Err(anyhow::anyhow!(msg.clone())),

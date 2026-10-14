@@ -40,6 +40,25 @@ pub fn find_last_pr_url(text: &str) -> Option<String> {
     PR_URL_RE.find_iter(text).last().map(|m| m.as_str().to_owned())
 }
 
+/// Every distinct canonical PR URL in `text`, in first-appearance order.
+///
+/// Used by the hook-stream capture path, which must not pick one URL out of
+/// a publish command's output by position: a `cube pr create` whose output
+/// echoes the PR body (a follow-up body legitimately cites its origin PR)
+/// carries the origin URL *before* the URL of the PR it just opened. Every
+/// URL is staged as a candidate and the engine selects among them by the
+/// PR's head branch, never by text order.
+pub fn find_all_pr_urls(text: &str) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    for m in PR_URL_RE.find_iter(text) {
+        let url = m.as_str();
+        if !urls.iter().any(|seen| seen == url) {
+            urls.push(url.to_owned());
+        }
+    }
+    urls
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +82,20 @@ mod tests {
             find_last_pr_url(text),
             Some("https://github.com/o/r/pull/42".to_owned())
         );
+    }
+
+    #[test]
+    fn find_all_keeps_every_distinct_url_in_order() {
+        let text = "body cites https://github.com/o/r/pull/1757 and https://github.com/o/r/pull/1757/files\n\
+                    https://github.com/o/r/pull/1764\n";
+        assert_eq!(
+            find_all_pr_urls(text),
+            vec![
+                "https://github.com/o/r/pull/1757".to_owned(),
+                "https://github.com/o/r/pull/1764".to_owned(),
+            ]
+        );
+        assert!(find_all_pr_urls("no urls here").is_empty());
     }
 
     #[test]

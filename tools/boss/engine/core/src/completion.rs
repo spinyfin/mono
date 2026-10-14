@@ -87,6 +87,7 @@ mod handler_build;
 mod metadata_gate;
 mod no_op;
 mod nudge;
+mod pr_binding_guard;
 mod pr_transition;
 mod recheck;
 mod release;
@@ -2411,6 +2412,12 @@ pub enum StopOutcome {
     /// and `no_changes_needed` reaches [`Self::NoChangesNeeded`] — both
     /// existing variants, reused because their semantics already fit.
     RunDoneDeclaredWithoutDelivery { detail: String },
+    /// A primary execution's completion resolved to a PR that is already
+    /// bound to a different work item (`pr_binding_guard`). Nothing was
+    /// bound: the execution failed visibly, the task row records `detail`
+    /// as its blocked reason, and an attention item was filed. A PR that
+    /// belongs to another row is never this execution's deliverable.
+    ForeignPrRefused { pr_url: String, detail: String },
 }
 
 /// Number of transcript-read attempts [`WorkerCompletionHandler::read_final_triage_message`]
