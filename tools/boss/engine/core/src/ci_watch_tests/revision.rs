@@ -124,7 +124,7 @@ async fn evidence_free_trunk_eviction_spawns_an_investigation_revision() {
 
     let flipped = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         Some("feature-branch"),
         "entry-reasoning",

@@ -620,6 +620,7 @@ async fn on_stop_records_marker_but_awaits_ci_when_body_changed_but_ci_not_green
         .await;
     // The PR-template check is still re-running after the edit.
     let failures = vec![RequiredCheckFailure {
+        job_key: None,
         name: "pr-template".into(),
         conclusion: "IN_PROGRESS".into(),
         target_url: String::new(),
@@ -1064,6 +1065,7 @@ async fn revision_on_stop_no_pr_head_before_snapshot_and_ci_not_ready_awaits_wit
     }
     let detector = StubPrDetector::ok(None);
     let failures = vec![RequiredCheckFailure {
+        job_key: None,
         name: "build".into(),
         conclusion: "IN_PROGRESS".into(),
         target_url: String::new(),

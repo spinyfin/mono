@@ -790,6 +790,7 @@ pub fn spawn_loop(
                             callers::TRUNK_QUEUE_POLLER,
                             trunk_probe.run_pass(
                                 &crate::trunk_queue_poller::TrunkSweepContext {
+                                    contract_fetcher: &crate::queue_ci_contract::ProviderFetcher,
                                     work_db: work_db.as_ref(),
                                     publisher: publisher.as_ref(),
                                     api: trunk_queue_api.as_ref(),

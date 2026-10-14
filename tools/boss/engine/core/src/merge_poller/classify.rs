@@ -409,6 +409,7 @@ pub(crate) fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&
                 let provider = provider_for_url(&target_url);
                 let provider_job_id = parse_provider_job_id(provider, &target_url);
                 failures.push(RequiredCheckFailure {
+                    job_key: None,
                     name,
                     conclusion,
                     target_url,

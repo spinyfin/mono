@@ -208,7 +208,17 @@ pub(crate) async fn run_merge_queue_rebounce_pass(
     let dequeue_events = fetch_merge_queue_dequeue_events_batch(&rebounce_urls).await;
     for candidate in &rebounce_candidates {
         clear_github_merge_intent_on_observed_dequeue(work_db, publisher, candidate, &dequeue_events).await;
-        check_merge_queue_rebounce(work_db, publisher, candidate, &dequeue_events, outcome).await;
+        check_merge_queue_rebounce(
+            work_db,
+            crate::queue_ci_contract::DetectionContext {
+                publisher,
+                fetcher: &crate::queue_ci_contract::ProviderFetcher,
+            },
+            candidate,
+            &dequeue_events,
+            outcome,
+        )
+        .await;
     }
 }
 
@@ -296,7 +306,7 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
 /// call is logged at debug and skipped; the next sweep will retry.
 pub(crate) async fn check_merge_queue_rebounce(
     work_db: &WorkDb,
-    publisher: &dyn ExecutionPublisher,
+    context: crate::queue_ci_contract::DetectionContext<'_>,
     candidate: &PendingMergeCheck,
     dequeue_events: &HashMap<String, Vec<MergeQueueDequeueEvent>>,
     outcome: &mut SweepOutcome,
@@ -442,7 +452,7 @@ pub(crate) async fn check_merge_queue_rebounce(
         );
         if ci_watch::on_merge_queue_rebounce_detected(
             work_db,
-            publisher,
+            context,
             candidate,
             pr_head_sha,
             before_commit_sha,

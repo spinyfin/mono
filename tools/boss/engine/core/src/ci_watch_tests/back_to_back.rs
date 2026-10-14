@@ -39,7 +39,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     // Step 1: first dequeue (SHA_1) → chore flips to blocked, revision spawned.
     let first = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-1",
         "sha-merge-1",
@@ -100,7 +100,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     // eliminates. The chore stays in_review.
     let sha1_replay = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-1",
         "sha-merge-1",
@@ -137,7 +137,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     // fresh attempt gets its own revision immediately.
     let sha2_detect = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-2",
         "sha-merge-2",

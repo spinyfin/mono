@@ -374,6 +374,7 @@ fn backoff_delay(consecutive_failures: u32) -> Duration {
 /// call site in `merge_poller::spawn_loop` (already threading a long
 /// argument list) stays readable.
 pub struct TrunkSweepContext<'a> {
+    pub contract_fetcher: &'a dyn crate::queue_ci_contract::ContractFetcher,
     pub work_db: &'a WorkDb,
     pub publisher: &'a dyn ExecutionPublisher,
     pub api: &'a dyn TrunkQueueApi,
@@ -2005,7 +2006,10 @@ async fn handle_trunk_queue_eviction(
             };
             if crate::ci_watch::on_trunk_queue_eviction_detected(
                 ctx.work_db,
-                ctx.publisher,
+                crate::queue_ci_contract::DetectionContext {
+                    publisher: ctx.publisher,
+                    fetcher: ctx.contract_fetcher,
+                },
                 &candidate,
                 None, // head branch not tracked on the intent; mirrors the GH rebounce production callsite
                 &entry.id,

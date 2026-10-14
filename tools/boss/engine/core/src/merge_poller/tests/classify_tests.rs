@@ -317,6 +317,7 @@ fn classify_ci_collapses_leaves() {
         super::classify_ci(&failing, None),
         OpenPrCiStatus::Failing {
             failures: vec![RequiredCheckFailure {
+                job_key: None,
                 name: "buildkite/mono".into(),
                 conclusion: "FAILURE".into(),
                 target_url: "https://buildkite.com/acme/mono/builds/42#job-uuid".into(),
@@ -350,6 +351,7 @@ fn classify_ci_collapses_leaves() {
         super::classify_ci(&mixed, None),
         OpenPrCiStatus::Failing {
             failures: vec![RequiredCheckFailure {
+                job_key: None,
                 name: "ci/test".into(),
                 conclusion: "FAILURE".into(),
                 target_url: "".into(),
@@ -440,6 +442,7 @@ fn classify_ci_excludes_trunk_merge_queue_check() {
         super::classify_ci(&mixed, None),
         OpenPrCiStatus::Failing {
             failures: vec![RequiredCheckFailure {
+                job_key: None,
                 name: "ci/test".into(),
                 conclusion: "FAILURE".into(),
                 target_url: "".into(),

@@ -62,7 +62,7 @@ fn job_needs(name: &str) -> JobNeeds {
         build: has(&["build", "builds"]),
         bazel: has(&["bazel"]),
     };
-    needs.test |= !needs.lint && !needs.build;
+    needs.test |= !needs.lint;
     needs
 }
 
@@ -237,6 +237,7 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
         });
         anyhow::ensure!(
             (declared || caps.test || caps.build || (caps.lint && needs.lint))
+                && !run.command.trim().is_empty()
                 && !run.check_name.trim().is_empty()
                 && run.exit_code == 0
                 && !run.output.trim().is_empty()
@@ -276,10 +277,7 @@ fn validate_evidence(attempt: &CiRemediation, evidence: &QueueCiEvidence) -> Res
             anyhow::ensure!(
                 required
                     .iter()
-                    .all(|required| runs.iter().any(|r| r.command.trim() == required.command.trim()))
-                    && runs.iter().all(|r| required
-                        .iter()
-                        .any(|required| r.command.trim() == required.command.trim())),
+                    .all(|required| runs.iter().any(|r| r.command.trim() == required.command.trim())),
                 "{REQUIRED} Missing or mismatched declared command for {name} (job {job_key})."
             );
             continue;
@@ -439,6 +437,49 @@ pub(crate) fn record_delivery(conn: &Connection, execution_id: &str, payload: &R
 }
 
 impl WorkDb {
+    /// Restore a falsely retired queue episode and its parent in one transaction.
+    /// Clean head CI must still see an active queue-side attempt after the audit.
+    pub(crate) fn rearm_audited_queue_failure(&self, attempt: &CiRemediation) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let newer: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ci_remediations WHERE work_item_id = ?1 AND id != ?2 AND CAST(created_at AS INTEGER) >= CAST(?3 AS INTEGER))",
+            params![attempt.work_item_id, attempt.id, attempt.created_at],
+            |row| row.get(0),
+        )?;
+        if newer {
+            return Ok(false);
+        }
+        let head = super::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger);
+        let suppressed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ci_failure_suppressions WHERE work_item_id = ?1 AND head_sha = ?2)",
+            params![attempt.work_item_id, head],
+            |row| row.get(0),
+        )?;
+        if suppressed {
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE ci_remediations SET status = 'pending', failure_reason = NULL, finished_at = NULL,
+             head_sha_at_trigger = ?2, requeue_enqueued_at = NULL
+             WHERE id = ?1 AND status = 'abandoned' AND failure_reason = 'verified_requeue'
+             AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND deleted_at IS NULL
+                 AND (status = 'in_review' OR (status = 'blocked' AND blocked_reason = 'ci_failure')))",
+            params![attempt.id, format!("mq:{head}"), attempt.work_item_id],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure', updated_at = ?2 WHERE id = ?1",
+            params![attempt.work_item_id, now],
+        )?;
+        upsert_task_blocked_signal(&tx, &attempt.work_item_id, "ci_failure", Some(&attempt.id), &now)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub(crate) fn validate_queue_ci_failure(
         &self,
         attempt_id: &str,
@@ -698,7 +739,13 @@ mod tests {
             build_number: "7".into(),
             web_url: "https://buildkite.com/flunge/flunge-ci/builds/7".into(),
             failed_job_ids: vec!["job-lint".into(), "job-fe".into()],
-            failed_job_labels: vec![":mag: checks-framework".into(), "frontend-tests".into()],
+            failed_job_details: vec![":mag: checks-framework", "frontend-tests"]
+                .into_iter()
+                .map(|label| boss_ci_log_reader::TrunkJobDetails {
+                    label: label.into(),
+                    step_key: None,
+                })
+                .collect(),
         };
         let failures = crate::ci_watch::trunk_eviction_failures_from_build(&build);
         let checks: Vec<_> = failures
@@ -875,6 +922,12 @@ mod tests {
             );
             let required: Vec<_> = commands.iter().map(|(_, command)| *command).collect();
             assert!(validate(&attempt, Some(&job_proof(name, &required))).is_ok());
+            let mut extra = required.clone();
+            extra.extend(["bazel test //pkg:target", "checkleft run"]);
+            assert!(validate(&attempt, Some(&job_proof(name, &extra))).is_ok());
+            let mut failed_extra = job_proof(name, &extra);
+            failed_extra.runs.last_mut().unwrap().exit_code = 1;
+            assert!(validate(&attempt, Some(&failed_extra)).is_err());
             assert!(validate(&attempt, Some(&job_proof(name, &[wrong]))).is_err());
             if required.len() > 1 {
                 assert!(validate(&attempt, Some(&job_proof(name, &required[1..]))).is_err());
@@ -911,11 +964,15 @@ mod tests {
         ] {
             assert!(!accepts(frontend, &[filtered]), "{filtered}");
         }
-        // `test:*` scripts and build-only jobs are evidenceable.
+        // Undeclared non-lint jobs always need tests, even when named build.
         assert!(accepts(frontend, &["npm ci && npm run test:unit"]));
         let build_only = "Trunk merge queue: ci/frontend-build";
-        assert!(accepts(build_only, &["npm ci && npm run build"]));
-        assert!(accepts(build_only, &["bazel build //tools/boss/..."]));
+        assert!(!accepts(build_only, &["npm ci && npm run build"]));
+        assert!(!accepts(build_only, &["bazel build //tools/boss/..."]));
+        let mac = "buildkite/mono/mac-app-build";
+        assert!(!accepts(mac, &["bazel build //tools/boss/app-macos/..."]));
+        assert!(!accepts(mac, &["npm run build"]));
+        assert!(accepts(mac, &["bazel test //tools/boss/app-macos/..."]));
         assert!(!accepts(build_only, &["npm ci"]));
         // Project tests and builds require separate invocations.
         assert!(!accepts(build_only, &["npm run test"]));

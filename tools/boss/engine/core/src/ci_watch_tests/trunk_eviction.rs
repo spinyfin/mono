@@ -17,7 +17,7 @@ async fn trunk_eviction_flips_in_review_to_blocked_ci_failure() {
 
     let flipped = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         Some("feature-branch"),
         "36883b5b-bbae-4841-b239-a554d73e6f30",
@@ -82,6 +82,7 @@ async fn trunk_eviction_stores_failing_checks_from_failures_slice() {
     let pub_ = Arc::new(RecordingPublisher::default());
 
     let failures = vec![RequiredCheckFailure {
+        job_key: None,
         name: "Trunk merge queue: flunge-ci".into(),
         conclusion: "failure".into(),
         target_url: "https://buildkite.com/flunge/flunge-ci/builds/2364#job-uuid".into(),
@@ -91,7 +92,7 @@ async fn trunk_eviction_stores_failing_checks_from_failures_slice() {
 
     let flipped = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         Some("feature-branch"),
         "entry-id-1",
@@ -126,7 +127,7 @@ async fn trunk_eviction_detection_idempotent_on_same_episode() {
 
     let first = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         Some("feature"),
         "entry-A",
@@ -136,7 +137,7 @@ async fn trunk_eviction_detection_idempotent_on_same_episode() {
     .await;
     let second = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         Some("feature"),
         "entry-A",
@@ -175,7 +176,7 @@ async fn trunk_eviction_new_state_changed_at_on_same_entry_id_is_a_new_episode()
 
     let first = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &cand,
         Some("feature"),
         "entry-stable",
@@ -187,7 +188,7 @@ async fn trunk_eviction_new_state_changed_at_on_same_entry_id_is_a_new_episode()
 
     let second = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &cand,
         Some("feature"),
         "entry-stable",
@@ -226,7 +227,7 @@ async fn trunk_eviction_lands_exhausted_when_budget_is_zero() {
     let pub_ = Arc::new(RecordingPublisher::default());
     let flipped = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         Some("feature"),
         "entry-exhausted",
@@ -264,7 +265,7 @@ async fn trunk_eviction_honors_manual_suppression() {
 
     let flipped = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         Some("feature"),
         "entry-suppressed",
@@ -292,7 +293,7 @@ async fn trunk_eviction_block_is_not_cleared_by_head_branch_ci() {
 
     on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &cand,
         Some("feature"),
         "entry-noclear",
@@ -354,7 +355,7 @@ async fn evicted_with_a_fix_revision(
 
     on_trunk_queue_eviction_detected(
         db,
-        pub_,
+        crate::queue_ci_contract::test_context(pub_),
         &cand,
         Some("feature"),
         &format!("entry-{slug}"),
@@ -559,7 +560,7 @@ async fn trunk_eviction_budget_exhaustion_retires_the_intent() {
 
     let flipped = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &cand,
         Some("feature"),
         "entry-exhaust",
@@ -625,7 +626,7 @@ async fn trunk_eviction_clears_merge_queue_state_when_spawning_a_fix_revision() 
 
     let flipped = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &cand,
         Some("feature"),
         "entry-clears-queue",
@@ -678,7 +679,7 @@ async fn a_trunk_episode_with_no_failing_checks_still_mints_a_revision() {
 
     let evicted = on_trunk_queue_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &cand,
         Some("feature"),
         "entry-no-evidence",
@@ -753,7 +754,7 @@ async fn head_check_eviction_mints_for_a_direct_product() {
 
     let minted = on_trunk_head_check_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         &head_check_probe(pr, OpenPrCiStatus::Clean),
     )
@@ -790,8 +791,13 @@ async fn head_check_eviction_honors_pr_labels_opt_out() {
     let mut probe = head_check_probe(pr, OpenPrCiStatus::Clean);
     probe.labels = vec!["boss/no-auto-rebase".to_owned()];
 
-    let minted =
-        on_trunk_head_check_eviction_detected(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &probe).await;
+    let minted = on_trunk_head_check_eviction_detected(
+        &db,
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
+        &candidate(&product, &chore, pr),
+        &probe,
+    )
+    .await;
     assert!(!minted);
     assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
 }
@@ -807,7 +813,7 @@ async fn head_check_eviction_skips_when_required_checks_are_in_flight() {
 
     let minted = on_trunk_head_check_eviction_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         &head_check_probe(pr, OpenPrCiStatus::InFlight),
     )

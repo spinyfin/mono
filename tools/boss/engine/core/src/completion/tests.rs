@@ -1464,6 +1464,7 @@ fn ci_probe(ci: crate::merge_poller::OpenPrCiStatus) -> PrLifecycleProbe {
 
 fn failing_check(name: &str) -> crate::merge_poller::RequiredCheckFailure {
     crate::merge_poller::RequiredCheckFailure {
+        job_key: None,
         name: name.to_owned(),
         conclusion: "FAILURE".to_owned(),
         target_url: String::new(),
