@@ -160,6 +160,47 @@ final class TrekPortraitGridTests: XCTestCase {
         XCTAssertEqual(try alphaRange(of: slice).max, 0)
     }
 
+    func testSliceDropsANeighbouringBustsOpaquePixels() throws {
+        let width = TrekPortraitGrid.imageWidth, height = TrekPortraitGrid.imageHeight
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        let context = try XCTUnwrap(CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        let cell = TrekPortraitGrid.Cell(row: 0, column: 0)
+        let rect = TrekPortraitGrid.cropRect(for: cell)
+        // Own bust: most of the crop. Neighbour sliver: a detached 5px strip at its right edge.
+        context.fill(CGRect(
+            x: rect.minX, y: CGFloat(height) - rect.maxY, width: rect.width - 20, height: rect.height
+        ))
+        context.fill(CGRect(
+            x: rect.maxX - 5, y: CGFloat(height) - rect.maxY, width: 5, height: rect.height
+        ))
+        let slice = try XCTUnwrap(
+            TrekIconAssets.slice(try XCTUnwrap(context.makeImage()), cell: cell)
+        )
+        let alphas = try alphaColumns(of: slice)
+        XCTAssertEqual(alphas.last, 0, "detached sliver is cleared")
+        XCTAssertEqual(alphas.first, 255, "own bust is kept")
+    }
+
+    private func alphaColumns(of image: CGImage) throws -> [UInt8] {
+        let width = image.width, height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        try pixels.withUnsafeMutableBytes { buffer in
+            let context = try XCTUnwrap(CGContext(
+                data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                bytesPerRow: width * 4, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ))
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        // Alpha of the middle-row pixel in each column.
+        return (0..<width).map { pixels[((height / 2) * width + $0) * 4 + 3] }
+    }
+
     func testSliceRejectsASheetOfTheWrongSize() throws {
         let sheet = try makeSheet(width: 1340 / 2, height: 1174 / 2)
         XCTAssertNil(TrekIconAssets.slice(sheet, cell: TrekPortraitGrid.Cell(row: 0, column: 0)))

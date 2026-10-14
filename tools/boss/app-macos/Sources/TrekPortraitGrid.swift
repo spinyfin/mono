@@ -86,7 +86,10 @@ enum TrekPortraitGrid {
     /// busts; the soft red-tinted fringe around them is
     /// low-alpha and falls outside it. The one place two boxes overlap
     /// (Dukat's right shoulder against Martok's pauldron) is split at
-    /// the midpoint of the overlap.
+    /// the midpoint of the overlap; `TrekIconAssets.slice` then drops
+    /// any opaque pixels outside the slice's own bust (the largest
+    /// connected component), so neither crop keeps the neighbour's
+    /// sliver.
     static func cropRect(for cell: Cell) -> CGRect {
         let rect = cropRects[cell.row][cell.column]
         return CGRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)

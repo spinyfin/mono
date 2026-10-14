@@ -108,7 +108,48 @@ enum TrekIconAssets {
                 buffer[offset + 2] = 0
                 buffer[offset + 3] = 0
             }
+            keepLargestComponent(buffer, width: width, height: height)
             return context.makeImage()
+        }
+    }
+
+    /// Clears every opaque pixel not in the slice's largest
+    /// 8-connected opaque component. Dukat's and Martok's bounding
+    /// boxes overlap, so each crop can contain a sliver of the
+    /// neighbouring bust; those slivers are separate components and
+    /// are removed here.
+    static func keepLargestComponent(
+        _ buffer: UnsafeMutableRawBufferPointer, width: Int, height: Int
+    ) {
+        var label = [Int32](repeating: 0, count: width * height)
+        var sizes: [Int] = [0]
+        var stack: [Int] = []
+        for start in 0..<(width * height)
+        where label[start] == 0 && buffer[start * 4 + 3] != 0 {
+            let id = Int32(sizes.count)
+            var size = 0
+            label[start] = id
+            stack.append(start)
+            while let index = stack.popLast() {
+                size += 1
+                let x = index % width, y = index / width
+                for ny in max(y - 1, 0)...min(y + 1, height - 1) {
+                    for nx in max(x - 1, 0)...min(x + 1, width - 1) {
+                        let neighbour = ny * width + nx
+                        if label[neighbour] == 0, buffer[neighbour * 4 + 3] != 0 {
+                            label[neighbour] = id
+                            stack.append(neighbour)
+                        }
+                    }
+                }
+            }
+            sizes.append(size)
+        }
+        guard sizes.count > 2,
+              let keep = sizes.indices.dropFirst().max(by: { sizes[$0] < sizes[$1] })
+        else { return }
+        for index in 0..<(width * height) where label[index] != 0 && label[index] != Int32(keep) {
+            for byte in 0..<4 { buffer[index * 4 + byte] = 0 }
         }
     }
 

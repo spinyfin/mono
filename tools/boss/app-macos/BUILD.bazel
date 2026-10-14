@@ -347,8 +347,6 @@ macos_application(
     deps = [":boss_mac_app_lib"],
 )
 
-# Production sources scanned by `//tools/boss/engine/core:tmux_only_surface_test`,
-# the architecture guard for the tmux-only local-pane invariant.
 # The Swift roster, the portrait grid table and the bundled sheet, scanned by
 # `//tools/boss/protocol:worker_roster_parity_test` against the Rust roster.
 filegroup(
@@ -361,6 +359,8 @@ filegroup(
     visibility = ["//tools/boss/protocol:__pkg__"],
 )
 
+# Production sources scanned by `//tools/boss/engine/core:tmux_only_surface_test`,
+# the architecture guard for the tmux-only local-pane invariant.
 filegroup(
     name = "swift_sources",
     srcs = glob(["Sources/**/*.swift"]),
