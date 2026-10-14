@@ -2485,11 +2485,11 @@ pub(super) async fn dispatch_probe_reply_on_stop(
     // Decide which claim this boundary can consume before awaiting transcript
     // reads: the replacement may be submitted while an older reply is read.
     for previous in previous_replies {
-        let replied = dispatch_one_probe_reply(server_state, run_id, &previous).await;
+        let replied = dispatch_one_probe_reply(server_state, run_id, &previous, true).await;
         server_state.finish_previous_probe_reply(run_id, &previous.probe_id, replied);
     }
     if let Some(current) = current {
-        dispatch_one_probe_reply(server_state, run_id, &current).await;
+        dispatch_one_probe_reply(server_state, run_id, &current, false).await;
     }
 }
 
@@ -2497,6 +2497,7 @@ async fn dispatch_one_probe_reply(
     server_state: &Arc<ServerState>,
     run_id: &str,
     in_flight: &super::probes::InFlightProbe,
+    leased: bool,
 ) -> bool {
     // Guard against extracting a reply for a probe id whose lifecycle
     // was never actually advanced past being queued (e.g. a stale
@@ -2560,7 +2561,13 @@ async fn dispatch_one_probe_reply(
             return false;
         }
     };
-    server_state.set_probe_lifecycle(&in_flight.probe_id, ProbeDeliveryState::Replied);
+    if leased {
+        if !server_state.commit_previous_probe_reply(run_id, &in_flight.probe_id) {
+            return false;
+        }
+    } else {
+        server_state.set_probe_lifecycle(&in_flight.probe_id, ProbeDeliveryState::Replied);
+    }
     let envelope = FrontendEventEnvelope::push(FrontendEvent::ProbeReplied {
         run_id: run_id.to_owned(),
         probe_id: in_flight.probe_id.clone(),

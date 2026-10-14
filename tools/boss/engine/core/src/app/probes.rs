@@ -1130,6 +1130,21 @@ impl ServerState {
         None
     }
 
+    /// Commit a leased reply only while its snapshot is still owned.
+    /// A confirmed interrupt may settle it while transcript I/O is pending.
+    pub(super) fn commit_previous_probe_reply(&self, run_id: &str, probe_id: &str) -> bool {
+        let claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let mut reply = claims.get(run_id);
+        while let Some(entry) = reply {
+            if entry.probe_id == probe_id && entry.reply_reading {
+                self.set_probe_lifecycle(probe_id, ProbeDeliveryState::Replied);
+                return true;
+            }
+            reply = entry.previous_reply.as_deref();
+        }
+        false
+    }
+
     /// Complete a leased read without resurrecting a reply settled by an interrupt.
     pub(super) fn finish_previous_probe_reply(&self, run_id: &str, probe_id: &str, replied: bool) {
         let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");

@@ -1383,6 +1383,7 @@ async fn interrupted_reply_read_cannot_resurrect_settled_snapshot() {
     let reading = state.take_previous_probe_reply(&run).unwrap();
     assert!(state.take_previous_probe_reply(&run).is_none());
     assert_eq!(state.settle_interrupted_probe_reply(&run, &second), vec![first.clone()]);
+    assert!(!state.commit_previous_probe_reply(&run, &reading.probe_id));
     state.finish_previous_probe_reply(&run, &reading.probe_id, false);
     assert!(state.take_previous_probe_reply(&run).is_none());
     assert_eq!(state.probe_lifecycle_state(&first), Some(ProbeDeliveryState::Orphaned));
