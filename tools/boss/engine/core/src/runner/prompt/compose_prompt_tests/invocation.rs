@@ -172,11 +172,9 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
         prompt.contains("Put the blocker reason in this call's `--summary`"),
         "worker_signal seam off: blocked outcome must preserve the reason on propose done --summary:\n{prompt}",
     );
-    assert!(
-        prompt.contains(
-            "--question \"Approve raising the 30-file limit to 48 files?\" --answer-type yes-no --explanation"
-        )
-    );
+    assert!(prompt.contains(
+        "--question \"Approve including the remaining files needed for this fix?\" --answer-type yes-no --explanation"
+    ));
     assert!(prompt.contains("Before asking, check the brief for a `## Operator authorization` section."));
     assert!(prompt.contains("### Write operator questions for someone arriving cold"));
     assert!(prompt.contains("Context:\n"));

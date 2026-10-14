@@ -116,7 +116,7 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
         XCTAssertNotEqual(
             try render(first).representation(using: .png, properties: [:]),
             try render(changedAnswer).representation(using: .png, properties: [:]),
-            "The card must display the answer meaning before the operator opens Details"
+            "The card must display the answer meaning before Details is opened"
         )
     }
 

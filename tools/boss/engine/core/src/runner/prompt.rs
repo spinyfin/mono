@@ -1132,9 +1132,9 @@ pub(crate) fn run_done_directive(
      recorded, not just the fact that you stopped.\n\n\
      When delivery requires a human decision, attach one specific Yes/No question to that blocked declaration:\n\n\
      ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Approve raising the 30-file limit to 48 files?\" --answer-type yes-no --explanation \"<Context, Yes, No, Recommendation, and optional Details; see below>\"\n\
+     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Approve including the remaining files needed for this fix?\" --answer-type yes-no --explanation \"<Context, Yes, No, Recommendation, and optional Details; see below>\"\n\
      ```\n\n\
-     Name the check or limit, the amount needed versus allowed, and what you will do on Yes. \"Can I proceed?\" is not specific enough. Put the justification in --explanation, not the question.{question_companion} One question per run: ask the most blocking decision and disclose any further decisions in the explanation. Tasks wait durably for the answer; Yes appends authorization and restarts in the preserved workspace, No leaves the task blocked in Backlog. Chores retain the question in their failure detail.\n\n\
+     Say in plain words what is blocked and what Yes will let you do; put check names and numbers in Details. \"Can I proceed?\" is not specific enough. Put the justification in --explanation, not the question.{question_companion} One question per run: ask the most blocking decision and disclose any further decisions in the explanation. Tasks wait durably for the answer; Yes appends authorization and restarts in the preserved workspace, No leaves the task blocked in Backlog. Chores retain the question in their failure detail.\n\n\
      {question_guidance}\n\n\
      **When your task cannot proceed until some other, unrelated piece of work lands first, ask to create a prerequisite task instead of a plain Yes/No.** Example: a CI-fix revision finds that a pre-existing test fixture races retention cleanup; that needs its own fix on main before the PR's CI can go green, and it is out of scope for you. Propose that work as its own task:\n\n\
      ```\n\
