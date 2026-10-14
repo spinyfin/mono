@@ -43,6 +43,17 @@ Chosen policy and considered alternatives:
 
 A push straight to the default branch that bypasses Boss (a human editing the file directly) is picked up by the next session start or the next `boss guidance show`; that is acceptable for a file whose edits are supposed to go through chores.
 
+### Last-known-good cache
+
+GitHub being unreachable (a flaky network, a hotspot, an outage) must not strip the coordinator of rules that change a few times a month. The engine therefore keeps the last successful read per product and falls back to it when a read fails. It is implemented in `settle_with_cache` (`tools/boss/engine/core/src/coordinator_guidance.rs`), on the one path both consumers share (`load_product_guidance`), so the session-start brief and `boss guidance show` always agree.
+
+- **What is stored.** On every successful read — session start or `boss guidance show` — one entry per product: `owner/repo`, the resolved commit sha, the file text (or the fact that the file was absent at that sha, the `missing` outcome), and the read time. A newer successful read replaces the entry. It lives in the engine's state DB, in the `metadata` key-value table under `coordinator_guidance_cache.<product_id>` (JSON), next to the coordinator tmux record; there is no schema migration and nothing is written to a repo. `over_cap`, `no_repo_configured` and `not_github` reads are not stored and neither replace nor clear an entry.
+- **When it is served.** Whenever a read ends `failed`: unreachable, not authorized, rate limited, repo 404, or the session-start budget overrunning. A single bounded retry of the blob read already happens inside the read (`fetch_with_retry`); the cache is what answers after it gives up. An entry is only served for the `owner/repo` it was read from, so repointing a product never serves another repo's rules.
+- **What the coordinator sees.** The `cached` state, never `loaded`. The state line starts `CACHED (NOT freshly loaded)` and names the sha, the original read time, and the fetch error that caused the fallback, and says the rules may be newer upstream and to retry with `boss guidance show --product <id>`. The cached text is still injected between the same `--- BOSS_COORDINATOR.md for <product> begins/ends ---` fences, because the cached rules still bind. A cached `missing` result falls back the same way (`CACHED … had no BOSS_COORDINATOR.md`), with no body.
+- **No cache, no change.** A failure with no entry for the product is reported exactly as before (`FETCH FAILED`, "nothing is known — do NOT treat this as no guidance").
+- **No expiry.** The entry is never discarded for age; last-known-good is better than nothing. Staleness stays visible through the read time in the label.
+- **Cache problems are not hidden.** If the entry cannot be read, the original `failed` state is returned (and the error logged); if it cannot be written, the fresh result is still returned. Neither turns a failure into "no guidance".
+
 ### What the coordinator sees
 
 **Full text, injected,** not a pointer. The point of the mechanism is that the rules bind the session without it having to decide to read them. Each product's entry carries its name and id, `owner/repo`, the sha, the byte size, and the state line, then the body between `--- BOSS_COORDINATOR.md for <product> begins/ends ---` fences.
@@ -53,16 +64,19 @@ A push straight to the default branch that bypasses Boss (a human editing the fi
 
 Each product gets exactly one entry, whatever happened. The states (`CoordinatorGuidanceState` in `tools/boss/protocol/src/types/coordinator_guidance.rs`):
 
-| State                | Meaning                                                                                                      | What the coordinator is told                                                                                   |
-| -------------------- | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| `loaded`             | File read at the sha, under the cap.                                                                         | Full text; sha; size.                                                                                          |
-| `missing`            | The sha probe succeeded (repo reachable and visible) and the file 404s at that sha.                          | This product has no guidance file; file a chore to add one when a durable lesson comes up.                     |
-| `over_cap`           | File exists at the sha but exceeds 32 KiB.                                                                   | Both sizes; text withheld; tell the operator and file a trim chore.                                            |
-| `failed`             | GitHub could not be read: unreachable, not authorized, rate limited, repo 404, or the launch budget ran out. | The classified reason; "nothing is known — do NOT treat this as no guidance"; retry with `boss guidance show`. |
-| `no_repo_configured` | The product has no `repo_remote_url`.                                                                        | Nowhere to read from.                                                                                          |
-| `not_github`         | The remote is not a github.com URL.                                                                          | Cannot be read through the engine's GitHub path; nothing is known.                                             |
+| State                | Meaning                                                                                                                                               | What the coordinator is told                                                                                                                                                                    |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `loaded`             | File read at the sha, under the cap.                                                                                                                  | Full text; sha; size.                                                                                                                                                                           |
+| `missing`            | The sha probe succeeded (repo reachable and visible) and the file 404s at that sha.                                                                   | This product has no guidance file; file a chore to add one when a durable lesson comes up.                                                                                                      |
+| `over_cap`           | File exists at the sha but exceeds 32 KiB.                                                                                                            | Both sizes; text withheld; tell the operator and file a trim chore.                                                                                                                             |
+| `failed`             | GitHub could not be read: unreachable, not authorized, rate limited, repo 404, or the launch budget ran out, **and no last-known-good entry exists**. | The classified reason; "nothing is known — do NOT treat this as no guidance"; retry with `boss guidance show`.                                                                                  |
+| `cached`             | The same GitHub failure, but an earlier successful read of this repo is stored (see "Last-known-good cache").                                         | `CACHED (NOT freshly loaded)`: the sha and read time of the stored copy, the fetch error, the stored text (if it had a file); the rules may be newer upstream, retry with `boss guidance show`. |
+| `no_repo_configured` | The product has no `repo_remote_url`.                                                                                                                 | Nowhere to read from.                                                                                                                                                                           |
+| `not_github`         | The remote is not a github.com URL.                                                                                                                   | Cannot be read through the engine's GitHub path; nothing is known.                                                                                                                              |
 
 If the product list cannot be read, the brief reports the error and requires `boss guidance show`; only a successful empty query reports no products. If the brief cannot be written, the inline fallback reports undelivered guidance and requires a re-read and each product’s state in the first reply before product-scoped work.
+
+A `cached` entry still has the `failed` outcome behind it: the first reply must report it to the operator like any other degraded state.
 
 The distinction that matters most is `missing` versus `failed`: a 404 is only read as "no file" when the sha probe has already proven the repo reachable in the same read. A 404 on the probe itself (GitHub's answer for a private repo the token cannot see) is `failed`. The brief's consumption steps require the first reply to list each product's state in one line, so a failure reaches the operator rather than being worked around.
 
@@ -74,13 +88,13 @@ boss guidance show --product boss     # one product (id, slug, or name)
 boss guidance show --json             # { "guidance": [CoordinatorGuidanceView, ...] }
 ```
 
-Human output per product: a header, the state line (`LOADED from spinyfin/mono @ <sha> (<n> bytes)`, `MISSING: …`, `OVER CAP: …`, `FETCH FAILED: …`), the read time, and the body when loaded. The state line is produced by `CoordinatorGuidanceView::describe_state`, which the session-start brief also uses, so the two surfaces never describe a state differently.
+Human output per product: a header, the state line (`LOADED from spinyfin/mono @ <sha> (<n> bytes)`, `MISSING: …`, `OVER CAP: …`, `CACHED (NOT freshly loaded) …`, `FETCH FAILED: …`), the read time, and the body when loaded or cached. The state line is produced by `CoordinatorGuidanceView::describe_state`, which the session-start brief also uses, so the two surfaces never describe a state differently.
 
 `ListCoordinatorGuidance` is coordinator-only at the worker-tier gate (`boss_worker_policy`): a cube worker calling it gets a `CoordinatorOnly` denial.
 
 ## Forensics
 
-`engine-audit.log` records `coordinator_guidance_brief` on every fresh coordinator launch: `start_reason`, `product_list_error`, `delivery` (`brief_written` or `brief_unwritable`), `write_error`, and, per product, `product_id`, `product_name`, `owner_repo`, `state`, `git_ref`, and `bytes` — never the body. Together with `coordinator_handoff_brief` (see [coordinator-session-handoff.md](coordinator-session-handoff.md)) it answers "which guidance, at which sha, was session X launched with?" without opening the database. On-demand reads log one `coordinator guidance read on demand` line per product at `info`.
+`engine-audit.log` records `coordinator_guidance_brief` on every fresh coordinator launch: `start_reason`, `product_list_error`, `delivery` (`brief_written` or `brief_unwritable`), `write_error`, and, per product, `product_id`, `product_name`, `owner_repo`, `state` (including `cached`), `git_ref`, and `bytes` — never the body. Together with `coordinator_handoff_brief` (see [coordinator-session-handoff.md](coordinator-session-handoff.md)) it answers "which guidance, at which sha, was session X launched with?" without opening the database. On-demand reads log one `coordinator guidance read on demand` line per product at `info`.
 
 ## Adding or changing a rule
 

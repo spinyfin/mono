@@ -60,6 +60,7 @@ pub(super) async fn handle_list_coordinator_guidance(ctx: Dispatch, req: Fronten
     let _permit = permit;
     let guidance = crate::coordinator_guidance::load_product_guidance(
         &design_docs,
+        &work_db,
         &products,
         crate::coordinator_guidance::ON_DEMAND_FETCH_BUDGET,
         boss_engine_utils::epoch_time::now_epoch_secs(),
