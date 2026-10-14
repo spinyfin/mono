@@ -107,7 +107,10 @@ impl WorkDb {
         let path = execution
             .workspace_path
             .context("review-guide execution has no pinned workspace")?;
-        crate::review_guide_workspace::validate(std::path::Path::new(&path), packet, raw)
+        // Every linked range spawns `git`; do not pin a runtime worker for it.
+        crate::review_guide_workspace::off_runtime_worker(|| {
+            crate::review_guide_workspace::validate(std::path::Path::new(&path), packet, raw)
+        })
     }
 
     pub(crate) fn submitted_review_guide(&self, execution_id: &str, attempt_id: &str) -> Result<Option<String>> {

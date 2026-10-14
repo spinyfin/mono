@@ -13,13 +13,18 @@ const PENDING_PER_ACTIVE: usize = 4;
 /// Exceeds the 45 s on-demand fetch budget of the slowest network-bound read.
 const ORDER_WAIT: Duration = Duration::from_secs(60);
 
-pub(super) const BUSY: &str = "engine busy, retry: read admission limit exceeded";
+const QUEUE_FULL: &str = "engine busy, retry: read admission queue full";
+const DEADLINE: &str = "engine busy, retry: read admission deadline expired";
+mod diagnostics;
+pub(super) use diagnostics::Identity;
+use diagnostics::{Diagnostics, TrackedRead, Wait};
 
 pub(super) struct ReadAdmission {
     active: Arc<Semaphore>,
     pending: Arc<Semaphore>,
     per_connection: usize,
     wait: Duration,
+    diagnostics: Arc<Diagnostics>,
 }
 
 pub(super) struct ConnectionReads {
@@ -30,9 +35,9 @@ pub(super) struct ConnectionReads {
 pub(super) struct WaitingRead {
     engine: Arc<ReadAdmission>,
     connection: Arc<ConnectionReads>,
-    _engine_pending: OwnedSemaphorePermit,
-    _connection_pending: OwnedSemaphorePermit,
+    _pending: (OwnedSemaphorePermit, OwnedSemaphorePermit),
     deadline: tokio::time::Instant,
+    tracked: Option<TrackedRead>,
 }
 
 // Deliberately very high, pending measurement of normal traffic: the
@@ -92,6 +97,7 @@ impl ReadAdmission {
             pending: Arc::new(Semaphore::new(queue)),
             per_connection,
             wait,
+            diagnostics: Arc::default(),
         }
     }
 
@@ -108,21 +114,44 @@ impl ReadAdmission {
 
     /// Bound task allocation as well as active handlers. Full queues reject
     /// immediately; accepted waiters share one deadline across both limits.
+    #[cfg(test)]
     pub(super) fn enqueue(self: &Arc<Self>, connection: &Arc<ConnectionReads>) -> Result<WaitingRead, &'static str> {
-        let local = connection.pending.clone().try_acquire_owned().map_err(|_| BUSY)?;
-        let global = self.pending.clone().try_acquire_owned().map_err(|_| BUSY)?;
+        self.enqueue_as(connection, None)
+    }
+
+    /// Like [`Self::enqueue`], naming the request so a queue-full dump can
+    /// identify the rejected read, which is not yet tracked.
+    pub(super) fn enqueue_as(
+        self: &Arc<Self>,
+        connection: &Arc<ConnectionReads>,
+        identity: Option<Identity<'_>>,
+    ) -> Result<WaitingRead, &'static str> {
+        let full = |wait: Wait| {
+            self.diagnostics
+                .report(QUEUE_FULL, wait, None, identity, Arc::as_ptr(connection) as usize);
+            QUEUE_FULL
+        };
+        let local = connection
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| full(Wait::ConnectionQueue))?;
+        let global = self
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| full(Wait::EngineQueue))?;
         Ok(WaitingRead {
             engine: self.clone(),
             connection: connection.clone(),
-            _engine_pending: global,
-            _connection_pending: local,
+            _pending: (global, local),
             deadline: tokio::time::Instant::now() + self.wait,
+            tracked: None,
         })
     }
 }
 
-/// Why an accepted read was rejected while waiting. Both reach the client as
-/// the same busy reply; the distinction only selects which warning is logged.
+/// Why an accepted read was rejected while waiting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Rejection {
     /// Expired behind an earlier identical read (fixed `ORDER_WAIT`).
@@ -133,7 +162,10 @@ pub(super) enum Rejection {
 
 impl Rejection {
     pub(super) fn message(self) -> &'static str {
-        BUSY
+        match self {
+            Self::OrderingWait => "engine busy, retry: read ordering deadline expired behind an earlier read",
+            Self::AdmissionWait => DEADLINE,
+        }
     }
 }
 
@@ -141,32 +173,80 @@ impl WaitingRead {
     pub(super) async fn acquire_ordered(
         mut self,
         order: ordering::Turn,
-    ) -> Result<
-        (
-            (OwnedSemaphorePermit, OwnedSemaphorePermit),
-            tokio::sync::OwnedMutexGuard<()>,
-        ),
-        Rejection,
-    > {
+    ) -> Result<(ReadPermits, tokio::sync::OwnedMutexGuard<()>), Rejection> {
         // Waiting behind an identical in-flight read is not admission
         // pressure, so it has its own deadline; the admission deadline starts
         // once this read's turn comes up.
-        let turn = tokio::time::timeout(ORDER_WAIT, order)
-            .await
-            .map_err(|_| Rejection::OrderingWait)?;
+        let turn = tokio::time::timeout(ORDER_WAIT, order).await.map_err(|_| {
+            self.engine.diagnostics.report(
+                Rejection::OrderingWait.message(),
+                Wait::Ordering,
+                self.tracked.as_ref(),
+                None,
+                self.connection_id(),
+            );
+            Rejection::OrderingWait
+        })?;
         self.deadline = tokio::time::Instant::now() + self.engine.wait;
         let permits = self.acquire().await.map_err(|_| Rejection::AdmissionWait)?;
         Ok((permits, turn))
     }
 
-    pub(super) async fn acquire(self) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), &'static str> {
-        tokio::time::timeout_at(self.deadline, async {
-            let local = self.connection.active.clone().acquire_owned().await.map_err(|_| BUSY)?;
-            let global = self.engine.active.clone().acquire_owned().await.map_err(|_| BUSY)?;
+    /// `key` is `ReadOrdering::key_id` of the request.
+    pub(super) fn identify(mut self, session: &str, request: &str, verb: String, key: u64) -> Self {
+        self.tracked = Some(
+            self.engine
+                .diagnostics
+                .track(session, request, verb, key, self.connection_id()),
+        );
+        self
+    }
+
+    fn connection_id(&self) -> usize {
+        Arc::as_ptr(&self.connection) as usize
+    }
+
+    pub(super) async fn acquire(self) -> Result<ReadPermits, &'static str> {
+        let result = tokio::time::timeout_at(self.deadline, async {
+            if let Some(read) = &self.tracked {
+                read.stage("connection permit");
+            }
+            let local = self
+                .connection
+                .active
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| DEADLINE)?;
+            if let Some(read) = &self.tracked {
+                read.stage("engine permit");
+            }
+            let global = self.engine.active.clone().acquire_owned().await.map_err(|_| DEADLINE)?;
             Ok((local, global))
         })
         .await
-        .map_err(|_| BUSY)?
+        .unwrap_or(Err(DEADLINE));
+        match result {
+            Ok(permits) => {
+                if let Some(read) = &self.tracked {
+                    read.stage("blocking queue");
+                }
+                Ok(ReadPermits {
+                    _permits: permits,
+                    tracked: self.tracked,
+                })
+            }
+            Err(message) => {
+                self.engine.diagnostics.report(
+                    message,
+                    Wait::Permit,
+                    self.tracked.as_ref(),
+                    None,
+                    self.connection_id(),
+                );
+                Err(message)
+            }
+        }
     }
 }
 
@@ -179,4 +259,20 @@ pub(super) use ordering::ReadOrdering;
 #[cfg(test)]
 mod burst_tests;
 #[cfg(test)]
+mod contention_tests;
+#[cfg(test)]
 mod tests;
+
+#[derive(Debug)]
+pub(super) struct ReadPermits {
+    _permits: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    tracked: Option<TrackedRead>,
+}
+
+impl ReadPermits {
+    pub(super) fn started(&self) {
+        if let Some(read) = &self.tracked {
+            read.stage("handler");
+        }
+    }
+}

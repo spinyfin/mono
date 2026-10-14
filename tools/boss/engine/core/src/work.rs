@@ -564,7 +564,7 @@ struct InMemoryAnchor {
 /// `conn.prepare`, `conn.transaction()` on a `mut` binding, …) are unaffected
 /// by the switch from "fresh connection per call" to "one shared, cached
 /// connection guarded by a mutex."
-pub(crate) type PooledConnection<'a> = std::sync::MutexGuard<'a, Connection>;
+pub(crate) type PooledConnection<'a> = connection_wait::ConnectionGuard<'a>;
 
 #[derive(bon::Builder)]
 #[builder(on(String, into), builder_type(vis = "pub(self)"), start_fn(vis = "pub(self)"))]
@@ -663,6 +663,7 @@ mod queued_wait;
 #[cfg(test)]
 mod read_only_tests;
 pub(crate) use feedback_target::FeedbackTarget;
+mod connection_wait;
 mod description_guard;
 mod guide_comments;
 mod guide_feedback;

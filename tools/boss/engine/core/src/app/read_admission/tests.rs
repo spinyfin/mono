@@ -13,14 +13,14 @@ async fn limits_queue_deadline_and_release_are_bounded() {
     // One connection cannot consume the second global slot, even while
     // that slot is free. A different connection can still use it.
     let start = std::time::Instant::now();
-    assert_eq!(gate.enqueue(&a).unwrap().acquire().await.unwrap_err(), BUSY);
+    assert_eq!(gate.enqueue(&a).unwrap().acquire().await.unwrap_err(), DEADLINE);
     assert!(start.elapsed() < Duration::from_secs(1));
     let second = gate.enqueue(&b).unwrap().acquire().await.unwrap();
     drop(first);
     drop(second);
     assert!(gate.enqueue(&a).unwrap().acquire().await.is_ok());
     let queued: Vec<_> = (0..4).map(|_| gate.enqueue(&a).unwrap()).collect();
-    assert!(matches!(gate.enqueue(&a), Err(BUSY)));
+    assert!(matches!(gate.enqueue(&a), Err(QUEUE_FULL)));
     drop(queued);
     assert!(gate.enqueue(&a).is_ok());
 }
@@ -31,9 +31,9 @@ async fn global_queue_and_concurrency_apply_across_connections() {
     let active = gate.enqueue(&gate.connection()).unwrap().acquire().await.unwrap();
     let first = gate.enqueue(&gate.connection()).unwrap();
     let second = gate.enqueue(&gate.connection()).unwrap();
-    assert!(matches!(gate.enqueue(&gate.connection()), Err(BUSY)));
-    assert_eq!(first.acquire().await.unwrap_err(), BUSY);
-    assert_eq!(second.acquire().await.unwrap_err(), BUSY);
+    assert!(matches!(gate.enqueue(&gate.connection()), Err(QUEUE_FULL)));
+    assert_eq!(first.acquire().await.unwrap_err(), DEADLINE);
+    assert_eq!(second.acquire().await.unwrap_err(), DEADLINE);
     drop(active);
     assert!(gate.enqueue(&gate.connection()).unwrap().acquire().await.is_ok());
 }

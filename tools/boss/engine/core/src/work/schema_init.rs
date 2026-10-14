@@ -211,10 +211,9 @@ impl WorkDb {
     /// holds a `connect()` guard must drop it (e.g. scope it in a block)
     /// before calling anything that connects again, or it deadlocks against
     /// itself.
+    #[track_caller]
     pub(crate) fn connect(&self) -> Result<PooledConnection<'_>> {
-        self.conn
-            .lock()
-            .map_err(|_| anyhow::anyhow!("work db connection lock poisoned"))
+        super::connection_wait::acquire(&self.conn)
     }
 
     /// Escape hatch: open a brand-new connection to this database instead of
