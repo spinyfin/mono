@@ -1858,12 +1858,39 @@ mod t06;
 mod t07;
 mod t08;
 mod t09;
+/// [`MergeProbe`] reporting an open PR with a fixed mergeability and
+/// the raw GitHub strings the probe text quotes back at the worker.
+struct FixedMergeabilityProbe {
+    mergeability: crate::merge_poller::OpenPrMergeability,
+}
+
+#[async_trait]
+impl MergeProbe for FixedMergeabilityProbe {
+    async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+        use crate::merge_poller::{OpenPrMergeability, OpenPrStatus};
+        let (status, raw_mergeable, raw_state) = match self.mergeability {
+            OpenPrMergeability::Conflict => (OpenPrStatus::conflict_only(), "CONFLICTING", "DIRTY"),
+            OpenPrMergeability::Unknown => (OpenPrStatus::unknown_mergeability(), "UNKNOWN", "UNKNOWN"),
+            OpenPrMergeability::Clean => (OpenPrStatus::clean(), "MERGEABLE", "CLEAN"),
+        };
+        Ok(PrLifecycleProbe::builder()
+            .url(url.to_owned())
+            .state(PrLifecycleState::Open(status))
+            .labels(Vec::new())
+            .review(crate::merge_poller::PrReviewState::Unknown)
+            .raw_mergeable(raw_mergeable)
+            .raw_merge_state_status(raw_state)
+            .build())
+    }
+}
+
 mod t10;
 mod t11;
 mod t12;
 mod t13;
 mod t14;
 mod t15;
+mod t16;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

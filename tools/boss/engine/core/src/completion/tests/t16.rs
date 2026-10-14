@@ -167,6 +167,13 @@ async fn overlapping_stops_for_one_execution_are_serialized() {
     while gated.entered.load(Ordering::SeqCst) == 0 {
         tokio::task::yield_now().await;
     }
+    let weak_lock = handler
+        .stop_locks
+        .lock()
+        .unwrap()
+        .get(&execution_id)
+        .cloned()
+        .expect("first Stop registered a lock entry");
     let second = tokio::spawn({
         let handler = handler.clone();
         let id = execution_id.clone();
@@ -201,7 +208,11 @@ async fn overlapping_stops_for_one_execution_are_serialized() {
             .count(),
         1
     );
-    let mut locks = handler.stop_locks.lock().unwrap();
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    assert!(locks.is_empty(), "stop lock entry must be dropped: {locks:?}");
+    assert!(weak_lock.upgrade().is_none(), "stop lock must be released");
+    // The next Stop (any execution) sweeps the expired entry.
+    let _ = handler.on_stop("unrelated-execution").await;
+    assert!(
+        !handler.stop_locks.lock().unwrap().contains_key(&execution_id),
+        "expired stop lock entry must be swept by the next Stop"
+    );
 }

@@ -817,7 +817,9 @@ impl WorkerCompletionHandler {
     /// durable stamp `apply_run_done` writes unconditionally — so this does
     /// not depend on the `run_done_proposals_seam` flag, which only governs
     /// whether the early Stop-boundary branch accepts the declaration for
-    /// every execution kind (revisions take their own gated path). The worker's prose is never consulted: a run that stops
+    /// every execution kind (revisions take their own gated path).
+    ///
+    /// The worker's prose is never consulted: a run that stops
     /// without declaring is "gave up / not done" and falls through to the
     /// normal produce-a-PR nudge (and, if the worker cannot reach the
     /// engine at all, to the nudge breaker's visible failure — never to a
