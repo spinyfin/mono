@@ -19,6 +19,10 @@ enum BossRevealCapture {
 
     static func start(updateModel: UpdateModel) {
         guard let state, let path = BossCaptureArgs.shared.captureTo else { return }
+        if state == "operator-question" {
+            BossOperatorQuestionCapture.start(path: path)
+            return
+        }
         let model = ChatViewModel(paths: BossEnginePaths.production())
         let now = ISO8601DateFormatter().string(from: Date())
         let product = WorkProduct(

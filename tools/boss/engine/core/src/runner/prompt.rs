@@ -16,6 +16,7 @@ use super::work_item::{project_details, work_item_details, work_item_name, work_
 mod block_boundary;
 mod ci_monitoring;
 mod design;
+mod operator_question;
 use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
@@ -1104,6 +1105,7 @@ pub(crate) fn run_done_directive(
          credentials or authorization, genuine instruction conflicts or contradictory briefs."
             .to_string()
     };
+    let question_guidance = operator_question::GUIDANCE;
     format!(
         "\n## Declaring your run finished\n\n\
      When your run is over, say so — as the ABSOLUTE LAST thing you do:\n\n\
@@ -1130,12 +1132,13 @@ pub(crate) fn run_done_directive(
      recorded, not just the fact that you stopped.\n\n\
      When delivery requires a human decision, attach one specific Yes/No question to that blocked declaration:\n\n\
      ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Approve raising the 30-file limit to 48 files?\" --answer-type yes-no --explanation \"<why this is needed and what Yes authorizes>\"\n\
+     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Approve raising the 30-file limit to 48 files?\" --answer-type yes-no --explanation \"<Context, Yes, No, Recommendation, and optional Details; see below>\"\n\
      ```\n\n\
      Name the check or limit, the amount needed versus allowed, and what you will do on Yes. \"Can I proceed?\" is not specific enough. Put the justification in --explanation, not the question.{question_companion} One question per run: ask the most blocking decision and disclose any further decisions in the explanation. Tasks wait durably for the answer; Yes appends authorization and restarts in the preserved workspace, No leaves the task blocked in Backlog. Chores retain the question in their failure detail.\n\n\
+     {question_guidance}\n\n\
      **When your task cannot proceed until some other, unrelated piece of work lands first, ask to create a prerequisite task instead of a plain Yes/No.** Example: a CI-fix revision finds that a pre-existing test fixture races retention cleanup; that needs its own fix on main before the PR's CI can go green, and it is out of scope for you. Propose that work as its own task:\n\n\
      ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained brief>\" --explanation \"<one line: why this task cannot unblock without it>\"\n\
+     {boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained brief>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details; see above>\"\n\
      ```\n\n\
      The brief must stand alone: the prerequisite becomes a separate chore that a different worker picks up cold, seeing only that brief. Name the files, the failure and its evidence, and what done looks like; never refer to \"this task\", \"above\", or your own session. Do not pass `--question` — the engine words it for the operator (\"Create prerequisite task '<name>'? This task will wait for it.\"). The operator still answers Yes or No. Yes creates the chore in this product (or, if an equivalent open task already exists, links to it instead), makes your task depend on it, appends a dated note to your brief, and redispatches your task once the prerequisite is done; No leaves the task blocked in Backlog like any declined question. Use this only for work that blocks your task: `{boss} propose followup-task` remains the non-blocking path for nice-to-have work later. The one-question-per-run rule applies here too.\n\n\
      Before asking, check the brief for a `## Operator authorization` section. If it already grants the authorization needed, proceed and cite it in the PR body. Do not ask for decisions you are allowed to make, or use questions to hand back work that is merely hard. The answer authorizes exactly the question; it does not disable or bypass repository checks.\n\n\

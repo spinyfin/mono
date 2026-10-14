@@ -40,19 +40,23 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
     var body: some View {
         let question = slice.presentation
         VStack(alignment: .leading, spacing: 6) {
-            // Three lines inline; the whole text is in the tooltip and the
-            // "Why?" popover. Validation caps a question at 500 characters
-            // so the inline rendering is the common case.
-            Text(question.text)
-                .font(.callout.weight(.medium))
-                .foregroundStyle(.primary)
-                .multilineTextAlignment(.leading)
-                .lineLimit(OperatorQuestionPresentation.inlineLineLimit)
-                .truncationMode(.tail)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(question.text)
-                .accessibilityIdentifier("operator-question-text")
+            if let explanation = OperatorQuestionExplanation(question.explanation) {
+                OperatorQuestionDecisionContent(question: question.text, explanation: explanation)
+            } else {
+                // Three lines inline; the whole text is in the tooltip and the
+                // "Why?" popover. Validation caps a question at 500 characters
+                // so the inline rendering is the common case.
+                Text(question.text)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(OperatorQuestionPresentation.inlineLineLimit)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help(question.text)
+                    .accessibilityIdentifier("operator-question-text")
+            }
 
             HStack(spacing: 8) {
                 Button("Why?") { showingDetail.toggle() }
@@ -84,24 +88,40 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
     }
 }
 
-/// "Why?" popover: the whole question, the proposed task (for a prerequisite
-/// question), why the worker asked, the run summary, and when — scrollable and
-/// never truncated.
+/// Plain context and answer meanings precede all technical evidence. Legacy
+/// explanations remain readable in full; details are expandable, never truncated.
 struct OperatorQuestionDetailPopover: View {
     let question: OperatorQuestionPresentation
+    @State private var showingTechnicalDetails = false
+
+    init(question: OperatorQuestionPresentation, detailsExpanded: Bool = false) {
+        self.question = question
+        _showingTechnicalDetails = State(initialValue: detailsExpanded)
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                section("Question", question.text)
-                if let proposed = question.prerequisiteTask {
-                    section("Proposed task", proposed.name)
-                    section("Proposed brief", proposed.brief)
+                if let explanation = OperatorQuestionExplanation(question.explanation) {
+                    OperatorQuestionDecisionContent(question: question.text, explanation: explanation)
+                } else {
+                    section("Question", question.text)
+                    if !question.explanation.isEmpty {
+                        section("Why the worker is asking", question.explanation)
+                    }
                 }
-                if !question.explanation.isEmpty {
-                    section("Why the worker is asking", question.explanation)
+                DisclosureGroup("Details", isExpanded: $showingTechnicalDetails) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if let details = OperatorQuestionExplanation(question.explanation)?.details {
+                            section("Technical details", details)
+                        }
+                        if let proposed = question.prerequisiteTask {
+                            section("Proposed task", proposed.name)
+                            section("Proposed brief", proposed.brief)
+                        }
+                        section("Run summary", question.runSummary ?? "No run summary recorded.")
+                    }
                 }
-                section("Run summary", question.runSummary ?? "No run summary recorded.")
                 if let asked = Self.askedLabel(question.askedAt) {
                     section("Asked", asked)
                 }
@@ -110,7 +130,7 @@ struct OperatorQuestionDetailPopover: View {
             .padding(12)
         }
         .frame(width: 340)
-        .frame(maxHeight: 360)
+        .frame(maxHeight: 520)
     }
 
     static func askedLabel(_ raw: String) -> String? {

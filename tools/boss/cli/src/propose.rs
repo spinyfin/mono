@@ -376,7 +376,8 @@ pub(crate) struct RunDoneArgs {
     #[arg(long)]
     summary: String,
 
-    /// One specific Yes/No decision preventing delivery. Required with
+    /// One specific Yes/No decision in everyday words, without internal symbols,
+    /// types, file names, API names, or review jargon. Required with
     /// `--answer-type yes-no`; not accepted with `create-prerequisite-task`,
     /// whose question the engine words from `--prerequisite-name`.
     #[arg(long, requires_all = ["answer_type", "explanation"], required_if_eq("answer_type", "yes-no"))]
@@ -385,12 +386,17 @@ pub(crate) struct RunDoneArgs {
     /// `yes-no` for a plain approval. `create-prerequisite-task` when this
     /// task cannot proceed until some other, unrelated piece of work lands
     /// first: also pass `--prerequisite-name` and `--prerequisite-brief`, and
-    /// make `--explanation` the one line saying why this task cannot unblock
-    /// without it.
+    /// explain the dependency and both answers in `--explanation`.
     #[arg(long, value_parser = ["yes-no", "create-prerequisite-task"], requires = "explanation")]
     answer_type: Option<String>,
 
-    /// Why the decision is needed and what Yes authorizes.
+    /// Self-contained decision explanation with these labels on their own lines,
+    /// in order: Context:, Yes:, No:, Recommendation:, and optional Details:.
+    /// Context opens with 1–2 plain-language sentences about the work and blocker.
+    /// Yes/No state the user-visible result and rough work size; No leaves work
+    /// blocked, rather than starting an alternative automatically. Recommend an
+    /// answer with a one-line reason. Keep symbols, types, file/API names and
+    /// links in Details only; preserve all technical evidence there.
     #[arg(long, requires = "answer_type")]
     explanation: Option<String>,
 

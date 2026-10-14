@@ -178,6 +178,16 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
         )
     );
     assert!(prompt.contains("Before asking, check the brief for a `## Operator authorization` section."));
+    assert!(prompt.contains("### Write operator questions for someone arriving cold"));
+    assert!(prompt.contains("Context:\n"));
+    assert!(prompt.contains("Yes:\n"));
+    assert!(prompt.contains("No:\n"));
+    assert!(prompt.contains("Recommendation:\n"));
+    assert!(prompt.contains("Details:\n"));
+    assert!(prompt.contains("Worked example — bad"));
+    assert!(prompt.contains("Worked example — plain rewrite"));
+    assert!(prompt.contains("Only resend actions that definitely never left the app?"));
+    assert!(prompt.contains("This writing contract does not change when a question is warranted"));
     assert!(prompt.contains("Use the typed question flags on a blocked declaration"));
     assert!(prompt.contains("Yes appends authorization and restarts in the preserved workspace"));
     assert!(prompt.contains("No leaves the task blocked in Backlog"));
