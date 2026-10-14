@@ -240,7 +240,7 @@ checks:
             version: "3.9.0"
 ```
 
-- When `npx` is not on `PATH`, the check falls back to a `prettier` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.prettier.bazel: "<label>"`, or at an explicit path with `needs.prettier.path: "<path>"` — no change to the bundled definition required.
+- checkleft provisions Node **24.8.0** in its cache and verifies its SHA-256 before running the pinned npm package. No host Node/npx or PATH fallback is used; provisioning failures are errors. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.prettier.bazel: "<label>"`, or at an explicit path with `needs.prettier.path: "<path>"` — no change to the bundled definition required.
 
 Notes:
 
@@ -279,7 +279,7 @@ checks:
             version: "2.6.0"
 ```
 
-- When `npx` is not on `PATH`, the check falls back to a `biome` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.biome.bazel: "<label>"`, or at an explicit path with `needs.biome.path: "<path>"` — no change to the bundled definition required.
+- checkleft provisions Node **24.8.0** in its cache and verifies its SHA-256 before running the pinned npm package. No host Node/npx or PATH fallback is used; provisioning failures are errors. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.biome.bazel: "<label>"`, or at an explicit path with `needs.biome.path: "<path>"` — no change to the bundled definition required.
 
 Notes:
 
@@ -320,7 +320,7 @@ checks:
             version: "0.56.0"
 ```
 
-- When `npx` is not on `PATH`, the check falls back to an `oxfmt` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.oxfmt.bazel: "<label>"`, or at an explicit path with `needs.oxfmt.path: "<path>"` — no change to the bundled definition required.
+- checkleft provisions Node **24.8.0** in its cache and verifies its SHA-256 before running the pinned npm package. No host Node/npx or PATH fallback is used; provisioning failures are errors. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.oxfmt.bazel: "<label>"`, or at an explicit path with `needs.oxfmt.path: "<path>"` — no change to the bundled definition required.
 
 Notes:
 
@@ -370,7 +370,7 @@ checks:
             version: "10.6.0"
 ```
 
-- When `npx` is not on `PATH`, the check falls back to an `eslint` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.eslint.bazel: "<label>"`, or at an explicit path with `needs.eslint.path: "<path>"` — no change to the bundled definition required.
+- checkleft provisions Node **24.8.0** in its cache and verifies its SHA-256 before running the pinned npm package. No host Node/npx or PATH fallback is used; provisioning failures are errors. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.eslint.bazel: "<label>"`, or at an explicit path with `needs.eslint.path: "<path>"` — no change to the bundled definition required.
 
 Notes:
 
@@ -426,7 +426,7 @@ checks:
             version: "2.6.0"
 ```
 
-- When `npx` is not on `PATH`, the check falls back to a `biome` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.biome.bazel: "<label>"`, or at an explicit path with `needs.biome.path: "<path>"` — no change to the bundled definition required.
+- checkleft provisions Node **24.8.0** in its cache and verifies its SHA-256 before running the pinned npm package. No host Node/npx or PATH fallback is used; provisioning failures are errors. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.biome.bazel: "<label>"`, or at an explicit path with `needs.biome.path: "<path>"` — no change to the bundled definition required.
 
 Notes:
 
@@ -467,7 +467,7 @@ checks:
             version: "1.71.0"
 ```
 
-- When `npx` is not on `PATH`, the check falls back to an `oxlint` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.oxlint.bazel: "<label>"`, or at an explicit path with `needs.oxlint.path: "<path>"` — no change to the bundled definition required.
+- checkleft provisions Node **24.8.0** in its cache and verifies its SHA-256 before running the pinned npm package. No host Node/npx or PATH fallback is used; provisioning failures are errors. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.oxlint.bazel: "<label>"`, or at an explicit path with `needs.oxlint.path: "<path>"` — no change to the bundled definition required.
 
 Notes:
 

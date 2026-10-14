@@ -219,7 +219,10 @@ A private scratch repo, [`brianduff/checkleft-sandbox`](https://github.com/brian
 npm bindings use Node **24.8.0**, downloaded from nodejs.org and checked against
 embedded SHA-256 digests before extraction. The platform-specific distribution
 is published atomically in checkleft's platform cache directory. macOS and Linux
-on x86-64 and ARM64 are supported; other platforms fail closed. No host Node or
+on x86-64 and ARM64 are supported. Linux requires glibc **2.28 or newer** and
+`getconf` for detection; musl/Alpine and older glibc hosts are unsupported, even
+when using the musl checkleft binary. Use a supported glibc host for npm checks.
+Other platforms fail closed. No host Node or
 npx is consulted. Cache misses require network access. Package versions remain
 pinned by each check's npm binding.
 

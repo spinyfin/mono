@@ -117,12 +117,14 @@ binaries, runs declared invocations, and applies declared transforms. Required:
    - `npm: { package: "<pkg>", version: "<x.y.z>" }` — a **version-pinned npm
      package**, resolved to `npx --yes <package>@<version>`. The pinned version is
      part of the package spec, so npx runs exactly that release regardless of any
-     globally-installed copy (requires `npx`/Node on `PATH`). This is how a check
+     globally-installed copy. checkleft provisions Node **24.8.0** in its cache and
+     verifies its SHA-256; no host Node or npx is required. This is how a check
      pins a tool version without standing up a parallel Bazel JS toolchain.
 
    A `fallback` is only meaningful when the `default` is `bazel` or `npm` (a `path`
    default always resolves). When the primary binding fails to resolve, the
-   framework uses the fallback and warns loudly on stderr. A CHECKS-config override
+   framework can use a `bazel` or `npm` fallback and warns on stderr. A
+   `fallback.path` binding is rejected rather than using an unpinned host tool. A CHECKS-config override
    at `needs.<name>.{bazel|path|npm}` substitutes a binding per repo; an `npm`
    override may set only the field it wants to change (e.g. just `version`) and
    inherits the rest from the default `npm` binding, so re-pinning a version is a
@@ -159,6 +161,35 @@ Not allowed in `declarative` mode:
 ### Component checks must not re-implement file scoping in guest config
 
 The manifest-level rule above (`include` disallowed in `component` mode, required in `declarative` mode) governs the package manifest. A separate, complementary rule governs the guest's own Rust source: a component check's config struct — the type deserialized via `CheckInput::config::<T>()` — must not declare a top-level field that answers "is this file a target of this check at all" either. That is the framework's decision (the check-entry `include` / `exclude` keys in the consuming repo's `CHECKS.yaml`), made before the host ever lowers a changeset into the guest — see [Configuring checks](checks-config.md#checks-must-not-answer-is-this-file-in-scope-themselves) for the full rule, the denylist, and the sanctioned nested finer-axis shape. The built-in `checkleft/no-check-level-file-scoping` check enforces this against every checkleft check's own source (built-in and component alike), scoped to `tools/checkleft/checks/**/src/lib.rs` and `tools/checkleft/src/checks/**/*.rs`.
+
+## Check Subprocess Environment
+
+Check commands, fixes, version probes and provisioning subprocesses use an
+allowlisted environment. PATH contains resolved tool directories followed by
+`/usr/bin:/bin:/usr/sbin:/sbin`; HOME and XDG_CONFIG_HOME point to an empty
+temporary directory. LANG and LC_ALL are `C`, and TZ is `UTC`.
+Inherited variables are RUNFILES_DIR, RUNFILES_MANIFEST_FILE, TEST_SRCDIR,
+TMPDIR, SYSTEMROOT, HTTP_PROXY, HTTPS_PROXY, NO_PROXY, ALL_PROXY (proxy names
+also in lower case), SSL_CERT_FILE, SSL_CERT_DIR and NODE_EXTRA_CA_CERTS.
+RUSTUP_TOOLCHAIN, NODE_OPTIONS and ambient npm settings are not inherited.
+npm uses checkleft's persistent cache and empty user/global configuration.
+Bazel and Bazelisk preserve the caller's environment to preserve build cache keys.
+
+Declare additional string values explicitly in a check's `config.environment`:
+
+```yaml
+checks:
+  - id: format/prettier
+    config:
+      environment:
+        NODE_EXTRA_CA_CERTS: "/etc/company/ca.pem"
+```
+
+This escape hatch can also set HOME when user configuration is intentional.
+PATH is framework-owned and cannot be overridden. Linux npm checks require glibc
+2.28 or newer and `getconf`; musl/Alpine hosts are unsupported.
+See the [README environment policy](https://github.com/spinyfin/mono/blob/main/tools/checkleft/README.md#check-subprocess-environment)
+for the full policy and Bazel version-pin handling.
 
 ## Host API Contract Surface (Names Frozen)
 

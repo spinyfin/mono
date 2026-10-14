@@ -41,8 +41,8 @@ use crate::external::timeout::{CheckDeadline, SubprocessTimeout, output_with_tim
 /// prefix args, so the version pin precedes the check's own arguments.
 ///
 /// `display_invocation` is the human-readable form used in remediation templates
-/// via `{{needs.<name>.invocation}}`. For `npm` this is `"npx --yes <pkg>@<ver>"`
-/// (not the full npx path); for `path`/`bazel` it is the program string itself.
+/// via `{{needs.<name>.invocation}}`. npm commands include the pinned runtime
+/// PATH and absolute npx path; path/bazel bindings use the program string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedBinary {
     pub program: PathBuf,
@@ -229,15 +229,21 @@ fn resolve_npm_binding(
             anyhow::anyhow!("pinned npx unavailable; cannot provision npm package `{package}@{version}`")
         })?,
     };
+    // Raw remediation must run with the same pinned Node as the check.
+    let quote = crate::install::shell_single_quote;
+    let path = crate::external::environment::check_path(&npx, std::iter::empty())?;
+    let display_invocation = format!(
+        "env PATH={} {} --yes {}",
+        quote(&path.to_string_lossy()),
+        quote(&npx.to_string_lossy()),
+        quote(&format!("{package}@{version}")),
+    );
     Ok(ResolvedBinary {
         program: npx,
         // `--yes` auto-confirms fetching the pinned package non-interactively (CI);
         // the `<package>@<version>` spec forces the exact release.
         prefix_args: vec!["--yes".to_owned(), format!("{package}@{version}")],
-        // Use a short "npx" name rather than the resolved absolute path so that
-        // remediation strings like `npx --yes prettier@3.8.4 --write <file>` are
-        // readable regardless of where npx is installed on the host.
-        display_invocation: format!("npx --yes {package}@{version}"),
+        display_invocation,
     })
 }
 

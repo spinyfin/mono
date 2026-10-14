@@ -137,7 +137,7 @@ fn npm_default_resolves_to_npx_with_pinned_version_spec() {
     assert_eq!(
         prettier.prefix_args,
         vec!["--yes".to_owned(), "prettier@3.8.4".to_owned()],
-        "default pin must produce `npx --yes prettier@3.8.4`"
+        "default pin must resolve through the pinned runtime npx for prettier@3.8.4"
     );
 }
 
@@ -458,8 +458,7 @@ fn prettier_exit_two_with_no_output_causes_check_error() {
 
 #[test]
 fn npm_default_resolved_binary_has_correct_display_invocation() {
-    // ResolvedBinary.display_invocation must use "npx --yes <pkg>@<ver>", not the
-    // full npx path, so remediation strings are human-readable on any host.
+    // Remediation pins both the executable path and the Node runtime on PATH.
     let package = parse_prettier_package();
     let config = toml::Value::Table(Default::default());
     let resolved = super::resolve::resolve_all_with_npx(
@@ -470,8 +469,9 @@ fn npm_default_resolved_binary_has_correct_display_invocation() {
     )
     .expect("resolve");
     assert_eq!(
-        resolved["prettier"].display_invocation, "npx --yes prettier@3.8.4",
-        "default npm binding must produce display_invocation `npx --yes prettier@3.8.4`"
+        resolved["prettier"].display_invocation,
+        "env PATH='/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin' '/usr/bin/npx' --yes 'prettier@3.8.4'",
+        "default npm binding must produce a pinned-runtime display_invocation for prettier@3.8.4"
     );
 }
 
@@ -490,8 +490,9 @@ fn npm_version_override_updates_display_invocation() {
     )
     .expect("resolve");
     assert_eq!(
-        resolved["prettier"].display_invocation, "npx --yes prettier@3.9.0",
-        "version override to 3.9.0 must update display_invocation to `npx --yes prettier@3.9.0`"
+        resolved["prettier"].display_invocation,
+        "env PATH='/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin' '/usr/bin/npx' --yes 'prettier@3.9.0'",
+        "version override to 3.9.0 must update display_invocation to the pinned runtime npx for prettier@3.9.0"
     );
 }
 

@@ -121,7 +121,7 @@ fn lint_js_npm_default_resolves_to_npx_with_pinned_version() {
     assert_eq!(
         eslint.prefix_args,
         vec!["--yes".to_owned(), "eslint@10.5.0".to_owned()],
-        "default pin must produce `npx --yes eslint@10.5.0`"
+        "default pin must resolve through the pinned runtime npx for eslint@10.5.0"
     );
 }
 
@@ -493,7 +493,8 @@ fn lint_js_pinned_version_honored_via_npm_version_override() {
     )
     .expect("resolve");
     assert_eq!(
-        resolved["eslint"].display_invocation, "npx --yes eslint@10.6.0",
-        "version override must update display_invocation to `npx --yes eslint@10.6.0`"
+        resolved["eslint"].display_invocation,
+        "env PATH='/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin' '/usr/bin/npx' --yes 'eslint@10.6.0'",
+        "version override must update display_invocation to the pinned runtime npx for eslint@10.6.0"
     );
 }

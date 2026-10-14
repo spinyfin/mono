@@ -506,13 +506,6 @@ fn run_tool_invocation(
     }
 }
 
-/// Expand `{{severity_deny_flag}}` in a single `build_flags` entry.
-///
-/// Returns `Some(expanded)` to keep the entry (with the template replaced), or
-/// `None` to drop the entry entirely. Currently the only recognised template is
-/// `{{severity_deny_flag}}`, which resolves to `-Dwarnings` when the effective
-/// severity is `Error` (so clippy violations fail the build action) and causes
-/// the containing flag to be dropped when severity is anything else.
 /// Args for a `bazel query` that resolves labels; always led by `startup_flags`.
 fn aspect_query_args(startup_flags: &[String], query: String) -> Vec<String> {
     let mut args = startup_flags.to_vec();
@@ -556,6 +549,13 @@ fn aspect_cquery_args(
     args
 }
 
+/// Expand `{{severity_deny_flag}}` in a single `build_flags` entry.
+///
+/// Returns `Some(expanded)` to keep the entry (with the template replaced), or
+/// `None` to drop the entry entirely. Currently the only recognised template is
+/// `{{severity_deny_flag}}`, which resolves to `-Dwarnings` when the effective
+/// severity is `Error` (so clippy violations fail the build action) and causes
+/// the containing flag to be dropped when severity is anything else.
 fn expand_build_flag(flag: &str, effective_severity: Option<Severity>) -> Option<String> {
     const SEVERITY_DENY_FLAG: &str = "{{severity_deny_flag}}";
     if flag.contains(SEVERITY_DENY_FLAG) {
@@ -941,19 +941,11 @@ fn invocation_command(context: CheckExecutionContext<'_>, binary: &Path, args: &
     if !crate::external::environment::is_bazel_launcher(Path::new(command.get_program()))
         && let Some(binaries) = context.binaries
     {
-        let mut paths = Vec::new();
-        if let Some(parent) = Path::new(command.get_program()).parent().filter(|p| p.is_absolute()) {
-            paths.push(parent.to_owned());
-        }
-        for binary in binaries.values() {
-            if let Some(parent) = binary.program.parent().filter(|p| p.is_absolute())
-                && !paths.iter().any(|path| path == parent)
-            {
-                paths.push(parent.to_owned());
-            }
-        }
-        paths.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
-        command.env("PATH", std::env::join_paths(paths)?);
+        let path = crate::external::environment::check_path(
+            Path::new(command.get_program()),
+            binaries.values().filter_map(|binary| binary.program.parent()),
+        )?;
+        command.env("PATH", path);
     }
     if let Some(environment) = context.environment {
         let entries = environment
