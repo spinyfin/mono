@@ -79,7 +79,10 @@ async fn send_to_app_resolves_app_disconnected_on_session_drop() {
     let send = tokio::spawn(async move {
         server_clone
             .send_to_app(
-                EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 1 }),
+                EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput {
+                    run_id: "run-test".into(),
+                    slot_id: 1,
+                }),
                 Duration::from_secs(5),
             )
             .await

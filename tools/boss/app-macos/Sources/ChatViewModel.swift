@@ -1048,8 +1048,8 @@ final class ChatViewModel: ObservableObject {
     /// leaves them `nil` and those arms answer with a failure.
     var paneAttachHandler: ((EngineAttachRequest) -> EngineAttachResult)?
     var coordinatorPaneAttachHandler: ((EngineCoordinatorAttachRequest) -> EngineCoordinatorAttachResult)?
-    var paneDetachHandler: ((Int) -> EngineReleaseResult)?
-    var paneFocusHandler: ((Int) -> EngineFocusResult)?
+    var paneDetachHandler: ((String) -> EngineReleaseResult)?
+    var paneFocusHandler: ((String) -> EngineFocusResult)?
     /// Enumerates every slot the app currently hosts a session in,
     /// regardless of whether the engine has a live-tracked run for it.
     /// Backs `bossctl agents list --all`. `nil` build (Bazel without

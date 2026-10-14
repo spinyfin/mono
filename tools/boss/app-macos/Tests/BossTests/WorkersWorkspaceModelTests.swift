@@ -46,14 +46,14 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
     }
 
     func testDetachUnknownSlotReturnsUnknownSlot() {
-        let result = WorkersWorkspaceModel().detachWorkerPane(slotId: 99)
+        let result = WorkersWorkspaceModel().detachWorkerPane(runId: "unknown")
         guard case .failure(.unknownSlot) = result else {
             return XCTFail("expected unknownSlot, got \(result)")
         }
     }
 
     func testDetachIdleSlotReturnsUnknownSlot() {
-        let result = WorkersWorkspaceModel().detachWorkerPane(slotId: 1)
+        let result = WorkersWorkspaceModel().detachWorkerPane(runId: "run-tmux")
         guard case .failure(.unknownSlot) = result else {
             return XCTFail("expected unknownSlot, got \(result)")
         }
@@ -70,7 +70,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
             taskTitle: nil
         ))
 
-        let result = model.detachWorkerPane(slotId: 1)
+        let result = model.detachWorkerPane(runId: "run-tmux")
         guard case .success = result else {
             XCTFail("expected tmux pane detach to succeed, got \(result)")
             return
@@ -270,7 +270,7 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
     func testFocusUnknownSlotReturnsUnknownSlot() {
         let model = WorkersWorkspaceModel()
         // Interactive grid is 1...16 (Bridge Crew + Lower Decks); 99 has no slot at all.
-        let result = model.focusWorkerPane(slotId: 99)
+        let result = model.focusWorkerPane(runId: "unknown")
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for nonexistent slot, got \(result)")
             return
@@ -284,7 +284,7 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
         // app has nothing to raise. Mirrors the
         // `detachWorkerPane` semantics for idle slots so the engine
         // can treat both cases the same way.
-        let result = model.focusWorkerPane(slotId: 1)
+        let result = model.focusWorkerPane(runId: "run-tmux")
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for idle slot, got \(result)")
             return
@@ -294,6 +294,57 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
 
 @MainActor
 final class WorkersWorkspaceModelAttachSlotRoutingTests: XCTestCase {
+    func testSameRunAttachPreservesSurfaceAndOriginalSlotMetadata() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3))
+        let session = model.viewersByRunId["run-test"]?.session
+        for slot in [3, 5] {
+            guard case .success = model.attachWorkerPane(makeAttachRequest(slot: slot)) else {
+                return XCTFail("same-run attach must succeed")
+            }
+            XCTAssertTrue(model.viewersByRunId["run-test"]?.session === session)
+            XCTAssertEqual(model.listHostedPanes().map(\.slotId), [3])
+            XCTAssertEqual(model.listHostedPanes().map(\.runId), ["run-test"])
+        }
+    }
+
+    func testDelayedDetachAndFocusCannotTargetReplacementInReusedSlot() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "old-run"))
+        guard case .success = model.detachWorkerPane(runId: "old-run") else {
+            return XCTFail("first detach must succeed")
+        }
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "new-run"))
+        let replacement = model.viewersByRunId["new-run"]?.session
+        guard case .failure(.unknownSlot) = model.detachWorkerPane(runId: "old-run") else {
+            return XCTFail("delayed detach must report the old viewer absent")
+        }
+        guard case .failure(.unknownSlot) = model.focusWorkerPane(runId: "old-run") else {
+            return XCTFail("delayed focus must report the old viewer absent")
+        }
+        guard case .failure(.internalFailure("pane has no live surface")) = model.focusWorkerPane(runId: "new-run") else {
+            return XCTFail("focus must resolve the new viewer before checking its surface")
+        }
+        XCTAssertTrue(model.viewersByRunId["new-run"]?.session === replacement)
+        XCTAssertEqual(model.listHostedPanes().map(\.runId), ["new-run"])
+        XCTAssertEqual(model.listHostedPanes().map(\.slotId), [3])
+    }
+
+    func testViewerReportSurvivesGridCapacityChangesUntilDetach() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 40, runId: "review-run"))
+        let session = model.viewersByRunId["review-run"]?.session
+        model.configureSlots(workerCount: 16, automationCount: 8, reviewCount: 8)
+        XCTAssertFalse(model.reviewSlots.contains { $0.slotId == 40 })
+        XCTAssertEqual(model.listHostedPanes().map(\.slotId), [40])
+        XCTAssertEqual(model.listHostedPanes().map(\.runId), ["review-run"])
+        XCTAssertTrue(model.viewersByRunId["review-run"]?.session === session)
+        guard case .success = model.detachWorkerPane(runId: "review-run") else {
+            return XCTFail("viewer outside the grid must remain detachable by run")
+        }
+        XCTAssertTrue(model.listHostedPanes().isEmpty)
+    }
+
     private func makeAttachRequest(slot: Int, runId: String = "run-test") -> EngineAttachRequest {
         EngineAttachRequest(
             runId: runId,

@@ -46,18 +46,23 @@ final class WorkersWorkspaceModel: ObservableObject {
     }
 
     let runtime: GhosttyRuntime
-    @Published private(set) var slots: [WorkerSlot]
-    /// Automation-pool slots. These are always idle until the engine wires
-    /// up automation pane spawning; the pool-switcher UI shows them so the
-    /// slot grid is visible before any automation worker runs.
-    @Published private(set) var automationSlots: [WorkerSlot]
-    /// Review-pool slots. Mirror the automation pool layout; always idle
-    /// until the engine routes a `pr_review` execution to this pool.
-    @Published private(set) var reviewSlots: [WorkerSlot]
+    /// Authoritative viewer identity. Slot arrays below are temporary grid projections.
+    @Published private(set) var viewersByRunId: [String: WorkerSlot] = [:]
+    private var idleFlavorCycles: [Int: Int] = [:]
+
+    var slots: [WorkerSlot] { projectSlots(1...Self.workerSlotCount) }
+    var automationSlots: [WorkerSlot] { projectSlots(Self.automationSlotRange) }
+    var reviewSlots: [WorkerSlot] { projectSlots(reviewSlotRange) }
+
+    private func projectSlots(_ range: ClosedRange<Int>) -> [WorkerSlot] {
+        range.map { slotId in
+            viewersByRunId.values.first { $0.slotId == slotId }
+                ?? WorkerSlot(slotId: slotId, idleFlavorCycle: idleFlavorCycles[slotId, default: 0])
+        }
+    }
 
     /// The interactive pool split into its two display pages. Both are drawn
-    /// from `slots` (the single main-pool array) so spawn/release routing stays
-    /// keyed on the flat slot id — the pages are a pure display grouping.
+    /// from `slots` as a pure display grouping; RPC routing uses run identity.
     var bridgeCrewSlots: [WorkerSlot] {
         slots.filter { Self.bridgeCrewSlotRange.contains($0.slotId) }
     }
@@ -67,27 +72,20 @@ final class WorkersWorkspaceModel: ObservableObject {
 
     init() {
         self.runtime = GhosttyRuntime.shared
-        self.slots = (1...Self.workerSlotCount).map { slot in
-            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
-        }
-        self.automationSlots = (Self.automationSlotBase...(Self.automationSlotBase + Self.automationSlotCount - 1)).map { slot in
-            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
-        }
-        self.reviewSlots = (Self.reviewSlotBase...(Self.reviewSlotBase + 16 - 1)).map { slot in
-            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
+        for slotId in 1...(Self.reviewSlotBase + reviewSlotCount - 1) {
+            idleFlavorCycles[slotId] = Int.random(in: 0...10_000)
         }
     }
 
     /// Update pool capacities from the engine's EnginePoolConfig push.
     /// Called every time the app registers a session, so the slot ranges
     /// always mirror the live engine rather than independently-maintained
-    /// constants. Rebuilds the reviewer slot array when the count changes.
+    /// constants. Existing viewers survive capacity changes until detached.
     func configureSlots(workerCount: Int, automationCount: Int, reviewCount: Int) {
         guard reviewSlotCount != reviewCount else { return }
         reviewSlotCount = reviewCount
-        let base = WorkersWorkspaceModel.reviewSlotBase
-        reviewSlots = (base...(base + reviewCount - 1)).map { slot in
-            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
+        for slotId in reviewSlotRange where idleFlavorCycles[slotId] == nil {
+            idleFlavorCycles[slotId] = Int.random(in: 0...10_000)
         }
     }
 
@@ -112,7 +110,8 @@ final class WorkersWorkspaceModel: ObservableObject {
     }
 
     /// Host an attached worker pane in the slot the engine has claimed for
-    /// this worker (`request.slotId`).
+    /// this worker (`request.slotId`). An existing run keeps its surface and
+    /// original slot metadata and succeeds before slot allocation checks.
     ///
     /// Main-pool slots occupy 1...\(workerSlotCount); automation-pool
     /// slots occupy \(automationSlotBase)...\(automationSlotBase + automationSlotCount - 1).
@@ -124,30 +123,19 @@ final class WorkersWorkspaceModel: ObservableObject {
     ///    a session (engine and app disagree about what's free —
     ///    the engine should reconcile rather than retry blindly).
     private func hostAttachedPane(_ request: WorkerViewerLaunch) -> EngineSpawnResult {
-        let requestedSlot = request.slotId
-        let isAutomation = Self.automationSlotRange.contains(Int(requestedSlot))
-        let isReview = reviewSlotRange.contains(Int(requestedSlot))
-        let targetSlots: [WorkerSlot] = isReview ? reviewSlots : (isAutomation ? automationSlots : slots)
-        guard requestedSlot >= 1,
-              (requestedSlot <= Self.workerSlotCount || isAutomation || isReview),
-              let index = targetSlots.firstIndex(where: { $0.slotId == Int(requestedSlot) })
-        else {
-            let validRanges = "1...\(Self.workerSlotCount) or \(Self.automationSlotBase)...\(Self.automationSlotBase + Self.automationSlotCount - 1) or \(Self.reviewSlotBase)...\(Self.reviewSlotBase + reviewSlotCount - 1)"
-            return .failure(.internalFailure(
-                "engine requested slot \(requestedSlot), valid ranges are \(validRanges)"
-            ))
+        // Reconnection/retry must preserve the exact surface, even if slot
+        // metadata changed. Run identity alone selects an existing viewer.
+        if let existing = viewersByRunId[request.runId] {
+            return .success(slotId: existing.slotId)
         }
-        guard targetSlots[index].session == nil else {
-            return .failure(.slotBusy(occupyingRunId: targetSlots[index].runId))
+        let slotId = request.slotId
+        guard (1...Self.workerSlotCount).contains(slotId)
+                || Self.automationSlotRange.contains(slotId)
+                || reviewSlotRange.contains(slotId) else {
+            return .failure(.internalFailure("engine requested unknown slot \(slotId)"))
         }
-
-        let slotId: Int
-        if isReview {
-            slotId = reviewSlots[index].slotId
-        } else if isAutomation {
-            slotId = automationSlots[index].slotId
-        } else {
-            slotId = slots[index].slotId
+        if let occupant = viewersByRunId.values.first(where: { $0.slotId == slotId }) {
+            return .failure(.slotBusy(occupyingRunId: occupant.runId))
         }
 
         let launchSpec = TerminalLaunchSpec(
@@ -161,22 +149,13 @@ final class WorkersWorkspaceModel: ObservableObject {
             role: .worker(slot: slotId),
             launchSpec: launchSpec
         )
-        if isReview {
-            reviewSlots[index].session = session
-            reviewSlots[index].runId = request.runId
-            reviewSlots[index].summary = request.summary
-            reviewSlots[index].taskTitle = request.taskTitle
-        } else if isAutomation {
-            automationSlots[index].session = session
-            automationSlots[index].runId = request.runId
-            automationSlots[index].summary = request.summary
-            automationSlots[index].taskTitle = request.taskTitle
-        } else {
-            slots[index].session = session
-            slots[index].runId = request.runId
-            slots[index].summary = request.summary
-            slots[index].taskTitle = request.taskTitle
-        }
+        viewersByRunId[request.runId] = WorkerSlot(
+            slotId: slotId,
+            session: session,
+            runId: request.runId,
+            summary: request.summary,
+            taskTitle: request.taskTitle
+        )
 
         SpawnDiagnosticsLog.shared.spawnRequested(
             runId: request.runId,
@@ -191,42 +170,14 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// detached tmux session, not by Ghostty, so this does not inspect or
     /// signal any foreground process — it only tears down the app's own
     /// viewer bookkeeping.
-    func detachWorkerPane(slotId: Int) -> EngineReleaseResult {
-        clearWorkerPane(slotId: slotId)
-    }
-
-    private func clearWorkerPane(slotId: Int) -> EngineReleaseResult {
-        let isAutomation = Self.automationSlotRange.contains(slotId)
-        let isReview = reviewSlotRange.contains(slotId)
-        var targetSlots = isReview ? reviewSlots : (isAutomation ? automationSlots : slots)
-        guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
+    func detachWorkerPane(runId: String) -> EngineReleaseResult {
+        guard let viewer = viewersByRunId[runId], let session = viewer.session else {
             return .failure(.unknownSlot)
         }
-        guard let session = targetSlots[index].session else {
-            return .failure(.unknownSlot)
-        }
-
-        // Mark released before nil-ing the slot so a display-change retry
-        // racing this release (see `GhosttyTerminalHostView.attemptSurfaceCreation`)
-        // can't create a fresh surface and spawn a duplicate `claude` for the
-        // run the engine just gave up on.
+        // Prevent a display-change retry from recreating a released surface.
         session.markReleased()
-
-        targetSlots[index].session = nil
-        targetSlots[index].runId = nil
-        targetSlots[index].summary = nil
-        targetSlots[index].taskTitle = nil
-        // Re-roll the idle flavor so consecutive idle bouts on the same
-        // slot don't show the same line — fresh recreation each time
-        // the crew member clocks out.
-        targetSlots[index].idleFlavorCycle &+= 1
-        if isReview {
-            reviewSlots = targetSlots
-        } else if isAutomation {
-            automationSlots = targetSlots
-        } else {
-            slots = targetSlots
-        }
+        idleFlavorCycles[viewer.slotId, default: 0] &+= 1
+        viewersByRunId.removeValue(forKey: runId)
         return .success
     }
 
@@ -236,7 +187,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// engine diffs this against its own live-worker registry to
     /// surface "husk" panes for `bossctl agents list --all`.
     func listHostedPanes() -> [EngineHostedPaneEntry] {
-        (slots + automationSlots + reviewSlots).compactMap { slot in
+        viewersByRunId.values.sorted { $0.slotId < $1.slotId }.compactMap { slot in
             guard slot.session != nil, let runId = slot.runId else { return nil }
             return EngineHostedPaneEntry(
                 slotId: slot.slotId,
@@ -253,12 +204,8 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// `makeFirstResponder(self)`), then activates the application so
     /// the window is visible if it was minimised or behind another
     /// app. Used by `bossctl agents focus`.
-    func focusWorkerPane(slotId: Int) -> EngineFocusResult {
-        let targetSlots = reviewSlotRange.contains(slotId) ? reviewSlots : (Self.automationSlotRange.contains(slotId) ? automationSlots : slots)
-        guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
-            return .failure(.unknownSlot)
-        }
-        guard let session = targetSlots[index].session else {
+    func focusWorkerPane(runId: String) -> EngineFocusResult {
+        guard let session = viewersByRunId[runId]?.session else {
             return .failure(.unknownSlot)
         }
         guard let host = session.hostView else {

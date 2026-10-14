@@ -183,11 +183,11 @@ struct ContentView: View {
                 hostView.submitText(text)
                 return true
             }
-            model.paneDetachHandler = { [workspace = workersWorkspace] slotId in
-                workspace.detachWorkerPane(slotId: slotId)
+            model.paneDetachHandler = { [workspace = workersWorkspace] runId in
+                workspace.detachWorkerPane(runId: runId)
             }
-            model.paneFocusHandler = { [workspace = workersWorkspace] slotId in
-                workspace.focusWorkerPane(slotId: slotId)
+            model.paneFocusHandler = { [workspace = workersWorkspace] runId in
+                workspace.focusWorkerPane(runId: runId)
             }
             model.paneListHostedHandler = { [workspace = workersWorkspace] in
                 workspace.listHostedPanes()

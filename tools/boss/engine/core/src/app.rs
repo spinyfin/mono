@@ -2017,7 +2017,10 @@ impl ServerState {
              being taken, against a run that was already going away",
         )
         .await;
-        let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id });
+        let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput {
+            run_id: run_id.to_owned(),
+            slot_id,
+        });
         // Whether the app has actually told us the slot no longer hosts a
         // pane. This is what gates the WorkerPool handback below — see
         // `PANE_RELEASE_ACK_TIMEOUT` and the release site for why an
@@ -2133,7 +2136,10 @@ impl ServerState {
                      are left untouched",
                 );
             } else {
-                let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id });
+                let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput {
+                    run_id: run_id.to_owned(),
+                    slot_id,
+                });
                 if let Err(err) = self.send_to_app(request, PANE_RELEASE_ACK_TIMEOUT).await {
                     tracing::warn!(run_id, slot_id, ?err, "failed to detach untracked tmux viewer");
                 }

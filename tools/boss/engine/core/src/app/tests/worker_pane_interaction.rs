@@ -40,6 +40,7 @@ async fn focus_worker_pane_round_trips_to_app() {
     match request {
         EngineToAppRequest::FocusWorkerPane(input) => {
             assert_eq!(input.slot_id, 5);
+            assert_eq!(input.run_id, "run-focus");
         }
         other => panic!("expected FocusWorkerPane, got {other:?}"),
     }

@@ -179,11 +179,17 @@ mod tests {
                 "attach_coordinator_pane",
             ),
             (
-                EngineToAppRequest::DetachWorkerPane(DetachWorkerPaneInput { slot_id: 1 }),
+                EngineToAppRequest::DetachWorkerPane(DetachWorkerPaneInput {
+                    run_id: "run-test".into(),
+                    slot_id: 1,
+                }),
                 "detach_worker_pane",
             ),
             (
-                EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id: 1 }),
+                EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput {
+                    run_id: "run-test".into(),
+                    slot_id: 1,
+                }),
                 "focus_worker_pane",
             ),
             (
@@ -269,7 +275,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let logger = IpcLogger::new(dir.path());
 
-        let req = EngineToAppRequest::DetachWorkerPane(DetachWorkerPaneInput { slot_id: 3 });
+        let req = EngineToAppRequest::DetachWorkerPane(DetachWorkerPaneInput {
+            run_id: "run-test".into(),
+            slot_id: 3,
+        });
         logger.log_request("session-1-eng-req-42", &req);
 
         let resp = EngineToAppResponse::DetachWorkerPane {

@@ -68,11 +68,9 @@ async fn retire_pane_succeeds_for_husk_slot_with_no_app_session() {
 }
 
 #[tokio::test]
-async fn retire_pane_sends_slot_keyed_detach_request_with_no_run_id_resolution() {
-    // The defining property of retire_pane vs release_worker_pane: it
-    // never resolves through worker_registry (there is no run id for
-    // a husk) — it goes straight to the app with the slot id the
-    // caller supplied.
+async fn retire_pane_targets_reported_viewer_run_without_worker_registry() {
+    // A husk has no engine registry entry; inventory supplies viewer identity,
+    // never process ownership. Detach carries that identity across slot reuse.
     let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     server_state
@@ -81,6 +79,7 @@ async fn retire_pane_sends_slot_keyed_detach_request_with_no_run_id_resolution()
 
     let server_clone = server_state.clone();
     let retire = tokio::spawn(async move { server_clone.retire_pane(7).await });
+    super::worker_pane_reattach::answer_list_hosted_panes(&server_state, &sink, vec![("husk-run".into(), 7)]).await;
 
     // Occupancy is resolved from durable identity, not ListHostedPanes.
     // Slot 7 has none, so Guard 3 is inert and retirement proceeds as a husk.
@@ -92,6 +91,7 @@ async fn retire_pane_sends_slot_keyed_detach_request_with_no_run_id_resolution()
     match request {
         EngineToAppRequest::DetachWorkerPane(input) => {
             assert_eq!(input.slot_id, 7);
+            assert_eq!(input.run_id, "husk-run");
         }
         other => panic!("expected DetachWorkerPane, got {other:?}"),
     }
@@ -1004,6 +1004,7 @@ async fn a_waiting_review_durable_occupant_is_a_husk_and_retire_detaches() {
 
     let server_clone = server_state.clone();
     let retire = tokio::spawn(async move { server_clone.retire_pane(1).await });
+    super::worker_pane_reattach::answer_list_hosted_panes(&server_state, &sink, vec![(execution_id.clone(), 1)]).await;
     let request = sink.next().await.expect("a DetachWorkerPane request");
     match request.payload {
         FrontendEvent::EngineRequest { request_id, request } => {
@@ -1177,12 +1178,52 @@ async fn retire_preserves_replacement_assigned_during_tmux_probe() {
 }
 
 #[tokio::test]
+async fn retire_preserves_replacement_assigned_during_viewer_inventory() {
+    let (server, _dir) = test_server_state();
+    let sink = make_session_sink();
+    server.register_app_session("session-app".into(), sink.clone()).await;
+    let task_server = server.clone();
+    let retire = tokio::spawn(async move { task_server.retire_pane(1).await });
+    let envelope = sink.next().await.unwrap();
+    let FrontendEvent::EngineRequest {
+        request_id,
+        request: EngineToAppRequest::ListHostedPanes(_),
+    } = envelope.payload
+    else {
+        panic!("expected viewer inventory")
+    };
+    assign_replacement(&server).await;
+    server
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Ok(crate::protocol::ListHostedPanesResult {
+                    panes: vec![hosted(1, "replacement")],
+                }),
+            },
+        )
+        .await;
+    assert!(matches!(
+        retire.await.unwrap(),
+        Err(RetirePaneError::LiveRunTracked { .. })
+    ));
+    assert_replacement_survives(&server).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), sink.next())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn retire_preserves_replacement_assigned_during_detach_ack() {
     let (server, _dir) = test_server_state();
     let sink = make_session_sink();
     server.register_app_session("session-app".into(), sink.clone()).await;
     let task_server = server.clone();
     let retire = tokio::spawn(async move { task_server.retire_pane(1).await });
+    super::worker_pane_reattach::answer_list_hosted_panes(&server, &sink, vec![("retired-run".into(), 1)]).await;
     let envelope = sink.next().await.unwrap();
     let FrontendEvent::EngineRequest {
         request_id,

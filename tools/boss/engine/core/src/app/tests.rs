@@ -28,7 +28,10 @@ fn response_envelope(request_id: &str) -> FrontendEventEnvelope {
 fn engine_request_envelope(request_id: &str) -> FrontendEventEnvelope {
     FrontendEventEnvelope::push(FrontendEvent::EngineRequest {
         request_id: request_id.to_owned(),
-        request: EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 1 }),
+        request: EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput {
+            run_id: "run-test".into(),
+            slot_id: 1,
+        }),
     })
 }
 

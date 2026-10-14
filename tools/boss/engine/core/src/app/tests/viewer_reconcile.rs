@@ -224,7 +224,7 @@ async fn live_different_occupant_is_not_detached_and_returns_typed_failure() {
 }
 
 #[tokio::test]
-async fn same_occupant_slot_busy_is_treated_as_already_attached() {
+async fn same_occupant_slot_busy_is_not_silently_converted_to_success() {
     let (state, _dir) = test_server_state();
     let occupant = seed_tmux_hosted_live_run(&state, 3, "live-session", "live-token");
     let EngineToAppRequest::AttachWorkerPane(mut input) = attach_request() else {
@@ -249,7 +249,7 @@ async fn same_occupant_slot_busy_is_treated_as_already_attached() {
     .await;
     assert!(matches!(
         pass.await.unwrap(),
-        Ok(EngineToAppResponse::AttachWorkerPane { result: Ok(_) })
+        Ok(EngineToAppResponse::AttachWorkerPane { result: Err(EngineToAppError::SlotBusy { occupying_run_id: Some(id) }) }) if id == occupant
     ));
     assert!(
         tokio::time::timeout(Duration::from_millis(50), sink.next())
