@@ -165,7 +165,10 @@ fn lint_oxc_npm_default_resolves_to_npx_with_pinned_version() {
         vec!["--yes".to_owned(), "oxlint@1.70.0".to_owned()],
         "default pin must produce `npx --yes oxlint@1.70.0`"
     );
-    assert_eq!(oxlint.display_invocation, "npx --yes oxlint@1.70.0");
+    assert_eq!(
+        oxlint.display_invocation,
+        "env PATH='/fake/bin:/usr/bin:/bin:/usr/sbin:/sbin' '/fake/bin/npx' --yes 'oxlint@1.70.0'"
+    );
 }
 
 #[test]
@@ -184,7 +187,10 @@ fn lint_oxc_npm_version_override_repins() {
         vec!["--yes".to_owned(), "oxlint@1.71.0".to_owned()],
         "version override must re-pin to 1.71.0 while inheriting the package name"
     );
-    assert_eq!(resolved["oxlint"].display_invocation, "npx --yes oxlint@1.71.0");
+    assert_eq!(
+        resolved["oxlint"].display_invocation,
+        "env PATH='/fake:/usr/bin:/bin:/usr/sbin:/sbin' '/fake/npx' --yes 'oxlint@1.71.0'"
+    );
 }
 
 fn lint_oxc_findings(stdout: &[u8]) -> Vec<Finding> {

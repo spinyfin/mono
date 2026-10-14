@@ -73,24 +73,42 @@ fn prepare_bazel(command: &mut Command, home: tempfile::TempDir) -> Result<tempf
     Ok(home)
 }
 
+/// Compose the controlled PATH for provisioning and check invocations.
+pub(crate) fn check_path<'a>(
+    program: &'a Path,
+    extra_dirs: impl Iterator<Item = &'a Path>,
+) -> Result<std::ffi::OsString> {
+    let mut paths = Vec::new();
+    for dir in program
+        .parent()
+        .into_iter()
+        .chain(extra_dirs)
+        .filter(|p| p.is_absolute())
+    {
+        if !paths.iter().any(|p| p == dir) {
+            paths.push(dir.to_owned());
+        }
+    }
+    paths.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
+    Ok(std::env::join_paths(paths)?)
+}
+
 /// Keep the isolated HOME alive until the child exits.
 pub(crate) fn prepare(command: &mut Command) -> Result<tempfile::TempDir> {
+    prepare_with(command, |key| std::env::var_os(key))
+}
+
+fn prepare_with(
+    command: &mut Command,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<tempfile::TempDir> {
     let home = tempfile::tempdir().context("create isolated check HOME")?;
     let declared: Vec<_> = command
         .get_envs()
         .map(|(key, value)| (key.to_owned(), value.map(|value| value.to_owned())))
         .collect();
     let program = Path::new(command.get_program());
-    let mut paths = Vec::new();
-    if let Some(parent) = program.parent().filter(|path| path.is_absolute()) {
-        paths.push(parent.to_owned());
-    }
-    paths.extend([
-        PathBuf::from("/usr/bin"),
-        PathBuf::from("/bin"),
-        PathBuf::from("/usr/sbin"),
-        PathBuf::from("/sbin"),
-    ]);
+    let path = check_path(program, std::iter::empty())?;
     let bazel = is_bazel_launcher(program);
     if bazel {
         return prepare_bazel(command, home);
@@ -98,7 +116,7 @@ pub(crate) fn prepare(command: &mut Command) -> Result<tempfile::TempDir> {
     let npm = program.file_name().is_some_and(|name| name == "npx");
     command
         .env_clear()
-        .env("PATH", std::env::join_paths(paths)?)
+        .env("PATH", path)
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path())
         .env("LC_ALL", "C")
@@ -133,7 +151,7 @@ pub(crate) fn prepare(command: &mut Command) -> Result<tempfile::TempDir> {
         "SSL_CERT_DIR",
         "NODE_EXTRA_CA_CERTS",
     ] {
-        if let Some(value) = std::env::var_os(key) {
+        if let Some(value) = lookup(key) {
             command.env(key, value);
         }
     }
@@ -186,11 +204,18 @@ mod tests {
     #[test]
     fn other_launchers_inherit_network_transport_vars() {
         let mut command = Command::new("/usr/bin/true");
-        let _home = prepare(&mut command).unwrap();
+        let inherited = std::collections::BTreeMap::from([
+            ("HTTPS_PROXY", "https://proxy.invalid"),
+            ("NODE_EXTRA_CA_CERTS", "/certs.pem"),
+            ("RUSTUP_TOOLCHAIN", "nightly"),
+            ("NODE_OPTIONS", "--inspect"),
+        ]);
+        let _home = prepare_with(&mut command, |key| inherited.get(key).map(std::ffi::OsString::from)).unwrap();
         let envs = envs(&command);
         assert_eq!(envs["LC_ALL"].as_deref(), Some("C"));
-        if let Some(v) = std::env::var_os("HTTPS_PROXY") {
-            assert_eq!(envs["HTTPS_PROXY"].as_deref(), v.to_str());
-        }
+        assert_eq!(envs["HTTPS_PROXY"].as_deref(), Some("https://proxy.invalid"));
+        assert_eq!(envs["NODE_EXTRA_CA_CERTS"].as_deref(), Some("/certs.pem"));
+        assert!(!envs.contains_key("RUSTUP_TOOLCHAIN"));
+        assert!(!envs.contains_key("NODE_OPTIONS"));
     }
 }

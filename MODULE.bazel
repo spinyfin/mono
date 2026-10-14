@@ -277,6 +277,11 @@ use_repo(
     "swiftpkg_textual",
 )
 
+# Utilities declared by the Node archive integration tests.
+node_test_tools = use_repo_rule("//tools/checkleft:node_test_tools.bzl", "node_test_tools")
+
+node_test_tools(name = "checkleft_node_test_tools")
+
 # Prebuilt GhosttyKit.xcframework for the Bazel installer.
 # Rebuild procedure: tools/boss/docs/runbooks/update-ghostty-prebuilt.md
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")

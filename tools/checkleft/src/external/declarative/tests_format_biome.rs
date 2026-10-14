@@ -162,7 +162,10 @@ fn format_biome_npm_default_resolves_to_npx_with_pinned_version() {
         vec!["--yes".to_owned(), "@biomejs/biome@2.5.0".to_owned()],
         "default pin must produce `npx --yes @biomejs/biome@2.5.0`"
     );
-    assert_eq!(biome.display_invocation, "npx --yes @biomejs/biome@2.5.0");
+    assert_eq!(
+        biome.display_invocation,
+        "env PATH='/fake/bin:/usr/bin:/bin:/usr/sbin:/sbin' '/fake/bin/npx' --yes '@biomejs/biome@2.5.0'"
+    );
 }
 
 #[test]
@@ -181,7 +184,10 @@ fn format_biome_npm_version_override_repins() {
         vec!["--yes".to_owned(), "@biomejs/biome@2.6.0".to_owned()],
         "version override must re-pin to 2.6.0 while inheriting the package name"
     );
-    assert_eq!(resolved["biome"].display_invocation, "npx --yes @biomejs/biome@2.6.0");
+    assert_eq!(
+        resolved["biome"].display_invocation,
+        "env PATH='/fake:/usr/bin:/bin:/usr/sbin:/sbin' '/fake/npx' --yes '@biomejs/biome@2.6.0'"
+    );
 }
 
 fn format_biome_findings(stdout: &[u8]) -> Vec<Finding> {

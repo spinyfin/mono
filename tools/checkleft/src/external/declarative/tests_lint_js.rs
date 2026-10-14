@@ -493,7 +493,8 @@ fn lint_js_pinned_version_honored_via_npm_version_override() {
     )
     .expect("resolve");
     assert_eq!(
-        resolved["eslint"].display_invocation, "npx --yes eslint@10.6.0",
+        resolved["eslint"].display_invocation,
+        "env PATH='/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin' '/usr/bin/npx' --yes 'eslint@10.6.0'",
         "version override must update display_invocation to `npx --yes eslint@10.6.0`"
     );
 }
