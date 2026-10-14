@@ -4,8 +4,9 @@ import Foundation
 /// task by the engine (`Task.operator_question`, `OperatorQuestionView` on the
 /// wire). `nil` on `WorkTask` once the question is answered or withdrawn.
 ///
-/// The card renders `text` inline and keeps `explanation` behind the "Why?"
-/// popover; `askedAt` orders the Doing column's "Needs Attention" section.
+/// The card renders `text` with labeled decision context from `explanation`;
+/// technical details stay in the "Why?" popover. `askedAt` orders the Doing
+/// column's "Needs Attention" section.
 struct OperatorQuestion: Hashable {
     /// How the user answers. Mirrors `OperatorAnswerType`. Both kinds are
     /// answered with Yes/No; a payload carrying any other kind is not decoded

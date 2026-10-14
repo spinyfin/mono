@@ -57,9 +57,9 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
     func testPopoverRendersRunSummarySeparatelyFromExplanation() throws {
         var question = presentation()
         question.runSummary = "Prepared migration changes and stopped for authorization."
-        let first = try renderView(OperatorQuestionDetailPopover(question: question), size: CGSize(width: 340, height: 360))
+        let first = try renderView(OperatorQuestionDetailPopover(question: question, detailsExpanded: true), size: CGSize(width: 340, height: 520))
         question.runSummary = "Validated the migration; all checks passed before asking."
-        let second = try renderView(OperatorQuestionDetailPopover(question: question), size: CGSize(width: 340, height: 360))
+        let second = try renderView(OperatorQuestionDetailPopover(question: question, detailsExpanded: true), size: CGSize(width: 340, height: 520))
         XCTAssertFalse(isUniformlyBlank(first), "The popover must render visible content")
         XCTAssertNotEqual(
             first.representation(using: .png, properties: [:]),
@@ -70,12 +70,12 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
 
     func testPopoverShowsTheProposedPrerequisiteTask() throws {
         var question = presentation()
-        let plain = try renderView(OperatorQuestionDetailPopover(question: question), size: CGSize(width: 340, height: 360))
+        let plain = try renderView(OperatorQuestionDetailPopover(question: question, detailsExpanded: true), size: CGSize(width: 340, height: 520))
         question.prerequisiteTask = PrerequisiteTaskProposal(
             name: "Fix the retention-cleanup fixture race",
             brief: "The shared fixture races retention cleanup. Fix it on main."
         )
-        let proposed = try renderView(OperatorQuestionDetailPopover(question: question), size: CGSize(width: 340, height: 360))
+        let proposed = try renderView(OperatorQuestionDetailPopover(question: question, detailsExpanded: true), size: CGSize(width: 340, height: 520))
         XCTAssertFalse(isUniformlyBlank(proposed), "The popover must render visible content")
         XCTAssertNotEqual(
             plain.representation(using: .png, properties: [:]),
@@ -84,17 +84,54 @@ final class OperatorQuestionCardRenderTests: XCTestCase {
         )
     }
 
+    func testPopoverCollapsesTechnicalContentByDefault() throws {
+        var question = presentation()
+        let plain = try renderView(OperatorQuestionDetailPopover(question: question), size: CGSize(width: 340, height: 520))
+        question.runSummary = "Technical run summary that must remain reachable."
+        question.prerequisiteTask = PrerequisiteTaskProposal(name: "Prerequisite", brief: "Technical task brief.")
+        let collapsed = try renderView(OperatorQuestionDetailPopover(question: question), size: CGSize(width: 340, height: 520))
+        let expanded = try renderView(
+            OperatorQuestionDetailPopover(question: question, detailsExpanded: true),
+            size: CGSize(width: 340, height: 520)
+        )
+        XCTAssertFalse(isUniformlyBlank(collapsed))
+        XCTAssertEqual(plain.representation(using: .png, properties: [:]), collapsed.representation(using: .png, properties: [:]))
+        XCTAssertNotEqual(collapsed.representation(using: .png, properties: [:]), expanded.representation(using: .png, properties: [:]))
+    }
+
+    func testLabeledExplanationShowsDecisionAndKeepsEvidenceExpandable() throws {
+        let explanation = "Context:\nEdits can be lost.\nYes:\nResend unsent edits. Small change.\nNo:\nWork stays blocked. Bigger change.\nRecommendation:\nYes, to avoid duplicates.\nDetails:\n"
+        let first = presentation(explanation: explanation + "First technical evidence.")
+        let second = presentation(explanation: explanation + "Different technical evidence.")
+        let size = CGSize(width: 340, height: 520)
+        let collapsed = try renderView(OperatorQuestionDetailPopover(question: first), size: size)
+        let otherCollapsed = try renderView(OperatorQuestionDetailPopover(question: second), size: size)
+        let expanded = try renderView(OperatorQuestionDetailPopover(question: first, detailsExpanded: true), size: size)
+        let otherExpanded = try renderView(OperatorQuestionDetailPopover(question: second, detailsExpanded: true), size: size)
+        XCTAssertFalse(isUniformlyBlank(collapsed))
+        XCTAssertEqual(collapsed.representation(using: .png, properties: [:]), otherCollapsed.representation(using: .png, properties: [:]))
+        XCTAssertNotEqual(expanded.representation(using: .png, properties: [:]), otherExpanded.representation(using: .png, properties: [:]))
+
+        let changedAnswer = presentation(explanation: explanation.replacingOccurrences(of: "Resend unsent edits.", with: "Ask you to check each edit."))
+        XCTAssertNotEqual(
+            try render(first).representation(using: .png, properties: [:]),
+            try render(changedAnswer).representation(using: .png, properties: [:]),
+            "The card must display the answer meaning before Details is opened"
+        )
+    }
+
     // MARK: - Helpers
 
     private func presentation(
         text: String = "Approve bypass of the 30 max file limit (48 needed)?",
+        explanation: String = "Sweeps 48 files.",
         answerInFlight: Bool = false,
         error: String? = nil
     ) -> OperatorQuestionPresentation {
         OperatorQuestionPresentation(
             questionID: "oq_1",
             text: text,
-            explanation: "Sweeps 48 files.",
+            explanation: explanation,
             askedAt: "1790000000",
             answerInFlight: answerInFlight,
             errorMessage: error

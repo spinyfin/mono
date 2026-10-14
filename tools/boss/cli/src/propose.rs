@@ -3,15 +3,19 @@
 //!
 //! Pure CLI + wire-protocol glue: every verb here translates flags into a
 //! [`FrontendRequest::SubmitProposal`] / [`FrontendRequest::ListProposals`]
-//! call and renders the typed reply. All validation (payload schema, rate
+//! call and renders the typed reply. Payload validation (schema, rate
 //! caps, attribution) happens engine-side — see
 //! `boss_engine_proposal_validation` and `engine/core/src/app/proposals.rs`
 //! — so a malformed submission comes back as a
 //! [`FrontendEvent::ProposalRejected`] the worker can act on immediately,
 //! rather than a client-side guess at what the engine would have accepted.
+//! The CLI additionally enforces the labelled explanation writing contract
+//! for newly filed questions before sending the payload.
 //!
 //! Design: `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`
 //! §"CLI surface".
+
+mod explanation;
 
 use std::path::PathBuf;
 
@@ -376,7 +380,8 @@ pub(crate) struct RunDoneArgs {
     #[arg(long)]
     summary: String,
 
-    /// One specific Yes/No decision preventing delivery. Required with
+    /// One specific Yes/No decision in everyday words, without internal symbols,
+    /// types, file names, API names, or review jargon. Required with
     /// `--answer-type yes-no`; not accepted with `create-prerequisite-task`,
     /// whose question the engine words from `--prerequisite-name`.
     #[arg(long, requires_all = ["answer_type", "explanation"], required_if_eq("answer_type", "yes-no"))]
@@ -385,13 +390,18 @@ pub(crate) struct RunDoneArgs {
     /// `yes-no` for a plain approval. `create-prerequisite-task` when this
     /// task cannot proceed until some other, unrelated piece of work lands
     /// first: also pass `--prerequisite-name` and `--prerequisite-brief`, and
-    /// make `--explanation` the one line saying why this task cannot unblock
-    /// without it.
+    /// explain the dependency and both answers in `--explanation`.
     #[arg(long, value_parser = ["yes-no", "create-prerequisite-task"], requires = "explanation")]
     answer_type: Option<String>,
 
-    /// Why the decision is needed and what Yes authorizes.
-    #[arg(long, requires = "answer_type")]
+    /// Self-contained decision explanation with these labels on their own lines,
+    /// in order: Context:, Yes:, No:, Recommendation:, and optional Details:.
+    /// Context opens with 1–2 plain-language sentences about the work and blocker.
+    /// Yes/No state the user-visible result and rough work size; No leaves work
+    /// blocked, rather than starting an alternative automatically. Recommend an
+    /// answer with a one-line reason. Keep symbols, types, file/API names and
+    /// links in Details only; preserve all technical evidence there.
+    #[arg(long, requires = "answer_type", value_parser = explanation::validate)]
     explanation: Option<String>,
 
     /// Name of the proposed prerequisite task (`create-prerequisite-task`).
@@ -1034,14 +1044,14 @@ mod tests {
         for flags in [
             vec!["--question", "Approve?"],
             vec!["--answer-type", "yes-no"],
-            vec!["--explanation", "Why"],
+            vec!["--explanation", explanation::tests::VALID],
             vec![
                 "--question",
                 "Approve?",
                 "--answer-type",
                 "prompt",
                 "--explanation",
-                "Why",
+                explanation::tests::VALID,
             ],
         ] {
             assert!(Cli::try_parse_from(base.iter().copied().chain(flags)).is_err());
@@ -1052,7 +1062,7 @@ mod tests {
             "--answer-type",
             "yes-no",
             "--explanation",
-            "Why",
+            explanation::tests::VALID,
         ];
         let cli = Cli::try_parse_from(base.iter().copied().chain(flags)).unwrap();
         let Commands::Propose(args) = cli.command else {
@@ -1061,7 +1071,7 @@ mod tests {
         let (_, payload, _) = payload_for(args.command.unwrap()).unwrap();
         assert_eq!(payload["question"]["answer_type"]["kind"], "yes_no");
         assert_eq!(payload["question"]["text"], "Approve?");
-        assert_eq!(payload["question"]["explanation"], "Why");
+        assert_eq!(payload["question"]["explanation"], explanation::tests::VALID);
         for flags in [vec![], vec!["--yes", "--no"]] {
             assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example"].into_iter().chain(flags)).is_err());
         }
@@ -1083,7 +1093,7 @@ mod tests {
             "--answer-type",
             "create-prerequisite-task",
             "--explanation",
-            "CI cannot go green until the fixture is fixed",
+            explanation::tests::VALID,
         ];
         // Name and brief are both required with the prerequisite type.
         assert!(Cli::try_parse_from(base).is_err());
@@ -1126,7 +1136,7 @@ mod tests {
             "--answer-type",
             "yes-no",
             "--explanation",
-            "Why",
+            explanation::tests::VALID,
             "--prerequisite-name",
             "x",
             "--prerequisite-brief",
