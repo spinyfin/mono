@@ -1,125 +1,133 @@
 import AppKit
+import CoreGraphics
 import Foundation
+import ImageIO
 
-/// Asset keys for the TNG portraits vendored under
-/// `Sources/Resources/TrekIcons/<size>/<key>.png`. The key matches the
-/// filename stem so the loader can build a path mechanically. Eight
-/// of these (Riker..O'Brien) form the worker roster; `picard` is used
-/// for the Boss pane and is intentionally not part of `forSlot`.
-enum TrekCharacter: String, CaseIterable {
-    case riker
-    case data
-    case worf
-    case laforge
-    case troi
-    case crusher
-    case yar
-    case obrien
-    case picard
-
-    /// Display name as rendered by `WorkerNames.roster` for the same
-    /// slot. Kept in lock-step with that roster — slot 1 = Riker,
-    /// slot 2 = Data, …, slot 8 = O'Brien.
-    var displayName: String {
-        switch self {
-        case .riker: "Riker"
-        case .data: "Data"
-        case .worf: "Worf"
-        case .laforge: "La Forge"
-        case .troi: "Troi"
-        case .crusher: "Crusher"
-        case .yar: "Yar"
-        case .obrien: "O'Brien"
-        case .picard: "Picard"
-        }
-    }
-
-    /// Match the engine persona, ignoring only its remote host qualifier.
-    static func forPersona(_ name: String?) -> TrekCharacter? {
-        guard let name else { return nil }
-        let suffix = " (Remote)"
-        let persona = name.hasSuffix(suffix) ? String(name.dropLast(suffix.count)) : name
-        return allCases.first { $0.displayName == persona }
-    }
-
-    /// Slot 1..8 → character. The interactive pool is 16 slots (Bridge
-    /// Crew 1..8, Lower Decks 9..16), but the icon roster only has 8
-    /// named characters, so slots 9..16 get `nil` and the UI falls back
-    /// to text-only (`WorkerNames` still provides a crew name for those
-    /// slots via a longer, wrapping roster).
-    static func forSlot(_ slotId: Int) -> TrekCharacter? {
-        let roster: [TrekCharacter] = [
-            .riker, .data, .worf, .laforge,
-            .troi, .crusher, .yar, .obrien,
-        ]
-        guard slotId >= 1, slotId <= roster.count else { return nil }
-        return roster[slotId - 1]
-    }
-}
-
-enum TrekIconSize: String {
-    case xsmall
-    case small
-    case medium
-    case large
-}
-
-/// Loads bundled TNG portraits. Resources live under
-/// `Sources/Resources/TrekIcons/...`. SwiftPM builds access them via
-/// `Bundle.module`; Bazel builds find them in `Bundle.main` because
-/// the Bazel `macos_application` places them at
+/// Crew portraits, sliced at runtime from the single bundled sheet
+/// `Sources/Resources/TrekIcons/trek-crew-grid.png` (layout and crop
+/// rects: `TrekPortraitGrid`). SwiftPM builds access it via
+/// `Bundle.module`; Bazel builds find it in `Bundle.main` because the
+/// Bazel `macos_application` places it at
 /// `Contents/Resources/TrekIcons/` via `additional_contents`.
+///
+/// Every lookup takes the persona name the engine shows (`"Data"`,
+/// `"Data (Remote)"`, the coordinator's `"Picard"`). A name with no
+/// grid cell, or a sheet that can't be loaded, yields `nil` and the
+/// caller keeps its generic icon — nothing here can crash or hand
+/// back a blank image.
+///
+/// Draw the result with `.interpolation(.none)` so the pixel art stays
+/// crisp when SwiftUI scales it.
 enum TrekIconAssets {
-    private struct CacheKey: Hashable {
-        let character: TrekCharacter
-        let size: TrekIconSize
-    }
+    /// Pixels below this alpha are cleared from a slice. The sheet is
+    /// ringed with a soft, low-alpha, red-tinted fringe that reads as
+    /// speckle on a dark pane background; the portrait itself is
+    /// well above this.
+    static let fringeAlphaCutoff: UInt8 = 128
 
     // Decoded NSImages are immutable for our consumers (they only
     // render via SwiftUI `Image(nsImage:)`), so handing the same
-    // instance to many views is safe. The roster has <20 distinct
-    // (character, size) pairs over the app lifetime — no eviction
-    // needed.
+    // instance to many views is safe. There are at most 56 cells —
+    // no eviction needed.
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var cache: [CacheKey: NSImage] = [:]
-    nonisolated(unsafe) private static var negativeCache: Set<CacheKey> = []
+    nonisolated(unsafe) private static var cache: [TrekPortraitGrid.Cell: NSImage] = [:]
+    nonisolated(unsafe) private static var negativeCache: Set<TrekPortraitGrid.Cell> = []
+    nonisolated(unsafe) private static var cachedSheet: CGImage?
+    nonisolated(unsafe) private static var sheetLoaded = false
 
-    static func image(_ character: TrekCharacter, size: TrekIconSize) -> NSImage? {
-        let key = CacheKey(character: character, size: size)
+    /// Portrait for an engine persona name, or `nil` when the name has
+    /// no grid cell (e.g. the "Worker N" / "Ensign N" fallbacks).
+    static func portrait(forPersona persona: String?) -> NSImage? {
+        guard let cell = TrekPortraitGrid.cell(forPersona: persona) else { return nil }
+        return portrait(for: cell)
+    }
+
+    /// The coordinator ("Boss") pane's portrait.
+    static func coordinatorPortrait() -> NSImage? {
+        portrait(forPersona: TrekPortraitGrid.coordinatorName)
+    }
+
+    static func portrait(for cell: TrekPortraitGrid.Cell) -> NSImage? {
         lock.lock()
-        if let cached = cache[key] {
+        if let cached = cache[cell] {
             lock.unlock()
             return cached
         }
-        if negativeCache.contains(key) {
+        if negativeCache.contains(cell) {
             lock.unlock()
             return nil
         }
         lock.unlock()
 
-        let loaded = loadFromBundle(character: character, size: size)
+        var loaded: NSImage?
+        if let sheet = loadSheet(), let slice = slice(sheet, cell: cell) {
+            loaded = NSImage(cgImage: slice, size: NSSize(width: slice.width, height: slice.height))
+        }
 
         lock.lock()
         if let loaded {
-            cache[key] = loaded
+            cache[cell] = loaded
         } else {
-            negativeCache.insert(key)
+            negativeCache.insert(cell)
         }
         lock.unlock()
         return loaded
     }
 
-    private static func loadFromBundle(character: TrekCharacter, size: TrekIconSize) -> NSImage? {
-        let resource = "TrekIcons/\(size.rawValue)/\(character.rawValue)"
+    /// Crops one portrait out of the sheet and clears the fringe.
+    /// `nil` unless `sheet` is the expected size, so a replaced or
+    /// resampled image degrades to the generic icon instead of
+    /// showing misaligned crops.
+    static func slice(_ sheet: CGImage, cell: TrekPortraitGrid.Cell) -> CGImage? {
+        guard sheet.width == TrekPortraitGrid.imageWidth,
+              sheet.height == TrekPortraitGrid.imageHeight,
+              let cropped = sheet.cropping(to: TrekPortraitGrid.cropRect(for: cell))
+        else { return nil }
+        return clearingFringe(of: cropped)
+    }
+
+    private static func clearingFringe(of image: CGImage) -> CGImage? {
+        let width = image.width
+        let height = image.height
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        return pixels.withUnsafeMutableBytes { buffer -> CGImage? in
+            guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+                  let context = CGContext(
+                      data: buffer.baseAddress, width: width, height: height,
+                      bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: colorSpace,
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  )
+            else { return nil }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            // Premultiplied RGBA: a fully transparent pixel is four zero bytes.
+            for offset in stride(from: 0, to: buffer.count, by: 4)
+            where buffer[offset + 3] < fringeAlphaCutoff {
+                buffer[offset] = 0
+                buffer[offset + 1] = 0
+                buffer[offset + 2] = 0
+                buffer[offset + 3] = 0
+            }
+            return context.makeImage()
+        }
+    }
+
+    /// Decodes the bundled sheet once; a missing or undecodable file is
+    /// remembered as `nil` so every later lookup falls back cheaply.
+    private static func loadSheet() -> CGImage? {
+        lock.lock()
+        defer { lock.unlock() }
+        if sheetLoaded { return cachedSheet }
+        sheetLoaded = true
         #if SWIFT_PACKAGE
         let bundle = Bundle.module
         #else
         let bundle = Bundle.main
         #endif
-        if let url = bundle.url(forResource: resource, withExtension: "png"),
-           let image = NSImage(contentsOf: url) {
-            return image
+        if let url = bundle.url(forResource: "TrekIcons/trek-crew-grid", withExtension: "png"),
+           let source = CGImageSourceCreateWithURL(url as CFURL, nil) {
+            cachedSheet = CGImageSourceCreateImageAtIndex(source, 0, nil)
         }
-        return nil
+        return cachedSheet
     }
 }

@@ -1,5 +1,6 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 exports_files(["Cargo.toml"])
 
@@ -37,4 +38,17 @@ filegroup(
     name = "srcs",
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//tools/boss/engine/core:__pkg__"],
+)
+
+# Keeps the Rust roster, the Swift roster and the crew portrait grid (and the
+# bundled sheet's size) in step by parsing the real sources.
+sh_test(
+    name = "worker_roster_parity_test",
+    size = "small",
+    srcs = ["tests/worker_roster_parity_test.sh"],
+    data = [
+        "src/worker_names.rs",
+        "tests/worker_roster_parity_test.py",
+        "//tools/boss/app-macos:crew_roster_sources",
+    ],
 )
