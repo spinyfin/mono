@@ -40,7 +40,7 @@ fn lint_js_manifest_parses_correctly() {
 }
 
 #[test]
-fn lint_js_needs_npm_default_pinned_to_10_5_0_with_path_fallback() {
+fn lint_js_needs_npm_default_pinned_to_10_5_0_without_host_fallback() {
     let package = parse_lint_js_package();
     let req = package.needs.get("eslint").expect("eslint binary must be declared");
     match &req.default {
@@ -51,8 +51,8 @@ fn lint_js_needs_npm_default_pinned_to_10_5_0_with_path_fallback() {
         other => panic!("default binding must be an npm version-pinned binding; got: {other:?}"),
     }
     assert!(
-        matches!(req.fallback, Some(super::BinaryBinding::Path(_))),
-        "fallback binding must be a PATH binary for environments without npx; got: {:?}",
+        req.fallback.is_none(),
+        "host fallback must be absent; got: {:?}",
         req.fallback
     );
 }
@@ -289,7 +289,7 @@ fn lint_js_transform_handles_null_rule_id_as_parse_error() {
 /// so the full executor pipeline runs without npx.
 fn lint_js_manifest_with_path_default(script: &Path) -> String {
     LINT_JS_MANIFEST.replace(
-        "needs:\n  eslint:\n    default:\n      npm:\n        package: \"eslint\"\n        version: \"10.5.0\"\n    fallback:\n      path: \"eslint\"",
+        "needs:\n  eslint:\n    default:\n      npm:\n        package: \"eslint\"\n        version: \"10.5.0\"",
         &format!("needs:\n  eslint:\n    default:\n      path: \"{}\"", script.display()),
     )
 }

@@ -1,7 +1,7 @@
 //! Tests for the format/prettier declarative check and the npm version-pinned
 //! `needs` binding: manifest shape and flags, applies_to coverage, the
 //! `npx --yes <pkg>@<ver>` resolution (with version / package / path overrides
-//! and npx-missing fallback), binding validation, end-to-end runs through a fake
+//! and missing-runtime errors), binding validation, end-to-end runs through a fake
 //! prettier, the `{{needs.<name>.invocation}}` remediation template, and the
 //! skip_symlinks manifest flag.
 
@@ -105,9 +105,8 @@ fn prettier_applies_to_covers_js_ts_and_friends() {
 }
 
 #[test]
-fn prettier_needs_npm_default_pinned_to_3_8_4_with_path_fallback() {
-    // The version pin lives in the manifest as the per-check default (3.8.4), with a
-    // PATH fallback for environments without npx — mirroring rustfmt's bazel+path shape.
+fn prettier_needs_npm_default_pinned_to_3_8_4_without_host_fallback() {
+    // The package pin and mandatory runtime provisioning prevent host fallbacks.
     let package = parse_prettier_package();
     let req = package.needs.get("prettier").expect("prettier binary must be declared");
     match &req.default {
@@ -118,8 +117,8 @@ fn prettier_needs_npm_default_pinned_to_3_8_4_with_path_fallback() {
         other => panic!("default binding must be an npm version-pinned binding; got: {other:?}"),
     }
     assert!(
-        matches!(req.fallback, Some(super::BinaryBinding::Path(_))),
-        "fallback binding must be a PATH binary for non-npx environments; got: {:?}",
+        req.fallback.is_none(),
+        "host fallback must be absent; got: {:?}",
         req.fallback
     );
 }
@@ -200,19 +199,12 @@ fn npm_path_override_swaps_binding_and_drops_npx() {
 }
 
 #[test]
-fn npm_missing_npx_falls_back_to_path_binary() {
-    // No npx on PATH: the npm default fails to resolve and the declared `fallback.path`
-    // takes over (a loud warning is emitted to stderr).
+fn npm_missing_provisioned_npx_is_an_error() {
     let package = parse_prettier_package();
     let config = toml::Value::Table(Default::default());
-    let resolved =
-        super::resolve::resolve_all_with_npx(Path::new("/repo"), &package.needs, &config, None).expect("resolve");
-    assert_eq!(
-        resolved["prettier"].program,
-        Path::new("prettier"),
-        "fallback should use the PATH `prettier` binary"
-    );
-    assert!(resolved["prettier"].prefix_args.is_empty());
+    let error = super::resolve::resolve_all_with_npx(Path::new("/repo"), &package.needs, &config, None)
+        .expect_err("missing pinned runtime must fail closed");
+    assert!(format!("{error:#}").contains("cannot provision npm package"));
 }
 
 #[test]
@@ -309,8 +301,11 @@ invocations:
 /// the full executor pipeline runs without npx/Node.
 fn prettier_manifest_with_path_default(script: &Path) -> String {
     PRETTIER_MANIFEST.replace(
-        "needs:\n  prettier:\n    default:\n      npm:\n        package: \"prettier\"\n        version: \"3.8.4\"\n    fallback:\n      path: \"prettier\"",
-        &format!("needs:\n  prettier:\n    default:\n      path: \"{}\"", script.display()),
+        "needs:\n  prettier:\n    default:\n      npm:\n        package: \"prettier\"\n        version: \"3.8.4\"",
+        &format!(
+            "needs:\n  prettier:\n    default:\n      path: \"{}\"",
+            script.display()
+        ),
     )
 }
 

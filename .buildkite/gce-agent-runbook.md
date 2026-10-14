@@ -204,27 +204,20 @@ This happened on the first GCE host: flunge's `MODULE.bazel` pinned `rules_mypy`
 
 ## Node
 
-```sh
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt-get install -y nodejs
-node --version && npx --version
-```
+checkleft provisions Node **24.8.0** itself for npm-backed checks such as
+`format/oxc` and `lint/oxc`. It downloads the official distribution, verifies
+an embedded SHA-256 digest, and publishes it atomically in its platform cache.
+The host Node installation and PATH order do not select the runtime.
 
-`checks` shells out to `npx --yes oxfmt@0.55.0` and `oxlint@1.70.0` via checkleft's declarative external-tool resolution. Node is a host package, not a Bazel toolchain — `MODULE.bazel` has no `rules_js`, `rules_nodejs`, or node `http_archive`.
+Give the agent write access to its normal cache directory and network access to
+`nodejs.org` for a cold runtime cache and the npm registry for package
+provisioning. On Linux the runtime and npm caches live under checkleft's
+directory in `$XDG_CACHE_HOME` (default `$HOME/.cache`). Both x86-64 and ARM64
+agents are supported.
 
-Node **≥ 22** specifically, enforced by `MIN_NODE_MAJOR_VERSION` in `tools/checkleft/src/external/declarative/resolve.rs:218`. A Node 20 host fails with `ERR_UNKNOWN_FILE_EXTENSION`, which does not look like a Node version problem.
-
-If the agent is already running, restart it so it picks up the new PATH:
-
-```sh
-sudo systemctl restart buildkite-agent
-```
-
-`checks` is a **required merge context** (`REQUIRED_CHECKS.md:19`), and `format/oxc`'s include glob covers `md, markdown, mdx, yaml, yml, toml, json, css, html`, so it fires on nearly every PR — including doc-only ones. Without Node a fresh host can run `bazel-build-test` fine but cannot pass PR CI at all.
-
-`mono-integrity` → `integrity-checkleft` (`.buildkite/steps/integrity-checkleft.sh:15`) also needs it. `bazel-build-test`, `mac-app-build`, `boss-release`, `checkleft-release` and `changelog-release` do not.
-
-There is a declared fallback to a bare `oxfmt`/`oxlint` on `PATH`, but on a host with neither `npx` nor those binaries it resolves to the bare name and then fails at spawn — it does not save you.
+The PR `checks` step and `mono-integrity`'s `integrity-checkleft` step use this
+same provisioner. There is no CI-specific Node bootstrap, version-floor guard,
+or fallback to host `oxfmt`/`oxlint`; provisioning failures fail the check.
 
 ## Configure the agent
 

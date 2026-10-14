@@ -213,3 +213,40 @@ A private scratch repo, [`brianduff/checkleft-sandbox`](https://github.com/brian
 
 - `checkleft` shells out to `git` or `jj` to discover repository state.
 - Some built-in checks are specific to Bazel- or monorepo-style workflows.
+
+### Check subprocess environment
+
+npm bindings use Node **24.8.0**, downloaded from nodejs.org and checked against
+embedded SHA-256 digests before extraction. The platform-specific distribution
+is published atomically in checkleft's platform cache directory. macOS and Linux
+on x86-64 and ARM64 are supported; other platforms fail closed. No host Node or
+npx is consulted. Cache misses require network access. Package versions remain
+pinned by each check's npm binding.
+
+Check invocations, fixes, version probes and provisioning subprocesses clear the
+ambient environment. PATH contains the resolved executable's directory, other declared tool directories, followed
+by `/usr/bin:/bin:/usr/sbin:/sbin`. HOME and XDG_CONFIG_HOME point to a temporary
+empty directory; LANG and LC_ALL are `C`, and TZ is `UTC`. The only inherited
+variables are RUNFILES_DIR, RUNFILES_MANIFEST_FILE and TEST_SRCDIR (Bazel tool
+runfiles), TMPDIR (temporary storage), and SYSTEMROOT (platform support), plus the network-transport variables HTTP_PROXY,
+HTTPS_PROXY, NO_PROXY, ALL_PROXY (upper and lower case), SSL_CERT_FILE,
+SSL_CERT_DIR and NODE_EXTRA_CA_CERTS.
+RUSTUP_TOOLCHAIN, NODE_OPTIONS, ambient npm settings and user configuration are absent.
+For npx, checkleft sets npm_config_cache to its own persistent cache and npm
+user/global config paths to the empty HOME.
+A check can explicitly declare string values in its CHECKS configuration under
+`config.environment`, including HOME when user configuration is intentional. PATH remains framework-owned
+and cannot be overridden.
+
+Bazel and Bazelisk launchers are exempt from clearing: they run with the
+caller's exact environment and the startup flags from `CI_BAZEL_STARTUP_FLAGS`
+only, so server and cache keys match ordinary builds. The one addition is
+`USE_BAZEL_VERSION`, set from workspace `.bazeliskrc` first, then `.bazelversion`,
+so the user version pin cannot override the repository pin. A conflicting inherited
+`USE_BAZEL_VERSION` is an error: unset it or match the repository pin. Other user
+`~/.bazeliskrc` keys, including `BAZELISK_BASE_URL` and `BAZELISK_HOME`, still apply;
+checkleft does not relocate Bazelisk caches or replace its download configuration.
+Hermeticity of Bazel actions belongs in the repository's `.bazelrc`.
+Repositories remain responsible for pinning their Bazel toolchains
+and explicit path bindings. `format/rust` requires its rules_rust wrapper:
+failure to resolve it is an error, with no PATH rustfmt fallback.

@@ -11,9 +11,6 @@
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
-# format/oxc and lint/oxc need npx on PATH; Linux GCE agents do not ship Node.
-source "$(dirname "${BASH_SOURCE[0]}")/ensure-node.sh"
-ensure_npx
 
 echo "--- [checks] running checks"
 # checkleft already defaults --show-progress off outside an interactive

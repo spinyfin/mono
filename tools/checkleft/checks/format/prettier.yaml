@@ -15,8 +15,7 @@ skip_symlinks: true
 #     pinned here to 3.8.4. The version is part of the package spec, so npx fetches
 #     and runs exactly that release regardless of any globally-installed copy — a
 #     reproducible tool without standing up a parallel Bazel JS toolchain (mono has
-#     no rules_js/node Bazel integration today; Node arrives on PATH via the planned
-#     CI bootstrap). Re-pin per-repo via CHECKS config, setting only the version
+#     no rules_js/node Bazel integration today; checkleft provisions Node). Re-pin per-repo via CHECKS config, setting only the version
 #     (package is inherited from this default `npm` binding):
 #
 #       checks:
@@ -27,11 +26,7 @@ skip_symlinks: true
 #                 npm:
 #                   version: "3.9.0"
 #
-#   - fallback: when `npx` is not on PATH (some local/non-CI environments), the
-#     framework uses `prettier` from PATH and warns loudly on stderr so you know the
-#     pinned toolchain was skipped. A repo that later adopts a hermetic Bazel JS
-#     toolchain can point `needs.prettier.bazel` at its prettier target via CHECKS
-#     config with no change to this definition.
+#   - Node and npx use checkleft's SHA-verified runtime pin.
 #   - Prettier discovers the REPO's own config (.prettierrc / prettier.config.*) and
 #     .prettierignore relative to the repo root (invocations run with cwd = repo
 #     root). checkleft imposes no formatting options of its own.
@@ -41,8 +36,6 @@ needs:
       npm:
         package: "prettier"
         version: "3.8.4"
-    fallback:
-      path: "prettier"
 
 invocations:
   - id: format

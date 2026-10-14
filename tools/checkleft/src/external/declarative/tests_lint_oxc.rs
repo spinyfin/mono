@@ -101,7 +101,7 @@ fn lint_oxc_args_use_json_format_and_no_error_on_unmatched() {
 }
 
 #[test]
-fn lint_oxc_needs_npm_default_pinned_to_1_70_0_with_path_fallback() {
+fn lint_oxc_needs_npm_default_pinned_to_1_70_0_without_host_fallback() {
     let package = parse_lint_oxc_package();
     let req = package.needs.get("oxlint").expect("oxlint binary must be declared");
     match &req.default {
@@ -112,8 +112,8 @@ fn lint_oxc_needs_npm_default_pinned_to_1_70_0_with_path_fallback() {
         other => panic!("default binding must be an npm version-pinned binding; got: {other:?}"),
     }
     assert!(
-        matches!(req.fallback, Some(super::BinaryBinding::Path(_))),
-        "fallback binding must be a PATH binary for non-npx environments; got: {:?}",
+        req.fallback.is_none(),
+        "host fallback must be absent; got: {:?}",
         req.fallback
     );
 }
@@ -299,7 +299,7 @@ fn lint_oxc_transform_uses_dynamic_severity() {
 
 fn lint_oxc_manifest_with_path_default(script: &Path) -> String {
     let replaced = LINT_OXC_MANIFEST.replace(
-        "needs:\n  oxlint:\n    default:\n      npm:\n        package: \"oxlint\"\n        version: \"1.70.0\"\n    fallback:\n      path: \"oxlint\"",
+        "needs:\n  oxlint:\n    default:\n      npm:\n        package: \"oxlint\"\n        version: \"1.70.0\"",
         &format!("needs:\n  oxlint:\n    default:\n      path: \"{}\"", script.display()),
     );
     assert_ne!(
