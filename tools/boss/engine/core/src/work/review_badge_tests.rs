@@ -1,6 +1,50 @@
 use super::*;
 
 #[test]
+fn review_family_uses_parent_index_and_preserves_cycle_semantics() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE tasks(id TEXT PRIMARY KEY, kind TEXT, parent_task_id TEXT);
+        CREATE INDEX idx_tasks_parent_task_id ON tasks(parent_task_id);
+        INSERT INTO tasks VALUES ('root','project_task',NULL), ('child','revision','root'),
+        ('grandchild','revision','child'), ('cycle-a','revision','cycle-b'),
+        ('cycle-b','revision','cycle-a'), ('unrelated','project_task',NULL);",
+    )
+    .unwrap();
+    let sql = format!(
+        "{} SELECT root, id, depth FROM family ORDER BY root,id,depth",
+        review_family_cte("?1,?2")
+    );
+    let rows = |query: &str| {
+        conn.prepare(query)
+            .unwrap()
+            .query_map(["grandchild", "cycle-a"], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows(&sql),
+        rows(&sql.replace(" INDEXED BY idx_tasks_parent_task_id", ""))
+    );
+    assert_eq!(rows(&sql).len(), 3);
+    let plan = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(["grandchild", "cycle-a"], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n");
+    assert!(
+        plan.contains("USING INDEX idx_tasks_parent_task_id (parent_task_id=?)"),
+        "{plan}"
+    );
+}
+
+#[test]
 fn review_badge_labels_and_icons_cover_every_state() {
     let history = ReviewBadgeHistory {
         verdict_payload: None,

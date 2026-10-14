@@ -83,6 +83,8 @@ final class EngineClient: @unchecked Sendable {
     // Accessed only on the serial decode queue.
     private var decodingGeneration = 0
     private var rejectedDecodeGeneration: Int?
+    // Accessed only on the serial decode queue.
+    private var workTreeCache = WorkTreeDeltaCache()
 
     private lazy var handoff = LineDecodeHandoff(
         maxPendingBytes: Self.maxPendingDecodeBytes,
@@ -353,6 +355,7 @@ final class EngineClient: @unchecked Sendable {
                 let recvNanos = PopulationTiming.now()
                 let generation = self.connectionGeneration
                 self.handoff.afterPendingLines { [weak self] in
+                    self?.workTreeCache.startConnection(generation)
                     self?.decodingGeneration = generation
                 }
                 let lines = self.frameLines().map { (data: $0, recvNanos: recvNanos) }
@@ -409,8 +412,8 @@ final class EngineClient: @unchecked Sendable {
         let lineByteCount = lineData.count
 
         let envelope: [String: Any]
-        let payload: [String: Any]
-        let type: String
+        var payload: [String: Any]
+        var type: String
         do {
             (envelope, payload, type) = try Self.decodeEnvelope(lineData)
         } catch {
@@ -421,6 +424,20 @@ final class EngineClient: @unchecked Sendable {
                 self.closeConnection()
             }
             return
+        }
+        if type == "work_tree_update" {
+            guard let update = payload["update"] as? [String: Any],
+                  let tree = workTreeCache.apply(update) else {
+                if let update = payload["update"] as? [String: Any],
+                   let productID = update["product_id"] as? String {
+                    sendLine(["type": "get_work_tree", "product_id": productID, "delta": false])
+                }
+                return
+            }
+            payload = tree
+            type = "work_tree"
+        } else if type == "work_tree" {
+            workTreeCache.resetBase()
         }
         let envelopeRequestId = envelope["request_id"] as? String
 

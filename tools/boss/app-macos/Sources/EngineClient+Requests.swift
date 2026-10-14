@@ -289,6 +289,7 @@ extension EngineClient {
         let fetchSeq = PopulationTiming.shared.fetchIssued(productId: productId, flow: flow)
         sendLine([
             "type": "get_work_tree",
+            "delta": true,
             "product_id": productId,
             "fetch_seq": fetchSeq,
         ], queueIfDisconnected: true)

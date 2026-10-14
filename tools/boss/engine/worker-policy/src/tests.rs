@@ -660,6 +660,30 @@ fn work_tree_strips_ideas_for_workers() {
 }
 
 #[test]
+fn work_tree_updates_strip_ideas_for_workers() {
+    for base_sequence in [None, Some(1)] {
+        let event = FrontendEvent::WorkTreeUpdate {
+            update: boss_protocol::work_tree_delta::WorkTreeUpdate {
+                product_id: "prod_1".into(),
+                sequence: 2,
+                base_sequence,
+                changes: serde_json::json!({"ideas": [{"body": "private draft"}], "tasks": []}),
+            },
+        };
+        let FrontendEvent::WorkTreeUpdate { update } = sanitize_event_for_worker(event) else {
+            panic!("update")
+        };
+        assert!(!serde_json::to_string(&update).unwrap().contains("private draft"));
+        assert_eq!(update.changes["tasks"], serde_json::json!([]));
+        if base_sequence.is_none() {
+            assert_eq!(update.changes["ideas"], serde_json::json!([]));
+        } else {
+            assert!(update.changes.get("ideas").is_none());
+        }
+    }
+}
+
+#[test]
 fn idea_verbs_stay_closed_and_get_work_tree_stays_allowed() {
     for request in [
         FrontendRequest::CreateIdea {
@@ -687,6 +711,7 @@ fn idea_verbs_stay_closed_and_get_work_tree_stays_allowed() {
         assert_eq!(denial.reason, WorkerTierDenialReason::CoordinatorOnly);
     }
     assert_allowed(FrontendRequest::GetWorkTree {
+        delta: false,
         product_id: "prod_1".into(),
         fetch_seq: None,
     });

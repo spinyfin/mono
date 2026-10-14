@@ -593,6 +593,14 @@ pub(super) async fn publish_work_invalidation(
     product_id: Option<String>,
     item_ids: Vec<String>,
 ) -> u64 {
+    tracing::info!(
+        source = "mutation",
+        reason,
+        product_id = ?product_id,
+        item_count = item_ids.len(),
+        topic_count = topics.len(),
+        "work invalidation fanout"
+    );
     if let Some(product_id) = product_id.as_deref() {
         match server_state.work_db.reconcile_product_executions(product_id) {
             Ok(result) => {
@@ -732,6 +740,14 @@ pub(super) async fn publish_batch_work_invalidation(
 
     let revision = server_state.bump_work_revision();
     for (product_id, item_ids) in by_product {
+        tracing::info!(
+            source = "batch_mutation",
+            reason,
+            product_id = %product_id,
+            item_count = item_ids.len(),
+            topic_count = 1,
+            "work invalidation fanout"
+        );
         let topic = work_product_topic(&product_id);
         let event = FrontendEvent::TopicEvent {
             topic: topic.clone(),

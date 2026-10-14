@@ -128,6 +128,7 @@ async fn fetch_work_tree(client: &mut BossClient, product_id: &str) -> Result<(D
         .send_request(&FrontendRequest::GetWorkTree {
             product_id: product_id.to_owned(),
             fetch_seq: None,
+            delta: false,
         })
         .await?;
     let elapsed = started.elapsed();

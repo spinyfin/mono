@@ -366,8 +366,12 @@ struct SinkWakers {
 /// invalidations out by calling `enqueue`; the writer task drains via
 /// `next`; if either side decides the session is slow or finished, it
 /// `close`s the sink and `trigger_shutdown` stops the reader.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub(super) struct SessionSink {
+    #[builder(default = StdMutex::new(SessionQueue::new()))]
     pub(super) queue: StdMutex<SessionQueue>,
+    #[builder(skip)]
     wakers: SinkWakers,
     shutdown: StdMutex<Option<oneshot::Sender<()>>>,
     /// In-flight population-timing traces for this session, keyed by the
@@ -377,22 +381,20 @@ pub(super) struct SessionSink {
     /// appends the `serialize` / `socket_write` / `total` segments, and
     /// flushes. Empty for every non-population request. See
     /// [`crate::population_timing`].
+    #[builder(default)]
     pop_traces: StdMutex<HashMap<String, crate::population_timing::PopulationTrace>>,
+    #[builder(default)]
+    pub(super) work_tree_cache: StdMutex<boss_protocol::work_tree_delta::WorkTreeCache>,
     /// One-shot acknowledgements for responses whose producer must know that
     /// the writer has flushed the frame before it can safely tear down the
     /// caller's process tree.
+    #[builder(default)]
     delivery_waiters: StdMutex<HashMap<String, oneshot::Sender<bool>>>,
 }
 
 impl SessionSink {
     pub(super) fn new(shutdown_tx: oneshot::Sender<()>) -> Self {
-        Self {
-            queue: StdMutex::new(SessionQueue::new()),
-            wakers: SinkWakers::default(),
-            shutdown: StdMutex::new(Some(shutdown_tx)),
-            pop_traces: StdMutex::new(HashMap::new()),
-            delivery_waiters: StdMutex::new(HashMap::new()),
-        }
+        Self::builder().shutdown(StdMutex::new(Some(shutdown_tx))).build()
     }
 
     /// Stash a partial population-timing trace to be completed by the writer
