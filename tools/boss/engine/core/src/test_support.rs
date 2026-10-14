@@ -1154,6 +1154,7 @@ pub fn make_dispatchable_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<E
 /// query helpers live in the `impl` block below.
 #[derive(Default)]
 pub struct RecordingPublisher {
+    pub contract_fetcher: Option<Arc<dyn crate::queue_ci_contract::ContractFetcher>>,
     pub publish_calls: Mutex<Vec<(String, String, String, String)>>,
     pub events: Mutex<Vec<(String, String, String)>>,
     pub typed_events: Mutex<Vec<(String, FrontendEvent)>>,
@@ -1224,6 +1225,13 @@ impl RecordingPublisher {
 
 #[async_trait]
 impl ExecutionPublisher for RecordingPublisher {
+    async fn snapshot_queue_ci_contract(&self, pr_url: &str, checks: &str) -> anyhow::Result<String> {
+        match &self.contract_fetcher {
+            Some(fetcher) => crate::queue_ci_contract::snapshot_with(fetcher.as_ref(), pr_url, checks).await,
+            None => Ok(checks.to_owned()),
+        }
+    }
+
     async fn publish(&self, execution_id: &str, work_item_id: &str, status: &str, reason: &str) {
         self.publish_calls.lock().await.push((
             execution_id.to_owned(),

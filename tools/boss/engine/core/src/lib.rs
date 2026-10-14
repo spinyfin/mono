@@ -26,6 +26,7 @@ pub mod build_wait;
 pub mod build_wait_tracker;
 pub use boss_ci_log_reader as ci_log_reader;
 pub mod ci_watch;
+mod queue_ci_contract;
 pub use boss_claude_client as claude_client;
 pub mod cli;
 pub use boss_comment_anchor as comments_anchor;

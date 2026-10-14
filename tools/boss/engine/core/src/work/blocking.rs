@@ -1031,26 +1031,31 @@ impl WorkDb {
         Ok(exists)
     }
 
-    /// Epoch-seconds time the latest retired (verified-requeue) attempt for
-    /// this PR head was created. Verified requeues archive only the newest
-    /// queue construction's dedup key, so every older coalesced failure at
-    /// this head is pre-requeue history. All of those failures were already
-    /// on the timeline when the attempt was detected, so they precede its
-    /// creation; anchoring to the episode (not the delivery time) keeps a real
-    /// failure of the requeued construction, which lands after detection but
-    /// possibly before the proposal is applied, from being skipped.
+    /// Epoch-seconds boundary below which same-head queue failures are
+    /// pre-requeue history. A verified requeue archives only the newest queue
+    /// construction's dedup key, so older failures coalesced into the retired
+    /// attempt after its detection no longer match any row. The boundary is
+    /// the requeue itself: the persisted receipt's `enqueuedAt`, so a failure of the requeued construction (whose dequeue
+    /// follows `enqueuedAt`) still mints. Rows without a recorded receipt time
+    /// fall back to the attempt's creation, the best pre-receipt anchor.
     pub fn verified_requeue_boundary(&self, work_item_id: &str, pr_head_sha: &str) -> Result<Option<i64>> {
         let conn = self.connect()?;
-        let boundary: Option<i64> = conn.query_row(
-            "SELECT MAX(CAST(created_at AS INTEGER)) FROM ci_remediations
-              WHERE work_item_id = ?1
-                AND failure_kind = 'merge_queue_rebounce'
-                AND failure_reason = 'verified_requeue'
-                AND head_sha_at_trigger LIKE 'mq:' || ?2 || '@%'",
+        Ok(conn.query_row(
+            "SELECT MAX(COALESCE(requeue_enqueued_at, CAST(created_at AS INTEGER))) FROM ci_remediations
+             WHERE work_item_id = ?1 AND failure_kind = 'merge_queue_rebounce'
+             AND failure_reason = 'verified_requeue' AND head_sha_at_trigger LIKE 'mq:' || ?2 || '@%'",
             params![work_item_id, pr_head_sha],
             |row| row.get(0),
+        )?)
+    }
+
+    /// Replace the delivery-time receipt boundary with GitHub's authoritative time.
+    pub(crate) fn correct_requeue_boundary(&self, attempt_id: &str, enqueued_at: i64) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE ci_remediations SET requeue_enqueued_at = ?2 WHERE id = ?1 AND failure_reason = 'verified_requeue'",
+            params![attempt_id, enqueued_at],
         )?;
-        Ok(boundary)
+        Ok(())
     }
 
     /// Read a `ci_remediations` row by id, terminal or not. Returns
@@ -2235,6 +2240,101 @@ mod tests {
 
     fn mem_db() -> WorkDb {
         WorkDb::open(PathBuf::from(":memory:")).unwrap()
+    }
+
+    /// A retired `verified_requeue` attempt created at `created`, with an
+    /// applied `delivered` declaration carrying `enqueued_at` (when given).
+    fn retired_requeue(
+        db: &WorkDb,
+        product_id: &str,
+        parent: &str,
+        created: i64,
+        queue_sha: &str,
+        enqueued_at: Option<&str>,
+    ) {
+        let revision = crate::test_support::create_test_chore(db, product_id.to_owned(), format!("CI fix {queue_sha}"));
+        let execution = crate::test_support::create_ready_chore_execution(db, revision.id.clone());
+        let attempt = db
+            .insert_ci_remediation(crate::work::CiRemediationInsertInput {
+                product_id: product_id.to_owned(),
+                work_item_id: parent.to_owned(),
+                pr_url: "https://github.com/spinyfin/mono/pull/9".into(),
+                pr_number: 9,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: format!("mq:{}@{queue_sha}", "b".repeat(40)),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+                failure_kind: "merge_queue_rebounce".into(),
+                before_commit_sha: Some(queue_sha.to_owned()),
+            })
+            .unwrap()
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE ci_remediations SET created_at = ?2, failure_reason = 'verified_requeue', revision_task_id = ?3, requeue_enqueued_at = ?4 WHERE id = ?1",
+            params![attempt.id, created.to_string(), revision.id, enqueued_at.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.timestamp())],
+        )
+        .unwrap();
+        let mut evidence = boss_protocol::QueueCiEvidence::builder()
+            .main_sha("a".repeat(40))
+            .verified_head_sha("b".repeat(40))
+            .queue_sha(queue_sha)
+            .queue_base_sha("d".repeat(40))
+            .runs(vec![])
+            .build();
+        evidence.queue_entry_enqueued_at = enqueued_at.map(str::to_owned);
+        let payload = boss_protocol::RunDoneProposalPayload {
+            outcome: boss_protocol::RunDoneOutcome::Delivered,
+            summary: String::new(),
+            question: None,
+            queue_ci_evidence: Some(evidence),
+        };
+        conn.execute(
+            "INSERT INTO worker_proposals (id, execution_id, work_item_id, kind, payload_json, idempotency_key, state, created_at)
+             VALUES (?1, ?2, ?3, 'run_done', ?4, 'k', 'applied', '1')",
+            params![
+                format!("prop-{}", attempt.id),
+                execution.id,
+                revision.id,
+                serde_json::to_string(&payload).unwrap()
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verified_requeue_boundary_follows_enqueued_at_with_creation_fallback_and_max() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let parent = crate::test_support::create_test_chore(&db, product.id.clone(), "Parent");
+        let head = "b".repeat(40);
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), None);
+        // No recorded enqueuedAt: fall back to the attempt's creation.
+        retired_requeue(&db, &product.id, &parent.id, 1_000, &"c".repeat(40), None);
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), Some(1_000));
+        // A recorded enqueuedAt after creation moves the boundary to it.
+        retired_requeue(
+            &db,
+            &product.id,
+            &parent.id,
+            1_100,
+            &"d".repeat(40),
+            Some("1970-01-01T00:30:00Z"),
+        );
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), Some(1_800));
+        // The newest boundary across attempts wins; authoritative enqueue
+        // times are not raised to a later detection time.
+        retired_requeue(
+            &db,
+            &product.id,
+            &parent.id,
+            5_000,
+            &"e".repeat(40),
+            Some("1970-01-01T00:01:00Z"),
+        );
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &head).unwrap(), Some(1_800));
+        assert_eq!(db.verified_requeue_boundary(&parent.id, &"f".repeat(40)).unwrap(), None);
     }
 
     #[test]

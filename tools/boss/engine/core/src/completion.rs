@@ -88,6 +88,7 @@ mod metadata_gate;
 mod no_op;
 mod nudge;
 mod pr_transition;
+mod queue_ci_audit;
 mod recheck;
 mod release;
 mod remediation;
@@ -711,6 +712,33 @@ pub trait BranchVerifier: Send + Sync {
     /// second `gh pr view` call. An empty body is a valid value (not an
     /// error), unlike the head-ref fetches.
     async fn fetch_pr_title_and_body(&self, repo_slug: &str, pr_number: u64) -> Result<(String, String)>;
+
+    /// True when `base` is an ancestor of (or identical to) `head`, from
+    /// GitHub's compare status (`ahead` / `identical`). Used by the queue-CI
+    /// evidence audit to confirm a verified tree really contained `main`.
+    /// Unsupported by default so verifiers that cannot answer skip the audit.
+    async fn fetch_is_ancestor(&self, _repo_slug: &str, _base: &str, _head: &str) -> Result<bool> {
+        Err(anyhow!("ancestry lookup unsupported by this verifier"))
+    }
+
+    async fn fetch_queue_dequeues(
+        &self,
+        _repo_slug: &str,
+        _pr_number: u64,
+    ) -> Result<Vec<crate::merge_poller::MergeQueueDequeueEvent>> {
+        Err(anyhow!("queue timeline lookup unsupported by this verifier"))
+    }
+
+    /// The PR's state, head OID and live merge-queue entry (id, enqueuedAt)
+    /// in one read. Used by the queue-CI evidence audit to check a
+    /// worker-supplied `enqueuePullRequest` receipt against GitHub.
+    async fn fetch_pr_merge_queue_snapshot(
+        &self,
+        _repo_slug: &str,
+        _pr_number: u64,
+    ) -> Result<boss_github::gh_runner::PrMergeQueueSnapshot> {
+        Err(anyhow!("merge-queue entry lookup unsupported by this verifier"))
+    }
 }
 
 /// `BranchVerifier` that shells out to `gh pr view`.
@@ -758,6 +786,36 @@ impl BranchVerifier for CommandBranchVerifier {
 
     async fn fetch_pr_title_and_body(&self, repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
         fetch_pr_title_and_body_cmd(repo_slug, pr_number).await
+    }
+
+    async fn fetch_is_ancestor(&self, repo_slug: &str, base: &str, head: &str) -> Result<bool> {
+        let status = gh_scope(callers::COMPLETION, gh_compare_jq(repo_slug, base, head, ".status")).await?;
+        Ok(matches!(status.as_str(), "ahead" | "identical"))
+    }
+
+    async fn fetch_queue_dequeues(
+        &self,
+        repo_slug: &str,
+        pr_number: u64,
+    ) -> Result<Vec<crate::merge_poller::MergeQueueDequeueEvent>> {
+        let url = format!("https://github.com/{repo_slug}/pull/{pr_number}");
+        let mut events = crate::merge_poller::fetch_merge_queue_dequeue_events_batch(std::slice::from_ref(&url)).await;
+        events.remove(&url).context("queue timeline unavailable")
+    }
+
+    async fn fetch_pr_merge_queue_snapshot(
+        &self,
+        repo_slug: &str,
+        pr_number: u64,
+    ) -> Result<boss_github::gh_runner::PrMergeQueueSnapshot> {
+        let (owner, name) = repo_slug
+            .split_once('/')
+            .with_context(|| format!("invalid repo slug `{repo_slug}`"))?;
+        gh_scope(
+            callers::COMPLETION,
+            boss_github::gh_runner::pr_merge_queue_snapshot(owner, name, pr_number),
+        )
+        .await
     }
 }
 

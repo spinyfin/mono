@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 40;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 41;
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -93,6 +93,9 @@ impl WorkDb {
         }
         if version < 40 {
             tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")?;
+        }
+        if version < 41 {
+            tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -593,6 +596,7 @@ mod floor_tests {
             35,
             36,
             38,
+            40,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -628,6 +632,10 @@ mod floor_tests {
                 conn.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")
                     .unwrap();
             }
+            if version >= 41 {
+                conn.execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
+                    .unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -652,6 +660,9 @@ mod floor_tests {
                 .unwrap();
             expected
                 .execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")
+                .unwrap();
+            expected
+                .execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
                 .unwrap();
             let before = capture(&expected);
             drop(conn);

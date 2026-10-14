@@ -311,7 +311,32 @@ impl WorkerCompletionHandler {
         {
             return StopOutcome::DbError;
         }
+        self.spawn_blocked_queue_ci_audit(execution);
         StopOutcome::RunDoneDeclaredWithoutDelivery { detail }
+    }
+
+    /// Post-hoc audit of a queue-CI `blocked` declaration's evidence (its
+    /// `main_sha` ancestry), off the termination path like the delivery audit.
+    /// A no-op for a declaration without queue-CI evidence. The PR is the
+    /// attempt's own, since a blocked run resolves none.
+    fn spawn_blocked_queue_ci_audit(&self, execution: &crate::work::WorkExecution) {
+        let branch_verifier = self.branch_verifier.clone();
+        let work_db = self.work_db.clone();
+        let publisher = self.publisher.clone();
+        let (execution_id, work_item_id) = (execution.id.clone(), execution.work_item_id.clone());
+        let repo_remote_url = execution.repo_remote_url.clone();
+        tokio::spawn(async move {
+            super::queue_ci_audit::audit_queue_ci_delivery(
+                branch_verifier.as_ref(),
+                &work_db,
+                publisher.as_ref(),
+                &execution_id,
+                &work_item_id,
+                &repo_remote_url,
+                "",
+            )
+            .await;
+        });
     }
 
     /// Post-hoc audit for a `delivered` declaration that WAS terminalized
@@ -327,6 +352,26 @@ impl WorkerCompletionHandler {
     /// silently accepting the declaration is correct (refusing would only
     /// punish executions that predate reliable snapshotting).
     fn spawn_declared_delivery_audit(&self, execution: &crate::work::WorkExecution, work_item_id: &str, pr_url: &str) {
+        {
+            let branch_verifier = self.branch_verifier.clone();
+            let work_db = self.work_db.clone();
+            let publisher = self.publisher.clone();
+            let (execution_id, work_item_id, pr_url) =
+                (execution.id.clone(), work_item_id.to_owned(), pr_url.to_owned());
+            let repo_remote_url = execution.repo_remote_url.clone();
+            tokio::spawn(async move {
+                super::queue_ci_audit::audit_queue_ci_delivery(
+                    branch_verifier.as_ref(),
+                    &work_db,
+                    publisher.as_ref(),
+                    &execution_id,
+                    &work_item_id,
+                    &repo_remote_url,
+                    &pr_url,
+                )
+                .await;
+            });
+        }
         let Some(pr_head_before) = execution.pr_head_before.clone().filter(|s| !s.is_empty()) else {
             return;
         };

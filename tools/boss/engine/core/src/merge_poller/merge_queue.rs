@@ -361,10 +361,11 @@ pub(crate) async fn check_merge_queue_rebounce(
         }
         // A verified requeue archives only the newest queue construction's
         // dedup key, so older coalesced failures at this head no longer match
-        // any row. They are pre-requeue history: ignore every dequeue at or
-        // before the creation of the retired attempt (the boundary is the
-        // episode, not the delivery time, so a failure of the requeued
-        // construction landing before the proposal is applied still mints).
+        // any row. Ignore every dequeue at or before the requeue itself: the
+        // receipt's `enqueuedAt`, falling back to the retired attempt's
+        // creation when none was recorded. A failure of the requeued
+        // construction follows `enqueuedAt`, so it still mints even if it
+        // lands before the proposal is applied.
         match work_db.verified_requeue_boundary(&candidate.work_item_id, pr_head_sha) {
             Ok(Some(boundary)) => {
                 let created = event

@@ -468,6 +468,9 @@ pub struct TrunkEvictionBuild {
     /// parse, so callers can hand the result straight to those helpers.
     pub web_url: String,
     pub failed_job_ids: Vec<String>,
+    /// Buildkite step key (or, failing that, job name) of each entry in
+    /// `failed_job_ids`, index-aligned; empty when the job carries neither.
+    pub failed_job_labels: Vec<String>,
 }
 
 /// Pages of the org-wide failed-build search [`find_trunk_merge_eviction_build`]
@@ -478,6 +481,31 @@ pub struct TrunkEvictionBuild {
 /// build pushed past the first page against not hammering the API on a
 /// lookup that is already degrading gracefully to an empty result.
 const MAX_EVICTION_BUILD_SEARCH_PAGES: u32 = 3;
+
+/// Resolve a provider job UUID to the stable pipeline step key.
+pub async fn fetch_buildkite_step_key(binary: &str, url: &str, job_id: &str) -> Result<String> {
+    let path = url
+        .strip_prefix("https://buildkite.com/")
+        .context("invalid Buildkite URL")?;
+    let parts: Vec<_> = path.split('#').next().unwrap_or_default().split('/').collect();
+    anyhow::ensure!(parts.len() == 4 && parts[2] == "builds", "invalid Buildkite build URL");
+    let endpoint = format!("/organizations/{}/pipelines/{}/builds/{}", parts[0], parts[1], parts[3]);
+    let output = run_capture(binary, &["api", &endpoint]).await?;
+    parse_buildkite_step_key(&output, job_id)
+}
+
+fn parse_buildkite_step_key(output: &str, job_id: &str) -> Result<String> {
+    let build: serde_json::Value = serde_json::from_str(output)?;
+    build["jobs"]
+        .as_array()
+        .context("missing jobs")?
+        .iter()
+        .find(|job| job["id"].as_str() == Some(job_id))
+        .and_then(|job| job["step_key"].as_str())
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .context("missing stable Buildkite step key")
+}
 
 /// Discover the newest failed/failing Buildkite build whose branch is the
 /// gating `trunk-merge/pr-<pr_number>/*` construction branch for a Trunk
@@ -548,18 +576,27 @@ fn parse_trunk_eviction_build(builds: &serde_json::Value, branch_prefix: &str) -
         let pipeline_slug = build.get("pipeline")?.get("slug")?.as_str()?.to_owned();
         let build_number = build.get("number")?.as_u64()?.to_string();
         let web_url = build.get("web_url")?.as_str()?.to_owned();
-        let failed_job_ids = build
+        let (failed_job_ids, failed_job_labels) = build
             .get("jobs")?
             .as_array()?
             .iter()
             .filter(|job| job.get("state").and_then(|s| s.as_str()) == Some("failed"))
-            .filter_map(|job| job.get("id")?.as_str().map(str::to_owned))
-            .collect();
+            .filter_map(|job| {
+                let id = job.get("id")?.as_str()?.to_owned();
+                let label = ["step_key", "name"]
+                    .iter()
+                    .find_map(|k| job.get(*k)?.as_str().filter(|s| !s.trim().is_empty()))
+                    .unwrap_or_default()
+                    .to_owned();
+                Some((id, label))
+            })
+            .unzip();
         Some(TrunkEvictionBuild {
             pipeline_slug,
             build_number,
             web_url,
             failed_job_ids,
+            failed_job_labels,
         })
     })
 }
@@ -743,7 +780,7 @@ mod tests {
             "pipeline": { "slug": pipeline },
             "number": number,
             "web_url": web_url,
-            "jobs": job_states.iter().map(|(id, state)| serde_json::json!({"id": id, "state": state})).collect::<Vec<_>>(),
+            "jobs": job_states.iter().map(|(id, state)| serde_json::json!({"id": id, "state": state, "step_key": format!("{id}-key")})).collect::<Vec<_>>(),
         })
     }
 
@@ -761,6 +798,7 @@ mod tests {
         assert_eq!(found.build_number, "2364");
         assert_eq!(found.web_url, "https://buildkite.com/flunge/flunge-ci/builds/2364");
         assert_eq!(found.failed_job_ids, vec!["job-abc".to_owned()]);
+        assert_eq!(found.failed_job_labels, vec!["job-abc-key".to_owned()]);
     }
 
     #[test]
@@ -1293,5 +1331,21 @@ exit 2
             let msg = format!("{err:#}");
             assert!(msg.contains("auth required"), "stderr missing: {msg}");
         }
+    }
+}
+
+#[cfg(test)]
+mod verification_identity_tests {
+    #[test]
+    fn step_key_is_resolved_by_job_id_never_by_display_label() {
+        let build = r#"{"jobs":[{"id":"other","step_key":"frontend"},{"id":"failed","name":"Friendly label","step_key":"mac-app-build"}]}"#;
+        assert_eq!(
+            super::parse_buildkite_step_key(build, "failed").unwrap(),
+            "mac-app-build"
+        );
+        assert!(super::parse_buildkite_step_key(build, "absent").is_err());
+        assert!(
+            super::parse_buildkite_step_key(r#"{"jobs":[{"id":"failed","name":"label-only"}]}"#, "failed").is_err()
+        );
     }
 }
