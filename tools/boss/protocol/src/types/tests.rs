@@ -973,6 +973,7 @@ fn ci_remediation_roundtrips_with_all_fields() {
         finished_at: Some("1747000100".into()),
         failure_kind: Some("pr_branch_ci".into()),
         before_commit_sha: None,
+        queue_base_sha: None,
         revision_task_id: None,
     };
     let raw = serde_json::to_value(&attempt).unwrap();
@@ -1107,6 +1108,7 @@ fn ci_remediation_pending_skips_optional_fields_on_encode() {
         finished_at: None,
         failure_kind: None,
         before_commit_sha: None,
+        queue_base_sha: None,
         revision_task_id: None,
     };
     let encoded = serde_json::to_value(&attempt).unwrap();
@@ -2009,6 +2011,7 @@ fn run_done_outcome_display_and_parse_are_inverses() {
 #[test]
 fn run_done_payload_roundtrips() {
     let payload = RunDoneProposalPayload {
+        queue_ci_evidence: None,
         outcome: RunDoneOutcome::Delivered,
         summary: "opened https://github.com/foo/bar/pull/1 with the md5 crate swap".into(),
         question: None,

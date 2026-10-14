@@ -1044,6 +1044,7 @@ fn sample_ci_attempt() -> crate::work::CiRemediation {
             finished_at: None,
             failure_kind: None,
             before_commit_sha: None,
+            queue_base_sha: None,
             revision_task_id: Some("task-rev-1".into()),
         }
 }
@@ -1655,7 +1656,7 @@ fn trunk_eviction_prompt_keeps_the_rebase_playbook_when_a_build_was_captured() {
         "no bail-out when there is a real failing build to fix:\n{prompt}",
     );
     assert!(
-        prompt.contains("### Action: rebase onto the target branch, then fix the semantic conflict"),
+        prompt.contains("rebase this PR's changes onto current `main@origin`"),
         "the rebase-and-fix playbook must survive for a genuine test failure:\n{prompt}",
     );
     assert!(
@@ -1670,8 +1671,8 @@ fn ci_remediation_prompt_omits_mark_noop_for_rebounce() {
     // commit, so the PR's head-branch checks always read green. The
     // engine REJECTS a rebounce noop outright
     // (`handle_mark_ci_remediation_noop`), so the brief must NOT
-    // surface it — mirroring the `!is_rebounce` gate in the sibling
-    // `compose_ci_remediation_fragment`. (A rebounce normally
+    // surface it — as `compose_ci_remediation_fragment` also omits it by
+    // routing every rebounce into the queue CI fragment. (A rebounce normally
     // delivers via a revision; the stranded-rescue path can still
     // re-dispatch one through this bespoke prompt.)
     let mut attempt = sample_ci_attempt();
@@ -1695,6 +1696,47 @@ fn ci_remediation_prompt_omits_mark_noop_for_rebounce() {
         prompt.contains("CI remediation: PR #"),
         "expected the bespoke ci_remediation prompt to be generated:\n{prompt}",
     );
+}
+
+#[test]
+fn merge_queue_brief_names_failure_source_and_requires_rebased_bazel_evidence() {
+    let mut attempt = sample_ci_attempt();
+    attempt.failure_kind = Some("merge_queue_rebounce".into());
+    attempt.before_commit_sha = Some("queue-commit".into());
+    attempt.failed_checks = r#"[{"name":"bazel-build-test","conclusion":"FAILURE","target_url":"https://buildkite.com/flunge/mono/builds/20619","provider":"buildkite"}]"#.into();
+    attempt.queue_base_sha = Some("historical-base".into());
+    let prompt = compose_ci_remediation_fragment(&attempt);
+    for required in [
+        "Failure source: the failing merge-queue build",
+        "builds/20619",
+        "queue-commit",
+        "historical-base",
+        "current `main@origin`",
+        "EVERY failed test target",
+        "FULL build/test invocation",
+        "--queue-ci-evidence-file",
+        "enqueuePullRequest",
+        "expectedHeadOid",
+        "no code changed",
+    ] {
+        assert!(prompt.contains(required), "missing {required}: {prompt}");
+    }
+    attempt.failed_checks = "[]".into();
+    attempt.queue_base_sha = Some("empty-capture-base".into());
+    assert!(compose_ci_remediation_fragment(&attempt).contains("empty-capture-base"));
+    attempt.failure_kind = Some("trunk_queue_eviction".into());
+    attempt.failed_checks = "{malformed".into();
+    assert!(compose_ci_remediation_fragment(&attempt).contains("Merge-queue CI verification"));
+    let legacy = compose_ci_remediation_prompt(
+        &ci_remediation_execution(&attempt.pr_url),
+        &chore_without_pr(),
+        std::path::Path::new("/tmp/workspace"),
+        None,
+        &attempt,
+        None,
+    );
+    assert!(legacy.contains("Merge-queue CI verification"));
+    assert!(!prompt.contains("rely on CI to verify the push"));
 }
 
 #[test]

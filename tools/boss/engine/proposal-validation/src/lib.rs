@@ -278,11 +278,21 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
             let outcome = reader.required_enum::<RunDoneOutcome>("outcome");
             let summary = reader.required_text("summary", MAX_SHORT_FIELD_CHARS);
             let question = reader.operator_question(outcome);
+            let queue_ci_evidence = reader.raw("queue_ci_evidence").and_then(|value| {
+                match serde_json::from_value::<boss_protocol::QueueCiEvidence>(value.clone()) {
+                    Ok(evidence) => Some(evidence),
+                    Err(err) => {
+                        reader.error("queue_ci_evidence", err.to_string());
+                        None
+                    }
+                }
+            });
             reader.finish()?;
             to_json(&RunDoneProposalPayload {
                 outcome: outcome.unwrap_or(RunDoneOutcome::Blocked),
                 summary: summary.unwrap_or_default(),
                 question,
+                queue_ci_evidence,
             })
         }
         ProposalKind::Wait => {

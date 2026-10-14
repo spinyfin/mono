@@ -457,6 +457,12 @@ pub(super) async fn audit_declared_delivery(
     if head_now != pr_head_before {
         return;
     }
+    if work_db
+        .has_verified_queue_delivery(execution_id, &head_now)
+        .unwrap_or(false)
+    {
+        return;
+    }
     tracing::warn!(
         execution_id,
         work_item_id,

@@ -43,7 +43,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         &candidate(&product, &chore, pr),
         "pr-head-1",
         "sha-merge-1",
-        &[],
+        None,
         &one_failure(),
     )
     .await;
@@ -104,7 +104,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         &candidate(&product, &chore, pr),
         "pr-head-1",
         "sha-merge-1",
-        &[],
+        None,
         &one_failure(),
     )
     .await;
@@ -141,7 +141,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         &candidate(&product, &chore, pr),
         "pr-head-2",
         "sha-merge-2",
-        &[],
+        None,
         &one_failure(),
     )
     .await;

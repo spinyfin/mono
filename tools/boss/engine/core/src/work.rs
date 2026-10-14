@@ -680,6 +680,7 @@ mod products_design;
 mod proposal_apply;
 mod proposals;
 mod query_ensure;
+pub(crate) mod queue_ci_evidence;
 mod review_badge;
 mod review_batches;
 mod review_findings_followup;

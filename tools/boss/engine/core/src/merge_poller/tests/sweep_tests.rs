@@ -2096,7 +2096,7 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
         &rebounce_candidate,
         "original-pr-head",
         "synthetic-merge-sha",
-        &[],
+        None,
         // A failing check from the synthetic merge commit: a queue-side
         // failure with none is refused outright (there would be nothing for
         // the fix revision to act on).
@@ -2200,7 +2200,7 @@ async fn advanced_pr_head_retires_queue_attempt_and_new_failure_mints_again() {
             &candidate,
             "original-pr-head",
             "synthetic-queue-commit",
-            &[],
+            None,
             &[RequiredCheckFailure {
                 name: "ci/test".to_owned(),
                 conclusion: "FAILURE".to_owned(),

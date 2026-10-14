@@ -1818,6 +1818,79 @@ fn compose_merge_order_preservation_fragment(merged_siblings: &[String]) -> Stri
     out
 }
 
+fn compose_queue_ci_fragment(attempt: &CiRemediation) -> String {
+    let mut out = format!(
+        "\n## Merge-queue CI verification\n\nFailure source: the failing merge-queue build, its jobs and logs below. The PR head's checks are not evidence.\n\nPR: {}\nBranch: `{}`\nAttempt: `{}`\nQueue commit: `{}`\n\n### Failing required checks\n\n",
+        attempt.pr_url,
+        attempt.head_branch,
+        attempt.id,
+        attempt
+            .before_commit_sha
+            .as_deref()
+            .unwrap_or("resolve from the failing construction build"),
+    );
+    out.push_str(&render_failed_checks_markdown(&attempt.failed_checks).unwrap_or_else(||
+        "No checks captured. Resolve the failing build from the queue commit's commit statuses and check-runs; never substitute `gh pr checks`. If the build cannot be obtained, verification remains unsatisfied and the run must remain visibly failed.\n".into()));
+    if let Some(commands) = render_bk_log_commands(&attempt.failed_checks) {
+        out.push_str(&commands);
+    }
+    if let Some(base) = &attempt.queue_base_sha {
+        out.push_str(&format!(
+            "\nQueue base commit (first parent of the failing construction): `{base}`\n"
+        ));
+    }
+    if let Some(log) = &attempt.log_excerpt {
+        out.push_str(&format!("\nQueue job log excerpt:\n```\n{log}\n```\n"));
+    }
+    out.push_str(r#"
+Before any verdict (including flaky, infra, unfixable or cannot complete):
+
+1. Read the failing queue build's jobs and logs. Record its queue commit and queue base commit. Fetch the queue commit's parents with `gh api repos/<owner>/<repo>/commits/<queue-sha> --jq '.parents[].sha'` and use the build's checkout/merge metadata to identify the base (a batch can contain sibling PRs). This is the historical queue base, distinct from today's main. Fetch statuses at that queue SHA if the build was not captured: `gh api repos/<owner>/<repo>/commits/<queue-sha>/status`; also inspect `/check-runs`.
+2. Fetch `origin`, then rebase this PR's changes onto current `main@origin` using `"$CUBE_BIN" workspace rebase`. Resolve conflicts by integrating both sides. Record the full `main@origin` SHA and the final tested head SHA. Preserve and advance the execution recovery bookmarks after rebasing. Do this even if main is already an ancestor: verify and record that fact.
+3. On that main-rebased tree, use `bazel test` for EVERY failed test target, and `bazel build` for every failed build target. A fast whole-job failure requires the job's FULL build/test invocation and target set from its script, not one isolated test. Include all shards; do not use test filters, suppress tests, or bypass caches. Fix failures and repeat the affected verification. Record each command, output and real exit code. A passing rerun on the old PR branch does not count.
+4. Run `checkleft run`. Push substantive changes or a changed rebase through `"$CUBE_BIN" pr update` to the existing PR. If the verified head is unchanged, do not make an empty or cosmetic commit: requeue that same head as described below.
+
+Write a JSON evidence file, for example `/tmp/queue-ci-evidence.json`:
+```json
+{
+  "main_sha": "<full current origin/main SHA used for rebase>",
+  "verified_head_sha": "<full final tested PR head SHA>",
+  "queue_sha": "<full failing queue commit SHA>",
+  "queue_base_sha": "<full base SHA of that failing queue build>",
+  "runs": [{
+    "check_name": "<exact captured failing check name>",
+    "source_url": "<captured target_url including job fragment, or resolved HTTPS build URL if absent>",
+    "command": "bazel test //path:each_failed_target",
+    "exit_code": 0,
+    "output": "<Bazel result summary>",
+    "coverage": "<all failed targets from this job, or its full invocation for a whole-job failure>"
+  }]
+}
+```
+For a failing lint job, record `checkleft run` and its output as that job's verification command. Include every failing check name and job URL and every required build/test invocation. Only successful verification of this tree permits a terminal declaration. The engine rejects missing, incomplete, wrong-queue or failing evidence every time; repeating the declaration does not waive the gate. Do not classify from green PR-head checks, hand back coordinator resubmission, or use branch-CI noop/retrigger shortcuts for this queue failure. `engine ci classify` requires `--queue-ci-evidence-file` for every class except `tractable`; `tractable` is metadata and can be recorded before verification.
+
+If verification passed but a genuine external blocker prevents recovery, both `"$BOSS_BIN" engine ci mark-failed --attempt-id <attempt> --reason <reason> --queue-ci-evidence-file /tmp/queue-ci-evidence.json` and `"$BOSS_BIN" propose done --outcome blocked --summary <reason> --queue-ci-evidence-file /tmp/queue-ci-evidence.json` require that evidence. State the main SHA, targets and results in the summary too. An unsatisfied gate must stay loud; do not claim completion.
+"#);
+    if attempt.failure_kind.as_deref() == Some("merge_queue_rebounce") {
+        out.push_str(r#"
+### Re-enqueue the verified GitHub head
+
+If you pushed a changed head and its checks are still pending, arm normal queue entry with `gh pr merge <PR URL> --auto --squash --match-head-commit <verified_head_sha>` (use the repository's configured merge method). A successful request lets GitHub enqueue once checks pass; declare delivered with the verification evidence and stop without waiting for CI. An actual queue-entry receipt is required when delivering an unchanged head, whose already-green checks cannot establish any progress by themselves.
+
+GitHub's `enqueuePullRequest` mutation accepts the existing head SHA; a new SHA is not required. Read the PR node ID with `gh pr view <PR URL> --json id,headRefOid`, check that headRefOid equals verified_head_sha, and enqueue once using the tested SHA as the concurrency guard:
+```sh
+gh api graphql -f query='mutation($id: ID!, $head: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head}) { mergeQueueEntry { id } } }' -f id='<PR node ID>' -f head='<verified_head_sha>'
+```
+If already queued, read its existing entry ID with `gh api graphql -f query='query($id: ID!) { node(id: $id) { ... on PullRequest { headRefOid mergeQueueEntry { id } } } }' -f id='<PR node ID>'`. Put the returned entry ID in `queue_entry_id` in the evidence file. A rejected mutation is not a receipt: resolve its error, do not loop enqueue until green. This requests a normal queue build with all checks still required. Do not poll CI to completion.
+"#);
+    } else {
+        out.push_str("\n### Re-enter the Trunk queue\n\nDeclare the verified revision delivered. Boss's existing poller resubmits once the revision is in review and head CI is green; it does not require a changed head SHA. Do not submit a competing queue request.\n");
+    }
+    out.push_str("\nFinish with `\"$BOSS_BIN\" propose done --outcome delivered --summary <main-SHA-and-target-results> --queue-ci-evidence-file /tmp/queue-ci-evidence.json`. Verified requeue is a delivery even when no code changed. This queue-specific completion path replaces any generic requirement to produce a diff or new head SHA.\n");
+    out.push_str(check_bypass_prohibition_text());
+    out
+}
+
 /// Signal-specific fragment appended to `compose_revision_directive` when the
 /// revision was created with `created_via = "merge-conflict:<crz_id>"`.
 ///
@@ -2097,55 +2170,21 @@ fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> Strin
 /// bespoke `compose_ci_remediation_prompt` except that the branch/push spine
 /// is already covered by the shared revision directive.
 fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
-    let is_rebounce = attempt.failure_kind.as_deref() == Some("merge_queue_rebounce");
+    if crate::work::queue_ci_evidence::queue_ci_verification_required(attempt) {
+        return compose_queue_ci_fragment(attempt);
+    }
     let is_trunk_eviction = attempt.failure_kind.as_deref() == Some("trunk_queue_eviction");
-    // Both share the "PR's own head-branch CI is green" property — see
-    // `ci_watch::is_queue_side_failure_kind`.
-    let is_queue_side_failure = is_rebounce || is_trunk_eviction;
-
     let mut out = String::new();
     out.push_str("\n---\n\n");
 
-    if is_rebounce {
-        out.push_str(&format!(
-            "## CI remediation context: PR #{pr_num} ({kind}) — merge-queue FAILED_CHECKS\n\n",
-            pr_num = attempt.pr_number,
-            kind = attempt.attempt_kind,
-        ));
-        out.push_str(
-            "> **Important**: this is a **merge-queue rebounce**, not a per-PR CI failure.\n\
-             > - The PR's own required checks are **green** on its head SHA.\n\
-             > - **`gh pr checks` will show green** — this is expected and does NOT mean CI passed.\n\
-             >   Do NOT run `gh pr checks` and conclude there is nothing to fix. The actual failing\n\
-             >   build is on the **synthetic merge commit** on a `gh-readonly-queue/*` branch,\n\
-             >   listed under \"Failing required checks\" below with its build URL and job id.\n\
-             > - Root cause: something landed on `main` between this PR's CI run and its queue turn\n\
-             >   that is semantically incompatible. After fixing, **re-enqueue** the PR.\n\n",
-        );
-    } else if is_trunk_eviction {
+    if is_trunk_eviction {
         out.push_str(&format!(
             "## CI remediation context: PR #{pr_num} ({kind}) — Trunk merge-queue eviction\n\n",
             pr_num = attempt.pr_number,
             kind = attempt.attempt_kind,
         ));
         out.push_str(
-            "> **Important**: this PR was **evicted from the Trunk merge queue**, not a per-PR CI failure.\n\
-             > - The PR's own required checks are **green** on its head SHA.\n\
-             > - **`gh pr checks` will show green** — this is expected and does NOT mean CI passed.\n\
-             >   Do NOT run `gh pr checks` and conclude there is nothing to fix. The actual failing\n\
-             >   build ran on Trunk's ephemeral `trunk-merge/pr-<N>/<uuid>` construction branch,\n\
-             >   listed under \"Failing required checks\" below with its build URL and job id.\n\
-             > - Root cause: something landed on the target branch between this PR's CI run and its\n\
-             >   queue turn that is semantically incompatible. After fixing, just push and stop —\n\
-             >   Boss auto-resubmits the PR to the Trunk queue on the next poller pass, once this\n\
-             >   revision comes to rest and the PR's head CI reads green. Do NOT ask a human to\n\
-             >   re-run the merge, do NOT comment `/trunk merge` yourself, and do NOT run\n\
-             >   `gh pr merge` — that bypasses the queue and races the automatic resubmit.\n\
-             > - If a failing construction-branch build is listed below, **push a commit** that \
-             >   addresses it — the engine refuses every \"nothing to push\" terminal for a \
-             >   queue-side failure because the PR's head CI is green already and so proves nothing \
-             >   about that build. If no failing build is listed, do **not** invent one: follow the \
-             >   STOP section and `\"$BOSS_BIN\" engine ci mark-failed` rather than force-pushing.\n\n",
+            "> This PR was evicted from the Trunk merge queue without captured failing checks. Its head checks are green and do not explain the eviction. Investigate the queue rejection using the STOP section below; do not invent a failing build or force a new commit.\n\n",
         );
     } else {
         out.push_str(&format!(
@@ -2157,9 +2196,6 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
 
     if !attempt.head_branch.is_empty() {
         out.push_str(&format!("**Branch**: `{}`\n", attempt.head_branch));
-    }
-    if is_rebounce && let Some(ref sha) = attempt.before_commit_sha {
-        out.push_str(&format!("**Synthetic merge SHA** (fetch CI logs from here): `{sha}`\n",));
     }
     out.push_str(&format!(
         "**Head sha at trigger**: `{}`\n",
@@ -2176,25 +2212,12 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     // authoritative even with no construction build); this STOP section
     // is what keeps the worker from inventing a fix. Merge-queue rebounce
     // *may* land with empty checks when evidence enrichment misses; that
-    // path uses the generic directive below rather than the Trunk bail-out.
+    // path returns early into the queue CI fragment, never the Trunk bail-out.
     let trunk_eviction_without_evidence = is_trunk_eviction && captured_checks.is_none();
     match captured_checks {
         Some(md) => out.push_str(&md),
         None => {
-            if is_rebounce {
-                let sha_hint = attempt.before_commit_sha.as_deref().unwrap_or("<synthetic-merge-sha>");
-                out.push_str(&format!(
-                    "_The engine did not capture the failing checks for this merge-queue rebounce. \
-                     Do NOT use `gh pr checks` — it shows the PR-head checks, which are green. \
-                     Instead, fetch CI for the synthetic merge SHA directly. Prefer legacy commit \
-                     statuses when check-runs are empty (Buildkite on mono posts only those): \
-                     `gh api repos/<owner>/<repo>/commits/{sha_hint}/status \
-                     | jq '.statuses[] | select(.state == \"failure\" or .state == \"error\") | {{context, target_url}}'`; \
-                     also try check-runs: \
-                     `gh api repos/<owner>/<repo>/commits/{sha_hint}/check-runs \
-                     | jq '.check_runs[] | select(.conclusion == \"failure\") | {{name, details_url}}'`._\n",
-                ));
-            } else if is_trunk_eviction {
+            if is_trunk_eviction {
                 out.push_str(&format!(
                     "_The engine did not capture the failing checks for this Trunk queue eviction. \
                      Do NOT use `gh pr checks` — it shows the PR-head checks, which are green. \
@@ -2256,11 +2279,16 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              If every one of these says the PR is clean — no conflict, no sibling-in-queue collision, \
              and no failing `trunk-merge/pr-{pr_num}/*` build after an exhaustive search — that is your \
              answer: Trunk never got as far as testing, or the eviction has already cleared. Record it \
-             and stop:\n\n\
+             and stop. The engine accepts a give-up without evidence only with `--reason` one of \
+             `no-failing-build-found`, `merge-conflict` or `sibling-collision`:\n\n\
              ```\n\
-             \"$BOSS_BIN\" engine ci classify --attempt-id {attempt} --class unfixable\n\
              \"$BOSS_BIN\" engine ci mark-failed --attempt-id {attempt} --reason no-failing-build-found\n\
              ```\n\n\
+             **If the search DOES find a failing `trunk-merge/pr-{pr_num}/*` build**, this is a real \
+             merge-queue CI failure: rebase onto current `main@origin`, run every failed target with \
+             Bazel (the full job invocation for whole-job failures), and give up or deliver only \
+             with `--queue-ci-evidence-file` (main_sha, verified_head_sha, queue_sha, queue_base_sha \
+             and successful runs). Without that file the engine rejects the give-up.\n\n\
              **Do NOT** rebase, reset, force-push, or \"resolve\" anything unless one of the checks \
              above found something concrete on **this PR** for you to act on. A revision whose head \
              ends up with an empty diff has destroyed the PR's contents, not fixed them. If your work \
@@ -2270,7 +2298,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
         ));
     }
 
-    if !is_queue_side_failure {
+    if !is_trunk_eviction {
         out.push_str("### If CI is already green (nothing to fix)\n\n");
         out.push_str(&format!(
             "Before assuming there is work to do, check the **current** state of the PR's required \
@@ -2306,36 +2334,12 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              3. Stop. The merge-poller will observe the re-run's outcome on the next sweep.\n\n",
         );
     } else if !trunk_eviction_without_evidence {
-        if is_rebounce {
-            out.push_str("### Action: rebase onto current main, then fix the semantic conflict\n\n");
-            out.push_str(
-                "A merge-queue rebounce almost always means something landed on `main` between \
-                 this PR's CI run and its queue turn that is **semantically incompatible**.\n\
-                 Fix is: rebase, look at the CI failure on the synthetic merge SHA, add a focused \
-                 fix, push, and re-enqueue the PR.\n\n",
-            );
-        } else if is_trunk_eviction {
-            out.push_str("### Action: rebase onto the target branch, then fix the semantic conflict\n\n");
-            out.push_str(
-                "A Trunk queue eviction **whose failing build the engine identified** (listed above) \
-                 means something landed on the target branch between this PR's CI run and its queue \
-                 turn that is **semantically incompatible**.\n\
-                 Fix is: rebase, look at that CI failure on Trunk's construction branch, add a focused \
-                 fix, push, and get the PR resubmitted to the queue.\n\n\
-                 This does NOT generalise to an eviction with no failing build attached. Trunk reports \
-                 the same `failed` state when it could not construct the merge at all, in which case \
-                 there is no build, no semantic conflict, and nothing here to fix — see the STOP \
-                 section above. Rebasing on that assumption is how a previous run force-pushed an \
-                 empty commit over a PR's entire contents.\n\n",
-            );
-        } else {
-            out.push_str("### Action: rebase first, then fix\n\n");
-            out.push_str(
-                "Many CI failures on long-running PRs are caused by `main` moving. The cheapest \
-                 experiment is rebasing onto `main` HEAD before changing any code — if CI goes \
-                 green after the rebase, no fix-attempt slot is consumed.\n\n",
-            );
-        }
+        out.push_str("### Action: rebase first, then fix\n\n");
+        out.push_str(
+            "Many CI failures on long-running PRs are caused by `main` moving. The cheapest \
+             experiment is rebasing onto `main` HEAD before changing any code — if CI goes \
+             green after the rebase, no fix-attempt slot is consumed.\n\n",
+        );
         out.push_str("**Step 1 — Rebase onto base HEAD and force-push** (replaces step 3 above).\n\n");
         out.push_str(&format!(
             "```\n\
@@ -2365,144 +2369,43 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              Always pass `-m \"…\"` to `jj describe`/`jj squash`/`jj commit`/`jj new` — \
              `EDITOR=false` in this environment; any command that opens an editor hard-fails.\n\n",
         );
-        if is_rebounce {
-            out.push_str(
-                "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
-                 - **If post-rebase CI is green**, do NOT call `mark-succeeded-via-rebase` — rebounce \
-                 attempts are not validatable via head-branch CI (the engine's guard rejects that verb \
-                 unconditionally for this attempt class). Instead re-enqueue the PR directly \
-                 (`gh pr merge --auto --squash`) and stop; the merge-poller retires the attempt when \
-                 the queue outcome is observed.\n\
-                 - **If post-rebase CI is still red**, the semantic conflict requires a code fix — \
-                 continue to Step 2.\n\n",
-            );
-        } else if is_trunk_eviction {
-            out.push_str(
-                "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
-                 - **If post-rebase CI is green**, do NOT call `mark-succeeded-via-rebase` — Trunk \
-                 eviction attempts are not validatable via head-branch CI (the engine's guard rejects \
-                 that verb unconditionally for this attempt class). Push the fix and stop — do NOT ask \
-                 a human and do NOT run `gh pr merge`; Boss auto-resubmits the PR to the Trunk queue on \
-                 the next poller pass once this revision reaches `done`, and the poller retires the \
-                 attempt when the queue outcome is observed.\n\
-                 - **If post-rebase CI is still red**, the semantic conflict requires a code fix — \
-                 continue to Step 2.\n\n",
-            );
-        } else {
-            out.push_str(
-                "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
-                 - **If post-rebase CI is green**, call \
-                 `\"$BOSS_BIN\" engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>`. The engine \
-                 independently re-probes live CI for the PR's current head SHA before honoring this — \
-                 calling it early or on a red head gets a rejection (non-zero exit), not a recorded \
-                 success, so actually wait for `--watch` to finish. On a verified-green response, stop; \
-                 the engine flips the attempt to `succeeded`, sets `consumes_budget = 0`, and decrements \
-                 `tasks.ci_attempts_used` so this attempt does not count against the PR's budget.\n\
-                 - **If post-rebase CI is still red**, continue to Step 2. The budget slot is now \
-                 consumed; this is the fix attempt the engine pre-classified.\n\n",
-            );
-        }
+        out.push_str(
+            "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
+             - **If post-rebase CI is green**, call \
+             `\"$BOSS_BIN\" engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>`. The engine \
+             independently re-probes live CI for the PR's current head SHA before honoring this — \
+             calling it early or on a red head gets a rejection (non-zero exit), not a recorded \
+             success, so actually wait for `--watch` to finish. On a verified-green response, stop; \
+             the engine flips the attempt to `succeeded`, sets `consumes_budget = 0`, and decrements \
+             `tasks.ci_attempts_used` so this attempt does not count against the PR's budget.\n\
+             - **If post-rebase CI is still red**, continue to Step 2. The budget slot is now \
+             consumed; this is the fix attempt the engine pre-classified.\n\n",
+        );
 
         out.push_str("**Step 2 — Read the log, classify, fix, push.**\n\n");
-        if is_rebounce {
-            let sha_hint = attempt.before_commit_sha.as_deref().unwrap_or("<synthetic-merge-sha>");
-            out.push_str(&format!(
-                "The failing job ran on the **synthetic merge SHA `{sha_hint}`** \
-                 (`gh-readonly-queue/*` branch), NOT the PR head. \
-                 Use the pre-filled commands in \"Ready-to-run Buildkite log commands\" above \
-                 if shown; otherwise fall back to the provider CLI:\n\n\
-                 - Buildkite: `bk job log --pipeline <slug> --build-number <N> <job-uuid>` \
-                 (slug and build number are in the check's `target_url` above; job UUIDs come \
-                 from `bk build view <N> --pipeline <slug>`)\n\
-                 - GitHub Actions: `gh run view --log-failed --job <job-id>` \
-                 (job id from the failing check URL above)\n\n",
-            ));
-            out.push_str("Engine-collected log excerpt (from the synthetic merge commit's failing job):\n\n");
-            match attempt.log_excerpt.as_deref().map(str::trim) {
-                Some(tail) if !tail.is_empty() => {
-                    out.push_str("```\n");
-                    out.push_str(tail);
-                    out.push_str("\n```\n\n");
-                }
-                _ => {
-                    out.push_str(&format!(
-                        "_No pre-fetched log excerpt is available for this attempt. \
-                         Use the commands above to fetch directly from the synthetic merge \
-                         SHA `{sha_hint}`._\n\n",
-                    ));
-                }
+        out.push_str("Engine-collected log excerpt (failing job tail):\n\n");
+        match attempt.log_excerpt.as_deref().map(str::trim) {
+            Some(tail) if !tail.is_empty() => {
+                out.push_str("```\n");
+                out.push_str(tail);
+                out.push_str("\n```\n\n");
             }
-        } else if is_trunk_eviction {
-            out.push_str(&format!(
-                "The failing job ran on Trunk's **ephemeral construction branch** \
-                 `trunk-merge/pr-{pr_num}/<uuid>`, NOT the PR head. \
-                 Use the pre-filled commands in \"Ready-to-run Buildkite log commands\" above \
-                 if shown; otherwise discover the build via \
-                 `bk api \"/builds?state[]=failed&state[]=failing&per_page=100\"` (paginate with `&page=N` \
-                 if needed) filtered to a branch starting with `trunk-merge/pr-{pr_num}/`, then \
-                 `bk job log --pipeline <slug> --build-number <N> <job-uuid>`.\n\n",
-                pr_num = attempt.pr_number,
-            ));
-            out.push_str("Engine-collected log excerpt (from the Trunk construction branch's failing job):\n\n");
-            match attempt.log_excerpt.as_deref().map(str::trim) {
-                Some(tail) if !tail.is_empty() => {
-                    out.push_str("```\n");
-                    out.push_str(tail);
-                    out.push_str("\n```\n\n");
-                }
-                _ => {
-                    out.push_str(
-                        "_No pre-fetched log excerpt is available for this attempt. \
-                         Use the commands above to fetch directly from Trunk's construction branch \
-                         build._\n\n",
-                    );
-                }
-            }
-        } else {
-            out.push_str("Engine-collected log excerpt (failing job tail):\n\n");
-            match attempt.log_excerpt.as_deref().map(str::trim) {
-                Some(tail) if !tail.is_empty() => {
-                    out.push_str("```\n");
-                    out.push_str(tail);
-                    out.push_str("\n```\n\n");
-                }
-                _ => {
-                    out.push_str(
-                        "_The engine's pre-spawn log fetch did not produce an excerpt for this attempt. \
-                         Use the ready-to-run commands above (`bk job log --pipeline …`) or \
-                         `gh run view --log-failed --job <job-id>` (job id from the failing check URL)._\n\n",
-                    );
-                }
+            _ => {
+                out.push_str(
+                    "_The engine's pre-spawn log fetch did not produce an excerpt for this attempt. \
+                     Use the ready-to-run commands above (`bk job log --pipeline …`) or \
+                     `gh run view --log-failed --job <job-id>` (job id from the failing check URL)._\n\n",
+                );
             }
         }
         out.push_str(
             "1. Classify the failure with `\"$BOSS_BIN\" engine ci classify --attempt-id <attempt-id> --class <tractable|flaky_or_infra|unfixable>`.\n   \
                 - `tractable` → there's a clear code change that resolves it. Make it. Push.\n   ",
         );
-        // `flaky_or_infra` on a queue-side failure must NOT steer the worker
-        // into `mark-retriggered`: that verb is terminal, the engine now
-        // rejects it for a queue-side `failure_kind`, and following the old
-        // wording is exactly what stranded a real PR out of the Trunk queue
-        // for 50 hours (no push, attempt terminal, no resubmit sentinel).
-        // Re-running the failing build is still the right diagnosis — the
-        // *delivery* is a push, because a resubmit is what actually re-runs
-        // the construction build, and only a new head sha triggers one.
-        if is_queue_side_failure {
-            out.push_str(
-                "- `flaky_or_infra` → the failure is environmental. There is still no no-push exit: \
-                `mark-retriggered` is rejected for a queue-side failure (it is terminal and would \
-                strand the PR out of the queue). Re-running the queue's own build is what a resubmit \
-                does, and a resubmit needs a new head sha — so push something that re-triggers it \
-                (a rebase onto the current target branch is the usual minimum), or, if the infra \
-                failure is genuinely not addressable from this PR, call \
-                `\"$BOSS_BIN\" engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` and stop.\n   ",
-            );
-        } else {
-            out.push_str(
-                "- `flaky_or_infra` → the failure is environmental. Pivot to the retrigger playbook \
-                (re-run the failing build via the provider CLI and call `mark-retriggered`).\n   ",
-            );
-        }
+        out.push_str(
+            "- `flaky_or_infra` → the failure is environmental. Pivot to the retrigger playbook \
+            (re-run the failing build via the provider CLI and call `mark-retriggered`).\n   ",
+        );
         out.push_str(
             "- `unfixable` → the failure is real and out of scope. Call \
                 `\"$BOSS_BIN\" engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` \
@@ -2519,31 +2422,6 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                 attempt.head_branch.as_str()
             },
         ));
-        if is_rebounce {
-            out.push_str(
-                "**Step 3 (after CI is green) — Re-enqueue the PR.**\n\n\
-                 The merge queue does **not** auto-retry after a dequeue. After your push produces \
-                 green CI, re-add the PR to the merge queue:\n\n\
-                 ```\n\
-                 gh pr merge --auto --squash  # or --merge / --rebase per repo policy\n\
-                 ```\n\n",
-            );
-        } else if is_trunk_eviction {
-            out.push_str(
-                "**Step 3 — push, then stop.**\n\n\
-                 The Trunk queue does **not** auto-retry after an eviction, but Boss's own poller does. \
-                 The resubmit fires when two things are both true: this revision has come to rest \
-                 (its normal terminal is `in_review` — you do NOT need to get it to `done`, and on an \
-                 open PR it cannot reach `done`), and the merge-poller sees the PR's head CI green on \
-                 your new head sha. Then the poller calls `submitPullRequest` again on its next pass.\n\n\
-                 So: push your fix and stop — do NOT ask a human to resubmit, do NOT comment \
-                 `/trunk merge` yourself, and do NOT run `gh pr merge`; any of those would race the \
-                 automatic resubmit. **Do not exit without pushing**: with no new commit there is no \
-                 new head sha, nothing for the poller to observe, and the PR stays out of the queue. \
-                 If you truly cannot fix it here, call `\"$BOSS_BIN\" engine ci mark-failed` so a human is \
-                 told, rather than stopping silently.\n\n",
-            );
-        }
     }
 
     out.push_str("### Stop conditions\n\n");
@@ -2595,6 +2473,11 @@ fn compose_ci_remediation_prompt(
     }
     prompt.push_str(&format!("**Work item**: `{}`\n\n", work_item_name(work_item),));
 
+    if crate::work::queue_ci_evidence::queue_ci_verification_required(attempt) {
+        prompt.push_str(&compose_queue_ci_fragment(attempt));
+        return prompt;
+    }
+
     // Failing-check list — same JSON the engine seeded on the row at
     // detection time. Rendered as a bulleted summary; the worker has the
     // raw `failed_checks` field if it wants to read further.
@@ -2612,17 +2495,7 @@ fn compose_ci_remediation_prompt(
     // validated noop rather than retriggering a build that is no longer
     // red. The engine re-probes live CI before honoring it.
     //
-    // Gated `!is_rebounce` to match the sibling revision-fragment brief
-    // (`compose_ci_remediation_fragment`): a merge_queue_rebounce
-    // failure lives on the synthetic merge commit, so the PR's
-    // head-branch checks always read green — surfacing `mark-noop` to a
-    // rebounce worker would invite a claim the engine is guaranteed to
-    // reject (`handle_mark_ci_remediation_noop` refuses rebounce
-    // attempts before it even probes). Rebounce rows normally deliver
-    // via a revision rather than this bespoke prompt, but the
-    // stranded-rescue path can re-dispatch one here, so guard it.
-    let is_rebounce = attempt.failure_kind.as_deref() == Some("merge_queue_rebounce");
-    if !is_rebounce {
+    if attempt.failure_kind.as_deref() != Some("trunk_queue_eviction") {
         prompt.push_str("### If CI is already green (nothing to fix)\n\n");
         prompt.push_str(&format!(
             "Check the **current** required checks first (`gh pr checks {pr}`). If they are already \

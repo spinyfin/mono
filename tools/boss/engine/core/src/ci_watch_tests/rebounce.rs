@@ -25,7 +25,7 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "synthetic-merge-sha-abc",
-        &[],
+        None,
         &one_failure(),
     )
     .await;
@@ -135,7 +135,7 @@ async fn rebounce_with_legacy_status_context_failures_flips_the_row() {
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         discriminator,
-        &[],
+        None,
         &failures,
     )
     .await;
@@ -178,7 +178,7 @@ async fn rebounce_with_empty_failures_still_flips_with_generic_directive() {
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         sha,
-        &[],
+        Some("captured-queue-base"),
         &[],
     )
     .await;
@@ -193,6 +193,7 @@ async fn rebounce_with_empty_failures_still_flips_with_generic_directive() {
         .expect("attempt row must exist so subsequent sweeps dedup");
     assert_eq!(attempt.failure_kind.as_deref(), Some("merge_queue_rebounce"));
     assert_eq!(attempt.before_commit_sha.as_deref(), Some(sha));
+    assert_eq!(attempt.queue_base_sha.as_deref(), Some("captured-queue-base"));
     assert_eq!(
         attempt.failed_checks, "[]",
         "empty evidence lands as [] so the worker prompt's generic rebounce directive fires"
@@ -206,7 +207,7 @@ async fn rebounce_with_empty_failures_still_flips_with_generic_directive() {
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         sha,
-        &[],
+        None,
         &[],
     )
     .await;
@@ -245,7 +246,7 @@ async fn rebounce_stores_failing_checks_from_failures_slice() {
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "synthetic-merge-sha-xyz",
-        &[],
+        None,
         &failures,
     )
     .await;
@@ -298,7 +299,7 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "synthetic-sha-xyz",
-        &[],
+        None,
         &one_failure(),
     )
     .await;
@@ -349,7 +350,7 @@ async fn rebounce_block_not_cleared_by_inflight_head_branch_ci() {
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "synthetic-sha-inflight",
-        &[],
+        None,
         &one_failure(),
     )
     .await;
@@ -415,7 +416,7 @@ async fn rebounce_does_not_flap_across_repeated_sweeps() {
             &cand,
             "pr-head-at-trigger",
             sha,
-            &[],
+            None,
             &one_failure(),
         )
         .await
@@ -465,7 +466,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "sha-A",
-        &[],
+        None,
         &one_failure(),
     )
     .await;
@@ -477,7 +478,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "sha-A",
-        &[],
+        None,
         &one_failure(),
     )
     .await;
@@ -532,7 +533,7 @@ async fn rebounce_block_clears_after_worker_succeeds() {
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "sha-Q",
-        &[],
+        None,
         &one_failure(),
     )
     .await;

@@ -17,6 +17,8 @@ pub struct MergeQueueDequeueEvent {
     /// `beforeCommit.oid` — the synthetic merge SHA that failed CI.
     /// `None` when GitHub omitted it (edge case for non-CI reasons).
     pub before_commit_oid: Option<String>,
+    /// First parent of the failed queue construction, possibly including queued siblings.
+    pub queue_base_oid: Option<String>,
 }
 
 /// Timeline-events selection set for [`build_batch_query`]'s `fields`
@@ -31,7 +33,7 @@ pub(crate) const DEQUEUE_EVENTS_FIELDS: &str = concat!(
     "REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) { nodes { __typename ",
     "... on PullRequestCommit { commit { oid } } ",
     "... on HeadRefForcePushedEvent { afterCommit { oid } } ",
-    "... on RemovedFromMergeQueueEvent { reason createdAt beforeCommit { oid } } } }",
+    "... on RemovedFromMergeQueueEvent { reason createdAt beforeCommit { oid parents(first: 1) { nodes { oid } } } } } }",
 );
 
 /// Batch-fetch merge-queue dequeue events for every PR in `pr_urls` with
@@ -176,6 +178,9 @@ pub(crate) fn parse_dequeue_event_nodes(nodes: &[serde_json::Value]) -> Vec<Merg
             created_at: node["createdAt"].as_str().map(str::to_owned),
             pr_head_oid: pr_head_oid.clone(),
             before_commit_oid,
+            queue_base_oid: node["beforeCommit"]["parents"]["nodes"][0]["oid"]
+                .as_str()
+                .map(str::to_owned),
         });
     }
     events
@@ -354,6 +359,34 @@ pub(crate) async fn check_merge_queue_rebounce(
             );
             continue;
         }
+        // A verified requeue archives only the newest queue construction's
+        // dedup key, so older coalesced failures at this head no longer match
+        // any row. They are pre-requeue history: ignore every dequeue at or
+        // before the creation of the retired attempt (the boundary is the
+        // episode, not the delivery time, so a failure of the requeued
+        // construction landing before the proposal is applied still mints).
+        match work_db.verified_requeue_boundary(&candidate.work_item_id, pr_head_sha) {
+            Ok(Some(boundary)) => {
+                let created = event
+                    .created_at
+                    .as_deref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| t.timestamp());
+                if created.is_some_and(|created| created <= boundary) {
+                    tracing::debug!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_head_sha,
+                        before_commit_sha,
+                        "merge poller: rebounce event predates verified requeue; skipping",
+                    );
+                    continue;
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(work_item_id = %candidate.work_item_id, ?err, "merge poller: failed to read requeue boundary; continuing");
+            }
+        }
         // Per-episode dedup *before* the check-runs/status round trip.
         // The timeline keeps historical `RemovedFromMergeQueueEvent`s
         // forever (including on PRs that have since re-queued and
@@ -363,8 +396,9 @@ pub(crate) async fn check_merge_queue_rebounce(
         // live (historically 1000+ re-fetches for a single PR episode).
         // Match PR head *or* synthetic before_commit so pre-transition
         // rows (synthetic stored in `head_sha_at_trigger`) still hit.
-        // `on_merge_queue_rebounce_detected`'s INSERT OR IGNORE is the
-        // authoritative no-op; this just avoids the surrounding work.
+        // `on_merge_queue_rebounce_detected` repeats this same episode
+        // check as its own guard (the insert alone cannot dedup archived
+        // `mq:<head>@<queue>` rows), so this just avoids the surrounding work.
         match work_db.ci_remediation_exists_for_merge_queue_episode(
             &candidate.work_item_id,
             pr_head_sha,
@@ -411,7 +445,7 @@ pub(crate) async fn check_merge_queue_rebounce(
             candidate,
             pr_head_sha,
             before_commit_sha,
-            &[], // labels not available here; opt-out check uses product flag only
+            event.queue_base_oid.as_deref(),
             &failures,
         )
         .await

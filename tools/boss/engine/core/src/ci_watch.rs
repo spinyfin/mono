@@ -1067,9 +1067,18 @@ pub async fn on_merge_queue_rebounce_detected(
     candidate: &PendingMergeCheck,
     pr_head_sha: &str,
     before_commit_sha: &str,
-    labels: &[String],
+    queue_base_sha: Option<&str>,
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    match work_db.ci_remediation_exists_for_merge_queue_episode(&candidate.work_item_id, pr_head_sha, before_commit_sha)
+    {
+        Ok(true) => return false,
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(?err, "failed to inspect merge-queue episode; deferring detection");
+            return false;
+        }
+    }
     let discriminator = merge_queue_rebounce_discriminator(pr_head_sha);
     on_queue_side_failure_detected(
         work_db,
@@ -1084,8 +1093,9 @@ pub async fn on_merge_queue_rebounce_detected(
             discriminator: &discriminator,
             suppression_discriminator: pr_head_sha,
             before_commit_sha: Some(before_commit_sha),
+            queue_base_sha,
             failure_kind: "merge_queue_rebounce",
-            labels,
+            labels: &[],
         },
         failures,
     )
@@ -1095,6 +1105,8 @@ pub async fn on_merge_queue_rebounce_detected(
 /// The per-caller facts [`on_queue_side_failure_detected`] needs — bundled
 /// (rather than four more positional args) to keep the shared helper under
 /// the repo's `too_many_arguments` lint threshold.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 struct QueueSideFailureEpisode<'a> {
     /// The dedup key stored as `ci_remediations.head_sha_at_trigger`.
     discriminator: &'a str,
@@ -1106,6 +1118,7 @@ struct QueueSideFailureEpisode<'a> {
     /// for a merge-queue rebounce (the synthetic merge SHA), `None` for a
     /// Trunk eviction (no equivalent commit is persisted).
     before_commit_sha: Option<&'a str>,
+    queue_base_sha: Option<&'a str>,
     failure_kind: &'a str,
     /// PR labels, for the auto-pr-maintenance-disabled gate. Trunk evictions
     /// have none available at the call site, so callers pass `&[]`.
@@ -1132,6 +1145,7 @@ async fn on_queue_side_failure_detected(
         discriminator,
         suppression_discriminator,
         before_commit_sha,
+        queue_base_sha,
         failure_kind,
         labels,
     } = episode;
@@ -1311,21 +1325,25 @@ async fn on_queue_side_failure_detected(
     // `discriminator` serves as `head_sha_at_trigger` so the unique key
     // `(work_item_id, head_sha_at_trigger, attempt_kind)` naturally
     // deduplicates on the PR contribution that failed in the queue. A
-    // retry of the same PR head must not spend another remediation budget;
-    // a real fix push advances the head and admits a new attempt.
-    let insert_result = work_db.insert_ci_remediation(CiRemediationInsertInput {
-        product_id: candidate.product_id.clone(),
-        work_item_id: candidate.work_item_id.clone(),
-        pr_url: candidate.pr_url.clone(),
-        pr_number,
-        head_branch: head_ref_name.unwrap_or_default().to_owned(),
-        head_sha_at_trigger: discriminator.to_owned(),
-        attempt_kind: "fix".to_owned(),
-        consumes_budget: 1,
-        failed_checks: encode_failed_checks(failures),
-        failure_kind: failure_kind.to_owned(),
-        before_commit_sha: before_commit_sha.map(str::to_owned),
-    });
+    // duplicate detection must not spend another remediation budget. Verified
+    // requeue delivery archives that key by queue SHA, admitting a later failed
+    // construction at the same head while preserving dedup of the old episode.
+    let insert_result = work_db.insert_ci_remediation_with_queue_base(
+        CiRemediationInsertInput {
+            product_id: candidate.product_id.clone(),
+            work_item_id: candidate.work_item_id.clone(),
+            pr_url: candidate.pr_url.clone(),
+            pr_number,
+            head_branch: head_ref_name.unwrap_or_default().to_owned(),
+            head_sha_at_trigger: discriminator.to_owned(),
+            attempt_kind: "fix".to_owned(),
+            consumes_budget: 1,
+            failed_checks: encode_failed_checks(failures),
+            failure_kind: failure_kind.to_owned(),
+            before_commit_sha: before_commit_sha.map(str::to_owned),
+        },
+        queue_base_sha,
+    );
     let attempt = match insert_result {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -1645,6 +1663,7 @@ pub async fn on_trunk_queue_eviction_detected(
             discriminator: &discriminator,
             suppression_discriminator: &discriminator,
             before_commit_sha: None,
+            queue_base_sha: None,
             failure_kind: "trunk_queue_eviction",
             labels: &[],
         },

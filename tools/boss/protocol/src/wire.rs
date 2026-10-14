@@ -339,6 +339,8 @@ pub enum FrontendRequest {
     ClassifyCiRemediation {
         attempt_id: String,
         triage_class: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_ci_evidence: Option<crate::QueueCiEvidence>,
     },
 
     /// Read-only summary of the `[Revise]` banner's state for an
@@ -1663,6 +1665,8 @@ pub enum FrontendRequest {
     MarkCiRemediationFailed {
         attempt_id: String,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_ci_evidence: Option<crate::QueueCiEvidence>,
     },
 
     /// Worker → engine, *validated* terminal signal: "there is no CI

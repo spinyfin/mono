@@ -17,10 +17,19 @@ pub(super) async fn handle_classify_ci_remediation(ctx: Dispatch, req: FrontendR
     let FrontendRequest::ClassifyCiRemediation {
         attempt_id,
         triage_class,
+        queue_ci_evidence,
     } = req
     else {
         unreachable!()
     };
+    // `triage_class` is free-form, so gate everything but the one
+    // non-give-up verdict instead of denying a list of known spellings.
+    if triage_class != "tractable"
+        && let Err(err) = work_db.validate_queue_ci_failure(&attempt_id, queue_ci_evidence.as_ref(), &triage_class)
+    {
+        send_work_error(&sink, &request_id, &err);
+        return;
+    }
     {
         // Worker-facing marker: stamp `triage_class` on a
         // `ci_remediations` row. Pure metadata column, no
@@ -48,8 +57,31 @@ pub(super) async fn handle_mark_ci_remediation_failed(ctx: Dispatch, req: Fronte
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::MarkCiRemediationFailed { attempt_id, reason } = req else {
+    let FrontendRequest::MarkCiRemediationFailed {
+        attempt_id,
+        reason,
+        queue_ci_evidence,
+    } = req
+    else {
         unreachable!()
+    };
+    if let Err(err) = work_db.validate_queue_ci_failure(&attempt_id, queue_ci_evidence.as_ref(), &reason) {
+        send_work_error(&sink, &request_id, &err);
+        return;
+    }
+    let reason = match queue_ci_evidence {
+        Some(evidence) => format!(
+            "{reason}\nQueue verification: main_sha={} verified_head_sha={} runs={}",
+            evidence.main_sha,
+            evidence.verified_head_sha,
+            evidence
+                .runs
+                .iter()
+                .map(|run| format!("{}: {} (exit {})", run.check_name, run.command, run.exit_code))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        None => reason,
     };
     {
         match work_db.mark_ci_remediation_failed(&attempt_id, &reason) {

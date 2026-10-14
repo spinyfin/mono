@@ -187,6 +187,7 @@ pub(crate) async fn run_engine_ci_command(command: EngineCiCommand, ctx: &RunCon
             let mut client = connect_for_work(ctx).await?;
             let response = client
                 .send_request(&FrontendRequest::ClassifyCiRemediation {
+                    queue_ci_evidence: crate::propose::read_queue_ci_evidence(args.queue_ci_evidence_file.clone())?,
                     attempt_id: args.attempt_id.clone(),
                     triage_class: args.class.clone(),
                 })
@@ -216,6 +217,7 @@ pub(crate) async fn run_engine_ci_command(command: EngineCiCommand, ctx: &RunCon
             let mut client = connect_for_work(ctx).await?;
             let response = client
                 .send_request(&FrontendRequest::MarkCiRemediationFailed {
+                    queue_ci_evidence: crate::propose::read_queue_ci_evidence(args.queue_ci_evidence_file.clone())?,
                     attempt_id: args.attempt_id.clone(),
                     reason: args.reason.clone(),
                 })

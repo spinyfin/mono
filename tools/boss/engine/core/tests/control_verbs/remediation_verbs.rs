@@ -872,6 +872,75 @@ async fn mark_ci_remediation_retriggered_rejects_queue_side_failures() -> Result
             row.status, "pending",
             "a rejected {failure_kind} verb must leave the attempt actionable, not terminal",
         );
+        let response = client
+            .send_request(&FrontendRequest::ClassifyCiRemediation {
+                attempt_id: attempt.id.clone(),
+                triage_class: "tractable".into(),
+                queue_ci_evidence: None,
+            })
+            .await?;
+        assert!(matches!(response, FrontendEvent::CiRemediationClassified { .. }));
+        if failure_kind == "merge_queue_rebounce" {
+            let response = client
+                .send_request(&FrontendRequest::ClassifyCiRemediation {
+                    attempt_id: attempt.id.clone(),
+                    triage_class: "unfixable".into(),
+                    queue_ci_evidence: None,
+                })
+                .await?;
+            assert!(matches!(response, FrontendEvent::WorkError { .. }));
+            // The give-up gate is "anything but tractable", so a class the
+            // engine has never heard of must not bypass it.
+            for class in ["infra", "flaky", "cannot_complete"] {
+                let response = client
+                    .send_request(&FrontendRequest::ClassifyCiRemediation {
+                        attempt_id: attempt.id.clone(),
+                        triage_class: class.into(),
+                        queue_ci_evidence: None,
+                    })
+                    .await?;
+                assert!(matches!(response, FrontendEvent::WorkError { .. }), "{class}");
+                let row = work_db.get_ci_remediation(&attempt.id)?.unwrap();
+                assert_eq!(row.status, "pending", "{class}");
+                assert_eq!(row.triage_class.as_deref(), Some("tractable"), "{class}");
+            }
+            let evidence = boss_protocol::QueueCiEvidence::builder()
+                .main_sha("a".repeat(40))
+                .verified_head_sha("b".repeat(40))
+                .queue_sha("c".repeat(40))
+                .queue_base_sha("d".repeat(40))
+                .runs(vec![boss_protocol::QueueCiRun {
+                    check_name: "bazel-build-test".into(),
+                    source_url: "https://buildkite.com/foo/bar/builds/1".into(),
+                    command: "bazel test //...".into(),
+                    exit_code: 0,
+                    output: "verbose output must not enter failure_reason".into(),
+                    coverage: "full job".into(),
+                }])
+                .build();
+            let response = client
+                .send_request(&FrontendRequest::ClassifyCiRemediation {
+                    attempt_id: attempt.id.clone(),
+                    triage_class: "infra".into(),
+                    queue_ci_evidence: Some(evidence.clone()),
+                })
+                .await?;
+            assert!(matches!(response, FrontendEvent::CiRemediationClassified { .. }));
+            client
+                .send_request(&FrontendRequest::MarkCiRemediationFailed {
+                    attempt_id: attempt.id.clone(),
+                    reason: "External queue outage".into(),
+                    queue_ci_evidence: Some(evidence),
+                })
+                .await?;
+            let row = work_db.get_ci_remediation(&attempt.id)?.unwrap();
+            assert_eq!(row.status, "failed");
+            let reason = row.failure_reason.unwrap();
+            assert!(reason.contains(&"a".repeat(40)));
+            assert!(reason.contains(&"b".repeat(40)));
+            assert!(reason.contains("bazel-build-test: bazel test //... (exit 0)"));
+            assert!(!reason.contains("verbose output"));
+        }
     }
 
     // Control: an ordinary `pr_branch_ci` attempt is still accepted, so the
