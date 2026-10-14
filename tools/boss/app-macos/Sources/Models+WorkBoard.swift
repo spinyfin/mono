@@ -95,7 +95,7 @@ enum WorkBoardGroupKey: String {
 /// `classify_review_section`); this type only names the sections and their
 /// headers.
 enum ReviewSection: String, CaseIterable {
-    /// Nothing left for an agent to do; waiting only on the operator.
+    /// Nothing left for an agent to do; only review / merge remains.
     case ready
     /// A revision is running or queued on the PR.
     case inRevision = "in_revision"

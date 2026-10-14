@@ -5,8 +5,7 @@ import XCTest
 /// each card (`Task.review_section`, see `classify_review_section`); the board
 /// only groups by the key it is given. These tests pin that the column always
 /// shows every card, in the fixed section order, with empty sections hidden
-/// and each section's incoming card order preserved — and that the old
-/// "Ready" filter is gone.
+/// and each section's incoming card order preserved.
 @MainActor
 final class ReviewSectionsTests: XCTestCase {
 

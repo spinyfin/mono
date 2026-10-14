@@ -1988,3 +1988,36 @@ fn create_revision_is_idempotent_per_pr_review_execution() {
         .unwrap();
     assert_eq!(count, 1, "one review execution must materialise at most one work item");
 }
+
+#[test]
+fn review_section_is_attached_on_tree_and_single_row_reads() {
+    // A Review-lane chore with failing required CI must come back classified
+    // Blocked from both projection paths. If review_section were attached
+    // before its inputs, or dropped when the single-row projection is copied
+    // back, the card would fall through to Pending.
+    let db = WorkDb::open(temp_db_path("review-section-projection")).unwrap();
+    let product_id = make_revision_product(&db, "review-section");
+    let pr_url = "https://github.com/spinyfin/mono/pull/503";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET ci_required_state = 'fail', pr_mergeable_state = 'mergeable' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let from_tree = tree
+        .chores
+        .iter()
+        .find(|c| c.id == chore_id)
+        .expect("chore must be in work_tree.chores");
+    assert_eq!(from_tree.review_section, Some(boss_protocol::ReviewSection::Blocked));
+
+    let from_item = match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert_eq!(from_item.review_section, Some(boss_protocol::ReviewSection::Blocked));
+}

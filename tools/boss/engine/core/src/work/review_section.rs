@@ -28,7 +28,8 @@ use super::{AI_REVIEW_STATE_REVIEW_QUEUED, AI_REVIEW_STATE_REVIEWED_WITH_FINDING
 /// 3. **AI Review** — an AI review is queued or running, or it reported
 ///    findings that no revision has started on yet (a started revision would
 ///    have matched rule 2).
-/// 4. **Ready** — `ready_for_review`, the same fact the old Ready filter read.
+/// 4. **Ready** — `ready_for_review`, the engine-computed flag, once the
+///    higher-priority states are excluded.
 /// 5. **Pending** — everything else: an open PR whose required CI is still
 ///    running or not yet polled, whose mergeability is unknown, or that has
 ///    no PR bound yet. Nothing is wrong and nobody needs to act; the card is
@@ -38,7 +39,7 @@ use super::{AI_REVIEW_STATE_REVIEW_QUEUED, AI_REVIEW_STATE_REVIEWED_WITH_FINDING
 ///
 /// Blocked outranks In Revision because a revision does not make a failing
 /// check or a conflict any less blocking: until the revision lands and the
-/// facts clear, the operator cannot merge, and the failure is the more
+/// facts clear, the PR cannot merge, and the failure is the more
 /// important thing to see. In Revision outranks AI Review because a card with
 /// a revision running is not waiting on the reviewer, and AI Review outranks
 /// Ready because a clean-CI PR with a review still in flight is not yet safe

@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewSection {
-    /// Nothing is left for an agent to do; waiting only on the operator
-    /// (review / merge). Exactly `Task::ready_for_review`.
+    /// Nothing is left for an agent to do; only review / merge remains.
+    /// Exactly `Task::ready_for_review`.
     Ready,
     /// A revision is running or queued on the PR (the orange "in revision"
     /// badge).
@@ -20,7 +20,7 @@ pub enum ReviewSection {
     /// An AI review is queued or running, or it reported findings that no
     /// revision has started on yet.
     AiReview,
-    /// Open PR with no operator action and no agent action pending, but not
+    /// Open PR with no human action and no agent action pending, but not
     /// yet ready either: required CI is still running or has not been polled,
     /// or GitHub has not reported mergeability yet.
     Pending,

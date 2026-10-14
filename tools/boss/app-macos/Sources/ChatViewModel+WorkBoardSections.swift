@@ -305,8 +305,7 @@ extension ChatViewModel {
         }
         // Review is always grouped into the engine's labelled sections
         // (Ready, In Revision, ...), whatever the board's project grouping
-        // is set to: the state a card is in is what the operator scans this
-        // column for.
+        // is set to.
         if column == .review {
             return Self.reviewSections(items: items)
         }

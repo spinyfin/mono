@@ -803,6 +803,7 @@ final class ChatViewModel: ObservableObject {
     let showBlockedOnlyDefaultsKey = "boss.work.showBlockedOnly"
     let showArchivedProjectsDefaultsKey = "boss.work.showArchivedProjects"
     let workBoardGroupingDefaultsKey = "boss.work.grouping"
+    let legacyReviewReadyOnlyDefaultsKey = "boss.work.reviewReadyOnly"
     let bossPanelCollapsedDefaultsKey = "boss.work.bossPanelCollapsed"
     let bossPanelWidthDefaultsKey = "boss.work.bossPanelWidth"
 
@@ -855,9 +856,8 @@ final class ChatViewModel: ObservableObject {
         }
         showBlockedOnly = defaults.bool(forKey: showBlockedOnlyDefaultsKey)
         showArchivedProjects = defaults.bool(forKey: showArchivedProjectsDefaultsKey)
-        // The Review column's "Ready" filter became a section; drop the
-        // persisted toggle so it does not linger in the defaults domain.
-        defaults.removeObject(forKey: "boss.work.reviewReadyOnly")
+        // Remove the unused preference left by earlier builds.
+        defaults.removeObject(forKey: legacyReviewReadyOnlyDefaultsKey)
         if let groupingRaw = defaults.string(forKey: workBoardGroupingDefaultsKey),
            let grouping = WorkBoardGrouping(rawValue: groupingRaw) {
             workBoardGrouping = grouping
