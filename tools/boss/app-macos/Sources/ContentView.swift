@@ -539,7 +539,7 @@ struct ContentView: View {
                     Label(notice, systemImage: "exclamationmark.triangle")
                     Spacer()
                     Button("Retry") { model.retryDisconnectedActions() }
-                        .disabled(!model.isConnected || !model.engine.hasUnsentActions)
+                        .disabled(!model.isConnected || !model.hasUnsentActions)
                     Button("Discard") { model.dismissDisconnectedActions() }
                 }
                 .padding(8)

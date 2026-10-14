@@ -335,6 +335,9 @@ final class ChatViewModel: ObservableObject {
     @Published var pendingWorkEditRequest: WorkEditRequest?
     @Published var workErrorMessage: String?
     @Published var disconnectedActionNotice: String?
+    /// Mirror of `engine.hasUnsentActions`, refreshed on connection and
+    /// action events so the banner never queries the engine from a view body.
+    @Published var hasUnsentActions = false
     /// Current state of an in-flight `evaluate_editorial_rules` RPC.
     @Published var editorialEvaluationState: EditorialEvaluationState = .idle
     @Published var workSearchText: String = "" {

@@ -61,6 +61,14 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
     /// failure mode from #698: the reconnect loop emits a new
     /// `socket waiting:` line per attempt, so dismissing the modal
     /// only worked until the next retry.
+    func testNotConnectedForUnretainedKindShowsNoRetryNotice() {
+        let model = makeModel()
+        XCTAssertNil(model.engine.sendLine(["type": "move_work_item_on_board", "work_item_id": "t"]))
+        model.applyEventForTest(.notConnected(requestKind: "move_work_item_on_board"))
+        XCTAssertNil(model.disconnectedActionNotice)
+        XCTAssertFalse(model.hasUnsentActions)
+    }
+
     func testRepeatedSocketWaitingDoesNotResurrectModal() {
         let model = makeModel()
         for _ in 0..<10 {
@@ -74,8 +82,11 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
     func testDroppedActionStaysVisibleThroughReconnectWithoutSystemMessages() {
         let model = makeModel()
         XCTAssertFalse(model.showSystemMessages)
+        // Only an action the engine actually retained earns the Retry notice.
+        XCTAssertNil(model.engine.sendLine(["type": "create_chore", "name": "dropped"]))
         model.applyEventForTest(.notConnected(requestKind: "create_chore"))
         XCTAssertNotNil(model.disconnectedActionNotice)
+        XCTAssertTrue(model.hasUnsentActions)
         model.applyEventForTest(.connected)
         XCTAssertNotNil(model.disconnectedActionNotice)
         XCTAssertNil(model.workErrorMessage)

@@ -9,8 +9,49 @@ final class EngineClient: @unchecked Sendable {
     private var socketIndex = 0
     private let queue = DispatchQueue(label: "Boss.EngineClient")
     private var connection: NWConnection?
-    private var unsentActions: [[String: Any]] = []
-    private let retriedActionIDs = OSAllocatedUnfairLock(initialState: [String: Int]())
+    /// Retained user mutations and delivery tracking. Lock-guarded (not
+    /// `queue`) so the main actor can read/clear it without blocking on
+    /// the socket I/O queue; payloads are held as sorted-key JSON so the
+    /// state stays value-typed.
+    private struct ActionLedger {
+        /// Never reached the wire; safe to resend on explicit Retry.
+        var unsent: [Data] = []
+        /// Written to the socket, awaiting an engine reply echoing the
+        /// envelope id, keyed by that id. If the connection ends first the
+        /// outcome is uncertain and the action is NOT replayed (the engine
+        /// has no dedupe), only reported.
+        var awaiting: [String: (data: Data, generation: Int)] = [:]
+        /// Subset of `awaiting`/in-flight ids sent via Retry; drives the
+        /// "Sending pending actions…" banner.
+        var retried: Set<String> = []
+    }
+    private let ledger = OSAllocatedUnfairLock(initialState: ActionLedger())
+    static let maxUnsentActions = 64
+    /// User mutations eligible for retention and explicit Retry. Explicit
+    /// opt-in: reads, `engine_response` replies (answers to RPCs of a dead
+    /// session) and actions whose `.notConnected` handler rolls back or
+    /// clears view-model continuation state (drag-to-column admission and
+    /// move, coordinator reset, archive, in-flight answer/accept requests)
+    /// are never retained and instead surface their own failure path.
+    /// Every kind here is answered by a direct reply echoing `request_id`.
+    static let retainableKinds: Set<String> = [
+        "create_task", "create_chore", "create_idea", "create_project", "create_product",
+        "create_automation", "delete_work_item", "update_idea", "update_automation",
+        "enable_automation", "disable_automation", "delete_automation", "set_automation_paused",
+        "reorder_project_tasks", "merge_when_ready", "request_execution", "release_project",
+        "unpopulate_project", "answer_attention", "dismiss_attention",
+        "comments_create", "comments_resolve", "comments_set_status", "comments_set_intent",
+        "comments_dismiss", "comments_post_followup", "comments_update_anchor",
+        "set_setting", "set_feature_flag", "set_dispatch_paused", "set_live_status_enabled",
+        "set_driver_traffic_split", "set_offsite_backup", "set_product_editorial_rules",
+        "set_product_external_tracker", "set_product_merge_mechanism", "set_host_enabled",
+        "add_host", "remove_host", "add_host_tag", "remove_host_tag",
+    ]
+
+    static func isRetainable(_ payload: [String: Any]) -> Bool {
+        guard let kind = payload["type"] as? String else { return false }
+        return retainableKinds.contains(kind)
+    }
     private var buffer = Data()
     /// Connection whose read loop is suspended by decode backpressure.
     private var readPause = ReadLoopPauseGate<NWConnection>()
@@ -222,12 +263,6 @@ final class EngineClient: @unchecked Sendable {
     /// user actions must either queue or report a visible failure.
     @discardableResult
     func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true) -> String? {
-        queue.sync {
-            sendLineOnQueue(payload, queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
-        }
-    }
-
-    private func sendLineOnQueue(_ payload: [String: Any], queueIfDisconnected: Bool, reportIfDisconnected: Bool) -> String? {
         let envelopeRequestId = UUID().uuidString
         outboundRecorder?(payload)
 
@@ -247,64 +282,113 @@ final class EngineClient: @unchecked Sendable {
 
         if simulateConnectedForTesting { return envelopeRequestId }
         guard reachableState.withLock({ $0 }) else {
-            // A send while the socket is down is a transport condition,
-            // not an engine-reported error. Idempotent reads are held and
-            // delivered on reconnect when the caller opts in with
-            // `queueIfDisconnected`; other reported actions are retained
-            // for explicit Retry and reported as typed `.notConnected`.
-            let kind = (payload["type"] as? String) ?? "unknown"
-            if queueIfDisconnected {
-                Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
-                // Held as sorted-key JSON so the queue is Sendable and an
-                // identical newer request supersedes the queued one.
-                if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
-                    queuedReads.withLock { state in
-                        state.removeAll { $0.data == data }
-                        state.append((envelopeRequestId, data))
-                        if state.count > Self.maxQueuedReads { state.removeFirst(state.count - Self.maxQueuedReads) }
-                    }
-                } else {
-                    emit(.notConnected(requestKind: kind))
-                    return nil
+            return handleDisconnectedSend(
+                payload, envelopeRequestId: envelopeRequestId,
+                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
+        }
+        // The write runs on the socket queue (FIFO with other writes);
+        // the caller never blocks on it. If the socket died after the
+        // reachability check, `write` re-applies the disconnected policy.
+        queue.async {
+            self.write(
+                payload, envelopeRequestId: envelopeRequestId,
+                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
+        }
+        return envelopeRequestId
+    }
+
+    /// A send while the socket is down is a transport condition, not an
+    /// engine-reported error. Idempotent reads are held and delivered on
+    /// reconnect when the caller opts in with `queueIfDisconnected`;
+    /// retainable user mutations are kept for explicit Retry; everything
+    /// else reported as typed `.notConnected` and dropped. Thread-safe.
+    private func handleDisconnectedSend(
+        _ payload: [String: Any], envelopeRequestId: String,
+        queueIfDisconnected: Bool, reportIfDisconnected: Bool
+    ) -> String? {
+        let kind = (payload["type"] as? String) ?? "unknown"
+        if queueIfDisconnected {
+            Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
+            // Held as sorted-key JSON so the queue is Sendable and an
+            // identical newer request supersedes the queued one.
+            if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
+                queuedReads.withLock { state in
+                    state.removeAll { $0.data == data }
+                    state.append((envelopeRequestId, data))
+                    if state.count > Self.maxQueuedReads { state.removeFirst(state.count - Self.maxQueuedReads) }
                 }
-                return envelopeRequestId
-            }
-            if !reportIfDisconnected {
-                Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
+            } else {
+                emit(.notConnected(requestKind: kind))
                 return nil
             }
-            unsentActions.append(payload)
-            Self.log.info("retained \(kind, privacy: .public) while disconnected; awaiting explicit retry")
-            emit(.notConnected(requestKind: kind))
+            return envelopeRequestId
+        }
+        if !reportIfDisconnected {
+            Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
             return nil
         }
-        return write(payload, envelopeRequestId: envelopeRequestId)
+        retainUnsent(payload)
+        emit(.notConnected(requestKind: kind))
+        return nil
+    }
+
+    /// Retains `payload` for explicit Retry when it is an eligible user
+    /// mutation and the buffer has room. Returns whether it was retained.
+    @discardableResult
+    private func retainUnsent(_ payload: [String: Any]) -> Bool {
+        let kind = (payload["type"] as? String) ?? "unknown"
+        guard Self.isRetainable(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        else {
+            Self.log.info("not retaining \(kind, privacy: .public); not an eligible user mutation")
+            return false
+        }
+        return retainUnsent(data, kind: kind)
+    }
+
+    @discardableResult
+    private func retainUnsent(_ data: Data, kind: String) -> Bool {
+        let retained = ledger.withLock { state -> Bool in
+            guard state.unsent.count < Self.maxUnsentActions else { return false }
+            state.unsent.append(data)
+            return true
+        }
+        Self.log.info("\(retained ? "retained" : "dropped (buffer full)", privacy: .public) \(kind, privacy: .public); awaiting explicit retry")
+        return retained
     }
 
     /// Only actions never handed to Network.framework are eligible. Once a
     /// write is attempted its delivery is uncertain, so it must not be replayed.
     func retryUnsentActions() -> Bool {
-        queue.sync {
-            guard reachableState.withLock({ $0 }) else { return false }
-            let actions = unsentActions.map { (id: UUID().uuidString, payload: $0) }
-            unsentActions.removeAll()
-            let actionIDs = actions.map(\.id)
-            let generation = connectionGeneration
-            retriedActionIDs.withLock { ids in
-                for id in actionIDs { ids[id] = generation }
-            }
-            for action in actions {
-                write(action.payload, envelopeRequestId: action.id)
-            }
-            return true
+        guard reachableState.withLock({ $0 }) else { return false }
+        let actions = ledger.withLock { state -> [(id: String, data: Data)] in
+            let drained = state.unsent.map { (id: UUID().uuidString, data: $0) }
+            state.unsent.removeAll()
+            // Registered before the write so a fast reply cannot race it.
+            state.retried.formUnion(drained.map(\.id))
+            return drained
         }
+        queue.async {
+            for action in actions {
+                guard let payload = (try? JSONSerialization.jsonObject(with: action.data)) as? [String: Any] else {
+                    self.ledger.withLock { _ = $0.retried.remove(action.id) }
+                    continue
+                }
+                self.write(payload, envelopeRequestId: action.id)
+            }
+        }
+        return true
     }
 
     func discardUnsentActions() {
-        queue.sync { unsentActions.removeAll() }
+        ledger.withLock { $0.unsent.removeAll() }
     }
 
-    var hasUnsentActions: Bool { queue.sync { !unsentActions.isEmpty } }
+    var hasUnsentActions: Bool { ledger.withLock { !$0.unsent.isEmpty } }
+
+    /// Test hooks.
+    var unsentActionCountForTesting: Int { ledger.withLock { $0.unsent.count } }
+    var awaitingReplyCountForTesting: Int { ledger.withLock { $0.awaiting.count } }
 
     private static let log = Logger(subsystem: "Boss", category: "EngineClient")
     private static let maxQueuedReads = 64
@@ -332,10 +416,15 @@ final class EngineClient: @unchecked Sendable {
     }
 
     @discardableResult
-    private func write(_ payload: [String: Any], envelopeRequestId: String) -> String? {
+    private func write(
+        _ payload: [String: Any], envelopeRequestId: String,
+        queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true
+    ) -> String? {
         guard let connection else {
-            emit(.notConnected(requestKind: (payload["type"] as? String) ?? "unknown"))
-            return nil
+            ledger.withLock { _ = $0.retried.remove(envelopeRequestId) }
+            return handleDisconnectedSend(
+                payload, envelopeRequestId: envelopeRequestId,
+                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
         }
         do {
             let envelope: [String: Any] = [
@@ -350,9 +439,22 @@ final class EngineClient: @unchecked Sendable {
                                   kind: "coordinator_reset_rpc_send", body: payload)
             }
 
+            // Track the first attempt of every retainable mutation until
+            // the engine replies: if the write fails the payload goes back
+            // to the unsent buffer, and if the connection ends first the
+            // outcome is reported as uncertain rather than lost silently.
+            let kind = (payload["type"] as? String) ?? "unknown"
+            if Self.isRetainable(payload),
+               let saved = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
+                let generation = connectionGeneration
+                ledger.withLock { $0.awaiting[envelopeRequestId] = (saved, generation) }
+            }
+
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
-                guard let self, self.connection === connection else { return }
+                guard let self else { return }
                 if let error {
+                    self.reclaimFailedWrite(id: envelopeRequestId, kind: kind)
+                    guard self.connection === connection else { return }
                     self.emit(.transportError(message: "socket send failed: \(error.localizedDescription)"))
                     self.closeConnection()
                 }
@@ -362,6 +464,22 @@ final class EngineClient: @unchecked Sendable {
             emit(.error(message:"failed to encode payload: \(error.localizedDescription)"))
             return nil
         }
+    }
+
+    /// A write that Network.framework reported as failed was not delivered:
+    /// move it back to the unsent buffer and report it, instead of leaving
+    /// only a transport error.
+    private func reclaimFailedWrite(id: String, kind: String) {
+        let reclaimed = ledger.withLock { state -> (data: Data, generation: Int)? in
+            state.awaiting.removeValue(forKey: id)
+        }
+        guard let reclaimed else { return }
+        retainUnsent(reclaimed.data, kind: kind)
+        let retryFinished = ledger.withLock { state in
+            state.retried.remove(id) != nil && state.retried.isEmpty
+        }
+        if retryFinished { emit(.retriedActionsStatus(message: nil)) }
+        emit(.notConnected(requestKind: kind))
     }
 
     /// Records that `connection` has terminated. Returns `false` if it was
@@ -424,9 +542,12 @@ final class EngineClient: @unchecked Sendable {
         let generation = connectionGeneration
         handoff.afterPendingLines { [weak self] in
             guard let self else { return }
-            let uncertain = self.retriedActionIDs.withLock { ids in
-                let pending = ids.filter { $0.value == generation }
-                for id in pending.keys { ids.removeValue(forKey: id) }
+            let uncertain = self.ledger.withLock { state -> Bool in
+                let pending = state.awaiting.filter { $0.value.generation == generation }
+                for id in pending.keys {
+                    state.awaiting.removeValue(forKey: id)
+                    state.retried.remove(id)
+                }
                 return !pending.isEmpty
             }
             if uncertain {
@@ -495,8 +616,9 @@ final class EngineClient: @unchecked Sendable {
         }
         let envelopeRequestId = envelope["request_id"] as? String
         if let id = envelopeRequestId {
-            let finished = retriedActionIDs.withLock { ids in
-                ids.removeValue(forKey: id) != nil && ids.isEmpty
+            let finished = ledger.withLock { state -> Bool in
+                state.awaiting.removeValue(forKey: id)
+                return state.retried.remove(id) != nil && state.retried.isEmpty
             }
             if finished { emit(.retriedActionsStatus(message: nil)) }
         }

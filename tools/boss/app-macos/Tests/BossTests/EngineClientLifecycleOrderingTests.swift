@@ -42,6 +42,117 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         XCTAssertNil(second.readLine(timeout: 0.2), "exactly one mutation reached the peer")
     }
 
+    func testOnlyUserMutationsAreRetainedWhileDisconnected() {
+        let client = EngineClient(socketPath: "/nonexistent/boss-retention.sock")
+        // Replies to a dead session's RPCs, reads, and actions whose
+        // `.notConnected` handler rolls back view-model state are not retained.
+        XCTAssertNil(client.sendLine([
+            "type": "engine_response", "request_id": "r1", "response": ["kind": "pane_state"],
+        ]))
+        XCTAssertNil(client.sendLine(["type": "get_work_tree", "product_id": "p"]))
+        XCTAssertNil(client.sendLine(["type": "list_products"]))
+        XCTAssertNil(client.sendLine(["type": "evaluate_dispatch_admission", "work_item_id": "t"]))
+        XCTAssertNil(client.sendLine(["type": "move_work_item_on_board", "work_item_id": "t"]))
+        XCTAssertNil(client.sendLine(["type": "recreate_coordinator"]))
+        XCTAssertFalse(client.hasUnsentActions)
+        XCTAssertEqual(client.unsentActionCountForTesting, 0)
+
+        XCTAssertNil(client.sendLine(["type": "create_chore", "name": "kept"]))
+        XCTAssertEqual(client.unsentActionCountForTesting, 1)
+        for i in 0..<(EngineClient.maxUnsentActions + 10) {
+            client.sendLine(["type": "create_chore", "name": "bulk-\(i)"])
+        }
+        XCTAssertEqual(client.unsentActionCountForTesting, EngineClient.maxUnsentActions, "buffer is capped")
+        client.discardUnsentActions()
+        XCTAssertFalse(client.hasUnsentActions)
+    }
+
+    func testRetryBatchContainsOnlyMutationsAfterNoiseWhileDisconnected() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let client = EngineClient(socketPath: path)
+        client.sendLine(["type": "engine_response", "request_id": "r1", "response": ["kind": "k"]])
+        client.sendLine(["type": "move_work_item_on_board", "work_item_id": "t"])
+        client.sendLine(["type": "create_chore", "name": "real"])
+        client.start()
+        defer { client.stop() }
+        let conn = try XCTUnwrap(server.accept(timeout: 5))
+        defer { conn.close() }
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        XCTAssertTrue(client.retryUnsentActions())
+        let data = try XCTUnwrap(conn.readLine(timeout: 5))
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let payload = try XCTUnwrap(envelope["payload"] as? [String: Any])
+        XCTAssertEqual(payload["type"] as? String, "create_chore")
+        XCTAssertNil(conn.readLine(timeout: 0.3), "nothing but the one mutation was replayed")
+    }
+
+    /// First-attempt send whose connection then dies without a reply: the
+    /// outcome is surfaced as uncertain, not lost silently, and not replayed.
+    func testUnansweredFirstAttemptIsReportedUncertainAndNotReplayed() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let seen = OSAllocatedUnfairLock(initialState: [Seen]())
+        let client = makeClient(
+            path: path, seen: seen, blocking: "never", started: DispatchSemaphore(value: 0),
+            release: DispatchSemaphore(value: 0))
+        client.start()
+        defer { client.stop() }
+        let first = try XCTUnwrap(server.accept(timeout: 5))
+        XCTAssertTrue(waitUntil(5) { seen.withLock { $0 == [.connected] } })
+        XCTAssertNotNil(client.sendLine(["type": "create_chore", "name": "in-flight"]))
+        XCTAssertNotNil(first.readLine(timeout: 5))
+        XCTAssertEqual(client.awaitingReplyCountForTesting, 1)
+        first.close()  // no reply, connection lost
+        XCTAssertTrue(waitUntil(5) { seen.withLock { $0.contains(.retryUncertain) } })
+        XCTAssertEqual(client.awaitingReplyCountForTesting, 0)
+        XCTAssertFalse(client.hasUnsentActions, "a written action is never auto-retained for replay")
+        let second = try XCTUnwrap(server.accept(timeout: 10))
+        defer { second.close() }
+        XCTAssertNil(second.readLine(timeout: 0.3), "an uncertain action is not replayed")
+    }
+
+    /// A kind answered with a reply echoing `request_id` clears the in-flight
+    /// record and confirms a retry; a retried action whose connection dies
+    /// before any reply reports uncertainty.
+    func testRetriedActionWithoutReplyReportsUncertainThenReplyConfirms() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let seen = OSAllocatedUnfairLock(initialState: [Seen]())
+        let client = makeClient(
+            path: path, seen: seen, blocking: "never", started: DispatchSemaphore(value: 0),
+            release: DispatchSemaphore(value: 0))
+        client.sendLine(["type": "create_chore", "name": "a"])
+        client.start()
+        defer { client.stop() }
+        let first = try XCTUnwrap(server.accept(timeout: 5))
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        XCTAssertTrue(client.retryUnsentActions())
+        XCTAssertNotNil(first.readLine(timeout: 5))
+        first.close()
+        XCTAssertTrue(waitUntil(5) { seen.withLock { $0.contains(.retryUncertain) } })
+
+        // Same flow on a fresh connection, this time answered.
+        client.sendLine(["type": "create_chore", "name": "b"])
+        let second = try XCTUnwrap(server.accept(timeout: 10))
+        defer { second.close() }
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        XCTAssertTrue(client.retryUnsentActions())
+        let data = try XCTUnwrap(second.readLine(timeout: 5))
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        var reply = try JSONSerialization.data(withJSONObject: [
+            "request_id": try XCTUnwrap(envelope["request_id"] as? String),
+            "payload": ["type": "error", "message": "ok"],
+        ])
+        reply.append(0x0A)
+        second.sendBytes(reply)
+        XCTAssertTrue(waitUntil(5) { seen.withLock { $0.contains(.retryConfirmed) } })
+        XCTAssertEqual(client.awaitingReplyCountForTesting, 0)
+    }
+
     private enum Seen: Equatable {
         case reply(String)
         case connected

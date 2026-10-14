@@ -40,24 +40,28 @@ final class EngineReconnectIntegrationTests: XCTestCase {
 
         let client = EngineClient(socketPath: socket, pendingDecodeByteLimit: 64 * 1024)
         let connections = OSAllocatedUnfairLock(initialState: 0)
-        let actionQueued = OSAllocatedUnfairLock(initialState: false)
+        let disconnects = OSAllocatedUnfairLock(initialState: 0)
         let matchingProducts = OSAllocatedUnfairLock(initialState: 0)
         let seeded = OSAllocatedUnfairLock(initialState: false)
         let confirmed = OSAllocatedUnfairLock(initialState: false)
+        let overlapProducts = OSAllocatedUnfairLock(initialState: 0)
+        let uncertain = OSAllocatedUnfairLock(initialState: false)
         client.onEvent = { event in
             switch event {
             case .connected:
                 connections.withLock { $0 += 1 }
             case .disconnected:
-                if !actionQueued.withLock({ $0 }) {
-                    XCTAssertNil(client.sendLine(["type": "create_product", "name": "retry-once"]))
-                    actionQueued.withLock { $0 = true }
-                }
+                disconnects.withLock { $0 += 1 }
             case .productsList(let products):
                 seeded.withLock { $0 = products.contains { $0.name == "large-fixture" } }
                 matchingProducts.withLock { $0 = products.filter { $0.name == "retry-once" }.count }
+                overlapProducts.withLock { $0 = products.filter { $0.name == "overlap-once" }.count }
             case .retriedActionsStatus(let message):
-                if message == nil { confirmed.withLock { $0 = true } }
+                if message == nil {
+                    confirmed.withLock { $0 = true }
+                } else {
+                    uncertain.withLock { $0 = true }
+                }
             default: break
             }
         }
@@ -86,14 +90,35 @@ final class EngineReconnectIntegrationTests: XCTestCase {
         XCTAssertTrue(waitUntil(15) {
             ((try? String(contentsOf: logURL, encoding: .utf8)) ?? "").contains("slow subscriber")
         }, "engine must force a real slow-subscriber drop")
+        // The engine has dropped us, but the blocked decoder holds back the
+        // client's `.disconnected`: mutations sent now race the dead socket.
+        // Depending on whether the client has already seen the failed write,
+        // each is either retained as unsent or written and awaiting a reply.
+        client.sendLine(["type": "create_product", "name": "retry-once"])
+        client.sendLine(["type": "create_product", "name": "overlap-once"])
         release.signal()
-        XCTAssertTrue(waitUntil(15) { actionQueued.withLock { $0 } && connections.withLock { $0 >= 2 } })
+        XCTAssertTrue(waitUntil(15) { disconnects.withLock { $0 >= 1 } && connections.withLock { $0 >= 2 } })
         XCTAssertTrue(process.isRunning, "the same isolated engine survived the drop")
+        // Neither mutation is lost silently: it is either back in the unsent
+        // buffer (resent once below) or its lost connection is reported as
+        // delivery-uncertain (never auto-replayed: the engine has no dedupe).
+        XCTAssertTrue(waitUntil(5) { client.hasUnsentActions || uncertain.withLock { $0 } })
+        XCTAssertEqual(client.awaitingReplyCountForTesting, 0, "no write left unaccounted")
+        let retained = client.unsentActionCountForTesting
+        XCTAssertLessThanOrEqual(retained, 2)
         XCTAssertTrue(client.retryUnsentActions())
         XCTAssertTrue(client.retryUnsentActions())
-        XCTAssertTrue(waitUntil(10) { confirmed.withLock { $0 } })
+        if retained > 0 { XCTAssertTrue(waitUntil(10) { confirmed.withLock { $0 } }) }
         client.sendLine(["type": "list_products"])
-        XCTAssertTrue(waitUntil(10) { matchingProducts.withLock { $0 == 1 } })
-        XCTAssertEqual(matchingProducts.withLock { $0 }, 1)
+        XCTAssertTrue(waitUntil(10) {
+            matchingProducts.withLock { $0 } + overlapProducts.withLock { $0 } >= retained
+        })
+        // Exactly-once: no mutation is ever applied twice, and any that is
+        // not applied was reported as uncertain rather than dropped.
+        XCTAssertLessThanOrEqual(matchingProducts.withLock { $0 }, 1)
+        XCTAssertLessThanOrEqual(overlapProducts.withLock { $0 }, 1)
+        XCTAssertTrue(
+            uncertain.withLock { $0 } || (matchingProducts.withLock { $0 } == 1 && overlapProducts.withLock { $0 } == 1),
+            "each overlapping mutation was either resent once or reported as delivery-uncertain")
     }
 }

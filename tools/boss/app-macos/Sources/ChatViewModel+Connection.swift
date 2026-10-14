@@ -12,18 +12,29 @@ extension ChatViewModel {
             : "Lost connection to the engine — reconnecting… Your actions are saved; try again with Retry once connected."
     }
 
+    /// Re-reads the engine's retained-action state into the published
+    /// mirror. Returns the fresh value.
+    @discardableResult
+    func refreshUnsentActions() -> Bool {
+        let value = engine.hasUnsentActions
+        if hasUnsentActions != value { hasUnsentActions = value }
+        return value
+    }
+
     func retryDisconnectedActions() {
-        guard engine.hasUnsentActions else { return }
+        guard refreshUnsentActions() else { return }
         if engine.retryUnsentActions() {
             disconnectedActionNotice = "Sending pending actions…"
         } else {
             showDisconnectedActionNotice()
         }
+        refreshUnsentActions()
     }
 
     func dismissDisconnectedActions() {
         engine.discardUnsentActions()
         disconnectedActionNotice = nil
+        refreshUnsentActions()
     }
 
     /// The engine dropped pending invalidations for our session while

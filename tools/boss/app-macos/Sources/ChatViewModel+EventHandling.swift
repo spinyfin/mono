@@ -33,7 +33,7 @@ extension ChatViewModel {
             UpdateLifecycle.recordStartup("engine-connected")
             markConnected()
             resetConnectionLostBanner()
-            if engine.hasUnsentActions { showDisconnectedActionNotice() }
+            if refreshUnsentActions() { showDisconnectedActionNotice() }
             // A quota request in flight when the socket dropped will never be
             // answered, so clear the pending flag rather than leaving the
             // pane's Refresh button disabled for the rest of the session.
@@ -86,7 +86,7 @@ extension ChatViewModel {
             disconnectOffsiteBackupEdit()
             clearCoordinatorReset()
             isConnected = false
-            if engine.hasUnsentActions { showDisconnectedActionNotice() }
+            if refreshUnsentActions() { showDisconnectedActionNotice() }
             stopBackgroundWorkPolling(clearSnapshot: true)
             isAppSessionRegistered = false
             subscribedWorkTopics.removeAll()
@@ -291,7 +291,7 @@ extension ChatViewModel {
             appendSystemMessage(message)
         case .retriedActionsStatus(let message):
             disconnectedActionNotice = message
-            if engine.hasUnsentActions { showDisconnectedActionNotice() }
+            if refreshUnsentActions() { showDisconnectedActionNotice() }
         case .notConnected(let requestKind):
             if requestKind == "recreate_coordinator" {
                 // The request was dropped, so no handoff will ever arrive.
@@ -305,7 +305,8 @@ extension ChatViewModel {
                 pendingDragAdmissionCheck = nil
                 bounceBackOptimisticMoves(message: "Not connected to the engine — reconnect and try again.")
             }
-            showDisconnectedActionNotice()
+            // Only kinds retained for Retry earn the "your actions are saved" notice.
+            if refreshUnsentActions() { showDisconnectedActionNotice() }
             appendSystemMessage("Not connected to the engine; \(requestKind) was not sent.", alwaysShow: true)
         case .workItemUpdateDecodeFailed(let message, let requestId):
             // The reply a pending archive was waiting on arrived undecodable;
