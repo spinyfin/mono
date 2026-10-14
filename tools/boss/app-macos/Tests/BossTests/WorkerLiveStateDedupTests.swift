@@ -29,6 +29,9 @@ final class WorkerLiveStateDedupTests: XCTestCase {
         XCTAssertNotEqual(base, makeLiveState(liveStatusAt: "2026-06-01T00:00:05Z", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
         XCTAssertNotEqual(base, makeLiveState(recoveryStatus: "Recovering", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
         XCTAssertNotEqual(base, makeLiveState(tmuxHosted: true, lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(agentType: "review", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(hostId: "local", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(pool: "main", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
     }
 
     @MainActor
@@ -74,6 +77,9 @@ final class WorkerLiveStateDedupTests: XCTestCase {
         liveStatusAt: String? = nil,
         recoveryStatus: String? = nil,
         tmuxHosted: Bool? = nil,
+        agentType: String? = nil,
+        hostId: String? = nil,
+        pool: String? = nil,
         lastEventAt: String?,
         lastToolEndedAt: String?
     ) -> WorkerLiveState {
@@ -89,7 +95,10 @@ final class WorkerLiveStateDedupTests: XCTestCase {
             liveStatus: liveStatus,
             liveStatusAt: liveStatusAt,
             recoveryStatus: recoveryStatus,
-            tmuxHosted: tmuxHosted
+            tmuxHosted: tmuxHosted,
+            agentType: agentType,
+            hostId: hostId,
+            pool: pool
         )
     }
 }

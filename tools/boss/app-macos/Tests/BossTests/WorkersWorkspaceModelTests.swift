@@ -18,7 +18,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
             return
         }
 
-        let session = model.slots.first(where: { $0.slotId == 1 })?.session
+        let session = model.viewersByRunId["run-tmux"]?.session
         XCTAssertEqual(session?.launchSpec.initialInput, "exec tmux -S '/state/boss/tmux.sock' attach-session -t 'boss-1-run-tmux'\n")
         XCTAssertTrue(session?.launchSpec.env.isEmpty ?? false)
         XCTAssertEqual(session?.launchSpec.workingDirectory, FileManager.default.homeDirectoryForCurrentUser.path)
@@ -75,7 +75,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
             XCTFail("expected tmux pane detach to succeed, got \(result)")
             return
         }
-        XCTAssertNil(model.slots.first(where: { $0.slotId == 1 })?.session)
+        XCTAssertNil(model.viewersByRunId["run-tmux"]?.session)
     }
 
     func testAttachRejectsEmptyTmuxSocketPath() {
@@ -335,7 +335,7 @@ final class WorkersWorkspaceModelAttachSlotRoutingTests: XCTestCase {
         _ = model.attachWorkerPane(makeAttachRequest(slot: 40, runId: "review-run"))
         let session = model.viewersByRunId["review-run"]?.session
         model.configureSlots(workerCount: 16, automationCount: 8, reviewCount: 8)
-        XCTAssertFalse(model.reviewSlots.contains { $0.slotId == 40 })
+        XCTAssertEqual(model.reviewSlotCount, 8)
         XCTAssertEqual(model.listHostedPanes().map(\.slotId), [40])
         XCTAssertEqual(model.listHostedPanes().map(\.runId), ["review-run"])
         XCTAssertTrue(model.viewersByRunId["review-run"]?.session === session)
@@ -368,13 +368,11 @@ final class WorkersWorkspaceModelAttachSlotRoutingTests: XCTestCase {
             return
         }
         XCTAssertNotNil(
-            model.slots.first(where: { $0.slotId == 5 })?.session,
+            model.viewersByRunId["run-test"]?.session,
             "slot 5 should now host a session"
         )
-        XCTAssertNil(
-            model.slots.first(where: { $0.slotId == 1 })?.session,
-            "no other slot should be touched when the engine asked for slot 5"
-        )
+        XCTAssertEqual(model.viewersByRunId["run-test"]?.slotId, 5)
+        XCTAssertEqual(model.viewersByRunId.count, 1)
     }
 
     func testAttachIntoOccupiedSlotReturnsSlotBusy() {
@@ -465,50 +463,41 @@ final class WorkersWorkspaceModelPageTests: XCTestCase {
         )
     }
 
-    func testInteractivePoolIsSixteenSlotsSplitIntoTwoPages() {
-        // The interactive pool is now two pages of 8: Bridge Crew (slots
-        // 1...8) and Lower Decks (slots 9...16). Both are drawn from the flat
-        // `slots` array; the pages must be disjoint and cover it exactly.
+    func testInteractivePoolCapacityAndAutomationBaseStayPinned() {
         let model = WorkersWorkspaceModel()
-        XCTAssertEqual(model.slots.count, 16, "main pool must span both pages")
-        XCTAssertEqual(model.bridgeCrewSlots.map(\.slotId), Array(1...8))
-        XCTAssertEqual(model.lowerDecksSlots.map(\.slotId), Array(9...16))
-        // Namespace agreement with the engine: automation floats immediately
-        // above the interactive pool (worker 16 → automation base 17).
+        XCTAssertEqual(WorkersWorkspaceModel.workerSlotCount, 16)
         XCTAssertEqual(WorkersWorkspaceModel.automationSlotBase, 17)
+        XCTAssertEqual(model.interactivePoolSize, 16)
+        XCTAssertEqual(model.automationPoolSize, 8)
+        XCTAssertEqual(model.reviewSlotCount, 16)
     }
 
-    func testAttachIntoLowerDecksSlotSucceedsAndRoutesToMainPool() {
-        // Slot 9 is Lower Decks slot 1 — the first spillover slot. Before the
-        // second page existed it was the automation pool and would not host a
-        // main worker; now it must attach into the main `slots` array and show
-        // up under `lowerDecksSlots`, indistinguishable from a Bridge Crew pane.
+    func testAttachIntoInteractiveSpilloverSlotSucceeds() {
         let model = WorkersWorkspaceModel()
         let result = model.attachWorkerPane(makeAttachRequest(slot: 9, runId: "run-ld1"))
         guard case .success = result else {
-            XCTFail("expected .success attaching Lower Decks slot 9, got \(result)")
+            XCTFail("expected .success attaching slot 9, got \(result)")
             return
         }
-        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 9 })?.session)
-        XCTAssertNotNil(
-            model.lowerDecksSlots.first(where: { $0.slotId == 9 })?.session,
-            "the attached pane must appear on the Lower Decks page"
-        )
-        XCTAssertTrue(
-            model.bridgeCrewSlots.allSatisfy { $0.session == nil },
-            "attaching Lower Decks must not touch any Bridge Crew slot"
-        )
+        XCTAssertEqual(model.viewersByRunId["run-ld1"]?.slotId, 9)
+        XCTAssertNotNil(model.viewersByRunId["run-ld1"]?.session)
     }
 
-    func testAttachIntoTopLowerDecksSlotSucceeds() {
-        // Slot 16 is the last interactive slot. It must be a valid attach
-        // target (it was out of range when the pool capped at 8).
+    func testAttachIntoLastInteractiveSlotSucceeds() {
         let model = WorkersWorkspaceModel()
         let result = model.attachWorkerPane(makeAttachRequest(slot: 16, runId: "run-ld8"))
         guard case .success = result else {
-            XCTFail("expected .success attaching Lower Decks slot 16, got \(result)")
+            XCTFail("expected .success attaching slot 16, got \(result)")
             return
         }
-        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 16 })?.session)
+        XCTAssertEqual(model.viewersByRunId["run-ld8"]?.slotId, 16)
+    }
+
+    func testConfigureSlotsPublishesEnginePoolSizes() {
+        let model = WorkersWorkspaceModel()
+        model.configureSlots(workerCount: 16, automationCount: 8, reviewCount: 12)
+        XCTAssertEqual(model.interactivePoolSize, 16)
+        XCTAssertEqual(model.automationPoolSize, 8)
+        XCTAssertEqual(model.reviewSlotCount, 12)
     }
 }

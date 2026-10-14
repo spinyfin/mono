@@ -50,9 +50,8 @@ struct ContentView: View {
         // Hidden-tab layout cost is cut without unmounting: `WorkersDetailView`
         // is Equatable over workspace / live-state identity, visibility, and
         // the two live-status flags, so an unrelated `ChatViewModel` publish
-        // (the kanban's usual invalidation) skips the Agents body. While the
-        // tab is hidden, its snapshot cache also prevents live-state ticks
-        // from invalidating a grid or slot while preserving all surfaces.
+        // (the kanban's usual invalidation) skips the Agents body. Off-page
+        // and unplaced attached surfaces stay mounted at zero opacity.
         //
         // This ZStack must stay the root of the window's content: SwiftUI only
         // promotes a NavigationSplitView to the window's content view

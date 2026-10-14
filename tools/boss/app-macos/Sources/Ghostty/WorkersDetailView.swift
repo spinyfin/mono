@@ -1,42 +1,17 @@
 import AppKit
+import PaneLayout
 import SwiftUI
 
-/// Which worker pool page the Agents tab is currently displaying.
+/// Agents-tab shell. Observes the workspace (viewer map) and the live-state
+/// store (engine membership) — the two objects whose publishes change pane
+/// chrome — and receives live-status flags and tab visibility as values from
+/// `ContentView`. It does **not** observe `ChatViewModel`. Closures stay
+/// outside `==` so a parent rebuild of the toggle handler cannot defeat
+/// `.equatable()` at the call site.
 ///
-/// Bridge Crew and Lower Decks are the two pages of the single interactive
-/// worker pool (slots 1...8 and 9...16 respectively). They are one engine
-/// pool — dispatch just fills Bridge Crew before spilling into Lower Decks.
-enum AgentPoolKind: String, CaseIterable, Identifiable {
-    case bridgeCrew
-    case lowerDecks
-    case automations
-    case reviewers
-
-    var id: String { rawValue }
-
-    func label(bridgeCrewCount: Int, lowerDecksCount: Int, automationCount: Int, reviewCount: Int) -> String {
-        switch self {
-        case .bridgeCrew: return "Bridge Crew (\(bridgeCrewCount))"
-        case .lowerDecks: return "Lower Decks (\(lowerDecksCount))"
-        case .automations: return "Automations (\(automationCount))"
-        case .reviewers: return "Reviewers (\(reviewCount))"
-        }
-    }
-}
-
-/// Agents-tab shell. Observes the workspace and the live-state store —
-/// the two objects whose publishes actually change slot chrome — and
-/// receives live-status flags and tab visibility as values from `ContentView`. It does
-/// **not** observe `ChatViewModel`: that type has ~100 `@Published`
-/// properties, and a grid that subscribed to it re-laid-out all 40
-/// slots on every unrelated write (transcript chunk, hover, panel
-/// width). Closures stay outside `==` so a parent rebuild of the
-/// toggle handler cannot defeat `.equatable()` at the call site.
-///
-/// The four pool grids stay permanently in the `ZStack` so switching
-/// pools is a display filter — no `dismantleNSView`, no libghostty
-/// surface teardown. Hidden grids skip body evaluation via
-/// `WorkerGrid.equatable()` when their snapshots have not moved.
+/// Every page of the grid stays in the `ZStack` so pagination is a display
+/// filter — no `dismantleNSView`, no libghostty surface teardown. Off-page
+/// and unplaced attached surfaces stay mounted at zero opacity.
 struct WorkersDetailView: View, @MainActor Equatable {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @ObservedObject var liveStates: LiveWorkerStateStore
@@ -44,8 +19,8 @@ struct WorkersDetailView: View, @MainActor Equatable {
     let liveStatusDisabledSlotIDs: Set<Int>
     let onToggleLiveStatus: (Int, Bool) -> Void
 
-    @State private var selectedPool: AgentPoolKind = .bridgeCrew
-    @State private var snapshotCache: WorkerSlotSnapshotCache
+    @StateObject private var grid = AgentsGridModel()
+    @State private var emptyFlavorCycle = Int.random(in: 0...10_000)
 
     init(
         workspace: WorkersWorkspaceModel,
@@ -59,11 +34,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
         self.isVisible = isVisible
         self.liveStatusDisabledSlotIDs = liveStatusDisabledSlotIDs
         self.onToggleLiveStatus = onToggleLiveStatus
-        _snapshotCache = State(initialValue: WorkerSlotSnapshotCache(
-            workspace: workspace,
-            liveStates: liveStates,
-            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
-        ))
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
@@ -75,188 +45,309 @@ struct WorkersDetailView: View, @MainActor Equatable {
 
     var body: some View {
         VStack(spacing: 0) {
-            poolPickerHeader
+            agentsHeader
             Divider()
-            // All grids stay permanently in the view hierarchy so that
-            // switching pools is a pure display filter — no SwiftUI identity
-            // churn, no dismantleNSView, no libghostty surface teardown.
-            // Only the visible grid receives hit-testing and is rendered.
-            // Do not replace this ZStack with `if selectedPool ==` (or a
-            // lazy stack): `GhosttyTerminalView.dismantleNSView` frees the
-            // surface, and remounting restarts the worker's claude session.
-            ZStack {
-                // Bridge Crew and Lower Decks are the two pages of the same
-                // interactive pool, filtered out of the flat `slots` array.
-                grid(for: workspace.bridgeCrewSlots, pool: .bridgeCrew)
-                    .opacity(selectedPool == .bridgeCrew ? 1 : 0)
-                    .allowsHitTesting(selectedPool == .bridgeCrew)
-
-                grid(for: workspace.lowerDecksSlots, pool: .lowerDecks)
-                    .opacity(selectedPool == .lowerDecks ? 1 : 0)
-                    .allowsHitTesting(selectedPool == .lowerDecks)
-
-                grid(for: workspace.automationSlots, pool: .automations, columns: 3)
-                    .opacity(selectedPool == .automations ? 1 : 0)
-                    .allowsHitTesting(selectedPool == .automations)
-
-                grid(for: workspace.reviewSlots, pool: .reviewers)
-                    .opacity(selectedPool == .reviewers ? 1 : 0)
-                    .allowsHitTesting(selectedPool == .reviewers)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            paneArea
         }
         .background(Color(nsColor: .separatorColor))
+        .onAppear(perform: bindAndSync)
+        .onChange(of: isVisible) { _, _ in syncGrid() }
+        .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
+        .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
+        .onChange(of: workspace.viewersByRunId) { _, _ in syncGrid() }
+        .onChange(of: workspace.interactivePoolSize) { _, _ in syncGrid() }
+        .onChange(of: workspace.automationPoolSize) { _, _ in syncGrid() }
+        .onChange(of: workspace.reviewSlotCount) { _, _ in syncGrid() }
+        .onChange(of: liveStatusDisabledSlotIDs) { _, _ in syncGrid() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEndLiveResizeNotification)) { _ in
+            grid.liveResizeDidEnd()
+        }
     }
 
-    private func grid(for slots: [WorkerSlot], pool: AgentPoolKind, columns: Int = 4) -> some View {
-        WorkerGrid(
-            runtime: workspace.runtime,
-            snapshots: snapshotCache.snapshots(
-                for: pool,
-                slots: slots,
-                liveStates: liveStates,
-                liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs,
-                refresh: isVisible
-            ),
-            onToggleLiveStatus: onToggleLiveStatus,
-            columns: columns
-        )
-        .equatable()
-    }
-
-    private var poolPickerHeader: some View {
-        HStack {
-            NativeSegmentedPicker(
-                "Pool",
-                selection: $selectedPool,
-                options: AgentPoolKind.allCases,
-                title: { pool in
-                    pool.label(
-                        bridgeCrewCount: workspace.bridgeCrewSlots.count,
-                        lowerDecksCount: workspace.lowerDecksSlots.count,
-                        automationCount: WorkersWorkspaceModel.automationSlotCount,
-                        reviewCount: workspace.reviewSlotCount
-                    )
-                }
-            )
-            .frame(maxWidth: 460)
-            Spacer()
+    private var agentsHeader: some View {
+        HStack(spacing: 10) {
+            if liveStates.feedUnavailable {
+                Label("Showing last known agents", systemImage: "wifi.slash")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .help("The engine feed is disconnected. Membership is the last accepted snapshot.")
+            }
+            if grid.layout.selectorsVisible {
+                pageSelectors
+            }
+            Spacer(minLength: 8)
+            if grid.layout.waitingCount > 0 {
+                Text("Needs input \(grid.layout.waitingCount)")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.orange)
+            }
+            Button("Tidy") { grid.tidy() }
+                .font(.caption)
+                .disabled(!grid.layout.isTidyHighlighted)
+                .opacity(grid.layout.isTidyHighlighted ? 1 : 0.45)
+                .help("Pack agents into the current sort order and drop empty cells.")
+            Text(grid.poolStrip)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color(nsColor: .windowBackgroundColor))
     }
+
+    private var pageSelectors: some View {
+        HStack(spacing: 6) {
+            ForEach(grid.layout.pageSelectors, id: \.index) { selector in
+                AgentPageSelectorChip(
+                    selector: selector,
+                    isSelected: selector.index == grid.layout.selectedPage
+                ) {
+                    grid.selectPage(selector.index)
+                }
+            }
+        }
+    }
+
+    private var paneArea: some View {
+        ZStack {
+            ForEach(grid.layout.pages, id: \.index) { page in
+                AgentPageGrid(
+                    runtime: workspace.runtime,
+                    page: page,
+                    snapshots: snapshots(for: page),
+                    onToggleLiveStatus: onToggleLiveStatus
+                )
+                .equatable()
+                .opacity(page.index == grid.layout.selectedPage && !grid.layout.isEmpty ? 1 : 0)
+                .allowsHitTesting(page.index == grid.layout.selectedPage && !grid.layout.isEmpty)
+            }
+            unplacedSurfaceHost
+            if grid.layout.isEmpty {
+                emptyState
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(paneSizeReader)
+    }
+
+    /// Surfaces whose run is no longer in a layout cell. Kept mounted
+    /// until the engine detaches them; never invent membership.
+    private var unplacedSurfaceHost: some View {
+        ZStack {
+            ForEach(grid.unplacedViewers.filter { $0.runId != nil }, id: \.slotId) { slot in
+                WorkerSlotView(
+                    runtime: workspace.runtime,
+                    snapshot: WorkerSlotSnapshot.build(
+                        slot: slot,
+                        liveState: slot.runId.flatMap { liveStates.byRunID[$0] },
+                        liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slot.slotId)
+                    ),
+                    onToggleLiveStatus: { enabled in
+                        onToggleLiveStatus(slot.slotId, enabled)
+                    }
+                )
+            }
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private var emptyState: some View {
+        let crew = TrekCharacter.allCases.filter { $0 != .picard }
+        let character = crew[abs(emptyFlavorCycle) % max(crew.count, 1)]
+        return VStack(spacing: 14) {
+            Spacer()
+            if let nsImage = TrekIconAssets.image(character, size: .large) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 220, maxHeight: 240)
+                    .opacity(0.85)
+            }
+            Text("No agents running")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(Color.white.opacity(0.85))
+            Text(TrekIdleFlavor.line(for: character, cycle: emptyFlavorCycle))
+                .font(.callout)
+                .foregroundStyle(Color.white.opacity(0.6))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+                .lineLimit(3)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .black))
+    }
+
+    private var paneSizeReader: some View {
+        GeometryReader { geo in
+            Color.clear.preference(key: AgentsPaneSizeKey.self, value: geo.size)
+        }
+        .onPreferenceChange(AgentsPaneSizeKey.self) { size in
+            Task { @MainActor in
+                let liveResize = NSApp.windows.contains { $0.inLiveResize }
+                grid.noteArea(width: size.width, height: size.height, inLiveResize: liveResize)
+            }
+        }
+    }
+
+    private func bindAndSync() {
+        if let cell = workspace.runtime.lastCellSize {
+            grid.noteCellSize(width: cell.width, height: cell.height)
+        }
+        workspace.runtime.onCellSizeChanged = { [grid] width, height in
+            Task { @MainActor in
+                grid.noteCellSize(width: width, height: height)
+            }
+        }
+        syncGrid()
+    }
+
+    private func syncGrid() {
+        grid.setVisible(isVisible)
+        grid.apply(
+            states: Array(liveStates.byRunID.values),
+            viewers: workspace.viewersByRunId,
+            interactivePoolSize: workspace.interactivePoolSize,
+            automationPoolSize: workspace.automationPoolSize,
+            reviewPoolSize: workspace.reviewSlotCount,
+            feedUnavailable: liveStates.feedUnavailable
+        )
+    }
+
+    private func snapshots(for page: PaneLayoutPage) -> [Int: WorkerSlotSnapshot] {
+        var result: [Int: WorkerSlotSnapshot] = [:]
+        for cell in page.cells {
+            if let snapshot = snapshot(for: cell) {
+                result[cell.localIndex] = snapshot
+            }
+        }
+        return result
+    }
+
+    private func snapshot(for cell: PaneCell) -> WorkerSlotSnapshot? {
+        switch cell.content {
+        case .empty:
+            return nil
+        case .occupied(let member):
+            return snapshot(runId: member.runId, isPlaceholder: false)
+        case .placeholder(let runId):
+            return snapshot(runId: runId, isPlaceholder: true)
+        }
+    }
+
+    private func snapshot(runId: String, isPlaceholder: Bool) -> WorkerSlotSnapshot {
+        let viewer = workspace.viewersByRunId[runId]
+        let live = liveStates.byRunID[runId]
+        let slotId = viewer?.slotId ?? live?.slotId ?? 0
+        let slot = viewer ?? WorkerSlot(
+            slotId: slotId,
+            runId: runId,
+            summary: nil,
+            taskTitle: nil
+        )
+        return WorkerSlotSnapshot.build(
+            slot: slot,
+            liveState: live,
+            liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slotId),
+            isPlaceholder: isPlaceholder,
+            cachedPersona: grid.personaName(for: runId)
+        )
+    }
 }
 
-/// Keeps the last visible inputs for each permanently-mounted worker grid.
-/// `LiveWorkerStateStore` still invalidates the enclosing view while Agents
-/// is hidden, but those invalidations reuse these values. That avoids both
-/// snapshot construction and a changed `WorkerGrid` input, while retaining
-/// the existing terminal-view hierarchy and its libghostty surfaces.
-@MainActor
-final class WorkerSlotSnapshotCache {
-    private var snapshotsByPool: [AgentPoolKind: [WorkerSlotSnapshot]]
+private struct AgentPageSelectorChip: View {
+    let selector: PageSelector
+    let isSelected: Bool
+    let onSelect: () -> Void
 
-    init(
-        workspace: WorkersWorkspaceModel,
-        liveStates: LiveWorkerStateStore,
-        liveStatusDisabledSlotIDs: Set<Int>
-    ) {
-        snapshotsByPool = [:]
-        refresh(
-            .bridgeCrew,
-            slots: workspace.bridgeCrewSlots,
-            liveStates: liveStates,
-            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
-        )
-        refresh(
-            .lowerDecks,
-            slots: workspace.lowerDecksSlots,
-            liveStates: liveStates,
-            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
-        )
-        refresh(
-            .automations,
-            slots: workspace.automationSlots,
-            liveStates: liveStates,
-            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
-        )
-        refresh(
-            .reviewers,
-            slots: workspace.reviewSlots,
-            liveStates: liveStates,
-            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
-        )
-    }
-
-    func snapshots(
-        for pool: AgentPoolKind,
-        slots: [WorkerSlot],
-        liveStates: LiveWorkerStateStore,
-        liveStatusDisabledSlotIDs: Set<Int>,
-        refresh shouldRefresh: Bool
-    ) -> [WorkerSlotSnapshot] {
-        if shouldRefresh {
-            refresh(pool, slots: slots, liveStates: liveStates, liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs)
-        }
-        return snapshotsByPool[pool] ?? []
-    }
-
-    private func refresh(
-        _ pool: AgentPoolKind,
-        slots: [WorkerSlot],
-        liveStates: LiveWorkerStateStore,
-        liveStatusDisabledSlotIDs: Set<Int>
-    ) {
-        snapshotsByPool[pool] = slots.map { slot in
-            WorkerSlotSnapshot.build(
-                slot: slot,
-                liveState: liveStates.bySlot[slot.slotId],
-                liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slot.slotId)
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 4) {
+                Text(pageLabel)
+                    .font(.caption.weight(.semibold))
+                Text(occupiedLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if selector.hasWaiting {
+                    Circle()
+                        .fill(Color.orange)
+                        .frame(width: 6, height: 6)
+                        .accessibilityLabel("Waiting workers")
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                isSelected
+                    ? Color.accentColor.opacity(0.18)
+                    : Color.secondary.opacity(0.08)
             )
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Page \(selector.index + 1), \(selector.occupiedCount) agents")
+    }
+
+    private var pageLabel: String { String(selector.index + 1) }
+    private var occupiedLabel: String { String(selector.occupiedCount) }
+}
+
+private struct AgentsPaneSizeKey: PreferenceKey {
+    static let defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
     }
 }
 
-/// Eager 4-column (or 3-column automations) grid. Not lazy: every slot
-/// of a pool is on-screen in this full-bleed layout, and a `LazyVStack`
-/// would let SwiftUI dismantle off-screen `NSViewRepresentable`s —
-/// `GhosttyTerminalView.dismantleNSView` frees the libghostty surface.
-/// Equatable over the snapshot array so a live-state tick in another
-/// pool skips this grid's body.
-private struct WorkerGrid: View, @MainActor Equatable {
+/// Eager grid of one layout page. Not lazy: a `LazyVStack` would let
+/// SwiftUI dismantle off-screen `NSViewRepresentable`s.
+private struct AgentPageGrid: View, @MainActor Equatable {
     let runtime: GhosttyRuntime
-    let snapshots: [WorkerSlotSnapshot]
+    let page: PaneLayoutPage
+    let snapshots: [Int: WorkerSlotSnapshot]
     let onToggleLiveStatus: (Int, Bool) -> Void
-    var columns: Int = 4
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.runtime === rhs.runtime
+            && lhs.page == rhs.page
             && lhs.snapshots == rhs.snapshots
-            && lhs.columns == rhs.columns
     }
 
     var body: some View {
-        let rows = stride(from: 0, to: snapshots.count, by: columns).map { start in
-            Array(snapshots[start..<min(start + columns, snapshots.count)])
+        let columns = max(1, page.shape.columns)
+        let rows = stride(from: 0, to: page.cells.count, by: columns).map { start in
+            Array(page.cells[start..<min(start + columns, page.cells.count)])
         }
-
         VStack(spacing: 1) {
             ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                 HStack(spacing: 1) {
-                    ForEach(row, id: \.slotId) { snapshot in
-                        WorkerSlotView(
-                            runtime: runtime,
-                            snapshot: snapshot,
-                            onToggleLiveStatus: { enabled in
-                                onToggleLiveStatus(snapshot.slotId, enabled)
-                            }
-                        )
-                        .equatable()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    ForEach(row, id: \.localIndex) { cell in
+                        cellView(cell)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func cellView(_ cell: PaneCell) -> some View {
+        if let snapshot = snapshots[cell.localIndex] {
+            WorkerSlotView(
+                runtime: runtime,
+                snapshot: snapshot,
+                onToggleLiveStatus: { enabled in
+                    onToggleLiveStatus(snapshot.slotId, enabled)
+                }
+            )
+            .equatable()
+        } else {
+            Color(nsColor: .windowBackgroundColor)
         }
     }
 }
@@ -281,6 +372,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
     var body: some View {
         VStack(spacing: 0) {
             slotHeader
+                .opacity(snapshot.isPlaceholder || snapshot.isExited ? 0.55 : 1)
             Divider()
             slotBody
         }
@@ -289,7 +381,9 @@ struct WorkerSlotView: View, @MainActor Equatable {
 
     @ViewBuilder
     private var slotBody: some View {
-        if let session = snapshot.session {
+        if snapshot.isPlaceholder, snapshot.session == nil {
+            placeholderCard
+        } else if let session = snapshot.session {
             WorkerPaneTerminalView(
                 runtime: runtime,
                 session: session,
@@ -310,11 +404,61 @@ struct WorkerSlotView: View, @MainActor Equatable {
             // the old surface is always torn down and a fresh one
             // created before the new run's output ever lands.
             .id(session.id)
+            .opacity(snapshot.isPlaceholder || snapshot.isExited ? 0.55 : 1)
             .onChange(of: snapshot.displayName, initial: true) { _, name in
                 session.setWorkerName(name)
             }
+        } else if snapshot.isViewerMissing {
+            viewerMissingCard
         } else {
             idlePaneView
+        }
+    }
+
+    private var placeholderCard: some View {
+        VStack(spacing: 8) {
+            Spacer()
+            personaPortrait(size: .medium)
+            Text("\(snapshot.displayName) finished")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(Color.white.opacity(0.7))
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .black))
+        .opacity(0.55)
+    }
+
+    private var viewerMissingCard: some View {
+        VStack(spacing: 10) {
+            Spacer()
+            personaPortrait(size: .large)
+            Text(snapshot.displayName)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(Color.white.opacity(0.85))
+            AgentTypeBadge(type: snapshot.badgeType, raw: snapshot.live?.agentType)
+            if let live = snapshot.live {
+                statusPill(live.activity.agentsPaneLabel, color: liveActivityColor(live.activity))
+            }
+            Text("Viewer not attached")
+                .font(.callout)
+                .foregroundStyle(Color.white.opacity(0.6))
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .black))
+    }
+
+    @ViewBuilder
+    private func personaPortrait(size: TrekIconSize) -> some View {
+        if let character = TrekCharacter.forPersona(snapshot.live?.name ?? snapshot.cachedPersona),
+           let nsImage = TrekIconAssets.image(character, size: size) {
+            Image(nsImage: nsImage)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(maxWidth: size == .large ? 220 : 96, maxHeight: size == .large ? 240 : 120)
+                .opacity(0.85)
         }
     }
 
@@ -361,7 +505,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
 
     private var slotHeader: some View {
         HStack(spacing: 8) {
-            if let nsImage = TrekIconAssets.portrait(forPersona: snapshot.live?.name) {
+            if let nsImage = TrekIconAssets.portrait(forPersona: snapshot.live?.name ?? snapshot.cachedPersona) {
                 Image(nsImage: nsImage)
                     .resizable()
                     .interpolation(.none)
@@ -378,15 +522,21 @@ struct WorkerSlotView: View, @MainActor Equatable {
 
             Spacer(minLength: 0)
 
+            if snapshot.live != nil {
+                AgentTypeBadge(type: snapshot.badgeType, raw: snapshot.live?.agentType)
+            }
+
             // Prefer engine-supplied LiveWorkerState — its activity is
             // driven by hook events rather than a screen-scrape that
             // always rendered "Agent Unknown". Fall back to a session-
             // observing pill until the worker's first hook fires, so
             // `.equatable()` skipping this body does not freeze the
             // fallback chrome.
-            if let live = snapshot.live {
+            if snapshot.isPlaceholder {
+                statusPill("Finished", color: .secondary)
+            } else if let live = snapshot.live {
                 statusPill(
-                    live.activity.label,
+                    live.activity.agentsPaneLabel,
                     color: liveActivityColor(live.activity)
                 )
             } else if let session = snapshot.session {
@@ -437,11 +587,20 @@ struct WorkerSlotView: View, @MainActor Equatable {
     }
 
     private var slotTooltip: String {
-        let base = "Worker \(snapshot.slotId)"
+        var parts: [String] = []
         if let runId = snapshot.runId {
-            return "\(base) · run \(runId)"
+            parts.append("run \(runId)")
         }
-        return "\(base) · idle"
+        parts.append("slot \(snapshot.slotId)")
+        if let pool = snapshot.live?.pool, !pool.isEmpty {
+            parts.append(pool)
+        }
+        if let project = snapshot.live?.projectName, !project.isEmpty {
+            parts.append(project)
+        } else if snapshot.runId != nil {
+            parts.append("Unfiled")
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// First line in the titlebar — the overall task this worker is
@@ -456,6 +615,9 @@ struct WorkerSlotView: View, @MainActor Equatable {
     private var slotTaskLine: some View {
         let name = snapshot.displayName
         let text: String = {
+            if snapshot.isPlaceholder {
+                return "\(name) finished"
+            }
             if let summary = snapshot.summary, !summary.isEmpty {
                 // Success path: Claude-generated gerund phrase.
                 // Preserved verbatim — do NOT change this branch.
@@ -548,6 +710,42 @@ struct WorkerSlotView: View, @MainActor Equatable {
         default:
             return .secondary
         }
+    }
+}
+
+struct AgentTypeBadge: View {
+    let type: AgentType
+    let raw: String?
+
+    var body: some View {
+        Text(type.badgeLabel)
+            .font(.caption2.weight(.semibold))
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.16))
+            .foregroundStyle(color)
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .help(helpText)
+            .accessibilityLabel(type == .unknown ? "Unknown agent type \(raw ?? "")" : type.badgeLabel)
+    }
+
+    private var color: Color {
+        switch type {
+        case .coding: .blue
+        case .design: .purple
+        case .review: .orange
+        case .automation: .teal
+        case .answer: .green
+        case .unknown: .red
+        }
+    }
+
+    private var helpText: String {
+        if type == .unknown, let raw, !raw.isEmpty {
+            return "Unknown agent type: \(raw)"
+        }
+        return type.badgeLabel
     }
 }
 

@@ -91,6 +91,7 @@ extension ChatViewModel {
             }
             isConnected = false
             if refreshUnsentActions() { showDisconnectedActionNotice() }
+            liveWorkerStates.markFeedUnavailable()
             stopBackgroundWorkPolling(clearSnapshot: true)
             isAppSessionRegistered = false
             subscribedWorkTopics.removeAll()

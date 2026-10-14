@@ -5,22 +5,10 @@ import GhosttyKit
 
 @MainActor
 final class WorkersWorkspaceModel: ObservableObject {
-    /// Interactive worker slots shown on one page (one "Pool" tab). Mirrors
-    /// WORKER_PAGE_SIZE in coordinator.rs.
-    static let workerPageSize = 8
-    /// Number of interactive pages: page 0 "Bridge Crew", page 1 "Lower Decks".
-    /// Mirrors WORKER_PAGE_COUNT in coordinator.rs.
-    static let workerPageCount = 2
-    /// Total interactive/main pool capacity = pages × page size (currently 16).
-    /// Mirrors MAX_WORKER_POOL_SIZE in coordinator.rs; every derived base below
-    /// keys off it so engine and app agree on the slot namespace across pages.
-    static let workerSlotCount = workerPageSize * workerPageCount
-    /// Bridge Crew occupies the first page of slot IDs (1...8); Lower Decks the
-    /// second (9...16). Dispatch fills Bridge Crew before spilling into Lower
-    /// Decks, but both are the same engine pool — indistinguishable except for
-    /// claim-time scheduling priority.
-    static let bridgeCrewSlotRange = 1...workerPageSize                              // 1...8
-    static let lowerDecksSlotRange = (workerPageSize + 1)...workerSlotCount          // 9...16
+    /// Interactive/main pool capacity. Mirrors `MAX_WORKER_POOL_SIZE`.
+    /// Slot ids 1...16 remain engine capacity handles; they are not
+    /// Agents-view pages.
+    static let workerSlotCount = 16
     /// Automation pool occupies slot IDs immediately above the interactive pool.
     /// Matches MAX_AUTOMATION_POOL_SIZE in coordinator.rs.
     static let automationSlotCount = 8
@@ -28,17 +16,14 @@ final class WorkersWorkspaceModel: ObservableObject {
     static let automationSlotRange = automationSlotBase...(automationSlotBase + automationSlotCount - 1)  // 17...24
     /// Review pool occupies slot IDs immediately above the automation pool.
     /// The count is set dynamically via configureSlots(workerCount:automationCount:reviewCount:)
-    /// when the engine pushes EnginePoolConfig on RegisterAppSession, so the
-    /// app never independently hardcodes a value that drifts from the engine.
-    /// The initial value of 16 matches DEFAULT_REVIEW_POOL_SIZE in coordinator.rs
-    /// and ensures the slot grid renders correctly before the first pool-config
-    /// push arrives (covering the unlikely race of an AttachWorkerPane before
-    /// EnginePoolConfig, and preventing an empty grid on first launch).
+    /// when the engine pushes EnginePoolConfig on RegisterAppSession.
+    /// The initial value of 16 matches DEFAULT_REVIEW_POOL_SIZE in coordinator.rs.
     static let reviewSlotBase = automationSlotBase + automationSlotCount   // 25
 
-    /// Instance-level review slot count, kept in sync with the engine's live
-    /// pool config. Published so the pool-picker header re-renders whenever
-    /// the engine reports a pool size change on reconnect.
+    /// Engine-pushed pool sizes for the Agents pool strip. Existing
+    /// viewers survive capacity changes until detached.
+    @Published private(set) var interactivePoolSize: Int = 16
+    @Published private(set) var automationPoolSize: Int = 8
     @Published private(set) var reviewSlotCount: Int = 16
 
     var reviewSlotRange: ClosedRange<Int> {
@@ -46,35 +31,12 @@ final class WorkersWorkspaceModel: ObservableObject {
     }
 
     let runtime: GhosttyRuntime
-    /// Authoritative viewer identity. Slot arrays below are temporary grid projections.
+    /// Authoritative viewer identity, keyed by run id. Layout cells are
+    /// a separate presentation concern in `AgentsGridModel`.
     @Published private(set) var viewersByRunId: [String: WorkerSlot] = [:]
-    private var idleFlavorCycles: [Int: Int] = [:]
-
-    var slots: [WorkerSlot] { projectSlots(1...Self.workerSlotCount) }
-    var automationSlots: [WorkerSlot] { projectSlots(Self.automationSlotRange) }
-    var reviewSlots: [WorkerSlot] { projectSlots(reviewSlotRange) }
-
-    private func projectSlots(_ range: ClosedRange<Int>) -> [WorkerSlot] {
-        range.map { slotId in
-            viewersByRunId.values.first { $0.slotId == slotId }
-                ?? WorkerSlot(slotId: slotId, idleFlavorCycle: idleFlavorCycles[slotId, default: 0])
-        }
-    }
-
-    /// The interactive pool split into its two display pages. Both are drawn
-    /// from `slots` as a pure display grouping; RPC routing uses run identity.
-    var bridgeCrewSlots: [WorkerSlot] {
-        slots.filter { Self.bridgeCrewSlotRange.contains($0.slotId) }
-    }
-    var lowerDecksSlots: [WorkerSlot] {
-        slots.filter { Self.lowerDecksSlotRange.contains($0.slotId) }
-    }
 
     init() {
         self.runtime = GhosttyRuntime.shared
-        for slotId in 1...(Self.reviewSlotBase + reviewSlotCount - 1) {
-            idleFlavorCycles[slotId] = Int.random(in: 0...10_000)
-        }
     }
 
     /// Update pool capacities from the engine's EnginePoolConfig push.
@@ -82,10 +44,14 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// always mirror the live engine rather than independently-maintained
     /// constants. Existing viewers survive capacity changes until detached.
     func configureSlots(workerCount: Int, automationCount: Int, reviewCount: Int) {
-        guard reviewSlotCount != reviewCount else { return }
-        reviewSlotCount = reviewCount
-        for slotId in reviewSlotRange where idleFlavorCycles[slotId] == nil {
-            idleFlavorCycles[slotId] = Int.random(in: 0...10_000)
+        if interactivePoolSize != workerCount {
+            interactivePoolSize = workerCount
+        }
+        if automationPoolSize != automationCount {
+            automationPoolSize = automationCount
+        }
+        if reviewSlotCount != reviewCount {
+            reviewSlotCount = reviewCount
         }
     }
 
@@ -176,7 +142,6 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
         // Prevent a display-change retry from recreating a released surface.
         session.markReleased()
-        idleFlavorCycles[viewer.slotId, default: 0] &+= 1
         viewersByRunId.removeValue(forKey: runId)
         return .success
     }

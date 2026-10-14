@@ -25,11 +25,20 @@ final class LiveWorkerStateStore: ObservableObject {
     /// possibly in-progress edits in its leased workspace).
     @Published private(set) var activeAgentCount = 0
 
+    /// True while the engine feed is down. The last accepted snapshot
+    /// stays in `byRunID`/`bySlot`; disconnection is not an empty
+    /// snapshot and must not clear the Agents grid.
+    @Published private(set) var feedUnavailable = false
+
     /// Replace the snapshot with `states`. Skips the publish when the
     /// new snapshot is value-equal to the previous one — a hook event
     /// that nudged `lastEventAt` but left every per-slot field
     /// otherwise unchanged still reaches us, and republishing it would
     /// invalidate every observing card for no visible delta.
+    ///
+    /// Duplicate run or slot ids are malformed: the previous snapshot
+    /// is kept. An empty list is an accepted authoritative snapshot
+    /// (no local workers) and does replace membership.
     func update(states: [WorkerLiveState]) {
         guard WorkerLiveState.hasUniqueIds(states) else { return }
         let newByRunID = Dictionary(uniqueKeysWithValues: states.map { ($0.runId, $0) })
@@ -43,6 +52,17 @@ final class LiveWorkerStateStore: ObservableObject {
         }
         if newActiveAgentCount != activeAgentCount {
             activeAgentCount = newActiveAgentCount
+        }
+        if feedUnavailable {
+            feedUnavailable = false
+        }
+    }
+
+    /// Mark the live-state feed unavailable without touching membership.
+    /// Call on engine disconnect; the next accepted `update` clears it.
+    func markFeedUnavailable() {
+        if !feedUnavailable {
+            feedUnavailable = true
         }
     }
 }

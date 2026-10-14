@@ -1,4 +1,5 @@
 import Foundation
+import PaneLayout
 
 // ===========================================================================
 // Live worker state. `WorkerLiveState` is the per-worker snapshot the app polls
@@ -63,6 +64,32 @@ struct WorkerLiveState {
     let waitReason: String?
     /// ISO-8601 expiry of that wait, when one is set.
     let waitExpiresAt: String?
+    /// Wire badge type (`"coding"`, `"review"`, …). Missing or unrecognised
+    /// values render as Unknown; they are never dropped from membership.
+    let agentType: String?
+    let projectId: String?
+    let projectName: String?
+    /// Host the run executes on. Agents membership is
+    /// `hostId == WorkerLiveState.localHostId`; remote workers stay out.
+    let hostId: String?
+    /// ISO-8601 execution start; the Agents grid sorts by this then `runId`.
+    let startedAt: String?
+    /// Attributed pool: `"main"`, `"automation"`, or `"review"`. Independent
+    /// of the physical slot — spilled automation still reports `"automation"`.
+    let pool: String?
+
+    /// Wire value the engine stamps on local workers. Keep in lock-step
+    /// with `boss_protocol::LOCAL_HOST_ID`.
+    static let localHostId = "local"
+
+    var badgeType: AgentType { AgentType.fromWire(agentType) }
+
+    var agentProject: AgentProject {
+        if let projectId, !projectId.isEmpty { return .project(id: projectId) }
+        return .unfiled
+    }
+
+    var isLocalMember: Bool { hostId == Self.localHostId }
 
     init(
         name: String? = nil,
@@ -79,7 +106,13 @@ struct WorkerLiveState {
         recoveryStatus: String?,
         tmuxHosted: Bool?,
         waitReason: String? = nil,
-        waitExpiresAt: String? = nil
+        waitExpiresAt: String? = nil,
+        agentType: String? = nil,
+        projectId: String? = nil,
+        projectName: String? = nil,
+        hostId: String? = nil,
+        startedAt: String? = nil,
+        pool: String? = nil
     ) {
         self.name = name
         self.slotId = slotId
@@ -96,6 +129,12 @@ struct WorkerLiveState {
         self.tmuxHosted = tmuxHosted
         self.waitReason = waitReason
         self.waitExpiresAt = waitExpiresAt
+        self.agentType = agentType
+        self.projectId = projectId
+        self.projectName = projectName
+        self.hostId = hostId
+        self.startedAt = startedAt
+        self.pool = pool
     }
 
     /// False when two entries share a `runId` or a `slotId`. A snapshot
@@ -140,6 +179,12 @@ extension WorkerLiveState: Hashable {
             && lhs.tmuxHosted == rhs.tmuxHosted
             && lhs.waitReason == rhs.waitReason
             && lhs.waitExpiresAt == rhs.waitExpiresAt
+            && lhs.agentType == rhs.agentType
+            && lhs.projectId == rhs.projectId
+            && lhs.projectName == rhs.projectName
+            && lhs.hostId == rhs.hostId
+            && lhs.startedAt == rhs.startedAt
+            && lhs.pool == rhs.pool
     }
 
     func hash(into hasher: inout Hasher) {
@@ -156,6 +201,12 @@ extension WorkerLiveState: Hashable {
         hasher.combine(tmuxHosted)
         hasher.combine(waitReason)
         hasher.combine(waitExpiresAt)
+        hasher.combine(agentType)
+        hasher.combine(projectId)
+        hasher.combine(projectName)
+        hasher.combine(hostId)
+        hasher.combine(startedAt)
+        hasher.combine(pool)
     }
 }
 
@@ -179,6 +230,16 @@ enum WorkerActivity: String, Hashable {
         case .idle: "Idle"
         case .errored: "Errored"
         case .terminated: "Terminated"
+        }
+    }
+
+    /// Agents-pane activity pill. Spawning is a neutral "Starting"; an
+    /// engine terminal state is "Exited" until the snapshot releases the run.
+    var agentsPaneLabel: String {
+        switch self {
+        case .spawning: "Starting"
+        case .terminated: "Exited"
+        default: label
         }
     }
 }

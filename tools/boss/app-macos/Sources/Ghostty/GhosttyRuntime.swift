@@ -140,6 +140,13 @@ final class GhosttyRuntime: @unchecked Sendable {
     /// instead of waiting for the engine's periodic sweeps.
     var onDisplaysDidWake: (() -> Void)?
 
+    /// Last libghostty cell size in points at the worker font, when any
+    /// surface has reported one. The Agents layout model uses this with
+    /// the pane area to compute per-page capacity.
+    private(set) var lastCellSize: (width: Double, height: Double)?
+    /// Invoked on the main actor when libghostty reports a cell size.
+    var onCellSizeChanged: ((Double, Double) -> Void)?
+
     private init() {
         GhosttyBootstrap.ensureInitialized()
 
@@ -422,6 +429,11 @@ final class GhosttyRuntime: @unchecked Sendable {
 
         case .cellSize(let size):
             resolved.host?.setCellSize(size)
+            let width = Double(size.width)
+            let height = Double(size.height)
+            let runtime = GhosttyRuntime.shared
+            runtime.lastCellSize = (width, height)
+            runtime.onCellSizeChanged?(width, height)
 
         case .colorChange(let change):
             resolved.host?.applyColorChange(change)

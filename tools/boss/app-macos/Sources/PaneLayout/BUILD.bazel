@@ -12,6 +12,7 @@ swift_library(
     ],
     module_name = "PaneLayout",
     visibility = [
+        "//tools/boss/app-macos:__pkg__",
         "//tools/boss/app-macos/Tests/PaneLayout:__pkg__",
     ],
 )

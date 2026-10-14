@@ -88,6 +88,7 @@ swift_library(
     deps = [
         "//tools/boss/app-macos/Sources/CrashWatchdog",
         "//tools/boss/app-macos/Sources/DiagnosticIO",
+        "//tools/boss/app-macos/Sources/PaneLayout",
         "//tools/boss/app-macos/Sources/UpdateCore",
         "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",
@@ -317,7 +318,10 @@ swift_library(
     ],
     linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsShard3",
-    deps = [":boss_mac_app_lib"],
+    deps = [
+        ":boss_mac_app_lib",
+        "//tools/boss/app-macos/Sources/PaneLayout",
+    ],
 )
 
 # Stamps CFBundleShortVersionString (full version, e.g. "1.0.4-dev-f3be785") and

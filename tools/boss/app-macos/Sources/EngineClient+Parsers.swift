@@ -598,7 +598,13 @@ extension EngineClient {
             recoveryStatus: payload["recovery_status"] as? String,
             tmuxHosted: (payload["tmux_hosted"] as? NSNumber)?.boolValue,
             waitReason: payload["wait_reason"] as? String,
-            waitExpiresAt: payload["wait_expires_at"] as? String
+            waitExpiresAt: payload["wait_expires_at"] as? String,
+            agentType: payload["agent_type"] as? String,
+            projectId: payload["project_id"] as? String,
+            projectName: payload["project_name"] as? String,
+            hostId: payload["host_id"] as? String,
+            startedAt: payload["started_at"] as? String,
+            pool: payload["pool"] as? String
         )
     }
 

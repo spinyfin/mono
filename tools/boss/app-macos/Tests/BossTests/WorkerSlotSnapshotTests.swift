@@ -71,6 +71,9 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "liveStatus",
         "recoveryStatus",
         "lastEventAt",
+        "agentType",
+        "projectName",
+        "pool",
     ]
 
     /// `WorkerLiveState` fields the slot snapshot intentionally ignores.
@@ -86,6 +89,9 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "tmuxHosted",
         "waitReason",
         "waitExpiresAt",
+        "projectId",
+        "hostId",
+        "startedAt",
     ]
 
     func testWorkerLiveStateStoredPropertyClassificationIsExhaustive() {
@@ -153,6 +159,9 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             Self.makeLiveState(tmuxHosted: true),
             Self.makeLiveState(waitReason: "CI build"),
             Self.makeLiveState(waitExpiresAt: "2026-09-01T00:00:00Z"),
+            Self.makeLiveState(projectId: "proj-other"),
+            Self.makeLiveState(hostId: "remote-1"),
+            Self.makeLiveState(startedAt: "2026-01-01T00:00:00Z"),
         ]
         for other in variants {
             let otherSnap = WorkerSlotSnapshot.build(
@@ -216,6 +225,9 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             ("liveStatus", Self.makeLiveState(liveStatus: "something else")),
             ("recoveryStatus", Self.makeLiveState(recoveryStatus: "recovering from API error")),
             ("lastEventAt", Self.makeLiveState(lastEventAt: "2026-09-01T00:00:00Z")),
+            ("agentType", Self.makeLiveState(agentType: "review")),
+            ("projectName", Self.makeLiveState(projectName: "Nine")),
+            ("pool", Self.makeLiveState(pool: "automation")),
         ]
         for (field, other) in flips {
             let otherSnap = WorkerSlotSnapshot.build(
@@ -394,42 +406,42 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertNotEqual(a, b)
     }
 
-    func testSnapshotCacheKeepsLastVisibleSnapshotsWhileHidden() {
-        let workspace = WorkersWorkspaceModel()
-        let liveStates = LiveWorkerStateStore()
-        let slot = WorkerSlot(slotId: 1, idleFlavorCycle: 0)
-        let cache = WorkerSlotSnapshotCache(
-            workspace: workspace,
-            liveStates: liveStates,
-            liveStatusDisabledSlotIDs: []
+    func testPlaceholderAndViewerMissingFlipEquality() {
+        let slot = WorkerSlot(slotId: 1, runId: "exec-1", idleFlavorCycle: 0)
+        let live = Self.makeLiveState()
+        let occupied = WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true)
+        let placeholder = WorkerSlotSnapshot.build(
+            slot: slot, liveState: live, liveStatusEnabled: true, isPlaceholder: true
         )
-        let visibleSnapshots = cache.snapshots(
-            for: .bridgeCrew,
-            slots: [slot],
-            liveStates: liveStates,
-            liveStatusDisabledSlotIDs: [],
-            refresh: true
+        let named = WorkerSlotSnapshot.build(
+            slot: slot, liveState: live, liveStatusEnabled: true, cachedPersona: "Riker"
         )
+        XCTAssertTrue(occupied.isViewerMissing)
+        XCTAssertFalse(placeholder.isViewerMissing)
+        XCTAssertNotEqual(occupied, placeholder)
+        XCTAssertNotEqual(occupied, named)
+        XCTAssertEqual(named.displayName, "Riker")
+    }
 
-        liveStates.update(states: [Self.makeLiveState(slotId: slot.slotId)])
-
-        let hiddenSnapshots = cache.snapshots(
-            for: .bridgeCrew,
-            slots: [slot],
-            liveStates: liveStates,
-            liveStatusDisabledSlotIDs: [],
-            refresh: false
-        )
-        let refreshedSnapshots = cache.snapshots(
-            for: .bridgeCrew,
-            slots: [slot],
-            liveStates: liveStates,
-            liveStatusDisabledSlotIDs: [],
-            refresh: true
-        )
-
-        XCTAssertEqual(hiddenSnapshots, visibleSnapshots)
-        XCTAssertNotEqual(refreshedSnapshots, visibleSnapshots)
+    func testParseMembershipMetadata() throws {
+        let client = EngineClient(socketPath: "/tmp/meta-test-\(UUID().uuidString).sock")
+        let payload: [String: Any] = [
+            "slot_id": 3, "run_id": "run-meta", "model": "opus", "activity": "spawning",
+            "name": "Riker", "agent_type": "coding", "project_id": "proj-1",
+            "project_name": "Nine", "host_id": "local", "started_at": "2026-10-09T00:00:00Z",
+            "pool": "main",
+        ]
+        let live = try XCTUnwrap(client.parseWorkerLiveState(payload))
+        XCTAssertEqual(live.agentType, "coding")
+        XCTAssertEqual(live.projectId, "proj-1")
+        XCTAssertEqual(live.projectName, "Nine")
+        XCTAssertEqual(live.hostId, WorkerLiveState.localHostId)
+        XCTAssertEqual(live.startedAt, "2026-10-09T00:00:00Z")
+        XCTAssertEqual(live.pool, "main")
+        XCTAssertEqual(live.badgeType, .coding)
+        XCTAssertEqual(live.agentProject, .project(id: "proj-1"))
+        XCTAssertTrue(live.isLocalMember)
+        XCTAssertEqual(live.activity.agentsPaneLabel, "Starting")
     }
 
     // MARK: - WorkersDetailView Equatable
@@ -551,7 +563,13 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         recoveryStatus: String? = nil,
         tmuxHosted: Bool? = nil,
         waitReason: String? = nil,
-        waitExpiresAt: String? = nil
+        waitExpiresAt: String? = nil,
+        agentType: String? = nil,
+        projectId: String? = nil,
+        projectName: String? = nil,
+        hostId: String? = nil,
+        startedAt: String? = nil,
+        pool: String? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
             name: name,
@@ -568,7 +586,13 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             recoveryStatus: recoveryStatus,
             tmuxHosted: tmuxHosted,
             waitReason: waitReason,
-            waitExpiresAt: waitExpiresAt
+            waitExpiresAt: waitExpiresAt,
+            agentType: agentType,
+            projectId: projectId,
+            projectName: projectName,
+            hostId: hostId,
+            startedAt: startedAt,
+            pool: pool
         )
     }
 }
