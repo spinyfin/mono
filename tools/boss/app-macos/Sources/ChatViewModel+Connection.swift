@@ -7,9 +7,15 @@ import Foundation
 extension ChatViewModel {
     /// Retained actions require an explicit retry after automatic reconnect.
     func showDisconnectedActionNotice() {
-        disconnectedActionNotice = isConnected
-            ? "Connection restored. Retry to send your pending actions."
-            : "Lost connection to the engine — reconnecting… Your actions are saved; try again with Retry once connected."
+        var notices = [String]()
+        if let uncertainActionNotice { notices.append(uncertainActionNotice) }
+        if retryingDisconnectedActions { notices.append("Sending pending actions…") }
+        if engine.hasUnsentActions {
+            notices.append(isConnected
+                ? "Connection restored. Retry to send your pending actions."
+                : "Lost connection to the engine — reconnecting… Your actions are saved; try again with Retry once connected.")
+        }
+        disconnectedActionNotice = notices.isEmpty ? nil : notices.joined(separator: "\n")
     }
 
     /// Re-reads the engine's retained-action state into the published
@@ -24,7 +30,8 @@ extension ChatViewModel {
     func retryDisconnectedActions() {
         guard refreshUnsentActions() else { return }
         if engine.retryUnsentActions() {
-            disconnectedActionNotice = "Sending pending actions…"
+            retryingDisconnectedActions = true
+            showDisconnectedActionNotice()
         } else {
             showDisconnectedActionNotice()
         }
@@ -33,8 +40,8 @@ extension ChatViewModel {
 
     func dismissDisconnectedActions() {
         engine.discardUnsentActions()
-        disconnectedActionNotice = nil
         refreshUnsentActions()
+        showDisconnectedActionNotice()
     }
 
     /// The engine dropped pending invalidations for our session while

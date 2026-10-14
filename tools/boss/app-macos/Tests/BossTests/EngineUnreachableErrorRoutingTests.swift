@@ -56,11 +56,6 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
         XCTAssertEqual(model.workErrorMessage, "work item could not be created")
     }
 
-    /// Even after a transport burst, the message stays clear so the
-    /// modal binding never flips to `true`. This is the specific
-    /// failure mode from #698: the reconnect loop emits a new
-    /// `socket waiting:` line per attempt, so dismissing the modal
-    /// only worked until the next retry.
     func testNotConnectedForUnretainedKindShowsNoRetryNotice() {
         let model = makeModel()
         XCTAssertNil(model.engine.sendLine(["type": "move_work_item_on_board", "work_item_id": "t"]))
@@ -69,6 +64,11 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
         XCTAssertFalse(model.hasUnsentActions)
     }
 
+    /// Even after a transport burst, the message stays clear so the
+    /// modal binding never flips to `true`. This is the specific
+    /// failure mode from #698: the reconnect loop emits a new
+    /// `socket waiting:` line per attempt, so dismissing the modal
+    /// only worked until the next retry.
     func testRepeatedSocketWaitingDoesNotResurrectModal() {
         let model = makeModel()
         for _ in 0..<10 {
@@ -138,5 +138,27 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
         model.dismissDisconnectedActions()
         XCTAssertFalse(model.engine.hasUnsentActions)
         XCTAssertNil(model.disconnectedActionNotice)
+    }
+
+    func testUncertaintySurvivesAnotherQueuedActionAcknowledgmentAndDiscard() {
+        let model = makeModel()
+        let uncertain = "Connection lost before confirmation. Check whether your actions completed before trying again."
+        model.applyEventForTest(.retriedActionsStatus(message: uncertain))
+        model.engine.sendLine(["type": "create_product", "name": "pending"])
+        model.applyEventForTest(.notConnected(requestKind: "create_product"))
+        XCTAssertTrue(model.disconnectedActionNotice?.contains(uncertain) == true)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("Your actions are saved") == true)
+
+        model.applyEventForTest(.disconnected)
+        model.applyEventForTest(.connected)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains(uncertain) == true)
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("Retry to send") == true)
+
+        // Acknowledging a different batch must not settle the unknown outcome.
+        model.applyEventForTest(.retriedActionsStatus(message: nil))
+        XCTAssertTrue(model.disconnectedActionNotice?.contains(uncertain) == true)
+        model.dismissDisconnectedActions()
+        XCTAssertEqual(model.disconnectedActionNotice, uncertain)
+        XCTAssertFalse(model.hasUnsentActions)
     }
 }

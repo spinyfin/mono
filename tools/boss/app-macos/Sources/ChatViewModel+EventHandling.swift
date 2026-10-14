@@ -290,8 +290,10 @@ extension ChatViewModel {
             // user-facing signal; never a modal.
             appendSystemMessage(message)
         case .retriedActionsStatus(let message):
-            disconnectedActionNotice = message
-            if refreshUnsentActions() { showDisconnectedActionNotice() }
+            if let message { uncertainActionNotice = message }
+            retryingDisconnectedActions = false
+            refreshUnsentActions()
+            showDisconnectedActionNotice()
         case .notConnected(let requestKind):
             if requestKind == "recreate_coordinator" {
                 // The request was dropped, so no handoff will ever arrive.

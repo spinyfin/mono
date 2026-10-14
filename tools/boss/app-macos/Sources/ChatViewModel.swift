@@ -335,6 +335,8 @@ final class ChatViewModel: ObservableObject {
     @Published var pendingWorkEditRequest: WorkEditRequest?
     @Published var workErrorMessage: String?
     @Published var disconnectedActionNotice: String?
+    var uncertainActionNotice: String?
+    var retryingDisconnectedActions = false
     /// Mirror of `engine.hasUnsentActions`, refreshed on connection and
     /// action events so the banner never queries the engine from a view body.
     @Published var hasUnsentActions = false
