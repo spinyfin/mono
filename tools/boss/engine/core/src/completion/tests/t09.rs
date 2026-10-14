@@ -4,41 +4,41 @@
 use super::*;
 
 #[tokio::test]
-async fn no_op_marker_is_refused_when_a_committed_stack_has_a_contribution() {
-    // An empty `@` does not imply the workspace is clean: `jj commit` and
-    // `jj new` leave committed changes below it. The verifier reports that
-    // whole-stack contribution as non-empty, so the marker must be refused.
-    let workspace = tempdir().unwrap();
-    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-    write_assistant_transcript(
-        &db,
-        workspace.path(),
-        &execution_id,
-        "## Summary\nThe requested change is already present.\n\nNO_CHANGES_NEEDED\n",
-    );
-    let detector = StubPrDetector::ok(None);
-    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
-    let handler = handler.with_workspace_diff_verifier(StubWorkspaceDiffVerifier::dirty());
+async fn no_op_declaration_is_refused_when_a_committed_stack_has_a_contribution() {
+    for seam_enabled in [false, true] {
+        // An empty `@` does not imply the workspace is clean: `jj commit` and
+        // `jj new` leave committed changes below it. The verifier reports that
+        // whole-stack contribution as non-empty, so the declaration must be refused.
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        declare_no_changes_needed(&db, &execution_id);
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        flags.load().unwrap();
+        flags.set("worker_proposals", true).unwrap();
+        flags.set("run_done_proposals_seam", seam_enabled).unwrap();
+        let handler = handler
+            .with_workspace_diff_verifier(StubWorkspaceDiffVerifier::dirty())
+            .with_feature_flags(flags);
 
-    let outcome = handler.on_stop(&execution_id).await;
-    assert!(matches!(outcome, StopOutcome::AwaitingInput));
-    assert_eq!(probes.snapshot(), [(execution_id.clone(), PROBE_NO_PR.to_owned())]);
-    match db.get_work_item(&chore_id).unwrap() {
-        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
-        other => panic!("expected chore, got {other:?}"),
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(matches!(outcome, StopOutcome::AwaitingInput));
+        assert_eq!(probes.snapshot(), [(execution_id.clone(), PROBE_NO_PR.to_owned())]);
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+            other => panic!("expected chore, got {other:?}"),
+        }
     }
 }
 
 #[tokio::test]
-async fn no_op_marker_is_refused_when_the_working_copy_cannot_be_verified() {
+async fn no_op_declaration_is_refused_when_the_working_copy_cannot_be_verified() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-    write_assistant_transcript(
-        &db,
-        workspace.path(),
-        &execution_id,
-        "## Summary\nThe requested change is already present.\n\nNO_CHANGES_NEEDED\n",
-    );
+    declare_no_changes_needed(&db, &execution_id);
     let detector = StubPrDetector::ok(None);
     let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
     let handler = handler.with_workspace_diff_verifier(StubWorkspaceDiffVerifier::err("jj unavailable"));
@@ -53,15 +53,10 @@ async fn no_op_marker_is_refused_when_the_working_copy_cannot_be_verified() {
 }
 
 #[tokio::test]
-async fn no_op_marker_is_refused_without_a_recorded_workspace_path() {
+async fn no_op_declaration_is_refused_without_a_recorded_workspace_path() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-    write_assistant_transcript(
-        &db,
-        workspace.path(),
-        &execution_id,
-        "## Summary\nThe requested change is already present.\n\nNO_CHANGES_NEEDED\n",
-    );
+    declare_no_changes_needed(&db, &execution_id);
     db.connect()
         .unwrap()
         .execute(

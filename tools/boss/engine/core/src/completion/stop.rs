@@ -1555,43 +1555,8 @@ must not be asked to open one",
                     // that follows gets a fair no-changes-needed evaluation.
                     if self.refuse_no_op_declaration(&execution) {
                         return self.nudge_refused_no_op(&execution).await;
-                    } else if let Some(workspace_path) = execution.workspace_path.as_deref() {
-                        match self
-                            .workspace_diff_verifier
-                            .is_workspace_contribution_empty(std::path::Path::new(workspace_path))
-                            .await
-                        {
-                            Ok(true) => {
-                                tracing::info!(
-                                    execution_id,
-                                    expected_branch = %expected_branch,
-                                    kind = %execution.kind,
-                                    "stop event: worker emitted NO_CHANGES_NEEDED with no workspace contribution and no PR produced — work already done; closing task as a no-op (no PR, no nudge)"
-                                );
-                                return self.finalize_no_op_completion(&execution, None, None).await;
-                            }
-                            Ok(false) => tracing::warn!(
-                                execution_id,
-                                expected_branch = %expected_branch,
-                                kind = %execution.kind,
-                                "stop event: worker emitted NO_CHANGES_NEEDED but the workspace has a contribution — refusing the no-op claim; falling through to the produce-a-PR nudge instead",
-                            ),
-                            Err(err) => tracing::error!(
-                                execution_id,
-                                expected_branch = %expected_branch,
-                                kind = %execution.kind,
-                                ?err,
-                                "stop event: could not verify whether the workspace has a contribution — refusing the no-op claim; falling through to the produce-a-PR nudge instead",
-                            ),
-                        }
-                    } else {
-                        tracing::error!(
-                            execution_id,
-                            expected_branch = %expected_branch,
-                            kind = %execution.kind,
-                            "stop event: worker emitted NO_CHANGES_NEEDED without a recorded workspace path — refusing the no-op claim; falling through to the produce-a-PR nudge instead",
-                        );
                     }
+                    return self.finalize_no_op_completion(&execution, None, None).await;
                 }
                 tracing::info!(
                     execution_id,
