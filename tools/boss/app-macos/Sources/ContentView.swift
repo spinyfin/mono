@@ -1019,12 +1019,12 @@ struct ContentView: View {
     @ViewBuilder
     private func bossAgentHeader(isCollapsed: Bool) -> some View {
         HStack(alignment: .center, spacing: 10) {
-            if let portrait = TrekIconAssets.image(.picard, size: .small) {
+            if let portrait = TrekIconAssets.coordinatorPortrait() {
                 Image(nsImage: portrait)
                     .resizable()
-                    .interpolation(.high)
+                    .interpolation(.none)
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 22, height: 28)
+                    .frame(width: 28, height: 28)
                     .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
             } else {
                 Image(systemName: "person.crop.circle.badge.checkmark")

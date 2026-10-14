@@ -51,25 +51,39 @@ fn spawn_transaction_allocates_one_roster_across_local_and_remote_runs() {
 #[test]
 fn overflow_is_unique_reusable_and_counted_only_on_allocation() {
     let (_dir, db) = open_db();
+    let roster = boss_protocol::ROSTER.len();
+    // Exhaust the whole roster, then make 56 more allocations that can only
+    // be Ensigns.
+    let overflow = 56;
     let mut executions = Vec::new();
     let mut names = HashSet::new();
-    // Full local capacity plus the entire remote virtual-slot range.
-    for index in 0..96 {
+    for index in 0..roster + overflow {
+        // Full local capacity first, then remote virtual slots.
         let (execution, run) = start(&db, if index < 40 { "local" } else { "remote-host" });
         assert!(names.insert(run.persona.unwrap()));
         executions.push(execution);
     }
-    assert!(names.contains("Ensign 56"));
-    assert_eq!(db.persona_metrics.counter_value("persona_roster_exhausted"), Some(56));
+    assert!(names.contains(&format!("Ensign {overflow}")));
+    assert!(!names.contains("Ensign 57"));
     assert_eq!(
-        db.lease_persona_for_execution(&executions[40].id).unwrap(),
+        db.persona_metrics.counter_value("persona_roster_exhausted"),
+        Some(overflow as u64)
+    );
+    assert_eq!(
+        db.lease_persona_for_execution(&executions[roster].id).unwrap(),
         "Ensign 1 (Remote)"
     );
-    assert_eq!(db.persona_metrics.counter_value("persona_roster_exhausted"), Some(56));
-    db.release_persona(&executions[40].id).unwrap();
+    assert_eq!(
+        db.persona_metrics.counter_value("persona_roster_exhausted"),
+        Some(overflow as u64)
+    );
+    db.release_persona(&executions[roster].id).unwrap();
     let (_, replacement) = start(&db, "local");
     assert_eq!(replacement.persona.as_deref(), Some("Ensign 1"));
-    assert_eq!(db.persona_metrics.counter_value("persona_roster_exhausted"), Some(57));
+    assert_eq!(
+        db.persona_metrics.counter_value("persona_roster_exhausted"),
+        Some(overflow as u64 + 1)
+    );
 }
 
 #[test]

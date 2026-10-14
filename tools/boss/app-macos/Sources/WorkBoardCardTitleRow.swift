@@ -63,17 +63,16 @@ struct WorkBoardCardTitleRow: View, @MainActor Equatable {
                 }
                 if let slotId = slice.assignedSlotId, let name = slice.assignedWorkerName {
                     Group {
-                        if let character = TrekCharacter.forPersona(name),
-                           let nsImage = TrekIconAssets.image(character, size: .small) {
+                        if let nsImage = TrekIconAssets.portrait(forPersona: name) {
                             Image(nsImage: nsImage)
                                 .resizable()
-                                .interpolation(.high)
+                                .interpolation(.none)
                                 .aspectRatio(contentMode: .fit)
                         } else {
                             Image(systemName: "person.crop.square")
                         }
                     }
-                    .frame(width: 20, height: 26)
+                    .frame(width: 24, height: 24)
                     .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
                     .help("\(name) (slot \(slotId))")
                 }

@@ -1,11 +1,18 @@
 //! Shared crew roster and legacy app slot labels.
 //!
+//! The roster is the crew portrait grid
+//! (`tools/boss/app-macos/Sources/TrekPortraitGrid.swift`) in reading
+//! order, minus Picard, who is reserved for the coordinator and is
+//! never a worker name.
+//!
 //! The engine assigns durable persona leases from ROSTER independently of
 //! capacity slots, across local and remote workers. LiveWorkerState carries
 //! the resulting display name. name_for_slot remains for the app migration;
 //! it must not be used to allocate or resolve worker identity. Keep the
 //! roster order synchronized with the legacy Swift roster until that
-//! compatibility implementation is retired.
+//! compatibility implementation is retired;
+//! `tools/boss/protocol/tests/worker_roster_parity_test.py` fails when
+//! the two, or either and the grid, diverge.
 
 /// First slot id reserved for remote workers' virtual slots.
 ///
@@ -23,6 +30,7 @@ pub const REMOTE_SLOT_BASE: u8 = 200;
 /// appended, never inserted. Must have at least one entry per live
 /// slot (currently 40: interactive 1-16, automation 17-24, review
 /// 25-40) so every concurrently live worker gets a distinct name.
+/// Picard is skipped: the coordinator owns that name.
 pub const ROSTER: &[&str] = &[
     "Riker",      // TNG
     "Data",       // TNG
@@ -64,6 +72,21 @@ pub const ROSTER: &[&str] = &[
     "Shelby",     // TNG
     "Brahms",     // TNG
     "Sela",       // TNG
+    "Sisko",      // DS9
+    "Janeway",    // VOY
+    "Archer",     // ENT
+    "Kirk",       // TOS
+    "Spock",      // TOS
+    "McCoy",      // TOS
+    "Scotty",     // TOS
+    "Uhura",      // TOS
+    "Sulu",       // TOS
+    "Chekov",     // TOS
+    "Q",          // TNG
+    "Dukat",      // DS9
+    "Martok",     // DS9
+    "Chapel",     // TOS
+    "Rand",       // TOS
 ];
 
 /// Display name for a 1-based slot id. Falls back to `"Worker N"` for
@@ -147,13 +170,10 @@ mod tests {
     }
 
     #[test]
-    fn rust_and_swift_rosters_stay_in_lock_step() {
-        // Cheap guard against the two literal lists drifting: this is
-        // a hand-copied snapshot of `WorkerNames.roster` in
-        // `tools/boss/app-macos/Sources/Ghostty/WorkerNames.swift`.
-        // If this test fails, either that edit forgot to mirror the
-        // change here, or this edit forgot to mirror it there.
-        const SWIFT_ROSTER: &[&str] = &[
+    fn existing_slot_names_are_stable_and_picard_is_reserved() {
+        // Slot ids are indexes into ROSTER, so these 40 names (the roster
+        // before the grid extension) must never move or change.
+        const FIRST_FORTY: &[&str] = &[
             "Riker",
             "Data",
             "Worf",
@@ -195,11 +215,18 @@ mod tests {
             "Brahms",
             "Sela",
         ];
-        assert_eq!(
-            ROSTER, SWIFT_ROSTER,
-            "Rust ROSTER and the Swift WorkerNames.roster snapshot in this test have drifted \
-             — update both tools/boss/app-macos/Sources/Ghostty/WorkerNames.swift and this \
-             test's SWIFT_ROSTER together"
-        );
+        assert_eq!(&ROSTER[..FIRST_FORTY.len()], FIRST_FORTY);
+        for (index, name) in FIRST_FORTY.iter().enumerate() {
+            assert_eq!(name_for_slot(index as u8 + 1), *name);
+        }
+        assert!(!ROSTER.contains(&"Picard"), "Picard is the coordinator's name");
+        assert_eq!(ROSTER.len(), 55, "56 grid characters minus the coordinator");
+        let unique: std::collections::HashSet<_> = ROSTER.iter().collect();
+        assert_eq!(unique.len(), ROSTER.len(), "roster names must be unique");
     }
+
+    // Parity with the Swift roster and the portrait grid is enforced by
+    // `worker_roster_parity_test` (a Bazel sh_test that parses both Swift
+    // files), which fails when this list, `WorkerNames.swift`, or
+    // `TrekPortraitGrid.swift` diverge.
 }

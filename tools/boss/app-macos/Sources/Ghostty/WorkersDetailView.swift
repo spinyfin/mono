@@ -325,22 +325,21 @@ struct WorkerSlotView: View, @MainActor Equatable {
     /// the line never flickers.
     @ViewBuilder
     private var idlePaneView: some View {
-        let character = TrekCharacter.forPersona(snapshot.live?.name)
+        let persona = snapshot.live?.name
         VStack(spacing: 14) {
             Spacer()
-            if let character {
-                if let nsImage = TrekIconAssets.image(character, size: .large) {
-                    Image(nsImage: nsImage)
-                        .resizable()
-                        .interpolation(.high)
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: 220, maxHeight: 240)
-                        .opacity(0.85)
-                }
+            if let nsImage = TrekIconAssets.portrait(forPersona: persona),
+               let name = TrekPortraitGrid.name(forPersona: persona) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .interpolation(.none)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 220, maxHeight: 240)
+                    .opacity(0.85)
                 Text(snapshot.displayName)
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(Color.white.opacity(0.85))
-                Text(TrekIdleFlavor.line(for: character, cycle: snapshot.idleFlavorCycle))
+                Text(TrekIdleFlavor.line(for: name, cycle: snapshot.idleFlavorCycle))
                     .font(.callout)
                     .foregroundStyle(Color.white.opacity(0.6))
                     .multilineTextAlignment(.center)
@@ -362,13 +361,12 @@ struct WorkerSlotView: View, @MainActor Equatable {
 
     private var slotHeader: some View {
         HStack(spacing: 8) {
-            if let character = TrekCharacter.forPersona(snapshot.live?.name),
-               let nsImage = TrekIconAssets.image(character, size: .small) {
+            if let nsImage = TrekIconAssets.portrait(forPersona: snapshot.live?.name) {
                 Image(nsImage: nsImage)
                     .resizable()
-                    .interpolation(.high)
+                    .interpolation(.none)
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 22, height: 28)
+                    .frame(width: 28, height: 28)
                     .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
             }
 

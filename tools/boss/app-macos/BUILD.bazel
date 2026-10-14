@@ -257,6 +257,8 @@ swift_library(
 macos_unit_test(
     name = "BossTestsShard3",
     size = "small",
+    # TrekPortraitGridTests slices the real bundled sheet.
+    data = ["//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons"],
     env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
     runner = "//tools/test-sandbox:macos_direct_test_runner",
@@ -353,4 +355,16 @@ filegroup(
     name = "swift_sources",
     srcs = glob(["Sources/**/*.swift"]),
     visibility = ["//tools/boss/engine/core:__pkg__"],
+)
+
+# The Swift roster, the portrait grid table and the bundled sheet, scanned by
+# `//tools/boss/protocol:worker_roster_parity_test` against the Rust roster.
+filegroup(
+    name = "crew_roster_sources",
+    srcs = [
+        "Sources/Ghostty/WorkerNames.swift",
+        "Sources/TrekPortraitGrid.swift",
+        "//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons",
+    ],
+    visibility = ["//tools/boss/protocol:__pkg__"],
 )

@@ -11,16 +11,17 @@ final class WorkerSlotSnapshotTests: XCTestCase {
 
     func testEnginePersonaNamesAndPortraits() throws {
         let client = EngineClient(socketPath: "/tmp/persona-test-\(UUID().uuidString).sock")
-        let cases: [(String?, String, TrekCharacter?)] = [
-            ("Worf", "Worf", .worf),
-            ("Ensign 41", "Ensign 41", nil),
-            ("Data (Remote)", "Data (Remote)", .data),
-            (nil, "Worker run-persona", nil),
-            ("", "Worker run-persona", nil),
+        let cases: [(String?, String, Bool)] = [
+            ("Worf", "Worf", true),
+            ("Kirk", "Kirk", true),
+            ("Ensign 41", "Ensign 41", false),
+            ("Data (Remote)", "Data (Remote)", true),
+            (nil, "Worker run-persona", false),
+            ("", "Worker run-persona", false),
         ]
         let store = LiveWorkerStateStore()
         var previous: WorkerSlotSnapshot?
-        for (name, expected, portrait) in cases {
+        for (name, expected, hasPortrait) in cases {
             var payload: [String: Any] = [
                 "slot_id": 1, "run_id": "run-persona",
                 "model": "opus", "activity": "working",
@@ -34,7 +35,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                 liveState: live, liveStatusEnabled: true
             )
             XCTAssertEqual(snapshot.displayName, expected)
-            XCTAssertEqual(TrekCharacter.forPersona(snapshot.live?.name), portrait)
+            XCTAssertEqual(TrekPortraitGrid.cell(forPersona: snapshot.live?.name) != nil, hasPortrait)
             if let previous { XCTAssertNotEqual(previous, snapshot) }
             previous = snapshot
         }
