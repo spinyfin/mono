@@ -156,14 +156,14 @@ struct WorkersDetailView: View, @MainActor Equatable {
     }
 
     private var emptyState: some View {
-        let crew = TrekCharacter.allCases.filter { $0 != .picard }
+        let crew = TrekPortraitGrid.workerNames
         let character = crew[abs(emptyFlavorCycle) % max(crew.count, 1)]
         return VStack(spacing: 14) {
             Spacer()
-            if let nsImage = TrekIconAssets.image(character, size: .large) {
+            if let nsImage = TrekIconAssets.portrait(forPersona: character) {
                 Image(nsImage: nsImage)
                     .resizable()
-                    .interpolation(.high)
+                    .interpolation(.none)
                     .aspectRatio(contentMode: .fit)
                     .frame(maxWidth: 220, maxHeight: 240)
                     .opacity(0.85)
@@ -418,7 +418,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
     private var placeholderCard: some View {
         VStack(spacing: 8) {
             Spacer()
-            personaPortrait(size: .medium)
+            personaPortrait(large: false)
             Text("\(snapshot.displayName) finished")
                 .font(.callout.weight(.medium))
                 .foregroundStyle(Color.white.opacity(0.7))
@@ -432,7 +432,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
     private var viewerMissingCard: some View {
         VStack(spacing: 10) {
             Spacer()
-            personaPortrait(size: .large)
+            personaPortrait(large: true)
             Text(snapshot.displayName)
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(Color.white.opacity(0.85))
@@ -450,14 +450,13 @@ struct WorkerSlotView: View, @MainActor Equatable {
     }
 
     @ViewBuilder
-    private func personaPortrait(size: TrekIconSize) -> some View {
-        if let character = TrekCharacter.forPersona(snapshot.live?.name ?? snapshot.cachedPersona),
-           let nsImage = TrekIconAssets.image(character, size: size) {
+    private func personaPortrait(large: Bool) -> some View {
+        if let nsImage = TrekIconAssets.portrait(forPersona: snapshot.live?.name ?? snapshot.cachedPersona) {
             Image(nsImage: nsImage)
                 .resizable()
-                .interpolation(.high)
+                .interpolation(.none)
                 .aspectRatio(contentMode: .fit)
-                .frame(maxWidth: size == .large ? 220 : 96, maxHeight: size == .large ? 240 : 120)
+                .frame(maxWidth: large ? 220 : 96, maxHeight: large ? 240 : 120)
                 .opacity(0.85)
         }
     }
