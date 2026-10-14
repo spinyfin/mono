@@ -543,6 +543,10 @@ struct ServerStateOverrides {
     design_docs: Option<Arc<boss_engine_design_docs::DesignDocsService>>,
     read_admission: Option<Arc<read_admission::ReadAdmission>>,
     live_read_admission: Option<Arc<read_admission::ReadAdmission>>,
+    /// Global limiter for on-demand coordinator guidance fetches. `None` uses
+    /// `coordinator_guidance::MAX_CONCURRENT_FETCHES` permits.
+    guidance_fetches: Option<Arc<tokio::sync::Semaphore>>,
+    org_recheck: Option<Arc<tokio::sync::Semaphore>>,
     /// Fake live-CI probe. `None` uses `CommandMergeProbe`.
     merge_probe: Option<Arc<dyn MergeProbe>>,
     /// Fake Trunk token store. `None` uses `boss_trunk_auth::TrunkTokenStore`.
@@ -794,6 +798,13 @@ struct ServerState {
     /// Retry restarts the existing schedule instead of stacking another.
     #[builder(default)]
     design_doc_revalidation: Arc<design_docs::RevalidationRegistry>,
+    /// Bounds concurrent on-demand coordinator guidance fetches across all
+    /// connections.
+    #[builder(default = Arc::new(tokio::sync::Semaphore::new(coordinator_guidance::MAX_CONCURRENT_FETCHES)))]
+    guidance_fetches: Arc<tokio::sync::Semaphore>,
+    /// Bounds the detached org/SSO re-checks started by `GitHubAuthStatus`.
+    #[builder(default = Arc::new(tokio::sync::Semaphore::new(1)))]
+    org_recheck: Arc<tokio::sync::Semaphore>,
     /// Primary-path `execution_id → pr_url` staging cache. Populated
     /// by [`dispatch_live_worker_state`] from `PostToolUse` Bash
     /// hooks that surface a `gh pr create` (or `view` / `edit`)
@@ -1205,6 +1216,8 @@ impl ServerState {
             design_docs: design_docs_override,
             read_admission: read_admission_override,
             live_read_admission: live_read_admission_override,
+            guidance_fetches: guidance_fetches_override,
+            org_recheck: org_recheck_override,
             merge_probe: merge_probe_override,
             trunk_token_store: trunk_token_store_override,
             trunk_client: trunk_client_override,
@@ -1711,6 +1724,8 @@ impl ServerState {
                 .run_cost_capture(Arc::new(crate::run_cost::RunCostCapture::new()))
                 .read_admission(read_admission_override.unwrap_or_default())
                 .maybe_live_read_admission(live_read_admission_override)
+                .maybe_guidance_fetches(guidance_fetches_override)
+                .maybe_org_recheck(org_recheck_override)
                 .design_docs(design_docs_override.unwrap_or_else(|| {
                     Arc::new(boss_engine_design_docs::DesignDocsService::new(
                         state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),
@@ -2528,8 +2543,16 @@ async fn handle_frontend_connection(
                             );
                         }
                     }
-                    Err(message) => {
-                        tracing::warn!(%session_id, "read RPC rejected: admission deadline expired");
+                    Err(rejection) => {
+                        let message = rejection.message();
+                        match rejection {
+                            read_admission::Rejection::OrderingWait => {
+                                tracing::warn!(%session_id, "read RPC rejected: ordering wait expired");
+                            }
+                            read_admission::Rejection::AdmissionWait => {
+                                tracing::warn!(%session_id, "read RPC rejected: admission deadline expired");
+                            }
+                        }
                         send_response(
                             &sink,
                             &request_id,

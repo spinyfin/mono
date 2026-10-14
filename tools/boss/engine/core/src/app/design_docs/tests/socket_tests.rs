@@ -289,3 +289,93 @@ async fn guidance_fetch_holds_connection_admission_and_identical_reply_order() {
     drop(write);
     handler.await.unwrap().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_beyond_the_global_limit_gets_the_busy_error_and_frees_on_release() {
+    let source = Arc::new(GatedSource {
+        inner: FakeSource::new(),
+        gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        started: AtomicUsize::new(0),
+    });
+    let limiter = Arc::new(tokio::sync::Semaphore::new(
+        crate::app::coordinator_guidance::MAX_CONCURRENT_FETCHES,
+    ));
+    let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
+        ServerStateOverrides::builder()
+            .design_docs(Arc::new(DesignDocsService::with_source(source.clone())))
+            .guidance_fetches(limiter.clone())
+            .read_admission(Arc::new(ReadAdmission::new(8, 8, 16, Duration::from_secs(5))))
+            .build(),
+    );
+    let products: Vec<_> = (0..5)
+        .map(|index| {
+            crate::test_support::create_test_product_with_repo(
+                &state.work_db,
+                &format!("Guidance {index}"),
+                Some(FLUNGE),
+            )
+        })
+        .collect();
+    let (client, server) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(handle_frontend_connection(server, state, None));
+    let (read, mut write) = client.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let request = |index: usize| FrontendRequest::ListCoordinatorGuidance {
+        product_id: Some(products[index].id.clone()),
+    };
+    for index in 0..4 {
+        send(&mut write, &format!("fetch-{index}"), request(index)).await;
+    }
+    wait_started(&source, 4).await;
+    assert_eq!(limiter.available_permits(), 0);
+    send(&mut write, "excess", request(4)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let env: FrontendEventEnvelope = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            if let Some(id) = env.request_id {
+                assert_eq!(id, "excess", "gated fetch replied before release");
+                match env.payload {
+                    FrontendEvent::WorkError { message } => assert_eq!(message, crate::app::read_admission::BUSY),
+                    other => panic!("expected busy WorkError, got {other:?}"),
+                }
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(source.started.load(Ordering::SeqCst), 4);
+    source.gate.add_permits(4);
+    let mut ids = std::collections::HashSet::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ids.len() < 4 {
+            let env: FrontendEventEnvelope = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            if let Some(id) = env.request_id {
+                let index = (0..4)
+                    .find(|index| id == format!("fetch-{index}"))
+                    .expect("original request id");
+                match env.payload {
+                    FrontendEvent::CoordinatorGuidanceList { guidance } => {
+                        assert_eq!(guidance.len(), 1);
+                        assert_eq!(guidance[0].product_id, products[index].id);
+                        assert!(
+                            matches!(
+                                guidance[0].state,
+                                boss_protocol::CoordinatorGuidanceState::Loaded { .. }
+                            ),
+                            "{guidance:?}"
+                        );
+                    }
+                    other => panic!("expected guidance response, got {other:?}"),
+                }
+                assert!(ids.insert(id));
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(lines);
+    drop(write);
+    handler.await.unwrap().unwrap();
+    assert_eq!(limiter.available_permits(), 4);
+}

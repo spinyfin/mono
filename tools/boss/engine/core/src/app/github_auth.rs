@@ -7,9 +7,6 @@
 
 use super::*;
 
-/// Bounds the detached org/SSO re-checks started by `GitHubAuthStatus`.
-static ORG_RECHECK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-
 pub(super) async fn handle_git_hub_auth_start(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -109,7 +106,7 @@ pub(super) async fn handle_git_hub_auth_status(ctx: Dispatch, req: FrontendReque
         if let GitHubAuthState::Authorized { record, .. } = current {
             // Detached so the bulk permits and ordering turn are released once
             // the reply is sent; at most one re-check runs at a time.
-            let Ok(permit) = ORG_RECHECK.try_acquire() else {
+            let Ok(permit) = server_state.org_recheck.clone().try_acquire_owned() else {
                 return;
             };
             tokio::spawn(async move {

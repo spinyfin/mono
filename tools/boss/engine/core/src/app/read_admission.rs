@@ -62,12 +62,18 @@ fn setting(name: &str, default: usize) -> usize {
 }
 
 /// Outbound-queue depth the reader loop waits for before reading another
-/// request: every reply both lanes may have outstanding, plus one.
+/// request: every reply both lanes may have outstanding, plus one, capped at
+/// half the outbound queue. With the very high default limits the uncapped
+/// value exceeds the queue, which would make the reader wait for a completely
+/// empty queue before every request.
 pub(super) fn reply_headroom(bulk: &ReadAdmission, live: &ReadAdmission) -> usize {
     bulk.outstanding_per_connection()
         .saturating_add(live.outstanding_per_connection())
         .saturating_add(1)
+        .min(MAX_REPLY_RESERVE)
 }
+
+const MAX_REPLY_RESERVE: usize = super::session_queue::MAX_SESSION_QUEUE / 2;
 
 impl ReadAdmission {
     pub(super) fn live() -> Self {
@@ -115,6 +121,22 @@ impl ReadAdmission {
     }
 }
 
+/// Why an accepted read was rejected while waiting. Both reach the client as
+/// the same busy reply; the distinction only selects which warning is logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Rejection {
+    /// Expired behind an earlier identical read (fixed `ORDER_WAIT`).
+    OrderingWait,
+    /// Expired waiting for admission permits (`BOSS_RPC_*_READ_WAIT_MS`).
+    AdmissionWait,
+}
+
+impl Rejection {
+    pub(super) fn message(self) -> &'static str {
+        BUSY
+    }
+}
+
 impl WaitingRead {
     pub(super) async fn acquire_ordered(
         mut self,
@@ -124,14 +146,16 @@ impl WaitingRead {
             (OwnedSemaphorePermit, OwnedSemaphorePermit),
             tokio::sync::OwnedMutexGuard<()>,
         ),
-        &'static str,
+        Rejection,
     > {
         // Waiting behind an identical in-flight read is not admission
         // pressure, so it has its own deadline; the admission deadline starts
         // once this read's turn comes up.
-        let turn = tokio::time::timeout(ORDER_WAIT, order).await.map_err(|_| BUSY)?;
+        let turn = tokio::time::timeout(ORDER_WAIT, order)
+            .await
+            .map_err(|_| Rejection::OrderingWait)?;
         self.deadline = tokio::time::Instant::now() + self.engine.wait;
-        let permits = self.acquire().await?;
+        let permits = self.acquire().await.map_err(|_| Rejection::AdmissionWait)?;
         Ok((permits, turn))
     }
 
