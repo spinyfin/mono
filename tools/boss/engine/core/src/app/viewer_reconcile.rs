@@ -1,7 +1,7 @@
 //! Engine-owned reconciliation of app presentation against execution truth.
 
 use super::*;
-use boss_protocol::{AttachWorkerPaneInput, AttachWorkerPaneResult, HostedPaneEntry};
+use boss_protocol::{AttachWorkerPaneInput, HostedPaneEntry};
 
 /// Result of one hosted-pane inventory pass. Failures are recorded per pane
 /// so a single unconfirmed detach cannot skip attaching every other live worker.
@@ -35,10 +35,13 @@ impl ServerState {
             .is_none_or(|run| run.status.is_terminal()))
     }
 
-    async fn detach_viewer(&self, slot_id: u8) -> Result<(), String> {
+    pub(super) async fn detach_viewer(&self, run_id: &str, slot_id: u8) -> Result<(), String> {
         match self
             .send_to_app(
-                EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id }),
+                EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput {
+                    run_id: run_id.to_owned(),
+                    slot_id,
+                }),
                 PANE_RELEASE_ACK_TIMEOUT,
             )
             .await
@@ -60,7 +63,7 @@ impl ServerState {
         let mut had_failures = false;
         for pane in self.hosted_worker_viewers().await?.unwrap_or_default() {
             match self.viewer_is_stale(&pane.run_id) {
-                Ok(true) => match self.detach_viewer(pane.slot_id).await {
+                Ok(true) => match self.detach_viewer(&pane.run_id, pane.slot_id).await {
                     Ok(()) => {
                         tracing::info!(run_id = %pane.run_id, slot_id = pane.slot_id, "detached stale app viewer");
                     }
@@ -109,17 +112,20 @@ impl ServerState {
             result: Err(EngineToAppError::SlotBusy { occupying_run_id }),
         } = &response
         {
-            if occupying_run_id.as_deref() == Some(input.run_id.as_str()) {
-                return Ok(EngineToAppResponse::AttachWorkerPane {
-                    result: Ok(AttachWorkerPaneResult {}),
-                });
-            }
             // A different live run is an ownership conflict, never permission
             // to evict it. Unknown identity also cannot authorize a detach.
             let stale = occupying_run_id
                 .as_deref()
                 .is_some_and(|occupant| occupant != input.run_id && self.viewer_is_stale(occupant).unwrap_or(false));
-            if stale && self.detach_viewer(input.slot_id).await.is_ok() {
+            if stale
+                && self
+                    .detach_viewer(
+                        occupying_run_id.as_deref().expect("stale viewer has a run id"),
+                        input.slot_id,
+                    )
+                    .await
+                    .is_ok()
+            {
                 let retry = self.send_to_app(request, timeout).await;
                 if matches!(retry, Ok(EngineToAppResponse::AttachWorkerPane { result: Ok(_) })) {
                     return retry;
@@ -162,7 +168,7 @@ impl crate::pool_claim_sweep::WorkerViewerDetach for ServerState {
             if !wanted.contains(pane.run_id.as_str()) {
                 continue;
             }
-            if let Err(err) = self.detach_viewer(pane.slot_id).await {
+            if let Err(err) = self.detach_viewer(&pane.run_id, pane.slot_id).await {
                 failed.insert(pane.run_id, err);
             }
         }

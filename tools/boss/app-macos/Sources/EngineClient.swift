@@ -627,13 +627,13 @@ final class EngineClient: @unchecked Sendable {
                     ))
                 ))
             case "detach_worker_pane":
-                let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
-                emit(.engineRequest(requestId: requestId, request: .detachWorkerPane(slotId: slotId)))
+                let runId = request["run_id"] as? String ?? ""
+                emit(.engineRequest(requestId: requestId, request: .detachWorkerPane(runId: runId)))
             case "focus_worker_pane":
-                let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
+                let runId = request["run_id"] as? String ?? ""
                 emit(.engineRequest(
                     requestId: requestId,
-                    request: .focusWorkerPane(slotId: slotId)
+                    request: .focusWorkerPane(runId: runId)
                 ))
             case "reveal_work_item":
                 let workItemId = request["work_item_id"] as? String ?? ""

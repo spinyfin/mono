@@ -424,7 +424,10 @@ async fn pending_reset_does_not_stall_the_connection_read_loop() {
         async move {
             state
                 .send_to_app(
-                    EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 1 }),
+                    EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput {
+                        run_id: "run-test".into(),
+                        slot_id: 1,
+                    }),
                     Duration::from_secs(10),
                 )
                 .await

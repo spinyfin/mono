@@ -744,11 +744,11 @@ extension ChatViewModel {
                 coordinatorPaneAttached(attach)
             }
             engine.sendAttachCoordinatorPaneResponse(requestId: requestId, result: result)
-        case .detachWorkerPane(let slotId):
-            let result = paneDetachHandler.map { $0(slotId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
+        case .detachWorkerPane(let runId):
+            let result = paneDetachHandler.map { $0(runId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendDetachWorkerPaneResponse(requestId: requestId, result: result)
-        case .focusWorkerPane(let slotId):
-            let result = paneFocusHandler.map { $0(slotId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
+        case .focusWorkerPane(let runId):
+            let result = paneFocusHandler.map { $0(runId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendFocusWorkerPaneResponse(requestId: requestId, result: result)
         case .revealWorkItem(let workItemId, let productId):
             revealWorkCard(workItemId, productID: productId) { [weak self] result in

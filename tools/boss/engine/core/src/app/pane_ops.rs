@@ -230,7 +230,10 @@ impl ServerState {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(FocusPaneError::UnknownRun);
         };
-        let request = EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id });
+        let request = EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput {
+            run_id: run_id.to_owned(),
+            slot_id,
+        });
         match self.send_to_app(request, Duration::from_secs(5)).await {
             Ok(EngineToAppResponse::FocusWorkerPane { result: Ok(_) }) => Ok(slot_id),
             Ok(EngineToAppResponse::FocusWorkerPane { result: Err(err) }) => Err(FocusPaneError::App(err)),
@@ -608,8 +611,7 @@ impl ServerState {
     /// live-tracked run. The engine has already terminal-failed or
     /// forgotten the run that used to occupy it. `bossctl agents retire-pane`
     /// resolves a crew name or run id to `slot_id` client-side before
-    /// calling this — the wire request stays slot-keyed since that is
-    /// what identifies a pane to the app.
+    /// calling this. App viewer requests target the reported run identity.
     ///
     /// Refuses with [`RetirePaneError::LiveRunTracked`] when
     /// `LiveWorkerStateRegistry` still shows a live (non-terminal) run
@@ -642,13 +644,9 @@ impl ServerState {
     /// completes the retirement.
     ///
     /// Otherwise (no live-state entry and no durable evidence at all —
-    /// a genuine husk) sends a slot-keyed `DetachWorkerPane` request —
-    /// the app's viewer teardown is already keyed purely by `slot_id`
-    /// with zero dependency on engine run-tracking state, so this is
-    /// the only signal a true husk (no run id, no session identity) can
-    /// give the app. Ownership is rechecked before detaching and after
-    /// acknowledgement. Bookkeeping cleanup is scoped to the retiring
-    /// execution, so a replacement's claim, live-state and status task survive.
+    /// a genuine husk) inventories viewers for this slot and detaches each
+    /// by run id. A delayed request cannot detach a replacement viewer.
+    /// Bookkeeping cleanup is scoped to the retiring execution.
     pub async fn retire_pane(&self, slot_id: u8) -> Result<(), RetirePaneError> {
         let mut retiring_run = None;
         if let Some(state) = self.live_worker_states.get(slot_id) {
@@ -771,29 +769,21 @@ impl ServerState {
             }
         }
         self.check_retiring_slot_owner(slot_id, retiring_run.as_deref()).await?;
-        let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::DetachWorkerPane { result: Ok(_) }) => {
-                tracing::info!(slot_id, "retire_pane: released husk pane");
-            }
-            Ok(EngineToAppResponse::DetachWorkerPane {
-                result: Err(EngineToAppError::UnknownSlot),
-            }) => {
-                tracing::debug!(slot_id, "retire_pane: app reports unknown slot — nothing hosted there");
-            }
-            Ok(EngineToAppResponse::DetachWorkerPane { result: Err(err) }) => {
-                return Err(RetirePaneError::App(err));
-            }
-            Ok(other) => {
-                return Err(RetirePaneError::ResponseKindMismatch(format!("{other:?}")));
-            }
-            Err(SendToAppError::NotRegistered) => {
-                tracing::debug!(
-                    slot_id,
-                    "retire_pane: no app session registered; skipping app round-trip"
-                );
-            }
-            Err(err) => return Err(RetirePaneError::Send(err)),
+        // Inventory selects presentation identity only. Process/pool safety is
+        // established above from engine state and durable tmux identity.
+        let viewers = self
+            .hosted_worker_viewers()
+            .await
+            .map_err(|message| RetirePaneError::App(EngineToAppError::Internal { message }))?;
+        for pane in viewers
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|pane| pane.slot_id == slot_id)
+        {
+            self.check_retiring_slot_owner(slot_id, retiring_run.as_deref()).await?;
+            self.detach_viewer(&pane.run_id, pane.slot_id)
+                .await
+                .map_err(|message| RetirePaneError::App(EngineToAppError::Internal { message }))?;
         }
         self.check_retiring_slot_owner(slot_id, retiring_run.as_deref()).await?;
         if let Some(run_id) = retiring_run {
