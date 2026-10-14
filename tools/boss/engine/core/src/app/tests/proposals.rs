@@ -1255,6 +1255,15 @@ async fn accepted_review_report_reaps_a_real_worker_process() {
     );
 }
 
+struct EmptyProposalWorkspace;
+
+#[async_trait::async_trait]
+impl crate::completion::WorkspaceDiffVerifier for EmptyProposalWorkspace {
+    async fn is_workspace_contribution_empty(&self, _path: &std::path::Path) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+}
+
 /// Build one live (`running`) `chore_implementation` execution against a
 /// fake app runtime — the shape a `run_done` declaration is actually
 /// submitted against (unlike a review-batch leaf/supervisor, most kinds
@@ -1272,7 +1281,13 @@ fn live_chore_execution_with_pr_status(
     // "no resolvable PR" a visible failure; the sandbox's denied `gh` would
     // instead read as "GitHub unreachable", which the engine (correctly)
     // defers rather than fails.
-    let (server_state, dir) = test_server_state_with_fakes_and_pr_detector(Arc::new(FixedPrDetector(status)));
+    //
+    // This fixture tests proposal lifecycle, not the jj subprocess. Supply
+    // the same explicit empty-workspace evidence as the completion fixtures.
+    let (server_state, dir) = test_server_state_with_fakes_and_pr_detector(
+        Arc::new(FixedPrDetector(status)),
+        Some(Arc::new(EmptyProposalWorkspace)),
+    );
     // Every test using this fixture exercises the `run_done` synchronous
     // finalize path, which `handle_submit_proposal` only takes with both
     // halves of the seam's kill switch on — see
