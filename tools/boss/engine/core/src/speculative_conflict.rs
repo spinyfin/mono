@@ -297,6 +297,11 @@ async fn run_in_lease(
         }
     };
 
+    if let Err(err) = work_db.checkpoint_rewritten_baselines(&candidate.work_item_id).await {
+        tracing::warn!(?err, "speculative rebase baseline checkpoint failed");
+        return;
+    }
+
     if rebase.clean {
         SPECULATIVE_CONFLICT_CLEAN.inc(metrics);
         record_outcome_counter(metrics, &candidate.product_id, false);

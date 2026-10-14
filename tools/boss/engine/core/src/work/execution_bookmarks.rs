@@ -2,6 +2,29 @@ use super::*;
 use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
 
 impl WorkDb {
+    /// Complete an engine-driven rewrite by checkpointing its baseline
+    /// bookmarks and their database provenance before reporting success.
+    pub(crate) async fn checkpoint_rewritten_baselines(&self, work_item_id: &str) -> Result<()> {
+        use boss_engine_recovery::execution_bookmark::{LocalJj, checkpoint_baseline, is_missing_pointer_error};
+        for execution in self.list_executions(Some(work_item_id))? {
+            let Some(record) = self.execution_bookmark_optional(&execution.id)? else {
+                continue;
+            };
+            // Engine-direct cube rewrites run on the engine host. Other
+            // hosts' repositories are independent and were not rewritten.
+            if record.host_id != "local" {
+                continue;
+            }
+            let base = match checkpoint_baseline(&LocalJj, &record).await {
+                Ok(base) => base,
+                Err(err) if is_missing_pointer_error(&err) => continue,
+                Err(err) => return Err(err),
+            };
+            self.update_execution_bookmark_base(&execution.id, &base)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn record_execution_restore_report(
         &self,
         execution_id: &str,
@@ -61,7 +84,7 @@ impl WorkDb {
     /// its own pointers could not be vouched for) is superseded in place; the
     /// attention item filed at retirement keeps that history.
     pub(crate) fn record_execution_bookmark(&self, record: &ExecutionBookmark) -> Result<()> {
-        self.connect()?.execute(
+        let changed = self.connect()?.execute(
             "INSERT INTO execution_bookmarks (execution_id, repo_path, host_id, base_commit) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(execution_id) DO UPDATE SET
                 repo_path = excluded.repo_path, host_id = excluded.host_id, base_commit = excluded.base_commit,
@@ -75,6 +98,16 @@ impl WorkDb {
                 record.base_commit,
             ],
         )?;
+        anyhow::ensure!(changed == 1, "execution bookmark record already exists and is live");
+        Ok(())
+    }
+
+    pub(crate) fn update_execution_bookmark_base(&self, execution_id: &str, commit: &str) -> Result<()> {
+        let changed = self.connect()?.execute(
+            "UPDATE execution_bookmarks SET base_commit = ?2 WHERE execution_id = ?1 AND retired_at IS NULL",
+            params![execution_id, commit],
+        )?;
+        anyhow::ensure!(changed == 1, "live execution bookmark record missing");
         Ok(())
     }
 

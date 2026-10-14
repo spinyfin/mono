@@ -41,7 +41,7 @@ impl ExecutionCoordinator {
     /// `pr_for_reconcile` is the item's recorded PR for any execution kind
     /// (a revision's bound PR, or the task's own open PR), used only to name
     /// the `pr/<n>` bookmark cube writes when damaged pointers must be
-    /// re-anchored; it never changes positioning.
+    /// re-anchored; a verified PR anchor also controls positioning.
     pub(super) async fn recover_execution_bookmark(
         &self,
         execution: &WorkExecution,
@@ -81,7 +81,11 @@ impl ExecutionCoordinator {
         // them: both restore paths below assume a single line from the
         // baseline to the head.
         let inspection = match adapter.execution_bookmark_diff(&record).await {
-            Ok(patch) => Inspection::Patch(patch, None),
+            Ok(patch) => {
+                let base = adapter.checkpoint_execution_baseline(&record).await?;
+                self.work_db.update_execution_bookmark_base(&prior.id, &base)?;
+                Inspection::Patch(patch, None)
+            }
             Err(err) if is_missing_pointer_error(&err) => {
                 self.degrade_missing_pointers(execution, Some(&prior.id), &record, &err)
                     .await;
@@ -123,10 +127,30 @@ impl ExecutionCoordinator {
                 return Ok(None);
             }
         };
+        let reconciled_pr = reconciliation.as_ref().and_then(|r| match &r.anchor {
+            boss_engine_recovery::execution_bookmark::Anchor::PrHead { .. } => pr_for_reconcile,
+            _ => None,
+        });
         let has_work = if prior.id != execution.id && is_implementation {
             let has_work = !patch.trim().is_empty();
             if execution.kind == ExecutionKind::RevisionImplementation && pr_for_goto.is_none() && !has_work {
                 return Ok(None);
+            }
+            // A retry after reconciliation may already have intact pointers.
+            // Keep using the recorded open PR even when this attempt did not
+            // itself move the baseline, or an empty recovered range would
+            // discard the PR implementation during restaging.
+            let positioning_pr = match reconciled_pr.or(pr_for_goto).or(pr_for_reconcile) {
+                Some(pr)
+                    if reconciled_pr.is_some()
+                        || adapter.prepare_recovery_pr(&record, &lease.workspace_path, pr).await? =>
+                {
+                    Some(pr)
+                }
+                _ => None,
+            };
+            if execution.kind == ExecutionKind::RevisionImplementation && positioning_pr.is_none() {
+                return Err(pointer_integrity_error("revision recovery requires its bound PR URL"));
             }
             let repos = adapter.list_repos().await?;
             let repo = repos
@@ -134,9 +158,7 @@ impl ExecutionCoordinator {
                 .find(|repo| repo.repo_id == repo_id)
                 .ok_or_else(|| anyhow!("recovery repository {repo_id} is absent from cube repo list"))?;
             let mut base_fallback = None;
-            let base_branch = if execution.kind == ExecutionKind::RevisionImplementation {
-                let pr = pr_for_goto
-                    .ok_or_else(|| pointer_integrity_error("revision recovery requires its bound PR URL"))?;
+            let base_branch = if let Some(pr) = positioning_pr {
                 match adapter.recovery_pr_base(&repo.origin, pr).await {
                     Ok(base) => base,
                     // Only a base that can never be resolved (e.g. a non-GitHub
@@ -155,16 +177,7 @@ impl ExecutionCoordinator {
             } else {
                 repo.main_branch.clone()
             };
-            let pr_bookmark = if execution.kind == ExecutionKind::RevisionImplementation {
-                let pr = pr_for_goto
-                    .ok_or_else(|| pointer_integrity_error("revision recovery requires its bound PR URL"))?;
-                // Cube resolves the bound PR head, fetches it, and writes pr/<n>.
-                // The preserved execution pointer survives this checkout.
-                adapter.goto_workspace(&lease.workspace_path, pr).await?;
-                Some(format!("pr/{pr}"))
-            } else {
-                None
-            };
+            let pr_bookmark = positioning_pr.map(|pr| format!("pr/{pr}"));
             let restore = adapter
                 .restore_rebased_execution_bookmark(
                     &record,
@@ -176,7 +189,7 @@ impl ExecutionCoordinator {
             let mut report = match restore {
                 Ok(report) => report,
                 Err(err)
-                    if execution.kind == ExecutionKind::RevisionImplementation
+                    if positioning_pr.is_some()
                         && base_branch != repo.main_branch
                         && is_base_unresolvable_error(&err) =>
                 {
@@ -263,11 +276,10 @@ impl ExecutionCoordinator {
             "recovery pointers are damaged; reconciling against engine-recorded pointers"
         );
         let pr_bookmark = match pr_for_reconcile {
-            Some(pr) => {
-                // Cube resolves the bound PR head, fetches it, and writes pr/<n>.
-                adapter.goto_workspace(&lease.workspace_path, pr).await?;
-                Some(format!("pr/{pr}"))
-            }
+            Some(pr) => adapter
+                .prepare_recovery_pr(record, &lease.workspace_path, pr)
+                .await?
+                .then(|| format!("pr/{pr}")),
             None => None,
         };
         let repos = adapter.list_repos().await?;
@@ -281,6 +293,8 @@ impl ExecutionCoordinator {
             .await
         {
             Ok(reconciliation) => {
+                let base = adapter.checkpoint_execution_baseline(record).await?;
+                self.work_db.update_execution_bookmark_base(&prior.id, &base)?;
                 if let Some(reconciliation) = &reconciliation {
                     tracing::info!(
                         execution_id = %execution.id,

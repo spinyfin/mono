@@ -14,6 +14,14 @@ struct FlakyRestoreAdapter {
 
 #[async_trait]
 impl HostAdapter for FlakyRestoreAdapter {
+    async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
+        self.inner.checkpoint_execution_baseline(record).await
+    }
+
+    async fn prepare_recovery_pr(&self, record: &ExecutionBookmark, workspace: &Path, pr: u64) -> Result<bool> {
+        self.inner.prepare_recovery_pr(record, workspace, pr).await
+    }
+
     async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
         self.inner.recovery_pr_base(origin, pr).await
     }

@@ -167,10 +167,19 @@ pub trait HostAdapter: Send + Sync {
         let _ = (record, workspace, pr_bookmark, base_branch);
         bail!("rebased execution recovery is not supported by this host adapter")
     }
+    /// Validate and heal the baseline, returning its current durable identity.
+    async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
+        let _ = record;
+        bail!("baseline checkpoint is not supported by this host adapter")
+    }
+    /// Resolve an open PR while preserving the pre-checkout recovery pointers.
+    /// Returns false for a closed or merged PR, which cannot anchor recovery.
+    async fn prepare_recovery_pr(&self, record: &ExecutionBookmark, workspace: &Path, pr: u64) -> Result<bool> {
+        let _ = (record, workspace, pr);
+        bail!("recovery PR preparation is not supported by this host adapter")
+    }
     /// Repair stranded, diverged or baseline-less pointers from an
-    /// engine-recorded anchor (the `pr/<n>` bookmark cube wrote, the
-    /// record's baseline commit, or the other head). `Ok(None)` when the
-    /// pointers are intact.
+    /// engine-recorded anchor. Returns None when the pointers are intact.
     async fn reconcile_execution_bookmark(
         &self,
         record: &ExecutionBookmark,
@@ -481,6 +490,27 @@ impl HostAdapter for LocalHostAdapter {
             .map(|(name, _)| name)
             .unwrap_or_else(|| "origin".into());
         execution_bookmark::restore_rebased(&LocalJj, record, workspace, pr_bookmark, base_branch, &remote).await
+    }
+    async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery store belongs to another host"
+        );
+        execution_bookmark::checkpoint_baseline(&LocalJj, record).await
+    }
+    async fn prepare_recovery_pr(&self, record: &ExecutionBookmark, workspace: &Path, pr: u64) -> Result<bool> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery store belongs to another host"
+        );
+        let saved = execution_bookmark::snapshot_pointers(&LocalJj, record).await?;
+        let result = self.goto_workspace(workspace, pr).await;
+        execution_bookmark::restore_pointers(&LocalJj, record, &saved).await?;
+        match result {
+            Ok(_) => Ok(true),
+            Err(err) if format!("{err:#}").contains("cannot position on a non-open PR") => Ok(false),
+            Err(err) => Err(err),
+        }
     }
     async fn reconcile_execution_bookmark(
         &self,
@@ -984,6 +1014,27 @@ impl HostAdapter for SshHostAdapter {
             .map(|(name, _)| name)
             .unwrap_or_else(|| "origin".into());
         execution_bookmark::restore_rebased(self, record, workspace, pr_bookmark, base_branch, &remote).await
+    }
+    async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery store belongs to another host"
+        );
+        execution_bookmark::checkpoint_baseline(self, record).await
+    }
+    async fn prepare_recovery_pr(&self, record: &ExecutionBookmark, workspace: &Path, pr: u64) -> Result<bool> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery store belongs to another host"
+        );
+        let saved = execution_bookmark::snapshot_pointers(self, record).await?;
+        let result = self.goto_workspace(workspace, pr).await;
+        execution_bookmark::restore_pointers(self, record, &saved).await?;
+        match result {
+            Ok(_) => Ok(true),
+            Err(err) if format!("{err:#}").contains("cannot position on a non-open PR") => Ok(false),
+            Err(err) => Err(err),
+        }
     }
     async fn reconcile_execution_bookmark(
         &self,

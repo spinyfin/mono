@@ -2,7 +2,7 @@ use super::*;
 use boss_engine_test_git::jj::JjRepo;
 
 /// `(commit id)` of the single commit `revset` names.
-fn one(repo: &std::path::Path, revset: &str) -> String {
+pub(super) fn one(repo: &std::path::Path, revset: &str) -> String {
     let out = JjRepo::run(
         repo,
         &[
@@ -20,7 +20,7 @@ fn one(repo: &std::path::Path, revset: &str) -> String {
     ids[0].to_owned()
 }
 
-fn bookmark(repo: &std::path::Path, name: &str, commit: &str) {
+pub(super) fn bookmark(repo: &std::path::Path, name: &str, commit: &str) {
     JjRepo::run(repo, &["bookmark", "set", name, "-r", commit, "--allow-backwards"]);
 }
 
@@ -57,7 +57,7 @@ fn files(repo: &std::path::Path, revset: &str) -> Vec<String> {
 /// Keep an old variant visible after a rewrite, as a remote bookmark or a
 /// concurrent operation does in the shared store: a described child is a
 /// visible head, and jj 0.26 leaves a bookmark's hidden target hidden.
-fn keep_visible(repo: &std::path::Path, commit: &str) {
+pub(super) fn keep_visible(repo: &std::path::Path, commit: &str) {
     JjRepo::run(repo, &["new", commit, "-m", "Keep variant visible"]);
 }
 
@@ -67,17 +67,17 @@ fn pointers_at(repo: &std::path::Path, record: &ExecutionBookmark, commit: &str)
     }
 }
 
-struct Scene {
+pub(super) struct Scene {
     _dir: tempfile::TempDir,
-    repo: JjRepo,
-    record: ExecutionBookmark,
+    pub(super) repo: JjRepo,
+    pub(super) record: ExecutionBookmark,
 }
 
-/// A revision dispatched against PR head `P0` (bookmark `pr/7`, PR branch
+/// A revision dispatched against the original PR head commit (bookmark `pr/7`, PR branch
 /// `boss/root`), positioned the way cube does it: `@` is an empty child of
 /// the PR head and the titled change sits on top. The worker's execution
 /// pointers sit on that change `W`. Main has moved on to `M1` meanwhile.
-async fn revision_on_pr_head(execution_id: &str) -> Scene {
+pub(super) async fn revision_on_pr_head(execution_id: &str) -> Scene {
     let dir = tempfile::tempdir().unwrap();
     let repo = JjRepo::new(dir.path());
     JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
@@ -102,20 +102,20 @@ async fn revision_on_pr_head(execution_id: &str) -> Scene {
 
 #[tokio::test]
 async fn baseline_skips_the_empty_positioning_commit_and_survives_its_abandon() {
-    // Case 3's cause: the baseline used to sit on the empty commit cube's
+    // MissingBaseline: the baseline used to sit on the empty commit cube's
     // goto left under the titled change; abandoning that commit deletes the
     // bookmarks on it.
     let s = revision_on_pr_head("exec_durable_base").await;
     let repo = &s.repo.repo;
-    let p0 = one(repo, "pr/7");
+    let pr_head = one(repo, "pr/7");
     assert_eq!(
         one(repo, &revision(&s.record.base())),
-        p0,
+        pr_head,
         "baseline is the PR head, not the empty child"
     );
-    assert_eq!(s.record.base_commit.as_deref(), Some(p0.as_str()));
-    let empty = one(repo, &format!("({p0})+ & empty()"));
-    assert_ne!(empty, p0);
+    assert_eq!(s.record.base_commit.as_deref(), Some(pr_head.as_str()));
+    let empty = one(repo, &format!("({pr_head})+ & empty()"));
+    assert_ne!(empty, pr_head);
     JjRepo::run(&s.repo.worker, &["abandon", &empty]);
     assert!(bookmark_exists(repo, &s.record.base()));
     let patch = diff(&LocalJj, &s.record).await.unwrap();
@@ -128,19 +128,19 @@ async fn baseline_skips_the_empty_positioning_commit_and_survives_its_abandon() 
 
 #[tokio::test]
 async fn stranded_baseline_resumes_from_the_pr_head_that_carries_the_work() {
-    // Case 1 as seen in the shared store: the change under the baseline was
+    // NotDescended: the change under the baseline was
     // rewritten onto newer main in one operation while the head was moved
     // back onto the original variant and published in another; the bookmark
     // stayed on the variant the head's lineage no longer includes.
     let s = revision_on_pr_head("exec_stranded").await;
     let repo = &s.repo.repo;
-    let p0 = one(repo, "pr/7");
+    let pr_head = one(repo, "pr/7");
     let m1 = one(repo, "bookmarks(exact:\"main\")");
     JjRepo::run(&s.repo.worker, &["rebase", "-b", "boss/root", "-d", &m1]);
     let stranded_base = one(repo, &revision(&s.record.base()));
-    assert_ne!(stranded_base, p0, "the baseline followed the rebased variant");
-    bookmark(repo, "pr/7", &p0);
-    bookmark(repo, "boss/root", &p0);
+    assert_ne!(stranded_base, pr_head, "the baseline followed the rebased variant");
+    bookmark(repo, "pr/7", &pr_head);
+    bookmark(repo, "boss/root", &pr_head);
     let work = one(repo, &revision(&s.record.head()));
     JjRepo::run(repo, &["rebase", "-s", &work, "-d", "pr/7"]);
     let published = one(repo, &revision(&s.record.head()));
@@ -197,13 +197,13 @@ async fn stranded_baseline_resumes_from_the_pr_head_that_carries_the_work() {
 
 #[tokio::test]
 async fn work_rebased_onto_newer_main_is_contained_by_the_pr_that_received_the_rebase() {
-    // The Case 1 hypothesis: the PR branch, baseline commit included, was
+    // NotDescended after a rebase: the PR branch, baseline commit included, was
     // rebased onto newer main and pushed, while the execution pointers stayed
     // on the original variants. The PR head carries rewritten variants of
     // every preserved commit, and of the baseline's own change.
     let s = revision_on_pr_head("exec_rebased_pr").await;
     let repo = &s.repo.repo;
-    let p0 = one(repo, "pr/7");
+    let pr_head = one(repo, "pr/7");
     let work = one(repo, &revision(&s.record.head()));
     bookmark(repo, "pr/7", &work);
     bookmark(repo, "boss/root", &work);
@@ -215,7 +215,7 @@ async fn work_rebased_onto_newer_main_is_contained_by_the_pr_that_received_the_r
     let rebased = one(repo, &revision(&s.record.head()));
     let rebased_base = one(repo, &revision(&s.record.base()));
     assert_ne!(rebased, work);
-    assert_ne!(rebased_base, p0, "the baseline's own change was rewritten too");
+    assert_ne!(rebased_base, pr_head, "the baseline's own change was rewritten too");
     // Every bookmark followed; put the heads back on the original variant,
     // which the shared store still shows, so only the baseline and the PR
     // are on the rebased lineage.
@@ -238,7 +238,10 @@ async fn work_rebased_onto_newer_main_is_contained_by_the_pr_that_received_the_r
                     .map(|m| (m.preserved.as_str(), m.published.as_str()))
                     .collect();
                 assert!(pairs.contains(&(work.as_str(), rebased.as_str())), "{matched:?}");
-                assert!(pairs.contains(&(p0.as_str(), rebased_base.as_str())), "{matched:?}");
+                assert!(
+                    pairs.contains(&(pr_head.as_str(), rebased_base.as_str())),
+                    "{matched:?}"
+                );
                 assert_eq!(matched.len(), 2, "{matched:?}");
             }
             other => panic!("expected rewritten variants: {other:?}"),
@@ -250,7 +253,7 @@ async fn work_rebased_onto_newer_main_is_contained_by_the_pr_that_received_the_r
 
 #[tokio::test]
 async fn diverged_pointers_resume_from_a_pr_head_built_from_rewritten_variants() {
-    // Case 2: the worker amended after publishing, cube's goto re-pointed the
+    // Diverged: the worker amended after publishing, cube's goto re-pointed the
     // PR branch at the remote head, and a later rebase moved that remote
     // lineage onto newer main. The recovery pointer stays on the amended
     // variant; the PR carries the same changes as rewritten commits.
@@ -444,7 +447,7 @@ async fn missing_baseline_is_rebuilt_from_the_recorded_commit_when_the_heads_des
 
 #[tokio::test]
 async fn missing_baseline_on_a_legacy_record_resumes_from_the_pr_head_or_refuses() {
-    // Case 3 exactly: a record written before the baseline commit was
+    // MissingBaseline: a record written before the baseline commit was
     // recorded, with its baseline on the empty positioning commit that the
     // worker then abandoned.
     let dir = tempfile::tempdir().unwrap();
@@ -453,7 +456,7 @@ async fn missing_baseline_on_a_legacy_record_resumes_from_the_pr_head_or_refuses
     JjRepo::run(&repo.repo, &["new", "main", "-m", "Published PR commit"]);
     std::fs::write(repo.repo.join("pr.txt"), "published\n").unwrap();
     JjRepo::run(&repo.repo, &["bookmark", "set", "pr/7", "-r", "@"]);
-    let p0 = one(&repo.repo, "pr/7");
+    let pr_head = one(&repo.repo, "pr/7");
     JjRepo::run(&repo.worker, &["new", "pr/7"]);
     JjRepo::run(&repo.worker, &["new", "-m", "Revision work"]);
     let record = ExecutionBookmark {
@@ -503,7 +506,7 @@ async fn missing_baseline_on_a_legacy_record_resumes_from_the_pr_head_or_refuses
     let error = reconcile(&LocalJj, &record, Some("pr/7"), "main").await.unwrap_err();
     assert_eq!(pointer_integrity_kind(&error), Some(PointerIntegrityKind::NotContained));
     assert!(
-        error.to_string().contains("Revision work") && error.to_string().contains(&p0),
+        error.to_string().contains("Revision work") && error.to_string().contains(&pr_head),
         "{error}"
     );
     assert_eq!(one(&repo.repo, &revision(&record.head())), work);

@@ -1,6 +1,6 @@
 use super::helpers::*;
 
-fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecution, WorkExecution) {
+pub(super) fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecution, WorkExecution) {
     let db = Arc::new(WorkDb::open(path.to_path_buf()).unwrap());
     let product = create_test_product(&db);
     let chore = create_test_chore_manual(&db, product.id, "Blocked revision");
@@ -480,7 +480,7 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
 }
 
 /// Dispatch against a predecessor whose baseline bookmark is gone and whose
-/// record predates the baseline commit (Case 3). With the PR head carrying
+/// record predates the baseline commit (MissingBaseline). With the PR head carrying
 /// the work, dispatch resumes from it; otherwise it retires the record,
 /// files attention, and starts fresh instead of wedging on every attempt.
 #[tokio::test]

@@ -552,6 +552,14 @@ async fn run_rung1_in_lease(
         }
     };
 
+    if let Err(err) = work_db.checkpoint_rewritten_baselines(&candidate.work_item_id).await {
+        tracing::warn!(?err, "rebase baseline checkpoint failed");
+        return LadderOutcome::FellThrough {
+            residual_conflict_files: None,
+            reason: "rebase baseline checkpoint failed",
+        };
+    }
+
     if rebase.clean {
         if rebase.pushed {
             // T9 (T2562): vet rung 1's pushed resolution against the

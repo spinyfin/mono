@@ -68,8 +68,11 @@ pub async fn restore_rebased(
             "recovery destination belongs to a different shared repository",
         ));
     }
-    heal_baseline(jj, record).await?;
-    jj.run(workspace, &["git", "fetch", "--remote", upstream]).await?;
+    checkpoint_baseline(jj, record).await?;
+    let saved = snapshot_pointers(jj, record).await?;
+    let fetched = jj.run(workspace, &["git", "fetch", "--remote", upstream]).await;
+    restore_pointers(jj, record, &saved).await?;
+    fetched?;
     let base_ref = format!(
         "remote_bookmarks(exact:{}, exact:{})",
         serde_json::to_string(base_branch)?,

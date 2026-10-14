@@ -50,7 +50,7 @@ pub enum Containment {
     /// The head is that commit or one of its ancestors.
     Ancestor,
     /// Every non-empty change in `base..head` that is not itself in the
-    /// vouching history has a rewritten variant (same change id) there.
+    /// vouching history has a content-equivalent variant with the same change id there.
     Rewritten { matched: Vec<RewrittenChange> },
     /// Changes the vouching history does not carry in any form.
     Missing { missing: Vec<MissingChange> },
@@ -114,7 +114,7 @@ impl Reconciliation {
                 "The engine resumed from the PR head `{bookmark}` (`{commit}`) and moved the baseline and both pointers there."
             ),
             Anchor::RecordedBaseline { commit } => format!(
-                "The engine recreated the baseline bookmark at the commit it recorded when the baseline was made (`{commit}`); the heads were not moved."
+                "The engine recreated the baseline bookmark at the commit validated by its recorded provenance (`{commit}`); the heads were not moved."
             ),
             Anchor::ContainingHead { bookmark, commit } => format!(
                 "The engine resumed from `{bookmark}` (`{commit}`), which already carried the other pointer's changes, and moved that pointer there."
@@ -222,11 +222,9 @@ fn vouching_range(base: &str, vouching: &str, trunk: &str) -> String {
 /// Is the preserved work of `head` already carried by `vouching`? Ancestry
 /// first; otherwise every non-empty preserved commit that is not an
 /// ancestor of `vouching` must have a visible commit with the same change
-/// id in the vouching history. Change ids are jj's durable identity for a
-/// rewritten commit, so a rebase, amend or conflict resolution of a
-/// published change counts; work the vouching history never received does
-/// not. Without a base there is no bound for the change-id search, so only
-/// ancestry counts.
+/// id and an equivalent patch in the vouching history. An empty interdiff
+/// proves equivalence across rebases; identity alone cannot vouch for an
+/// unpublished amendment. Without a base only ancestry counts.
 pub(crate) async fn containment(
     jj: &dyn Jj,
     repo: &Path,
@@ -279,12 +277,33 @@ pub(crate) async fn containment(
     let mut missing = Vec::new();
     for (change, commit, description) in change_commit_lines(&outside) {
         match published.get(change) {
-            Some(variant) => matched.push(RewrittenChange {
-                change_id: change.to_owned(),
-                preserved: commit.to_owned(),
-                published: variant.clone(),
-            }),
-            None => missing.push(MissingChange {
+            Some(variant)
+                if crate::recovery_apply::filter_bookkeeping(
+                    &jj.run(
+                        repo,
+                        &[
+                            "--ignore-working-copy",
+                            "interdiff",
+                            "--from",
+                            commit,
+                            "--to",
+                            variant,
+                            "--git",
+                        ],
+                    )
+                    .await?,
+                )
+                .text
+                .trim()
+                .is_empty() =>
+            {
+                matched.push(RewrittenChange {
+                    change_id: change.to_owned(),
+                    preserved: commit.to_owned(),
+                    published: variant.clone(),
+                })
+            }
+            _ => missing.push(MissingChange {
                 change_id: change.to_owned(),
                 commit: commit.to_owned(),
                 description: description.to_owned(),
@@ -349,8 +368,7 @@ fn baseline_detail(record: &ExecutionBookmark, base: Option<&str>) -> String {
 }
 
 /// The pointers failed in a repairable way and nothing recorded carries the
-/// preserved work. Names each missing change so an operator can decide
-/// without a jj session, and the exact command that would adopt the
+/// preserved work. Names each missing change and the exact command that would adopt the
 /// vouching commit if the content is confirmed present.
 fn not_contained_error(
     record: &ExecutionBookmark,
@@ -385,8 +403,8 @@ async fn set_bookmarks(jj: &dyn Jj, record: &ExecutionBookmark, bookmarks: &[Str
 /// The integrity state of a record's pointers, classified for repair.
 enum Damage {
     Intact,
-    /// The bookmark is gone but the record's own commit still vouches for
-    /// every head: the only repair is to recreate the bookmark.
+    /// The bookmark is absent or stale but the recorded baseline's evolution
+    /// still vouches for every head: only the baseline bookmark needs repair.
     BaselineBookmarkOnly {
         base: String,
     },
@@ -452,7 +470,10 @@ pub async fn reconcile(
                 anchor: Anchor::RecordedBaseline { commit: base },
                 baseline: None,
                 superseded: Vec::new(),
-                failure: format!("recovery bookmark {} {UNRESOLVED_MESSAGE}; found 0", record.base()),
+                failure: format!(
+                    "recovery bookmark {} was absent or did not reference the validated baseline",
+                    record.base()
+                ),
             }));
         }
         Damage::Repairable { failure, base } => (failure, base),

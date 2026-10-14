@@ -12,6 +12,12 @@ use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+mod baseline;
+pub use baseline::checkpoint_baseline;
+
+mod snapshot;
+pub use snapshot::{PointerSnapshot, restore_pointers, snapshot_pointers};
+
 mod redispatch;
 pub use redispatch::{RestoreReport, restore_rebased};
 
@@ -23,6 +29,8 @@ pub use reconcile::{
     Anchor, Containment, MissingChange, Reconciliation, RewrittenChange, SupersededPointer, reconcile,
 };
 
+#[cfg(test)]
+mod amendment_tests;
 #[cfg(test)]
 mod reconcile_tests;
 
@@ -69,8 +77,7 @@ impl std::fmt::Display for PointerIntegrityError {
 impl std::error::Error for PointerIntegrityError {}
 
 /// The message a pointer that is not descended from its baseline reports,
-/// followed by ` boss-base/<execution id>` and, since reconciliation
-/// landed, the commits involved. Shared so a stored work-item blocker can
+/// followed by ` boss-base/<execution id>` and the commits involved. Shared so a stored work-item blocker can
 /// be recognised exactly, rather than by a copied string.
 pub const NOT_DESCENDED_MESSAGE: &str = "preserved execution pointer is not descended from its engine-created baseline";
 
@@ -200,11 +207,9 @@ pub struct ExecutionBookmark {
     pub execution_id: String,
     pub repo_path: PathBuf,
     pub host_id: String,
-    /// The commit `boss-base/<execution id>` was created at. The bookmark
-    /// is a convenience; this is the baseline's identity, so it lives
-    /// exactly as long as the record and can rebuild the bookmark when
-    /// something in the shared store forgot it. Absent on records written
-    /// before it was recorded.
+    /// The last checkpointed baseline commit. This identity, or a verified
+    /// evolution successor, can rebuild a missing baseline bookmark.
+    /// Legacy records may lack this provenance.
     #[serde(default)]
     pub base_commit: Option<String>,
 }
@@ -435,16 +440,18 @@ fn missing_baseline_error(record: &ExecutionBookmark, heads: &Heads) -> anyhow::
 }
 
 /// The baseline commit: the `boss-base/…` bookmark when it exists, else the
-/// commit the record says it was created at, if that commit is still in the
-/// store. `Err(MissingBaseline)` when neither can be found.
+/// recorded commit, following verified evolution to a common ancestor of
+/// the heads when necessary. `Err(MissingBaseline)` when neither can be found.
 pub(crate) async fn resolve_base(jj: &dyn Jj, record: &ExecutionBookmark, heads: &Heads) -> Result<(String, bool)> {
     if let Some(base) = resolve_optional(jj, &record.repo_path, &record.base()).await? {
-        return Ok((base, true));
+        let evolved = baseline::evolved_baseline(jj, record, &base, heads).await?;
+        let unchanged = evolved == base;
+        return Ok((evolved, unchanged));
     }
     if let Some(commit) = &record.base_commit
         && commit_exists(jj, &record.repo_path, commit).await?
     {
-        return Ok((commit.clone(), false));
+        return Ok((baseline::evolved_baseline(jj, record, commit, heads).await?, false));
     }
     Err(missing_baseline_error(record, heads))
 }
@@ -595,7 +602,7 @@ async fn durable_baseline(jj: &dyn Jj, workspace: &Path) -> Result<String> {
                 "log",
                 "--no-graph",
                 "-r",
-                "latest((::@-) ~ (empty() & description(exact:\"\")))",
+                "heads((::@-) ~ (empty() & description(exact:\"\")))",
                 "-T",
                 "commit_id ++ \"\\n\"",
             ],
