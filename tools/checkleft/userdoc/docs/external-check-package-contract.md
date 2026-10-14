@@ -162,61 +162,7 @@ Not allowed in `declarative` mode:
 
 The manifest-level rule above (`include` disallowed in `component` mode, required in `declarative` mode) governs the package manifest. A separate, complementary rule governs the guest's own Rust source: a component check's config struct — the type deserialized via `CheckInput::config::<T>()` — must not declare a top-level field that answers "is this file a target of this check at all" either. That is the framework's decision (the check-entry `include` / `exclude` keys in the consuming repo's `CHECKS.yaml`), made before the host ever lowers a changeset into the guest — see [Configuring checks](checks-config.md#checks-must-not-answer-is-this-file-in-scope-themselves) for the full rule, the denylist, and the sanctioned nested finer-axis shape. The built-in `checkleft/no-check-level-file-scoping` check enforces this against every checkleft check's own source (built-in and component alike), scoped to `tools/checkleft/checks/**/src/lib.rs` and `tools/checkleft/src/checks/**/*.rs`.
 
-## Host API Contract Surface (Names Frozen)
-
-External checks use host calls with these operation names:
-
-1. `changeset.list_changed_files()`
-2. `tree.read_file(path)`
-3. `tree.exists(path)`
-4. `tree.list_dir(path)`
-5. `tree.glob(pattern)`
-6. `changeset.bypass_reason(name)`
-
-Semantics:
-
-1. Source-tree paths are repository-relative and validated.
-2. Host operations are deterministic for a fixed input.
-3. No ambient network or filesystem access is implied by the API.
-
-## Code Stubs
-
-Phase 0 schema stubs and validators live in:
-
-1. `tools/checkleft/src/external/mod.rs`
-
-These stubs define the frozen contract types and parsing/validation behavior without integrating runtime execution yet.
-
-### Component checks must not re-implement file scoping in guest config
-
-The manifest-level rule above (`include` disallowed in `component` mode, required in `declarative` mode) governs the package manifest. A separate, complementary rule governs the guest's own Rust source: a component check's config struct — the type deserialized via `CheckInput::config::<T>()` — must not declare a top-level field that answers "is this file a target of this check at all" either. That is the framework's decision (the check-entry `include` / `exclude` keys in the consuming repo's `CHECKS.yaml`), made before the host ever lowers a changeset into the guest — see [Configuring checks](checks-config.md#checks-must-not-answer-is-this-file-in-scope-themselves) for the full rule, the denylist, and the sanctioned nested finer-axis shape. The built-in `checkleft/no-check-level-file-scoping` check enforces this against every checkleft check's own source (built-in and component alike), scoped to `tools/checkleft/checks/**/src/lib.rs` and `tools/checkleft/src/checks/**/*.rs`.
-
-## Host API Contract Surface (Names Frozen)
-
-External checks use host calls with these operation names:
-
-1. `changeset.list_changed_files()`
-2. `tree.read_file(path)`
-3. `tree.exists(path)`
-4. `tree.list_dir(path)`
-5. `tree.glob(pattern)`
-6. `changeset.bypass_reason(name)`
-
-Semantics:
-
-1. Source-tree paths are repository-relative and validated.
-2. Host operations are deterministic for a fixed input.
-3. No ambient network or filesystem access is implied by the API.
-
-## Code Stubs
-
-Phase 0 schema stubs and validators live in:
-
-1. `tools/checkleft/src/external/mod.rs`
-
-These stubs define the frozen contract types and parsing/validation behavior without integrating runtime execution yet.
-
-### Check subprocess environment
+## Check Subprocess Environment
 
 Check commands, fixes, version probes and provisioning subprocesses use an
 allowlisted environment. PATH contains resolved tool directories followed by
@@ -244,3 +190,28 @@ PATH is framework-owned and cannot be overridden. Linux npm checks require glibc
 2.28 or newer and `getconf`; musl/Alpine hosts are unsupported.
 See the [README environment policy](https://github.com/spinyfin/mono/blob/main/tools/checkleft/README.md#check-subprocess-environment)
 for the full policy and Bazel version-pin handling.
+
+## Host API Contract Surface (Names Frozen)
+
+External checks use host calls with these operation names:
+
+1. `changeset.list_changed_files()`
+2. `tree.read_file(path)`
+3. `tree.exists(path)`
+4. `tree.list_dir(path)`
+5. `tree.glob(pattern)`
+6. `changeset.bypass_reason(name)`
+
+Semantics:
+
+1. Source-tree paths are repository-relative and validated.
+2. Host operations are deterministic for a fixed input.
+3. No ambient network or filesystem access is implied by the API.
+
+## Code Stubs
+
+Phase 0 schema stubs and validators live in:
+
+1. `tools/checkleft/src/external/mod.rs`
+
+These stubs define the frozen contract types and parsing/validation behavior without integrating runtime execution yet.

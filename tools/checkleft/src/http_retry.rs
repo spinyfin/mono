@@ -86,3 +86,86 @@ pub async fn get_bytes_with_retry(
     let message = last_error.unwrap_or_else(|| format!("failed to retrieve {what}"));
     bail!("{message} after {} attempts", policy.max_attempts)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{GetRetryPolicy, get_bytes_with_retry};
+
+    fn url(server: &MockServer) -> reqwest::Url {
+        format!("{}/file", server.uri()).parse().expect("url")
+    }
+
+    fn policy<'a>(not_found_base_delay: Option<Duration>) -> GetRetryPolicy<'a> {
+        GetRetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(5),
+            not_found_base_delay,
+            remaining: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn not_found_fails_at_once_without_not_found_delay() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/file"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = get_bytes_with_retry(&reqwest::Client::new(), &url(&server), "thing", &policy(None))
+            .await
+            .expect_err("404 should fail");
+        assert!(error.to_string().contains("404"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn remaining_budget_cuts_retries_short() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/file"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let remaining = || Duration::from_millis(1);
+        let policy = GetRetryPolicy {
+            remaining: Some(&remaining),
+            ..policy(None)
+        };
+        let error = get_bytes_with_retry(&reqwest::Client::new(), &url(&server), "thing", &policy)
+            .await
+            .expect_err("503 should fail");
+        assert!(error.to_string().contains("503"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn retries_transient_failure_then_returns_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/file"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bytes = get_bytes_with_retry(&reqwest::Client::new(), &url(&server), "thing", &policy(None))
+            .await
+            .expect("should succeed");
+        assert_eq!(bytes, b"payload");
+    }
+}
