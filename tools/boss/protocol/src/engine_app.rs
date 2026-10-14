@@ -403,7 +403,15 @@ mod tests {
             task_title: Some("attach panes".into()),
         });
         let attach_json = serde_json::to_string(&attach).unwrap();
-        assert!(attach_json.contains("attach_worker_pane"));
+        // Exact wire fields: layout page/cell coordinates are app-local.
+        assert_eq!(
+            serde_json::to_value(&attach).unwrap(),
+            serde_json::json!({
+                "kind": "attach_worker_pane", "run_id": "run-tmux", "slot_id": 3,
+                "session_name": "boss-3-run-tmux", "tmux_socket_path": "/state/boss/tmux.sock",
+                "summary": "implementing attach mode", "task_title": "attach panes"
+            })
+        );
         assert_eq!(
             serde_json::from_str::<EngineToAppRequest>(&attach_json).unwrap(),
             attach
