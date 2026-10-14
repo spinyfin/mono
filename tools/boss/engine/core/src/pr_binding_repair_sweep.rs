@@ -299,8 +299,14 @@ async fn repair_candidate(
         true
     };
 
+    if candidate.has_live_review && !bound_is_own {
+        // A live review owns the row; rebinding or parking waits for it.
+        return Ok(());
+    }
+
     if bound_is_own {
         if doc_suspect {
+            clear_foreign_doc_pointer(work_db, candidate);
             doc_refresher
                 .refresh(
                     work_db,
@@ -406,6 +412,9 @@ async fn repair_candidate(
     ) {
         tracing::warn!(task_id = %candidate.task_id, ?err, "pr-binding-repair sweep: audit line append failed (non-fatal)");
     }
+    if doc_suspect {
+        clear_foreign_doc_pointer(work_db, candidate);
+    }
     doc_refresher
         .refresh(work_db, &candidate.task_id, &candidate.product_id, &own_pr_url)
         .await;
@@ -431,6 +440,15 @@ async fn repair_candidate(
         ),
     }
     Ok(())
+}
+
+/// Drop a doc pointer copied off the wrong PR so the detector can re-derive
+/// it from the right one (it never overwrites an existing `doc_path`). When
+/// the right PR carries no doc the pointer stays empty.
+fn clear_foreign_doc_pointer(work_db: &WorkDb, candidate: &PrBindingRepairCandidate) {
+    if let Err(err) = work_db.clear_task_doc_pointer(&candidate.task_id) {
+        tracing::warn!(task_id = %candidate.task_id, ?err, "pr-binding-repair sweep: failed to clear foreign doc pointer");
+    }
 }
 
 fn park_unresolved(
@@ -536,7 +554,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "UPDATE tasks SET pr_url = ?2, status = 'todo', doc_branch = 'boss/exec_18dad2723a80ed10_23' WHERE id = ?1",
+            "UPDATE tasks SET pr_url = ?2, status = 'todo', doc_branch = 'boss/exec_18dad2723a80ed10_23',
+                 doc_path = 'docs/designs/origin.md' WHERE id = ?1",
             rusqlite::params![task.id, bound_pr_url],
         )
         .unwrap();
@@ -711,6 +730,55 @@ mod tests {
         let t = task(&db, &task_id);
         assert_eq!(t.pr_url.as_deref(), Some(OWN));
         assert_eq!(t.status, TaskStatus::Todo, "a correct binding leaves status alone");
+        assert_eq!(
+            db.task_doc_path(&task_id).unwrap(),
+            None,
+            "the doc path copied off the origin PR must be gone"
+        );
+        assert!(db.list_pr_binding_repair_candidates().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rebind_clears_the_foreign_doc_path() {
+        let (_dir, db) = open_db();
+        let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_18dad2723a80ed10_23".to_owned())]));
+        let detector = FixedDetector(PrStatus::Fresh { url: OWN.to_owned() }, StdMutex::default());
+        let mut attempts = HashMap::new();
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &verifier,
+            &FakePrStateChecker::always(PrOpenState::Open),
+            &RecordingDocRefresher::default(),
+            &mut attempts,
+        )
+        .await;
+        assert_eq!(outcome.rebound, 1, "{outcome:?}");
+        assert_eq!(db.task_doc_path(&task_id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn live_review_allows_only_the_doc_repair() {
+        let (_dir, db) = open_db();
+        let (_product, task_id, exec_id) = mis_bound_followup(&db, OWN);
+        let own_branch = expected_branch_name(&exec_id, &Default::default(), None);
+        db.request_pr_review(&task_id, &FakePrStateChecker::always(PrOpenState::Open))
+            .unwrap();
+        let verifier = MapVerifier(HashMap::from([(1764, own_branch)]));
+        let detector = FixedDetector(PrStatus::None, StdMutex::default());
+        let mut attempts = HashMap::new();
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &verifier,
+            &FakePrStateChecker::always(PrOpenState::Open),
+            &RecordingDocRefresher::default(),
+            &mut attempts,
+        )
+        .await;
+        assert_eq!(outcome.doc_repaired, 1, "{outcome:?}");
+        assert_eq!(db.task_doc_path(&task_id).unwrap(), None);
     }
 
     #[tokio::test]

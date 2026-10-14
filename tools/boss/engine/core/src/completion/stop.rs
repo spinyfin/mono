@@ -166,12 +166,16 @@ impl WorkerCompletionHandler {
                 }
                 None => {
                     // No bound PR resolvable (execution.pr_url not
-                    // stamped and the chain-root lookup failed) — trust
-                    // the first staged URL rather than discard legitimate
-                    // evidence; a wrong URL here would still have to
-                    // pass `validate_pr_url`'s product-repo gate at
-                    // staging time.
-                    Some(entry.pr_url)
+                    // stamped and the chain-root lookup failed). A lone
+                    // candidate is unambiguous; with several there is
+                    // nothing to choose by except text position, which
+                    // is exactly how an echoed origin PR gets bound — so
+                    // treat them as unverifiable and leave recovery to
+                    // the SHA-delta and Stop paths.
+                    match candidates.as_slice() {
+                        [only] => Some(only.clone()),
+                        _ => None,
+                    }
                 }
             };
         }

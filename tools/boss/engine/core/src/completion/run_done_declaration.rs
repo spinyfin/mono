@@ -35,16 +35,15 @@
 //! submission path cannot block on GitHub for long.
 //!
 //! **Nothing binds a PR to a work item unless that PR's head branch is the
-//! execution's own branch.** The first version of this module honoured the
-//! first rule by skipping the branch check entirely: a `delivered`
-//! declaration bound whatever publish-armed URL the hook stream had staged
-//! and left correctness to the post-hoc audit. That audit returns early
-//! without a `pr_head_before` snapshot, which only a small fraction of
-//! primary implementations have, so it almost never ran — and a follow-up
-//! whose publish command echoed its PR body bound its *origin* PR, already
-//! merged, instead of the PR it had just opened (flunge, 2026-10-05; mono,
-//! 2026-10-13). Both reviewer passes then failed on the merged PR and the
-//! real PR was never reviewed.
+//! execution's own branch.** A `delivered` declaration binds only a PR whose
+//! head is the execution's branch. The post-hoc audit cannot be relied on to
+//! catch a wrong URL: it returns early without a `pr_head_before` snapshot,
+//! which only a small fraction of primary implementations have. Binding
+//! whatever publish-armed URL the hook stream staged would bind a follow-up's
+//! *origin* PR (already merged), echoed by its publish command ahead of the
+//! new PR's URL, instead of the PR it just opened (flunge, 2026-10-05; mono,
+//! 2026-10-13): the reviewer then fails on the merged PR and the real PR is
+//! never reviewed.
 //!
 //! Both rules hold at once because the branch check is **bounded**, and a
 //! miss never falls back to an unverified URL:
@@ -125,8 +124,8 @@ impl WorkerCompletionHandler {
     /// declarations until the driver terminal boundary. This is the
     /// counterpart to `on_stop`/`on_stop_inner` for every other completion
     /// path, but reached from `app::proposals::handle_submit_proposal`
-    /// instead of a driver Stop hook. See the module doc for why this must
-    /// never make a network call.
+    /// instead of a driver Stop hook. See the module doc for why every GitHub
+    /// call here is bounded and why a miss never binds an unverified URL.
     ///
     /// `outcome` is the worker's own declared
     /// [`boss_protocol::RunDoneOutcome`] — already durably stamped onto the
@@ -185,14 +184,13 @@ impl WorkerCompletionHandler {
     ///    [`expected_branch_name`]) — the durable pointer the engine itself
     ///    created. One bounded `gh` call.
     ///
-    /// A staged or artifact URL is never trusted on its own. This path used
-    /// to skip the branch check and rely on the post-hoc audit
-    /// ([`Self::spawn_declared_delivery_audit`]), which returns early
-    /// without a `pr_head_before` snapshot — stamped for only a small
-    /// fraction of primary implementations — so a wrong URL (a follow-up's
-    /// origin PR, echoed in the publish command's output ahead of the new
-    /// PR's URL) bound unopposed, the reviewer failed on a merged PR, and the
-    /// real PR was never reviewed (flunge, 2026-10-05; mono, 2026-10-13).
+    /// A staged or artifact URL is never trusted on its own. The post-hoc
+    /// audit ([`Self::spawn_declared_delivery_audit`]) cannot catch a wrong
+    /// URL: it returns early without a `pr_head_before` snapshot, stamped for
+    /// only a small fraction of primary implementations. A follow-up's origin
+    /// PR, echoed in the publish command's output ahead of the new PR's URL,
+    /// would bind unopposed and the real PR would never be reviewed (flunge,
+    /// 2026-10-05; mono, 2026-10-13).
     ///
     /// Every network step is wrapped in [`DECLARED_DELIVERY_NETWORK_BUDGET`].
     /// A timeout or transient failure yields
@@ -323,7 +321,7 @@ impl WorkerCompletionHandler {
     /// already uses: the execution is already terminal and torn down by the
     /// time either task runs, so a slow or failing `gh` call can delay those
     /// side effects, never a slot release.
-    async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+    pub(super) async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let (pr_url, merged) = match self.resolve_declared_pr_url(execution).await {
             DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged),
             DeclaredPrResolution::NoneFound { detail } => {
@@ -341,9 +339,11 @@ impl WorkerCompletionHandler {
             }
         };
         if execution.kind != ExecutionKind::RevisionImplementation
-            && let Some(detail) = self.foreign_pr_binding_conflict(execution, &pr_url)
+            && let Some(conflict) = self.foreign_pr_binding_conflict(execution, &pr_url)
         {
-            return self.finalize_declared_delivery_without_pr(execution, &detail).await;
+            return self
+                .refuse_foreign_pr_binding(execution, &pr_url, &conflict, "run_done")
+                .await;
         }
 
         // Captured before `record_worker_pr_completion` nulls

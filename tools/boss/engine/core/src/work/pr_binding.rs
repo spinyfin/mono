@@ -45,6 +45,11 @@ pub struct PrBindingRepairCandidate {
     pub worker_branch_prefix: Option<String>,
     /// Why the row was selected; informational, for logs and attention text.
     pub reasons: Vec<PrBindingSuspicion>,
+    /// A `pr_review` / `pr_review_guide` execution is live on the row. The
+    /// sweep may then only repair the doc pointer (which touches neither
+    /// `pr_url` nor status); rebinding or parking waits for the review to end.
+    #[builder(default)]
+    pub has_live_review: bool,
 }
 
 /// Structural signals, each computable from the DB alone, that a row's PR
@@ -72,8 +77,9 @@ impl PrBindingSuspicion {
 }
 
 impl WorkDb {
-    /// The id of a different, live, non-revision work item already bound to
-    /// `pr_url`, if any. Revision rows are excluded: a revision's `pr_url`
+    /// The id of a different non-revision work item (in any status, including
+    /// `done` / `archived`; only soft-deleted rows are ignored) already bound
+    /// to `pr_url`, if any. Revision rows are excluded: a revision's `pr_url`
     /// is only ever its chain root's PR (stamped for the reviewer's benefit),
     /// so the root itself — a non-revision row — is what a conflict would
     /// surface as.
@@ -99,8 +105,11 @@ impl WorkDb {
     /// plus branch-shape comparison — no network; the sweep confirms against
     /// GitHub before touching anything.
     ///
-    /// Excludes rows with a live execution (the running worker owns the
-    /// binding) and rows a human already closed (`done` / `archived`).
+    /// Excludes rows with a live implementation-style execution (the running
+    /// worker owns the binding) and rows a human already closed (`done` /
+    /// `archived`). A live review does not exclude a row — it is flagged via
+    /// [`PrBindingRepairCandidate::has_live_review`] so only the doc-pointer
+    /// repair runs while it is live.
     pub fn list_pr_binding_repair_candidates(&self) -> Result<Vec<PrBindingRepairCandidate>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(&format!(
@@ -114,7 +123,16 @@ impl WorkDb {
                         AND o.id != t.id
                         AND o.deleted_at IS NULL
                         AND o.kind != 'revision'
-                    ) AS shared
+                    ) AS shared,
+                    EXISTS (
+                      SELECT 1 FROM work_executions rv
+                      WHERE rv.work_item_id = t.id
+                        AND rv.kind IN ('pr_review', 'pr_review_guide')
+                        AND rv.status IN (
+                          'queued', 'ready', 'waiting_dependency', 'claimed', 'running',
+                          'waiting_human', 'waiting_review', 'waiting_merge'
+                        )
+                    ) AS live_review
              FROM tasks t
              JOIN work_executions we ON we.id = (
                SELECT latest.id
@@ -135,6 +153,7 @@ impl WorkDb {
                AND NOT EXISTS (
                  SELECT 1 FROM work_executions live
                  WHERE live.work_item_id = t.id
+                   AND live.kind NOT IN ('pr_review', 'pr_review_guide')
                    AND live.status IN (
                      'queued', 'ready', 'waiting_dependency', 'claimed', 'running',
                      'waiting_human', 'waiting_review', 'waiting_merge'
@@ -158,6 +177,7 @@ impl WorkDb {
                     branch_naming,
                     worker_branch_prefix: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
                     reasons: Vec::new(),
+                    has_live_review: row.get::<_, bool>(12)?,
                 },
                 row.get::<_, bool>(10)?,
                 row.get::<_, bool>(11)?,
@@ -193,6 +213,21 @@ impl WorkDb {
             }
         }
         Ok(candidates)
+    }
+
+    /// Clear a task's whole doc pointer (repo, branch, path). The repair
+    /// sweep calls this before re-running doc detection on the correct PR:
+    /// the detector never overwrites an existing `doc_path`, so a pointer
+    /// copied off the wrong PR would otherwise survive.
+    pub fn clear_task_doc_pointer(&self, task_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks
+             SET doc_repo_remote_url = NULL, doc_branch = NULL, doc_path = NULL, updated_at = ?2
+             WHERE id = ?1",
+            params![task_id, now_string()],
+        )?;
+        Ok(())
     }
 
     /// Re-point `task_id` (and `execution_id`) at `new_pr_url`, the PR whose

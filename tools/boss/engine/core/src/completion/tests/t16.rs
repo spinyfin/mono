@@ -69,7 +69,7 @@ fn followup_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, Str
     (dir, db, product.id, followup.id, execution.id)
 }
 
-/// Deliverable 5a: a publish command whose output contains the origin PR
+/// A publish command whose output contains the origin PR
 /// URL before the new PR URL binds the new PR. Both are staged; the branch
 /// check — not text position — selects.
 #[tokio::test]
@@ -118,7 +118,7 @@ async fn stop_binds_the_pr_on_the_execution_branch_when_publish_output_named_the
     );
 }
 
-/// Deliverable 5b: the `run_done` path rejects a staged URL whose head
+/// The `run_done` path rejects a staged URL whose head
 /// branch is not the execution's, and — with no PR on the branch — fails
 /// loudly with the branch and the rejected URL on the row.
 #[tokio::test]
@@ -164,7 +164,7 @@ async fn run_done_delivered_rejects_a_staged_url_whose_head_is_not_the_execution
     assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
 }
 
-/// Deliverable 1: when no output URL validates, the PR is resolved by
+/// When no output URL validates, the PR is resolved by
 /// branch instead — and that is what binds.
 #[tokio::test]
 async fn run_done_delivered_resolves_by_branch_after_rejecting_the_staged_url() {
@@ -197,7 +197,7 @@ async fn run_done_delivered_resolves_by_branch_after_rejecting_the_staged_url() 
     );
 }
 
-/// Deliverable 5c (Stop path): a follow-up citing a merged origin PR ends
+/// Stop path: A follow-up citing a merged origin PR ends
 /// up bound to its own PR and enters review.
 #[tokio::test]
 async fn followup_citing_a_merged_origin_pr_binds_its_own_pr_and_enters_review_on_stop() {
@@ -230,7 +230,7 @@ async fn followup_citing_a_merged_origin_pr_binds_its_own_pr_and_enters_review_o
     assert_eq!(db.get_execution(&execution_id).unwrap().pr_url.as_deref(), Some(OWN_PR));
 }
 
-/// Deliverable 5c (`run_done` path): the same follow-up, declaring
+/// `run_done` path: The same follow-up, declaring
 /// `delivered` with both URLs staged, binds its own PR — the staged entry
 /// is branch-checked, not taken as-is.
 #[tokio::test]
@@ -331,7 +331,7 @@ async fn run_done_delivered_defers_when_github_is_unreachable_instead_of_binding
     assert!(cube.release_calls.lock().await.is_empty());
 }
 
-/// Deliverable 3: a PR already bound to a different work item is refused,
+/// A PR already bound to a different work item is refused,
 /// even when it is the PR the branch-keyed detector returns.
 #[tokio::test]
 async fn stop_refuses_to_bind_a_pr_that_belongs_to_another_work_item() {
@@ -365,6 +365,46 @@ async fn stop_refuses_to_bind_a_pr_that_belongs_to_another_work_item() {
             .any(|item| item.kind == crate::completion::pr_binding_guard::FOREIGN_PR_REFUSED_ATTENTION_KIND),
         "the refusal is surfaced as an attention item",
     );
+}
+
+/// A `delivered` declaration parked by a GitHub outage must not stay parked
+/// quietly once GitHub answers "no PR on the branch": the recheck re-enters
+/// the declaration path and the run fails visibly.
+#[tokio::test]
+async fn transient_run_done_that_later_resolves_to_no_pr_fails_visibly_on_recheck() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::err("gh: connect: network is unreachable");
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector.clone());
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET run_done_outcome = 'delivered', run_done_declared_at = '2026-10-13T00:00:00Z' \
+             WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )
+        .unwrap();
+
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert_eq!(outcome, StopOutcome::DetectorFailed);
+    assert!(db.get_execution(&execution_id).unwrap().status.is_live());
+
+    detector.set_result(PrStatus::None).await;
+    let outcome = handler.recheck_for_pr(&execution_id).await;
+    let StopOutcome::RunDoneDeclaredWithoutDelivery { detail } = outcome else {
+        panic!("a definitive no-PR answer must fail visibly, got {outcome:?}");
+    };
+    assert!(
+        detail.contains(&own_branch(&execution_id)),
+        "the branch looked for is named: {detail}"
+    );
+    let task = task_row(&db, &chore_id);
+    assert_eq!(task.status, TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
 }
 
 mod stop_boundary {

@@ -539,9 +539,9 @@ fn spawned_source_capture_worker(server_state: &ServerState) -> (String, String)
 /// Capture-time source collection runs only for a PR URL whose head branch
 /// is this execution's own branch: the dispatcher stages the URL, the
 /// background branch check confirms it, and only then is the review-guide
-/// source captured on the canonical root. (An unverified URL used to be
-/// captured straight away — that is what logged "canonical PR … is already
-/// associated with root task …" on the mis-bound follow-ups.)
+/// source captured on the canonical root. Collecting for an unverified URL
+/// would log "canonical PR … is already associated with root task …" for a
+/// PR the execution did not open.
 #[tokio::test]
 async fn finalization_armed_observation_captures_on_the_canonical_root() {
     let calls = Arc::new(AtomicUsize::new(0));

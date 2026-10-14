@@ -445,7 +445,9 @@ pub enum RecordCommandObservationOutcome {
 /// Upper bound on distinct candidate URLs retained per execution. Branch
 /// verification costs one GitHub call per candidate until one matches, so
 /// the list is bounded; a worker whose publish command echoes more PR URLs
-/// than this is not a shape the engine has ever observed.
+/// than this is not a shape the engine has ever observed. When a command
+/// prints more, the latest URLs are kept (the new PR's URL prints after the
+/// URLs echoed from its body).
 pub const MAX_STAGED_PR_URL_CANDIDATES: usize = 8;
 
 /// The staged PR-URL candidates for one execution plus the wall-clock
@@ -487,15 +489,21 @@ pub struct StagedPrUrlEntry {
 
 impl StagedPrUrlEntry {
     fn new(urls: &[String], finalization_armed: bool) -> Option<Self> {
-        let (first, rest) = urls.split_first()?;
+        let mut distinct: Vec<String> = Vec::new();
+        for url in urls {
+            if !distinct.contains(url) {
+                distinct.push(url.clone());
+            }
+        }
+        // Over the cap, keep the LAST candidates: a publish command echoes
+        // the PR body's cited URLs before the URL of the PR it just opened,
+        // so the one that verifies is the one most likely to come last.
+        let skip = distinct.len().saturating_sub(MAX_STAGED_PR_URL_CANDIDATES);
+        let mut kept = distinct.into_iter().skip(skip);
+        let first = kept.next()?;
         Some(Self {
-            pr_url: first.clone(),
-            alternates: rest
-                .iter()
-                .filter(|u| *u != first)
-                .take(MAX_STAGED_PR_URL_CANDIDATES.saturating_sub(1))
-                .cloned()
-                .collect(),
+            alternates: kept.collect(),
+            pr_url: first,
             staged_at: Instant::now(),
             finalization_armed,
             branch_verified: false,
@@ -678,7 +686,10 @@ impl StagedPrUrlCache {
                         continue;
                     }
                     if entry.alternates.len() + 1 >= MAX_STAGED_PR_URL_CANDIDATES {
-                        break;
+                        // Full: drop the oldest alternate so the newest
+                        // observation (the PR just opened prints last)
+                        // survives.
+                        entry.alternates.remove(0);
                     }
                     entry.alternates.push(url.clone());
                     added = true;

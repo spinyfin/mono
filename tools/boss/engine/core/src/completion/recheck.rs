@@ -354,8 +354,21 @@ impl WorkerCompletionHandler {
             }
         };
         let (pr_url, target) = match pr_status {
-            // Quiet returns — no probes, no awaiting-input publish.
-            PrStatus::None | PrStatus::Closed { .. } => return StopOutcome::AwaitingInput,
+            PrStatus::None | PrStatus::Closed { .. } => {
+                // A worker that already declared `delivered` while GitHub was
+                // unreachable (the declaration stayed stamped, the execution
+                // live) must not park quietly now that GitHub answered "no
+                // PR": re-enter the declaration path, which fails visibly
+                // with the branch and the rejected URLs.
+                if matches!(
+                    self.work_db.execution_run_done_outcome(execution_id),
+                    Ok(Some(boss_protocol::RunDoneOutcome::Delivered))
+                ) {
+                    return self.finalize_declared_delivery(&execution).await;
+                }
+                // Quiet return — no probes, no awaiting-input publish.
+                return StopOutcome::AwaitingInput;
+            }
             PrStatus::Stale { url, reason } => return StopOutcome::StalePr { pr_url: url, reason },
             PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url },
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
