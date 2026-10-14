@@ -108,7 +108,7 @@ fn park_slot(server_state: &ServerState, slot_id: u8) {
 /// unconditionally would let a test pass even if the engine typed first and
 /// interrupted second, which is the exact ordering bug this whole path
 /// exists to prevent.
-fn park_once_interrupted(
+pub(super) fn park_once_interrupted(
     server_state: &Arc<ServerState>,
     runner: &Arc<RecordingTmux>,
     slot_id: u8,
@@ -131,7 +131,7 @@ fn park_once_interrupted(
 /// `UserPromptSubmit` hook once the pane write has gone out. Reads the text
 /// back out of what actually reached tmux rather than reconstructing it, so
 /// the confirmation cannot accidentally paper over a mangled write.
-fn confirm_write_when_it_lands(
+pub(super) fn confirm_write_when_it_lands(
     server_state: &Arc<ServerState>,
     runner: &Arc<RecordingTmux>,
     run_id: &str,
@@ -191,11 +191,32 @@ async fn interrupting_probe_cuts_the_turn_short_before_writing() {
 
     match sole_response(&sink).await {
         FrontendEvent::ProbeDelivered {
+            probe_id,
             state,
             interrupt,
             interrupt_attempts,
             ..
         } => {
+            let status_sink = make_session_sink();
+            executions::handle_probe_status(
+                dispatch_for(&server_state, &status_sink),
+                FrontendRequest::ProbeStatus { probe_id },
+            )
+            .await;
+            match sole_response(&status_sink).await {
+                FrontendEvent::ProbeStatusResult {
+                    detail: Some(detail),
+                    submitted,
+                    resumed,
+                    ..
+                } => {
+                    assert!(detail.contains("submitted=true"));
+                    assert!(detail.contains("resumed=confirmed"));
+                    assert_eq!(submitted, Some(true));
+                    assert_eq!(resumed, Some(boss_protocol::ProbeResumeEvidence::Confirmed));
+                }
+                other => panic!("status must report submission evidence: {other:?}"),
+            }
             assert_eq!(
                 state,
                 ProbeDeliveryState::Consumed,
@@ -823,7 +844,7 @@ fn updating_the_in_flight_snapshot_keeps_the_claim() {
         .expect("claim succeeds");
     assert_eq!(claimed.probe_id, probe_id);
 
-    server_state.update_in_flight_probe_snapshot("run-snap", Some("/tmp/after.jsonl".to_owned()), 4096);
+    server_state.update_in_flight_probe_snapshot("run-snap", &probe_id, Some("/tmp/after.jsonl".to_owned()), 4096);
     assert!(server_state.has_in_flight_probe("run-snap"));
     assert_eq!(
         server_state.in_flight_probe_id("run-snap").as_deref(),
@@ -842,7 +863,7 @@ fn updating_the_in_flight_snapshot_keeps_the_claim() {
 #[test]
 fn updating_the_snapshot_for_a_run_with_no_claim_does_nothing() {
     let (server_state, _dir) = test_server_state();
-    server_state.update_in_flight_probe_snapshot("run-none", Some("/tmp/x.jsonl".to_owned()), 7);
+    server_state.update_in_flight_probe_snapshot("run-none", "no-probe", Some("/tmp/x.jsonl".to_owned()), 7);
     assert!(!server_state.has_in_flight_probe("run-none"));
     assert_eq!(server_state.in_flight_probe_id("run-none"), None);
 }
@@ -989,6 +1010,9 @@ async fn interrupting_a_busy_worker_reports_delivered_without_a_prompt_submit_ho
                 server_state.probe_lifecycle_state(&probe_id),
                 Some(ProbeDeliveryState::Consumed),
             );
+            let detail = server_state.probe_record(&probe_id).unwrap().detail.unwrap();
+            assert!(detail.contains("submitted=true"));
+            assert!(detail.contains("resumed=unconfirmed"));
         }
         other => panic!("expected ProbeDelivered, got {other:?}"),
     }
@@ -1119,4 +1143,334 @@ async fn interrupting_probe_does_not_cut_the_turn_when_tmux_identity_is_missing(
         "detail must name the transport failure, got {:?}",
         delivered.detail,
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_second_interrupt_preserves_first_probe_reply() {
+    let (server_state, dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 3, None);
+    let runner = tmux_hosted(&server_state, &run_id, 3);
+    let path = dir.path().join("first-reply.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let first = server_state.queue_probe(run_id.clone(), "first".into(), false);
+    server_state
+        .try_reserve_probe_for_delivery(&run_id, Some(path.to_string_lossy().into_owned()), 0)
+        .unwrap();
+    server_state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+
+    let second = server_state.queue_probe(run_id.clone(), "second".into(), false);
+    let result = super::super::probe_interrupt::deliver_probe_interrupting(&server_state, &run_id, &second).await;
+    assert_eq!(result.state, ProbeDeliveryState::InterruptFailed);
+    assert!(!runner.wrote_text());
+    assert_eq!(server_state.in_flight_probe_id(&run_id), Some(first.clone()));
+    assert_preserved_reply(&server_state, &run_id, &first, &path).await;
+}
+
+async fn assert_preserved_reply(state: &Arc<ServerState>, run_id: &str, first: &str, path: &Path) {
+    let sink = make_session_sink();
+    state
+        .topic_broker
+        .register_session("reply-observer", sink.clone())
+        .await;
+    state
+        .topic_broker
+        .subscribe("reply-observer", &[probe_topic(run_id)])
+        .await;
+    std::fs::write(
+        path,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first answer"}]}}
+"#,
+    )
+    .unwrap();
+    dispatch_probe_reply_on_stop(
+        state,
+        &crate::events_socket::IncomingHookEvent::for_test(
+            WorkerEvent::Stop {
+                session_id: "test-sess".into(),
+                stop_hook_active: false,
+                stop_reason: crate::protocol::StopReason::Completed,
+            },
+            Some(run_id.to_owned()),
+            None,
+        ),
+    )
+    .await;
+    sink.close();
+    match sink.next().await.expect("reply event").payload {
+        FrontendEvent::ProbeReplied { probe_id, text, .. } => {
+            assert_eq!(probe_id, first);
+            assert_eq!(text, "first answer");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    assert_eq!(state.probe_lifecycle_state(first), Some(ProbeDeliveryState::Replied));
+}
+
+#[tokio::test]
+async fn natural_stop_dispatches_previous_reply_without_releasing_new_claim() {
+    let (state, dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&state, 3, None);
+    let path = dir.path().join("previous.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let first = state.queue_probe(run_id.clone(), "first".into(), false);
+    state
+        .try_reserve_probe_for_delivery(&run_id, Some(path.to_string_lossy().into_owned()), 0)
+        .unwrap();
+    state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+    let second = state.queue_probe(run_id.clone(), "second".into(), false);
+    state
+        .try_reserve_specific_probe_for_delivery(&run_id, &second, None, 0)
+        .unwrap();
+    // The interrupt boundary can arrive before the transcript flushes a reply.
+    dispatch_probe_reply_on_stop(
+        &state,
+        &crate::events_socket::IncomingHookEvent::for_test(
+            WorkerEvent::Stop {
+                session_id: "test-sess".into(),
+                stop_hook_active: false,
+                stop_reason: crate::protocol::StopReason::Interrupted,
+            },
+            Some(run_id.clone()),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(state.in_flight_probe_id(&run_id), Some(second.clone()));
+    assert_preserved_reply(&state, &run_id, &first, &path).await;
+    assert_eq!(state.in_flight_probe_id(&run_id), Some(second));
+}
+
+fn interrupted_stop(run_id: &str) -> crate::events_socket::IncomingHookEvent {
+    crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "test-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Interrupted,
+        },
+        Some(run_id.to_owned()),
+        None,
+    )
+}
+
+/// Probe A restored at an empty interrupted boundary must not be answered with
+/// the reply that belongs to the replacement probe B.
+#[tokio::test]
+async fn restored_earlier_reply_does_not_read_replacement_answer() {
+    let (state, dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&state, 3, None);
+    let path = dir.path().join("restored.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let path_str = path.to_string_lossy().into_owned();
+    let first = state.queue_probe(run_id.clone(), "first".into(), false);
+    state
+        .try_reserve_probe_for_delivery(&run_id, Some(path_str.clone()), 0)
+        .unwrap();
+    state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+    let second = state.queue_probe(run_id.clone(), "second".into(), false);
+    state
+        .try_reserve_specific_probe_for_delivery(&run_id, &second, Some(path_str.clone()), 0)
+        .unwrap();
+    // Interrupted boundary with no assistant text: A keeps its retained snapshot.
+    dispatch_probe_reply_on_stop(&state, &interrupted_stop(&run_id)).await;
+    assert_eq!(state.in_flight_probe_id(&run_id), Some(second.clone()));
+    // B is re-snapshotted and written; its prompt and answer land after.
+    state.update_in_flight_probe_snapshot(&run_id, &second, Some(path_str.clone()), 0);
+    state.set_probe_lifecycle(&second, ProbeDeliveryState::Consumed);
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"user","message":{"content":"second"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"second answer"}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let sink = make_session_sink();
+    state.topic_broker.register_session("obs", sink.clone()).await;
+    state.topic_broker.subscribe("obs", &[probe_topic(&run_id)]).await;
+    dispatch_probe_reply_on_stop(&state, &interrupted_stop(&run_id)).await;
+    sink.close();
+    let mut replies = Vec::new();
+    while let Some(event) = sink.next().await {
+        if let FrontendEvent::ProbeReplied { probe_id, text, .. } = event.payload {
+            replies.push((probe_id, text));
+        }
+    }
+    assert_eq!(replies, vec![(second.clone(), "second answer".to_owned())]);
+    assert_ne!(state.probe_lifecycle_state(&first), Some(ProbeDeliveryState::Replied));
+}
+
+/// Teardown restates the whole retained reply chain, not just the top claim.
+#[tokio::test]
+async fn teardown_orphans_retained_previous_reply() {
+    let (state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&state, 3, None);
+    let first = state.queue_probe(run_id.clone(), "first".into(), false);
+    state.try_reserve_probe_for_delivery(&run_id, None, 0).unwrap();
+    state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+    let second = state.queue_probe(run_id.clone(), "second".into(), false);
+    state
+        .try_reserve_specific_probe_for_delivery(&run_id, &second, None, 0)
+        .unwrap();
+    state.set_probe_lifecycle(&second, ProbeDeliveryState::Consumed);
+    let mut orphaned = state.orphan_in_flight_probe_for_terminated_run(&run_id, "test teardown");
+    orphaned.sort();
+    let mut expected = vec![first.clone(), second.clone()];
+    expected.sort();
+    assert_eq!(orphaned, expected);
+    assert_eq!(state.probe_lifecycle_state(&first), Some(ProbeDeliveryState::Orphaned));
+    assert_eq!(state.probe_lifecycle_state(&second), Some(ProbeDeliveryState::Orphaned));
+    assert!(!state.has_in_flight_probe(&run_id));
+}
+
+#[tokio::test(start_paused = true)]
+async fn buffered_busy_send_is_an_error_and_must_not_be_requeued() {
+    let (state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&state, 3, None);
+    tmux_hosted(&state, &run_id, 3);
+    // Pane text confirms the interrupt, but live activity is busy at the
+    // write, so the real injection path buffers without submitting.
+    let runner = Arc::new(
+        RecordingPaneRunner::with_identity("boss-probe-interrupt", "probe-interrupt-test-token").capture_text("❯ \n"),
+    );
+    *state.pane_delivery_tmux_override.write().unwrap() = Some(super::tmux_stub::tmux_with_runner(runner.clone()));
+    let err = state
+        .send_input_to_worker_with_receipt(&run_id, "busy send".into())
+        .await
+        .unwrap_err();
+    assert!(runner.escape_presses() > 0);
+    assert!(runner.wrote_text());
+    assert!(err.to_string().contains("submitted=false"));
+    assert!(!err.safe_to_retry_at_boundary());
+    match err {
+        super::super::pane_ops::SendInputError::NudgeDelivery {
+            probe_id,
+            state: delivery_state,
+            ..
+        } => {
+            assert_eq!(delivery_state, boss_protocol::ProbeDeliveryState::Buffered);
+            assert_eq!(state.probe_record(&probe_id).unwrap().submitted, Some(false));
+        }
+        other => panic!("expected buffered error, got {other:?}"),
+    }
+}
+
+#[test]
+fn brief_notice_retries_only_before_write_failures() {
+    use boss_protocol::ProbeDeliveryState as S;
+    let nudge = |state| super::super::pane_ops::SendInputError::NudgeDelivery {
+        probe_id: "probe".into(),
+        state,
+        detail: "no write".into(),
+    };
+    assert!(nudge(S::InterruptFailed).safe_to_retry_at_boundary());
+    for state in [
+        S::Queued,
+        S::Unconfirmed,
+        S::Orphaned,
+        S::Buffered,
+        S::Abandoned,
+        S::Dropped,
+    ] {
+        assert!(!nudge(state).safe_to_retry_at_boundary(), "{state:?}");
+    }
+}
+
+#[tokio::test]
+async fn stale_stop_and_cleanup_cannot_remove_or_rewrite_replacement_claim() {
+    let (state, _dir) = test_server_state();
+    let run = register_working_worker_with_driver(&state, 3, None);
+    let first = state.queue_probe(run.clone(), "first".into(), false);
+    state.try_reserve_probe_for_delivery(&run, None, 7).unwrap();
+    state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+    let observed = state.in_flight_probe_id(&run).unwrap();
+    let second = state.queue_probe(run.clone(), "second".into(), false);
+    state
+        .try_reserve_specific_probe_for_delivery(&run, &second, None, 11)
+        .unwrap();
+    assert!(
+        state
+            .take_in_flight_probe_if(&run, &observed, |s| s == ProbeDeliveryState::Consumed)
+            .is_none()
+    );
+    assert!(
+        state
+            .take_in_flight_probe_if(&run, &second, |s| s == ProbeDeliveryState::Consumed)
+            .is_none()
+    );
+    assert!(state.take_in_flight_probe_if(&run, &first, |_| true).is_none());
+    state.update_in_flight_probe_snapshot(&run, &first, Some("stale".into()), 99);
+    let sibling = state.queue_probe(run.clone(), "sibling".into(), false);
+    assert!(
+        state
+            .try_reserve_specific_probe_for_delivery(&run, &sibling, None, 0)
+            .is_none()
+    );
+    assert!(state.try_reserve_probe_for_delivery(&run, None, 0).is_none());
+    let held = state.take_in_flight_probe_if(&run, &second, |_| true).unwrap();
+    assert_eq!(held.offset_bytes, 11);
+    assert_eq!(held.transcript_path, None);
+    assert_eq!(state.in_flight_probe_id(&run), Some(first));
+}
+
+#[tokio::test]
+async fn buffered_holder_blocks_interrupt_takeover() {
+    let (state, _dir) = test_server_state();
+    let run = register_working_worker_with_driver(&state, 3, None);
+    let first = state.queue_probe(run.clone(), "composer text".into(), false);
+    state.try_reserve_probe_for_delivery(&run, None, 0).unwrap();
+    state.set_probe_lifecycle(&first, ProbeDeliveryState::Buffered);
+    state.set_probe_submission(&first, false, None);
+    let second = state.queue_probe(run.clone(), "second".into(), false);
+    assert!(
+        state
+            .try_reserve_specific_probe_for_delivery(&run, &second, None, 0)
+            .is_none()
+    );
+    assert_eq!(state.in_flight_probe_id(&run), Some(first));
+    assert_eq!(state.pending_probe_count(&run), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn confirmed_second_interrupt_settles_displaced_reply() {
+    let (state, _dir) = test_server_state();
+    let run = register_working_worker_with_driver(&state, 3, None);
+    let runner = tmux_hosted(&state, &run, 3);
+    let first = state.queue_probe(run.clone(), "first".into(), false);
+    state.try_reserve_probe_for_delivery(&run, None, 0).unwrap();
+    state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+    let second = state.queue_probe(run.clone(), "second".into(), false);
+    let parker = park_once_interrupted(&state, &runner, 3);
+    let confirmer = confirm_write_when_it_lands(&state, &runner, &run);
+    let result = super::super::probe_interrupt::deliver_probe_interrupting(&state, &run, &second).await;
+    parker.await.unwrap();
+    confirmer.await.unwrap();
+    assert_eq!(result.interrupt, ProbeInterruptOutcome::Interrupted);
+    assert_eq!(result.state, ProbeDeliveryState::Consumed);
+    let record = state.probe_record(&first).unwrap();
+    assert_eq!(record.state, ProbeDeliveryState::Orphaned);
+    assert_eq!(record.detail, Some(format!("reply turn interrupted by probe {second}")));
+    assert_eq!(state.in_flight_probe_id(&run), Some(second));
+}
+
+#[tokio::test]
+async fn interrupted_reply_read_cannot_resurrect_settled_snapshot() {
+    let (state, _dir) = test_server_state();
+    let run = register_working_worker_with_driver(&state, 3, None);
+    let first = state.queue_probe(run.clone(), "first".into(), false);
+    state.try_reserve_probe_for_delivery(&run, None, 0).unwrap();
+    state.set_probe_lifecycle(&first, ProbeDeliveryState::Consumed);
+    let second = state.queue_probe(run.clone(), "second".into(), false);
+    state
+        .try_reserve_specific_probe_for_delivery(&run, &second, None, 0)
+        .unwrap();
+    let reading = state.take_previous_probe_reply(&run).unwrap();
+    assert!(state.take_previous_probe_reply(&run).is_none());
+    assert_eq!(state.settle_interrupted_probe_reply(&run, &second), vec![first.clone()]);
+    assert!(!state.commit_previous_probe_reply(&run, &reading.probe_id));
+    state.finish_previous_probe_reply(&run, &reading.probe_id, false);
+    assert!(state.take_previous_probe_reply(&run).is_none());
+    assert_eq!(state.probe_lifecycle_state(&first), Some(ProbeDeliveryState::Orphaned));
+    assert_eq!(state.in_flight_probe_id(&run), Some(second));
 }

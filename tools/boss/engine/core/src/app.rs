@@ -146,12 +146,9 @@ use process_signals::{
     register_app_session_trust_ok, resolve_status_actor, signal_shell_pids,
 };
 
-// Re-import pane-op error types so child modules can match on them via
-// `use super::*`. Production code (chore-update notify) matches
-// `SendInputError::NotAcceptingInput` to requeue; tests use the full set.
-use pane_ops::SendInputError;
+// Re-import pane-op error types for child test modules.
 #[cfg(test)]
-use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError, SlotOccupancy};
+use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError, SendInputError, SlotOccupancy};
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{dispatch_probe_now, dispatch_worker_event_fanout};
@@ -182,7 +179,9 @@ pub use trust::{PeerClass, RpcTier};
 // functions over the wire types — see the crate docs for why they live
 // outside `boss-engine`.
 use boss_engine_worker_policy::{sanitize_event_for_worker, variant_name, worker_verb_decision};
-use boss_protocol::{ProbeDeliveryExpectation, ProbeDeliveryState, WorkerTierDenial, WorkerTierDenialReason};
+use boss_protocol::{
+    ProbeDeliveryExpectation, ProbeDeliveryState, ProbeResumeEvidence, WorkerTierDenial, WorkerTierDenialReason,
+};
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
@@ -2001,7 +2000,7 @@ impl ServerState {
         .await;
         // The probe past the queue, if any. Its reply would have arrived at
         // the worker's next turn boundary, and there is not going to be one.
-        if let Some(orphaned) = self.orphan_in_flight_probe_for_terminated_run(run_id, "worker pane released") {
+        for orphaned in self.orphan_in_flight_probe_for_terminated_run(run_id, "worker pane released") {
             self.surface_undelivered_probe(
                 run_id,
                 &orphaned,

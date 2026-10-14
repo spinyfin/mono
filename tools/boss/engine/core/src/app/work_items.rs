@@ -1067,11 +1067,9 @@ pub(super) async fn apply_work_item_patch(
                 // in sequence — that's acceptable per the acceptance
                 // criteria.
                 //
-                // A mid-turn worker is injectable when its driver buffers
-                // pane input (the notice lands in the composer and the agent
-                // acts on it when the composer next drains — inside the
-                // running turn on a folding driver, at the next turn
-                // otherwise). When there is no injectable posture
+                // A mid-turn worker whose driver buffers pane input is
+                // interrupted and the notice submitted at its prompt.
+                // When there is no injectable posture
                 // — no live state, a pre-session/terminal worker, or a
                 // driver that does not read mid-turn stdin —
                 // `send_input_to_worker` refuses for safety, and the notice
@@ -1093,7 +1091,10 @@ pub(super) async fn apply_work_item_patch(
                         tokio::spawn(async move {
                             match server_for_notify.send_input_to_worker(&run_id, msg.clone()).await {
                                 Ok(_) => {}
-                                Err(SendInputError::NotAcceptingInput { activity }) => {
+                                Err(err)
+                                    if err.safe_to_retry_at_boundary()
+                                        && server_for_notify.worker_registry.slot_for_run(&run_id).is_some() =>
+                                {
                                     // Durable deferral: same probe queue
                                     // Stop/idle paths already drain.
                                     let probe_id =
@@ -1101,8 +1102,8 @@ pub(super) async fn apply_work_item_patch(
                                     tracing::info!(
                                         %run_id,
                                         %probe_id,
-                                        activity = activity.map(boss_protocol::WorkerActivity::as_str),
-                                        "chore-update: worker not accepting typed input; \
+                                        ?err,
+                                        "chore-update: notice was not written; \
                                          re-queued notice for Stop/idle delivery",
                                     );
                                 }

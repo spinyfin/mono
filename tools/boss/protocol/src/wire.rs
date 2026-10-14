@@ -21,7 +21,7 @@ use crate::types::{
     DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
     GitHubAuthStateDto, GuideCommentDisposition, Idea, IdeaGraduationKind, IdeaPatch, LinkExternalRefInput,
     ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState,
-    ProbeInterruptOutcome, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
+    ProbeInterruptOutcome, ProbeResumeEvidence, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
     RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt,
     ReviewGuideSummary, ReviewGuideVersion, ReviseDocInput, ReviseDocOutcome, SelectedProductState,
     SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,

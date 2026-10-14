@@ -98,14 +98,22 @@ pub(super) async fn handle_send_input_to_worker(ctx: Dispatch, req: FrontendRequ
             );
             return;
         }
-        match server_state.send_input_to_worker(&run_id, text).await {
-            Ok(slot_id) => {
+        match server_state.send_input_to_worker_with_receipt(&run_id, text).await {
+            Ok((slot_id, probe_id)) => {
                 tracing::info!(
                     run_id = %run_id,
                     slot_id,
                     "send_input_to_worker: text injected",
                 );
-                send_response(&sink, &request_id, FrontendEvent::WorkerInputSent { run_id, slot_id });
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkerInputSent {
+                        run_id,
+                        slot_id,
+                        probe_id,
+                    },
+                );
             }
             Err(err) => {
                 tracing::warn!(?err, run_id = %run_id, "send_input_to_worker failed");

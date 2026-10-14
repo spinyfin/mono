@@ -1900,7 +1900,7 @@ pub(super) async fn record_pane_write_outcome(
         state = intended.as_str(),
         "{success_message}",
     );
-    server_state.set_probe_lifecycle(probe_id, intended);
+    server_state.set_probe_lifecycle_detail(probe_id, intended, Some(success_message.to_owned()));
     intended
 }
 
@@ -2465,29 +2465,40 @@ pub(super) async fn dispatch_probe_reply_on_stop(
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
-    // Peek before taking. A claim whose probe is still `Queued` has not been
-    // written into the pane yet — the interrupting delivery path holds one
-    // across the whole interrupt, precisely so no other dispatcher can
-    // deliver the same probe on the boundary that interrupt produces. Taking
-    // it here would free the run's delivery slot out from under an in-progress
-    // delivery and let a second one start. Every other state means the write
-    // has at least been issued, which is the case the unconditional take was
-    // written for, so this leaves that behaviour exactly as it was.
-    if server_state
-        .in_flight_probe_id(run_id)
-        .and_then(|probe_id| server_state.probe_lifecycle_state(&probe_id))
-        == Some(ProbeDeliveryState::Queued)
-    {
-        tracing::debug!(
-            run_id,
-            "probe reply skipped: the run's in-flight claim is held by a delivery that has not \
-             written yet; leaving the claim in place",
-        );
-        return;
+    let mut previous_replies = Vec::new();
+    while let Some(previous) = server_state.take_previous_probe_reply(run_id) {
+        previous_replies.push(previous);
     }
-    let Some(in_flight) = server_state.take_in_flight_probe(run_id) else {
-        return;
-    };
+    // Compare both identity and lifecycle while holding the ownership lock.
+    let current = server_state.in_flight_probe_id(run_id).and_then(|probe_id| {
+        server_state.take_in_flight_probe_if(run_id, &probe_id, |state| {
+            matches!(
+                state,
+                ProbeDeliveryState::Injected
+                    | ProbeDeliveryState::Consumed
+                    | ProbeDeliveryState::Buffered
+                    | ProbeDeliveryState::Unconfirmed
+                    | ProbeDeliveryState::Orphaned
+            )
+        })
+    });
+    // Decide which claim this boundary can consume before awaiting transcript
+    // reads: the replacement may be submitted while an older reply is read.
+    for previous in previous_replies {
+        let replied = dispatch_one_probe_reply(server_state, run_id, &previous, true).await;
+        server_state.finish_previous_probe_reply(run_id, &previous.probe_id, replied);
+    }
+    if let Some(current) = current {
+        dispatch_one_probe_reply(server_state, run_id, &current, false).await;
+    }
+}
+
+async fn dispatch_one_probe_reply(
+    server_state: &Arc<ServerState>,
+    run_id: &str,
+    in_flight: &super::probes::InFlightProbe,
+    leased: bool,
+) -> bool {
     // Guard against extracting a reply for a probe id whose lifecycle
     // was never actually advanced past being queued (e.g. a stale
     // in-flight entry surviving some other bug) — only a probe that
@@ -2516,7 +2527,7 @@ pub(super) async fn dispatch_probe_reply_on_stop(
                 ?other,
                 "probe reply skipped: lifecycle state was not a dispatched state",
             );
-            return;
+            return false;
         }
     }
     let Some(transcript_path) = in_flight.transcript_path.as_deref() else {
@@ -2525,10 +2536,17 @@ pub(super) async fn dispatch_probe_reply_on_stop(
             probe_id = %in_flight.probe_id,
             "probe reply skipped: no transcript path was recorded at dispatch",
         );
-        return;
+        return false;
     };
     let driver = crate::driver_transcript::driver_for_execution(&server_state.work_db, run_id);
-    let text = match read_assistant_reply(driver.as_deref(), transcript_path, in_flight.offset_bytes).await {
+    let text = match read_assistant_reply(
+        driver.as_deref(),
+        transcript_path,
+        in_flight.offset_bytes,
+        in_flight.end_offset,
+    )
+    .await
+    {
         Ok(Some(text)) => text,
         Ok(None) => {
             tracing::warn!(
@@ -2537,7 +2555,7 @@ pub(super) async fn dispatch_probe_reply_on_stop(
                 transcript_path,
                 "probe reply skipped: transcript had no assistant turn after dispatch offset",
             );
-            return;
+            return false;
         }
         Err(err) => {
             tracing::warn!(
@@ -2547,10 +2565,16 @@ pub(super) async fn dispatch_probe_reply_on_stop(
                 ?err,
                 "probe reply skipped: transcript read failed",
             );
-            return;
+            return false;
         }
     };
-    server_state.set_probe_lifecycle(&in_flight.probe_id, ProbeDeliveryState::Replied);
+    if leased {
+        if !server_state.commit_previous_probe_reply(run_id, &in_flight.probe_id) {
+            return false;
+        }
+    } else {
+        server_state.set_probe_lifecycle(&in_flight.probe_id, ProbeDeliveryState::Replied);
+    }
     let envelope = FrontendEventEnvelope::push(FrontendEvent::ProbeReplied {
         run_id: run_id.to_owned(),
         probe_id: in_flight.probe_id.clone(),
@@ -2562,9 +2586,10 @@ pub(super) async fn dispatch_probe_reply_on_stop(
         probe_id = %in_flight.probe_id,
         "probe reply emitted",
     );
+    true
 }
 
-/// Read transcript bytes from `offset_bytes` to the end of the file
+/// Read transcript bytes from `offset_bytes` to `end_offset` (or the end of the file)
 /// at `transcript_path`, normalize each new JSONL line through `driver`,
 /// and return the last assistant-turn text found. Returns `Ok(None)` when
 /// no assistant turn appears in the new region (e.g. the worker
@@ -2577,16 +2602,18 @@ async fn read_assistant_reply(
     driver: Option<&dyn crate::driver::AgentDriver>,
     transcript_path: &str,
     offset_bytes: u64,
+    end_offset: Option<u64>,
 ) -> std::io::Result<Option<String>> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
     let mut file = tokio::fs::File::open(transcript_path).await?;
     let metadata = file.metadata().await?;
-    if metadata.len() <= offset_bytes {
+    let end = end_offset.map_or(metadata.len(), |end| end.min(metadata.len()));
+    if end <= offset_bytes {
         return Ok(None);
     }
     file.seek(SeekFrom::Start(offset_bytes)).await?;
-    let mut buf = Vec::with_capacity((metadata.len() - offset_bytes) as usize);
-    file.read_to_end(&mut buf).await?;
+    let mut buf = Vec::with_capacity((end - offset_bytes) as usize);
+    file.take(end - offset_bytes).read_to_end(&mut buf).await?;
     let chunk = match String::from_utf8(buf) {
         Ok(chunk) => chunk,
         Err(_) => {

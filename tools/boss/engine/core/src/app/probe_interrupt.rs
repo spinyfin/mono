@@ -114,6 +114,19 @@ pub(super) const INTERRUPT_NOTICE: &str = "[coordinator-interrupt] The coordinat
 /// worker is not told its work was discarded when it was not.
 const NUDGE_NOTICE: &str = "[coordinator-nudge]";
 
+/// Probe `detail` for an interrupting delivery whose prompt hook or transcript
+/// entry confirmed the worker took the text. The same facts are recorded
+/// structurally on the probe record (`submitted` / `resumed`); these strings
+/// are only the human-readable rendering, shared so the stored lifecycle
+/// record and the synchronous reply cannot drift apart.
+const DETAIL_SUBMITTED_RESUMED_CONFIRMED: &str =
+    "submitted=true; resumed=confirmed by matching prompt hook or transcript";
+const DETAIL_SUBMITTED_PANE_ECHO_ONLY: &str = "submitted=true; resumed=unconfirmed (only the pane echo was observed)";
+const DETAIL_SUBMITTED_UNCONFIRMED: &str =
+    "submitted=true; resumed=unconfirmed (no matching prompt hook or transcript yet)";
+const DETAIL_WRITTEN_BUT_MID_TURN_AGAIN: &str = "submitted=false; the worker was mid-turn again when the text was \
+     written, so it sits in the agent's composer until the next turn boundary";
+
 /// Everything the interrupting delivery path settled, for the caller to
 /// report back over the wire.
 ///
@@ -161,7 +174,7 @@ enum TurnEndWait {
 /// ([`InterruptPlan::worst_case_duration`]) plus one verification window, so
 /// it cannot hang the request indefinitely.
 pub(super) async fn deliver_probe_interrupting(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     probe_id: &str,
 ) -> InterruptingDelivery {
@@ -196,6 +209,21 @@ pub(super) async fn deliver_probe_interrupting(
         Err(failure) => return settle_interrupt_failure(server_state, run_id, probe, failure).await,
     };
 
+    if interrupt == ProbeInterruptOutcome::Interrupted {
+        for displaced in server_state.settle_interrupted_probe_reply(run_id, probe_id) {
+            server_state
+                .topic_broker
+                .publish(
+                    &probe_topic(run_id),
+                    FrontendEventEnvelope::push(FrontendEvent::ProbeDeliveryEscalated {
+                        run_id: run_id.to_owned(),
+                        probe_id: displaced,
+                        reason: format!("reply turn interrupted by probe {probe_id}"),
+                    }),
+                )
+                .await;
+        }
+    }
     inject_after_interrupt(server_state, run_id, slot_id, probe, interrupt, attempts).await
 }
 
@@ -234,7 +262,7 @@ fn refuse_if_write_transport_not_ready(server_state: &ServerState, run_id: &str)
 ///
 /// `Ok((outcome, attempts))` means the pane will now take a write.
 async fn interrupt_and_confirm(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     slot_id: u8,
 ) -> Result<(ProbeInterruptOutcome, u8), InterruptFailure> {
@@ -424,12 +452,7 @@ async fn interrupt_and_confirm(
 ///   visibly stopped.
 ///
 /// Never a fixed sleep: an interrupt that takes 200 ms is acted on in 200 ms.
-async fn wait_for_turn_end(
-    server_state: &Arc<ServerState>,
-    run_id: &str,
-    slot_id: u8,
-    plan: &InterruptPlan,
-) -> TurnEndWait {
+async fn wait_for_turn_end(server_state: &ServerState, run_id: &str, slot_id: u8, plan: &InterruptPlan) -> TurnEndWait {
     let deadline = tokio::time::Instant::now() + plan.confirm_window;
     let mut next_pane_read = tokio::time::Instant::now() + PANE_TEXT_POLL_INTERVAL;
     loop {
@@ -473,7 +496,7 @@ async fn wait_for_turn_end(
 /// re-snapshotted first so the interrupted turn's own trailing output is not
 /// later mistaken for the worker's reply.
 async fn inject_after_interrupt(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     slot_id: u8,
     probe: PendingProbe,
@@ -491,7 +514,7 @@ async fn inject_after_interrupt(
     // Re-snapshot after the turn ended: the reply we want is the worker's
     // answer to *this* text, not the tail of the turn we just cancelled.
     let (transcript_path, offset_bytes) = super::worker_events::transcript_offset_for_run(server_state, run_id).await;
-    server_state.update_in_flight_probe_snapshot(run_id, transcript_path.clone(), offset_bytes);
+    server_state.update_in_flight_probe_snapshot(run_id, &probe.probe_id, transcript_path.clone(), offset_bytes);
 
     let mut posture = server_state.pane_input_posture_for_run(run_id, slot_id);
     if !posture.permits_write() && server_state.pane_text_shows_turn_ended(run_id).await {
@@ -548,30 +571,30 @@ async fn inject_after_interrupt(
                 attempts,
                 "probe delivered after interrupting the worker's turn (delivery confirmed)",
             );
-            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
+            server_state.set_probe_lifecycle_detail(
+                &probe_id,
+                ProbeDeliveryState::Consumed,
+                Some(DETAIL_SUBMITTED_RESUMED_CONFIRMED.to_owned()),
+            );
+            server_state.set_probe_submission(&probe_id, true, Some(ProbeResumeEvidence::Confirmed));
             InterruptingDelivery {
                 state: ProbeDeliveryState::Consumed,
                 interrupt,
                 attempts,
-                detail: None,
+                detail: server_state.probe_record(&probe_id).and_then(|record| record.detail),
             }
         }
         PaneInjectOutcome::PaneEcho => {
-            let state = super::worker_events::record_pane_write_outcome(
+            settle_unconfirmed_write(
                 server_state,
                 run_id,
                 slot_id,
                 &probe_id,
-                ProbeDeliveryState::Consumed,
-                "probe pane echo observed after interrupt (parked-write consumption)",
-            )
-            .await;
-            InterruptingDelivery {
-                state,
+                DETAIL_SUBMITTED_PANE_ECHO_ONLY,
                 interrupt,
                 attempts,
-                detail: None,
-            }
+            )
+            .await
         }
         // A parked worker submitting nothing is not the mid-turn `Buffered`
         // shape — it is the same "wrote it, could not prove it" the parked
@@ -587,12 +610,17 @@ async fn inject_after_interrupt(
                 "probe written after an interrupt but the worker was mid-turn again by then; \
                  recorded buffered",
             );
-            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Buffered);
+            server_state.set_probe_lifecycle_detail(
+                &probe_id,
+                ProbeDeliveryState::Buffered,
+                Some(DETAIL_WRITTEN_BUT_MID_TURN_AGAIN.to_owned()),
+            );
+            server_state.set_probe_submission(&probe_id, false, None);
             InterruptingDelivery {
                 state: ProbeDeliveryState::Buffered,
                 interrupt,
                 attempts,
-                detail: None,
+                detail: server_state.probe_record(&probe_id).and_then(|record| record.detail),
             }
         }
         PaneInjectOutcome::Unconfirmed => {
@@ -614,21 +642,16 @@ async fn inject_after_interrupt(
                 "probe written into a parked pane after interrupt; UserPromptSubmit/transcript did \
                  not confirm within the window — recording parked-write consumption",
             );
-            let state = super::worker_events::record_pane_write_outcome(
+            settle_unconfirmed_write(
                 server_state,
                 run_id,
                 slot_id,
                 &probe_id,
-                ProbeDeliveryState::Consumed,
-                "probe written into parked pane after interrupt (parked-write consumption)",
-            )
-            .await;
-            InterruptingDelivery {
-                state,
+                DETAIL_SUBMITTED_UNCONFIRMED,
                 interrupt,
                 attempts,
-                detail: None,
-            }
+            )
+            .await
         }
         PaneInjectOutcome::NotAcceptingInput { activity } => {
             requeue_after_write_declined(
@@ -665,6 +688,39 @@ async fn inject_after_interrupt(
     }
 }
 
+/// Settle a post-interrupt write that was issued but not positively confirmed
+/// as a prompt. The text did reach the pane, so `submitted` is recorded true
+/// with `resumed=unconfirmed` regardless of whether the liveness recheck in
+/// [`super::worker_events::record_pane_write_outcome`] then downgrades the
+/// state to `Orphaned`. The returned `detail` is read back from the stored
+/// record, so the synchronous reply always matches `probe-status`.
+async fn settle_unconfirmed_write(
+    server_state: &ServerState,
+    run_id: &str,
+    slot_id: u8,
+    probe_id: &str,
+    success_message: &'static str,
+    interrupt: ProbeInterruptOutcome,
+    attempts: u8,
+) -> InterruptingDelivery {
+    let state = super::worker_events::record_pane_write_outcome(
+        server_state,
+        run_id,
+        slot_id,
+        probe_id,
+        ProbeDeliveryState::Consumed,
+        success_message,
+    )
+    .await;
+    server_state.set_probe_submission(probe_id, true, Some(ProbeResumeEvidence::Unconfirmed));
+    InterruptingDelivery {
+        state,
+        interrupt,
+        attempts,
+        detail: server_state.probe_record(probe_id).and_then(|record| record.detail),
+    }
+}
+
 /// The interrupt worked but the write did not happen. Give the claim back so
 /// a later boundary can retry with the same probe id, or settle `Abandoned`
 /// when the run is already gone and no boundary is coming.
@@ -682,7 +738,7 @@ async fn inject_after_interrupt(
 /// The revert only belongs on the terminal `Abandoned` branch below, where
 /// the probe truly never reaches the pane.
 async fn requeue_after_write_declined(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     probe: PendingProbe,
     interrupt: ProbeInterruptOutcome,
@@ -724,7 +780,7 @@ async fn requeue_after_write_declined(
 /// Settle a probe whose interrupt phase failed. Nothing was written, so this
 /// is terminal: no reply can arrive to correct it.
 async fn settle_interrupt_failure(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     probe: PendingProbe,
     failure: InterruptFailure,
@@ -733,7 +789,7 @@ async fn settle_interrupt_failure(
     // Drop the claim without re-queuing: the probe is settled terminally, and
     // leaving it in the pending queue would have a later boundary deliver
     // text the caller has already been told did not arrive.
-    server_state.take_in_flight_probe(run_id);
+    server_state.take_in_flight_probe_if(run_id, &probe_id, |_| true);
     let state = if failure.worker_gone {
         ProbeDeliveryState::Abandoned
     } else {
@@ -763,7 +819,7 @@ async fn settle_interrupt_failure(
 /// and settling only the one the caller asked about would leave its siblings
 /// reading `queued` forever with nothing left to deliver them.
 async fn abandon_before_write(
-    server_state: &Arc<ServerState>,
+    server_state: &ServerState,
     run_id: &str,
     probe_id: &str,
     cause: &str,
@@ -796,11 +852,7 @@ async fn abandon_before_write(
 /// `Injected`), wait for it to record an outcome so the interrupting RPC
 /// does not answer `queued` for a write that is already in flight — the
 /// shape that made a delivered probe look like a lost one.
-async fn raced_to_another_dispatcher(
-    server_state: &Arc<ServerState>,
-    run_id: &str,
-    probe_id: &str,
-) -> InterruptingDelivery {
+async fn raced_to_another_dispatcher(server_state: &ServerState, run_id: &str, probe_id: &str) -> InterruptingDelivery {
     let in_flight_id = server_state.in_flight_probe_id(run_id);
     let state = if in_flight_id.as_deref() == Some(probe_id) {
         wait_for_other_path_to_settle(server_state, probe_id).await

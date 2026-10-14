@@ -62,11 +62,54 @@ pub const PROBE_UNDELIVERED_ATTENTION_KIND: &str = "probe_undelivered";
 #[derive(Default)]
 pub(super) struct ServerStateProbeQueuer {
     server: std::sync::OnceLock<Weak<ServerState>>,
+    /// The most recent engine nudge per run and whether an interrupting
+    /// delivery task currently owns it. `deliver_queued_probes_now` consults
+    /// this instead of inferring ownership from the worker's posture at the
+    /// moment it runs, which can differ from the posture `queue_probe` saw.
+    nudges: Arc<StdMutex<HashMap<String, QueuedNudge>>>,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedNudge {
+    probe_id: String,
+    /// True while a spawned `deliver_probe_interrupting` task is responsible
+    /// for delivering `probe_id`.
+    interrupt_owned: bool,
 }
 
 impl ServerStateProbeQueuer {
     pub(super) fn set_server_state(&self, weak: Weak<ServerState>) {
         let _ = self.server.set(weak);
+    }
+
+    fn worker_is_busy(server: &ServerState, run_id: &str) -> bool {
+        server
+            .worker_registry
+            .slot_for_run(run_id)
+            .is_some_and(|slot| server.pane_input_posture_for_run(run_id, slot) == PaneInputPosture::MidTurnBuffered)
+    }
+
+    /// Run the interrupting delivery for `probe_id` on a detached task, and
+    /// release the nudge's ownership when it finishes. The caller must already
+    /// have marked the nudge `interrupt_owned`.
+    fn spawn_interrupting_delivery(&self, server: Arc<ServerState>, run_id: String, probe_id: String) {
+        let nudges = self.nudges.clone();
+        tokio::spawn(async move { deliver_owned_nudge(&nudges, &server, &run_id, &probe_id).await });
+    }
+}
+
+/// Run the interrupting delivery for a nudge this caller owns, then release
+/// the ownership record (unless a newer nudge has replaced it meanwhile).
+async fn deliver_owned_nudge(
+    nudges: &StdMutex<HashMap<String, QueuedNudge>>,
+    server: &ServerState,
+    run_id: &str,
+    probe_id: &str,
+) {
+    super::probe_interrupt::deliver_probe_interrupting(server, run_id, probe_id).await;
+    let mut guard = nudges.lock().expect("queuer nudges mutex poisoned");
+    if guard.get(run_id).is_some_and(|nudge| nudge.probe_id == probe_id) {
+        guard.remove(run_id);
     }
 }
 
@@ -80,10 +123,20 @@ impl ProbeQueuer for ServerStateProbeQueuer {
             tracing::debug!(run_id, "probe queuer: server state already dropped");
             return;
         };
-        // Completion-driven probes don't need the minted id — only
-        // the human-driven `ProbeRun` RPC surfaces it back to the
-        // caller. Discard it here. Completion probes are never urgent.
-        let _ = server.queue_probe(run_id.to_owned(), text.to_owned(), false);
+        // Keep the specific id: an older --no-interrupt probe must not be
+        // substituted for this nudge when the worker is busy.
+        let probe_id = server.queue_probe(run_id.to_owned(), text.to_owned(), false);
+        let busy = Self::worker_is_busy(&server, run_id);
+        self.nudges.lock().expect("queuer nudges mutex poisoned").insert(
+            run_id.to_owned(),
+            QueuedNudge {
+                probe_id: probe_id.clone(),
+                interrupt_owned: busy,
+            },
+        );
+        if busy {
+            self.spawn_interrupting_delivery(server, run_id.to_owned(), probe_id);
+        }
     }
 
     fn clear_pending_probes(&self, run_id: &str, reason: &str) {
@@ -98,12 +151,13 @@ impl ProbeQueuer for ServerStateProbeQueuer {
         server.clear_pending_probes(run_id, reason);
     }
 
-    /// Reuses the same delivery path the human-driven `ProbeRun` RPC calls
-    /// ([`super::worker_events::dispatch_probe_now`]) — including its
-    /// in-flight guard, its `(activity, driver)` posture check, and its
-    /// mid-turn-vs-parked branch. A parked (`Idle`/`WaitingForInput`) pane
-    /// is documented there as "a reliable arrival point just like Stop",
-    /// which is exactly the posture a stalled worker sits in.
+    /// Deliver parked workers through the ordinary immediate path. A nudge
+    /// whose interrupting delivery task already owns it is left to that task
+    /// rather than raced with a composer write. A nudge queued while the
+    /// worker was parked that finds the worker busy by the time this runs
+    /// takes over the interrupt itself, so it is not left waiting behind a
+    /// long tool call. Drivers that reject mid-turn input keep waiting for
+    /// their boundary.
     ///
     /// Spawned rather than awaited because [`ProbeQueuer`] is a sync trait
     /// and this is fire-and-forget by contract: the caller has already
@@ -122,7 +176,42 @@ impl ProbeQueuer for ServerStateProbeQueuer {
             return;
         };
         let run_id = run_id.to_owned();
+        let nudges = self.nudges.clone();
         tokio::spawn(async move {
+            // Decide under one lock so exactly one task owns the nudge.
+            let takeover = {
+                let mut guard = nudges.lock().expect("queuer nudges mutex poisoned");
+                match guard.get_mut(&run_id) {
+                    Some(nudge) if nudge.interrupt_owned => {
+                        // queue_probe's interrupt task owns this nudge.
+                        tracing::debug!(
+                            run_id,
+                            "probe queuer: nudge is owned by its scheduled interrupt delivery"
+                        );
+                        return;
+                    }
+                    Some(nudge)
+                        if Self::worker_is_busy(&server, &run_id)
+                            && server.probe_lifecycle_state(&nudge.probe_id) == Some(ProbeDeliveryState::Queued) =>
+                    {
+                        nudge.interrupt_owned = true;
+                        Some(nudge.probe_id.clone())
+                    }
+                    _ => {
+                        guard.remove(&run_id);
+                        None
+                    }
+                }
+            };
+            if let Some(probe_id) = takeover {
+                tracing::debug!(
+                    run_id,
+                    probe_id,
+                    "probe queuer: worker went busy after the nudge was queued; interrupting"
+                );
+                deliver_owned_nudge(&nudges, &server, &run_id, &probe_id).await;
+                return;
+            }
             let outcome = super::worker_events::dispatch_probe_now(&server, &run_id).await;
             tracing::debug!(
                 run_id,
@@ -230,8 +319,14 @@ pub(super) struct PendingProbe {
 /// waiting for the next `Stop` boundary so we can emit
 /// `FrontendEvent::ProbeReplied` with the assistant turn that
 /// landed in the transcript afterwards.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub(super) struct InFlightProbe {
+    /// A Stop reader holds this snapshot; keep it tracked until that read settles.
+    #[builder(default)]
+    reply_reading: bool,
+    /// Earlier submitted reply contract retained across a new delivery claim.
+    pub(super) previous_reply: Option<Box<InFlightProbe>>,
     pub(super) probe_id: String,
     /// Transcript path captured at dispatch time. Stashing it here
     /// (rather than re-querying `WorkRun` on the follow-up Stop)
@@ -244,6 +339,10 @@ pub(super) struct InFlightProbe {
     /// new JSONL line — anything earlier already pre-dated the probe
     /// and isn't part of the reply.
     pub(super) offset_bytes: u64,
+    /// Exclusive upper bound of this probe's reply window. Set when a
+    /// replacement probe displaces it: anything the transcript gains from the
+    /// replacement's own snapshot onward answers the replacement, not this probe.
+    pub(super) end_offset: Option<u64>,
 }
 
 /// Everything the engine knows about one probe id after it was accepted:
@@ -253,15 +352,45 @@ pub(super) struct InFlightProbe {
 /// The state itself is [`boss_protocol::ProbeDeliveryState`] — the same enum
 /// the wire uses — so `bossctl probe-status` reports exactly what the engine
 /// recorded, with no second vocabulary to keep in sync.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub(super) struct ProbeRecord {
     pub(super) run_id: String,
     pub(super) urgent: bool,
     pub(super) state: ProbeDeliveryState,
     pub(super) detail: Option<String>,
+    /// Structured evidence from the interrupting path: whether the text was
+    /// written into the pane. `None` for probes that never went through it.
+    pub(super) submitted: Option<bool>,
+    /// Whether the worker was seen resuming on the submitted text.
+    pub(super) resumed: Option<ProbeResumeEvidence>,
+}
+
+/// States of a probe whose text was written into the pane and which only
+/// awaits its reply (as opposed to `Queued`/`Injected`, where the write itself
+/// is still in progress).
+fn awaits_reply_after_submission(state: ProbeDeliveryState) -> bool {
+    matches!(
+        state,
+        ProbeDeliveryState::Consumed | ProbeDeliveryState::Unconfirmed | ProbeDeliveryState::Orphaned
+    )
 }
 
 impl ServerState {
+    /// Record the structured submission evidence for an interrupting delivery
+    /// on `probe_id`'s status record (see [`ProbeRecord::submitted`]).
+    pub(super) fn set_probe_submission(&self, probe_id: &str, submitted: bool, resumed: Option<ProbeResumeEvidence>) {
+        if let Some(record) = self
+            .probe_lifecycle
+            .lock()
+            .expect("probe_lifecycle mutex poisoned")
+            .get_mut(probe_id)
+        {
+            record.submitted = Some(submitted);
+            record.resumed = resumed;
+        }
+    }
+
     /// Push probe text onto the queue for `run_id`, mint a fresh
     /// `probe_id`, and return it so the caller can correlate the
     /// queued probe with the eventual `FrontendEvent::ProbeReplied`
@@ -314,12 +443,11 @@ impl ServerState {
             .expect("probe_lifecycle mutex poisoned")
             .insert(
                 probe_id.clone(),
-                ProbeRecord {
-                    run_id: run_id.clone(),
-                    urgent,
-                    state: ProbeDeliveryState::Queued,
-                    detail: None,
-                },
+                ProbeRecord::builder()
+                    .run_id(run_id.clone())
+                    .urgent(urgent)
+                    .state(ProbeDeliveryState::Queued)
+                    .build(),
             );
         // Tag for worker-signal resolution BEFORE the probe is inserted into
         // `pending_probes` below — i.e. before any concurrent dispatcher can
@@ -466,11 +594,11 @@ impl ServerState {
         }
         in_flight.insert(
             run_id.to_owned(),
-            InFlightProbe {
-                probe_id: probe.probe_id.clone(),
-                transcript_path,
-                offset_bytes,
-            },
+            InFlightProbe::builder()
+                .probe_id(&probe.probe_id)
+                .maybe_transcript_path(transcript_path)
+                .offset_bytes(offset_bytes)
+                .build(),
         );
         Some(probe)
     }
@@ -493,6 +621,12 @@ impl ServerState {
     /// dispatch, so this searches the whole queue rather than only the front
     /// — the probes behind it keep their relative order.
     ///
+    /// A slot held by an already-*submitted* probe (one that only awaits its
+    /// reply at the next boundary) does not block this claim: the interrupt
+    /// owns the delivery slot while the earlier reply snapshot is retained. A slot
+    /// held by a probe still `Queued`/`Injected`/`Buffered` does block it, which is what
+    /// keeps a write in progress from being delivered twice.
+    ///
     /// Returns `None` — routing the caller to
     /// [`super::probe_interrupt::raced_to_another_dispatcher`] — both when
     /// the run's slot is already claimed and when `probe_id` is not present
@@ -506,8 +640,12 @@ impl ServerState {
         offset_bytes: u64,
     ) -> Option<PendingProbe> {
         let mut in_flight = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
-        if in_flight.contains_key(run_id) {
-            return None;
+        if let Some(held) = in_flight.get(run_id) {
+            let records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
+            let record = records.get(&held.probe_id)?;
+            if !awaits_reply_after_submission(record.state) || record.submitted == Some(false) {
+                return None;
+            }
         }
         let mut pending = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = pending.get_mut(run_id)?;
@@ -516,14 +654,18 @@ impl ServerState {
         if queue.is_empty() {
             pending.remove(run_id);
         }
+        let previous_reply = in_flight.remove(run_id).map(Box::new);
         in_flight.insert(
             run_id.to_owned(),
-            InFlightProbe {
-                probe_id: probe.probe_id.clone(),
-                transcript_path,
-                offset_bytes,
-            },
+            InFlightProbe::builder()
+                .maybe_previous_reply(previous_reply)
+                .probe_id(&probe.probe_id)
+                .maybe_transcript_path(transcript_path)
+                .offset_bytes(offset_bytes)
+                .build(),
         );
+        drop(pending);
+        drop(in_flight);
         Some(probe)
     }
 
@@ -544,6 +686,7 @@ impl ServerState {
     pub(super) fn update_in_flight_probe_snapshot(
         &self,
         run_id: &str,
+        probe_id: &str,
         transcript_path: Option<String>,
         offset_bytes: u64,
     ) {
@@ -552,9 +695,14 @@ impl ServerState {
             .lock()
             .expect("in_flight_probes mutex poisoned")
             .get_mut(run_id)
+            .filter(|entry| entry.probe_id == probe_id)
         {
             entry.transcript_path = transcript_path;
             entry.offset_bytes = offset_bytes;
+            // The displaced reply's window runs up to the replacement's write.
+            if let Some(previous) = entry.previous_reply.as_deref_mut() {
+                previous.end_offset.get_or_insert(offset_bytes);
+            }
         }
     }
 
@@ -581,10 +729,7 @@ impl ServerState {
     /// requeued, `false` when it was abandoned, so the caller can report the
     /// outcome it actually recorded rather than assuming a requeue.
     pub(super) fn release_probe_reservation(&self, run_id: &str, probe: PendingProbe) -> bool {
-        self.in_flight_probes
-            .lock()
-            .expect("in_flight_probes mutex poisoned")
-            .remove(run_id);
+        self.take_in_flight_probe_if(run_id, &probe.probe_id, |_| true);
         self.requeue_probe_front(run_id.to_owned(), probe)
     }
 
@@ -723,40 +868,49 @@ impl ServerState {
     /// path settled — only the delivered-but-unanswered states are re-stated.
     /// The in-flight *slot* is freed either way: the run is going away, so a
     /// slot held against it can only pin a probe that no longer has anywhere
-    /// to go. Returns the probe id when a state was actually re-stated, so
-    /// the caller surfaces exactly the ones it changed.
-    pub(super) fn orphan_in_flight_probe_for_terminated_run(&self, run_id: &str, cause: &str) -> Option<String> {
-        let in_flight = self.take_in_flight_probe(run_id)?;
-        let probe_id = in_flight.probe_id;
-        match self.probe_lifecycle_state(&probe_id) {
-            Some(ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Unconfirmed) => {}
-            // `Replied` already has the worker's answer; `Injected` means the
-            // write is still in flight on another task and that task records
-            // its own outcome — via `record_pane_write_outcome`, which
-            // rechecks the run's slot mapping before it claims
-            // `Consumed`/`Buffered` and downgrades to `Orphaned` when this
-            // very teardown has already cleared it, so the in-flight
-            // reservation `take_in_flight_probe` just removed above is not
-            // the only thing standing between that write and a
-            // `Consumed`-forever record; anything else is already settled.
-            _ => return None,
+    /// to go. Walks the whole retained reply chain and returns every probe id
+    /// that was actually re-stated, so the caller surfaces exactly the ones it changed.
+    pub(super) fn orphan_in_flight_probe_for_terminated_run(&self, run_id: &str, cause: &str) -> Vec<String> {
+        let mut chain = self
+            .in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .remove(run_id)
+            .map(Box::new);
+        let mut restated = Vec::new();
+        while let Some(mut in_flight) = chain {
+            chain = in_flight.previous_reply.take();
+            let probe_id = in_flight.probe_id;
+            match self.probe_lifecycle_state(&probe_id) {
+                Some(ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Unconfirmed) => {
+                }
+                // `Replied` already has the worker's answer; `Injected` means the
+                // write is still in flight on another task and that task records
+                // its own outcome — via `record_pane_write_outcome`, which
+                // rechecks the run's slot mapping before it claims
+                // `Consumed`/`Buffered` and downgrades to `Orphaned` when this
+                // very teardown has already cleared it; anything else is already
+                // settled.
+                _ => continue,
+            }
+            tracing::warn!(
+                run_id,
+                probe_id = %probe_id,
+                cause,
+                "run terminated with a delivered probe still unanswered; recording orphaned rather \
+                 than leaving it reading as consumed",
+            );
+            self.set_probe_lifecycle_detail(
+                &probe_id,
+                ProbeDeliveryState::Orphaned,
+                Some(format!(
+                    "{cause}; the text reached the pane but the run ended before the worker produced \
+                     the turn boundary its reply would have arrived on"
+                )),
+            );
+            restated.push(probe_id);
         }
-        tracing::warn!(
-            run_id,
-            probe_id = %probe_id,
-            cause,
-            "run terminated with a delivered probe still unanswered; recording orphaned rather \
-             than leaving it reading as consumed",
-        );
-        self.set_probe_lifecycle_detail(
-            &probe_id,
-            ProbeDeliveryState::Orphaned,
-            Some(format!(
-                "{cause}; the text reached the pane but the run ended before the worker produced \
-                 the turn boundary its reply would have arrived on"
-            )),
-        );
-        Some(probe_id)
+        restated
     }
 
     /// Tell somebody that `probe_id` will not be delivered.
@@ -912,15 +1066,132 @@ impl ServerState {
         )
     }
 
-    /// Take and return the in-flight probe for `run_id`, if any.
-    /// Idempotent on the second pop: a duplicate Stop firing for
-    /// the same run gets `None` and the engine emits no second
-    /// `ProbeReplied` for the same probe id.
+    /// Take and return the in-flight probe for `run_id`, restoring any
+    /// earlier reply contract. Production teardown walks the chain itself in
+    /// [`Self::orphan_in_flight_probe_for_terminated_run`].
+    #[cfg(test)]
     pub(super) fn take_in_flight_probe(&self, run_id: &str) -> Option<InFlightProbe> {
-        self.in_flight_probes
+        let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let mut claim = claims.remove(run_id)?;
+        if let Some(previous) = claim.previous_reply.take() {
+            claims.insert(run_id.to_owned(), *previous);
+        }
+        Some(claim)
+    }
+
+    /// Remove only the inspected claim, checking its lifecycle under the ownership lock.
+    pub(super) fn take_in_flight_probe_if(
+        &self,
+        run_id: &str,
+        probe_id: &str,
+        eligible: impl FnOnce(ProbeDeliveryState) -> bool,
+    ) -> Option<InFlightProbe> {
+        let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        if claims.get(run_id)?.probe_id != probe_id || claims.get(run_id)?.reply_reading {
+            return None;
+        }
+        let records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
+        if !eligible(records.get(probe_id)?.state) {
+            return None;
+        }
+        let mut claim = claims.remove(run_id)?;
+        if let Some(previous) = claim.previous_reply.take() {
+            claims.insert(run_id.to_owned(), *previous);
+        }
+        Some(claim)
+    }
+
+    /// Settle displaced reply contracts only after a confirmed interrupt.
+    pub(super) fn settle_interrupted_probe_reply(&self, run_id: &str, probe_id: &str) -> Vec<String> {
+        let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let Some(claim) = claims.get_mut(run_id).filter(|claim| claim.probe_id == probe_id) else {
+            return Vec::new();
+        };
+        let mut previous = claim.previous_reply.take();
+        let mut records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
+        let mut ids = Vec::new();
+        while let Some(mut reply) = previous {
+            if let Some(record) = records.get_mut(&reply.probe_id)
+                && record.state != ProbeDeliveryState::Replied
+            {
+                record.state = ProbeDeliveryState::Orphaned;
+                record.detail = Some(format!("reply turn interrupted by probe {probe_id}"));
+                ids.push(reply.probe_id);
+            }
+            previous = reply.previous_reply.take();
+        }
+        drop(records);
+        drop(claims);
+        let mut resolutions = self
+            .probe_worker_signal_resolution
             .lock()
-            .expect("in_flight_probes mutex poisoned")
-            .remove(run_id)
+            .expect("probe_worker_signal_resolution mutex poisoned");
+        for id in &ids {
+            resolutions.remove(id);
+        }
+        ids
+    }
+
+    /// Lease an earlier snapshot for reading, retaining it so interrupt settlement can find it.
+    pub(super) fn take_previous_probe_reply(&self, run_id: &str) -> Option<InFlightProbe> {
+        let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let mut previous = claims.get_mut(run_id)?.previous_reply.as_deref_mut();
+        while let Some(reply) = previous {
+            if !reply.reply_reading {
+                reply.reply_reading = true;
+                return Some(reply.clone());
+            }
+            previous = reply.previous_reply.as_deref_mut();
+        }
+        None
+    }
+
+    /// Commit a leased reply only while its snapshot is still owned.
+    /// A confirmed interrupt may settle it while transcript I/O is pending.
+    pub(super) fn commit_previous_probe_reply(&self, run_id: &str, probe_id: &str) -> bool {
+        let claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let mut reply = claims.get(run_id);
+        while let Some(entry) = reply {
+            if entry.probe_id == probe_id && entry.reply_reading {
+                self.set_probe_lifecycle(probe_id, ProbeDeliveryState::Replied);
+                return true;
+            }
+            reply = entry.previous_reply.as_deref();
+        }
+        false
+    }
+
+    /// Complete a leased read without resurrecting a reply settled by an interrupt.
+    pub(super) fn finish_previous_probe_reply(&self, run_id: &str, probe_id: &str, replied: bool) {
+        let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let Some(mut claim) = claims.remove(run_id) else {
+            return;
+        };
+        if claim.probe_id == probe_id {
+            if replied {
+                if let Some(previous) = claim.previous_reply.take() {
+                    claims.insert(run_id.to_owned(), *previous);
+                }
+                return;
+            }
+            claim.reply_reading = false;
+        } else {
+            let mut link = &mut claim.previous_reply;
+            while link.is_some() {
+                if link.as_ref().is_some_and(|reply| reply.probe_id == probe_id) {
+                    let mut reply = link.take().expect("reply link was present");
+                    if replied {
+                        *link = reply.previous_reply.take();
+                    } else {
+                        reply.reply_reading = false;
+                        *link = Some(reply);
+                    }
+                    break;
+                }
+                link = &mut link.as_mut().expect("reply link was present").previous_reply;
+            }
+        }
+        claims.insert(run_id.to_owned(), claim);
     }
 
     /// Record `probe_id`'s current delivery stage. Call sites drive

@@ -835,6 +835,8 @@ fn tag_cases() -> Vec<TagCase> {
                 state: ProbeDeliveryState::Buffered,
                 urgent: true,
                 detail: None,
+                submitted: None,
+                resumed: None,
             },
             expected_tag: "probe_status_result",
         },
@@ -901,6 +903,7 @@ fn tag_cases() -> Vec<TagCase> {
             event: FrontendEvent::WorkerInputSent {
                 run_id: "run_1".into(),
                 slot_id: 3,
+                probe_id: Some("probe-1".into()),
             },
             expected_tag: "worker_input_sent",
         },
