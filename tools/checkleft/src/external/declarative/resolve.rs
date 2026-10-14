@@ -3,8 +3,9 @@
 //! A declared binary requirement is resolved to a concrete command by the
 //! *framework*, not by any guest code. Three resolvers are supported:
 //!
-//! - [`BinaryBinding::Path`] — a direct path or PATH name, used as-is. The
-//!   portable fallback: standalone checkleft (no Bazel workspace) always has this.
+//! - [`BinaryBinding::Path`] — a direct path or PATH name, located once before the
+//!   child environment is cleared. Valid as a default binding or a CHECKS-config
+//!   override; never accepted as a fallback.
 //! - [`BinaryBinding::Bazel`] — a Bazel label, built then resolved to its
 //!   executable. **Environment-conditional**: it requires a Bazel workspace, so it
 //!   works in-repo but not in standalone checkleft. It reuses the *same* resolver
@@ -41,8 +42,9 @@ use crate::external::timeout::{CheckDeadline, SubprocessTimeout, output_with_tim
 /// prefix args, so the version pin precedes the check's own arguments.
 ///
 /// `display_invocation` is the human-readable form used in remediation templates
-/// via `{{needs.<name>.invocation}}`. npm commands include the pinned runtime
-/// PATH and absolute npx path; path/bazel bindings use the program string.
+/// via `{{needs.<name>.invocation}}`. It must be runnable on any host, so npm
+/// bindings render a host-independent `npx --yes '<package>@<version>'` rather
+/// than machine-local cache paths; path/bazel bindings use the program string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedBinary {
     pub program: PathBuf,
@@ -229,14 +231,11 @@ fn resolve_npm_binding(
             anyhow::anyhow!("pinned npx unavailable; cannot provision npm package `{package}@{version}`")
         })?,
     };
-    // Raw remediation must run with the same pinned Node as the check.
-    let quote = crate::install::shell_single_quote;
-    let path = crate::external::environment::check_path(&npx, std::iter::empty())?;
+    // Remediation text is read on other machines (e.g. from CI logs), so it must
+    // not embed this host's cache paths; `checkleft fix` provisions the pinned Node.
     let display_invocation = format!(
-        "env PATH={} {} --yes {}",
-        quote(&path.to_string_lossy()),
-        quote(&npx.to_string_lossy()),
-        quote(&format!("{package}@{version}")),
+        "npx --yes {}",
+        crate::install::shell_single_quote(&format!("{package}@{version}")),
     );
     Ok(ResolvedBinary {
         program: npx,

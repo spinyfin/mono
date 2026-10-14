@@ -280,7 +280,7 @@ _CHECKLEFT_LIB_TEST_COMPILE_DATA = [
 # that needs the cache runs without it staged.
 _CHECKLEFT_LIB_TEST_DATA = [
     ":precompiled_cwasm",
-    "@checkleft_node_test_tools//:tools",
+    "@checkleft_node_test_tools//:runtime",
     "@buildifier_prebuilt//:buildifier",
     "@rules_rust//tools/upstream_wrapper:rustfmt",
 ]
