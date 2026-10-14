@@ -908,6 +908,14 @@ impl WorkDb {
     /// Phase 9 ships the worker-spawn wiring; this method is the
     /// Phase 8 detection-side seam used by `ci_watch`.
     pub fn insert_ci_remediation(&self, input: CiRemediationInsertInput) -> Result<Option<CiRemediation>> {
+        self.insert_ci_remediation_with_queue_base(input, None)
+    }
+
+    pub(crate) fn insert_ci_remediation_with_queue_base(
+        &self,
+        input: CiRemediationInsertInput,
+        queue_base_sha: Option<&str>,
+    ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let id = next_id("cir");
@@ -917,8 +925,8 @@ impl WorkDb {
                 (id, product_id, work_item_id, pr_url, pr_number,
                  head_branch, head_sha_at_trigger, attempt_kind,
                  consumes_budget, failed_checks, status, created_at,
-                 failure_kind, before_commit_sha)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)",
+                 failure_kind, before_commit_sha, queue_base_sha)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14)",
             params![
                 id,
                 input.product_id,
@@ -933,6 +941,7 @@ impl WorkDb {
                 now,
                 input.failure_kind,
                 input.before_commit_sha,
+                queue_base_sha,
             ],
         )?;
         if rows == 0 {
@@ -993,6 +1002,9 @@ impl WorkDb {
     /// either SHA against either column so already-handled ejections and
     /// suppressions continue to short-circuit after deploy instead of
     /// re-minting remediations and burning non-refundable CI budget.
+    /// Verified requeues archive the trigger as `mq:<head>@<queue-sha>`;
+    /// those rows match only their captured queue SHA, not all future builds
+    /// of the unchanged head.
     pub fn ci_remediation_exists_for_merge_queue_episode(
         &self,
         work_item_id: &str,
@@ -1051,7 +1063,7 @@ impl WorkDb {
                     triage_class, log_excerpt, status, failure_reason,
                     cube_lease_id, cube_workspace_id, worker_id,
                     created_at, started_at, finished_at,
-                    failure_kind, before_commit_sha, revision_task_id
+                    failure_kind, before_commit_sha, revision_task_id, queue_base_sha
              FROM ci_remediations WHERE 1=1",
         )
         .filter_product_id(product_id)
@@ -1411,7 +1423,7 @@ impl WorkDb {
                     triage_class, log_excerpt, status, failure_reason,
                     cube_lease_id, cube_workspace_id, worker_id,
                     created_at, started_at, finished_at,
-                    failure_kind, before_commit_sha, revision_task_id
+                    failure_kind, before_commit_sha, revision_task_id, queue_base_sha
              FROM ci_remediations
              WHERE work_item_id = ?1
                AND status IN ('pending', 'running')

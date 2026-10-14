@@ -22,7 +22,9 @@ pub(super) async fn handle_classify_ci_remediation(ctx: Dispatch, req: FrontendR
     else {
         unreachable!()
     };
-    if let Err(err) = work_db.validate_queue_ci_failure(&attempt_id, queue_ci_evidence.as_ref()) {
+    if matches!(triage_class.as_str(), "flaky_or_infra" | "unfixable")
+        && let Err(err) = work_db.validate_queue_ci_failure(&attempt_id, queue_ci_evidence.as_ref())
+    {
         send_work_error(&sink, &request_id, &err);
         return;
     }
@@ -67,8 +69,15 @@ pub(super) async fn handle_mark_ci_remediation_failed(ctx: Dispatch, req: Fronte
     }
     let reason = match queue_ci_evidence {
         Some(evidence) => format!(
-            "{reason}\nQueue verification: {}",
-            serde_json::to_string(&evidence).expect("serializable evidence")
+            "{reason}\nQueue verification: main_sha={} verified_head_sha={} runs={}",
+            evidence.main_sha,
+            evidence.verified_head_sha,
+            evidence
+                .runs
+                .iter()
+                .map(|run| format!("{}: {} (exit {})", run.check_name, run.command, run.exit_code))
+                .collect::<Vec<_>>()
+                .join("; ")
         ),
         None => reason,
     };

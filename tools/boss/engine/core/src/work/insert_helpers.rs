@@ -1,7 +1,7 @@
 use super::*;
 
 /// Recover the PR head from a namespaced merge-queue rebounce
-/// discriminator (`mq:<pr-head-sha>`, minted by
+/// discriminator (`mq:<pr-head-sha>` or retired `mq:<pr-head-sha>@<queue-sha>`, minted by
 /// `ci_watch::merge_queue_rebounce_discriminator`). Rows written before
 /// namespacing used the raw head directly, so callers must preserve that
 /// representation during the transition.
@@ -11,7 +11,10 @@ use super::*;
 /// the stored representation, and the watcher that writes through it
 /// must not be a dependency of the layer it writes to.
 pub(crate) fn merge_queue_rebounce_pr_head(discriminator: &str) -> &str {
-    discriminator.strip_prefix("mq:").unwrap_or(discriminator)
+    match discriminator.strip_prefix("mq:") {
+        Some(head) => head.split('@').next().unwrap_or(head),
+        None => discriminator,
+    }
 }
 
 /// Insert a `ci_failure_suppressions` row for the work item, keyed by
@@ -361,6 +364,17 @@ pub(crate) fn insert_investigation_in_tx(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_head_decoding_preserves_other_discriminators() {
+        assert_eq!(super::merge_queue_rebounce_pr_head("mq:head@queue"), "head");
+        assert_eq!(super::merge_queue_rebounce_pr_head("mq:head"), "head");
+        assert_eq!(super::merge_queue_rebounce_pr_head("head"), "head");
+        assert_eq!(
+            super::merge_queue_rebounce_pr_head("trunk:entry@time"),
+            "trunk:entry@time"
+        );
+    }
+
     use super::*;
     use crate::test_support::{create_test_product_named, open_db};
     use boss_engine_utils::epoch_time::now_epoch_secs;

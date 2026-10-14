@@ -1044,6 +1044,7 @@ fn sample_ci_attempt() -> crate::work::CiRemediation {
             finished_at: None,
             failure_kind: None,
             before_commit_sha: None,
+            queue_base_sha: None,
             revision_task_id: Some("task-rev-1".into()),
         }
 }
@@ -1719,7 +1720,21 @@ fn merge_queue_brief_names_failure_source_and_requires_rebased_bazel_evidence() 
     ] {
         assert!(prompt.contains(required), "missing {required}: {prompt}");
     }
-    assert!(!prompt.contains("a resubmit needs a new head sha"));
+    attempt.failed_checks = "[]".into();
+    attempt.queue_base_sha = Some("empty-capture-base".into());
+    assert!(compose_ci_remediation_fragment(&attempt).contains("empty-capture-base"));
+    attempt.failure_kind = Some("trunk_queue_eviction".into());
+    attempt.failed_checks = "{malformed".into();
+    assert!(compose_ci_remediation_fragment(&attempt).contains("Merge-queue CI verification"));
+    let legacy = compose_ci_remediation_prompt(
+        &ci_remediation_execution(&attempt.pr_url),
+        &chore_without_pr(),
+        std::path::Path::new("/tmp/workspace"),
+        None,
+        &attempt,
+        None,
+    );
+    assert!(legacy.contains("Merge-queue CI verification"));
     assert!(!prompt.contains("rely on CI to verify the push"));
 }
 

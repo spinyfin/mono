@@ -410,13 +410,13 @@ pub(crate) async fn check_merge_queue_rebounce(
             failing_checks = failures.len(),
             "merge poller: fetched failing checks for merge-queue commit",
         );
-        if ci_watch::on_merge_queue_rebounce_with_base(
+        if ci_watch::on_merge_queue_rebounce_detected(
             work_db,
             publisher,
             candidate,
             pr_head_sha,
-            (before_commit_sha, event.queue_base_oid.as_deref()),
-            &[], // labels not available here; opt-out check uses product flag only
+            before_commit_sha,
+            event.queue_base_oid.as_deref(),
             &failures,
         )
         .await

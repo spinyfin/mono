@@ -187,7 +187,7 @@ async fn unchanged_pr_head_keeps_queue_failure_active_and_visible() {
             &candidate,
             "pr-head-under-test",
             "synthetic-squash-commit",
-            &[],
+            None,
             &[RequiredCheckFailure {
                 name: "buildkite/checks".to_owned(),
                 conclusion: "FAILURE".to_owned(),
@@ -247,7 +247,7 @@ async fn legacy_queue_attempt_with_live_revision_stays_pending_when_head_advance
             &candidate,
             "original-pr-head",
             "synthetic-legacy-sha",
-            &[],
+            None,
             &[],
         )
         .await
@@ -312,7 +312,7 @@ async fn legacy_queue_attempt_with_concluded_revision_retires_and_unpins() {
             &candidate,
             "original-pr-head",
             "synthetic-legacy-sha",
-            &[],
+            None,
             &[],
         )
         .await
@@ -398,7 +398,7 @@ async fn rebounce_at_a_head_with_branch_ci_remediation_still_mints_attempt() {
             &candidate,
             "shared-pr-head",
             "synthetic-queue-sha",
-            &[],
+            None,
             &[],
         )
         .await
@@ -487,7 +487,7 @@ async fn queue_failure_detail_falls_back_when_failed_checks_empty() {
             &candidate,
             "pr-head-empty-checks",
             "synthetic-empty-checks",
-            &[],
+            None,
             &[], // lands failed_checks = "[]"
         )
         .await
@@ -543,7 +543,7 @@ async fn advanced_pr_head_with_clean_rollup_unpins_ci_required_state() {
             &candidate,
             "original-pr-head",
             "synthetic-queue-commit",
-            &[],
+            None,
             &[RequiredCheckFailure {
                 name: "ci/test".to_owned(),
                 conclusion: "FAILURE".to_owned(),
@@ -1529,4 +1529,117 @@ fn is_trunk_queue_product_false_for_unknown_product() {
     let (_dir, db) = open_db();
 
     assert!(!is_trunk_queue_product(&db, "does-not-exist"));
+}
+
+use boss_protocol::{ProposalKind, ProposalState, QueueCiEvidence, QueueCiRun, RunDoneOutcome, RunDoneProposalPayload};
+
+#[tokio::test]
+async fn verified_same_head_requeue_allows_a_later_queue_failure() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/3156";
+    let (product_id, chore) = make_chore_in_review(&db, "verified-requeue", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = crate::work::PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.into(),
+    };
+    let head = "a".repeat(40);
+    let queue = "b".repeat(40);
+    let base = "c".repeat(40);
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            &head,
+            &queue,
+            Some(&base),
+            &[],
+        )
+        .await
+    );
+    let attempt = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
+    let revision = attempt.revision_task_id.as_ref().unwrap();
+    let execution = crate::test_support::create_ready_chore_execution(&db, revision.clone());
+    let payload = RunDoneProposalPayload {
+        outcome: RunDoneOutcome::Delivered,
+        summary: "Verified main rebase and re-enqueued unchanged head".into(),
+        question: None,
+        queue_ci_evidence: Some(
+            QueueCiEvidence::builder()
+                .main_sha(base.clone())
+                .verified_head_sha(head.clone())
+                .queue_sha(queue.clone())
+                .queue_base_sha(base.clone())
+                .queue_entry_id("receipt")
+                .runs(vec![QueueCiRun {
+                    check_name: "bazel-build-test".into(),
+                    source_url: "https://buildkite.com/foo/bar/builds/42".into(),
+                    command: "bazel test //...".into(),
+                    exit_code: 0,
+                    output: "All tests passed".into(),
+                    coverage: "Full job".into(),
+                }])
+                .build(),
+        ),
+    };
+    let result = db
+        .submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: revision,
+            kind: ProposalKind::RunDone,
+            payload_json: &serde_json::to_string(&payload).unwrap(),
+            idempotency_key: "requeued",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.proposal.state, ProposalState::Applied);
+    assert!(db.has_verified_queue_delivery(&execution.id, &head).unwrap());
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+    assert!(db.active_blocked_signals(&chore).unwrap().is_empty());
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+    db.update_work_item(
+        revision,
+        WorkItemPatch {
+            status: Some("in_review".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let probe = StubProbe::new();
+    probe.states.lock().unwrap().insert(
+        pr.into(),
+        Ok(PrLifecycleProbe::builder()
+            .url(pr)
+            .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+            .head_ref_oid(head.clone())
+            .base_ref_oid(base)
+            .head_ref_name("feature")
+            .base_ref_name("main")
+            .labels(Vec::new())
+            .review(PrReviewState::Unknown)
+            .build()),
+    );
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+    assert!(
+        db.ci_remediation_exists_for_merge_queue_episode(&chore, &head, &queue)
+            .unwrap()
+    );
+    let next_queue = "d".repeat(40);
+    assert!(
+        !db.ci_remediation_exists_for_merge_queue_episode(&chore, &head, &next_queue)
+            .unwrap()
+    );
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(&db, publisher.as_ref(), &candidate, &head, &next_queue, None, &[],)
+            .await
+    );
+    let next = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
+    assert_ne!(next.id, attempt.id);
+    assert_eq!(next.before_commit_sha.as_deref(), Some(next_queue.as_str()));
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 2);
 }

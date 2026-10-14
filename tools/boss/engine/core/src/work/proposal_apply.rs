@@ -997,6 +997,7 @@ fn apply_run_done(
         [execution_id],
     )?;
     supersede_prior_run_done_declarations(tx, execution_id, proposal_id)?;
+    super::queue_ci_evidence::record_delivery(tx, execution_id, &payload)?;
     if let Some(question) = &payload.question {
         super::pr_flow::insert_question(tx, execution_id, proposal_id, question)?;
     }

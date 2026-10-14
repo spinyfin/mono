@@ -103,6 +103,9 @@ pub struct CiRemediation {
     /// attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_commit_sha: Option<String>,
+    /// Historical base of the failed queue construction, even if checks were not captured.
+    #[serde(default)]
+    pub queue_base_sha: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cube_lease_id: Option<String>,

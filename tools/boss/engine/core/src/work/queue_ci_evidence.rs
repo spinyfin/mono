@@ -6,7 +6,7 @@ use boss_protocol::{QueueCiEvidence, RunDoneOutcome, RunDoneProposalPayload};
 
 pub(crate) const REQUIRED: &str = "Merge-queue CI verification required: fetch origin, rebase the PR onto current origin/main, and run every failed target with Bazel (the full job invocation for whole-job failures). Supply --queue-ci-evidence-file with main_sha, verified_head_sha, queue_sha, queue_base_sha and successful runs (check_name, source_url, command, exit_code, output, coverage). PR-head checks or isolated un-rebased reruns are not evidence. This gate does not expire; continue verification before declaring failure.";
 
-fn requires_verification(attempt: &CiRemediation) -> bool {
+pub(crate) fn queue_ci_verification_required(attempt: &CiRemediation) -> bool {
     // A Trunk construction rejection with no failing build is a conflict or
     // batch collision investigation, not a CI-fix. Keep its existing exit.
     attempt.failure_kind.as_deref() == Some("merge_queue_rebounce")
@@ -15,8 +15,15 @@ fn requires_verification(attempt: &CiRemediation) -> bool {
                 .map_or(true, |checks| !checks.is_empty()))
 }
 
+fn is_lint_check(name: &str) -> bool {
+    matches!(
+        name.rsplit('/').next(),
+        Some("checks" | "checkleft" | "lint" | "clippy")
+    )
+}
+
 pub(crate) fn validate(attempt: &CiRemediation, evidence: Option<&QueueCiEvidence>) -> Result<()> {
-    if !requires_verification(attempt) {
+    if !queue_ci_verification_required(attempt) {
         return Ok(());
     }
     let evidence = evidence.context(REQUIRED)?;
@@ -47,7 +54,7 @@ pub(crate) fn validate(attempt: &CiRemediation, evidence: Option<&QueueCiEvidenc
             && words.iter().any(|w| w.starts_with("//"))
             && !words.iter().any(|w| w.starts_with("--test_filter"));
         anyhow::ensure!(
-            (bazel || words == ["checkleft", "run"])
+            (bazel || (is_lint_check(&run.check_name) && words == ["checkleft", "run"]))
                 && !run.check_name.trim().is_empty()
                 && run.exit_code == 0
                 && !run.output.trim().is_empty()
@@ -56,8 +63,23 @@ pub(crate) fn validate(attempt: &CiRemediation, evidence: Option<&QueueCiEvidenc
             "{REQUIRED} Every run must report a successful complete Bazel invocation (or checkleft run for lint), its output and coverage."
         );
     }
-    let checks: Vec<serde_json::Value> = serde_json::from_str(&attempt.failed_checks)
-        .context("cannot validate queue evidence against malformed failing checks")?;
+    if let Some(base) = &attempt.queue_base_sha {
+        anyhow::ensure!(
+            evidence.queue_base_sha == *base,
+            "{REQUIRED} queue_base_sha differs from the captured queue base."
+        );
+    }
+    // Malformed captures require resolving the build, like missing captures.
+    let checks: Vec<serde_json::Value> = serde_json::from_str(&attempt.failed_checks).unwrap_or_default();
+    if checks.is_empty() {
+        anyhow::ensure!(
+            evidence
+                .runs
+                .iter()
+                .any(|r| r.command.split_whitespace().take(2).eq(["bazel", "test"])),
+            "{REQUIRED} Incomplete captures require Bazel test evidence for the resolved queue build."
+        );
+    }
     for check in checks {
         if let Some(base) = check["queue_base_sha"].as_str() {
             anyhow::ensure!(
@@ -65,17 +87,13 @@ pub(crate) fn validate(attempt: &CiRemediation, evidence: Option<&QueueCiEvidenc
                 "{REQUIRED} queue_base_sha differs from the captured queue base."
             );
         }
-        let url = check["target_url"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .context(REQUIRED)?;
+        let url = check["target_url"].as_str().filter(|s| !s.is_empty());
         let name = check["name"].as_str().filter(|s| !s.is_empty()).context(REQUIRED)?;
         anyhow::ensure!(
-            evidence
-                .runs
-                .iter()
-                .any(|r| r.source_url == url && r.check_name == name),
-            "{REQUIRED} Missing results for {url}."
+            evidence.runs.iter().any(|r| url.is_none_or(|url| r.source_url == url)
+                && r.check_name == name
+                && (is_lint_check(name) || r.command.split_whitespace().nth(1) == Some("test"))),
+            "{REQUIRED} Missing complete verification for check {name} (source: {url:?})."
         );
     }
     Ok(())
@@ -108,7 +126,7 @@ pub(crate) fn validate_declaration(
     let Some(attempt) = attempt_for_execution(conn, execution_id)? else {
         return Ok(());
     };
-    if !requires_verification(&attempt) {
+    if !queue_ci_verification_required(&attempt) {
         return Ok(());
     }
     validate(&attempt, payload.queue_ci_evidence.as_ref())?;
@@ -130,6 +148,41 @@ pub(crate) fn validate_declaration(
                 .is_some_and(|id| !id.trim().is_empty()),
             "Re-enqueue the verified PR head with enqueuePullRequest and include its queue_entry_id receipt. No new SHA or empty commit is required."
         );
+    }
+    Ok(())
+}
+
+/// Retire the failed episode atomically with accepting its requeue delivery.
+/// The applied proposal retains the receipt and full verification evidence.
+/// Archive the head dedup key by queue SHA so the same failure remains deduped,
+/// but a later construction at the same PR head can consume the next budget slot.
+pub(crate) fn record_delivery(conn: &Connection, execution_id: &str, payload: &RunDoneProposalPayload) -> Result<()> {
+    let Some(attempt) = attempt_for_execution(conn, execution_id)? else {
+        return Ok(());
+    };
+    if payload.outcome == RunDoneOutcome::Delivered
+        && attempt.failure_kind.as_deref() == Some("merge_queue_rebounce")
+        && let Some(evidence) = &payload.queue_ci_evidence
+        && attempt.failure_reason.as_deref() != Some("verified_requeue")
+        && evidence.queue_entry_id.as_ref().is_some_and(|id| !id.trim().is_empty())
+    {
+        let head = super::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger);
+        conn.execute(
+            "UPDATE ci_remediations SET status = 'abandoned', finished_at = ?2,
+             failure_reason = 'verified_requeue', head_sha_at_trigger = ?3, head_sha_after = ?4 WHERE id = ?1",
+            params![
+                attempt.id,
+                now_string(),
+                format!("mq:{head}@{}", evidence.queue_sha),
+                evidence.verified_head_sha
+            ],
+        )?;
+        conn.execute(
+            "UPDATE task_blocked_signals SET cleared_at = ?2 WHERE work_item_id = ?1
+             AND reason IN ('ci_failure', 'ci_failure_exhausted', 'ci_flaky_retriggered') AND cleared_at IS NULL
+             AND NOT EXISTS (SELECT 1 FROM ci_remediations WHERE work_item_id = ?1 AND status IN ('pending', 'running'))",
+            params![attempt.work_item_id, now_string()],
+        )?;
     }
     Ok(())
 }
@@ -235,9 +288,20 @@ mod tests {
         }
         assert!(db.validate_queue_ci_failure(&attempt.id, None).is_err());
         let mut proof = evidence();
-        for bad in ["exit", "source", "queue", "base", "filter", "empty"] {
+        for bad in [
+            "exit",
+            "source",
+            "queue",
+            "base",
+            "filter",
+            "lint-only",
+            "build-only",
+            "empty",
+        ] {
             let mut invalid = proof.clone();
             match bad {
+                "lint-only" => invalid.runs[0].command = "checkleft run".into(),
+                "build-only" => invalid.runs[0].command = "bazel build //...".into(),
                 "exit" => invalid.runs[0].exit_code = 1,
                 "source" => invalid.runs[0].source_url = "https://example.org/pr-head".into(),
                 "queue" => invalid.queue_sha = "e".repeat(40),
@@ -251,6 +315,19 @@ mod tests {
             );
         }
         assert!(db.validate_queue_ci_failure(&attempt.id, Some(&proof)).is_ok());
+        let mut incomplete = attempt.clone();
+        incomplete.failed_checks = serde_json::json!([{"name": "bazel-build-test", "target_url": ""}]).to_string();
+        assert!(validate(&incomplete, Some(&proof)).is_ok());
+        incomplete.failed_checks = "{malformed".into();
+        incomplete.failure_kind = Some("trunk_queue_eviction".into());
+        assert!(queue_ci_verification_required(&incomplete));
+        assert!(validate(&incomplete, Some(&proof)).is_ok());
+        incomplete.failed_checks = "[]".into();
+        incomplete.failure_kind = Some("merge_queue_rebounce".into());
+        incomplete.queue_base_sha = Some("e".repeat(40));
+        assert!(validate(&incomplete, Some(&proof)).is_err());
+        incomplete.queue_base_sha = Some(proof.queue_base_sha.clone());
+        assert!(validate(&incomplete, Some(&proof)).is_ok());
         let mut shared_url = attempt.clone();
         shared_url.failed_checks = serde_json::json!([
             {"name": "bazel-build-test", "target_url": URL},

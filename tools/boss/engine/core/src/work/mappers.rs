@@ -858,6 +858,7 @@ pub(crate) fn map_ci_remediation(row: &Row<'_>) -> rusqlite::Result<CiRemediatio
         finished_at: row.get(20)?,
         failure_kind: row.get(21)?,
         before_commit_sha: row.get(22)?,
+        queue_base_sha: row.get(24)?,
         revision_task_id: row.get(23)?,
     })
 }
@@ -942,7 +943,7 @@ pub(crate) fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option
                 triage_class, log_excerpt, status, failure_reason,
                 cube_lease_id, cube_workspace_id, worker_id,
                 created_at, started_at, finished_at,
-                failure_kind, before_commit_sha, revision_task_id
+                failure_kind, before_commit_sha, revision_task_id, queue_base_sha
          FROM ci_remediations
          WHERE id = ?1",
     )?;
