@@ -891,6 +891,9 @@ pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], c
             task.review_guide_selected_comparison_id = state.selected_comparison_id.clone();
             task.review_guide_stale_source = state.stale_source;
             task.review_guide_error = state.error.clone();
+            if let Some(pr) = &task.pr_url {
+                task.review_guide_update_status = super::review_guide_jobs::guide_updates::status(conn, &task.id, pr)?;
+            }
         }
     }
     Ok(())
@@ -1052,6 +1055,7 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.review_guide_selected_comparison_id = src.review_guide_selected_comparison_id.clone();
     dst.review_guide_stale_source = src.review_guide_stale_source;
     dst.review_guide_error = src.review_guide_error.clone();
+    dst.review_guide_update_status = src.review_guide_update_status.clone();
 }
 
 fn push_projection_row(task: Task, tasks: &mut Vec<Task>, chores: &mut Vec<Task>) {

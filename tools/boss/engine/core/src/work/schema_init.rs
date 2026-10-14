@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 41;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 42;
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -96,6 +96,9 @@ impl WorkDb {
         }
         if version < 41 {
             tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")?;
+        }
+        if version < 42 {
+            review_guide_jobs::guide_updates::migrate(&tx)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -597,6 +600,7 @@ mod floor_tests {
             36,
             38,
             40,
+            41,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -636,6 +640,9 @@ mod floor_tests {
                 conn.execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
                     .unwrap();
             }
+            if version >= 42 {
+                review_guide_jobs::guide_updates::migrate(&conn).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -664,6 +671,7 @@ mod floor_tests {
             expected
                 .execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
                 .unwrap();
+            review_guide_jobs::guide_updates::migrate(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

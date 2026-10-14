@@ -63,25 +63,6 @@ impl WorkDb {
         // Versions that still have comments keep the comparison (RESTRICT) and therefore
         // the on-disk packet. Active series are untouched here.
         tx.execute(
-            "UPDATE pr_review_guide_source_series SET readable_version_id = (
-                SELECT retained.id FROM pr_review_guide_versions retained
-                WHERE retained.series_id = pr_review_guide_source_series.id
-                  AND EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = retained.id)
-                ORDER BY CAST(retained.generated_at AS INTEGER) DESC, retained.rowid DESC LIMIT 1
-             )
-             WHERE readable_version_id IN (
-                SELECT v.id FROM pr_review_guide_versions v
-                JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
-                JOIN pr_review_guide_source_series s ON s.id = v.series_id
-                LEFT JOIN tasks t ON t.id = s.root_task_id
-                WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
-                  AND CAST(c.captured_at AS INTEGER) < ?1
-                  AND CAST(v.generated_at AS INTEGER) < ?1
-                  AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = v.id)
-             )",
-            [cutoff],
-        )?;
-        tx.execute(
             "DELETE FROM pr_review_guide_versions WHERE id IN (
                 SELECT v.id FROM pr_review_guide_versions v
                 JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
@@ -91,8 +72,20 @@ impl WorkDb {
                   AND CAST(c.captured_at AS INTEGER) < ?1
                   AND CAST(v.generated_at AS INTEGER) < ?1
                   AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = v.id)
+                  AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u
+                      JOIN pr_review_guide_attempts a ON a.id = u.attempt_id
+                      WHERE u.previous_version_id = v.id AND a.status IN ('queued', 'running'))
+                  -- The readable version is never collected, whatever the lifecycle,
+                  -- until its root is deleted.
+                  AND (s.readable_version_id IS NOT v.id OR t.id IS NULL OR t.deleted_at IS NOT NULL)
             )",
             [cutoff],
+        )?;
+        tx.execute(
+            "UPDATE pr_review_guide_source_series SET readable_version_id = NULL
+             WHERE readable_version_id IS NOT NULL
+               AND readable_version_id NOT IN (SELECT id FROM pr_review_guide_versions)",
+            [],
         )?;
         tx.execute(
             "DELETE FROM pr_review_guide_attempts WHERE id IN (
@@ -105,6 +98,12 @@ impl WorkDb {
                   AND a.status IN ('succeeded', 'failed', 'cancelled', 'superseded')
                   AND CAST(a.created_at AS INTEGER) < ?1
                   AND NOT EXISTS (SELECT 1 FROM pr_review_guide_versions v WHERE v.attempt_id = a.id)
+                  -- The current request of a series with a readable guide carries
+                  -- the update/failure status and is what Retry re-admits from.
+                  AND NOT (s.readable_version_id IS NOT NULL
+                      AND t.id IS NOT NULL AND t.deleted_at IS NULL
+                      AND a.request_epoch = s.request_epoch
+                      AND a.comparison_id IS s.selected_comparison_id)
             )",
             [cutoff],
         )?;

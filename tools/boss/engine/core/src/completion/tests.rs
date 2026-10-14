@@ -1954,6 +1954,99 @@ async fn finalize_pr_transition_captures_on_the_canonical_root() {
     );
 }
 
+/// The real completion wiring, not the reconciler in isolation: a revision
+/// that moved the PR head produces exactly one incremental update attempt
+/// from the published guide and broadcasts a review-guide change.
+#[tokio::test]
+async fn revision_completion_through_the_handler_admits_one_update_and_publishes_a_change() {
+    use crate::review_guide_capture::REVIEW_GUIDE_GENERATION_FLAG;
+    use crate::work::{PrSourceCapturePersistOutcome, PublishReviewGuideOutcome};
+
+    let workspace = tempdir().unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/440";
+    let (_dir, db, _product, root, _revision, execution_id, _attempt) =
+        ci_revision_fixture(workspace.path(), pr_url, "published-head", "[]");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/spinyfin/mono.git' WHERE id = ?1",
+            [&root],
+        )
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(capture) = db
+        .persist_pr_review_guide_source_capture(
+            &root,
+            0,
+            PrSourceCaptureTrigger::Creation,
+            &source_capture_packet(pr_url, "base", "published-head"),
+        )
+        .unwrap()
+    else {
+        panic!("capture");
+    };
+    let first = db
+        .create_pr_review_guide_attempt(&capture.series_id, &capture.comparison_id, "test")
+        .unwrap();
+    assert!(matches!(
+        db.publish_pr_review_guide_version(&first.id, "# Published", "raw")
+            .unwrap(),
+        PublishReviewGuideOutcome::Published(_)
+    ));
+
+    let flags_dir = tempdir().unwrap();
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        flags_dir.path().join("feature-flags.toml"),
+    ));
+    flags.load().unwrap();
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let harness = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    // The teardown-time head read is the revision's delivered head.
+    let verifier = StubBranchVerifier::ok("boss/test");
+    verifier.set_fresh_head_oid(Ok("revision-head".to_owned())).await;
+    let handler = harness
+        .handler
+        .with_branch_verifier(verifier)
+        .with_feature_flags(flags)
+        .with_source_packet_collector(counting_source_collector(
+            calls,
+            source_capture_packet(pr_url, "base", "revision-head"),
+        ));
+
+    let outcome = handler
+        .finalize_pr_transition(&execution_id, pr_url.to_owned(), WorkerPrCompletionTarget::Done, "test")
+        .await;
+    assert!(
+        !matches!(outcome, StopOutcome::DbError),
+        "finalize must succeed; got {outcome:?}"
+    );
+    let started = std::time::Instant::now();
+    loop {
+        let changed = harness
+            .publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .any(|(_, id, reason)| id == &root && reason == "review_guide_revision_update");
+        if changed {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "no review-guide change event was published"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let updates: i64 = db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pr_review_guide_updates", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(updates, 1, "exactly one incremental update attempt");
+}
+
 #[tokio::test]
 async fn disabled_finalize_does_not_allocate_a_source_observation() {
     let workspace = tempdir().unwrap();

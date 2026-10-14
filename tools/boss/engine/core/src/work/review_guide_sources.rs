@@ -422,10 +422,30 @@ impl WorkDb {
             tx.commit()?;
             return Ok(false);
         }
+        // A readable guide is failed (and its in-flight generation fenced) only
+        // when the failed observation concerns a head the guide does not cover:
+        // a revision-attributed head that differs from the comparison being
+        // generated or published. A transient failure on an unchanged head
+        // only records the error; the next capture clears it.
+        let concerns_other_head = "readable_version_id IS NOT NULL AND EXISTS (
+                 SELECT 1 FROM pr_review_guide_revision_heads r
+                 WHERE r.root_task_id = pr_review_guide_source_series.root_task_id
+                   AND r.pr_url = pr_review_guide_source_series.canonical_pr_url
+                   AND r.observation_sequence = ?2
+                   AND r.head_sha != COALESCE(
+                       (SELECT c.head_sha FROM pr_review_guide_source_comparisons c
+                        WHERE c.id = pr_review_guide_source_series.selected_comparison_id),
+                       (SELECT c.head_sha FROM pr_review_guide_versions v
+                        JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
+                        WHERE v.id = pr_review_guide_source_series.readable_version_id)))";
         tx.execute(
-            "UPDATE pr_review_guide_source_series
-             SET latest_observation_sequence = ?2, last_capture_error = ?3, updated_at = ?4
-             WHERE id = ?1",
+            &format!(
+                "UPDATE pr_review_guide_source_series
+                 SET latest_observation_sequence = ?2, last_capture_error = ?3, updated_at = ?4,
+                     guide_lifecycle = CASE WHEN {concerns_other_head} THEN 'failed' ELSE guide_lifecycle END,
+                     request_epoch = request_epoch + CASE WHEN {concerns_other_head} THEN 1 ELSE 0 END
+                 WHERE id = ?1"
+            ),
             params![series_id, observation_sequence, error, now],
         )?;
         tx.commit()?;
@@ -674,6 +694,13 @@ fn select_comparison(
     tx.execute(
         "UPDATE pr_review_guide_source_series
          SET latest_observation_sequence = MAX(latest_observation_sequence, ?2),
+             -- A capture failure that failed a readable guide is undone once the
+             -- recapture re-selects the comparison that guide already covers; a
+             -- different head is re-admitted as a fresh update by the enqueue.
+             guide_lifecycle = CASE WHEN guide_lifecycle = 'failed' AND last_capture_error IS NOT NULL
+                 AND ?3 = (SELECT v.comparison_id FROM pr_review_guide_versions v
+                           WHERE v.id = pr_review_guide_source_series.readable_version_id)
+                 THEN 'ready' ELSE guide_lifecycle END,
              last_capture_error = NULL,
              selected_comparison_id = ?3,
              updated_at = ?4

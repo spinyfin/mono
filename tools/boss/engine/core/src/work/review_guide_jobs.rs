@@ -194,14 +194,31 @@ impl WorkDb {
     /// Admit a request for the selected comparison, reusing a live request
     /// for that comparison or atomically replacing an obsolete request.
     /// The durable queued attempt can be dispatched by enqueue or reconcile.
+    #[cfg(test)]
     pub(crate) fn create_pr_review_guide_attempt(
         &self,
         series_id: &str,
         comparison_id: &str,
         prompt_version: &str,
     ) -> Result<PrReviewGuideAttempt> {
-        self.admit_pr_review_guide_attempt(series_id, comparison_id, prompt_version, None, false)
+        self.admit_pr_review_guide_attempt(series_id, comparison_id, prompt_version, None, false, false)
             .map(|(attempt, _)| attempt)
+    }
+
+    pub(crate) fn create_automatic_pr_review_guide_attempt(
+        &self,
+        series_id: &str,
+        comparison_id: &str,
+    ) -> Result<PrReviewGuideAttempt> {
+        self.admit_pr_review_guide_attempt(
+            series_id,
+            comparison_id,
+            boss_review_guide::PROMPT_VERSION,
+            None,
+            false,
+            true,
+        )
+        .map(|(attempt, _)| attempt)
     }
 
     #[cfg(test)]
@@ -212,7 +229,7 @@ impl WorkDb {
         prompt_version: &str,
         idempotency_token: Option<&str>,
     ) -> Result<PrReviewGuideAttempt> {
-        self.admit_pr_review_guide_attempt(series_id, comparison_id, prompt_version, idempotency_token, true)
+        self.admit_pr_review_guide_attempt(series_id, comparison_id, prompt_version, idempotency_token, true, false)
             .map(|(attempt, _)| attempt)
     }
 
@@ -223,6 +240,7 @@ impl WorkDb {
         prompt_version: &str,
         idempotency_token: Option<&str>,
         replace: bool,
+        incremental: bool,
     ) -> Result<(PrReviewGuideAttempt, bool)> {
         let now = now_string();
         let mut conn = self.connect()?;
@@ -237,10 +255,10 @@ impl WorkDb {
                 return Ok((existing, false));
             }
         }
-        let selected: Option<String> = tx.query_row(
-            "SELECT selected_comparison_id FROM pr_review_guide_source_series WHERE id = ?1",
+        let (selected, epoch): (Option<String>, i64) = tx.query_row(
+            "SELECT selected_comparison_id, request_epoch FROM pr_review_guide_source_series WHERE id = ?1",
             [series_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         ensure!(
             selected.as_deref() == Some(comparison_id),
@@ -253,7 +271,11 @@ impl WorkDb {
             stmt.query_map([series_id], map_pr_review_guide_attempt)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        if !replace && let Some(existing) = live.iter().find(|a| a.comparison_id == comparison_id) {
+        if !replace
+            && let Some(existing) = live
+                .iter()
+                .find(|a| a.comparison_id == comparison_id && a.request_epoch == epoch)
+        {
             // Remember every coalesced click's token, so replay after this
             // attempt finishes still returns it instead of spending again.
             if let Some(token) = idempotency_token {
@@ -314,6 +336,15 @@ impl WorkDb {
                 now,
             ],
         )?;
+        // Only the automatic, revision-triggered path may start from the
+        // published version; an explicit Generate/Regenerate is a full run.
+        if incremental {
+            tx.execute(
+                "INSERT INTO pr_review_guide_automatic_attempts (attempt_id) VALUES (?1)",
+                [&attempt_id],
+            )?;
+            guide_updates::snapshot(&tx, &attempt_id, series_id, comparison_id)?;
+        }
         let attempt =
             query_pr_review_guide_attempt(&tx, &attempt_id).require("pr_review_guide_attempt", &attempt_id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
@@ -610,6 +641,11 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let attempt = query_pr_review_guide_attempt(&tx, attempt_id).require("pr_review_guide_attempt", attempt_id)?;
         if PrReviewGuideAttemptStatus::from_str(&attempt.status)?.is_terminal() || attempt.execution_id.is_some() {
+            return Ok(attempt);
+        }
+        if guide_updates::chain_has_active_writer(&tx, &attempt.id)? {
+            // Hold the incremental update until the revision chain has no
+            // writer; the attempt stays queued and a later dispatch pass binds it.
             return Ok(attempt);
         }
         let existing: Option<String> = tx.query_row(
@@ -957,6 +993,19 @@ impl WorkDb {
         )
     }
 
+    /// The pending source-capture failure for a root's guide series, if any.
+    pub(crate) fn pr_review_guide_capture_error_for_root(&self, root_task_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let Some(summary) = query_pr_review_guide_summary_for_root(&conn, root_task_id, None, None)? else {
+            return Ok(None);
+        };
+        Ok(conn.query_row(
+            "SELECT last_capture_error FROM pr_review_guide_source_series WHERE id = ?1",
+            [&summary.series_id],
+            |row| row.get(0),
+        )?)
+    }
+
     fn request_pr_review_guide(
         &self,
         root_task_id: &str,
@@ -975,11 +1024,23 @@ impl WorkDb {
         let Some(comparison_id) = summary.selected_comparison_id else {
             return Ok(RetryReviewGuideOutcome::NoComparison);
         };
+        let capture_error: Option<String> = self.connect()?.query_row(
+            "SELECT last_capture_error FROM pr_review_guide_source_series WHERE id = ?1",
+            [&summary.series_id],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            capture_error.is_none(),
+            "source capture failed: {}; the current head must be recaptured before retrying",
+            capture_error.unwrap_or_default()
+        );
         let (attempt, created) = self.admit_pr_review_guide_attempt(
             &summary.series_id,
             &comparison_id,
             prompt_version,
             idempotency_token,
+            replace,
+            // Retry resumes a failed revision update; Generate is a full run.
             replace,
         )?;
         let attempt = self.dispatch_if_unbound(attempt, root_task_id);
@@ -1223,3 +1284,515 @@ mod tests;
 #[cfg(test)]
 #[path = "review_guide_reenqueue_tests.rs"]
 mod reenqueue_tests;
+
+/// Immutable starting points for incremental guide updates and revision attribution.
+pub(in crate::work) mod guide_updates {
+    use super::*;
+
+    pub(in crate::work) fn migrate(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pr_review_guide_updates (
+            attempt_id TEXT PRIMARY KEY REFERENCES pr_review_guide_attempts(id) ON DELETE CASCADE,
+            previous_version_id TEXT NOT NULL REFERENCES pr_review_guide_versions(id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS pr_review_guide_automatic_attempts (
+            attempt_id TEXT PRIMARY KEY REFERENCES pr_review_guide_attempts(id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS pr_review_guide_revision_heads (
+            root_task_id TEXT NOT NULL,
+            pr_url TEXT NOT NULL,
+            head_sha TEXT NOT NULL,
+            revision_task_id TEXT NOT NULL,
+            observation_sequence INTEGER NOT NULL,
+            PRIMARY KEY(root_task_id, pr_url, head_sha)
+         );
+         CREATE TABLE IF NOT EXISTS pr_review_guide_head_ancestry (
+            root_task_id TEXT NOT NULL,
+            pr_url TEXT NOT NULL,
+            parent_sha TEXT NOT NULL,
+            child_sha TEXT NOT NULL,
+            PRIMARY KEY(root_task_id, pr_url, parent_sha, child_sha)
+         );",
+        )?;
+        Ok(())
+    }
+
+    /// True for an automatic (revision-triggered or retried) attempt that would
+    /// replace a readable guide while a revision in the root's chain is still
+    /// actively writing; the replacement waits for that writer to finish. The
+    /// root is resolved from the attempt's series, so an attempt admitted before
+    /// completion attribution arrives is held too. Parked (todo/blocked)
+    /// revisions are not writing and never hold an update.
+    pub(in crate::work) fn chain_has_active_writer(conn: &Connection, attempt: &str) -> Result<bool> {
+        let root: Option<String> = conn
+            .query_row(
+                "SELECT s.root_task_id FROM pr_review_guide_attempts a
+                 JOIN pr_review_guide_source_series s ON s.id = a.series_id
+                 JOIN pr_review_guide_source_comparisons new ON new.id = a.comparison_id
+                 JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+                 JOIN pr_review_guide_source_comparisons old ON old.id = v.comparison_id
+                 WHERE a.id = ?1 AND old.head_sha != new.head_sha
+                   AND (EXISTS (SELECT 1 FROM pr_review_guide_updates u WHERE u.attempt_id = a.id)
+                     OR EXISTS (SELECT 1 FROM pr_review_guide_automatic_attempts m WHERE m.attempt_id = a.id))",
+                [attempt],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(root) = root else { return Ok(false) };
+        for id in chain_helpers::collect_chain_revision_ids_including_deleted(conn, &root)? {
+            if let Some(task) = query_task(conn, &id)?
+                && task.deleted_at.is_none()
+                && task.status == TaskStatus::Active
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Snapshot the readable version in the admission transaction. Superseding a
+    /// queued update still starts from the published version, never unpublished prose.
+    pub(in crate::work) fn snapshot(conn: &Connection, attempt: &str, series: &str, comparison: &str) -> Result<()> {
+        conn.execute(
+            "INSERT INTO pr_review_guide_updates (attempt_id, previous_version_id)
+         SELECT ?1, v.id FROM pr_review_guide_source_series s
+         JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+         JOIN pr_review_guide_source_comparisons old ON old.id = v.comparison_id
+         JOIN pr_review_guide_source_comparisons new ON new.id = ?3
+         WHERE s.id = ?2 AND old.head_sha != new.head_sha
+           AND EXISTS (SELECT 1 FROM pr_review_guide_revision_heads r
+             WHERE r.root_task_id = s.root_task_id AND r.pr_url = s.canonical_pr_url
+               AND r.head_sha = new.head_sha)",
+            params![attempt, series, comparison],
+        )?;
+        conn.execute(
+            "UPDATE pr_review_guide_attempts SET prompt_version = ?2
+         WHERE id = ?1 AND EXISTS (SELECT 1 FROM pr_review_guide_updates WHERE attempt_id = ?1)",
+            params![attempt, boss_review_guide::UPDATE_PROMPT_VERSION],
+        )?;
+        Ok(())
+    }
+
+    impl WorkDb {
+        /// True when the comparison already has live work or its guide is the one
+        /// currently readable. A historical version for a head the PR has since
+        /// left (A -> B -> A) does not count: the card would keep opening B.
+        pub(crate) fn review_guide_comparison_has_attempt(&self, comparison: &str) -> Result<bool> {
+            Ok(self.connect()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pr_review_guide_attempts
+                 WHERE comparison_id = ?1 AND status IN ('queued', 'running'))
+                 OR EXISTS(SELECT 1 FROM pr_review_guide_source_series s
+                 JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+                 WHERE v.comparison_id = ?1)",
+                [comparison],
+                |row| row.get(0),
+            )?)
+        }
+
+        /// The old head and original Markdown are immutable and bound to this attempt.
+        pub(crate) fn review_guide_update_context(&self, execution: &str) -> Result<Option<(String, String)>> {
+            let conn = self.connect()?;
+            let context = conn
+                .query_row(
+                    "SELECT c.head_sha, v.markdown FROM pr_review_guide_updates u
+             JOIN pr_review_guide_attempts a ON a.id = u.attempt_id
+             JOIN pr_review_guide_versions v ON v.id = u.previous_version_id
+             JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
+             WHERE a.execution_id = ?1",
+                    [execution],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let requires_update: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pr_review_guide_attempts WHERE execution_id = ?1 AND prompt_version = ?2)",
+                params![execution, boss_review_guide::UPDATE_PROMPT_VERSION],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                !requires_update || context.is_some(),
+                "incremental guide starting version is missing"
+            );
+            Ok(context)
+        }
+
+        /// A revision pushed `child` on top of `parent`, so `child` contains
+        /// `parent`. A force-push never records an edge, which is what keeps a
+        /// replaced head from counting as contained.
+        pub(crate) fn record_review_guide_head_ancestry(
+            &self,
+            root: &str,
+            pr: &str,
+            parent: &str,
+            child: &str,
+        ) -> Result<()> {
+            self.connect()?.execute(
+                "INSERT OR IGNORE INTO pr_review_guide_head_ancestry
+                 (root_task_id, pr_url, parent_sha, child_sha) VALUES (?1, ?2, ?3, ?4)",
+                params![root, pr, parent, child],
+            )?;
+            Ok(())
+        }
+
+        pub(crate) fn record_review_guide_revision_head(
+            &self,
+            root: &str,
+            pr: &str,
+            head: &str,
+            revision: &str,
+            sequence: i64,
+        ) -> Result<()> {
+            self.connect()?.execute(
+                "INSERT INTO pr_review_guide_revision_heads
+             (root_task_id, pr_url, head_sha, revision_task_id, observation_sequence)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(root_task_id, pr_url, head_sha) DO UPDATE SET
+               revision_task_id = excluded.revision_task_id,
+               observation_sequence = excluded.observation_sequence
+             WHERE excluded.observation_sequence > observation_sequence",
+                params![root, pr, head, revision, sequence],
+            )?;
+            // The poller may have admitted (and held) the attempt before this
+            // attribution arrived: turn it into the incremental update.
+            let conn = self.connect()?;
+            let held = {
+                let mut stmt = conn.prepare(
+                    "SELECT a.id, a.series_id, a.comparison_id FROM pr_review_guide_attempts a
+                     JOIN pr_review_guide_automatic_attempts m ON m.attempt_id = a.id
+                     JOIN pr_review_guide_source_series s ON s.id = a.series_id
+                     JOIN pr_review_guide_source_comparisons c ON c.id = a.comparison_id
+                     WHERE s.root_task_id = ?1 AND s.canonical_pr_url = ?2 AND c.head_sha = ?3
+                       AND a.status = 'queued' AND a.execution_id IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u WHERE u.attempt_id = a.id)",
+                )?;
+                stmt.query_map(params![root, pr, head], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (attempt, series, comparison) in held {
+                snapshot(&conn, &attempt, &series, &comparison)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Shared by board reads and the series-scoped viewer poll. A revision label
+    /// belongs to an exact head, never to a replacement PR.
+    pub(in crate::work) fn status(conn: &Connection, root: &str, pr: &str) -> Result<Option<String>> {
+        let row = conn
+            .query_row(
+                "SELECT s.guide_lifecycle, c.head_sha, t.id, t.short_id
+         FROM pr_review_guide_source_series s
+         JOIN pr_review_guide_source_comparisons c ON c.id = s.selected_comparison_id
+         JOIN pr_review_guide_revision_heads r ON r.root_task_id = s.root_task_id
+           AND r.pr_url = s.canonical_pr_url
+           AND ((s.last_capture_error IS NULL AND r.head_sha = c.head_sha)
+             OR (s.last_capture_error IS NOT NULL AND r.observation_sequence = s.latest_observation_sequence))
+         JOIN tasks t ON t.id = r.revision_task_id
+         WHERE s.root_task_id = ?1 AND s.canonical_pr_url = ?2
+           AND s.readable_version_id IS NOT NULL
+           AND (s.last_capture_error IS NOT NULL OR EXISTS (SELECT 1 FROM pr_review_guide_attempts a
+             JOIN pr_review_guide_updates u ON u.attempt_id = a.id
+             WHERE a.series_id = s.id AND a.request_epoch = s.request_epoch
+               AND a.comparison_id = s.selected_comparison_id))
+         ORDER BY r.observation_sequence DESC LIMIT 1",
+                params![root, pr],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.map(|(lifecycle, head, id, short)| {
+            let label = boss_protocol::short_id_label(short).unwrap_or(id);
+            match lifecycle.as_str() {
+                "queued" | "generating" => format!("Updating after revision {label}..."),
+                "ready" => format!("Updated for revision {label} at {head}"),
+                _ => format!("Update after revision {label} failed; previous guide retained"),
+            }
+        }))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::test_support::{
+            create_active_chore, create_product, open_db, review_guide_source_packet, seed_review_guide_series,
+        };
+
+        #[test]
+        fn retention_preserves_a_live_updates_starting_version_then_reclaims_terminal_history() {
+            let (_dir, db) = open_db();
+            let product = create_product(&db);
+            let root = create_active_chore(&db, &product, "guide retention");
+            let (series, comparison) = seed_review_guide_series(&db, &root);
+            let first = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            let PublishReviewGuideOutcome::Published(old) = db
+                .publish_pr_review_guide_version(&first.id, "# Original", "original")
+                .unwrap()
+            else {
+                panic!("publish");
+            };
+            let PrSourceCapturePersistOutcome::Stored(new) = db
+                .persist_pr_review_guide_source_capture(
+                    &root,
+                    2,
+                    PrSourceCaptureTrigger::Completion,
+                    &review_guide_source_packet("base", "new-head"),
+                )
+                .unwrap()
+            else {
+                panic!("capture");
+            };
+            let url = db
+                .get_pr_review_guide_summary_for_root(&root)
+                .unwrap()
+                .unwrap()
+                .canonical_pr_url;
+            db.record_review_guide_revision_head(&root, &url, "new-head", "revision", 2)
+                .unwrap();
+            let update = db
+                .create_automatic_pr_review_guide_attempt(&series, &new.comparison_id)
+                .unwrap();
+            assert_eq!(update.prompt_version, boss_review_guide::UPDATE_PROMPT_VERSION);
+            let conn = db.connect().unwrap();
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&root])
+                .unwrap();
+            conn.execute("UPDATE pr_review_guide_versions SET generated_at = '1'", [])
+                .unwrap();
+            conn.execute("UPDATE pr_review_guide_source_comparisons SET captured_at = '1'", [])
+                .unwrap();
+            conn.execute("UPDATE pr_review_guide_attempts SET created_at = '1'", [])
+                .unwrap();
+            drop(conn);
+            db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
+            assert!(db.get_pr_review_guide_version(&old.id).unwrap().is_some());
+            assert_eq!(
+                db.get_pr_review_guide_summary_for_root(&root)
+                    .unwrap()
+                    .unwrap()
+                    .readable_version_id,
+                Some(old.id.clone())
+            );
+            db.fail_pr_review_guide_attempt(&update.id, "failed").unwrap();
+            db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
+            // A failed update keeps the previous version readable.
+            assert!(db.get_pr_review_guide_version(&old.id).unwrap().is_some());
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.lifecycle, "failed");
+            assert_eq!(summary.readable_version_id, Some(old.id.clone()));
+            // The failed request and its comparison survive GC, so the status
+            // text and Retry still have something to act on.
+            assert_eq!(summary.selected_comparison_id, Some(new.comparison_id.clone()));
+            assert!(summary.error.is_some());
+            let RetryReviewGuideOutcome::Created(retry) = db
+                .retry_pr_review_guide(&root, None, boss_review_guide::PROMPT_VERSION)
+                .unwrap()
+            else {
+                panic!("retry");
+            };
+            assert_eq!(retry.prompt_version, boss_review_guide::UPDATE_PROMPT_VERSION);
+            // Retried to success: the new guide is readable and survives GC; the
+            // superseded old version is no longer protected and may be reclaimed.
+            let PublishReviewGuideOutcome::Published(newer) = db
+                .publish_pr_review_guide_version(&retry.id, "# Updated", "updated")
+                .unwrap()
+            else {
+                panic!("publish");
+            };
+            db.connect()
+                .unwrap()
+                .execute("UPDATE pr_review_guide_versions SET generated_at = '1'", [])
+                .unwrap();
+            db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
+            assert!(db.get_pr_review_guide_version(&newer.id).unwrap().is_some());
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.lifecycle, "ready");
+            assert_eq!(summary.readable_version_id, Some(newer.id));
+        }
+
+        #[test]
+        fn explicit_generate_is_never_an_incremental_update() {
+            let (_dir, db) = open_db();
+            let product = create_product(&db);
+            let root = create_active_chore(&db, &product, "manual generate");
+            let (series, comparison) = seed_review_guide_series(&db, &root);
+            let first = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            db.publish_pr_review_guide_version(&first.id, "# Original", "original")
+                .unwrap();
+            let PrSourceCapturePersistOutcome::Stored(new) = db
+                .persist_pr_review_guide_source_capture(
+                    &root,
+                    2,
+                    PrSourceCaptureTrigger::Completion,
+                    &review_guide_source_packet("base", "new-head"),
+                )
+                .unwrap()
+            else {
+                panic!("capture");
+            };
+            let url = db
+                .get_pr_review_guide_summary_for_root(&root)
+                .unwrap()
+                .unwrap()
+                .canonical_pr_url;
+            db.record_review_guide_revision_head(&root, &url, "new-head", "revision", 2)
+                .unwrap();
+            let manual = db
+                .create_pr_review_guide_attempt_with_token(&series, &new.comparison_id, "test", Some("click"))
+                .unwrap();
+            assert_ne!(manual.prompt_version, boss_review_guide::UPDATE_PROMPT_VERSION);
+            let updates: i64 = db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM pr_review_guide_updates WHERE attempt_id = ?1",
+                    [&manual.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(updates, 0, "manual generation after a head change is a full run");
+        }
+
+        #[test]
+        fn failed_or_cancelled_attempts_do_not_suppress_automatic_enqueue() {
+            let (_dir, db) = open_db();
+            let product = create_product(&db);
+            let root = create_active_chore(&db, &product, "failed attempt");
+            let (series, comparison) = seed_review_guide_series(&db, &root);
+            let attempt = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            assert!(db.review_guide_comparison_has_attempt(&comparison).unwrap());
+            db.fail_pr_review_guide_attempt(&attempt.id, "failed").unwrap();
+            assert!(!db.review_guide_comparison_has_attempt(&comparison).unwrap());
+            let retry = db
+                .create_automatic_pr_review_guide_attempt(&series, &comparison)
+                .unwrap();
+            assert_ne!(retry.id, attempt.id);
+        }
+
+        #[test]
+        fn failed_source_capture_keeps_published_guide_and_fences_old_jobs() {
+            let (_dir, db) = open_db();
+            let product = create_product(&db);
+            let root = create_active_chore(&db, &product, "capture failure");
+            let (series, comparison) = seed_review_guide_series(&db, &root);
+            let first = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            let PublishReviewGuideOutcome::Published(old) = db
+                .publish_pr_review_guide_version(&first.id, "# Original", "original")
+                .unwrap()
+            else {
+                panic!("publish");
+            };
+            let stale = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            let url = db
+                .get_pr_review_guide_summary_for_root(&root)
+                .unwrap()
+                .unwrap()
+                .canonical_pr_url;
+            // The failed observation concerns a revision head the guide does not cover.
+            db.record_review_guide_revision_head(&root, &url, "new-head", "revision", 10)
+                .unwrap();
+            db.record_pr_review_guide_source_capture_failure(&root, &url, 10, "pinned delta unavailable")
+                .unwrap();
+            assert_eq!(
+                db.publish_pr_review_guide_version(&stale.id, "# Late", "late").unwrap(),
+                PublishReviewGuideOutcome::Superseded
+            );
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.lifecycle, "failed");
+            assert_eq!(summary.readable_version_id, Some(old.id));
+            assert!(
+                db.retry_pr_review_guide(&root, None, "test")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("recapture")
+            );
+        }
+
+        #[test]
+        fn transient_capture_failure_on_the_published_head_keeps_the_guide_ready() {
+            let (_dir, db) = open_db();
+            let product = create_product(&db);
+            let root = create_active_chore(&db, &product, "transient failure");
+            let (series, comparison) = seed_review_guide_series(&db, &root);
+            let first = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            db.publish_pr_review_guide_version(&first.id, "# Original", "original")
+                .unwrap();
+            let live = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            let url = db
+                .get_pr_review_guide_summary_for_root(&root)
+                .unwrap()
+                .unwrap()
+                .canonical_pr_url;
+            // A metadata error on a recheck of the unchanged head: no revision
+            // attribution for another head, so nothing is failed or fenced.
+            db.record_pr_review_guide_source_capture_failure(&root, &url, 10, "gh metadata unavailable")
+                .unwrap();
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.lifecycle, "queued");
+            assert!(db.pr_review_guide_capture_error_for_root(&root).unwrap().is_some());
+            assert!(matches!(
+                db.publish_pr_review_guide_version(&live.id, "# Regenerated", "raw")
+                    .unwrap(),
+                PublishReviewGuideOutcome::Published(_)
+            ));
+            // The next successful capture of the same comparison clears the error.
+            db.persist_pr_review_guide_source_capture(
+                &root,
+                11,
+                PrSourceCaptureTrigger::Completion,
+                &review_guide_source_packet("base", "head"),
+            )
+            .unwrap();
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.lifecycle, "ready");
+            assert!(db.pr_review_guide_capture_error_for_root(&root).unwrap().is_none());
+        }
+
+        #[test]
+        fn recapturing_the_published_comparison_restores_a_failed_guide_to_ready() {
+            let (_dir, db) = open_db();
+            let product = create_product(&db);
+            let root = create_active_chore(&db, &product, "restore ready");
+            let (series, comparison) = seed_review_guide_series(&db, &root);
+            let first = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+            db.publish_pr_review_guide_version(&first.id, "# Original", "original")
+                .unwrap();
+            let url = db
+                .get_pr_review_guide_summary_for_root(&root)
+                .unwrap()
+                .unwrap()
+                .canonical_pr_url;
+            db.record_review_guide_revision_head(&root, &url, "new-head", "revision", 10)
+                .unwrap();
+            db.record_pr_review_guide_source_capture_failure(&root, &url, 10, "pinned delta unavailable")
+                .unwrap();
+            assert_eq!(
+                db.get_pr_review_guide_summary_for_root(&root)
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle,
+                "failed"
+            );
+            // The PR head went back to the head the guide already covers.
+            db.persist_pr_review_guide_source_capture(
+                &root,
+                11,
+                PrSourceCaptureTrigger::Poller,
+                &review_guide_source_packet("base", "head"),
+            )
+            .unwrap();
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.lifecycle, "ready");
+            assert!(db.pr_review_guide_capture_error_for_root(&root).unwrap().is_none());
+        }
+    }
+}
