@@ -159,7 +159,7 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
 
 #[test]
 fn agent_rules_point_a_deliberate_background_job_at_propose_wait_without_banning_it() {
-    let preamble = CodexDriver::default().agent_rules_preamble();
+    let preamble = CodexDriver::default().agent_rules_preamble(true);
     let flat = preamble.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         flat.contains(
