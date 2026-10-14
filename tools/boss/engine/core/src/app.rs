@@ -2481,7 +2481,12 @@ async fn handle_frontend_connection(
         };
         let waiting_read = if let Some((admission, connection)) = read_lane {
             match admission.enqueue(connection) {
-                Ok(waiting) => Some(waiting.identify(&session_id, &request_id, variant_name(&request))),
+                Ok(waiting) => Some(waiting.identify(
+                    &session_id,
+                    &request_id,
+                    variant_name(&request),
+                    read_admission::ReadOrdering::key_id(&request),
+                )),
                 Err(message) => {
                     tracing::warn!(%session_id, %request_id, ?lane, "read RPC rejected: queue full");
                     send_response(

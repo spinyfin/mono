@@ -13,11 +13,10 @@ const PENDING_PER_ACTIVE: usize = 4;
 /// Exceeds the 45 s on-demand fetch budget of the slowest network-bound read.
 const ORDER_WAIT: Duration = Duration::from_secs(60);
 
-pub(super) const BUSY: &str = "engine busy, retry: read admission limit exceeded";
 const QUEUE_FULL: &str = "engine busy, retry: read admission queue full";
 const DEADLINE: &str = "engine busy, retry: read admission deadline expired";
 mod diagnostics;
-use diagnostics::{Diagnostics, TrackedRead};
+use diagnostics::{Diagnostics, TrackedRead, Wait};
 
 pub(super) struct ReadAdmission {
     active: Arc<Semaphore>,
@@ -116,7 +115,8 @@ impl ReadAdmission {
     /// immediately; accepted waiters share one deadline across both limits.
     pub(super) fn enqueue(self: &Arc<Self>, connection: &Arc<ConnectionReads>) -> Result<WaitingRead, &'static str> {
         let full = |_| {
-            self.diagnostics.report(QUEUE_FULL);
+            self.diagnostics
+                .report(QUEUE_FULL, Wait::Queue, None, Arc::as_ptr(connection) as usize);
             QUEUE_FULL
         };
         let local = connection.pending.clone().try_acquire_owned().map_err(full)?;
@@ -158,7 +158,12 @@ impl WaitingRead {
         // pressure, so it has its own deadline; the admission deadline starts
         // once this read's turn comes up.
         let turn = tokio::time::timeout(ORDER_WAIT, order).await.map_err(|_| {
-            self.engine.diagnostics.report(Rejection::OrderingWait.message());
+            self.engine.diagnostics.report(
+                Rejection::OrderingWait.message(),
+                Wait::Ordering,
+                self.tracked.as_ref(),
+                self.connection_id(),
+            );
             Rejection::OrderingWait
         })?;
         self.deadline = tokio::time::Instant::now() + self.engine.wait;
@@ -166,9 +171,18 @@ impl WaitingRead {
         Ok((permits, turn))
     }
 
-    pub(super) fn identify(mut self, session: &str, request: &str, verb: String) -> Self {
-        self.tracked = Some(self.engine.diagnostics.track(session, request, verb));
+    /// `key` is `ReadOrdering::key_id` of the request.
+    pub(super) fn identify(mut self, session: &str, request: &str, verb: String, key: u64) -> Self {
+        self.tracked = Some(
+            self.engine
+                .diagnostics
+                .track(session, request, verb, key, self.connection_id()),
+        );
         self
+    }
+
+    fn connection_id(&self) -> usize {
+        Arc::as_ptr(&self.connection) as usize
     }
 
     pub(super) async fn acquire(self) -> Result<ReadPermits, &'static str> {
@@ -202,7 +216,9 @@ impl WaitingRead {
                 })
             }
             Err(message) => {
-                self.engine.diagnostics.report(message);
+                self.engine
+                    .diagnostics
+                    .report(message, Wait::Permit, self.tracked.as_ref(), self.connection_id());
                 Err(message)
             }
         }

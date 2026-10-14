@@ -26,10 +26,17 @@ impl ReadOrdering {
         self.keys.len()
     }
 
-    pub(in crate::app) async fn reserve(&mut self, request: &FrontendRequest) -> Turn {
-        self.keys.retain(|_, mutex| mutex.strong_count() > 0);
+    /// Opaque identity of the request's ordering key, for diagnostics.
+    pub(in crate::app) fn key_id(request: &FrontendRequest) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        Self::key(request).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn key(request: &FrontendRequest) -> String {
         // Refresh changes how a listing is loaded, not its destination view.
-        let key = match request {
+        match request {
             FrontendRequest::GetDriverQuotaUsage { .. } => {
                 serde_json::to_string(&FrontendRequest::GetDriverQuotaUsage { refresh: false })
             }
@@ -47,7 +54,12 @@ impl ReadOrdering {
             }),
             _ => serde_json::to_string(request),
         }
-        .expect("serializable request");
+        .expect("serializable request")
+    }
+
+    pub(in crate::app) async fn reserve(&mut self, request: &FrontendRequest) -> Turn {
+        self.keys.retain(|_, mutex| mutex.strong_count() > 0);
+        let key = Self::key(request);
         let mutex = match self.keys.get(&key).and_then(Weak::upgrade) {
             Some(mutex) => mutex,
             None => {

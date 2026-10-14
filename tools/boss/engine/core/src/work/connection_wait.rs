@@ -1,4 +1,24 @@
 //! A contended synchronous DB mutex must not pin an async runtime worker.
+//!
+//! On a multithread runtime a contended `acquire` wraps the blocking
+//! `Mutex::lock` in `block_in_place`, which hands the worker's core (and its
+//! queued tasks, timers and IO) to another thread while this one sleeps.
+//! Trade-offs, accepted deliberately:
+//!
+//! - Each contended caller can cost one extra thread from tokio's blocking
+//!   pool (bounded by its `max_blocking_threads` cap, shared with
+//!   `spawn_blocking` reads). A pile-up behind a slow holder therefore grows
+//!   threads rather than starving the runtime; the slow holder is what the
+//!   timing log below exists to name.
+//! - `block_in_place` only frees the worker for *other* tasks. Futures
+//!   multiplexed inside the same task (`select!`/`join!`) cannot progress
+//!   while it waits, so long-running background DB callers belong on
+//!   `spawn_blocking` rather than directly in an async task.
+//! - The wait itself is unbounded: giving up would turn a slow query into a
+//!   spurious failure of a caller that has no retry path. A wait or hold of
+//!   at least 100 ms is logged with the caller's location instead.
+//!
+//! Synchronous callers and current-thread runtimes lock normally.
 use super::{Connection, Mutex, PooledConnection, Result};
 use std::sync::TryLockError;
 
@@ -74,4 +94,65 @@ pub(super) fn acquire(connection: &Mutex<Connection>) -> Result<PooledConnection
     };
     let waited = start.elapsed();
     guard.map(|guard| ConnectionGuard::new(guard, caller, waited))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::log_capture;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn mutex() -> Mutex<Connection> {
+        Mutex::new(Connection::open_in_memory().unwrap())
+    }
+
+    /// Log lines naming this file as the caller, emitted since `from`.
+    fn lines_since(buffer: &log_capture::SharedBuffer, from: usize) -> Vec<String> {
+        let log = String::from_utf8_lossy(&buffer.lock()[from..]).into_owned();
+        log.lines()
+            .filter(|line| line.contains("work DB connection lock timing") && line.contains("connection_wait.rs"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn slow_waits_and_holds_are_logged_with_caller_and_fast_ones_are_not() {
+        let buffer = log_capture::install();
+        let from = buffer.lock().len();
+        let fast = mutex();
+        drop(acquire(&fast).unwrap());
+        assert!(
+            lines_since(&buffer, from).is_empty(),
+            "fast uncontended lock must not log"
+        );
+
+        let from = buffer.lock().len();
+        let held = acquire(&fast).unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        drop(held);
+        let lines = lines_since(&buffer, from);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("wait_ms=0"), "{}", lines[0]);
+        assert!(!lines[0].contains("held_ms=0 "), "{}", lines[0]);
+
+        let from = buffer.lock().len();
+        let contended = Arc::new(mutex());
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn({
+            let contended = contended.clone();
+            move || {
+                let guard = contended.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+                drop(guard);
+            }
+        });
+        locked_rx.recv().unwrap();
+        drop(acquire(&contended).unwrap());
+        holder.join().unwrap();
+        let lines = lines_since(&buffer, from);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].contains("wait_ms=0 "), "{}", lines[0]);
+    }
 }

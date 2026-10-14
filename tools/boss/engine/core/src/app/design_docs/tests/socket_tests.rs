@@ -335,7 +335,9 @@ async fn a_fetch_beyond_the_global_limit_gets_the_busy_error_and_frees_on_releas
             if let Some(id) = env.request_id {
                 assert_eq!(id, "excess", "gated fetch replied before release");
                 match env.payload {
-                    FrontendEvent::WorkError { message } => assert_eq!(message, crate::app::read_admission::BUSY),
+                    FrontendEvent::WorkError { message } => {
+                        assert_eq!(message, crate::app::coordinator_guidance::FETCH_LIMIT)
+                    }
                     other => panic!("expected busy WorkError, got {other:?}"),
                 }
                 break;
