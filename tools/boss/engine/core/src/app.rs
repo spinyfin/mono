@@ -546,6 +546,7 @@ struct ServerStateOverrides {
     /// Global limiter for on-demand coordinator guidance fetches. `None` uses
     /// `coordinator_guidance::MAX_CONCURRENT_FETCHES` permits.
     guidance_fetches: Option<Arc<tokio::sync::Semaphore>>,
+    org_recheck: Option<Arc<tokio::sync::Semaphore>>,
     /// Fake live-CI probe. `None` uses `CommandMergeProbe`.
     merge_probe: Option<Arc<dyn MergeProbe>>,
     /// Fake Trunk token store. `None` uses `boss_trunk_auth::TrunkTokenStore`.
@@ -1216,6 +1217,7 @@ impl ServerState {
             read_admission: read_admission_override,
             live_read_admission: live_read_admission_override,
             guidance_fetches: guidance_fetches_override,
+            org_recheck: org_recheck_override,
             merge_probe: merge_probe_override,
             trunk_token_store: trunk_token_store_override,
             trunk_client: trunk_client_override,
@@ -1723,6 +1725,7 @@ impl ServerState {
                 .read_admission(read_admission_override.unwrap_or_default())
                 .maybe_live_read_admission(live_read_admission_override)
                 .maybe_guidance_fetches(guidance_fetches_override)
+                .maybe_org_recheck(org_recheck_override)
                 .design_docs(design_docs_override.unwrap_or_else(|| {
                     Arc::new(boss_engine_design_docs::DesignDocsService::new(
                         state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),

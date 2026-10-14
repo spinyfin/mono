@@ -122,7 +122,7 @@ impl ReadAdmission {
 }
 
 /// Why an accepted read was rejected while waiting. Both reach the client as
-/// the same busy reply; the distinction is for the operator's log.
+/// the same busy reply; the distinction only selects which warning is logged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Rejection {
     /// Expired behind an earlier identical read (fixed `ORDER_WAIT`).

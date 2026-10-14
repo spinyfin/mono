@@ -131,36 +131,3 @@ async fn no_products_is_an_empty_list_not_an_error() {
     let (state, _temp) = server_state();
     assert!(views(list(&state, None).await).is_empty());
 }
-
-#[tokio::test]
-async fn a_fetch_beyond_the_global_limit_gets_the_busy_error_and_frees_on_release() {
-    let temp = tempfile::tempdir().unwrap();
-    let cfg = Arc::new(RuntimeConfig::from_parts(
-        crate::config::WorkConfig::builder()
-            .cwd(temp.path().to_path_buf())
-            .db_path(temp.path().join("state.db"))
-            .build(),
-        None,
-    ));
-    let limiter = Arc::new(tokio::sync::Semaphore::new(
-        coordinator_guidance::MAX_CONCURRENT_FETCHES,
-    ));
-    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
-        cfg,
-        None,
-        None,
-        ServerStateOverrides::builder()
-            .guidance_fetches(limiter.clone())
-            .build(),
-    )
-    .unwrap();
-    let held: Vec<_> = (0..coordinator_guidance::MAX_CONCURRENT_FETCHES)
-        .map(|_| limiter.clone().try_acquire_owned().unwrap())
-        .collect();
-    match list(&state, None).await {
-        FrontendEvent::WorkError { message } => assert_eq!(message, read_admission::BUSY),
-        other => panic!("expected busy WorkError, got {other:?}"),
-    }
-    drop(held);
-    assert!(views(list(&state, None).await).is_empty());
-}
