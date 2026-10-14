@@ -12,6 +12,7 @@ mod local_worker_quarantine;
 mod pause_admission;
 mod pause_bypass;
 mod pool;
+mod pool_contract;
 mod post_merge_review_dispatch;
 mod recovery;
 mod review_batch_dispatch;
