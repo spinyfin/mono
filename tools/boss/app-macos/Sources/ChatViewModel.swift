@@ -432,6 +432,7 @@ final class ChatViewModel: ObservableObject {
     /// on Settings open and `offsite_backup_settings` after each save. `nil`
     /// until the engine first answers.
     @Published var offsiteBackup: OffsiteBackupSettings?
+    @Published var offsiteEdit = OffsiteBackupEdit()
 
     /// All registered hosts, populated by `list_hosts` on Settings-pane
     /// appear and updated in-place by `host_result`, `host_updated`, and

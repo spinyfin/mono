@@ -9,7 +9,12 @@ fn open_file_db(dir: &Path) -> WorkDb {
 }
 // ── off-machine copies ────────────────────────────────────────
 
-fn offsite_runtime(dest: &Path, keep_hourly: usize, keep_daily: usize) -> (Arc<OffsiteRuntime>, Arc<Registry>) {
+fn offsite_runtime(
+    state: &Path,
+    dest: &Path,
+    keep_hourly: usize,
+    keep_daily: usize,
+) -> (Arc<OffsiteRuntime>, Arc<Registry>) {
     let registry = Arc::new(Registry::new());
     register_metrics(&registry);
     let config = OffsiteConfig {
@@ -18,8 +23,29 @@ fn offsite_runtime(dest: &Path, keep_hourly: usize, keep_daily: usize) -> (Arc<O
         keep_hourly,
         keep_daily,
     };
-    let rt = OffsiteRuntime::from_config(config, registry.clone(), dest.join("success-record")).expect("enabled");
+    let rt = from_config(config, registry.clone(), state.join("settings.toml"));
     (rt, registry)
+}
+
+fn from_config(config: OffsiteConfig, registry: Arc<Registry>, settings: PathBuf) -> Arc<OffsiteRuntime> {
+    write_config(&settings, &config);
+    OffsiteRuntime::from_settings(&settings, registry)
+}
+
+fn write_config(path: &Path, config: &OffsiteConfig) {
+    let destination = config
+        .destination
+        .as_ref()
+        .map(|p| format!("destination = {:?}\n", p.to_str().unwrap()))
+        .unwrap_or_default();
+    std::fs::write(
+        path,
+        format!(
+            "[backup.offsite]\nenabled = {}\n{destination}keep_hourly = {}\nkeep_daily = {}\n",
+            config.enabled, config.keep_hourly, config.keep_daily
+        ),
+    )
+    .unwrap();
 }
 
 fn host_dir(dest: &Path) -> PathBuf {
@@ -32,9 +58,29 @@ fn host_dir(dest: &Path) -> PathBuf {
 fn offsite_disabled_by_default() {
     let tmp = TempDir::new().unwrap();
     let registry = Arc::new(Registry::new());
-    assert!(OffsiteRuntime::from_settings(&tmp.path().join("settings.toml"), registry.clone()).is_none());
+    let rt = OffsiteRuntime::from_settings(&tmp.path().join("settings.toml"), registry.clone());
+    assert!(!rt.load_config().unwrap().enabled);
     std::fs::write(tmp.path().join("settings.toml"), "default_pr_draft_mode = true\n").unwrap();
-    assert!(OffsiteRuntime::from_settings(&tmp.path().join("settings.toml"), registry).is_none());
+    let rt = OffsiteRuntime::from_settings(&tmp.path().join("settings.toml"), registry);
+    assert!(!rt.load_config().unwrap().enabled);
+}
+
+#[test]
+fn disabled_runtime_leaves_age_gauge_untouched() {
+    let tmp = TempDir::new().unwrap();
+    let db = open_file_db(tmp.path());
+    let registry = Arc::new(Registry::new());
+    register_metrics(&registry);
+    OFFSITE_LAST_SUCCESS_AGE_SECS.set(&registry, 12345);
+    let rt = OffsiteRuntime::from_settings(&tmp.path().join("settings.toml"), registry.clone());
+    rt.validate_at_startup();
+    run_backup_with_offsite(&db, &tmp.path().join("backups"), 24, Some(&rt));
+    wait_for_worker(&rt);
+    rt.refresh_age_gauge();
+    assert_eq!(
+        registry.gauge_value("database_backup.offsite.last_success_age_secs"),
+        Some(12345)
+    );
 }
 
 #[test]
@@ -44,7 +90,7 @@ fn offsite_enabled_without_destination_fails_loudly() {
     std::fs::write(&settings, "[backup.offsite]\nenabled = true\n").unwrap();
     let registry = Arc::new(Registry::new());
     register_metrics(&registry);
-    let rt = OffsiteRuntime::from_settings(&settings, registry.clone()).expect("runtime kept for retries");
+    let rt = OffsiteRuntime::from_settings(&settings, registry.clone());
     assert_eq!(rt.age_secs_at(123), -1);
     // Reported at startup, before any snapshot exists.
     rt.validate_at_startup();
@@ -74,7 +120,8 @@ fn offsite_unparseable_section_is_counted() {
     std::fs::write(&settings, "[backup.offsite]\nenabled = \"yes\"\n").unwrap();
     let registry = Arc::new(Registry::new());
     register_metrics(&registry);
-    assert!(OffsiteRuntime::from_settings(&settings, registry.clone()).is_none());
+    let rt = OffsiteRuntime::from_settings(&settings, registry.clone());
+    rt.validate_at_startup();
     assert_eq!(
         registry.counter_value("database_backup.offsite.config_invalid"),
         Some(1)
@@ -92,7 +139,7 @@ fn startup_reports_invalid_destination_when_local_snapshot_fails() {
     // A regular file as the backup dir makes every local snapshot fail.
     let backup_dir = tmp.path().join("not-a-dir");
     std::fs::write(&backup_dir, b"x").unwrap();
-    let (rt, registry) = offsite_runtime(&tmp.path().join("missing-mount"), 1, 1);
+    let (rt, registry) = offsite_runtime(tmp.path(), &tmp.path().join("missing-mount"), 1, 1);
     rt.validate_at_startup();
     wait_for_worker(&rt);
     run_backup_with_offsite(&db, &backup_dir, 24, Some(&rt));
@@ -111,7 +158,7 @@ fn zero_local_retention_still_copies_off_machine() {
     let backup_dir = tmp.path().join("backups");
     let dest = tmp.path().join("sync");
     std::fs::create_dir(&dest).unwrap();
-    let (rt, registry) = offsite_runtime(&dest, 24, 14);
+    let (rt, registry) = offsite_runtime(tmp.path(), &dest, 24, 14);
     run_backup_with_offsite(&db, &backup_dir, 0, Some(&rt));
     wait_for_worker(&rt);
     assert_eq!(std::fs::read_dir(&backup_dir).unwrap().count(), 0, "local pruned");
@@ -127,7 +174,7 @@ fn snapshot_pruned_while_destination_validation_is_blocked_still_copies() {
     let tmp = TempDir::new().unwrap();
     let dest = tmp.path().join("sync");
     std::fs::create_dir(&dest).unwrap();
-    let (rt, registry) = offsite_runtime(&dest, 24, 14);
+    let (rt, registry) = offsite_runtime(tmp.path(), &dest, 24, 14);
     let snap = tmp.path().join("state.db.bak-20260101-000000");
     std::fs::write(&snap, b"snapshot").unwrap();
     let pending = rt.open_snapshot(&snap).unwrap();
@@ -158,7 +205,7 @@ fn success_record_write_failure_is_not_a_failed_copy() {
     let tmp = TempDir::new().unwrap();
     let dest = tmp.path().join("sync");
     std::fs::create_dir(&dest).unwrap();
-    let (rt, registry) = offsite_runtime(&dest, 24, 14);
+    let (rt, registry) = offsite_runtime(tmp.path(), &dest, 24, 14);
     // Make the success record path a directory so persisting it fails.
     std::fs::remove_file(&rt.success_path).ok();
     std::fs::create_dir(&rt.success_path).unwrap();
@@ -170,6 +217,25 @@ fn success_record_write_failure_is_not_a_failed_copy() {
         registry.counter_value("database_backup.offsite.copies_succeeded"),
         Some(1)
     );
+    let success = rt.last_success.load(Ordering::Relaxed);
+    assert!(success > 0);
+    std::fs::remove_dir_all(&dest).unwrap();
+    rt.copy_and_prune(rt.open_snapshot(&snap).unwrap());
+    assert_eq!(rt.last_success.load(Ordering::Relaxed), success);
+    rt.refresh_age_gauge_at(success + 60);
+    assert_eq!(
+        registry.gauge_value("database_backup.offsite.last_success_age_secs"),
+        Some(60)
+    );
+    let mut changed = rt.load_config().unwrap();
+    changed.destination = Some(tmp.path().join("different"));
+    write_config(&rt.settings_path, &changed);
+    rt.load_config().unwrap();
+    rt.refresh_age_gauge();
+    assert_eq!(
+        registry.gauge_value("database_backup.offsite.last_success_age_secs"),
+        Some(-1)
+    );
 }
 
 #[test]
@@ -179,7 +245,7 @@ fn run_backup_copies_off_machine_and_prunes() {
     let backup_dir = tmp.path().join("backups");
     let dest = tmp.path().join("sync");
     std::fs::create_dir(&dest).unwrap();
-    let (rt, registry) = offsite_runtime(&dest, 1, 1);
+    let (rt, registry) = offsite_runtime(tmp.path(), &dest, 1, 1);
     // An old off-machine copy that retention must remove once a newer one lands.
     let host = host_dir(&dest);
     std::fs::create_dir_all(&host).unwrap();
@@ -223,7 +289,7 @@ fn offsite_failure_never_fails_local_backup() {
     let backup_dir = tmp.path().join("backups");
     let dest = tmp.path().join("sync");
     std::fs::create_dir(&dest).unwrap();
-    let (rt, registry) = offsite_runtime(&dest, 24, 14);
+    let (rt, registry) = offsite_runtime(tmp.path(), &dest, 24, 14);
     // Simulate the sync folder vanishing (unmounted) after startup.
     std::fs::remove_dir_all(&dest).unwrap();
 
@@ -247,7 +313,7 @@ fn offsite_failure_never_fails_local_backup() {
 #[test]
 fn age_gauge_uses_last_success_once_present() {
     let tmp = TempDir::new().unwrap();
-    let (rt, _registry) = offsite_runtime(tmp.path(), 1, 1);
+    let (rt, _registry) = offsite_runtime(tmp.path(), tmp.path(), 1, 1);
     rt.last_success.store(1000, Ordering::Relaxed);
     assert_eq!(rt.age_secs_at(1120), 120);
     assert_eq!(rt.age_secs_at(999), 0);
@@ -269,12 +335,16 @@ fn restart_preserves_stale_success_and_new_destination_has_no_success() {
         destination: Some(tmp.path().join("missing-mount")),
         ..OffsiteConfig::default()
     };
-    let path = tmp.path().join("success");
+    let path = tmp.path().join("settings.toml");
     let old = boss_engine_utils::epoch_time::now_epoch_secs() - 172800;
-    std::fs::write(&path, format!("{old}\n{:?}", config.destination)).unwrap();
+    std::fs::write(
+        path.with_file_name("offsite-last-success"),
+        format!("{old}\n{:?}", config.destination),
+    )
+    .unwrap();
     let registry = Arc::new(Registry::new());
     register_metrics(&registry);
-    let rt = OffsiteRuntime::from_config(config.clone(), registry.clone(), path.clone()).unwrap();
+    let rt = from_config(config.clone(), registry.clone(), path.clone());
     rt.refresh_age_gauge();
     assert!(
         registry
@@ -286,18 +356,18 @@ fn restart_preserves_stale_success_and_new_destination_has_no_success() {
         destination: Some(tmp.path().join("different")),
         ..config
     };
-    let rt = OffsiteRuntime::from_config(changed, registry, path).unwrap();
+    let rt = from_config(changed, registry, path);
     assert_eq!(rt.age_secs_at(123), -1);
 }
 
 #[test]
 fn successful_copy_persists_timestamp_for_restart() {
     let tmp = TempDir::new().unwrap();
-    let (rt, registry) = offsite_runtime(tmp.path(), 1, 1);
+    let (rt, registry) = offsite_runtime(tmp.path(), tmp.path(), 1, 1);
     let snapshot = tmp.path().join("state.db.bak-20260101-000000");
     std::fs::write(&snapshot, b"snapshot").unwrap();
     rt.copy_and_prune(rt.open_snapshot(&snapshot).unwrap());
-    let restarted = OffsiteRuntime::from_config(rt.config.clone(), registry, rt.success_path.clone()).unwrap();
+    let restarted = OffsiteRuntime::from_settings(&rt.settings_path, registry);
     assert_eq!(
         restarted.last_success.load(Ordering::Relaxed),
         rt.last_success.load(Ordering::Relaxed)
@@ -308,7 +378,7 @@ fn successful_copy_persists_timestamp_for_restart() {
 #[test]
 fn retention_failure_is_counted_without_failing_copy() {
     let tmp = TempDir::new().unwrap();
-    let (rt, registry) = offsite_runtime(tmp.path(), 1, 0);
+    let (rt, registry) = offsite_runtime(tmp.path(), tmp.path(), 1, 0);
     let host = host_dir(tmp.path());
     std::fs::create_dir_all(host.join("state.db.bak-20200101-000000")).unwrap();
     let snapshot = tmp.path().join("state.db.bak-20260101-000000");
@@ -329,7 +399,7 @@ fn blocked_destination_does_not_stop_local_snapshots_or_retention() {
     let tmp = TempDir::new().unwrap();
     let db = open_file_db(tmp.path());
     let backups = tmp.path().join("backups");
-    let (rt, registry) = offsite_runtime(tmp.path(), 1, 1);
+    let (rt, registry) = offsite_runtime(tmp.path(), tmp.path(), 1, 1);
     let (release, blocked) = std::sync::mpsc::channel();
     let (started, ready) = std::sync::mpsc::channel();
     rt.start_job(move |_| {
@@ -356,4 +426,56 @@ fn blocked_destination_does_not_stop_local_snapshots_or_retention() {
     );
     release.send(()).unwrap();
     wait_for_worker(&rt);
+}
+
+#[test]
+fn passes_reload_destination_retention_enablement_and_reject_bad_settings() {
+    let tmp = TempDir::new().unwrap();
+    let settings = tmp.path().join("settings.toml");
+    let registry = Arc::new(Registry::new());
+    register_metrics(&registry);
+    let rt = OffsiteRuntime::from_settings(&settings, registry.clone());
+    let snap = tmp.path().join("state.db.bak-20260102-000000");
+    std::fs::write(&snap, b"snapshot").unwrap();
+    let pass = || rt.copy_and_prune(rt.open_snapshot(&snap).unwrap());
+    pass(); // Disabled at startup, but runtime must observe later enablement.
+    for (name, keep) in [("first", 2), ("second", 1)] {
+        let destination = tmp.path().join(name);
+        std::fs::create_dir_all(host_dir(&destination)).unwrap();
+        let old = host_dir(&destination).join("state.db.bak-20260101-000000");
+        std::fs::write(&old, b"old").unwrap();
+        write_config(
+            &settings,
+            &OffsiteConfig {
+                enabled: true,
+                destination: Some(destination.clone()),
+                keep_hourly: keep,
+                keep_daily: 0,
+            },
+        );
+        pass();
+        assert!(host_dir(&destination).join(snap.file_name().unwrap()).exists());
+        assert_eq!(old.exists(), keep == 2);
+    }
+    assert_eq!(
+        registry.counter_value("database_backup.offsite.copies_succeeded"),
+        Some(2)
+    );
+    std::fs::write(&settings, "[backup.offsite]\nenabled = 'invalid'").unwrap();
+    pass();
+    assert_eq!(registry.counter_value("database_backup.offsite.copies_failed"), Some(1));
+    assert_eq!(
+        registry.counter_value("database_backup.offsite.config_invalid"),
+        Some(1)
+    );
+    assert_eq!(
+        registry.counter_value("database_backup.offsite.copies_succeeded"),
+        Some(2)
+    );
+    write_config(&settings, &OffsiteConfig::default());
+    pass();
+    assert_eq!(
+        registry.counter_value("database_backup.offsite.copies_succeeded"),
+        Some(2)
+    );
 }

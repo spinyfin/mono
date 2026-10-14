@@ -53,6 +53,7 @@ extension ChatViewModel {
             // Settings reflects the engine immediately after connecting
             // rather than waiting until Settings is opened.
             engine.sendGetSettings()
+            refreshOffsiteBackup()
             // Pull the current GitHub OAuth auth state so the "GitHub
             // account" settings subsection reflects a token persisted by a
             // prior session (the engine restores it from the keychain at
@@ -81,6 +82,7 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            disconnectOffsiteBackupEdit()
             clearCoordinatorReset()
             isConnected = false
             stopBackgroundWorkPolling(clearSnapshot: true)
@@ -205,6 +207,7 @@ extension ChatViewModel {
         case .operatorQuestionError(let message, let requestId):
             handleOperatorQuestionError(message: message, requestId: requestId)
         case .workError(let message, let requestId):
+            if settleOffsiteBackupError(message, requestID: requestId) { return }
             // An error carrying the answer's own request id is not ambiguous:
             // settle it onto that card without blaming any other request.
             if settleOperatorAnswerWorkError(message: message, requestId: requestId) { return }
@@ -370,8 +373,8 @@ extension ChatViewModel {
             panePoolConfigHandler?(workerSlots, automationSlots, reviewSlots, coordinatorModel)
         case .settingsList(let settings):
             engineSettings = settings
-        case .offsiteBackupSettings(let settings):
-            offsiteBackup = settings
+        case .offsiteBackupSettings(let settings, let requestId):
+            receiveOffsiteBackup(settings, requestID: requestId)
         case .settingSet(let key, let enabled):
             if let idx = engineSettings.firstIndex(where: { $0.key == key }) {
                 let prior = engineSettings[idx]

@@ -3,8 +3,8 @@ use boss_engine_offsite_backup::{CONFIG_SECTION, OffsiteConfig};
 use boss_metrics::Registry;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 // ── Off-machine copy metrics ──────────────────────────────────────────────
 
 crate::register_counter!(
@@ -65,76 +65,84 @@ pub struct Snapshot {
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct OffsiteRuntime {
-    config: OffsiteConfig,
+    settings_path: PathBuf,
     host: String,
     registry: Arc<Registry>,
     success_path: PathBuf,
     in_flight: AtomicBool,
+    enabled: AtomicBool,
+    // Outer None means startup; only a new destination reloads the durable record.
+    loaded_destination: Mutex<Option<Option<PathBuf>>>,
     /// Epoch seconds of the last successful copy; 0 = no durable success.
     last_success: AtomicI64,
 }
 
 impl OffsiteRuntime {
-    /// Build from `<state_root>/settings.toml`. `None` when the feature is
-    /// disabled (the default) or the section cannot be parsed. An enabled but
-    /// unusable destination still yields a runtime. The destination worker
-    /// validates it every cycle, since a sync folder may mount late.
-    pub fn from_settings(settings_path: &Path, registry: Arc<Registry>) -> Option<Arc<Self>> {
-        let config = match OffsiteConfig::load(settings_path) {
-            Ok(config) => config,
-            Err(err) => {
-                tracing::error!(
-                    error = %format!("{err:#}"),
-                    settings = %settings_path.display(),
-                    "database-backup: cannot read {CONFIG_SECTION} settings; off-machine backups are NOT running",
-                );
-                OFFSITE_CONFIG_INVALID.inc(&registry);
-                // No runtime means no refresher; a default 0 would read as fresh.
-                OFFSITE_LAST_SUCCESS_AGE_SECS.set(&registry, -1);
-                return None;
-            }
-        };
-        Self::from_config(config, registry, settings_path.with_file_name("offsite-last-success"))
+    /// Keep the runtime alive even when disabled, so each pass can observe edits.
+    pub fn from_settings(settings_path: &Path, registry: Arc<Registry>) -> Arc<Self> {
+        let runtime = Arc::new(
+            Self::builder()
+                .settings_path(settings_path.to_path_buf())
+                .host(boss_engine_utils::host::host_name())
+                .registry(registry)
+                .success_path(settings_path.with_file_name("offsite-last-success"))
+                .in_flight(AtomicBool::new(false))
+                // An unreadable startup configuration must still report unknown success.
+                .enabled(AtomicBool::new(true))
+                .loaded_destination(Mutex::new(None))
+                .last_success(AtomicI64::new(0))
+                .build(),
+        );
+        if let Ok(config) = OffsiteConfig::load(settings_path) {
+            runtime.restore_success(&config);
+        }
+        runtime
     }
 
-    fn from_config(config: OffsiteConfig, registry: Arc<Registry>, success_path: PathBuf) -> Option<Arc<Self>> {
-        if !config.enabled {
-            return None;
+    fn restore_success(&self, config: &OffsiteConfig) {
+        self.enabled.store(config.enabled, Ordering::Relaxed);
+        let mut loaded = self.loaded_destination.lock().unwrap();
+        if loaded.as_ref() == Some(&config.destination) {
+            return;
         }
-        let host = boss_engine_utils::host::host_name();
-        // Read local durable evidence only: startup must never touch the mount.
-        let last_success = std::fs::read_to_string(&success_path)
+        *loaded = Some(config.destination.clone());
+        let last = std::fs::read_to_string(&self.success_path)
             .ok()
             .and_then(|record| {
                 let (timestamp, destination) = record.split_once('\n')?;
-                if destination != format!("{:?}", config.destination) {
-                    return None;
-                }
-                timestamp.parse::<i64>().ok()
+                (destination == format!("{:?}", config.destination))
+                    .then(|| timestamp.parse::<i64>().ok())
+                    .flatten()
             })
             .unwrap_or(0);
-        Some(Arc::new(
-            Self::builder()
-                .config(config)
-                .host(host)
-                .registry(registry)
-                .success_path(success_path)
-                .in_flight(AtomicBool::new(false))
-                .last_success(AtomicI64::new(last_success))
-                .build(),
-        ))
+        self.last_success.store(last, Ordering::Relaxed);
     }
 
-    /// Fail loudly at startup, independent of local snapshot success. The
-    /// settings checks need no I/O and run inline; filesystem validation runs
-    /// on the single-flight worker so startup never waits on the destination.
+    fn load_config(&self) -> anyhow::Result<OffsiteConfig> {
+        OffsiteConfig::load(&self.settings_path)
+            .inspect(|config| self.restore_success(config))
+            .inspect_err(|err| {
+                OFFSITE_CONFIG_INVALID.inc(&self.registry);
+                tracing::error!(error = %format!("{err:#}"), settings = %self.settings_path.display(),
+                "database-backup: cannot read {CONFIG_SECTION}; skipping off-machine copy");
+            })
+    }
+
+    /// Validate independently of local snapshot success, without waiting on the mount.
     pub fn validate_at_startup(self: &Arc<Self>) {
-        if let Err(err) = self.config.destination_setting() {
+        let Ok(config) = self.load_config() else {
+            self.refresh_age_gauge();
+            return;
+        };
+        if !config.enabled {
+            return;
+        }
+        if let Err(err) = config.destination_setting() {
             self.report_config_invalid(&err);
             return;
         }
-        self.start_job(|runtime| {
-            if let Err(err) = runtime.config.validate(&runtime.host) {
+        self.start_job(move |runtime| {
+            if let Err(err) = config.validate(&runtime.host) {
                 runtime.report_config_invalid(&err);
             }
             runtime.refresh_age_gauge();
@@ -206,9 +214,20 @@ impl OffsiteRuntime {
 
     /// Copy the finished local backup `snapshot` off-machine, then prune.
     pub fn copy_and_prune(&self, snapshot: Snapshot) {
+        let config = match self.load_config() {
+            Ok(config) => config,
+            Err(_) => {
+                OFFSITE_COPIES_FAILED.inc(&self.registry);
+                self.refresh_age_gauge();
+                return;
+            }
+        };
+        if !config.enabled {
+            self.refresh_age_gauge();
+            return;
+        }
         let Snapshot { file, name } = snapshot;
-        let result = self
-            .config
+        let result = config
             .validate(&self.host)
             .inspect_err(|_| {
                 OFFSITE_CONFIG_INVALID.inc(&self.registry);
@@ -220,7 +239,7 @@ impl OffsiteRuntime {
         match result {
             Ok((dest, outcome)) => {
                 let now = boss_engine_utils::epoch_time::now_epoch_secs();
-                let record = format!("{now}\n{:?}", self.config.destination);
+                let record = format!("{now}\n{:?}", config.destination);
                 if let Err(error) =
                     boss_engine_utils::atomic_blob::write_blob_atomic(&self.success_path, record.as_bytes())
                 {
@@ -235,8 +254,7 @@ impl OffsiteRuntime {
                     bytes = outcome.bytes,
                     "database-backup: off-machine copy complete",
                 );
-                match boss_engine_offsite_backup::prune(&dest.host_dir, self.config.keep_hourly, self.config.keep_daily)
-                {
+                match boss_engine_offsite_backup::prune(&dest.host_dir, config.keep_hourly, config.keep_daily) {
                     Ok(outcome) => {
                         for (path, error) in outcome.failures {
                             OFFSITE_RETENTION_FAILED.inc(&self.registry);
@@ -280,7 +298,9 @@ impl OffsiteRuntime {
     }
 
     fn refresh_age_gauge_at(&self, now: i64) {
-        OFFSITE_LAST_SUCCESS_AGE_SECS.set(&self.registry, self.age_secs_at(now));
+        if self.enabled.load(Ordering::Relaxed) {
+            OFFSITE_LAST_SUCCESS_AGE_SECS.set(&self.registry, self.age_secs_at(now));
+        }
     }
 }
 
