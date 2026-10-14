@@ -532,12 +532,15 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 ),
                 _ => false,
             };
-            // A `run_done` declaration's acceptance is itself the completion
-            // signal for the WHOLE execution — not just a batch member, the
-            // way a review report/verdict is — mirroring the block above for
-            // exactly the reason its comment gives: do not wait for another,
-            // driver-specific turn boundary that may never arrive after the
-            // worker has delivered its declaration. Evidence checks stay in
+            // A `delivered`/`blocked` `run_done` declaration's acceptance is
+            // itself the completion signal for the WHOLE execution, not just
+            // a batch member the way a review report/verdict is. This
+            // mirrors the block above for exactly the reason its comment
+            // gives: do not wait for another, driver-specific turn boundary
+            // that may never arrive after the worker has delivered its
+            // declaration. A `no-changes-needed` declaration is the
+            // exception: it is accepted or refused only at the driver's
+            // Stop boundary. Evidence checks stay in
             // place, but move off this path entirely (never a network call
             // here — see `completion::run_done_declaration`'s module doc).
             //
@@ -720,7 +723,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                             outcome = %run_done_payload.outcome,
                             delivered = matches!(delivery_outcome, Ok(Ok(true))),
                             ?stop_outcome,
-                            "run_done proposal accepted: finalized synchronously at submit",
+                            "run_done proposal accepted: delivered/blocked finalized synchronously at submit (no-changes-needed waits for Stop)",
                         );
                     }
                     Err(err) => tracing::error!(

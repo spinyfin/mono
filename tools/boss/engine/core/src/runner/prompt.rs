@@ -1113,7 +1113,7 @@ pub(crate) fn run_done_directive(
      ```\n\
      {boss} propose done --outcome <delivered|no-changes-needed|blocked> --summary \"<one line>\"\n\
      ```\n\n\
-     **An accepted declaration ends your run** — the engine tears your pane \
+     **An accepted `delivered` or `blocked` declaration ends your run** — the engine tears your pane \
      down, with no turn after it, not even to see the response. Finish every other thing first, \
      including opening or updating the PR; only declare once nothing is left to do. The engine no \
      longer infers completion from PR state (a run dispatched against an already-open, already-green \

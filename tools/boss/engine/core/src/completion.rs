@@ -2092,8 +2092,9 @@ verified>\"`; that is the sanctioned way to close this run without another push.
 }
 
 /// Probe queued when the no-op guard refuses a `no-changes-needed`
-/// declaration at submit. The declaration is consumed on refusal, so the
-/// worker must re-verify and declare again for the claim to count.
+/// declaration at the driver's Stop boundary. The declaration is consumed
+/// on refusal, so the worker must re-verify and declare again for the claim
+/// to count.
 pub const NO_OP_DECLARATION_REFUSED_PROBE: &str = "Your `no-changes-needed` declaration was refused: \
 the engine could not trust the verification behind it (a command ran without a confirmed \
 result, or an observed contribution contradicts the claim). The declaration has been discarded. \
