@@ -312,6 +312,8 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         ai_review_findings_revision_id: None,
         // Derived; populated after mapping by attach_ready_for_review_flag.
         ready_for_review: false,
+        // Derived; populated after mapping by attach_review_section.
+        review_section: None,
         // Resolved per-task doc-link state. Computed by
         // attach_task_doc_link_state from the task's `doc_*` columns on
         // every read path that returns a Task; None here because the

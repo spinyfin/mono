@@ -80,6 +80,30 @@ extension ChatViewModel {
         )
     }
 
+    /// Build the Review column's labelled sections from each card's
+    /// engine-computed `reviewSection`, in `ReviewSection.allCases` order.
+    /// Empty sections are omitted rather than rendered as empty headers, and
+    /// `items` keeps its incoming order within each section.
+    ///
+    /// The client does not classify: a card the engine sent no section for
+    /// (an engine that predates the field, or a card optimistically moved
+    /// into Review before the next work-tree refresh) lands in `.pending`,
+    /// the neutral "not ready, nothing wrong" section, so it is never hidden
+    /// and never claims a state the engine did not report.
+    static func reviewSections(items: [WorkTask]) -> [WorkBoardSection] {
+        let grouped = Dictionary(grouping: items) { $0.reviewSection ?? .pending }
+        return ReviewSection.allCases.compactMap { section in
+            guard let sectionItems = grouped[section], !sectionItems.isEmpty else { return nil }
+            return WorkBoardSection(
+                id: "review-\(section.rawValue)",
+                title: section.title,
+                items: sectionItems,
+                isCollapsible: true,
+                defaultExpanded: true
+            )
+        }
+    }
+
     /// Bucket completed tasks by recency for the Done lane:
     ///   Today | Yesterday | <weekday names back to start of current week>
     ///   | Last Week | Earlier
@@ -244,13 +268,6 @@ extension ChatViewModel {
         // just `done` ones.
         if column == .review {
             items = items.filter { !($0.kind == "revision" && $0.status == "in_review") }
-            // View-only "ready to merge" narrowing — never mutates the
-            // underlying task. `readyForReview` is engine-computed
-            // (`Task.ready_for_review`), so this reads a fact, it doesn't
-            // re-derive one.
-            if reviewReadyOnly {
-                items = items.filter(\.readyForReview)
-            }
         }
         if column == .done {
             items = items.filter { !($0.kind == "revision" && ($0.status == "done" || $0.status == "in_review")) }
@@ -285,6 +302,12 @@ extension ChatViewModel {
             }
             sections.append(contentsOf: Self.doneSections(items: completed))
             return sections
+        }
+        // Review is always grouped into the engine's labelled sections
+        // (Ready, In Revision, ...), whatever the board's project grouping
+        // is set to.
+        if column == .review {
+            return Self.reviewSections(items: items)
         }
         // Doing's "Needs Attention" section sits above everything else —
         // flat or project-grouped alike: a task waiting on an answer needs attention

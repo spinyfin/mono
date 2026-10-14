@@ -207,6 +207,12 @@ struct WorkTask: Identifiable, Hashable {
     /// CLI and any future surface agree with the board. Mirrors
     /// `Task.ready_for_review` on the wire; `false` when absent.
     var readyForReview: Bool = false
+    /// The labelled Review-column section the engine grouped this card
+    /// under, or `nil` for a row that is not a Review-lane card (and for an
+    /// engine that predates the field). Engine-computed — the board renders
+    /// the key it is given and never re-derives it from the badge fields
+    /// above. Mirrors `Task.review_section` on the wire.
+    var reviewSection: ReviewSection? = nil
     /// Resolved doc-link state for this work item. Independent of `kind`
     /// — any task may carry a per-task pointer. Mirrors `Task.doc_link_state`
     /// on the wire: the engine resolves the task's own `doc_*` columns

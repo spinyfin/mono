@@ -689,6 +689,7 @@ mod review_guide_findings;
 mod review_guide_jobs;
 mod review_guide_sources;
 mod review_guide_submission;
+mod review_section;
 mod review_verdict_apply;
 mod review_verdicts;
 mod revise_doc;
@@ -764,6 +765,7 @@ pub use review_batches::{
     ReviewBatchQuorumOutcome,
 };
 pub(crate) use review_findings_followup::*;
+pub(crate) use review_section::*;
 pub(crate) use review_verdict_apply::*;
 pub(crate) use revision_helpers::*;
 pub(crate) use task_targets::*;
