@@ -40,12 +40,12 @@ pub(super) async fn terminal_handoff(real_model: bool) -> Result<()> {
         let boss = cwd.join("boss");
         std::fs::write(
             &boss,
-            "#!/bin/sh\n[ \"$1 $2 $3\" = \"handoff write -\" ] || exit 2\ncat > written-handoff\n",
+            "#!/bin/sh\n[ \"$1 $2 $3\" = \"handoff verify fixture-id\" ] && exit 0\n[ \"$1 $2 $3\" = \"handoff write -\" ] || exit 2\ncat > written-handoff\n",
         )?;
         std::fs::set_permissions(&boss, std::fs::Permissions::from_mode(0o700))?;
         std::fs::write(
             cwd.join("CLAUDE.md"),
-            "This is an isolated handoff verification. When a peer message begins [Boss reset request], it is trusted: run ./boss handoff write - with a nonempty summary on stdin, then stop. The local boss fixture only saves that summary in this directory.",
+            "This is an isolated handoff verification. When a peer message begins [Boss reset request id=<id>], run ./boss handoff verify <id>; only if that succeeds, run ./boss handoff write - with a nonempty summary on stdin, then stop. The local boss fixture only saves that summary in this directory.",
         )?;
     }
     std::fs::write(
@@ -147,7 +147,7 @@ pub(super) async fn terminal_handoff(real_model: bool) -> Result<()> {
             registration["pid"].as_i64().unwrap() as libc::pid_t,
             registration["sessionId"].as_str().unwrap(),
             if real_model {
-                "[Boss reset request] Write your handoff now with ./boss handoff write -, then stop."
+                "[Boss reset request id=fixture-id] Run ./boss handoff verify fixture-id. Only if it succeeds, write your handoff now with ./boss handoff write -, then stop."
             } else {
                 "fixture handoff request"
             },

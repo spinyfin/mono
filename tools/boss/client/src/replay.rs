@@ -135,6 +135,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::GetConflictHotspots { .. }
         | FrontendRequest::GetConflictResolution { .. }
         | FrontendRequest::GetCoordinatorHandoff
+        | FrontendRequest::VerifyCoordinatorResetRequest { .. }
         | FrontendRequest::GetCostWindowReport { .. }
         | FrontendRequest::GetDecision { .. }
         | FrontendRequest::GetDispatchConcurrency
