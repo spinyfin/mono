@@ -331,6 +331,55 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertEqual(grid.layout.focusedRunId, "run-6")
     }
 
+    func testFilterHidesMembersKeepsViewersMountedAndCountsWaiting() {
+        let workspace = WorkersWorkspaceModel()
+        let grid = AgentsGridModel()
+        for (index, run) in ["a", "b", "c"].enumerated() {
+            _ = workspace.attachWorkerPane(makeAttach(runId: run, slot: index + 1))
+        }
+        let sessions = workspace.viewersByRunId.mapValues { $0.session }
+        let states = [
+            makeState(runId: "a", slotId: 1, agentType: "coding", projectId: "p1", projectName: "Alpha"),
+            makeState(runId: "b", slotId: 2, activity: .waitingForInput, agentType: "review", projectId: "p2", projectName: "Beta"),
+            makeState(runId: "c", slotId: 3, agentType: "mystery"),
+        ]
+        grid.apply(states: states, viewers: workspace.viewersByRunId, interactivePoolSize: 16,
+                   automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false)
+        XCTAssertFalse(grid.layout.filter.isActive)
+        XCTAssertEqual(grid.projectOptions, [.project(id: "p1"), .project(id: "p2"), .unfiled])
+        XCTAssertEqual(grid.projectLabel(.project(id: "p2")), "Beta")
+        XCTAssertTrue(grid.typeOptions.contains(.unknown))
+
+        grid.toggleProject(.project(id: "p1"))
+        XCTAssertEqual(grid.layout.visibleCount, 1)
+        XCTAssertEqual(grid.layout.hiddenCount, 2)
+        XCTAssertEqual(grid.layout.waitingCount, 0)
+        XCTAssertEqual(grid.layout.hiddenWaitingCount, 1)
+        // Hidden runs keep their mounted viewers; they are just unplaced.
+        for (run, session) in sessions { XCTAssertTrue(workspace.viewersByRunId[run]?.session === session) }
+        XCTAssertEqual(Set(grid.unplacedViewers.compactMap(\.runId)), ["b", "c"])
+
+        grid.clearFilter()
+        grid.toggleProject(.unfiled)
+        XCTAssertEqual(grid.layout.visibleCount, 1)
+        XCTAssertNotNil(grid.layout.logicalCellIndex(ofRun: "c"))
+        grid.clearFilter()
+        grid.toggleType(.unknown)
+        XCTAssertNotNil(grid.layout.logicalCellIndex(ofRun: "c"))
+        XCTAssertEqual(grid.layout.visibleCount, 1)
+
+        grid.clearFilter()
+        XCTAssertEqual(grid.layout.visibleCount, 3)
+        XCTAssertTrue(grid.unplacedViewers.isEmpty)
+    }
+
+    func testFilterStartsAtAllOnEveryNewModel() {
+        let grid = AgentsGridModel()
+        grid.toggleType(.review)
+        XCTAssertTrue(grid.layout.filter.isActive)
+        XCTAssertEqual(AgentsGridModel().layout.filter, .all)
+    }
+
     func testAttachedOwnershipSurvivesGrowthTidyCollapseAndGeometry() {
         let workspace = WorkersWorkspaceModel()
         let grid = AgentsGridModel(
@@ -391,7 +440,9 @@ final class AgentsGridModelTests: XCTestCase {
         agentType: String? = "coding",
         hostId: String? = WorkerLiveState.localHostId,
         startedAt: String = "2026-10-09T00:00:00Z",
-        pool: String? = "main"
+        pool: String? = "main",
+        projectId: String? = nil,
+        projectName: String? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
             name: name,
@@ -408,6 +459,8 @@ final class AgentsGridModelTests: XCTestCase {
             recoveryStatus: nil,
             tmuxHosted: true,
             agentType: agentType,
+            projectId: projectId,
+            projectName: projectName,
             hostId: hostId,
             startedAt: startedAt,
             pool: pool
