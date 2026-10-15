@@ -408,6 +408,79 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(named.displayName, "Riker")
     }
 
+    /// The grid's render rule: a run the engine no longer lists is finished,
+    /// with or without its viewer, and never the viewer-missing card with an
+    /// "Unknown" type or an "is working" header. "Unknown" is reserved for a
+    /// listed run whose wire type is missing or unrecognised.
+    func testReleasedRunNeverRendersUnknown() {
+        let session = TerminalPaneSession(
+            id: "run-exec-1", role: .worker(slot: 1),
+            launchSpec: TerminalLaunchSpec(fontSize: 10, workingDirectory: "/tmp", initialInput: "")
+        )
+        let attached = WorkerSlot(slotId: 1, session: session, runId: "exec-1", summary: "fixing the scraper", taskTitle: "scraper")
+
+        let detachPending = WorkerSlotSnapshot.render(
+            runId: "exec-1", viewer: attached, liveState: nil, liveStatusDisabledSlotIDs: [], cachedPersona: "Riker"
+        )
+        XCTAssertTrue(detachPending.isPlaceholder)
+        XCTAssertEqual(detachPending.bodyKind, .terminal)
+        XCTAssertEqual(detachPending.headerTitle, "Riker finished")
+        XCTAssertNil(detachPending.headerBadge)
+        XCTAssertEqual(detachPending.statusPillLabel, "Finished")
+        XCTAssertFalse(detachPending.showsLiveStatusToggle)
+
+        let detached = WorkerSlotSnapshot.render(
+            runId: "exec-1", viewer: nil, liveState: nil, liveStatusDisabledSlotIDs: [], cachedPersona: "Riker"
+        )
+        XCTAssertEqual(detached.bodyKind, .placeholder)
+        XCTAssertFalse(detached.isViewerMissing)
+        XCTAssertEqual(detached.headerTitle, "Riker finished")
+        XCTAssertNil(detached.headerBadge)
+        XCTAssertEqual(detached.statusPillLabel, "Finished")
+        XCTAssertEqual(detached.slotId, 0)
+
+        // Persona cache already gone: still finished, never "is working".
+        let anonymous = WorkerSlotSnapshot.render(
+            runId: "exec-1", viewer: nil, liveState: nil, liveStatusDisabledSlotIDs: [], cachedPersona: nil
+        )
+        XCTAssertEqual(anonymous.headerTitle, "Worker exec-1 finished")
+        XCTAssertNil(anonymous.headerBadge)
+
+        // A listed run without a viewer is the viewer-missing card with its
+        // real type and activity; a missing wire type is the one Unknown.
+        let listed = WorkerSlotSnapshot.render(
+            runId: "exec-1", viewer: nil, liveState: Self.makeLiveState(slotId: 7, agentType: "coding", pool: "main"),
+            liveStatusDisabledSlotIDs: [7], cachedPersona: "Riker"
+        )
+        XCTAssertFalse(listed.isPlaceholder)
+        XCTAssertEqual(listed.bodyKind, .viewerMissing)
+        XCTAssertTrue(listed.isViewerMissing)
+        XCTAssertEqual(listed.slotId, 7)
+        XCTAssertFalse(listed.liveStatusEnabled)
+        XCTAssertEqual(listed.headerBadge, .coding)
+        XCTAssertEqual(listed.statusPillLabel, "Working")
+        XCTAssertEqual(listed.headerTitle, "Riker is working")
+        let untyped = WorkerSlotSnapshot.render(
+            runId: "exec-1", viewer: attached, liveState: Self.makeLiveState(agentType: nil),
+            liveStatusDisabledSlotIDs: [], cachedPersona: nil
+        )
+        XCTAssertEqual(untyped.headerBadge, .unknown)
+        XCTAssertEqual(untyped.headerTitle, "Worker exec-1 is fixing the scraper")
+        XCTAssertTrue(untyped.showsLiveStatusToggle)
+    }
+
+    func testHeaderTitleFallsBackFromSummaryToTaskTitle() {
+        let live = Self.makeLiveState(name: "Crusher")
+        let titled = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "exec-1", summary: nil, taskTitle: "kanban: revision cards"),
+            liveState: live, liveStatusEnabled: true
+        )
+        XCTAssertEqual(titled.headerTitle, "Crusher: kanban: revision cards")
+        let bare = WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1, runId: "exec-1"), liveState: live, liveStatusEnabled: true)
+        XCTAssertEqual(bare.headerTitle, "Crusher is working")
+        XCTAssertNil(WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1), liveState: nil, liveStatusEnabled: true).statusPillLabel)
+    }
+
     func testParseMembershipMetadata() throws {
         let client = EngineClient(socketPath: "/tmp/meta-test-\(UUID().uuidString).sock")
         let payload: [String: Any] = [

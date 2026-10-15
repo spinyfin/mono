@@ -12,6 +12,14 @@ import SwiftUI
 /// Every attached run stays in the `ZStack` so pagination is a display
 /// filter — no `dismantleNSView`, no libghostty surface teardown. Off-page
 /// and unplaced attached surfaces stay mounted at zero opacity.
+///
+/// Pane state is derived, never cached: each body pass builds every slot's
+/// `WorkerSlotSnapshot` from the current layout cell, viewer map and
+/// live-state store (`WorkerSlotSnapshot.render`). A run the engine has
+/// released is therefore the finished placeholder — or gone — the moment
+/// the inputs say so, whether or not Agents was visible when the release,
+/// detach, or slot reuse arrived. `.equatable()` on `WorkerSlotView` still
+/// skips unchanged slot bodies because the snapshot is a value.
 struct WorkersDetailView: View, @MainActor Equatable {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @ObservedObject var liveStates: LiveWorkerStateStore
@@ -20,7 +28,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
     let onToggleLiveStatus: (Int, Bool) -> Void
 
     @StateObject private var grid = AgentsGridModel()
-    @State private var cachedSnapshots: [String: WorkerSlotSnapshot] = [:]
     @State private var emptyFlavorCycle = Int.random(in: 0...10_000)
 
     init(
@@ -52,7 +59,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
         }
         .background(Color(nsColor: .separatorColor))
         .onAppear(perform: bindAndSync)
-        .onChange(of: grid.layout) { _, _ in if isVisible { refreshSnapshots() } }
         .onChange(of: isVisible) { _, _ in syncGrid() }
         .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
         .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
@@ -90,7 +96,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.orange)
             }
-            Button("Tidy") { grid.tidy(); refreshSnapshots() }
+            Button("Tidy") { grid.tidy() }
                 .font(.caption)
                 .disabled(!grid.layout.isTidyHighlighted)
                 .opacity(grid.layout.isTidyHighlighted ? 1 : 0.45)
@@ -128,7 +134,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
                 Text(filterTitle("Type", count: grid.layout.filter.types?.count))
             }
             if grid.layout.filter.isActive {
-                Button("Clear") { grid.clearFilter(); refreshSnapshots() }
+                Button("Clear") { grid.clearFilter() }
                     .help("Show all agents again.")
             }
         }
@@ -179,7 +185,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
         let layout = grid.layout
         return GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                AgentSurfaceCollection(runIds: renderRunIds, layout: layout, area: geo.size) { runId in
+                AgentSurfaceCollection(runIds: grid.renderRunIds(attached: workspace.viewersByRunId.keys), layout: layout, area: geo.size) { runId in
                     let snapshot = renderSnapshot(runId: runId)
                     WorkerSlotView(
                         runtime: workspace.runtime,
@@ -196,16 +202,17 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .background(paneSizeReader)
     }
 
-    private var renderRunIds: [String] {
-        Set(cachedSnapshots.keys).union(workspace.viewersByRunId.keys).sorted()
-    }
-
+    /// Current render state for one mounted surface. The engine's live
+    /// state decides live versus finished; the layout only decides where
+    /// (and whether) the surface is visible.
     private func renderSnapshot(runId: String) -> WorkerSlotSnapshot {
-        if let cached = cachedSnapshots[runId],
-           cached.session === workspace.viewersByRunId[runId]?.session {
-            return cached
-        }
-        return snapshot(runId: runId, isPlaceholder: false)
+        WorkerSlotSnapshot.render(
+            runId: runId,
+            viewer: workspace.viewersByRunId[runId],
+            liveState: liveStates.byRunID[runId],
+            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs,
+            cachedPersona: grid.personaName(for: runId)
+        )
     }
 
     private var emptyState: some View {
@@ -264,57 +271,18 @@ struct WorkersDetailView: View, @MainActor Equatable {
         syncGrid()
     }
 
+    /// Feeds every input change to the grid, visible or hidden. Hidden
+    /// changes apply immediately under the layout's hidden rule; the only
+    /// thing visibility gates is what is drawn.
     private func syncGrid() {
-        grid.setVisible(isVisible)
-        guard isVisible else { return }
         grid.apply(
+            isVisible: isVisible,
             states: Array(liveStates.byRunID.values),
             viewers: workspace.viewersByRunId,
             interactivePoolSize: workspace.interactivePoolSize,
             automationPoolSize: workspace.automationPoolSize,
             reviewPoolSize: workspace.reviewSlotCount,
             feedUnavailable: liveStates.feedUnavailable
-        )
-        refreshSnapshots()
-    }
-
-    private func refreshSnapshots() {
-        var next: [String: WorkerSlotSnapshot] = [:]
-        for page in grid.layout.pages {
-            for cell in page.cells {
-                if let value = snapshot(for: cell), let runId = value.runId { next[runId] = value }
-            }
-        }
-        if cachedSnapshots != next { cachedSnapshots = next }
-    }
-
-    private func snapshot(for cell: PaneCell) -> WorkerSlotSnapshot? {
-        switch cell.content {
-        case .empty:
-            return nil
-        case .occupied(let member):
-            return snapshot(runId: member.runId, isPlaceholder: false)
-        case .placeholder(let runId):
-            return snapshot(runId: runId, isPlaceholder: true)
-        }
-    }
-
-    private func snapshot(runId: String, isPlaceholder: Bool) -> WorkerSlotSnapshot {
-        let viewer = workspace.viewersByRunId[runId]
-        let live = isVisible ? liveStates.byRunID[runId] : nil
-        let slotId = viewer?.slotId ?? live?.slotId ?? 0
-        let slot = viewer ?? WorkerSlot(
-            slotId: slotId,
-            runId: runId,
-            summary: nil,
-            taskTitle: nil
-        )
-        return WorkerSlotSnapshot.build(
-            slot: slot,
-            liveState: live,
-            liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slotId),
-            isPlaceholder: isPlaceholder,
-            cachedPersona: grid.personaName(for: runId)
         )
     }
 }
@@ -396,20 +364,23 @@ struct WorkerSlotView: View, @MainActor Equatable {
 
     @ViewBuilder
     private var slotBody: some View {
-        if snapshot.isPlaceholder, snapshot.session == nil {
+        switch snapshot.bodyKind {
+        case .placeholder:
             placeholderCard
-        } else if let session = snapshot.session {
-            WorkerPaneTerminalView(
-                runtime: runtime,
-                session: session,
-                liveStatePresent: snapshot.live != nil
-            )
-            .id(session.id)
-            .opacity(snapshot.isPlaceholder || snapshot.isExited ? 0.55 : 1)
-            .onChange(of: snapshot.displayName, initial: true) { _, name in
-                session.setWorkerName(name)
+        case .terminal:
+            if let session = snapshot.session {
+                WorkerPaneTerminalView(
+                    runtime: runtime,
+                    session: session,
+                    liveStatePresent: snapshot.live != nil
+                )
+                .id(session.id)
+                .opacity(snapshot.isPlaceholder || snapshot.isExited ? 0.55 : 1)
+                .onChange(of: snapshot.displayName, initial: true) { _, name in
+                    session.setWorkerName(name)
+                }
             }
-        } else {
+        case .viewerMissing:
             viewerMissingCard
         }
     }
@@ -435,7 +406,9 @@ struct WorkerSlotView: View, @MainActor Equatable {
             Text(snapshot.displayName)
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(Color.white.opacity(0.85))
-            AgentTypeBadge(type: snapshot.badgeType, raw: snapshot.live?.agentType)
+            if let badge = snapshot.headerBadge {
+                AgentTypeBadge(type: badge, raw: snapshot.live?.agentType)
+            }
             if let live = snapshot.live {
                 statusPill(live.activity.agentsPaneLabel, color: liveActivityColor(live.activity))
             }
@@ -479,8 +452,8 @@ struct WorkerSlotView: View, @MainActor Equatable {
 
             Spacer(minLength: 0)
 
-            if snapshot.live != nil {
-                AgentTypeBadge(type: snapshot.badgeType, raw: snapshot.live?.agentType)
+            if let badge = snapshot.headerBadge {
+                AgentTypeBadge(type: badge, raw: snapshot.live?.agentType)
             }
 
             // Prefer engine-supplied LiveWorkerState — its activity is
@@ -489,18 +462,15 @@ struct WorkerSlotView: View, @MainActor Equatable {
             // observing pill until the worker's first hook fires, so
             // `.equatable()` skipping this body does not freeze the
             // fallback chrome.
-            if snapshot.isPlaceholder {
-                statusPill("Finished", color: .secondary)
-            } else if let live = snapshot.live {
-                statusPill(
-                    live.activity.agentsPaneLabel,
-                    color: liveActivityColor(live.activity)
-                )
+            if let label = snapshot.statusPillLabel {
+                statusPill(label, color: snapshot.isPlaceholder ? .secondary : liveActivityColor(snapshot.live?.activity))
             } else if let session = snapshot.session {
                 WorkerSlotFallbackMonitorPill(session: session)
             }
 
-            liveStatusToggle
+            if snapshot.showsLiveStatusToggle {
+                liveStatusToggle
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
@@ -532,14 +502,14 @@ struct WorkerSlotView: View, @MainActor Equatable {
         .accessibilityLabel(enabled ? "Disable live status" : "Enable live status")
     }
 
-    private func liveActivityColor(_ activity: WorkerActivity) -> Color {
+    private func liveActivityColor(_ activity: WorkerActivity?) -> Color {
         switch activity {
         case .working: .blue
         case .waitingForInput: .orange
         case .idle: .green
         case .spawning: .secondary
         case .errored: .red
-        case .terminated: .secondary
+        case .terminated, nil: .secondary
         }
     }
 
@@ -570,27 +540,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
     /// and identifying the task without the gerund connector.
     @ViewBuilder
     private var slotTaskLine: some View {
-        let name = snapshot.displayName
-        let text: String = {
-            if snapshot.isPlaceholder {
-                return "\(name) finished"
-            }
-            if let summary = snapshot.summary, !summary.isEmpty {
-                // Success path: Claude-generated gerund phrase.
-                // Preserved verbatim — do NOT change this branch.
-                return "\(name) is \(summary)"
-            }
-            if let taskTitle = snapshot.taskTitle, !taskTitle.isEmpty {
-                // Fallback path: no gerund available (no API key or
-                // summarization failed). Use "<Name>: <task>" format.
-                return "\(name): \(taskTitle)"
-            }
-            if snapshot.runId != nil {
-                return "\(name) is working"
-            }
-            return name
-        }()
-        Text(text)
+        Text(snapshot.headerTitle)
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
             .lineLimit(1)

@@ -411,6 +411,210 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertEqual(Set(grid.unplacedViewers.compactMap(\.runId)), Set((1..<9).map { "run-\($0)" }))
     }
 
+    // MARK: - Released runs never linger
+
+    /// A release that lands while Agents is hidden applies at once under the
+    /// layout's hidden rule, and the released run renders as finished (not a
+    /// viewerless live member) until its detach removes it. Re-entering
+    /// Agents shows current membership with no placeholder and nothing to
+    /// tidy.
+    func testReleaseWhileHiddenCompactsAndRendersFinishedUntilDetach() throws {
+        let workspace = WorkersWorkspaceModel()
+        let grid = roomyGrid()
+        let runA = makeState(runId: "run-a", slotId: 1, name: "Riker")
+        let runB = makeState(runId: "run-b", slotId: 2, name: "Data", startedAt: "2026-10-09T00:00:01Z")
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-a", slot: 1))
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-b", slot: 2))
+        let sessionA = try XCTUnwrap(workspace.viewersByRunId["run-a"]?.session)
+
+        sync(grid, visible: true, states: [runA, runB], viewers: workspace.viewersByRunId)
+        XCTAssertEqual(grid.layout.logicalCellIndex(ofRun: "run-a"), 0)
+        sync(grid, visible: false, states: [runA, runB], viewers: workspace.viewersByRunId)
+
+        // Hidden: the engine finalizes run-a and drops it from the feed.
+        let store = LiveWorkerStateStore()
+        store.update(states: [runB])
+        sync(grid, visible: false, states: Array(store.byRunID.values), viewers: workspace.viewersByRunId)
+        XCTAssertNil(grid.layout.logicalCellIndex(ofRun: "run-a"))
+        XCTAssertFalse(grid.layout.pages.contains { page in
+            page.cells.contains { if case .placeholder = $0.content { return true } else { return false } }
+        }, "hidden releases compact away, no placeholder")
+        // The surface stays mounted (detach pending) but is a finished pane.
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-a", "run-b"])
+        let pending = render(grid, runId: "run-a", viewer: workspace.viewersByRunId["run-a"], live: store.byRunID["run-a"])
+        XCTAssertTrue(pending.isPlaceholder)
+        XCTAssertTrue(pending.session === sessionA)
+        XCTAssertEqual(pending.bodyKind, .terminal)
+        XCTAssertEqual(pending.headerTitle, "Riker finished")
+        XCTAssertNil(pending.headerBadge)
+        XCTAssertEqual(pending.statusPillLabel, "Finished")
+
+        // Hidden: the detach arrives. The run is no longer rendered at all.
+        assertSuccess(workspace.detachWorkerPane(runId: "run-a"))
+        sync(grid, visible: false, states: Array(store.byRunID.values), viewers: workspace.viewersByRunId)
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-b"])
+
+        // Back to Agents: current membership, packed, nothing stale.
+        sync(grid, visible: true, states: Array(store.byRunID.values), viewers: workspace.viewersByRunId)
+        XCTAssertEqual(grid.layout.visibleCount, 1)
+        XCTAssertEqual(grid.layout.logicalCellIndex(ofRun: "run-b"), 0)
+        XCTAssertFalse(grid.layout.isTidyHighlighted)
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-b"])
+        let liveB = render(grid, runId: "run-b", viewer: workspace.viewersByRunId["run-b"], live: store.byRunID["run-b"])
+        XCTAssertFalse(liveB.isPlaceholder)
+        XCTAssertEqual(liveB.headerBadge, .coding)
+        XCTAssertEqual(liveB.headerTitle, "Data is working")
+    }
+
+    /// A release while Agents is visible leaves the finished placeholder in
+    /// the run's cell. Once the detach removes the viewer it is the finished
+    /// card — never the viewer-missing card with an "Unknown" type.
+    func testReleaseWhileVisibleRendersFinishedCardAfterDetach() throws {
+        let workspace = WorkersWorkspaceModel()
+        let grid = roomyGrid()
+        let runA = makeState(runId: "run-a", slotId: 1, name: "Riker")
+        let runB = makeState(runId: "run-b", slotId: 2, name: "Data", startedAt: "2026-10-09T00:00:01Z")
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-a", slot: 1))
+        sync(grid, visible: true, states: [runA, runB], viewers: workspace.viewersByRunId)
+
+        let store = LiveWorkerStateStore()
+        store.update(states: [runB])
+        sync(grid, visible: true, states: Array(store.byRunID.values), viewers: workspace.viewersByRunId)
+        assertSuccess(workspace.detachWorkerPane(runId: "run-a"))
+        sync(grid, visible: true, states: Array(store.byRunID.values), viewers: workspace.viewersByRunId)
+
+        let page = try XCTUnwrap(grid.layout.currentPage)
+        XCTAssertEqual(page.cells[0].content, .placeholder(runId: "run-a"))
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-a", "run-b"])
+        let finished = render(grid, runId: "run-a", viewer: workspace.viewersByRunId["run-a"], live: store.byRunID["run-a"])
+        XCTAssertEqual(finished.bodyKind, .placeholder)
+        XCTAssertEqual(finished.headerTitle, "Riker finished")
+        XCTAssertNil(finished.headerBadge)
+        XCTAssertEqual(finished.statusPillLabel, "Finished")
+        XCTAssertFalse(finished.showsLiveStatusToggle)
+        XCTAssertFalse(finished.isViewerMissing)
+    }
+
+    /// Release followed by immediate slot reuse: the new run takes the slot
+    /// (after the stale viewer is detached), the old run is never rendered
+    /// as live again, and the feed's consecutive slot reuse is accepted by
+    /// the store rather than freezing membership.
+    func testReleaseThenImmediateSlotReuseShowsOnlyTheNewRun() throws {
+        let workspace = WorkersWorkspaceModel()
+        let grid = roomyGrid()
+        let store = LiveWorkerStateStore()
+        let runA = makeState(runId: "run-a", slotId: 1, name: "Riker")
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-a", slot: 1))
+        store.update(states: [runA])
+        sync(grid, visible: true, states: Array(store.byRunID.values), viewers: workspace.viewersByRunId)
+
+        // Engine frees slot 1 and spawns run-c into it before the old
+        // viewer's detach has landed: the attach is refused as SlotBusy,
+        // the engine detaches the stale viewer, then retries.
+        store.update(states: [])
+        sync(grid, visible: true, states: Array(store.byRunID.values), viewers: workspace.viewersByRunId)
+        guard case .failure(.slotBusy(let occupant)) = workspace.attachWorkerPane(makeAttach(runId: "run-c", slot: 1)) else {
+            XCTFail("expected SlotBusy while run-a's viewer is still attached")
+            return
+        }
+        XCTAssertEqual(occupant, "run-a")
+        assertSuccess(workspace.detachWorkerPane(runId: "run-a"))
+        guard case .success = workspace.attachWorkerPane(makeAttach(runId: "run-c", slot: 1)) else {
+            XCTFail("expected the retried attach to succeed")
+            return
+        }
+        let runC = makeState(runId: "run-c", slotId: 1, name: "Worf", agentType: "review", startedAt: "2026-10-09T00:00:05Z")
+        store.update(states: [runC])
+        XCTAssertEqual(store.byRunID.keys.sorted(), ["run-c"], "consecutive slot reuse is an accepted snapshot")
+        sync(grid, visible: true, states: Array(store.byRunID.values), viewers: workspace.viewersByRunId)
+
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-c"])
+        XCTAssertEqual(grid.layout.logicalCellIndex(ofRun: "run-c"), 0)
+        XCTAssertNil(grid.layout.logicalCellIndex(ofRun: "run-a"))
+        let liveC = render(grid, runId: "run-c", viewer: workspace.viewersByRunId["run-c"], live: store.byRunID["run-c"])
+        XCTAssertFalse(liveC.isPlaceholder)
+        XCTAssertEqual(liveC.slotId, 1)
+        XCTAssertEqual(liveC.headerBadge, .review)
+        XCTAssertEqual(liveC.headerTitle, "Worf is working")
+        XCTAssertEqual(liveC.bodyKind, .terminal)
+    }
+
+    /// Same reuse without viewers, while visible: run-a's placeholder cell
+    /// is the lowest free cell, so the arrival in its old slot takes that
+    /// cell. The released run is then neither placed nor attached and is
+    /// not rendered; were it rendered, it would still read as finished.
+    func testArrivalReusesReleasedCellAndReleasedRunIsNotRendered() throws {
+        let grid = roomyGrid()
+        let store = LiveWorkerStateStore()
+        let runA = makeState(runId: "run-a", slotId: 1, name: "Riker")
+        let runB = makeState(runId: "run-b", slotId: 2, name: "Data", startedAt: "2026-10-09T00:00:01Z")
+        store.update(states: [runA, runB])
+        sync(grid, visible: true, states: Array(store.byRunID.values), viewers: [:])
+        store.update(states: [runB])
+        sync(grid, visible: true, states: Array(store.byRunID.values), viewers: [:])
+        let runC = makeState(runId: "run-c", slotId: 1, name: "Worf", startedAt: "2026-10-09T00:00:05Z")
+        store.update(states: [runB, runC])
+        sync(grid, visible: true, states: Array(store.byRunID.values), viewers: [:])
+
+        let page = try XCTUnwrap(grid.layout.currentPage)
+        XCTAssertEqual(page.cells[0].content, .occupied(PaneMember(
+            runId: "run-c", startedAt: try XCTUnwrap(WorkerStaleness.parse("2026-10-09T00:00:05Z")),
+            project: .unfiled, type: .coding, isWaiting: false, hasViewer: false
+        )))
+        XCTAssertEqual(grid.renderRunIds(attached: [String]()), ["run-b", "run-c"])
+        XCTAssertNil(grid.personaName(for: "run-a"))
+        let finishedA = render(grid, runId: "run-a", viewer: nil, live: store.byRunID["run-a"])
+        XCTAssertTrue(finishedA.isPlaceholder)
+        XCTAssertNil(finishedA.headerBadge)
+    }
+
+    private func assertSuccess(_ result: EngineReleaseResult, file: StaticString = #filePath, line: UInt = #line) {
+        guard case .success = result else {
+            XCTFail("expected detach success, got \(result)", file: file, line: line)
+            return
+        }
+    }
+
+    private func sync(
+        _ grid: AgentsGridModel,
+        visible: Bool,
+        states: [WorkerLiveState],
+        viewers: [String: WorkerSlot]
+    ) {
+        grid.apply(
+            isVisible: visible,
+            states: states,
+            viewers: viewers,
+            interactivePoolSize: 16,
+            automationPoolSize: 8,
+            reviewPoolSize: 16,
+            feedUnavailable: false
+        )
+    }
+
+    /// Mirrors `WorkersDetailView.renderSnapshot`: the view's exact inputs.
+    private func render(
+        _ grid: AgentsGridModel,
+        runId: String,
+        viewer: WorkerSlot?,
+        live: WorkerLiveState?
+    ) -> WorkerSlotSnapshot {
+        WorkerSlotSnapshot.render(
+            runId: runId,
+            viewer: viewer,
+            liveState: live,
+            liveStatusDisabledSlotIDs: [],
+            cachedPersona: grid.personaName(for: runId)
+        )
+    }
+
+    private func roomyGrid() -> AgentsGridModel {
+        AgentsGridModel(
+            policy: PaneCapacityPolicy(minColumns: 1, minRows: 1, headerHeight: 0, maxPanesPerPage: 8, gap: 0, deadBand: 0),
+            geometry: PaneGeometry(area: PaneSize(width: 400, height: 200), cell: PaneSize(width: 100, height: 100))
+        )
+    }
+
     func testWorkerCellMeasurementIgnoresBossAndNormalizesBackingScale() {
         let one = BackingScaleView(scale: 1)
         let two = BackingScaleView(scale: 2)

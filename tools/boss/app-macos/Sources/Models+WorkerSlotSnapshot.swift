@@ -71,6 +71,63 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     var isExited: Bool { live?.isExited == true }
     var isViewerMissing: Bool { runId != nil && session == nil && !isPlaceholder }
 
+    /// What the slot body draws. A released run keeps its terminal, dimmed,
+    /// while its detach is pending; once the viewer is gone it is the
+    /// finished card. The viewer-missing card is reserved for a run the
+    /// engine still lists.
+    enum BodyKind: Equatable {
+        case placeholder
+        case terminal
+        case viewerMissing
+    }
+
+    var bodyKind: BodyKind {
+        if session != nil { return .terminal }
+        return isPlaceholder ? .placeholder : .viewerMissing
+    }
+
+    /// First titlebar line. A finished run never reads as working: the
+    /// placeholder text wins over any summary or task title.
+    var headerTitle: String {
+        let name = displayName
+        if isPlaceholder {
+            return "\(name) finished"
+        }
+        if let summary, !summary.isEmpty {
+            // Success path: Claude-generated gerund phrase.
+            // Preserved verbatim — do NOT change this branch.
+            return "\(name) is \(summary)"
+        }
+        if let taskTitle, !taskTitle.isEmpty {
+            // Fallback path: no gerund available (no API key or
+            // summarization failed). Use "<Name>: <task>" format.
+            return "\(name): \(taskTitle)"
+        }
+        if runId != nil {
+            return "\(name) is working"
+        }
+        return name
+    }
+
+    /// Type badge in the titlebar and on the viewer-missing card. Only an
+    /// engine-listed run has a type to show; a finished run shows none.
+    var headerBadge: AgentType? {
+        guard !isPlaceholder, live != nil else { return nil }
+        return badgeType
+    }
+
+    /// Titlebar status pill text. `nil` means no engine state yet: the view
+    /// falls back to the session-observing pane-monitor pill.
+    var statusPillLabel: String? {
+        if isPlaceholder { return "Finished" }
+        return live?.activity.agentsPaneLabel
+    }
+
+    /// Whether the live-status toggle is addressable. A finished placeholder
+    /// is historical text, not a worker: its slot may already belong to a
+    /// new run.
+    var showsLiveStatusToggle: Bool { !isPlaceholder }
+
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slotId == rhs.slotId
             && lhs.runId == rhs.runId
@@ -99,6 +156,35 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             liveStatusEnabled: liveStatusEnabled,
             live: liveState.map(WorkerSlotLiveSlice.init),
             isPlaceholder: isPlaceholder,
+            cachedPersona: cachedPersona
+        )
+    }
+
+    /// The Agents grid's render rule for one mounted surface, derived from
+    /// the current inputs only — never from an earlier render. A run the
+    /// engine lists is live; a run it no longer lists is finished, whatever
+    /// the layout, the viewer map, or tab visibility were doing when the
+    /// release arrived. There is no third state: a released run cannot be
+    /// drawn as a viewerless live member with an "Unknown" type.
+    ///
+    /// `viewer` is the run's attached pane, if any; without one the slot
+    /// metadata comes from the live state (the engine's slot id) so a
+    /// release followed by immediate slot reuse still attributes the
+    /// finished card to the right run.
+    static func render(
+        runId: String,
+        viewer: WorkerSlot?,
+        liveState: WorkerLiveState?,
+        liveStatusDisabledSlotIDs: Set<Int>,
+        cachedPersona: String?
+    ) -> WorkerSlotSnapshot {
+        let slotId = viewer?.slotId ?? liveState?.slotId ?? 0
+        let slot = viewer ?? WorkerSlot(slotId: slotId, runId: runId, summary: nil, taskTitle: nil)
+        return build(
+            slot: slot,
+            liveState: liveState,
+            liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slotId),
+            isPlaceholder: liveState == nil,
             cachedPersona: cachedPersona
         )
     }
