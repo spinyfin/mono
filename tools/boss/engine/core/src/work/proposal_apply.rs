@@ -911,17 +911,10 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
         }
     }
 
-    // Foreign-PR guard (the sync twin of `WorkDb::other_work_item_bound_to_pr`,
+    // Foreign-PR guard (shares `WorkDb::other_work_item_bound_to_pr`'s query,
     // on this transaction): a PR another work item holds — typically a
     // follow-up's merged origin PR — is never this execution's deliverable.
-    let holder: Option<String> = tx
-        .query_row(
-            "SELECT id FROM tasks WHERE pr_url = ?1 AND id != ?2 AND deleted_at IS NULL AND kind != 'revision' \
-             ORDER BY created_at ASC, id ASC LIMIT 1",
-            params![payload.pr_url, task.id],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let holder = super::pr_binding::query_other_work_item_bound_to_pr(tx, &payload.pr_url, &task.id)?;
     if let Some(holder) = holder {
         return Ok(ApplyDecision::Rejected(format!(
             "{} is already bound to work item `{holder}`; a PR that belongs to another work item is never \
@@ -1167,6 +1160,68 @@ mod tests {
             "decision_reason should name the real problem, not a provenance mismatch: {:?}",
             outcome.proposal.decision_reason
         );
+    }
+
+    /// A PR another work item already holds (e.g. a follow-up's merged
+    /// origin PR) is rejected and never bound; the work item's own bound PR
+    /// is still accepted.
+    #[test]
+    fn pr_created_rejects_a_pr_held_by_another_work_item() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let holder = crate::test_support::create_test_chore(&db, product.id.clone(), "Holder");
+        let follower = crate::test_support::create_test_chore(&db, product.id, "Follow-up");
+        let execution = crate::test_support::create_ready_chore_execution(&db, follower.id.clone());
+        let url = "https://github.com/spinyfin/mono/pull/77";
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET pr_url = ?2 WHERE id = ?1", params![holder.id, url])
+            .unwrap();
+
+        let outcome = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &follower.id,
+                kind: ProposalKind::PrCreated,
+                payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/77"}"#,
+                idempotency_key: "pr-77",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.proposal.state, ProposalState::Rejected);
+        assert!(
+            outcome
+                .proposal
+                .decision_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&holder.id),
+            "decision_reason should name the holder: {:?}",
+            outcome.proposal.decision_reason
+        );
+        let after = query_task(&db.connect().unwrap(), &follower.id).unwrap().unwrap();
+        assert_eq!(after.pr_url, None);
+
+        // Control: the same URL already bound to the submitting task itself.
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET pr_url = NULL WHERE id = ?1", params![holder.id])
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET pr_url = ?2 WHERE id = ?1", params![follower.id, url])
+            .unwrap();
+        let own = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &follower.id,
+                kind: ProposalKind::PrCreated,
+                payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/77"}"#,
+                idempotency_key: "pr-77-own",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.proposal.state, ProposalState::Applied);
     }
 
     /// Binding a PR via `pr_created` must stamp `updated_at`, mirroring

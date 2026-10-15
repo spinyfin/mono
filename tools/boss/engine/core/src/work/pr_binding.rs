@@ -87,6 +87,41 @@ impl PrBindingSuspicion {
 const NON_PRIMARY_EXECUTION_KINDS_SQL: &str = "'pr_review', 'pr_review_guide', 'revision_implementation', \
      'ci_remediation', 'conflict_resolution', 'automation_triage', 'answer_agent'";
 
+/// Connection-level form of [`WorkDb::other_work_item_bound_to_pr`], so a
+/// caller already inside a transaction (`Transaction` derefs to
+/// `Connection`) applies the same holder policy.
+pub(crate) fn query_other_work_item_bound_to_pr(
+    conn: &rusqlite::Connection,
+    pr_url: &str,
+    work_item_id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM tasks
+         WHERE pr_url = ?1
+           AND id != ?2
+           AND deleted_at IS NULL
+           AND kind != 'revision'
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1",
+        params![pr_url, work_item_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// SQL predicate: `t.pr_url` is the PR number the row was spawned from.
+const BOUND_TO_ORIGIN_SQL: &str = "(t.origin_pr_number IS NOT NULL AND t.pr_url LIKE '%/pull/' || t.origin_pr_number)";
+
+/// SQL predicate: another live non-revision row holds `t.pr_url`.
+const SHARED_PR_SQL: &str = "EXISTS (
+                      SELECT 1 FROM tasks o
+                      WHERE o.pr_url = t.pr_url
+                        AND o.id != t.id
+                        AND o.deleted_at IS NULL
+                        AND o.kind != 'revision'
+                    )";
+
 impl WorkDb {
     /// Expected branch names ([`crate::completion::expected_branch_name`]) of
     /// every primary implementation execution of `work_item_id`, newest first.
@@ -119,20 +154,7 @@ impl WorkDb {
     /// so the root itself — a non-revision row — is what a conflict would
     /// surface as.
     pub fn other_work_item_bound_to_pr(&self, pr_url: &str, work_item_id: &str) -> Result<Option<String>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id FROM tasks
-             WHERE pr_url = ?1
-               AND id != ?2
-               AND deleted_at IS NULL
-               AND kind != 'revision'
-             ORDER BY created_at ASC, id ASC
-             LIMIT 1",
-            params![pr_url, work_item_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(Into::into)
+        query_other_work_item_bound_to_pr(&*self.connect()?, pr_url, work_item_id)
     }
 
     /// Rows whose PR binding or doc pointer is structurally suspect, each
@@ -156,15 +178,8 @@ impl WorkDb {
             let mut stmt = conn.prepare(&format!(
                 "SELECT t.id, t.product_id, t.status, t.pr_url, t.origin_pr_number, t.doc_branch,
                     we.id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix,
-                    (t.origin_pr_number IS NOT NULL
-                       AND t.pr_url LIKE '%/pull/' || t.origin_pr_number) AS bound_to_origin,
-                    EXISTS (
-                      SELECT 1 FROM tasks o
-                      WHERE o.pr_url = t.pr_url
-                        AND o.id != t.id
-                        AND o.deleted_at IS NULL
-                        AND o.kind != 'revision'
-                    ) AS shared,
+                    {BOUND_TO_ORIGIN_SQL} AS bound_to_origin,
+                    {SHARED_PR_SQL} AS shared,
                     EXISTS (
                       SELECT 1 FROM work_executions rv
                       WHERE rv.work_item_id = t.id
@@ -185,7 +200,13 @@ impl WorkDb {
              )
              WHERE t.deleted_at IS NULL
                AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
-               AND NOT (t.status IN ('done', 'archived') AND COALESCE(t.last_status_actor, '') != 'engine')
+               AND (
+                 t.status NOT IN ('done', 'archived')
+                 OR (
+                   COALESCE(t.last_status_actor, '') = 'engine'
+                   AND ({BOUND_TO_ORIGIN_SQL} OR {SHARED_PR_SQL})
+                 )
+               )
                AND t.pr_url IS NOT NULL
                AND t.pr_url != ''
                AND NOT EXISTS (
@@ -234,7 +255,7 @@ impl WorkDb {
                 candidate.reasons.push(PrBindingSuspicion::SharedWithOtherWorkItem);
             }
             let closed = matches!(candidate.task_status, TaskStatus::Done | TaskStatus::Archived);
-            if !candidate.reasons.is_empty() || candidate.doc_branch.is_some() {
+            if !candidate.reasons.is_empty() || (!closed && candidate.doc_branch.is_some()) {
                 candidate.own_branches = self.primary_execution_branches(&candidate.task_id)?;
             }
             if !closed && let Some(doc_branch) = candidate.doc_branch.as_deref() {
@@ -289,8 +310,8 @@ impl WorkDb {
         let rows = tx.execute(
             "UPDATE tasks
              SET pr_url             = ?3,
-                 status             = CASE WHEN status IN ('todo', 'active', 'blocked', 'done') THEN 'in_review' ELSE status END,
-                 completed_at       = CASE WHEN status = 'done' THEN NULL ELSE completed_at END,
+                 status             = CASE WHEN status IN ('todo', 'active', 'blocked', 'done', 'archived') THEN 'in_review' ELSE status END,
+                 completed_at       = CASE WHEN status IN ('done', 'archived') THEN NULL ELSE completed_at END,
                  blocked_reason     = NULL,
                  blocked_detail     = NULL,
                  blocked_attempt_id = NULL,
