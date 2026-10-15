@@ -3,6 +3,20 @@ use crate::work::connection_wait::acquire;
 use rusqlite::Connection;
 
 #[test]
+fn result_boundary_preserves_success_and_non_busy_errors() {
+    let stats = LockStats::default();
+    assert_eq!(returned_with(&stats, Ok(42)).unwrap(), 42);
+    let result: anyhow::Result<()> = Err(rusqlite::Error::QueryReturnedNoRows.into());
+    let error = returned_with(&stats, result).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::QueryReturnedNoRows)
+    ));
+    assert!(error.downcast_ref::<CountedBusy>().is_none());
+    assert!(stats.take_summary().is_none());
+}
+
+#[test]
 fn busy_then_success_and_empty_guards_count_exactly_once() {
     assert_busy_count(true);
 }
