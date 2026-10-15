@@ -58,7 +58,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
             syncGrid()
         }
         .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
-        .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
         .onChange(of: workspace.viewersByRunId) { _, _ in syncGrid() }
         .onChange(of: workspace.viewerAttachFailuresByRunId) { _, _ in syncGrid() }
         .onChange(of: workspace.interactivePoolSize) { _, _ in syncGrid() }
@@ -177,7 +176,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
         let layout = grid.layout
         return GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                AgentSurfaceCollection(runIds: renderRunIds, layout: layout, area: geo.size) { runId in
+                AgentSurfaceCollection(runIds: grid.renderRunIds(attached: workspace.viewersByRunId.keys), layout: layout, area: geo.size) { runId in
                     let snapshot = renderSnapshot(runId: runId)
                     WorkerSlotView(
                         runtime: workspace.runtime,
@@ -195,10 +194,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
             }
         }
         .background(paneSizeReader)
-    }
-
-    private var renderRunIds: [String] {
-        Set(cachedSnapshots.keys).union(workspace.viewersByRunId.keys).sorted()
     }
 
     private func renderSnapshot(runId: String) -> WorkerSlotSnapshot {
@@ -285,27 +280,28 @@ struct WorkersDetailView: View, @MainActor Equatable {
     }
 
     private func syncGrid() {
-        if !isVisible {
-            grid.setVisible(false)
-            return
-        }
-        Self.applyMembership(grid: grid, workspace: workspace, liveStates: liveStates)
-        grid.setVisible(true)
-        refreshSnapshots()
+        Self.applyMembership(
+            grid: grid,
+            workspace: workspace,
+            liveStates: liveStates,
+            isVisible: isVisible
+        )
+        if isVisible { refreshSnapshots() }
     }
 
     private static func applyMembership(
         grid: AgentsGridModel,
         workspace: WorkersWorkspaceModel,
-        liveStates: LiveWorkerStateStore
+        liveStates: LiveWorkerStateStore,
+        isVisible: Bool = true
     ) {
         grid.apply(
+            isVisible: isVisible,
             states: Array(liveStates.byRunID.values),
             viewers: workspace.viewersByRunId,
             interactivePoolSize: workspace.interactivePoolSize,
             automationPoolSize: workspace.automationPoolSize,
-            reviewPoolSize: workspace.reviewSlotCount,
-            feedUnavailable: liveStates.feedUnavailable
+            reviewPoolSize: workspace.reviewSlotCount
         )
     }
 
@@ -517,7 +513,11 @@ struct WorkerSlotView: View, @MainActor Equatable {
                 WorkerSlotFallbackMonitorPill(session: session)
             }
 
-            liveStatusToggle
+            // A finished placeholder is historical text, not an addressable
+            // worker: its slot may already belong to a new run.
+            if !snapshot.isPlaceholder {
+                liveStatusToggle
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
