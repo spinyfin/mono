@@ -201,8 +201,8 @@ extension ChatViewModel {
             handleCreatedWorkItemsBatch(items)
         case .workItemUpdated(let item):
             handleUpdatedWorkItem(item)
-        case .projectTasksReordered(let projectId, _):
-            settleReorderSuccess(projectID: projectId)
+        case .projectTasksReordered(let projectId, _, let requestId):
+            settleReorderSuccess(requestId: requestId)
             if let productID = project(withID: projectId)?.productID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
@@ -216,8 +216,8 @@ extension ChatViewModel {
             }
         case .operatorQuestionError(let message, let requestId):
             handleOperatorQuestionError(message: message, requestId: requestId)
-        case .workItemRefused(let id, let code, let message, let suggestedAction):
-            handleWorkItemRefused(id: id, code: code, message: message, suggestedAction: suggestedAction)
+        case .workItemRefused(let id, let code, let message, let suggestedAction, let requestId):
+            handleWorkItemRefused(id: id, code: code, message: message, suggestedAction: suggestedAction, requestId: requestId)
         case .workError(let message, let requestId):
             if settleOffsiteBackupError(message, requestID: requestId) { return }
             // An error carrying the answer's own request id is not ambiguous:
@@ -229,6 +229,8 @@ extension ChatViewModel {
             // A refused Move Up/Down reorder carries its own request id:
             // show the reason on the card that was moved.
             if settleReorderWorkError(message: message, requestId: requestId) { return }
+            // Likewise a refused "Add revision…": show it on the parent card.
+            if settleRevisionWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
             // The engine's WorkError reply carries no request context, so we
             // can't tell which in-flight list_executions/list_attachments

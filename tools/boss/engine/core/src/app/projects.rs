@@ -6,6 +6,8 @@
 //! context every handler receives.
 
 use super::*;
+use crate::app::handler_helpers::{BoardRefusal, send_refusal};
+use boss_protocol::BoardRefusalCode;
 
 pub(super) async fn handle_list_projects(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -78,7 +80,12 @@ pub(super) async fn handle_reorder_project_tasks(ctx: Dispatch, req: FrontendReq
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::ReorderProjectTasks { project_id, task_ids } = req else {
+    let FrontendRequest::ReorderProjectTasks {
+        project_id,
+        task_ids,
+        moved_task_id,
+    } = req
+    else {
         unreachable!()
     };
     match work_db.get_work_item(&project_id) {
@@ -102,14 +109,26 @@ pub(super) async fn handle_reorder_project_tasks(ctx: Dispatch, req: FrontendReq
                     FrontendEvent::ProjectTasksReordered { project_id, task_ids },
                 );
             }
-            Err(err) => {
-                send_work_error(&sink, &request_id, &err);
-            }
+            Err(err) => send_reorder_error(&sink, &request_id, moved_task_id.as_deref(), &err),
         },
-        Err(err) => {
-            send_work_error(&sink, &request_id, &err);
-        }
+        Err(err) => send_reorder_error(&sink, &request_id, moved_task_id.as_deref(), &err),
     }
+}
+
+/// Answer a failed reorder. A board Move Up/Down names the card it moved, so
+/// its refusal is the structured `WorkItemRefused` shown on that card; any
+/// other caller (the CLI) keeps the plain `WorkError` it matches on.
+fn send_reorder_error(sink: &SessionSink, request_id: &str, moved_task_id: Option<&str>, err: &anyhow::Error) {
+    let Some(moved_task_id) = moved_task_id else {
+        send_work_error(sink, request_id, err);
+        return;
+    };
+    let mut refusal = BoardRefusal::new(
+        BoardRefusalCode::ReorderRejected,
+        "Couldn't move that task: the project's task list has changed since the board last loaded. Try the move again.",
+    );
+    refusal.raw = Some(format!("{err:#}"));
+    send_refusal(sink, request_id, true, moved_task_id, refusal);
 }
 
 pub(super) async fn handle_set_project_design_doc(ctx: Dispatch, req: FrontendRequest) {

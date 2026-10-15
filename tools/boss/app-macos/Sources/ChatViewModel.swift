@@ -90,6 +90,10 @@ final class ChatViewModel: ObservableObject {
     /// generic error banner.
     var reorderRequestTaskIDs: [String: String] = [:]
 
+    /// Envelope request id of each "Add revision…" `create_revision` → the
+    /// parent card it was filed against, so a refusal shows on that card.
+    var revisionRequestParentIDs: [String: String] = [:]
+
     /// Card whose "Add revision…" composer is open (see
     /// `performDragRefusalAction`). `nil` when no composer is showing.
     @Published var revisionComposerTaskID: String?

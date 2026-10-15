@@ -41,6 +41,7 @@ fn drop_on_doing(id: &str) -> FrontendRequest {
         target: BoardDropTarget::new(BoardColumn::Doing, None),
         bypass_dispatch_pause: false,
         observed_pause_since_epoch_s: None,
+        explicit_status: None,
     }
 }
 

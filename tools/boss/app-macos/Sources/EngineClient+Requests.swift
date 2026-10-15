@@ -633,7 +633,8 @@ extension EngineClient {
         column: WorkBoardColumnKey,
         group: WorkBoardGroupKey?,
         bypassDispatchPause: Bool = false,
-        observedPauseSinceEpochS: UInt64? = nil
+        observedPauseSinceEpochS: UInt64? = nil,
+        explicitStatus: String? = nil
     ) {
         var target: [String: Any] = ["column": column.rawValue]
         if let group, group.isEngineBoardGroup {
@@ -647,6 +648,9 @@ extension EngineClient {
         ]
         if let observedPauseSinceEpochS {
             payload["observed_pause_since_epoch_s"] = observedPauseSinceEpochS
+        }
+        if let explicitStatus {
+            payload["explicit_status"] = explicitStatus
         }
         sendLine(payload)
     }
@@ -736,17 +740,22 @@ extension EngineClient {
     /// Returns the envelope request id so a `work_error` reply can be
     /// correlated back to the card whose Move Up/Down produced it.
     @discardableResult
-    func sendReorderProjectTasks(projectId: String, taskIds: [String]) -> String? {
-        sendLine([
+    func sendReorderProjectTasks(projectId: String, taskIds: [String], movedTaskId: String? = nil) -> String? {
+        var payload: [String: Any] = [
             "type": "reorder_project_tasks",
             "project_id": projectId,
             "task_ids": taskIds,
-        ])
+        ]
+        if let movedTaskId {
+            payload["moved_task_id"] = movedTaskId
+        }
+        return sendLine(payload)
     }
 
     /// File a revision on `parentTaskId`'s open PR. The worker's deliverable
     /// is a new commit on the parent's PR branch, not a new PR.
-    func sendCreateRevision(parentTaskId: String, description: String) {
+    @discardableResult
+    func sendCreateRevision(parentTaskId: String, description: String) -> String? {
         sendLine([
             "type": "create_revision",
             "parent_task_id": parentTaskId,

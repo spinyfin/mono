@@ -646,31 +646,44 @@ impl BoardRefusal {
 
     /// Classify a dispatch failure. A bound-PR refusal names the PR and
     /// points at revisions; a missing repo says which item needs one;
-    /// anything else keeps the engine's own text under `fallback`.
+    /// anything else keeps the engine's own text under `fallback`. `prior_status`
+    /// is the item's status before the refused move, if known.
     pub(super) fn from_dispatch_error(
         work_db: &WorkDb,
         id: &str,
         err: &anyhow::Error,
         fallback: boss_protocol::BoardRefusalCode,
+        prior_status: Option<boss_protocol::TaskStatus>,
     ) -> Self {
         if err.downcast_ref::<crate::work::BoundPrRefusal>().is_some() {
             let pr_url = match work_db.get_work_item(id) {
                 Ok(WorkItem::Task(task)) | Ok(WorkItem::Chore(task)) => task.pr_url,
                 _ => None,
             };
+            // The status the item had before the refused move: the move has
+            // already flipped the stored status by the time dispatch refuses.
+            let merged = prior_status == Some(boss_protocol::TaskStatus::Done);
             let pr_number = pr_url
                 .as_deref()
                 .and_then(|url| url.trim_end_matches('/').rsplit('/').next())
                 .filter(|tail| !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()));
-            let message = match pr_number {
-                Some(number) => {
-                    format!("This item already has a PR (#{number}). To change it, add a revision.")
-                }
-                None => "This item already has a PR. To change it, add a revision.".to_owned(),
-            };
+            let pr_phrase = pr_number.map_or_else(|| "a PR".to_owned(), |number| format!("a PR (#{number})"));
+            // `create_revision` needs the PR open and unmerged. A Done item's
+            // PR has merged (the fact `assert_parent_revisable` checks first),
+            // so offering a revision there would lead to a certain failure.
+            if merged {
+                return Self {
+                    code: boss_protocol::BoardRefusalCode::BoundPrNotRevisable,
+                    message: format!(
+                        "This item already has {pr_phrase}, and it has been merged, so it can't be run again. Create a new item for follow-up work."
+                    ),
+                    raw: Some(format!("{err:#}")),
+                    action: None,
+                };
+            }
             return Self {
                 code: boss_protocol::BoardRefusalCode::BoundPr,
-                message,
+                message: format!("This item already has {pr_phrase}. To change it, add a revision."),
                 raw: Some(format!("{err:#}")),
                 action: Some(boss_protocol::BoardRefusalAction::AddRevision),
             };
