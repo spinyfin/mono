@@ -294,11 +294,14 @@ extension ChatViewModel {
     /// while moves are pending, or when `workItemUpdated` reports an unexpected
     /// status (engine silently rejected the transition).
     /// Parked drags are excluded unless explicitly selected.
-    func bounceBackOptimisticMoves(message: String?, only: Set<String>? = nil) {
-        guard !pendingMoveOriginByTaskID.isEmpty else { return }
+    /// Returns whether any card was bounced, so a caller can fall back to a
+    /// modal error when nothing was eligible (e.g. only parked drags pending).
+    @discardableResult
+    func bounceBackOptimisticMoves(message: String?, only: Set<String>? = nil) -> Bool {
+        guard !pendingMoveOriginByTaskID.isEmpty else { return false }
         let selected = only ?? Set(pendingMoveOriginByTaskID.keys).subtracting(engine.unsentDragTaskIDs())
         let bouncedIDs = pendingMoveOriginByTaskID.keys.filter { selected.contains($0) }
-        guard !bouncedIDs.isEmpty else { return }
+        guard !bouncedIDs.isEmpty else { return false }
         for id in bouncedIDs {
             optimisticColumnByTaskID.removeValue(forKey: id)
             pendingMoveOriginByTaskID.removeValue(forKey: id)
@@ -308,6 +311,7 @@ extension ChatViewModel {
             dragRefusalNotice = DragRefusalNotice(taskID: firstID, message: message)
             scheduleDragRefusalDismiss(for: firstID)
         }
+        return true
     }
 
     /// After the engine's work tree arrives and `tasksByProjectID` reflects

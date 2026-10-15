@@ -15,7 +15,7 @@ final class EngineClient: @unchecked Sendable {
     /// state stays value-typed.
     private struct ActionLedger {
         /// Never reached the wire; safe to resend on explicit Retry.
-        var unsent: [Data] = []
+        var unsent: [(id: String, data: Data)] = []
         /// Accepted by the caller, but still waiting on the socket queue.
         /// Reserve retry capacity before a form is allowed to close.
         var scheduled: [String: Data] = [:]
@@ -369,7 +369,7 @@ final class EngineClient: @unchecked Sendable {
             Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
             return nil
         }
-        if retainUnsent(payload) == .full {
+        if retainUnsent(payload, envelopeRequestId: envelopeRequestId) == .full {
             emit(.actionNotSaved(requestKind: kind))
             return nil
         }
@@ -380,7 +380,7 @@ final class EngineClient: @unchecked Sendable {
     private enum RetentionOutcome { case retained, ineligible, full }
 
     /// Explicit outcome prevents a rejected action being described as saved.
-    private func retainUnsent(_ payload: [String: Any]) -> RetentionOutcome {
+    private func retainUnsent(_ payload: [String: Any], envelopeRequestId: String) -> RetentionOutcome {
         let kind = (payload["type"] as? String) ?? "unknown"
         guard Self.isRetainable(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
@@ -388,13 +388,13 @@ final class EngineClient: @unchecked Sendable {
             Self.log.info("not retaining \(kind, privacy: .public); not an eligible user mutation")
             return .ineligible
         }
-        return retainUnsent(data, kind: kind)
+        return retainUnsent(data, id: envelopeRequestId, kind: kind)
     }
 
-    private func retainUnsent(_ data: Data, kind: String) -> RetentionOutcome {
+    private func retainUnsent(_ data: Data, id: String, kind: String) -> RetentionOutcome {
         let retained = ledger.withLock { state -> Bool in
             guard state.unsent.count + state.scheduled.count < Self.maxUnsentActions else { return false }
-            state.unsent.append(data)
+            state.unsent.append((id: id, data: data))
             return true
         }
         Self.log.info("\(retained ? "retained" : "dropped (buffer full)", privacy: .public) \(kind, privacy: .public); awaiting explicit retry")
@@ -406,7 +406,10 @@ final class EngineClient: @unchecked Sendable {
     func retryUnsentActions() -> Bool {
         guard reachableState.withLock({ $0 }) else { return false }
         let actions = ledger.withLock { state -> [(id: String, data: Data)] in
-            let drained = state.unsent.map { (id: UUID().uuidString, data: $0) }
+            // Reuse each action's original envelope id so a reply to the retried
+            // send still correlates with the caller's pending state.
+            let drained = state.unsent
+
             state.unsent.removeAll()
             for action in drained { state.scheduled[action.id] = action.data }
             // Registered before the write so a fast reply cannot race it.
@@ -427,8 +430,8 @@ final class EngineClient: @unchecked Sendable {
 
     func discardUnsentActions() {
         ledger.withLock { state in
-            for data in state.unsent {
-                if let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            for action in state.unsent {
+                if let payload = (try? JSONSerialization.jsonObject(with: action.data)) as? [String: Any],
                    payload["type"] as? String == "move_work_item_on_board",
                    let taskID = payload["id"] as? String {
                     state.retryAdmissionTasks.remove(taskID)
@@ -460,7 +463,7 @@ final class EngineClient: @unchecked Sendable {
     func hasUnsentAction(kind: String) -> Bool {
         ledger.withLock { state in
             state.unsent.contains {
-                ((try? JSONSerialization.jsonObject(with: $0)) as? [String: Any])?["type"] as? String == kind
+                ((try? JSONSerialization.jsonObject(with: $0.data)) as? [String: Any])?["type"] as? String == kind
             }
         }
     }
@@ -470,8 +473,8 @@ final class EngineClient: @unchecked Sendable {
     func unsentDragTaskIDs() -> Set<String> {
         ledger.withLock { state in
             var ids = Set<String>()
-            for data in state.unsent {
-                guard let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+            for action in state.unsent {
+                guard let payload = (try? JSONSerialization.jsonObject(with: action.data)) as? [String: Any] else { continue }
                 switch payload["type"] as? String {
                 case "evaluate_dispatch_admission": if let id = payload["work_item_id"] as? String { ids.insert(id) }
                 case "move_work_item_on_board": if let id = payload["id"] as? String { ids.insert(id) }
@@ -521,7 +524,7 @@ final class EngineClient: @unchecked Sendable {
         guard let connection else {
             let (retained, finished) = ledger.withLock { state in
                 let reserved = state.scheduled.removeValue(forKey: envelopeRequestId)
-                if let reserved { state.unsent.append(reserved) }
+                if let reserved { state.unsent.append((id: envelopeRequestId, data: reserved)) }
                 let finished = state.retried.remove(envelopeRequestId) != nil && state.retried.isEmpty && state.retryAdmissionTasks.isEmpty
                 return (reserved != nil, finished)
             }

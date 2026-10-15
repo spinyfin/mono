@@ -323,6 +323,58 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testRetriedAdmissionErrorSettlesParkedDragOnly() throws {
+        try assertRetriedAdmissionReplySettlesParkedDrag(payload: ["type": "error", "message": "boom"])
+    }
+
+    @MainActor
+    func testRetriedMalformedAdmissionReplySettlesParkedDragOnly() throws {
+        try assertRetriedAdmissionReplySettlesParkedDrag(payload: ["type": "dispatch_admission_evaluated"])
+    }
+
+    @MainActor
+    private func assertRetriedAdmissionReplySettlesParkedDrag(payload: [String: Any]) throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let model = ChatViewModel(socketPath: path)
+        let client = model.engine
+        // Parked while disconnected: the evaluate request sits in the unsent queue.
+        let parked = ChatViewModel.PendingDragAdmissionCheck(taskID: "parked", column: .doing, group: nil)
+        model.pendingDragAdmissionChecks["parked"] = parked
+        model.pendingMoveOriginByTaskID["parked"] = .backlog
+        model.optimisticColumnByTaskID["parked"] = .doing
+        client.sendEvaluateDispatchAdmission(workItemId: "parked", requestId: parked.requestID)
+        client.onEvent = { event in
+            if case .connected = event { model.isConnected = true }
+            else { model.applyEventForTest(event) }
+        }
+        client.start()
+        defer { client.stop() }
+        let peer = try XCTUnwrap(server.accept(timeout: 5))
+        defer { peer.close() }
+        XCTAssertTrue(waitUntil(5) { model.isConnected })
+        // A second drag whose request is unrelated and must survive. Added once
+        // connected so the initial connection churn cannot settle it.
+        // A second drag whose request is unrelated and must survive.
+        let other = ChatViewModel.PendingDragAdmissionCheck(taskID: "other", column: .doing, group: nil)
+        model.pendingDragAdmissionChecks["other"] = other
+        model.pendingMoveOriginByTaskID["other"] = .backlog
+        model.optimisticColumnByTaskID["other"] = .doing
+        XCTAssertTrue(client.retryUnsentActions())
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(peer.readLine(timeout: 5))) as? [String: Any])
+        XCTAssertEqual(envelope["request_id"] as? String, parked.requestID, "Retry must reuse the original envelope id")
+        var reply = try JSONSerialization.data(withJSONObject: ["request_id": parked.requestID, "payload": payload])
+        reply.append(0x0A)
+        peer.sendBytes(reply)
+        XCTAssertTrue(waitUntil(5) { model.pendingDragAdmissionChecks["parked"] == nil })
+        XCTAssertNil(model.optimisticColumnByTaskID["parked"])
+        XCTAssertFalse(client.hasRetriedActions)
+        XCTAssertNotNil(model.pendingDragAdmissionChecks["other"])
+        XCTAssertEqual(model.optimisticColumnByTaskID["other"], .doing)
+    }
+
     func testDisconnectedEditRetainsItsExactPatch() throws {
         let path = socketPath()
         defer { unlink(path) }

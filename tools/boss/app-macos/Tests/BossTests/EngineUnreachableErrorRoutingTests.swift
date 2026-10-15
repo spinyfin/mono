@@ -72,6 +72,7 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
         let model = makeModel()
         parkDrag(model, taskID: "parked", retained: true)
         model.applyEventForTest(.workError(message: "unrelated", requestId: "other"))
+        XCTAssertEqual(model.workErrorMessage, "unrelated", "the error must still be surfaced")
         XCTAssertNotNil(model.pendingDragAdmissionChecks["parked"])
         XCTAssertEqual(model.optimisticColumnByTaskID["parked"], .doing)
     }

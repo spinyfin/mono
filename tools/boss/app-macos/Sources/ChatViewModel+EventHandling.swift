@@ -279,12 +279,11 @@ extension ChatViewModel {
             if case .loading = reviewTerminalVM.state {
                 reviewTerminalVM.state = .idle
             }
-            if !pendingMoveOriginByTaskID.isEmpty {
-                // Error is likely from an in-flight kanban move: bounce the
-                // card(s) back and show an inline non-blocking notice instead
-                // of interrupting with a modal dialog.
-                bounceBackOptimisticMoves(message: message)
-            } else {
+            // Error is likely from an in-flight kanban move: bounce the
+            // card(s) back and show an inline non-blocking notice instead
+            // of interrupting with a modal dialog. Parked drags are not
+            // bounced, so with nothing eligible the error is still surfaced.
+            if pendingMoveOriginByTaskID.isEmpty || !bounceBackOptimisticMoves(message: message) {
                 workErrorMessage = message
             }
         case .transportError(let message):
