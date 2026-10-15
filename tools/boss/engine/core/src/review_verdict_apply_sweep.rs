@@ -23,7 +23,7 @@ pub fn spawn_notifications(
     let subscription = event_bus.subscribe(boss_event_bus::TopicFilter::kind(
         boss_event_bus::EventKind::ReviewVerdictApplied,
     ));
-    tokio::spawn(async move {
+    crate::work::db_diagnostics::spawn(async move {
         forward_notifications(subscription, publisher.as_ref()).await;
     })
 }
@@ -81,25 +81,27 @@ pub fn spawn_loop(
 /// heartbeat.
 pub async fn run_one_pass(work_db: &WorkDb, coordinator: Arc<ExecutionCoordinator>) -> ReviewVerdictApplyStats {
     let work_db_clone = work_db.clone();
-    let stats =
-        match tokio::task::spawn_blocking(move || work_db_clone.apply_pending_review_verdicts(&GhPrStateChecker)).await
-        {
-            Ok(Ok(stats)) => stats,
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    ?error,
-                    "review-verdict apply sweep: apply query failed; skipping this pass"
-                );
-                ReviewVerdictApplyStats::default()
-            }
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    "review-verdict apply sweep: apply task joined with error; skipping this pass"
-                );
-                ReviewVerdictApplyStats::default()
-            }
-        };
+    let stats = match crate::work::db_diagnostics::spawn_blocking(move || {
+        work_db_clone.apply_pending_review_verdicts(&GhPrStateChecker)
+    })
+    .await
+    {
+        Ok(Ok(stats)) => stats,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                ?error,
+                "review-verdict apply sweep: apply query failed; skipping this pass"
+            );
+            ReviewVerdictApplyStats::default()
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "review-verdict apply sweep: apply task joined with error; skipping this pass"
+            );
+            ReviewVerdictApplyStats::default()
+        }
+    };
     if stats.created_work > 0 {
         coordinator.kick();
     }

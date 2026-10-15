@@ -100,7 +100,7 @@ pub fn spawn_loop(
     interval: Duration,
     host_disabled: Subscription,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::work::db_diagnostics::spawn(async move {
         let mut host_disabled = host_disabled;
         // Once the bus itself is dropped (engine shutdown path in tests /
         // process teardown) `recv` resolves to `None` forever; stop polling

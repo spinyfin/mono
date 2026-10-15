@@ -1054,6 +1054,7 @@ impl WorkDb {
             "SELECT COUNT(*) FROM work_executions
               WHERE work_item_id = ?1
                 AND (?2 IS NULL OR kind = ?2)
+                AND engine_database_failure = 0
                 AND status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
                 AND CAST(created_at AS INTEGER) >= ?3",
             params![work_item_id, kind.map(|k| k.as_str()), since_epoch_secs],
@@ -1078,6 +1079,7 @@ impl WorkDb {
             "SELECT id FROM work_executions
               WHERE work_item_id = ?1
                 AND (?2 IS NULL OR kind = ?2)
+                AND engine_database_failure = 0
                 AND status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
                 AND CAST(created_at AS INTEGER) >= ?3
               ORDER BY created_at DESC, id DESC",
@@ -1120,7 +1122,7 @@ impl WorkDb {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, status FROM work_executions
-              WHERE work_item_id = ?1
+              WHERE work_item_id = ?1 AND engine_database_failure = 0
               ORDER BY created_at DESC, id DESC",
         )?;
         let rows = stmt.query_map(params![work_item_id], |row| {
@@ -1155,6 +1157,7 @@ impl WorkDb {
             "SELECT COUNT(*) FROM work_executions we
              WHERE we.work_item_id = ?1
                AND we.kind = 'pr_review'
+               AND we.engine_database_failure = 0
                AND CAST(we.created_at AS INTEGER) >= ?2
                AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
                     OR {unproductive_completed})"
@@ -1177,6 +1180,7 @@ impl WorkDb {
             "SELECT we.id FROM work_executions we
              WHERE we.work_item_id = ?1
                AND we.kind = 'pr_review'
+               AND we.engine_database_failure = 0
                AND CAST(we.created_at AS INTEGER) >= ?2
                AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
                     OR {unproductive_completed})

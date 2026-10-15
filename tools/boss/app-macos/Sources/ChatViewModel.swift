@@ -543,6 +543,9 @@ final class ChatViewModel: ObservableObject {
         let initialCount: Int
     }
     var currentDesignDocResolveBatch: DesignDocResolveBatch?
+    /// Pointer inputs and last attempt time, including the inherited product repo.
+    var designDocResolveInputs: [String: [String?]] = [:]
+    var designDocResolveAttemptedAt: [String: Date] = [:]
 
     /// Engine-tab attempt list, freshest first. Refreshed on Engine-tab
     /// entry, on `conflict_resolution_*` topic pushes, and on `Refresh`

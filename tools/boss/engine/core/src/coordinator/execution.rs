@@ -1951,7 +1951,7 @@ impl ExecutionCoordinator {
                 // pre-change behaviour.
                 self.execution_started_hook.on_execution_started(&execution.id).await;
                 let coordinator = self.clone();
-                tokio::spawn(async move {
+                crate::work::db_diagnostics::spawn(async move {
                     coordinator
                         .run_execution(execution, run, work_item, worker_id_owned, lease, change, adapter)
                         .await;
@@ -2355,24 +2355,30 @@ impl ExecutionCoordinator {
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
         let error_text = format!("{error:#}");
-        let (execution, run, outcome) = self.work_db.record_pre_start_failure(
-            &execution.id,
-            worker_id,
-            cube_repo_id,
-            &error_text,
-            if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
-                && matches!(
-                    execution.kind,
-                    ExecutionKind::ChoreImplementation
-                        | ExecutionKind::TaskImplementation
-                        | ExecutionKind::RevisionImplementation
-                )
-            {
-                &[]
-            } else {
-                &self.pre_start_retry_delays
-            },
-        )?;
+        let database_busy = crate::work::db_diagnostics::is_database_busy(error);
+        let (execution, run, outcome) = if database_busy {
+            self.work_db
+                .record_pre_start_database_failure(&execution.id, worker_id, cube_repo_id, &error_text)?
+        } else {
+            self.work_db.record_pre_start_failure(
+                &execution.id,
+                worker_id,
+                cube_repo_id,
+                &error_text,
+                if attention_kind == crate::execution_bookmark_recovery::RECOVERY_FAILED
+                    && matches!(
+                        execution.kind,
+                        ExecutionKind::ChoreImplementation
+                            | ExecutionKind::TaskImplementation
+                            | ExecutionKind::RevisionImplementation
+                    )
+                {
+                    &[]
+                } else {
+                    &self.pre_start_retry_delays
+                },
+            )?
+        };
 
         match outcome {
             PreStartFailureOutcome::Retry { delay } => {
@@ -2391,7 +2397,7 @@ impl ExecutionCoordinator {
                 // back into the ready queue and wake the scheduler. Until
                 // then `dispatch_not_before` keeps it invisible to
                 // `list_ready_executions`.
-                tokio::spawn(async move {
+                crate::work::db_diagnostics::spawn(async move {
                     tokio::time::sleep(delay).await;
                     coordinator.kick();
                 });
@@ -2513,7 +2519,7 @@ impl ExecutionCoordinator {
                         None
                     }
                 };
-                tokio::spawn(async move {
+                crate::work::db_diagnostics::spawn(async move {
                     publisher
                         .publish(&execution_id, &work_item_id, status_str, "execution_start_failed")
                         .await;
@@ -2538,7 +2544,7 @@ impl ExecutionCoordinator {
         let work_db = self.work_db.clone();
         let publisher = self.publisher.clone();
         let execution_id = execution.id.clone();
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution_id) else {
                 return;
             };

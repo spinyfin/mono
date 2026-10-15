@@ -67,14 +67,16 @@ pub fn spawn_loop(
     threshold: Duration,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::work::db_diagnostics::spawn(async move {
         tokio::time::sleep(interval).await;
         loop {
             // The pass reads the dispatch stream and then hits SQLite once
             // per stall — both blocking, neither belongs on a tokio worker.
             let index = index.clone();
             let work_db = work_db.clone();
-            let pass = tokio::task::spawn_blocking(move || run_one_pass(&index, work_db.as_ref(), threshold)).await;
+            let pass =
+                crate::work::db_diagnostics::spawn_blocking(move || run_one_pass(&index, work_db.as_ref(), threshold))
+                    .await;
             match pass {
                 Ok(Ok(outcome)) => log_pass(&outcome),
                 Ok(Err(err)) => tracing::warn!(?err, "dispatch stall attention sweep: pass failed"),

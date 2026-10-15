@@ -823,7 +823,7 @@ mod tests {
             r#"{{"hook_event_name":"Stop","session_id":"sess-1","stop_hook_active":false,"_boss_run_id":"{run_id}"}}"#
         );
         let path_owned = path.clone();
-        let client_task = tokio::task::spawn_blocking(move || {
+        let client_task = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(payload.as_bytes()).unwrap();
@@ -858,7 +858,7 @@ mod tests {
         let payload = format!(
             r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"transcript_path":"/home/u/.claude/projects/foo/sess-1.jsonl","_boss_run_id":"{run_id}"}}"#
         );
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(payload.as_bytes()).unwrap();
@@ -890,7 +890,7 @@ mod tests {
         let payload = format!(
             r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"{run_id}"}}"#
         );
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(payload.as_bytes()).unwrap();
@@ -920,7 +920,7 @@ mod tests {
         let payload = format!(
             r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"transcript_path":"","_boss_run_id":"{run_id}"}}"#
         );
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(payload.as_bytes()).unwrap();
@@ -950,7 +950,7 @@ mod tests {
         let payload = format!(
             r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"{run_id}"}}"#
         );
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(payload.as_bytes()).unwrap();
@@ -1004,7 +1004,7 @@ mod tests {
         let listener = bind_events_socket(&path).unwrap();
 
         let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(b"not json").unwrap();
@@ -1031,7 +1031,7 @@ mod tests {
 
         let payload = format!(r#"{{"session_id":"x","hook_event_name":"WeirdHook","_boss_run_id":"{run_id}"}}"#);
         let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(payload.as_bytes()).unwrap();
@@ -1183,7 +1183,7 @@ mod tests {
 
         let payload = format!(r#"{{"hookEventName":"Stop","sessionId":"grok-sess-1","_boss_run_id":"{run_id}"}}"#);
         let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(payload.as_bytes()).unwrap();
@@ -1216,7 +1216,7 @@ mod tests {
 
         let payload = format!(r#"{{"hookEventName":"Stop","sessionId":"grok-sess-1","_boss_run_id":"{run_id}"}}"#);
         let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(payload.as_bytes()).unwrap();
@@ -1343,7 +1343,7 @@ mod tests {
             run_id = run_id,
         );
         let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(payload.as_bytes()).unwrap();
@@ -1389,7 +1389,7 @@ mod tests {
         let listener = bind_events_socket(&path).unwrap();
 
         let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream
@@ -1419,7 +1419,7 @@ mod tests {
         let listener = bind_events_socket(&path).unwrap();
 
         let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(
@@ -1456,7 +1456,7 @@ mod tests {
         let listener = bind_events_socket(&path).unwrap();
 
         let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::{Read, Write};
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream
@@ -1500,7 +1500,7 @@ mod tests {
         let listener = bind_events_socket(&path).unwrap();
 
         let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::{Read, Write};
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(b"anything").unwrap();
@@ -1607,7 +1607,7 @@ mod tests {
             r#"{{"hook_event_name":"Stop","session_id":"answer-sess-1","stop_hook_active":false,"_boss_run_id":"{run_id}"}}"#
         );
         let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let client = crate::work::db_diagnostics::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
             stream.write_all(payload.as_bytes()).unwrap();

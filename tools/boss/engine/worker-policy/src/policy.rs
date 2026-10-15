@@ -161,6 +161,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ListProjects { .. }
         | FrontendRequest::ListRevisions { .. }
         | FrontendRequest::ListTasks { .. }
+        | FrontendRequest::ResolveProjectDesignDocs { .. }
         | FrontendRequest::ResolveProjectDesignDoc { .. } => Allow,
 
         // ── Allowed: dependency-edge reads ───────────────────────────────

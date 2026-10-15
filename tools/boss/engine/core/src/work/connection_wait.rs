@@ -22,11 +22,15 @@
 use super::{Connection, Mutex, PooledConnection, Result};
 use std::sync::TryLockError;
 
+#[derive(bon::Builder)]
+#[builder(on(String, into), builder_type(vis = "pub(self)"), start_fn(vis = "pub(self)"))]
 pub(crate) struct ConnectionGuard<'a> {
     guard: Option<std::sync::MutexGuard<'a, Connection>>,
     caller: &'static std::panic::Location<'static>,
     acquired: std::time::Instant,
     waited: std::time::Duration,
+    observation: std::rc::Rc<super::db_diagnostics::Observation>,
+    connection_id: usize,
 }
 
 impl<'a> ConnectionGuard<'a> {
@@ -34,13 +38,17 @@ impl<'a> ConnectionGuard<'a> {
         guard: std::sync::MutexGuard<'a, Connection>,
         caller: &'static std::panic::Location<'static>,
         waited: std::time::Duration,
+        metrics: std::sync::Arc<crate::metrics::Registry>,
     ) -> Self {
-        Self {
-            guard: Some(guard),
-            caller,
-            acquired: std::time::Instant::now(),
-            waited,
-        }
+        let (connection_id, observation) = super::db_diagnostics::start(&guard, caller, metrics);
+        Self::builder()
+            .connection_id(connection_id)
+            .observation(observation)
+            .guard(guard)
+            .caller(caller)
+            .acquired(std::time::Instant::now())
+            .waited(waited)
+            .build()
     }
 }
 
@@ -61,19 +69,31 @@ impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
         let held = self.acquired.elapsed();
         // Logging must not extend the critical section being measured.
+        let query_ms = self.observation.query_time().as_secs_f64() * 1000.0;
+        super::db_diagnostics::finish(self.connection_id);
         drop(self.guard.take());
         if held.max(self.waited) >= std::time::Duration::from_millis(100) {
-            tracing::warn!(wait_ms = self.waited.as_millis() as u64, held_ms = held.as_millis() as u64, caller = %self.caller,
+            tracing::warn!(query_ms, verb = %self.observation.attribution.verb, request_id = %self.observation.attribution.request_id, session_id = %self.observation.attribution.session_id, background = %self.observation.attribution.background, wait_ms = self.waited.as_millis() as u64, held_ms = held.as_millis() as u64, caller = %self.caller,
                 "work DB connection lock timing");
         }
     }
 }
 
 #[track_caller]
-pub(super) fn acquire(connection: &Mutex<Connection>) -> Result<PooledConnection<'_>> {
+pub(super) fn acquire<'a>(
+    connection: &'a Mutex<Connection>,
+    metrics: &std::sync::Arc<crate::metrics::Registry>,
+) -> Result<PooledConnection<'a>> {
     let caller = std::panic::Location::caller();
     match connection.try_lock() {
-        Ok(guard) => return Ok(ConnectionGuard::new(guard, caller, std::time::Duration::ZERO)),
+        Ok(guard) => {
+            return Ok(ConnectionGuard::new(
+                guard,
+                caller,
+                std::time::Duration::ZERO,
+                metrics.clone(),
+            ));
+        }
         Err(TryLockError::Poisoned(_)) => anyhow::bail!("work db connection lock poisoned"),
         Err(TryLockError::WouldBlock) => {}
     }
@@ -93,7 +113,7 @@ pub(super) fn acquire(connection: &Mutex<Connection>) -> Result<PooledConnection
         _ => lock(),
     };
     let waited = start.elapsed();
-    guard.map(|guard| ConnectionGuard::new(guard, caller, waited))
+    guard.map(|guard| ConnectionGuard::new(guard, caller, waited, metrics.clone()))
 }
 
 #[cfg(test)]
@@ -121,14 +141,14 @@ mod tests {
         let buffer = log_capture::install();
         let from = buffer.lock().len();
         let fast = mutex();
-        drop(acquire(&fast).unwrap());
+        drop(acquire(&fast, &super::super::personas::new_metrics_registry()).unwrap());
         assert!(
             lines_since(&buffer, from).is_empty(),
             "fast uncontended lock must not log"
         );
 
         let from = buffer.lock().len();
-        let held = acquire(&fast).unwrap();
+        let held = acquire(&fast, &super::super::personas::new_metrics_registry()).unwrap();
         std::thread::sleep(Duration::from_millis(120));
         drop(held);
         let lines = lines_since(&buffer, from);
@@ -149,7 +169,7 @@ mod tests {
             }
         });
         locked_rx.recv().unwrap();
-        drop(acquire(&contended).unwrap());
+        drop(acquire(&contended, &super::super::personas::new_metrics_registry()).unwrap());
         holder.join().unwrap();
         let lines = lines_since(&buffer, from);
         assert_eq!(lines.len(), 1, "{lines:?}");

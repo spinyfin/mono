@@ -315,6 +315,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::ReorderProjectTasks { .. }
         | FrontendRequest::ReportSelectedProduct { .. }
         | FrontendRequest::RequestExecution { .. }
+        | FrontendRequest::ResolveProjectDesignDocs { .. }
         | FrontendRequest::ResolveProjectDesignDoc { .. }
         | FrontendRequest::RetryCiRemediation { .. }
         | FrontendRequest::RetryConflictResolution { .. }

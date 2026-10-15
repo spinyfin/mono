@@ -804,6 +804,23 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Narrow index scan for design-doc batches; no execution JSON or history payloads.
+    pub fn list_in_flight_repo_workspaces(&self) -> Result<HashMap<String, String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT repo_remote_url, workspace_path FROM work_executions
+             WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND cube_lease_id IS NOT NULL AND workspace_path IS NOT NULL
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let mut paths = HashMap::new();
+        for row in stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? {
+            let (repo, path) = row?;
+            paths.entry(repo).or_insert(path);
+        }
+        Ok(paths)
+    }
+
     /// Return every non-terminal `work_executions` row that recorded a
     /// `workspace_path` — the candidate set for the lost-workspace
     /// reconciler ([`crate::lost_workspace_sweep`]).
@@ -1168,6 +1185,7 @@ impl WorkDb {
         let updated = tx.execute(
             "UPDATE work_executions
              SET status = 'running',
+                 engine_database_failure = 0,
                  cube_repo_id = ?2,
                  cube_lease_id = ?3,
                  cube_workspace_id = ?4,
@@ -1743,6 +1761,30 @@ impl WorkDb {
         error_text: &str,
         retry_delays: &[Duration],
     ) -> Result<(WorkExecution, Option<WorkRun>, PreStartFailureOutcome)> {
+        self.record_pre_start_failure_impl(execution_id, agent_id, cube_repo_id, (error_text, false), retry_delays)
+    }
+
+    /// Database admission failed before a worker started. Keep the terminal
+    /// error visible, but do not spend the worker churn budget or retry SQLite.
+    pub fn record_pre_start_database_failure(
+        &self,
+        execution_id: &str,
+        agent_id: &str,
+        cube_repo_id: Option<&str>,
+        error_text: &str,
+    ) -> Result<(WorkExecution, Option<WorkRun>, PreStartFailureOutcome)> {
+        self.record_pre_start_failure_impl(execution_id, agent_id, cube_repo_id, (error_text, true), &[])
+    }
+
+    fn record_pre_start_failure_impl(
+        &self,
+        execution_id: &str,
+        agent_id: &str,
+        cube_repo_id: Option<&str>,
+        error: (&str, bool),
+        retry_delays: &[Duration],
+    ) -> Result<(WorkExecution, Option<WorkRun>, PreStartFailureOutcome)> {
+        let (error_text, engine_database_failure) = error;
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -1799,10 +1841,18 @@ impl WorkDb {
                      cube_workspace_id = NULL,
                      workspace_path = NULL,
                      finished_at = ?4,
+                     engine_database_failure = ?6,
                      last_error = ?5
                  WHERE id = ?1
                    AND status IN ('ready', 'claimed')",
-                params![execution_id, new_count, cube_repo_id, now, error_text],
+                params![
+                    execution_id,
+                    new_count,
+                    cube_repo_id,
+                    now,
+                    error_text,
+                    engine_database_failure
+                ],
             )?;
             (PreStartFailureOutcome::PermanentFail, Some(run_id))
         };

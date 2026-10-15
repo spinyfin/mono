@@ -2349,7 +2349,7 @@ async fn handle_frontend_connection(
     // reconnected, which is not what a kill switch means.
     let writer_flags = server_state.feature_flags.clone();
     let writer_session_id = session_id.clone();
-    let writer_task = tokio::spawn(async move {
+    let writer_task = crate::work::db_diagnostics::spawn(async move {
         while let Some(mut event) = writer_sink.next().await {
             // The exposure boundary's single write choke point. Every frame
             // leaving a worker-classified connection passes through here —
@@ -2551,7 +2551,7 @@ async fn handle_frontend_connection(
         if let Some(waiting) = waiting_read {
             let sink = sink.clone();
             let session_id = session_id.clone();
-            tokio::spawn(async move {
+            crate::work::db_diagnostics::spawn(async move {
                 match waiting
                     .acquire_ordered(turn.expect("admitted read has a FIFO turn"))
                     .await
@@ -2562,7 +2562,7 @@ async fn handle_frontend_connection(
                         // Keep permits inside the blocking job even if its
                         // client disconnects; cancellation cannot inflate capacity.
                         let runtime = tokio::runtime::Handle::current();
-                        let result = tokio::task::spawn_blocking(move || {
+                        let result = crate::work::db_diagnostics::spawn_blocking(move || {
                             permits.0.started();
                             let _permits = permits;
                             runtime.block_on(dispatch_fut);

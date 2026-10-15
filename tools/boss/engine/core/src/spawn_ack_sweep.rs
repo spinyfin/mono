@@ -739,7 +739,7 @@ pub(crate) async fn reap_never_started_spawn(
         let work_db = WorkDb::clone(ctx.work_db);
         let execution_id_owned = execution_id.to_owned();
         let started_epoch = execution.started_epoch();
-        match tokio::task::spawn_blocking(move || {
+        match crate::work::db_diagnostics::spawn_blocking(move || {
             #[cfg(test)]
             probe_hold::wait_if_armed(&execution_id_owned);
             probe_transcript_liveness(&work_db, &execution_id_owned, now_epoch_secs, started_epoch)

@@ -832,7 +832,7 @@ where
         }
         prepared.root.revalidate()?;
         let scan_source = Arc::clone(&prepared);
-        let scan = match tokio::task::spawn_blocking(move || scan_once(&scan_source)).await {
+        let scan = match crate::work::db_diagnostics::spawn_blocking(move || scan_once(&scan_source)).await {
             Err(err) => return Err(format!("rollout discovery scan task failed: {err}")),
             Ok(Err(err)) => {
                 tracing::warn!(

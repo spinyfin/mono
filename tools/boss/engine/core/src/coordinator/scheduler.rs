@@ -64,7 +64,7 @@ impl ExecutionCoordinator {
         }
         tracing::debug!("scheduler_kick outcome=spawn — starting new run_scheduler task");
         let coordinator = self.clone();
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             coordinator.run_scheduler().await;
         });
     }
@@ -159,7 +159,7 @@ impl ExecutionCoordinator {
     ///   heartbeat does NOT address.
     pub fn spawn_scheduler_heartbeat(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
         let coordinator = self.clone();
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             // Stagger startup so the first beat doesn't race the
             // engine's own boot-time `kick()` (see `app.rs`).
             tokio::time::sleep(interval).await;
@@ -2206,7 +2206,7 @@ impl ExecutionCoordinator {
         let dispatch_slots = Arc::clone(&self.dispatch_slots);
         let execution = execution.clone();
         let worker_id = worker_id.to_string();
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             // Held for the whole dispatch: the guard de-registers the
             // reservation on drop, on every path including a panic.
             let _reservation = reservation;

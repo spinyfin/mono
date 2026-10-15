@@ -227,19 +227,19 @@ pub fn spawn_loop(
         offsite.validate_at_startup();
         // Keep the staleness gauge climbing between backups so a wedged
         // loop is still visible.
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             loop {
                 offsite.refresh_age_gauge();
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
     }
-    tokio::spawn(async move {
+    crate::work::db_diagnostics::spawn(async move {
         loop {
             let db = work_db.clone();
             let dir = backup_dir.clone();
             let offsite = offsite.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::work::db_diagnostics::spawn_blocking(move || {
                 run_backup_with_offsite(db.as_ref(), &dir, retention, offsite.as_ref())
             })
             .await

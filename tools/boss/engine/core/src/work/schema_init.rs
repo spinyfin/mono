@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 42;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 43;
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -39,6 +39,20 @@ fn schema_objects(conn: &Connection) -> Result<std::collections::BTreeSet<String
     Ok(stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+fn migrate_contention(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE work_executions ADD COLUMN engine_database_failure INTEGER NOT NULL DEFAULT 0;
+                UPDATE work_executions SET engine_database_failure = 1
+                WHERE status = 'failed' AND started_at IS NULL AND pre_start_failure_count > 0
+                  AND instr(last_error, 'database is locked') > 0;
+                CREATE INDEX work_executions_in_flight_idx
+                ON work_executions(created_at, id, repo_remote_url, workspace_path)
+                WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+                  AND cube_lease_id IS NOT NULL",
+    )?;
+    Ok(())
 }
 
 impl WorkDb {
@@ -99,6 +113,9 @@ impl WorkDb {
         }
         if version < 42 {
             review_guide_jobs::guide_updates::migrate(&tx)?;
+        }
+        if version < 43 {
+            migrate_contention(&tx)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -180,6 +197,7 @@ impl WorkDb {
         // the write lock up front so the second caller waits inside
         // the busy handler instead of racing.
         conn.set_transaction_behavior(TransactionBehavior::Immediate);
+        super::db_diagnostics::install_update_observer(conn);
         Ok(())
     }
 
@@ -213,7 +231,7 @@ impl WorkDb {
     /// itself.
     #[track_caller]
     pub(crate) fn connect(&self) -> Result<PooledConnection<'_>> {
-        super::connection_wait::acquire(&self.conn)
+        super::connection_wait::acquire(&self.conn, &self.persona_metrics)
     }
 
     /// Escape hatch: open a brand-new connection to this database instead of
@@ -222,8 +240,12 @@ impl WorkDb {
     /// snapshot that must not hold up every other operation on this `WorkDb`
     /// for its duration (see `database_backup::take_backup`). Most callers
     /// want [`Self::connect`], not this.
-    pub(crate) fn connect_new(&self) -> Result<Connection> {
-        Self::open_raw_connection(&self.path, self.memory.as_ref())
+    #[track_caller]
+    pub(crate) fn connect_new(&self) -> Result<super::db_diagnostics::OwnedConnection> {
+        Ok(super::db_diagnostics::OwnedConnection::new(
+            Self::open_raw_connection(&self.path, self.memory.as_ref())?,
+            self.persona_metrics.clone(),
+        ))
     }
 
     /// Inspect an existing database without migrations, journal-mode changes,
@@ -600,6 +622,7 @@ mod floor_tests {
             38,
             40,
             41,
+            42,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -642,6 +665,9 @@ mod floor_tests {
             if version >= 42 {
                 review_guide_jobs::guide_updates::migrate(&conn).unwrap();
             }
+            if version >= 43 {
+                migrate_contention(&conn).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -671,6 +697,7 @@ mod floor_tests {
                 .execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
                 .unwrap();
             review_guide_jobs::guide_updates::migrate(&expected).unwrap();
+            migrate_contention(&expected).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

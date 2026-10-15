@@ -742,7 +742,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 let work_db = Arc::clone(&work_db);
                 let publisher = server_state.publisher.clone();
                 tokio::spawn(async move {
-                    let created = tokio::task::spawn_blocking(move || {
+                    let created = crate::work::db_diagnostics::spawn_blocking(move || {
                         work_db.apply_review_verdict_proposal(&proposal_id, &crate::work::GhPrStateChecker)
                     })
                     .await;

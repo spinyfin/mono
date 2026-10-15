@@ -2175,6 +2175,11 @@ pub enum FrontendRequest {
         project_id: String,
     },
 
+    /// Resolve a board batch with one workspace lookup; returns one response containing every resolution.
+    ResolveProjectDesignDocs {
+        project_ids: Vec<String>,
+    },
+
     /// Inverse of [`Self::DeleteWorkItem`]: clear the `deleted_at`
     /// tombstone on a soft-deleted task, making it visible again. The
     /// `id` accepts a canonical `task_…` id or a friendly short id

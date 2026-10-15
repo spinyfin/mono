@@ -187,11 +187,22 @@ impl WorkDb {
     /// that ended while a previous engine process was running, or via a code
     /// path nobody thought to hook.
     pub fn reconcile_stale_attention_signals(&self) -> Result<AttentionReconcileOutcome> {
-        let conn = self.connect()?;
         let now = now_string();
         let mut outcome = AttentionReconcileOutcome::default();
         for lifecycle in automatically_cleared() {
-            let resolved = resolve_one_kind(&conn, &now, lifecycle)?;
+            let resolved = {
+                let conn = self.connect()?;
+                let has_candidates: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM work_attention_items WHERE status = 'open' AND kind = ?1)",
+                    [lifecycle.kind],
+                    |row| row.get(0),
+                )?;
+                if has_candidates {
+                    resolve_one_kind(&conn, &now, lifecycle)?
+                } else {
+                    0
+                }
+            };
             if resolved > 0 {
                 tracing::info!(
                     kind = lifecycle.kind,
@@ -202,7 +213,10 @@ impl WorkDb {
             }
             outcome.attentions_resolved += resolved;
         }
-        outcome.dispatch_banners_cleared = clear_stale_dispatch_failures(&conn)?;
+        outcome.dispatch_banners_cleared = {
+            let conn = self.connect()?;
+            clear_stale_dispatch_failures(&conn)?
+        };
         Ok(outcome)
     }
 }

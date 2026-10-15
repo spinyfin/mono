@@ -1134,6 +1134,13 @@ extension EngineClient {
         ], queueIfDisconnected: true)
     }
 
+    func sendResolveProjectDesignDocs(projectIDs: [String]) {
+        sendLine([
+            "type": "resolve_project_design_docs",
+            "project_ids": projectIDs,
+        ])
+    }
+
     /// Fetch one immutable review-guide version's full Markdown. Engine
     /// replies with `review_guide_content` carrying a
     /// `ReviewGuideVersionContent` (`content: nil` when the version id is

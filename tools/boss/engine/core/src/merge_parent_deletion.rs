@@ -119,7 +119,7 @@ pub async fn compute_merged_parent_deletions(
     let head_before = head_before.to_owned();
     let base_sha = base_sha.to_owned();
     let head_after = head_after.to_owned();
-    tokio::task::spawn_blocking(move || {
+    crate::work::db_diagnostics::spawn_blocking(move || {
         compute_merged_parent_deletions_blocking(&repo_slug, &head_before, &base_sha, &head_after)
     })
     .await

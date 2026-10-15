@@ -627,6 +627,10 @@ pub enum FrontendEvent {
     ProjectDesignDocResolved {
         output: ResolveProjectDesignDocOutput,
     },
+    /// One response for a board-wide design-doc resolution.
+    ProjectDesignDocsResolved {
+        outputs: Vec<ResolveProjectDesignDocOutput>,
+    },
     /// Response to [`FrontendRequest::ListProductDesignDocs`]: the
     /// markdown listing at HEAD of the product's repo, or the
     /// classified reason there isn't one. `product_id` is echoed so a

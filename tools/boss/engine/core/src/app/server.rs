@@ -324,7 +324,7 @@ impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
 }
 
 fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::work::db_diagnostics::spawn(async move {
         let controller = server_state.github_auth.clone();
         // Restore a persisted token (if any) before subscribing, so the first
         // loop iteration sees the restored `Authorized { Unknown }` state and
@@ -673,7 +673,7 @@ pub async fn serve_with_overrides(
     }
     {
         let state = server_state.clone();
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             // Drop covers return and panic-unwind only. The timeout below
             // fail-closes the database state and lifts the discovery hold;
             // a blocking discovery that outlives it is harmless because its
@@ -683,7 +683,7 @@ pub async fn serve_with_overrides(
             // Discovery itself is pure. Keeping the database write outside
             // `spawn_blocking` means a timed-out JoinHandle cannot later
             // repopulate capabilities after this task has failed closed.
-            let probe = tokio::task::spawn_blocking(crate::host_registry::discover_local_capabilities);
+            let probe = crate::work::db_diagnostics::spawn_blocking(crate::host_registry::discover_local_capabilities);
             match tokio::time::timeout(LOCAL_CAPABILITY_PROBE_TIMEOUT, probe).await {
                 Ok(Ok(capabilities)) => match state.work_db.replace_auto_host_capabilities("local", &capabilities) {
                     Ok(()) => tracing::info!(
@@ -765,7 +765,7 @@ pub async fn serve_with_overrides(
     // helper never creates an absent singleton; first creation remains tied
     // to app registration, after that app has prepared the session files.
     let coordinator_supervisor_state = server_state.clone();
-    tokio::spawn(async move {
+    crate::work::db_diagnostics::spawn(async move {
         let mut restart_failures = crate::coordinator_tmux::CoordinatorRestartFailures::new();
         // Short first delay so a registration-time attach miss is retried
         // promptly; later passes set delay from the pass outcome.
@@ -1017,7 +1017,7 @@ pub async fn serve_with_overrides(
         };
         tracing::info!(events_socket_path = %path.display(), "events socket is ready");
         let server_state_for_events = server_state.clone();
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             run_events_accept_loop(events_listener, server_state_for_events).await;
         });
     }
@@ -1385,7 +1385,7 @@ pub async fn serve_with_overrides(
     // it off the async runtime workers.
     {
         let state = server_state.clone();
-        if let Err(err) = tokio::task::spawn_blocking(move || {
+        if let Err(err) = crate::work::db_diagnostics::spawn_blocking(move || {
             state.reenqueue_pre_start_failed_review_guides(&crate::work::GhPrStateChecker)
         })
         .await
@@ -1571,7 +1571,7 @@ pub async fn serve_with_overrides(
     // never blocks startup; errors are logged and skipped per candidate.
     {
         let work_db_for_backfill = server_state.work_db.clone();
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             let candidates = match work_db_for_backfill.list_in_review_tasks_for_doc_branch_backfill() {
                 Ok(rows) => rows,
                 Err(err) => {
@@ -2166,7 +2166,7 @@ pub async fn serve_with_overrides(
         // The socket this engine bound, not a fresh `$BOSS_EVENTS_SOCKET`
         // read — a restored reverse forward must terminate at *this* engine.
         let engine_socket = crate::runner::bound_events_socket_path(&cfg).display().to_string();
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             coordinator.reattach_remote_runs(&engine_socket).await;
         });
     }
@@ -2487,7 +2487,7 @@ pub async fn serve_with_overrides(
     {
         let live_worker_states = server_state.live_worker_states.clone();
         let server_clone = Arc::clone(&server_state);
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
@@ -2542,7 +2542,7 @@ pub async fn serve_with_overrides(
     // is shallow — only emits above a small depth threshold.
     {
         let server_clone = Arc::clone(&server_state);
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             const LOG_DEPTH_THRESHOLD: usize = 32;
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             loop {
@@ -2583,7 +2583,7 @@ pub async fn serve_with_overrides(
     let orphan_trigger = Arc::new(Notify::new());
     if let Some(ppid) = watched_parent_pid {
         let trigger = orphan_trigger.clone();
-        tokio::spawn(async move {
+        crate::work::db_diagnostics::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if !process_is_alive(ppid) {
@@ -2660,7 +2660,7 @@ pub async fn serve_with_overrides(
                 // can't race us into ENOTCONN.
                 let peer_pid_value = peer_pid(&stream).ok();
                 let server_state = server_state.clone();
-                tokio::spawn(async move {
+                crate::work::db_diagnostics::spawn(async move {
                     if let Err(err) =
                         handle_frontend_connection(stream, server_state, peer_pid_value).await
                     {
@@ -2959,7 +2959,7 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
             Ok((stream, _)) => {
                 let server_state = server_state.clone();
                 let driver_registry = driver_registry.clone();
-                tokio::spawn(async move {
+                crate::work::db_diagnostics::spawn(async move {
                     match handle_connection(stream, &driver_registry, &server_state.work_db).await {
                         Ok(incoming) => {
                             tracing::info!(

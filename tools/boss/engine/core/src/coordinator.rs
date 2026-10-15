@@ -451,7 +451,7 @@ impl HeartbeatGuard {
         worker_id: String,
         interval: Duration,
     ) -> Self {
-        let handle = tokio::spawn(async move {
+        let handle = crate::work::db_diagnostics::spawn(async move {
             // First tick fires immediately at start; the elapsed
             // interval is the *gap* between subsequent ticks. Skip
             // the first immediate tick so we don't issue a redundant

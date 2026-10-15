@@ -34,6 +34,8 @@ extension ChatViewModel {
     /// Clears the banner and supersedes any pending delayed reveal on a
     /// successful (re)connect.
     func resetConnectionLostBanner() {
+        designDocResolveAttemptedAt.removeAll()
+        currentDesignDocResolveBatch = nil
         showConnectionLostBanner = false
         connectionGeneration += 1
     }

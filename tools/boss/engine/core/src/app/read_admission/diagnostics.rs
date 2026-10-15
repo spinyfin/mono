@@ -160,6 +160,7 @@ impl Diagnostics {
                 })
             });
         let suppressed = self.suppressed[kind].swap(0, Ordering::Relaxed);
+        let database_holders = crate::work::db_diagnostics::holder_snapshot();
         tracing::warn!(
             reason,
             ?wait,
@@ -168,6 +169,7 @@ impl Diagnostics {
             active,
             suppressed_dumps = suppressed,
             ?blockers,
+            ?database_holders,
             "read admission holders"
         );
     }

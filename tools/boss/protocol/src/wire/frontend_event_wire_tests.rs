@@ -1059,6 +1059,16 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "live_status_debug_report_event",
         },
         TagCase {
+            label: "ProjectDesignDocsResolved",
+            event: FrontendEvent::ProjectDesignDocsResolved {
+                outputs: vec![ResolveProjectDesignDocOutput {
+                    project_id: "proj_1".into(),
+                    state: ProjectDesignDocState::NotSet,
+                }],
+            },
+            expected_tag: "project_design_docs_resolved",
+        },
+        TagCase {
             label: "ProjectDesignDocResolved",
             event: FrontendEvent::ProjectDesignDocResolved {
                 output: ResolveProjectDesignDocOutput {
@@ -2237,6 +2247,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::LiveStatusEnabledSet { .. }
         | FrontendEvent::LiveStatusDisabledSlotsList { .. }
         | FrontendEvent::LiveStatusDebugReportEvent { .. }
+        | FrontendEvent::ProjectDesignDocsResolved { .. }
         | FrontendEvent::ProjectDesignDocResolved { .. }
         | FrontendEvent::ProductDesignDocsList { .. }
         | FrontendEvent::ProductDesignDocContent { .. }

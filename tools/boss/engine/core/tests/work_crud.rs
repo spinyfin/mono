@@ -2752,3 +2752,92 @@ async fn set_product_merge_mechanism_writes_clears_and_rejects_unknown() -> Resu
 
     Ok(())
 }
+
+/// Real socket requests against an isolated WAL database, with an independent
+/// writer competing throughout the old 61-request burst and the new batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn design_doc_burst_and_batch_do_not_starve_writer() -> Result<()> {
+    let engine = TestEngine::spawn_with(TestEngineOptions {
+        on_disk_db: true,
+        ..Default::default()
+    })
+    .await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(
+        &mut client,
+        CreateProductInput::builder()
+            .name("Contention")
+            .repo_remote_url("https://github.com/test/repo")
+            .build(),
+    )
+    .await?;
+    let project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: product.id,
+            name: "Design".into(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        },
+    )
+    .await?;
+    set_project_design_doc(
+        &mut client,
+        SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_path: Some("docs/design.md".into()),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(62));
+    let mut reads = tokio::task::JoinSet::new();
+    for _ in 0..61 {
+        let socket = engine.socket_str().to_owned();
+        let project_id = project.id.clone();
+        let barrier = barrier.clone();
+        reads.spawn(async move {
+            let mut client = BossClient::connect_socket(&socket).await?;
+            barrier.wait().await;
+            let output = resolve_project_design_doc(&mut client, &project_id).await?;
+            anyhow::ensure!(matches!(output.state, ProjectDesignDocState::Resolved { .. }));
+            Ok::<_, anyhow::Error>(())
+        });
+    }
+    let path = engine.db_path.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let writer = tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = rusqlite::Connection::open(path)?;
+        conn.busy_timeout(Duration::from_millis(100))?;
+        runtime.block_on(barrier.wait());
+        for n in 0..100 {
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES('rpc-contention',?1)",
+                [n.to_string()],
+            )?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    });
+    match client
+        .send_request(&FrontendRequest::ResolveProjectDesignDocs {
+            project_ids: vec![project.id.clone(); 61],
+        })
+        .await?
+    {
+        FrontendEvent::ProjectDesignDocsResolved { outputs } => {
+            assert_eq!(outputs.len(), 61);
+            assert!(outputs.iter().all(|output| output.project_id == project.id));
+        }
+        other => return Err(unexpected_event("resolve project design docs", other)),
+    }
+    while let Some(read) = reads.join_next().await {
+        read??;
+    }
+    writer.await??;
+    Ok(())
+}

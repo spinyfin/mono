@@ -1071,8 +1071,8 @@ impl WorkDb {
     /// the timing is genuinely free off the RPC path.
     pub fn get_work_tree_instrumented(&self, product_id: &str, trace: &mut PopulationTrace) -> Result<WorkTree> {
         let mut connection = self.connect()?;
-        // All projections must describe one consistent database snapshot.
-        let conn = connection.transaction()?;
+        // A read snapshot must not reserve the WAL writer for the whole board projection.
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
 
         let t = Instant::now();
         let product = query_product(&conn, product_id).require("product", product_id)?;

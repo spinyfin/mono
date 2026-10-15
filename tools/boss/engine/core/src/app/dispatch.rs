@@ -1,7 +1,17 @@
 //! Frontend handler routing, shared by the ordered live lane and admitted reads.
 use super::*;
 
-pub(super) async fn dispatch_request(mut ctx: Dispatch, request: FrontendRequest, bulk_read: bool) {
+pub(super) async fn dispatch_request(ctx: Dispatch, request: FrontendRequest, bulk_read: bool) {
+    let attribution = crate::work::db_diagnostics::Attribution {
+        verb: variant_name(&request),
+        request_id: ctx.request_id.clone(),
+        session_id: ctx.session_id.clone(),
+        background: String::new(),
+    };
+    attribution.scope(dispatch_attributed(ctx, request, bulk_read)).await;
+}
+
+async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_read: bool) {
     if bulk_read {
         let connection = if matches!(request, FrontendRequest::ListProposals { .. }) {
             ctx.work_db.reader()
@@ -265,7 +275,7 @@ pub(super) async fn dispatch_request(mut ctx: Dispatch, request: FrontendRequest
         r @ FrontendRequest::RemoveHostTag { .. } => Box::pin(hosts::handle_remove_host_tag(ctx, r)),
         r @ FrontendRequest::ReorderProjectTasks { .. } => Box::pin(projects::handle_reorder_project_tasks(ctx, r)),
         r @ FrontendRequest::RequestExecution { .. } => Box::pin(executions::handle_request_execution(ctx, r)),
-        r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
+        r @ (FrontendRequest::ResolveProjectDesignDoc { .. } | FrontendRequest::ResolveProjectDesignDocs { .. }) => {
             Box::pin(projects::handle_resolve_project_design_doc(ctx, r))
         }
         r @ FrontendRequest::RestoreWorkItem { .. } => Box::pin(work_items::handle_restore_work_item(ctx, r)),

@@ -678,6 +678,17 @@ final class EngineClient: @unchecked Sendable {
             let slotId = (payload["slot_id"] as? NSNumber)?.intValue ?? 0
             let enabled = (payload["enabled"] as? NSNumber)?.boolValue ?? false
             emit(.liveStatusEnabledSet(slotId: slotId, enabled: enabled))
+        case "project_design_docs_resolved":
+            guard let raw = payload["outputs"],
+                  let data = try? JSONSerialization.data(withJSONObject: raw),
+                  let outputs = try? JSONDecoder().decode([ResolveProjectDesignDocOutput].self, from: data)
+            else {
+                emit(.error(message: "received invalid project_design_docs_resolved payload"))
+                break
+            }
+            for output in outputs {
+                emit(.projectDesignDocResolved(output: output))
+            }
         case "project_design_doc_resolved":
             guard let outputPayload = payload["output"] as? [String: Any],
                   let outputData = try? JSONSerialization.data(withJSONObject: outputPayload),

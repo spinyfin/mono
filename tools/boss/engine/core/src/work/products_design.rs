@@ -293,6 +293,7 @@ impl WorkDb {
             ResolvedDesignDocKind::External
         };
 
+        drop(conn);
         let web_url = render_design_doc_web_url(&repo, &branch, &path);
         let raw_content_url = render_design_doc_raw_content_url(&repo, &branch, &path);
         let workspace_path = lookup_repo_workspace_path(&repo);

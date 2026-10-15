@@ -44,6 +44,7 @@ pub(super) const LIVE_VARIANTS: &[&str] = with_live_variants!(live_names);
 pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
     match request {
         R::AuditProductEffort { .. }
+        | R::ResolveProjectDesignDocs { .. }
         | R::ResolveProjectDesignDoc { .. }
         | R::CommentsBannerState { .. }
         | R::CommentsGet { .. }

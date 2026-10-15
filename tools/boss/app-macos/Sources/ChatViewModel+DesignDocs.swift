@@ -134,24 +134,35 @@ extension ChatViewModel {
         designDocsLoadingProductIDs.contains(productID)
     }
 
-    /// Ask the engine to resolve the design-doc pointer for every
-    /// project whose row carries a non-nil `designDocPath`. Projects
-    /// with no pointer set are skipped so the engine doesn't burn an
-    /// RPC just to be told `not_set` — the affordance is hidden in
-    /// that case anyway. Re-issued on every `WorkTree` so a re-point
-    /// landed in another session flows through to the icon.
-    func refreshDesignDocStates(for projects: [WorkProject]) {
+    /// Batch changed pointers; unrelated work-tree invalidations must not fan out
+    /// into another scan. Refresh workspace hints at most once a minute.
+    func refreshDesignDocStates(for projects: [WorkProject], now: Date = Date()) {
         guard isConnected else { return }
-        let pending = projects.filter { $0.designDocPath != nil }
+        var pending: [WorkProject] = []
+        for project in projects {
+            guard project.designDocPath != nil else {
+                designDocStateByProjectID.removeValue(forKey: project.id)
+                designDocResolveInputs.removeValue(forKey: project.id)
+                designDocResolveAttemptedAt.removeValue(forKey: project.id)
+                continue
+            }
+            let inputs = [
+                project.designDocRepoRemoteURL, project.designDocBranch, project.designDocPath,
+                products.first(where: { $0.id == project.productID })?.repoRemoteURL,
+            ]
+            let age = now.timeIntervalSince(designDocResolveAttemptedAt[project.id] ?? .distantPast)
+            guard designDocResolveInputs[project.id] != inputs || age >= 60 else { continue }
+            designDocResolveInputs[project.id] = inputs
+            designDocResolveAttemptedAt[project.id] = now
+            pending.append(project)
+        }
         guard !pending.isEmpty else { return }
         currentDesignDocResolveBatch = DesignDocResolveBatch(
-            startDate: Date(),
+            startDate: now,
             pendingProjectIDs: Set(pending.map(\.id)),
             initialCount: pending.count
         )
-        for project in pending {
-            engine.sendResolveProjectDesignDoc(projectID: project.id)
-        }
+        engine.sendResolveProjectDesignDocs(projectIDs: pending.map(\.id))
     }
 
     /// Open the design-doc pointer for `project`. Dispatch follows
