@@ -206,6 +206,7 @@ extension ChatViewModel {
             executionLabelsInvalidatedHandler?()
             handleUpdatedWorkItem(item)
         case .projectTasksReordered(let projectId, _):
+            settleReorderSuccess(projectID: projectId)
             if let productID = project(withID: projectId)?.productID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
@@ -235,6 +236,9 @@ extension ChatViewModel {
             // Likewise a refused project archive: the row drops its pending
             // mark and the message surfaces, with no other state touched.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
+            // A refused Move Up/Down reorder carries its own request id:
+            // show the reason on the card that was moved.
+            if settleReorderWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
             // Legacy list_executions/list_attachments guards do not retain
             // request IDs, so they cannot match the error's envelope ID.

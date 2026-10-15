@@ -3,7 +3,7 @@
 //! a bare error string, so the app can show it next to the dragged card.
 
 use super::*;
-use crate::app::work_items::handle_move_work_item_on_board;
+use crate::app::work_items::{handle_move_work_item_on_board, handle_update_work_item};
 use crate::test_support::{create_test_chore_manual, create_test_product_with_repo};
 use boss_protocol::{
     BoardColumn, BoardDropTarget, BoardRefusalAction, BoardRefusalCode, FrontendRequest, TaskStatus, WorkItem,
@@ -103,5 +103,78 @@ async fn drop_of_unknown_item_is_refused_as_not_a_card() {
             assert!(!message.is_empty());
         }
         other => panic!("expected WorkItemRefused, got {other:?}"),
+    }
+}
+
+/// A repo-less item dragged to Doing is refused up front with the missing-repo
+/// code and a sentence naming the item by title, not by internal id.
+#[tokio::test]
+async fn drag_to_doing_without_a_repo_is_refused_in_plain_language() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let product =
+        create_test_product_with_repo(&state.work_db, "NoRepoBoard", Some("git@example.com:board/no-repo.git"));
+    let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "Needs a home");
+    // Clear the product default so the chore resolves to no repo.
+    state
+        .work_db
+        .update_work_item(
+            &product.id,
+            WorkItemPatch {
+                repo_remote_url: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .expect("clear product repo");
+
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(dispatch(&state, &sink), drop_on(&chore.id, BoardColumn::Doing)).await;
+
+    match sole_response(&sink).await {
+        FrontendEvent::WorkItemRefused { code, message, .. } => {
+            assert_eq!(code, BoardRefusalCode::MissingRepo);
+            assert!(message.contains("Needs a home"), "must name the item, got: {message}");
+            assert!(
+                !message.contains(&chore.id),
+                "must not leak the internal id, got: {message}"
+            );
+        }
+        other => panic!("expected WorkItemRefused, got {other:?}"),
+    }
+}
+
+/// Only board gestures get the structured refusal: a plain `UpdateWorkItem`
+/// (the CLI's path) is still answered with a `WorkError`.
+#[tokio::test]
+async fn plain_update_work_item_refusal_stays_a_work_error() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let product = create_test_product_with_repo(
+        &state.work_db,
+        "UpdateCompat",
+        Some("git@example.com:board/update-compat.git"),
+    );
+    let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "Already has a PR");
+    state
+        .work_db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                pr_url: Some("https://github.com/example/repo/pull/3164".to_owned()),
+                ..Default::default()
+            },
+        )
+        .expect("bind a PR");
+
+    let sink = make_session_sink();
+    let req = FrontendRequest::UpdateWorkItem {
+        id: chore.id.clone(),
+        patch: WorkItemPatch::builder().status("active").build(),
+    };
+    handle_update_work_item(dispatch(&state, &sink), req).await;
+
+    match sole_response(&sink).await {
+        FrontendEvent::WorkError { message } => {
+            assert_eq!(message, "Work already has a bound PR; use a revision to change it");
+        }
+        other => panic!("expected WorkError for a non-board caller, got {other:?}"),
     }
 }

@@ -5,10 +5,9 @@ use super::queued_wait::ReviewNaming;
 use super::*;
 
 /// Typed marker for "this item already owns a PR, so a fresh implementation
-/// run is refused". A distinct type (rather than a bare `bail!`) lets board
-/// gestures report a machine-readable refusal code by downcasting instead of
-/// matching message text. The `Display` text is unchanged from the original
-/// `bail!`, so CLI and log output stay the same.
+/// run is refused". Being a distinct type lets board gestures report a
+/// machine-readable refusal code by downcasting instead of matching message
+/// text; the `Display` text is what CLI and log output show.
 #[derive(Debug)]
 pub struct BoundPrRefusal;
 
