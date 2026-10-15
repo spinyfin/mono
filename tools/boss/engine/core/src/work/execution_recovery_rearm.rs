@@ -124,7 +124,8 @@ mod tests {
     };
 
     /// Undo every schema step after 38 so reopening replays them.
-    const RESET_TO_38: &str = "ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at;
+    const RESET_TO_38: &str =
+        "DROP INDEX work_executions_in_flight_idx; ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at;
         ALTER TABLE ci_remediations DROP COLUMN queue_base_sha;
         ALTER TABLE execution_bookmarks DROP COLUMN base_commit;
         ALTER TABLE execution_bookmarks DROP COLUMN reconciliation_note;
@@ -132,8 +133,9 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
         UPDATE metadata SET value = '38' WHERE key = 'schema_version';";
 
-    /// Undo only schema 43 so reopening replays its re-arm.
-    const RESET_TO_42: &str = "ALTER TABLE execution_bookmarks DROP COLUMN base_commit;
+    /// Undo later schema steps so reopening replays the schema 43 re-arm.
+    const RESET_TO_42: &str = "DROP INDEX work_executions_in_flight_idx;
+        ALTER TABLE execution_bookmarks DROP COLUMN base_commit;
         ALTER TABLE execution_bookmarks DROP COLUMN reconciliation_note;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;

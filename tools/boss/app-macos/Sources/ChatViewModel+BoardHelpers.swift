@@ -468,7 +468,7 @@ extension ChatViewModel {
         // project-level design-doc pointer (a separate concept). Every
         // other kind — and a design whose project has no pointer —
         // falls through to the per-task `docLinkState`.
-        let designDocState: ProjectDesignDocState? = workItemDocState(for: task)
+        let docPresentation = workItemDocPresentation(for: task)
 
         // Roll-up rows must render wherever the parent's OWN card lands, not
         // just in Review/Done. A revision that reaches in_review/done never
@@ -528,7 +528,7 @@ extension ChatViewModel {
                 showsCIAutoFixedBadge: showsCIAutoFixedBadge(forPR: task.prURL),
                 ciFailureBadge: ciFailureBadge(forPR: task.prURL),
                 isFrontierHighlighted: isFrontierHighlighted,
-                designDocState: designDocState,
+                designDocPresentation: docPresentation,
                 externalRefLink: ExternalRefLinkPresentation.forTask(task),
                 ambiguousRepoNames: ambiguousVisibleRepoNames,
                 inReviewRevisions: inReviewRevisions,

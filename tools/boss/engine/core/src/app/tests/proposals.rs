@@ -202,7 +202,7 @@ async fn question_summary_survives_upgrade_of_existing_projection() {
          ALTER TABLE work_runs DROP COLUMN persona;
          ALTER TABLE work_runs DROP COLUMN persona_lease_active;
          ALTER TABLE work_executions DROP COLUMN dispatch_wait_blocker_id;
-         ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at;
+         DROP INDEX work_executions_in_flight_idx; ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at;
          ALTER TABLE ci_remediations DROP COLUMN queue_base_sha;
          ALTER TABLE execution_bookmarks DROP COLUMN base_commit;
          ALTER TABLE execution_bookmarks DROP COLUMN reconciliation_note;

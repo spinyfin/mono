@@ -767,7 +767,7 @@ struct ContentView: View {
                         let unblocked = model.unblockedTaskCount(forProjectID: project.id)
                         let blocked = model.blockedTaskCount(forProjectID: project.id)
                         let docPresentation = ProjectDesignDocAffordancePresentation.from(
-                            state: model.designDocStateByProjectID[project.id] ?? .notSet
+                            project: project
                         )
                         WorkSidebarFilterRow(
                             title: project.name,

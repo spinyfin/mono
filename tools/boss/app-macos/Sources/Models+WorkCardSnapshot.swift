@@ -70,7 +70,7 @@ struct WorkCardSnapshotContext: Equatable {
     var showsCIAutoFixedBadge: Bool = false
     var ciFailureBadge: CiFailureBadge? = nil
     var isFrontierHighlighted: Bool = false
-    var designDocState: ProjectDesignDocState? = nil
+    var designDocPresentation: ProjectDesignDocAffordancePresentation? = nil
     var externalRefLink: ExternalRefLinkPresentation? = nil
     var ambiguousRepoNames: Set<String> = []
     var inReviewRevisions: [WorkCardRevisionRollup] = []
@@ -142,7 +142,7 @@ struct WorkCardSnapshot: Equatable {
     let repoChip: RepoChipPresentation?
     let ciFailureBadge: CiFailureBadge?
     let isFrontierHighlighted: Bool
-    let designDocState: ProjectDesignDocState?
+    let designDocPresentation: ProjectDesignDocAffordancePresentation?
     let ciRequiredState: String?
     let ciRequiredDetail: String?
     let reviewRequiredState: String?
@@ -343,12 +343,7 @@ struct WorkCardSnapshot: Equatable {
         let tagChips = WorkTagPresentation.chips(for: task.tags)
         let liveStatusNonEmpty = liveStatus.map { !$0.isEmpty } ?? false
 
-        // Design-doc affordance: state must resolve to a presentation, and
-        // the caller must have wired a button (matches today's body gate).
-        let designDocPresentation: Bool = {
-            guard let state = context.designDocState else { return false }
-            return ProjectDesignDocAffordancePresentation.from(state: state) != nil
-        }()
+        let showsDesignDoc = context.designDocPresentation != nil
 
         // Revision parent PR row only when it points somewhere different
         // from the card's own PR (avoids the #1829 double-link).
@@ -406,7 +401,7 @@ struct WorkCardSnapshot: Equatable {
             repoChip: context.repoChip,
             ciFailureBadge: context.ciFailureBadge,
             isFrontierHighlighted: context.isFrontierHighlighted,
-            designDocState: context.designDocState,
+            designDocPresentation: context.designDocPresentation,
             ciRequiredState: ciRequiredState,
             ciRequiredDetail: ciRequiredDetail,
             reviewRequiredState: reviewRequiredState,
@@ -454,7 +449,7 @@ struct WorkCardSnapshot: Equatable {
             showsAutomationBadge: task.sourceAutomationId != nil,
             showsPlannerStagedBadge: task.isPlannerStaged,
             showsExternalRefLink: context.externalRefLink != nil,
-            showsDesignDocAffordance: designDocPresentation,
+            showsDesignDocAffordance: showsDesignDoc,
             showsAttachmentsAffordance: task.hasAttachments,
             showsTerminalButton: context.showsTerminalButton,
             showsMergeWhenReady: context.showsMergeWhenReady,

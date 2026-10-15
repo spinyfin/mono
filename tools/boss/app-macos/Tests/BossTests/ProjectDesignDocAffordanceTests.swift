@@ -94,6 +94,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         let project = model.projectsByProductID.values.first!.first!
         model.designDocStateByProjectID[project.id] = .notSet
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertNil(model.workErrorMessage)
     }
 
@@ -123,6 +126,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertNil(model.workErrorMessage)
         XCTAssertEqual(openedURLs.count, 1)
         let opened = openedURLs.first!
@@ -158,6 +164,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertNil(model.workErrorMessage)
         XCTAssertEqual(renderedContents.count, 1)
         let content = renderedContents.first!
@@ -197,6 +206,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertEqual(renderedContents.count, 1)
         let content = renderedContents.first!
         XCTAssertEqual(content.filePath, "\(workspacePath)/designs/x.md")
@@ -228,6 +240,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertTrue(renderedContents.isEmpty)
         XCTAssertEqual(openedURLs.count, 1)
     }
@@ -257,6 +272,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertEqual(openedURLs.count, 1)
         let opened = openedURLs.first!
         XCTAssertTrue(opened.isFileURL)
@@ -286,6 +304,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertNil(model.workErrorMessage)
         XCTAssertEqual(openedURLs.map(\.absoluteString), [webURL])
     }
@@ -315,6 +336,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertEqual(openedURLs.map(\.absoluteString), [webURL])
     }
 
@@ -357,6 +381,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             rawContentURL: rawURL
         )
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
 
         // The window open must be synchronous — one call before any await.
         XCTAssertEqual(asyncWindowOpens, 1, "async-markdown-viewer window must open immediately on click")
@@ -430,6 +457,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             rawContentURL: rawURL
         )
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
 
         // Window must open immediately.
         XCTAssertEqual(asyncWindowOpens, 1, "async-markdown-viewer window must open immediately")
@@ -483,6 +513,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertNotNil(model.workErrorMessage)
     }
 
@@ -494,6 +527,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         let project = model.projectsByProductID.values.first!.first!
         model.designDocStateByProjectID[project.id] = .broken(reason: "file not found")
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertEqual(
             model.workErrorMessage,
             "Design doc pointer is broken: file not found"
@@ -523,7 +559,7 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 rawContentURL: nil
             )
         )
-        model.handleForTest(event: .projectDesignDocResolved(output: output))
+        model.applyEventForTest(.projectDesignDocResolved(output: output))
         XCTAssertEqual(model.designDocStateByProjectID[project.id], output.state)
     }
 
@@ -740,61 +776,24 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
 
 // MARK: - Design task card affordance
 
-/// Verifies that the design-doc affordance wires correctly for `kind=design`
-/// task cards. The card derives its state from the same
-/// `model.designDocStateByProjectID` dict as the project-section header, so
-/// the same presentation rules apply — these tests exercise the path from
-/// task → projectID → state → presentation that `WorkBoardCardItem` computes.
+/// Design cards derive icon visibility from their project's pointer.
 @MainActor
 final class DesignTaskCardDesignDocAffordanceTests: XCTestCase {
-    /// A `kind=design` task whose parent project has a resolved pointer
-    /// should produce a non-nil affordance presentation — the doc icon
-    /// must appear on the card so the worker can navigate to the design
-    /// without first hunting for the project card.
-    func testDesignTaskWithResolvedStateProducesPresentation() {
+    func testDesignTaskWithPointerShowsIconBeforeAnyResolve() {
         let model = makeModelWithDesignTask()
-        let projectID = model.projectsByProductID.values.first!.first!.id
-        let resolvedState = ProjectDesignDocState.resolved(
-            resolved: ResolvedDesignDoc(
-                repoRemoteURL: "https://github.com/foo/bar.git",
-                branch: "main",
-                path: "tools/boss/docs/designs/test.md",
-                kind: .sameProduct(productID: "prod_test")
-            ),
-            workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-001",
-            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/test.md",
-            rawContentURL: nil
-        )
-        model.designDocStateByProjectID[projectID] = resolvedState
-        let state = model.designDocStateByProjectID[projectID] ?? .notSet
-        XCTAssertNotNil(ProjectDesignDocAffordancePresentation.from(state: state))
-        XCTAssertEqual(
-            ProjectDesignDocAffordancePresentation.from(state: state)?.systemImage,
-            "doc.text"
-        )
+        let project = model.projectsByProductID.values.first!.first!
+        let task = model.tasksByProjectID[project.id]!.first!
+        XCTAssertTrue(model.designDocStateByProjectID.isEmpty)
+        XCTAssertEqual(model.workItemDocPresentation(for: task)?.systemImage, "doc.text")
     }
 
-    /// A `kind=design` task whose parent project has `.notSet` state
-    /// must produce a nil presentation — the card renders no affordance
-    /// rather than a broken / empty placeholder.
-    func testDesignTaskWithNotSetStateProducesNoPresentation() {
+    func testDesignTaskWithoutPointerHidesIcon() {
         let model = makeModelWithDesignTask()
-        let projectID = model.projectsByProductID.values.first!.first!.id
-        model.designDocStateByProjectID[projectID] = .notSet
-        let state = model.designDocStateByProjectID[projectID] ?? .notSet
-        XCTAssertNil(ProjectDesignDocAffordancePresentation.from(state: state))
-    }
-
-    /// When the parent project's state has not been fetched yet
-    /// (no entry in `designDocStateByProjectID`) the affordance must
-    /// be hidden — the fallback to `.notSet` in `WorkBoardCardItem`
-    /// ensures no stale icon appears while a resolve RPC is in flight.
-    func testDesignTaskWithMissingStateDefaultsToHidden() {
-        let model = makeModelWithDesignTask()
-        let projectID = model.projectsByProductID.values.first!.first!.id
-        XCTAssertNil(model.designDocStateByProjectID[projectID])
-        let state = model.designDocStateByProjectID[projectID] ?? .notSet
-        XCTAssertNil(ProjectDesignDocAffordancePresentation.from(state: state))
+        var project = model.projectsByProductID.values.first!.first!
+        let task = model.tasksByProjectID[project.id]!.first!
+        project.designDocPath = nil
+        model.projectsByProductID[project.productID] = [project]
+        XCTAssertNil(model.workItemDocPresentation(for: task))
     }
 
     /// `openProjectDesignDoc` is called with the correct project when
@@ -818,6 +817,9 @@ final class DesignTaskCardDesignDocAffordanceTests: XCTestCase {
         )
         model.designDocStateByProjectID[project.id] = resolvedState
         model.openProjectDesignDoc(project)
+        model.applyResolvedProjectDesignDoc(ResolveProjectDesignDocOutput(
+            projectID: project.id, state: model.designDocStateByProjectID[project.id]!
+        ))
         XCTAssertEqual(openedURLs.count, 1)
         XCTAssertEqual(
             openedURLs.first?.absoluteString,
@@ -879,24 +881,5 @@ final class DesignTaskCardDesignDocAffordanceTests: XCTestCase {
         )
         model.tasksByProjectID = [projectID: [task]]
         return model
-    }
-}
-
-// MARK: - Test-only handler hook
-
-extension ChatViewModel {
-    /// The view-model's event handler is private so production code
-    /// can't reach in around the engine socket. The kanban affordance
-    /// tests need to drive a `projectDesignDocResolved` push without
-    /// standing up a fake socket, so we expose a tiny re-emit helper
-    /// for tests — same shape as `upsertTaskForTest` in the dependency
-    /// tests file.
-    fileprivate func handleForTest(event: EngineEvent) {
-        switch event {
-        case .projectDesignDocResolved(let output):
-            designDocStateByProjectID[output.projectID] = output.state
-        default:
-            XCTFail("handleForTest received unsupported event")
-        }
     }
 }

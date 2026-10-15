@@ -805,6 +805,23 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Narrow index scan for design-doc resolution; no execution JSON or history payloads.
+    pub fn list_in_flight_repo_workspaces(&self) -> Result<HashMap<String, String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT repo_remote_url, workspace_path FROM work_executions
+             WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND cube_lease_id IS NOT NULL AND workspace_path IS NOT NULL
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let mut paths = HashMap::new();
+        for row in stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? {
+            let (repo, path) = row?;
+            paths.entry(repo).or_insert(path);
+        }
+        Ok(paths)
+    }
+
     /// Return every non-terminal `work_executions` row that recorded a
     /// `workspace_path` — the candidate set for the lost-workspace
     /// reconciler ([`crate::lost_workspace_sweep`]).
