@@ -357,7 +357,6 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         XCTAssertTrue(waitUntil(5) { model.isConnected })
         // A second drag whose request is unrelated and must survive. Added once
         // connected so the initial connection churn cannot settle it.
-        // A second drag whose request is unrelated and must survive.
         let other = ChatViewModel.PendingDragAdmissionCheck(taskID: "other", column: .doing, group: nil)
         model.pendingDragAdmissionChecks["other"] = other
         model.pendingMoveOriginByTaskID["other"] = .backlog

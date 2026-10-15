@@ -409,7 +409,6 @@ final class EngineClient: @unchecked Sendable {
             // Reuse each action's original envelope id so a reply to the retried
             // send still correlates with the caller's pending state.
             let drained = state.unsent
-
             state.unsent.removeAll()
             for action in drained { state.scheduled[action.id] = action.data }
             // Registered before the write so a fast reply cannot race it.
