@@ -234,8 +234,12 @@ extension ChatViewModel {
                updatedTask.boardColumn == targetColumn {
                 pendingMoveOriginByTaskID.removeValue(forKey: updatedTask.id)
             } else if optimisticColumnByTaskID[updatedTask.id] != nil {
-                // Engine returned a different status — move silently rejected.
-                bounceBackOptimisticMoves(message: nil)
+                // Engine returned a different status without a refusal reply.
+                // Say so rather than snapping the card back with no word.
+                bounceBackOptimisticMoves(
+                    message: "The engine did not apply that move, so the card went back.",
+                    taskID: updatedTask.id
+                )
             }
             maybeFireReviewNotification(for: updatedTask)
             // Unrelated updates do not settle an answer to the same open question.

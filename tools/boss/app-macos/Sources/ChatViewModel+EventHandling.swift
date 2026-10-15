@@ -124,7 +124,7 @@ extension ChatViewModel {
             // `pendingDragAdmissionCheck` or the optimistic move it guards.
             if !pendingDragAdmissionChecks.isEmpty && !engine.hasUnsentAction(kind: "evaluate_dispatch_admission") {
                 pendingDragAdmissionChecks.removeAll()
-                bounceBackOptimisticMoves(message: nil)
+                bounceBackOptimisticMoves(message: "Connection to the engine was lost before it could answer — try the move again.")
             }
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, let itemIDs):
@@ -198,7 +198,8 @@ extension ChatViewModel {
             handleCreatedWorkItemsBatch(items)
         case .workItemUpdated(let item):
             handleUpdatedWorkItem(item)
-        case .projectTasksReordered(let projectId, _):
+        case .projectTasksReordered(let projectId, _, let requestId):
+            settleReorderSuccess(requestId: requestId)
             if let productID = project(withID: projectId)?.productID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
@@ -212,6 +213,8 @@ extension ChatViewModel {
             }
         case .operatorQuestionError(let message, let requestId):
             handleOperatorQuestionError(message: message, requestId: requestId)
+        case .workItemRefused(let id, let code, let message, let suggestedAction, let requestId):
+            handleWorkItemRefused(id: id, code: code, message: message, suggestedAction: suggestedAction, requestId: requestId)
         case .workError(let message, let requestId):
             if settleOffsiteBackupError(message, requestID: requestId) { return }
             // An error carrying the answer's own request id is not ambiguous:
@@ -220,6 +223,11 @@ extension ChatViewModel {
             // Likewise a refused project archive: the row drops its pending
             // mark and the message surfaces, with no other state touched.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
+            // A refused Move Up/Down reorder carries its own request id:
+            // show the reason on the card that was moved.
+            if settleReorderWorkError(message: message, requestId: requestId) { return }
+            // Likewise a refused "Add revision…": show it on the parent card.
+            if settleRevisionWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
             // The engine's WorkError reply carries no request context, so we
             // can't tell which in-flight list_executions/list_attachments
@@ -342,6 +350,8 @@ extension ChatViewModel {
                 // `pendingDragAdmissionCheck` for a reply that never
                 // arrives in the expected shape. Bounce it back exactly as
                 // a hard-blocker refusal would.
+                // The reply never decoded, so it names no card: every pending
+                // check is bounced.
                 pendingDragAdmissionChecks.removeAll()
                 bounceBackOptimisticMoves(message: message)
                 return

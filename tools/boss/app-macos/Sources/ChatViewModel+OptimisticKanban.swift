@@ -13,6 +13,11 @@ extension ChatViewModel {
     struct DragRefusalNotice: Equatable {
         let taskID: String
         let message: String
+        /// Machine-readable engine reason (`bound_pr`, …); nil for refusals
+        /// the client detected itself.
+        var code: String? = nil
+        /// Engine-suggested next step (`add_revision`), if any.
+        var suggestedAction: String? = nil
     }
 
     /// A drag-to-Doing waiting on its `EvaluateDispatchAdmission` reply.
@@ -93,27 +98,27 @@ extension ChatViewModel {
 
         // The engine owns dependency admission through `gating_prereqs_for`,
         // as for an explicit `RequestExecution`: an `in_review` prerequisite
-        // satisfies a revision. Forward the drop; refusals return as
-        // `work_error`, and `bounceBackOptimisticMoves` shows the reason on
-        // the card. Display helpers do not decide admission.
+        // satisfies a revision. Forward the drop; the engine answers a
+        // refusal with `work_item_refused`, and `handleWorkItemRefused` shows
+        // the reason on the card. Display helpers do not decide admission.
 
-        // Moving out of Doing while a live worker is attached is blocked
-        // except for two intentional gestures — see `moveTask`, which applies
-        // the same rule to the popover's explicit Move buttons.
+        // Moving out of Doing while a live worker is attached is allowed only
+        // to Backlog (stop + park) or Done. The popover's Move buttons reach
+        // this same check through `moveTask`.
         if origin == .doing,
            column != .backlog,
            column != .done,
            hasLiveWorker(forTaskID: taskID)
         {
-            appendSystemMessage(
-                "\(task.name) is being worked on by a live worker. Stop the worker before moving the card out of Doing.",
-                alwaysShow: true
-            )
+            let message = "\(task.name) is being worked on by a live worker. Stop the worker before moving the card out of Doing."
+            appendSystemMessage(message, alwaysShow: true)
+            dragRefusalNotice = DragRefusalNotice(taskID: taskID, message: message)
+            scheduleDragRefusalDismiss(for: taskID)
             return false
         }
 
         // Optimistic reposition: draw the card at the drop site until the
-        // engine's answer arrives. `bounceBackOptimisticMoves` returns it to
+        // engine's answer arrives. `handleWorkItemRefused` returns it to
         // `origin` if the engine refuses, and `reconcileOptimisticOverrides`
         // drops the override once real state agrees.
         pendingMoveOriginByTaskID[taskID] = origin
@@ -185,7 +190,7 @@ extension ChatViewModel {
         let hardBlockers = admission.hardBlockers
         if !hardBlockers.isEmpty {
             engine.finishAdmissionRetry(taskID: pending.taskID)
-            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "))
+            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "), taskID: pending.taskID)
             return
         }
 
@@ -193,7 +198,7 @@ extension ChatViewModel {
             engine.finishAdmissionRetry(taskID: pending.taskID)
             let reason = "dispatch is paused" + (admission.pause.reason.map { ": \($0)" } ?? "")
                 + " — this pause is not overridable"
-            bounceBackOptimisticMoves(message: reason)
+            bounceBackOptimisticMoves(message: reason, taskID: pending.taskID)
             return
         }
 
@@ -240,7 +245,7 @@ extension ChatViewModel {
         guard let confirmation = pendingPauseOverrideConfirmation else { return }
         engine.finishAdmissionRetry(taskID: confirmation.taskID)
         presentNextPauseOverrideConfirmation()
-        bounceBackOptimisticMoves(message: nil)
+        bounceBackOptimisticMoves(message: nil, taskID: confirmation.taskID)
     }
 
     /// Which of its column's named groups `task` currently renders in, or
@@ -274,22 +279,82 @@ extension ChatViewModel {
         }
     }
 
-    /// Bounce all unconfirmed in-flight optimistic moves back to their origin
-    /// columns and surface an inline notice. Called when `work_error` arrives
-    /// while moves are pending, or when `workItemUpdated` reports an unexpected
-    /// status (engine silently rejected the transition).
-    func bounceBackOptimisticMoves(message: String?) {
-        guard !pendingMoveOriginByTaskID.isEmpty else { return }
-        let bouncedIDs = Array(pendingMoveOriginByTaskID.keys)
+    /// Bounce unconfirmed in-flight optimistic moves back to their origin
+    /// columns and surface an inline notice. With a `taskID` (the engine
+    /// named the card it refused) only that card is bounced — other cards'
+    /// moves are still in flight and unaffected. Without one (an error that
+    /// cannot be attributed to a card: `work_error` while moves are pending,
+    /// or `workItemUpdated` reporting an unexpected status) every pending
+    /// move is bounced.
+    func bounceBackOptimisticMoves(
+        message: String?,
+        taskID: String? = nil,
+        code: String? = nil,
+        suggestedAction: String? = nil
+    ) {
+        let bouncedIDs: [String]
+        if let taskID {
+            bouncedIDs = pendingMoveOriginByTaskID[taskID] != nil ? [taskID] : []
+        } else {
+            bouncedIDs = Array(pendingMoveOriginByTaskID.keys)
+        }
         for id in bouncedIDs {
             optimisticColumnByTaskID.removeValue(forKey: id)
             pendingMoveOriginByTaskID.removeValue(forKey: id)
         }
-        invalidateWorkCache()
-        if let firstID = bouncedIDs.first, let message {
-            dragRefusalNotice = DragRefusalNotice(taskID: firstID, message: message)
-            scheduleDragRefusalDismiss(for: firstID)
+        if !bouncedIDs.isEmpty {
+            invalidateWorkCache()
         }
+        if let noticeID = taskID ?? bouncedIDs.first, let message {
+            dragRefusalNotice = DragRefusalNotice(
+                taskID: noticeID, message: message, code: code, suggestedAction: suggestedAction
+            )
+            scheduleDragRefusalDismiss(for: noticeID)
+        }
+    }
+
+    /// Reply handler for `.workItemRefused`: the engine refused or reverted a
+    /// board gesture and says why. Bounces the optimistic placement back and
+    /// shows the engine's reason on the dragged card (even when no optimistic
+    /// move is pending), with the engine's suggested next step if any.
+    func handleWorkItemRefused(
+        id: String,
+        code: String,
+        message: String,
+        suggestedAction: String?,
+        requestId: String? = nil
+    ) {
+        if let requestId {
+            reorderRequestTaskIDs.removeValue(forKey: requestId)
+        }
+        if pendingDragAdmissionChecks.removeValue(forKey: id) != nil {
+            engine.finishAdmissionRetry(taskID: id)
+        }
+        bounceBackOptimisticMoves(message: message, taskID: id, code: code, suggestedAction: suggestedAction)
+    }
+
+    /// Follow the engine's suggested next step from a refusal notice.
+    /// `add_revision` opens the revision composer for the refused card.
+    func performDragRefusalAction(_ notice: DragRefusalNotice) {
+        if notice.suggestedAction == "add_revision" {
+            revisionComposerTaskID = notice.taskID
+        }
+        clearDragRefusal()
+    }
+
+    /// File the revision typed into the composer against its parent card.
+    /// Blank text is ignored (the composer keeps its Create button disabled).
+    func submitRevision(parentTaskID: String, description: String) {
+        let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let requestID = engine.sendCreateRevision(parentTaskId: parentTaskID, description: trimmed) {
+            revisionRequestParentIDs[requestID] = parentTaskID
+        }
+        revisionComposerTaskID = nil
+    }
+
+    func cancelRevisionComposer() {
+        revisionComposerTaskID = nil
     }
 
     /// After the engine's work tree arrives and `tasksByProjectID` reflects

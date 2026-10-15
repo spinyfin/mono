@@ -84,6 +84,19 @@ final class ChatViewModel: ObservableObject {
     /// Envelope request id of each in-flight archive → its project id, so
     /// a `work_error` carrying that id settles onto the right row.
     var archiveRequestProjectIDs: [String: String] = [:]
+
+    /// Envelope request id of each in-flight Move Up/Down reorder → the card
+    /// that was moved, so a refusal shows on that card rather than as a
+    /// generic error banner.
+    var reorderRequestTaskIDs: [String: String] = [:]
+
+    /// Envelope request id of each "Add revision…" `create_revision` → the
+    /// parent card it was filed against, so a refusal shows on that card.
+    var revisionRequestParentIDs: [String: String] = [:]
+
+    /// Card whose "Add revision…" composer is open (see
+    /// `performDragRefusalAction`). `nil` when no composer is showing.
+    @Published var revisionComposerTaskID: String?
     /// Dependency edges keyed by product. Refreshed whenever the engine
     /// pushes a fresh `WorkTree` for that product. The kanban joins
     /// these against the task/chore/project name maps to render

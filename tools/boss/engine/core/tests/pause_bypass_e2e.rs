@@ -237,10 +237,11 @@ async fn board_drag_force_with_stale_pause_generation_refuses_without_activating
             target: BoardDropTarget::new(BoardColumn::Doing, None),
             bypass_dispatch_pause: true,
             observed_pause_since_epoch_s: Some(1),
+            explicit_status: None,
         })
         .await?;
     match response {
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkItemRefused { message, .. } => {
             assert!(
                 message.to_lowercase().contains("changed")
                     || message.to_lowercase().contains("pause")
