@@ -3,9 +3,11 @@
 //! Split out of `app.rs`; all `dispatch_*` functions that react to worker
 //! hook events live here. Pure structural move — no behavioural change.
 
+use super::transcript_persist::persist_transcript_and_capture_cost;
 use super::*;
 use crate::driver::{AgentDriver, Capability, ClaudeDriver};
-use crate::live_worker_state::DriverSignalKind;
+use crate::live_worker_state::{ApplyEventOutcome, DriverSignalKind};
+use boss_protocol::WorkerActivity;
 
 impl ServerState {
     /// Stamp a driver-originated signal and, if this run is the in-flight
@@ -493,7 +495,7 @@ pub(super) async fn dispatch_live_worker_state(
     server_state.dispatcher_stats.inc_hook_events_total();
     tracing::info!(
         run_id = ?incoming.run_id,
-        peer_pid = ?incoming.peer_pid,
+        peer_pid = ?incoming.connection.peer_pid,
         kind = event_kind,
         has_transcript_path = incoming.transcript_path.is_some(),
         "live_status: hook payload arrived at dispatcher",
@@ -502,7 +504,7 @@ pub(super) async fn dispatch_live_worker_state(
         server_state.dispatcher_stats.inc_dropped_missing_run_id();
         tracing::warn!(
             kind = event_kind,
-            peer_pid = ?incoming.peer_pid,
+            peer_pid = ?incoming.connection.peer_pid,
             "live_status: dropping hook — neither _boss_run_id payload nor peer-pid ancestor walk produced a run_id",
         );
         return;
@@ -548,7 +550,8 @@ pub(super) async fn dispatch_live_worker_state(
     // (first-writer-wins) so we don't clobber the path the tail
     // watcher has already opened across later sessions/resumes.
     //
-    // This runs BEFORE the slot lookup so it survives the cases where
+    // The persist itself (`persist_transcript_and_capture_cost`) runs on
+    // BOTH sides of the slot lookup below, so it survives the cases where
     // `slot_for_run` would otherwise drop the event: a first hook
     // racing ahead of `register_run_slot`, an engine restart that
     // wipes the in-memory `WorkerRegistry` while pre-existing workers
@@ -556,7 +559,10 @@ pub(super) async fn dispatch_live_worker_state(
     // been released. The persist is keyed solely on `run_id` and does
     // not need the slot mapping — gating it under that lookup was the
     // gap that pinned `work_runs.transcript_path` at NULL across
-    // engine restarts.
+    // engine restarts. On the slot-found path it runs *after* the
+    // live-state transition: it is the slow half of ingress (a turn
+    // boundary polls the transcript), and the activity the worker
+    // reports must not queue behind it.
     //
     // **2026-05-12 follow-up:** PR #366's persist branch only fires
     // when the current hook's payload carries `transcript_path`. In
@@ -588,121 +594,6 @@ pub(super) async fn dispatch_live_worker_state(
             }
         }
     };
-    if let Some(path) = resolved_path.as_deref() {
-        // The second driver-originated signal named in the driver-start
-        // contract: a resolved transcript path means the driver created
-        // its transcript. Redundant with the hook stamp above on this
-        // code path (both are reached from the same ingress), and
-        // recorded anyway so the contract holds at every site that
-        // learns a transcript path rather than depending on the two
-        // staying adjacent.
-        server_state
-            .record_driver_signal(run_id, DriverSignalKind::TranscriptPath)
-            .await;
-        // `run_id` here is the `_boss_run_id` from the hook payload,
-        // which carries the **execution_id** (`exec_*`) — not a
-        // `work_runs.id` (`run_*`). The setter joins on
-        // `work_runs.execution_id` so the caller doesn't have to
-        // care; the local `execution_id` binding is just to make
-        // the namespace explicit at the call site, since the
-        // historical "run_id" naming all the way through the
-        // dispatcher is what hid the wrong-namespace bug.
-        let execution_id = run_id;
-        match server_state
-            .work_db
-            .set_run_transcript_path_if_unset(execution_id, path)
-        {
-            Ok(SetRunTranscriptPathOutcome::Updated) => {
-                server_state.dispatcher_stats.inc_persist_updated();
-                if from_cache {
-                    server_state.dispatcher_stats.inc_persist_from_cache();
-                }
-                tracing::info!(
-                    execution_id,
-                    transcript_path = %path,
-                    from_cache,
-                    "recorded transcript_path on work_run from hook payload",
-                );
-            }
-            Ok(SetRunTranscriptPathOutcome::AlreadySet) => {
-                server_state.dispatcher_stats.inc_persist_noop();
-            }
-            Ok(SetRunTranscriptPathOutcome::RowMissing) => {
-                server_state.dispatcher_stats.inc_persist_row_missing();
-                tracing::warn!(
-                    execution_id,
-                    transcript_path = %path,
-                    "no work_runs row for execution yet; transcript_path persist deferred to a later hook",
-                );
-            }
-            Err(err) => {
-                server_state.dispatcher_stats.inc_persist_err();
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "failed to persist transcript_path from hook payload",
-                );
-            }
-        }
-
-        // Fold transcript records appended since the prior hook into a
-        // cumulative, idempotent snapshot. The driver-owned containment root
-        // was resolved at ingress alongside the turn boundary; failure to
-        // resolve it refuses the read instead of degrading a contained driver
-        // (notably Codex) to an unrestricted tail.
-        let containment_root = match incoming.transcript_containment_root() {
-            Ok(root) => Some(root),
-            Err(error) => {
-                tracing::warn!(
-                    execution_id = run_id,
-                    transcript_path = %path,
-                    %error,
-                    "refusing run cost capture because transcript containment could not be resolved",
-                );
-                None
-            }
-        };
-
-        // A provider can fire its turn boundary just before flushing the
-        // final assistant usage and turn-duration records. Poll with the same
-        // bounded linear-backoff shape used by triage transcript readback.
-        // This remains independent of successful finalization and runs before
-        // slot lookup, so orphaned and late-hook executions retain the final
-        // observed cost too. Missing synthetic/test paths take one poll only.
-        if let Some(containment_root) = containment_root {
-            let settle_attempts = if incoming.is_turn_boundary() && tokio::fs::try_exists(path).await.unwrap_or(false) {
-                crate::completion::TRIAGE_TRANSCRIPT_READ_ATTEMPTS
-            } else {
-                1
-            };
-            for attempt in 1..=settle_attempts {
-                if attempt > 1 {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        crate::completion::TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS * u64::from(attempt - 1),
-                    ))
-                    .await;
-                }
-                if let Err(error) = server_state
-                    .run_cost_capture
-                    .capture_and_persist(
-                        &server_state.work_db,
-                        run_id,
-                        std::path::Path::new(path),
-                        containment_root,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        execution_id = run_id,
-                        transcript_path = %path,
-                        %error,
-                        "failed to capture cumulative run cost from transcript",
-                    );
-                    break;
-                }
-            }
-        }
-    }
     let slot_id = match server_state.worker_registry.slot_for_run(run_id) {
         Some(slot_id) => slot_id,
         None => {
@@ -720,6 +611,14 @@ pub(super) async fn dispatch_live_worker_state(
             match register_remote_worker_slot(server_state, run_id).await {
                 Some(slot_id) => slot_id,
                 None => {
+                    persist_transcript_and_capture_cost(
+                        server_state,
+                        incoming,
+                        run_id,
+                        resolved_path.as_deref(),
+                        from_cache,
+                    )
+                    .await;
                     // No slot, and not a live remote worker. Before we
                     // drop the event, check whether it belongs to an
                     // execution the engine already believes is terminal —
@@ -785,16 +684,53 @@ pub(super) async fn dispatch_live_worker_state(
         .record_driver_signal(run_id, DriverSignalKind::HookEvent)
         .await;
     let prior_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
-    let changed = server_state.live_worker_states.apply_event(slot_id, &incoming.event);
+    // Applied in the worker's emission order (`ingress_seq`), so a `Stop`
+    // whose ingress task was slower than the next turn's `PreToolUse`
+    // cannot land second and rewind the slot to Idle mid-tool-call.
+    let outcome = server_state.live_worker_states.apply_sequenced_event(
+        slot_id,
+        incoming.connection.ingress_seq,
+        &incoming.event,
+    );
+    let stale_event = matches!(outcome, ApplyEventOutcome::Stale { .. });
+    let changed = matches!(outcome, ApplyEventOutcome::Applied { changed: true });
+    let new_state = server_state.live_worker_states.get(slot_id);
+    let new_activity = new_state.as_ref().map(|s| s.activity);
+    // A declared wait (`boss propose wait`) describes the idle period that
+    // follows it. The moment the worker is back to Working — a prompt, or
+    // Claude Code waking the session on its own because a background
+    // command finished, which opens the turn with tool hooks and no
+    // `UserPromptSubmit` — that period is over: end the wait so the pane
+    // stops advertising a stale `wait_reason` and the nudge ladder is no
+    // longer held for an idle period that has ended. Only an idle →
+    // Working transition qualifies: a wait declared mid-turn (the worker
+    // runs `propose wait`, then a few more tools, then stops) must survive
+    // the rest of that turn, and the prior activity is already Working
+    // for every one of those tool calls.
+    if changed
+        && prior_activity.is_some_and(|prior| prior != WorkerActivity::Working)
+        && new_activity == Some(WorkerActivity::Working)
+        && let Some(ended) = server_state.wait_registry.end_active(run_id)
+    {
+        tracing::info!(
+            execution_id = run_id,
+            slot_id,
+            ?prior_activity,
+            current_tool = new_state.as_ref().and_then(|s| s.current_tool.as_deref()).unwrap_or("-"),
+            reason = %ended.reason,
+            "live_status: worker resumed a turn; ended its declared wait",
+        );
+    }
     if changed {
         server_state.broadcast_live_worker_states().await;
     }
+    persist_transcript_and_capture_cost(server_state, incoming, run_id, resolved_path.as_deref(), from_cache).await;
     // Fan out the matching trigger to the per-slot live-status loop.
     // The manager drops the trigger if no slot task is running, so a
     // hook arriving before `register_spawn` or after `release_slot`
-    // is a benign no-op.
-    let new_state = server_state.live_worker_states.get(slot_id);
-    let new_activity = new_state.as_ref().map(|s| s.activity);
+    // is a benign no-op. A stale event (refused above) describes a turn
+    // state the worker has already left, so it is not a boundary or a
+    // tool result the loop should react to either.
     let is_pr_review = new_state.as_ref().and_then(|s| s.kind.as_deref()) == Some(ExecutionKind::PrReview.as_str());
     // Project the pane's awaiting-input state onto the durable row, so
     // `work_executions.status` and `bossctl agents`' `activity` cannot
@@ -816,7 +752,7 @@ pub(super) async fn dispatch_live_worker_state(
     // dispatcher recognising a Claude-shaped `Stop`. Checked ahead of the
     // match because the two are disjoint: no event is both a turn boundary
     // and a tool result.
-    if incoming.is_turn_boundary() && !is_remote_slot {
+    if incoming.is_turn_boundary() && !is_remote_slot && !stale_event {
         server_state.live_status_manager.notify(slot_id, Trigger::Stop);
     }
     if let crate::protocol::WorkerEvent::PostToolUse {
@@ -826,7 +762,7 @@ pub(super) async fn dispatch_live_worker_state(
         ..
     } = &incoming.event
     {
-        if !is_remote_slot {
+        if !is_remote_slot && !stale_event {
             server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
         }
         // Primary-path PR URL capture. Every worker that opens a

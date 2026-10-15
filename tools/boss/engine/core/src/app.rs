@@ -82,6 +82,7 @@ mod dependencies;
 mod design_docs;
 mod effort;
 mod engine_meta;
+mod events_accept;
 mod executions;
 mod external_tracker;
 mod github_auth;
@@ -130,6 +131,7 @@ mod subscriptions;
 #[cfg(test)]
 mod tests;
 mod tmux_teardown;
+mod transcript_persist;
 mod trunk_auth;
 mod trust;
 mod viewer_reconcile;

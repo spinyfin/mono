@@ -480,6 +480,7 @@ mod probe_delivery;
 mod probe_interrupt;
 mod project_archive_cascade;
 mod proposals;
+mod resumed_turn_activity;
 mod reveal_deadline;
 mod review_guide;
 mod revision_no_op_live_seam_reproduction;

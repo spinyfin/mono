@@ -1048,7 +1048,7 @@ async fn serve_scoped(
         tracing::info!(events_socket_path = %path.display(), "events socket is ready");
         let server_state_for_events = server_state.clone();
         boss_task_scope::spawn(async move {
-            run_events_accept_loop(events_listener, server_state_for_events).await;
+            events_accept::run_events_accept_loop(events_listener, server_state_for_events).await;
         });
     }
 
@@ -2930,58 +2930,6 @@ async fn graceful_shutdown_signal() -> &'static str {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => "SIGINT",
         _ = sigterm.recv() => "SIGTERM",
-    }
-}
-
-async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<ServerState>) {
-    let local_addr = listener.local_addr().ok();
-    let path_display = local_addr
-        .as_ref()
-        .and_then(|a| a.as_pathname())
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<unknown>".to_owned());
-    tracing::info!(
-        events_socket_path = %path_display,
-        "events socket: accept loop started",
-    );
-    if let Some(p) = local_addr.as_ref().and_then(|a| a.as_pathname()) {
-        crate::audit::record_accept_loop_started("events", p);
-    }
-    // This socket only ever hears from a `ProgressIngress::HookCallback`
-    // driver's `boss-event` shim (a `StdoutJsonl` driver never connects to
-    // it), but different connections carry different workers' drivers
-    // (Claude, Codex, Grok, …) — so the driver is resolved per connection
-    // inside `handle_connection`, from the payload's `_boss_run_id` via
-    // `WorkDb::get_execution_driver_slug`, rather than once here for every
-    // connection. The registry is still built once: it is stateless and
-    // shared read-only across connections.
-    let driver_registry = std::sync::Arc::new(crate::driver::DriverRegistry::default());
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let server_state = server_state.clone();
-                let driver_registry = driver_registry.clone();
-                boss_task_scope::spawn(async move {
-                    match handle_connection(stream, &driver_registry, &server_state.work_db).await {
-                        Ok(incoming) => {
-                            tracing::info!(
-                                peer_pid = ?incoming.peer_pid,
-                                run_id = ?incoming.run_id,
-                                event = ?incoming.event,
-                                "events socket: hook event received",
-                            );
-                            dispatch_worker_event_fanout(&server_state, &incoming).await;
-                        }
-                        Err(err) => {
-                            tracing::warn!(?err, "events socket: failed to handle connection");
-                        }
-                    }
-                });
-            }
-            Err(err) => {
-                tracing::error!(?err, "events socket accept failed");
-            }
-        }
     }
 }
 

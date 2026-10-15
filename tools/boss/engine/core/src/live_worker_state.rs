@@ -3,7 +3,10 @@
 //! The events socket consumer feeds this; bossctl reads from it via
 //! the frontend RPC; the topic broker re-publishes the full snapshot
 //! whenever any slot changes so UI subscribers can push to the kanban
-//! Doing icon and the pane titlebar pill in near-real-time.
+//! Doing icon and the pane titlebar pill in near-real-time. Hook events
+//! are applied in the worker's emission order, never in the order their
+//! per-connection ingress tasks happen to finish — see
+//! [`LiveWorkerStateRegistry::apply_sequenced_event`].
 //!
 //! Keyed by slot id (the interactive pool spans 1..=16 across two pages,
 //! with automation/review above it), not run id — run records finalise
@@ -343,6 +346,14 @@ struct SlotMeta {
     /// this counter is ever consulted.
     #[builder(default)]
     undeterminable_liveness_passes: u32,
+    /// Accept-order sequence of the newest hook event applied to this slot
+    /// through [`LiveWorkerStateRegistry::apply_sequenced_event`]. `None`
+    /// until the first sequenced event lands, and for slots fed only by
+    /// unsequenced ingress (the Codex stdout reader, engine-synthesized
+    /// events). A sequenced event numbered below this value was emitted by
+    /// the worker *before* the state the slot already shows, so applying it
+    /// would rewind the slot — it is refused instead; see that method.
+    last_applied_ingress_seq: Option<u64>,
     /// Whether [`crate::spawn_ack_sweep::raise_liveness_undeterminable_attention`]
     /// has already fired for this slot's current run. Guards against raising
     /// the same attention item again on every subsequent pass once the
@@ -1549,15 +1560,73 @@ impl LiveWorkerStateRegistry {
     /// when present it is treated as authoritative and overwrites the
     /// launch default stamped at spawn. When absent (Codex stdout
     /// `thread.started`, older fixtures), the launch default is retained.
+    ///
+    /// Unsequenced form of [`Self::apply_sequenced_event`]: the event is
+    /// always applied, in arrival order. Callers whose ingress is already
+    /// sequential (the Codex stdout reader, engine-synthesized events,
+    /// tests) use this.
     pub fn apply_event(&self, slot_id: u8, event: &WorkerEvent) -> bool {
+        matches!(
+            self.apply_sequenced_event(slot_id, None, event),
+            ApplyEventOutcome::Applied { changed: true }
+        )
+    }
+
+    /// [`Self::apply_event`], applied in the worker's emission order.
+    ///
+    /// `ingress_seq` is the accept-order sequence the events-socket accept
+    /// loop stamped on the hook's connection
+    /// ([`crate::events_socket::IncomingHookEvent::ingress_seq`]). Each
+    /// connection is dispatched on its own task, so two hooks the worker
+    /// emitted in order can reach this method in either order — and the
+    /// race is not symmetric: a turn boundary persists the transcript path
+    /// and captures run cost before it gets here, while a `PreToolUse`
+    /// arrives almost directly. When Claude Code wakes a stopped session on
+    /// its own (a background command finished) the resumed turn opens with
+    /// tool hooks, no `UserPromptSubmit`; if the preceding `Stop` is still
+    /// on its way, it lands *after* the `PreToolUse` and rewinds the slot to
+    /// `Idle` with no tool, for as long as the next hook takes to arrive —
+    /// the whole of a multi-minute `checkleft run`, in the 2026-10-15
+    /// incident this guards against.
+    ///
+    /// So the slot remembers the newest sequence it applied, and an event
+    /// numbered below it is refused as [`ApplyEventOutcome::Stale`]: it
+    /// describes a state the worker has already moved past. Liveness
+    /// bookkeeping for a stale event is unaffected — the ingress recorded
+    /// the driver signal before calling here — and `None` always applies.
+    pub fn apply_sequenced_event(
+        &self,
+        slot_id: u8,
+        ingress_seq: Option<u64>,
+        event: &WorkerEvent,
+    ) -> ApplyEventOutcome {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let now = current_iso8601();
         // The wire state and the per-slot bookkeeping this arm reads and
         // writes now live in one entry, so a single lookup reaches both;
         // `SlotEntry`'s fields split-borrow without a second map access.
         let Some(SlotEntry { state, meta }) = guard.get_mut(&slot_id) else {
-            return false;
+            return ApplyEventOutcome::NoSlot;
         };
+        if let Some(ingress_seq) = ingress_seq {
+            if let Some(last_applied_seq) = meta.last_applied_ingress_seq
+                && last_applied_seq > ingress_seq
+            {
+                tracing::info!(
+                    slot_id,
+                    run_id = %state.run_id,
+                    event = worker_event_name(event),
+                    ingress_seq,
+                    last_applied_seq,
+                    activity = state.activity.as_str(),
+                    current_tool = state.current_tool.as_deref().unwrap_or("-"),
+                    "live-state registry: refusing a hook event that arrived behind a newer one; \
+                     the slot already reflects what the worker did after it",
+                );
+                return ApplyEventOutcome::Stale { last_applied_seq };
+            }
+            meta.last_applied_ingress_seq = Some(ingress_seq);
+        }
         let before = state.clone();
 
         state.last_event_at = Some(now.clone());
@@ -1685,7 +1754,9 @@ impl LiveWorkerStateRegistry {
         let mut comparable_after = state.clone();
         comparable_after.last_event_at = before.last_event_at.clone();
         comparable_after.last_tool_ended_at = before.last_tool_ended_at.clone();
-        before != comparable_after
+        ApplyEventOutcome::Applied {
+            changed: before != comparable_after,
+        }
     }
 
     /// Replace the live-status string for `slot_id` and stamp
@@ -2030,6 +2101,36 @@ impl LiveWorkerStateRegistry {
         if let Some(entry) = guard.get_mut(&slot_id) {
             entry.meta.semantic_tool_condition = tool_condition;
         }
+    }
+}
+
+/// What [`LiveWorkerStateRegistry::apply_sequenced_event`] did with an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyEventOutcome {
+    /// The event was applied. `changed` reports whether any observable
+    /// field moved, exactly as [`LiveWorkerStateRegistry::apply_event`]'s
+    /// boolean does, so callers can keep suppressing no-op broadcasts.
+    Applied { changed: bool },
+    /// No entry exists for the slot — the event arrived before spawn
+    /// registered it or after release. A benign drop, as before.
+    NoSlot,
+    /// The event's ingress sequence is older than the newest event already
+    /// applied to the slot: the worker emitted it *before* the state the
+    /// slot currently shows. Not applied.
+    Stale { last_applied_seq: u64 },
+}
+
+/// Hook event name for log lines — the payload's `hook_event_name`, not
+/// the full event (a `PreToolUse` carries the whole tool input).
+fn worker_event_name(event: &WorkerEvent) -> &'static str {
+    match event {
+        WorkerEvent::SessionStart { .. } => "SessionStart",
+        WorkerEvent::UserPromptSubmit { .. } => "UserPromptSubmit",
+        WorkerEvent::PreToolUse { .. } => "PreToolUse",
+        WorkerEvent::PostToolUse { .. } => "PostToolUse",
+        WorkerEvent::Stop { .. } => "Stop",
+        WorkerEvent::Notification { .. } => "Notification",
+        WorkerEvent::SessionEnd { .. } => "SessionEnd",
     }
 }
 

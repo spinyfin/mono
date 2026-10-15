@@ -211,6 +211,36 @@ impl WaitRegistry {
             .unwrap_or(0)
     }
 
+    /// End the active wait for `execution_id` without touching the budget
+    /// it has already been charged. Returns the record that was active, or
+    /// `None` when nothing was.
+    ///
+    /// Called by the hook ingress when the worker's live activity leaves an
+    /// idle state for `Working` again. A declared wait describes the idle
+    /// period that follows the declaration, and a resumed turn — a human or
+    /// coordinator prompt, or Claude Code waking the session on its own
+    /// because a background command finished — ends that period. Leaving
+    /// the record in place would advertise a stale `wait_reason` on a
+    /// worker that is demonstrably working, and keep holding the nudge
+    /// ladder for an idle period that is over. The budget stays charged so
+    /// a worker cannot reset its per-execution cap by starting turns; it
+    /// re-declares (and is charged again) if it is still waiting when the
+    /// resumed turn ends.
+    pub fn end_active(&self, execution_id: &str) -> Option<WaitRecord> {
+        let mut guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
+        let state = guard.get_mut(execution_id)?;
+        let ended = state.active.take()?;
+        state.expiry_logged = false;
+        tracing::info!(
+            execution_id,
+            reason = %ended.reason,
+            expires_at_epoch = ended.expires_at_epoch,
+            total_granted_secs = state.total_granted_secs,
+            "worker wait ended — the worker resumed a turn before expiry; produce-a-PR nudge ladder resumes"
+        );
+        Some(ended)
+    }
+
     /// Drop all wait state for `execution_id`. Called when the execution
     /// ends so a later occupant of the same map slot cannot inherit budget.
     pub fn forget(&self, execution_id: &str) {
@@ -311,6 +341,28 @@ mod tests {
             registry.declare("exec_a", "n".into(), None, 0, 0).unwrap_err(),
             WaitDeclareError::DurationZero
         );
+    }
+
+    #[test]
+    fn end_active_drops_the_wait_but_keeps_the_budget_charged() {
+        let registry = WaitRegistry::new();
+        registry.declare("exec_a", "bazel".into(), None, 60, 0).unwrap();
+        let ended = registry.end_active("exec_a").expect("the active wait is returned");
+        assert_eq!(ended.reason, "bazel");
+        assert!(registry.active("exec_a", 0).is_none());
+        assert_eq!(
+            registry.total_granted_secs("exec_a"),
+            60,
+            "ending a wait early is not a refund against the per-execution cap"
+        );
+        assert!(registry.end_active("exec_a").is_none(), "nothing is left to end");
+        assert!(registry.end_active("exec_unknown").is_none());
+        // Re-declaring afterwards works and is charged on top.
+        registry
+            .declare("exec_a", "still waiting".into(), None, 30, 10)
+            .unwrap();
+        assert_eq!(registry.total_granted_secs("exec_a"), 90);
+        assert!(registry.active("exec_a", 10).is_some());
     }
 
     #[test]

@@ -1355,3 +1355,131 @@ fn spawn_registration_stamps_routing_metadata_on_the_state() {
     assert_eq!(state.host_id.as_deref(), Some("zakalwe"));
     assert_eq!(state.project_id, None);
 }
+
+// ─── Resumed turns and emission-order application ─────────────────────
+
+#[test]
+fn a_tool_call_after_stop_resumes_working_without_a_user_prompt() {
+    // Claude Code wakes a stopped session on its own when a background
+    // command finishes. The resumed turn has no `UserPromptSubmit` — it
+    // opens with tool hooks — and those alone must flip the slot back to
+    // Working with the tool in hand.
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    reg.apply_event(1, &pre_tool("Bash"));
+    reg.apply_event(1, &post_tool("Bash"));
+    assert!(reg.apply_event(1, &stop_event()));
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+
+    assert!(reg.apply_event(1, &pre_tool("Read")));
+    let state = reg.get(1).unwrap();
+    assert_eq!(state.activity, WorkerActivity::Working);
+    assert_eq!(state.current_tool.as_deref(), Some("Read"));
+
+    assert!(reg.apply_event(1, &stop_event()));
+    let state = reg.get(1).unwrap();
+    assert_eq!(state.activity, WorkerActivity::Idle);
+    assert!(state.current_tool.is_none());
+}
+
+#[test]
+fn a_stop_that_arrives_behind_a_later_tool_event_cannot_rewind_the_slot() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    assert_eq!(
+        reg.apply_sequenced_event(1, Some(1), &pre_tool("Bash")),
+        ApplyEventOutcome::Applied { changed: true }
+    );
+    assert_eq!(
+        reg.apply_sequenced_event(1, Some(2), &post_tool("Bash")),
+        ApplyEventOutcome::Applied { changed: true }
+    );
+    // The worker's Stop (seq 3) is still in its slow pre-apply work when
+    // the resumed turn's PreToolUse (seq 4) reaches the registry.
+    assert_eq!(
+        reg.apply_sequenced_event(1, Some(4), &pre_tool("Read")),
+        ApplyEventOutcome::Applied { changed: true }
+    );
+    assert_eq!(
+        reg.apply_sequenced_event(1, Some(3), &stop_event()),
+        ApplyEventOutcome::Stale { last_applied_seq: 4 },
+        "a Stop the worker emitted before its current tool call must not be applied over it",
+    );
+    let state = reg.get(1).unwrap();
+    assert_eq!(state.activity, WorkerActivity::Working);
+    assert_eq!(state.current_tool.as_deref(), Some("Read"));
+    // The resumed turn's own Stop (seq 5) still ends it.
+    assert_eq!(
+        reg.apply_sequenced_event(1, Some(5), &stop_event()),
+        ApplyEventOutcome::Applied { changed: true }
+    );
+    let state = reg.get(1).unwrap();
+    assert_eq!(state.activity, WorkerActivity::Idle);
+    assert!(state.current_tool.is_none());
+}
+
+#[test]
+fn a_refused_stale_event_reports_no_change_and_leaves_timestamps_alone() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    reg.apply_sequenced_event(1, Some(10), &pre_tool("Bash"));
+    let before = reg.get(1).unwrap();
+    assert_eq!(
+        reg.apply_sequenced_event(1, Some(9), &post_tool("Bash")),
+        ApplyEventOutcome::Stale { last_applied_seq: 10 }
+    );
+    let after = reg.get(1).unwrap();
+    assert_eq!(after, before, "a refused event must not touch the slot at all");
+    assert_eq!(
+        reg.apply_sequenced_event(1, Some(11), &post_tool("Bash")),
+        ApplyEventOutcome::Applied { changed: true },
+        "the next in-order event applies as usual",
+    );
+}
+
+#[test]
+fn unsequenced_events_always_apply_even_after_sequenced_ones() {
+    // The Codex stdout reader and engine-synthesized events carry no
+    // sequence; they are already in order and must keep applying.
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    reg.apply_sequenced_event(1, Some(7), &pre_tool("Bash"));
+    assert!(reg.apply_event(1, &stop_event()));
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    // And a later sequenced event is still judged against the newest
+    // sequenced one, not against the unsequenced event in between.
+    assert_eq!(
+        reg.apply_sequenced_event(1, Some(6), &pre_tool("Bash")),
+        ApplyEventOutcome::Stale { last_applied_seq: 7 }
+    );
+    assert_eq!(
+        reg.apply_sequenced_event(1, Some(8), &pre_tool("Bash")),
+        ApplyEventOutcome::Applied { changed: true }
+    );
+}
+
+#[test]
+fn a_sequenced_event_for_an_unregistered_slot_is_a_benign_drop() {
+    let reg = LiveWorkerStateRegistry::new();
+    assert_eq!(
+        reg.apply_sequenced_event(9, Some(1), &pre_tool("Bash")),
+        ApplyEventOutcome::NoSlot
+    );
+    assert!(!reg.apply_event(9, &pre_tool("Bash")));
+}
+
+#[test]
+fn a_fresh_registration_forgets_the_previous_occupants_sequence() {
+    // Slot reuse: the next run in the same slot starts with no sequence
+    // watermark, so its first (lower-numbered-looking in tests, but in
+    // production always higher) event applies.
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    reg.apply_sequenced_event(1, Some(50), &pre_tool("Bash"));
+    reg.release_slot(1);
+    reg.register_spawn(1, "run-2", "claude-opus-4-7", 2, None);
+    assert_eq!(
+        reg.apply_sequenced_event(1, Some(3), &pre_tool("Bash")),
+        ApplyEventOutcome::Applied { changed: true }
+    );
+}

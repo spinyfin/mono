@@ -88,11 +88,30 @@ const LOCAL_PEERPID: libc::c_int = 0x002;
 /// Claude-shaped assumption baked into the dispatchers.
 #[derive(Debug, Clone)]
 pub struct IncomingHookEvent {
-    pub peer_pid: Option<libc::pid_t>,
+    /// What the socket connection itself told us, independent of the
+    /// payload. See [`HookConnection`].
+    pub connection: HookConnection,
     pub run_id: Option<String>,
     pub transcript_path: Option<String>,
     pub event: WorkerEvent,
     driver_resolution: DriverHookResolution,
+}
+
+/// Connection-level provenance of a hook event: facts the accept loop
+/// learned from the socket, not from the payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HookConnection {
+    /// Best-effort peer pid of the connecting shim; see the note on
+    /// [`IncomingHookEvent`].
+    pub peer_pid: Option<libc::pid_t>,
+    /// Accept-order sequence the events-socket accept loop stamped on this
+    /// connection, via [`IncomingHookEvent::with_ingress_seq`]. The shim
+    /// connects from inside the driver's hook, synchronously, so accept
+    /// order is the order the worker emitted its events in — even though
+    /// each connection is then handled on its own task and can reach the
+    /// live-state reducer in any order. `None` for ingress that is already
+    /// sequential (a stdout-JSONL reader) and for events built in tests.
+    pub ingress_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,12 +154,25 @@ impl IncomingHookEvent {
             },
         };
         Self {
-            peer_pid,
+            connection: HookConnection {
+                peer_pid,
+                ingress_seq: None,
+            },
             run_id,
             transcript_path,
             event,
             driver_resolution,
         }
+    }
+
+    /// Stamp the accept-order sequence for this event. See
+    /// [`crate::live_worker_state::LiveWorkerStateRegistry::apply_sequenced_event`]
+    /// for what the sequence buys: the live-state reducer applies hook
+    /// events in this order rather than in whatever order their
+    /// per-connection tasks happen to reach it.
+    pub fn with_ingress_seq(mut self, ingress_seq: u64) -> Self {
+        self.connection.ingress_seq = Some(ingress_seq);
+        self
     }
 
     /// The driver-supplied turn-ended signal for this event, or `None` when

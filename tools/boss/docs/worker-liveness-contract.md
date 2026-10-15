@@ -128,6 +128,65 @@ enough for the real tmux wrapper to read `#{pane_dead}` and
 status, and the ordinary release path removes the retained session only after
 its live `BOSS_SPAWN_TOKEN` exactly matches the durable run identity.
 
+## Hook events are applied in the worker's emission order
+
+`LiveWorkerState.activity` is reduced from the hook stream by
+`LiveWorkerStateRegistry::apply_sequenced_event`
+(`engine/core/src/live_worker_state.rs`), and the reducer is simple:
+`UserPromptSubmit` / `PreToolUse` / `PostToolUse` → `Working` (with the
+tool on `PreToolUse`), `Stop` → `Idle` (or `WaitingForInput` when a
+`Notification` preceded it), `SessionEnd` → `Terminated`. There is no
+"turn gate": a `PreToolUse` after a `Stop` is a new turn, whether or not a
+`UserPromptSubmit` came first. It must be, because Claude Code wakes a
+stopped session **on its own** when a background command finishes, and
+that resumed turn opens with tool hooks and no prompt.
+
+What can go wrong is ordering. The events-socket accept loop
+(`engine/core/src/app/server.rs`) dispatches every connection on its own
+task, so two hooks the worker emitted in order can reach the reducer in
+either order — and the race is not symmetric. A turn boundary persists
+the transcript path and folds the transcript into the run's cost snapshot
+(a bounded settle loop with sleeps) on its way to the reducer; a
+`PreToolUse` goes almost straight there. When a `Stop` is slow and the
+re-woken turn's first `PreToolUse` is fast, the `Stop` lands second and
+rewinds the slot to `Idle` with no tool — and it stays that way until the
+next hook, which for a multi-minute `checkleft run` is the whole run. That
+is the 2026-10-15 "Idle while visibly running `checkleft`" symptom, with
+the old `wait_reason` still painted on the pane.
+
+Two things close it:
+
+- **Accept order is emission order, and the reducer honours it.** The
+  `boss-event` shim connects synchronously from inside the driver's hook,
+  so the order the accept loop sees connections is the order the worker
+  emitted them. The loop stamps that order as `ingress_seq` on the
+  `IncomingHookEvent` before spawning the task; the registry remembers the
+  newest sequence it applied per slot and refuses an older one
+  (`ApplyEventOutcome::Stale`). A refused event touches nothing — not
+  `activity`, not `current_tool`, not the display timestamps — and does not
+  trigger the live-status loop's `Stop`/`PostToolUse` refresh either.
+  Liveness bookkeeping (`record_driver_signal`) already happened at ingress,
+  so the stale event still counts as proof the driver is alive. Unsequenced
+  callers (the Codex stdout reader, engine-synthesized events, tests) keep
+  the always-apply `apply_event`.
+- **The live-state transition runs before the slow half of ingress.**
+  `dispatch_live_worker_state` (`engine/core/src/app/worker_events.rs`) now
+  applies the event and broadcasts first, then persists the transcript path
+  and captures cost. The persist still runs on the slot-less path too, so
+  orphaned and late-hook executions retain their cost as before.
+
+A declared wait (`boss propose wait`) is handled at the same seam. It
+describes the idle period that follows the declaration; the moment the
+slot goes from a non-`Working` activity back to `Working` — a prompt, or a
+background-command wake-up — the ingress calls `WaitRegistry::end_active`,
+so the pane stops advertising a stale `wait_reason` and the nudge ladder is
+no longer held for an idle period that is over. The per-execution wait
+budget stays charged. A wait declared _mid-turn_ (the worker runs `propose
+wait`, then a few more tools, then stops) survives the rest of that turn,
+because the prior activity is already `Working` for each of those tool
+calls. Workers are told, in their prompt, to re-declare before ending a
+resumed turn if they are still waiting.
+
 ## Rules of thumb for future work here
 
 - **A dead pane is terminal evidence.** `remain-on-exit` keeps a tmux session listed after its worker command has exited. `#{pane_dead}=1` must not be treated as a live worker, and it must not disprove an inferred death.
@@ -135,4 +194,5 @@ its live `BOSS_SPAWN_TOKEN` exactly matches the durable run identity.
 - **`Unknown` is not `Gone`.** A worker with no recorded pid is mid-spawn, not dead. `WorkerProcess::Unknown` and `PaneReleaseOutcome::NoLiveWorker` both exist to keep that case from being read as death — treating it as death reaps live-but-slow spawns and releases cube leases out from under workspaces a worker is about to occupy.
 - **`EPERM` means alive.** `kill(pid, 0)` returning `EPERM` proves the process exists.
 - **A pid is a durable number, not a durable handle.** Once the OS recycles it — macOS wraps at ~99999 — the same integer names an unrelated process, and the reap signals its whole process _group_. Anything that signals a process or restores state from the pid must use a bounded probe (`probe_execution_worker_within`, `probe_work_item_worker`), which declines to answer once the run row ages past `REDISPATCH_PID_TRUST_SECS`. The unbounded `probe_execution_worker` is only for callers whose failure direction is to decline to act, where a stale pid costs a missed reconciliation rather than a killed bystander.
+- **Never infer activity from pane output or timers.** `activity` is reduced from the hook stream, in emission order (`ingress_seq`). If a pane looks busy while the slot says `Idle`, the bug is in ingress ordering or the reducer — fix that, not the symptom.
 - **Don't lengthen a timeout to fix a contradiction.** A longer spawn-ack window narrows the race without closing it, and leaves the system with no answer for the times it still loses.

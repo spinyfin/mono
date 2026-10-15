@@ -1006,7 +1006,10 @@ fn worker_wait_protocol_directive() -> String {
      \"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>\n\
      ```\n\n\
      `--duration` is required (for example `30m` or `2h`; the engine caps a single wait at 2 hours). \
-     Optionally pass `--waiting-on <task-id|pid|file>`. Re-running renews the wait. An unexpired \
+     Optionally pass `--waiting-on <task-id|pid|file>`. Re-running renews the wait. A wait ends \
+     the moment your next turn begins — including a turn Claude Code starts on its own when a \
+     background command finishes — so if you are still waiting when that turn ends, run the \
+     command again before ending it. An unexpired \
      wait holds the produce-a-PR nudge ladder and the nudge circuit breaker; it does not pause \
      the stale-worker reap or other safety checks. After expiry, normal nudging resumes. Total \
      wait-extension per execution is also capped.\n"
