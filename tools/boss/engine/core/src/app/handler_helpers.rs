@@ -578,7 +578,13 @@ pub(super) fn send_work_error(sink: &SessionSink, request_id: &str, err: impl st
 #[derive(Debug, Clone)]
 pub(super) struct BoardRefusal {
     pub(super) code: boss_protocol::BoardRefusalCode,
+    /// Plain-language sentence for the board card.
     pub(super) message: String,
+    /// The engine's own text, sent as the `WorkError` to callers that are not
+    /// board gestures (the CLI), whose users act on the exact wording (e.g.
+    /// the `boss chore update --repo` hint). `None` when `message` is already
+    /// the engine's text.
+    pub(super) raw: Option<String>,
     pub(super) action: Option<boss_protocol::BoardRefusalAction>,
 }
 
@@ -587,13 +593,60 @@ impl BoardRefusal {
         Self {
             code,
             message: message.to_string(),
+            raw: None,
             action: None,
         }
     }
 
+    /// A refusal whose board sentence differs from the engine's own text.
+    fn phrased(code: boss_protocol::BoardRefusalCode, message: String, err: &anyhow::Error) -> Self {
+        Self {
+            code,
+            message,
+            raw: Some(format!("{err:#}")),
+            action: None,
+        }
+    }
+
+    /// A pause-override drag the engine will not force. `reason` is the
+    /// admission decision's own sentence; the item is named by its title
+    /// rather than its internal id.
+    pub(super) fn pause_override(work_db: &WorkDb, id: &str, reason: impl std::fmt::Display) -> Self {
+        let reason = reason.to_string();
+        Self {
+            code: boss_protocol::BoardRefusalCode::PauseOverrideRefused,
+            message: format!("Can't start {} right now: {reason}.", item_label(work_db, id)),
+            raw: Some(format!("cannot start {id}: {reason}")),
+            action: None,
+        }
+    }
+
+    /// Classify a failed status/field patch. A gated item names what it is
+    /// waiting on; anything else keeps the engine's own text.
+    pub(super) fn from_update_error(work_db: &WorkDb, id: &str, err: &anyhow::Error) -> Self {
+        if let Some(gated) = err.downcast_ref::<crate::work::GatedByPrerequisites>() {
+            return Self::phrased(
+                boss_protocol::BoardRefusalCode::UpdateRejected,
+                format!(
+                    "{} is waiting on {}, so it can't be moved yet. Finish those first, or remove the dependency.",
+                    item_label(work_db, id),
+                    gated
+                        .prerequisites
+                        .iter()
+                        .map(|prerequisite| item_name(work_db, prerequisite)
+                            .map_or_else(|| prerequisite.clone(), |name| format!("\"{name}\"")))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                err,
+            );
+        }
+        Self::new(boss_protocol::BoardRefusalCode::UpdateRejected, format!("{err:#}"))
+    }
+
     /// Classify a dispatch failure. A bound-PR refusal names the PR and
-    /// points at revisions; anything else keeps the engine's own text under
-    /// `fallback`.
+    /// points at revisions; a missing repo says which item needs one;
+    /// anything else keeps the engine's own text under `fallback`.
     pub(super) fn from_dispatch_error(
         work_db: &WorkDb,
         id: &str,
@@ -618,11 +671,39 @@ impl BoardRefusal {
             return Self {
                 code: boss_protocol::BoardRefusalCode::BoundPr,
                 message,
+                raw: Some(format!("{err:#}")),
                 action: Some(boss_protocol::BoardRefusalAction::AddRevision),
             };
         }
-        Self::new(fallback, format!("{err:#}"))
+        if fallback == boss_protocol::BoardRefusalCode::MissingRepo {
+            return Self::phrased(
+                fallback,
+                format!(
+                    "{} has no repository to run in, so it can't be started. Give it a repo and try again.",
+                    item_label(work_db, id)
+                ),
+                err,
+            );
+        }
+        Self::phrased(
+            fallback,
+            format!("Couldn't start {}: {err:#}", item_label(work_db, id)),
+            err,
+        )
     }
+}
+
+fn item_name(work_db: &WorkDb, id: &str) -> Option<String> {
+    match work_db.get_work_item(id) {
+        Ok(WorkItem::Task(task)) | Ok(WorkItem::Chore(task)) => Some(task.name),
+        _ => None,
+    }
+}
+
+/// How a refusal names an item: its title in quotes, or a generic phrase
+/// when the title cannot be read.
+fn item_label(work_db: &WorkDb, id: &str) -> String {
+    item_name(work_db, id).map_or_else(|| "This item".to_owned(), |name| format!("\"{name}\""))
 }
 
 /// Answer a request with a refusal: the structured
@@ -642,7 +723,7 @@ pub(super) fn send_refusal(sink: &SessionSink, request_id: &str, board_gesture: 
             },
         );
     } else {
-        send_work_error(sink, request_id, refusal.message);
+        send_work_error(sink, request_id, refusal.raw.unwrap_or(refusal.message));
     }
 }
 
