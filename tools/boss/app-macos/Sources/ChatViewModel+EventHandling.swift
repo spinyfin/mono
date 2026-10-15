@@ -118,7 +118,7 @@ extension ChatViewModel {
             // `pendingDragAdmissionCheck` or the optimistic move it guards.
             if pendingDragAdmissionCheck != nil {
                 pendingDragAdmissionCheck = nil
-                bounceBackOptimisticMoves(message: nil)
+                bounceBackOptimisticMoves(message: "Connection to the engine was lost before it could answer — try the move again.")
             }
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, let itemIDs):
@@ -206,6 +206,8 @@ extension ChatViewModel {
             }
         case .operatorQuestionError(let message, let requestId):
             handleOperatorQuestionError(message: message, requestId: requestId)
+        case .workItemRefused(let id, let code, let message, let suggestedAction):
+            handleWorkItemRefused(id: id, code: code, message: message, suggestedAction: suggestedAction)
         case .workError(let message, let requestId):
             if settleOffsiteBackupError(message, requestID: requestId) { return }
             // An error carrying the answer's own request id is not ambiguous:

@@ -20,10 +20,10 @@ use super::*;
 // Enum discriminants and inputs used only by these fixtures are not part of
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
-    AttachmentMediaType, AutomationTrigger, COORDINATOR_GUIDANCE_PATH, CoordinatorGuidanceState, Decision,
-    DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree, DispatchAdmissionBlocker, DispatchPauseSnapshot,
-    EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError,
-    TaskKind, TaskStatus, WorkerTierDenialReason,
+    AttachmentMediaType, AutomationTrigger, BoardRefusalAction, BoardRefusalCode, COORDINATOR_GUIDANCE_PATH,
+    CoordinatorGuidanceState, Decision, DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree,
+    DispatchAdmissionBlocker, DispatchPauseSnapshot, EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput,
+    ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -776,6 +776,16 @@ fn tag_cases() -> Vec<TagCase> {
             label: "WorkError",
             event: FrontendEvent::WorkError { message: "boom".into() },
             expected_tag: "work_error",
+        },
+        TagCase {
+            label: "WorkItemRefused",
+            event: FrontendEvent::WorkItemRefused {
+                id: "task_1".into(),
+                code: BoardRefusalCode::BoundPr,
+                message: "already has a PR".into(),
+                suggested_action: Some(BoardRefusalAction::AddRevision),
+            },
+            expected_tag: "work_item_refused",
         },
         TagCase {
             label: "WorkItemDuplicateBlocked",
@@ -2204,6 +2214,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkItemDeleted { .. }
         | FrontendEvent::WorkItemRestored { .. }
         | FrontendEvent::WorkError { .. }
+        | FrontendEvent::WorkItemRefused { .. }
         | FrontendEvent::WorkItemDuplicateBlocked { .. }
         | FrontendEvent::Error { .. }
         | FrontendEvent::AppSessionRegistered
