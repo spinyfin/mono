@@ -73,6 +73,32 @@ final class ReviewSectionsTests: XCTestCase {
         XCTAssertEqual(columnOrder, ["newer", "older"])
     }
 
+    func testPendingSectionIsOrderedByMostRecentActivityDescending() {
+        let model = makeModel()
+        func pending(_ id: String, updated: String, pr: String? = nil) -> WorkTask {
+            var t = makeReviewItem(id: id, section: .pending)
+            t.updatedAt = updated
+            t.prUpdatedAt = pr
+            return t
+        }
+        model.choresByProductID = ["prod_test": [
+            pending("old", updated: "2026-05-01T00:00:00Z"),
+            pending("newest-row", updated: "2026-05-20T00:00:00Z"),
+            // Row is old but the PR moved most recently: it must lead.
+            pending("pr-newer", updated: "2026-05-02T00:00:00Z", pr: "2026-05-25T00:00:00Z"),
+            // PR older than the row: the row's time wins.
+            pending("pr-older", updated: "2026-05-10T00:00:00Z", pr: "2026-05-03T00:00:00Z"),
+            // Tie with "tie-a" on activity: broken on id.
+            pending("tie-b", updated: "2026-05-15T00:00:00Z"),
+            pending("tie-a", updated: "2026-05-04T00:00:00Z", pr: "2026-05-15T00:00:00Z"),
+        ]]
+
+        XCTAssertEqual(
+            model.workSections(in: .review).first?.items.map(\.id),
+            ["pr-newer", "newest-row", "tie-a", "tie-b", "pr-older", "old"]
+        )
+    }
+
     func testCardWithoutAnEngineSectionLandsInPendingNotHidden() {
         let model = makeModel()
         model.choresByProductID = ["prod_test": [makeReviewItem(id: "unclassified", section: nil)]]

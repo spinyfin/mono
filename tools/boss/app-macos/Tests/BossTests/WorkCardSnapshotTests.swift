@@ -108,6 +108,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "parentTaskId",
         "readyForReview",
         "reviewSection",
+        "prUpdatedAt",
         "docLinkState",
         "reviewGuideSelectedComparisonId",
         "originTaskShortId",
@@ -258,6 +259,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             ("parentTaskId", { t in var t = t; t.parentTaskId = "task_parent"; return t }),
             ("readyForReview", { t in var t = t; t.readyForReview = true; return t }),
             ("reviewSection", { t in var t = t; t.reviewSection = .blocked; return t }),
+            ("prUpdatedAt", { t in var t = t; t.prUpdatedAt = "2026-05-25T00:00:00Z"; return t }),
             ("docLinkState", { t in
                 var t = t; t.docLinkState = .notSet; return t
             }),

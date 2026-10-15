@@ -213,6 +213,10 @@ struct WorkTask: Identifiable, Hashable {
     /// the key it is given and never re-derives it from the badge fields
     /// above. Mirrors `Task.review_section` on the wire.
     var reviewSection: ReviewSection? = nil
+    /// GitHub's `updatedAt` for the bound PR (RFC 3339), engine-supplied.
+    /// Together with `updatedAt` it keys the Review column's Pending-section
+    /// order. Mirrors `Task.pr_updated_at` on the wire.
+    var prUpdatedAt: String? = nil
     /// Resolved doc-link state for this work item. Independent of `kind`
     /// — any task may carry a per-task pointer. Mirrors `Task.doc_link_state`
     /// on the wire: the engine resolves the task's own `doc_*` columns

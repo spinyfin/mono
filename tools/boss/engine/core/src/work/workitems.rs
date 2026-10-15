@@ -1191,6 +1191,9 @@ impl WorkDb {
         // under. Reads ready_for_review, has_in_progress_revision and
         // ai_review_state, so it must run after all three attaches above.
         attach_review_section(&mut tasks, &mut chores);
+        if let Err(err) = attach_pr_updated_at(&conn, &mut tasks, &mut chores) {
+            tracing::warn!(?err, "get_work_tree: failed to attach pr_updated_at; ignoring");
+        }
 
         // Resolve has_attachments for every task/chore so the kanban card can
         // gate its screenshot-viewer affordance without a per-card query.

@@ -624,6 +624,49 @@ fn poll_state_first_probe_reports_change_with_null_prior() {
     );
 }
 
+/// The PR's GitHub `updatedAt` is stored by the poll, counts as a change when
+/// it moves on its own, survives a probe that omits it, and is surfaced on
+/// the Review-lane card by `attach_pr_updated_at`.
+#[test]
+fn poll_state_stores_pr_updated_at_and_attaches_it() {
+    let (db, _p, chore_id) = setup_product_and_chore();
+    let poll = |pr_updated_at| PrPollStateInput {
+        ci_required_state: "success",
+        review_required_state: "approved",
+        pr_updated_at,
+        ..Default::default()
+    };
+    db.update_task_pr_poll_state(&chore_id, poll(Some("2026-05-20T10:00:00Z")))
+        .unwrap();
+
+    let out = db
+        .update_task_pr_poll_state(&chore_id, poll(Some("2026-05-20T11:00:00Z")))
+        .unwrap();
+    assert!(out.changed, "a moved PR updatedAt alone is a change");
+    let out = db.update_task_pr_poll_state(&chore_id, poll(None)).unwrap();
+    assert!(
+        !out.changed,
+        "omitting updatedAt keeps the stored value and is not a change"
+    );
+
+    let conn = db.connect().unwrap();
+    let mut chore = Task::builder()
+        .id(chore_id.clone())
+        .product_id("p")
+        .kind(boss_protocol::TaskKind::Chore)
+        .name("n")
+        .description("")
+        .status(boss_protocol::TaskStatus::InReview)
+        .created_at("")
+        .updated_at("")
+        .build();
+    assert_eq!(chore.pr_updated_at, None, "not set until attached");
+    chore.review_section = Some(boss_protocol::ReviewSection::Pending);
+    let mut chores = vec![chore];
+    crate::work::attach_pr_updated_at(&conn, &mut [], &mut chores).unwrap();
+    assert_eq!(chores[0].pr_updated_at.as_deref(), Some("2026-05-20T11:00:00Z"));
+}
+
 /// An identical (equal-state) probe reports `changed = false` but still stamps
 /// the poll timestamp — the documented "always stamp so operators can see the
 /// poller is alive" invariant. `prior_ci_state` reflects the stored value.

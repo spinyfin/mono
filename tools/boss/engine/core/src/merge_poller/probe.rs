@@ -101,6 +101,11 @@ pub struct PrLifecycleProbe {
     /// trigger to key the immutable review target on the exact landed
     /// tree rather than the pre-merge head.
     pub merge_commit_oid: Option<String>,
+    /// GitHub's `updatedAt` for the PR (RFC 3339): the last time anything
+    /// on the PR changed (push, comment, review, label, status). Persisted
+    /// to `tasks.pr_updated_at` so the Review column can order its Pending
+    /// section by recency. `None` when GitHub omitted the field.
+    pub updated_at: Option<String>,
 }
 
 /// Lifecycle states the poller reacts to. The split between
@@ -307,7 +312,7 @@ impl MergeProbe for CommandMergeProbe {
             // in `fetch_merge_queue_status` below. `autoMergeRequest` (used
             // to detect a "Merge When Ready" PR that hasn't reached the
             // queue) IS a valid `--json` field, so it's requested directly.
-            "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews,autoMergeRequest,mergeCommit",
+            "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews,autoMergeRequest,mergeCommit,updatedAt",
         ])
         .await
         .with_context(|| format!("failed to spawn `gh pr view {pr_url}`"))?;
@@ -407,7 +412,7 @@ pub(crate) const PR_PROBE_FIELDS: &str = concat!(
     "reviewDecision reviews(last: 10) { nodes { author { login } state } } ",
     "mergeQueueEntry { state position enqueuedAt } ",
     "autoMergeRequest { enabledAt } ",
-    "mergeCommit { oid } ",
+    "mergeCommit { oid } updatedAt ",
     "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 30) { nodes { ",
     // `completedAt` is requested for one reader only: it is the episode
     // discriminator `trunk_queue_adopt` keys adoption on (a head sha is not
@@ -729,6 +734,7 @@ pub(crate) fn flatten_batched_pr_node(node: &serde_json::Value) -> serde_json::V
         "mergeQueueEntry": node["mergeQueueEntry"],
         "autoMergeRequest": node["autoMergeRequest"],
         "mergeCommit": node["mergeCommit"],
+        "updatedAt": node["updatedAt"],
     })
 }
 
@@ -1028,6 +1034,11 @@ pub(crate) fn parse_probe_json(url: &str, body: &str, combined_state: Option<&st
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    let updated_at = root
+        .get("updatedAt")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     Ok(PrLifecycleProbe {
         url: url.to_owned(),
         state,
@@ -1047,5 +1058,6 @@ pub(crate) fn parse_probe_json(url: &str, body: &str, combined_state: Option<&st
         auto_merge_enabled_at,
         trunk_queue_check_failure,
         merge_commit_oid,
+        updated_at,
     })
 }
