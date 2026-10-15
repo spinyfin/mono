@@ -347,9 +347,19 @@ async fn handoff_write_through_the_handler_replaces_the_coordinator() {
 
     // The replacement is attached through the app: the only frame the app sees
     // is the attach request for the new session, never an Error.
-    let (_, event) = next_event(&sink).await;
-    let FrontendEvent::EngineRequest { request_id, request } = event else {
-        panic!("expected the coordinator attach request, got {event:?}")
+    // The reset also gets a correlated completion reply (so the app settles its
+    // retry ledger); its order relative to the attach request is not fixed.
+    let mut completion_seen = false;
+    let (request_id, request) = loop {
+        let (reply_id, event) = next_event(&sink).await;
+        match event {
+            FrontendEvent::CoordinatorRecreated => {
+                assert_eq!(reply_id, "reset-1", "completion must echo the request id");
+                completion_seen = true;
+            }
+            FrontendEvent::EngineRequest { request_id, request } => break (request_id, request),
+            other => panic!("expected the coordinator attach request, got {other:?}"),
+        }
     };
     let EngineToAppRequest::AttachCoordinatorPane(attach) = request else {
         panic!("expected AttachCoordinatorPane, got {request:?}")
@@ -403,11 +413,16 @@ async fn handoff_write_through_the_handler_replaces_the_coordinator() {
     })
     .await
     .expect("the new session must be recorded as attached");
+    if !completion_seen {
+        let (reply_id, event) = next_event(&sink).await;
+        assert!(matches!(event, FrontendEvent::CoordinatorRecreated), "got {event:?}");
+        assert_eq!(reply_id, "reset-1", "completion must echo the request id");
+    }
     assert!(
         tokio::time::timeout(Duration::from_millis(50), sink.next())
             .await
             .is_err(),
-        "a successful reset sends no further frame"
+        "a successful reset sends no further frame after its completion reply"
     );
 }
 

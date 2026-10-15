@@ -33,6 +33,7 @@ extension ChatViewModel {
             UpdateLifecycle.recordStartup("engine-connected")
             markConnected()
             resetConnectionLostBanner()
+            if refreshUnsentActions() { showDisconnectedActionNotice() }
             // A quota request in flight when the socket dropped will never be
             // answered, so clear the pending flag rather than leaving the
             // pane's Refresh button disabled for the rest of the session.
@@ -83,8 +84,13 @@ extension ChatViewModel {
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
             disconnectOffsiteBackupEdit()
-            clearCoordinatorReset()
+            if engine.hasUnsentAction(kind: "recreate_coordinator") {
+                coordinatorResetWaiting = false
+            } else {
+                clearCoordinatorReset()
+            }
             isConnected = false
+            if refreshUnsentActions() { showDisconnectedActionNotice() }
             stopBackgroundWorkPolling(clearSnapshot: true)
             isAppSessionRegistered = false
             subscribedWorkTopics.removeAll()
@@ -116,8 +122,8 @@ extension ChatViewModel {
             // flight: the socket drop means no `dispatch_admission_evaluated`
             // reply is ever coming, so nothing else would clear
             // `pendingDragAdmissionCheck` or the optimistic move it guards.
-            if pendingDragAdmissionCheck != nil {
-                pendingDragAdmissionCheck = nil
+            if !pendingDragAdmissionChecks.isEmpty && !engine.hasUnsentAction(kind: "evaluate_dispatch_admission") {
+                pendingDragAdmissionChecks.removeAll()
                 bounceBackOptimisticMoves(message: nil)
             }
             scheduleConnectionLostBannerCheck()
@@ -287,21 +293,38 @@ extension ChatViewModel {
             // debounced banner (`showConnectionLostBanner`) is the
             // user-facing signal; never a modal.
             appendSystemMessage(message)
+        case .retriedActionsStatus(let message):
+            if let message {
+                uncertainActionMessages.append(message)
+                uncertainActionNotice = uncertainActionMessages.joined(separator: "\n")
+                if !engine.hasUnsentAction(kind: "move_work_item_on_board") && !engine.hasUnsentAction(kind: "evaluate_dispatch_admission") {
+                    bounceBackOptimisticMoves(message: nil)
+                }
+            }
+            retryingDisconnectedActions = false
+            refreshUnsentActions()
+            showDisconnectedActionNotice()
         case .notConnected(let requestKind):
             if requestKind == "recreate_coordinator" {
-                // The request was dropped, so no handoff will ever arrive.
-                clearCoordinatorReset()
+                if engine.hasUnsentAction(kind: requestKind) {
+                    coordinatorResetWaiting = false
+                } else {
+                    clearCoordinatorReset()
+                }
             }
             if requestKind == "update_work_item" {
                 settleAllArchiveRequests()
             }
             // Only the drag's own requests may clear admission/optimistic state.
-            if requestKind == "evaluate_dispatch_admission" || requestKind == "move_work_item_on_board" {
-                pendingDragAdmissionCheck = nil
+            if (requestKind == "evaluate_dispatch_admission" || requestKind == "move_work_item_on_board") && !engine.hasUnsentAction(kind: requestKind) {
+                pendingDragAdmissionChecks.removeAll()
                 bounceBackOptimisticMoves(message: "Not connected to the engine — reconnect and try again.")
             }
-            showDisconnectedActionNotice()
+            // Only kinds retained for Retry earn the "your actions are saved" notice.
+            if refreshUnsentActions() { showDisconnectedActionNotice() }
             appendSystemMessage("Not connected to the engine; \(requestKind) was not sent.", alwaysShow: true)
+        case .actionNotSaved(let requestKind):
+            showActionNotSaved(requestKind: requestKind)
         case .workItemUpdateDecodeFailed(let message, let requestId):
             // The reply a pending archive was waiting on arrived undecodable;
             // it is the only reply that request gets, so settle it here.
@@ -309,7 +332,8 @@ extension ChatViewModel {
             handle(.error(message: message))
         case .error(let message):
             if handleCoordinatorResetError(message) { return }
-            if pendingDragAdmissionCheck != nil {
+            if !pendingDragAdmissionChecks.isEmpty {
+                for pending in pendingDragAdmissionChecks.values { engine.finishAdmissionRetry(taskID: pending.taskID) }
                 // A malformed/undecodable `dispatch_admission_evaluated`
                 // reply (EngineClient emits `.error`, never
                 // `.dispatchAdmissionEvaluated`, when the payload fails to
@@ -318,7 +342,7 @@ extension ChatViewModel {
                 // `pendingDragAdmissionCheck` for a reply that never
                 // arrives in the expected shape. Bounce it back exactly as
                 // a hard-blocker refusal would.
-                pendingDragAdmissionCheck = nil
+                pendingDragAdmissionChecks.removeAll()
                 bounceBackOptimisticMoves(message: message)
                 return
             }
@@ -876,7 +900,7 @@ extension ChatViewModel {
         if !deferredScopeActionInFlightIDs.isEmpty { return true }
         if !operatorAnswerInFlightByTaskID.isEmpty { return true }
         if !pendingMoveOriginByTaskID.isEmpty { return true }
-        if pendingDragAdmissionCheck != nil { return true }
+        if !pendingDragAdmissionChecks.isEmpty { return true }
         if engineAttemptDetailRequestID != nil { return true }
         // `pendingReviewGuideVersionId` is retained after a successful load
         // (it is the displayed version), so pair it with `.loading`.

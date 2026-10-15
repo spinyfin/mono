@@ -305,7 +305,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         XCTAssertEqual(sent.first?["type"] as? String, "move_work_item_on_board")
     }
 
-    func testDragWhileDisconnectedBouncesBackWithoutModal() {
+    func testDragWhileDisconnectedPreservesRetryAndDiscardBouncesBack() {
         let model = makeModel()
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
@@ -314,8 +314,39 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         model.applyEventForTest(.notConnected(requestKind: "evaluate_dispatch_admission"))
 
         XCTAssertNil(model.workErrorMessage, "disconnect must not raise the modal")
-        XCTAssertNotNil(model.dragRefusalNotice, "bounce shows the inline notice")
+        XCTAssertNotNil(model.pendingDragAdmissionCheck, "Retry must retain the continuation")
+        XCTAssertEqual(model.engine.unsentActionCountForTesting, 1)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+        model.dismissDisconnectedActions()
+        XCTAssertNil(model.pendingDragAdmissionCheck)
+        XCTAssertFalse(model.engine.hasUnsentActions)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
+    }
+
+    func testTwoDisconnectedDragsKeepIndependentContinuations() {
+        let model = makeModel()
+        let first = makeTask(status: "todo")
+        let second = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [first, second]]
+        _ = model.attemptDrop(first.id, onColumn: .doing, group: nil)
+        _ = model.attemptDrop(second.id, onColumn: .doing, group: nil)
+        XCTAssertEqual(Set(model.pendingDragAdmissionChecks.keys), [first.id, second.id])
+
+        model.engine.simulateConnectedForTesting = true
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+        for task in [first, second] {
+            model.handleDispatchAdmissionEvaluated(DispatchAdmission(
+                workItemID: task.id,
+                wouldDispatch: true,
+                pause: DispatchPauseSnapshot(active: false, origin: nil, reason: nil, pausedSinceEpochS: nil, overridable: false),
+                blockers: []
+            ))
+        }
+        let moved = sent.filter { $0["type"] as? String == "move_work_item_on_board" }.compactMap { $0["id"] as? String }
+        XCTAssertEqual(Set(moved), [first.id, second.id])
+        XCTAssertEqual(moved.count, 2, "exactly one move per task")
+        XCTAssertTrue(model.pendingDragAdmissionChecks.isEmpty)
     }
 
     func testUnrelatedDroppedRequestsPreservePendingDrag() {
@@ -330,6 +361,22 @@ final class OptimisticKanbanMoveTests: XCTestCase {
             XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
             XCTAssertNil(model.dragRefusalNotice)
         }
+    }
+
+    func testDiscardingUnrelatedQueuedActionPreservesLiveDrag() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+        model.engine.simulateConnectedForTesting = true
+        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: nil))
+        model.engine.simulateConnectedForTesting = false
+        model.engine.sendLine(["type": "create_product", "name": "Queued product"])
+
+        model.dismissDisconnectedActions()
+
+        XCTAssertNotNil(model.pendingDragAdmissionCheck)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+        XCTAssertFalse(model.engine.hasUnsentActions)
     }
 
     // MARK: - Helpers

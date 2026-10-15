@@ -155,8 +155,8 @@ extension ChatViewModel {
         return task(withID: taskID)
     }
 
-    /// Short display label for a group's association — `"T34"` / `"P12"` /
-    /// a project name / `"Open"` when neither resolves.
+    /// Short display label for a group's association: a task or project short label,
+    /// a project name, or Open when neither resolves.
     func attentionAssociationLabel(_ group: AttentionGroup) -> String {
         if let taskID = group.associationTaskID {
             if let task = task(withID: taskID), let shortID = task.shortID {

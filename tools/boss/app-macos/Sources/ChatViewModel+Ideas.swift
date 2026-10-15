@@ -76,8 +76,10 @@ extension ChatViewModel {
     /// in-progress edit, a not-yet-created idea has nothing durable on
     /// disk to protect.
     func createIdea() {
-        guard isConnected, let productID = currentSelectedProductID else { return }
+        guard let productID = currentSelectedProductID, canSubmitUserActions() else { return }
         engine.sendCreateIdea(productId: productID, name: "New idea", body: nil)
+        refreshUnsentActions()
+        showDisconnectedActionNotice()
     }
 
     /// Switch the editor to a different idea (or `nil` to close it),

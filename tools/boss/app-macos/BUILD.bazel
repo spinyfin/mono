@@ -152,6 +152,7 @@ _SHARD1_SRCS = [
     "Tests/BossTests/AttachmentAffordanceTests.swift",
     "Tests/BossTests/DesignsTests.swift",
     "Tests/BossTests/EngineAutoChoreKanbanTests.swift",
+    "Tests/BossTests/EngineClientLifecycleOrderingTests.swift",
     "Tests/BossTests/KanbanExternalRefLinkTests.swift",
     "Tests/BossTests/KanbanRepoChipTests.swift",
     "Tests/BossTests/KanbanShortIDBadgeTests.swift",
@@ -196,6 +197,24 @@ _SHARD2_SRCS = [
     "Tests/BossTests/WorkDependencyKanbanTests.swift",
     "Tests/BossTests/WorkItemRepoRowTests.swift",
 ]
+
+macos_unit_test(
+    name = "EngineReconnectIntegrationTests",
+    size = "medium",
+    data = ["//tools/boss/engine/core:engine_fixture_test"],
+    env = XCODE_TEST_ENV,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":engine_reconnect_integration_tests_lib"],
+)
+
+swift_library(
+    name = "engine_reconnect_integration_tests_lib",
+    testonly = True,
+    srcs = ["Tests/EngineIntegration/EngineReconnectIntegrationTests.swift"],
+    module_name = "EngineReconnectIntegrationTests",
+    deps = [":boss_mac_app_lib"],
+)
 
 macos_unit_test(
     name = "BossTestsCommentsTranscript",

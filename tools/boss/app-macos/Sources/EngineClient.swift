@@ -9,6 +9,58 @@ final class EngineClient: @unchecked Sendable {
     private var socketIndex = 0
     private let queue = DispatchQueue(label: "Boss.EngineClient")
     private var connection: NWConnection?
+    /// Retained user mutations and delivery tracking. Lock-guarded (not
+    /// `queue`) so the main actor can read/clear it without blocking on
+    /// the socket I/O queue; payloads are held as sorted-key JSON so the
+    /// state stays value-typed.
+    private struct ActionLedger {
+        /// Never reached the wire; safe to resend on explicit Retry.
+        var unsent: [Data] = []
+        /// Accepted by the caller, but still waiting on the socket queue.
+        /// Reserve retry capacity before a form is allowed to close.
+        var scheduled: [String: Data] = [:]
+        /// Written to the socket, awaiting an engine reply echoing the
+        /// envelope id, keyed by that id. If the connection ends first the
+        /// outcome is uncertain and the action is NOT replayed (the engine
+        /// has no dedupe), only reported.
+        var awaiting: [String: (data: Data, generation: Int)] = [:]
+        /// Subset of `awaiting`/in-flight ids sent via Retry; drives the
+        /// "Sending pending actions…" banner.
+        var retried: Set<String> = []
+        var uncertain: [String: String] = [:]
+        var retryAdmissionTasks: Set<String> = []
+    }
+    private let ledger = OSAllocatedUnfairLock(initialState: ActionLedger())
+    static let maxUnsentActions = 64
+    static func isRetainable(_ payload: [String: Any]) -> Bool {
+        isUserMutation(payload)
+    }
+
+    /// Read-only evaluations are tracked for reply correlation but can never
+    /// have completed an action, so a drop before their reply is not an
+    /// uncertain delivery.
+    static func isSideEffectFree(kind: String) -> Bool {
+        kind == "evaluate_dispatch_admission" || kind == "evaluate_editorial_rules"
+    }
+
+    /// "update_work_item" -> "update work item" for user-facing text.
+    static func describeAction(kind: String) -> String {
+        kind.replacingOccurrences(of: "_", with: " ")
+    }
+
+    /// Reads and session housekeeping have no user mutation to recover.
+    static func isUserMutation(_ payload: [String: Any]) -> Bool {
+        guard let kind = payload["type"] as? String else { return false }
+        return !kind.hasPrefix("get_") && !kind.hasPrefix("list_") && ![
+            "engine_response", "subscribe", "unsubscribe", "register_capabilities",
+            "register_app_session", "report_selected_product", "spawn_capability_restored",
+            "metrics_list_live", "git_hub_auth_status", "trunk_status", "execution_transcript",
+            "comments_list", "comments_banner_state", "resolve_project_design_doc",
+            "release_review_terminal", "kick_pr_reconcilers", "comments_get", "metrics_show_live",
+            "worker_pool_summary", "workspace_pool_summary", "find_work_items_by_pr", "tail_run_transcript",
+            "probe_status", "debug_live_status_pipeline",
+        ].contains(kind)
+    }
     private var buffer = Data()
     /// Connection whose read loop is suspended by decode backpressure.
     private var readPause = ReadLoopPauseGate<NWConnection>()
@@ -57,6 +109,8 @@ final class EngineClient: @unchecked Sendable {
     /// Generation of the live connection attempt, from `terminationLatch`.
     private var connectionGeneration = 0
     private let decodeHook = OSAllocatedUnfairLock<(@Sendable (Data) -> Void)?>(initialState: nil)
+    private let beforeWriteHook = OSAllocatedUnfairLock<(@Sendable (String, Int) -> Void)?>(initialState: nil)
+    private let failedWriteCompletions = OSAllocatedUnfairLock(initialState: 0)
 
     /// Thread-safe liveness signal for `EngineProcessController`'s
     /// supervision tick: true only while this connection is `.ready`. Lets
@@ -80,6 +134,7 @@ final class EngineClient: @unchecked Sendable {
     /// above the largest observed single reply (~25 MB `work_tree`) so
     /// backpressure only engages under a genuine decode backlog.
     static let maxPendingDecodeBytes = 128 * 1024 * 1024
+    private var pendingDecodeByteLimit = EngineClient.maxPendingDecodeBytes
     // Accessed only on the serial decode queue.
     private var decodingGeneration = 0
     private var rejectedDecodeGeneration: Int?
@@ -87,7 +142,7 @@ final class EngineClient: @unchecked Sendable {
     private var workTreeCache = WorkTreeDeltaCache()
 
     private lazy var handoff = LineDecodeHandoff(
-        maxPendingBytes: Self.maxPendingDecodeBytes,
+        maxPendingBytes: pendingDecodeByteLimit,
         decode: { [weak self] data, recvNanos in
             self?.decodeHook.withLock { $0 }?(data)
             self?.decodeLine(data, lineRecvNanos: recvNanos)
@@ -103,8 +158,9 @@ final class EngineClient: @unchecked Sendable {
         }
     )
 
-    init(socketPath: String) {
+    init(socketPath: String, pendingDecodeByteLimit: Int = EngineClient.maxPendingDecodeBytes) {
         self.socketPaths = [socketPath]
+        self.pendingDecodeByteLimit = pendingDecodeByteLimit
     }
 
     init(socketPaths: [String]) {
@@ -236,39 +292,169 @@ final class EngineClient: @unchecked Sendable {
         }
 
         if simulateConnectedForTesting { return envelopeRequestId }
-        guard connection != nil else {
-            // A send while the socket is down is a transport condition,
-            // not an engine-reported error. Idempotent reads are held and
-            // delivered on reconnect when the caller opts in with
-            // `queueIfDisconnected`; anything else is failed back to the
-            // app as a typed `.notConnected`.
-            let kind = (payload["type"] as? String) ?? "unknown"
-            if queueIfDisconnected {
-                Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
-                // Held as sorted-key JSON so the queue is Sendable and an
-                // identical newer request supersedes the queued one.
-                if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
-                    queuedReads.withLock { state in
-                        state.removeAll { $0.data == data }
-                        state.append((envelopeRequestId, data))
-                        if state.count > Self.maxQueuedReads { state.removeFirst(state.count - Self.maxQueuedReads) }
-                    }
-                } else {
-                    emit(.notConnected(requestKind: kind))
-                    return nil
-                }
-                return envelopeRequestId
-            }
-            if !reportIfDisconnected {
-                Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
-                return nil
-            }
-            Self.log.info("dropped \(kind, privacy: .public) while disconnected; reporting not-connected")
-            emit(.notConnected(requestKind: kind))
+        guard reachableState.withLock({ $0 }) else {
+            return handleDisconnectedSend(
+                payload, envelopeRequestId: envelopeRequestId,
+                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
+        }
+        guard let encoded = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            emit(.error(message: "failed to encode outbound request"))
             return nil
         }
-        return write(payload, envelopeRequestId: envelopeRequestId)
+        if Self.isUserMutation(payload) {
+            let reserved = ledger.withLock { state in
+                guard state.unsent.count + state.scheduled.count < Self.maxUnsentActions else { return false }
+                state.scheduled[envelopeRequestId] = encoded
+                return true
+            }
+            guard reserved else {
+                emit(.actionNotSaved(requestKind: payload["type"] as? String ?? "action"))
+                return nil
+            }
+        }
+        // The write runs on the socket queue (FIFO with other writes);
+        // the caller never blocks on it. If the socket died after the
+        // reachability check, `write` re-applies the disconnected policy.
+        queue.async {
+            guard let payload = (try? JSONSerialization.jsonObject(with: encoded)) as? [String: Any] else { return }
+            self.write(
+                payload, envelopeRequestId: envelopeRequestId,
+                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
+        }
+        return envelopeRequestId
     }
+
+    /// A send while the socket is down is a transport condition, not an
+    /// engine-reported error. Idempotent reads are held and delivered on
+    /// reconnect when the caller opts in with `queueIfDisconnected`;
+    /// retainable user mutations are kept for explicit Retry; everything
+    /// else reported as typed `.notConnected` and dropped. Thread-safe.
+    private func handleDisconnectedSend(
+        _ payload: [String: Any], envelopeRequestId: String,
+        queueIfDisconnected: Bool, reportIfDisconnected: Bool
+    ) -> String? {
+        let kind = (payload["type"] as? String) ?? "unknown"
+        if queueIfDisconnected {
+            Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
+            // Held as sorted-key JSON so the queue is Sendable and an
+            // identical newer request supersedes the queued one.
+            if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
+                queuedReads.withLock { state in
+                    state.removeAll { $0.data == data }
+                    state.append((envelopeRequestId, data))
+                    if state.count > Self.maxQueuedReads { state.removeFirst(state.count - Self.maxQueuedReads) }
+                }
+            } else {
+                emit(.notConnected(requestKind: kind))
+                return nil
+            }
+            return envelopeRequestId
+        }
+        if !reportIfDisconnected {
+            Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
+            return nil
+        }
+        if retainUnsent(payload) == .full {
+            emit(.actionNotSaved(requestKind: kind))
+            return nil
+        }
+        emit(.notConnected(requestKind: kind))
+        return nil
+    }
+
+    private enum RetentionOutcome { case retained, ineligible, full }
+
+    /// Explicit outcome prevents a rejected action being described as saved.
+    private func retainUnsent(_ payload: [String: Any]) -> RetentionOutcome {
+        let kind = (payload["type"] as? String) ?? "unknown"
+        guard Self.isRetainable(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        else {
+            Self.log.info("not retaining \(kind, privacy: .public); not an eligible user mutation")
+            return .ineligible
+        }
+        return retainUnsent(data, kind: kind)
+    }
+
+    private func retainUnsent(_ data: Data, kind: String) -> RetentionOutcome {
+        let retained = ledger.withLock { state -> Bool in
+            guard state.unsent.count + state.scheduled.count < Self.maxUnsentActions else { return false }
+            state.unsent.append(data)
+            return true
+        }
+        Self.log.info("\(retained ? "retained" : "dropped (buffer full)", privacy: .public) \(kind, privacy: .public); awaiting explicit retry")
+        return retained ? .retained : .full
+    }
+
+    /// Only actions never handed to Network.framework are eligible. Once a
+    /// write is attempted its delivery is uncertain, so it must not be replayed.
+    func retryUnsentActions() -> Bool {
+        guard reachableState.withLock({ $0 }) else { return false }
+        let actions = ledger.withLock { state -> [(id: String, data: Data)] in
+            let drained = state.unsent.map { (id: UUID().uuidString, data: $0) }
+            state.unsent.removeAll()
+            for action in drained { state.scheduled[action.id] = action.data }
+            // Registered before the write so a fast reply cannot race it.
+            state.retried.formUnion(drained.map(\.id))
+            return drained
+        }
+        queue.async {
+            for action in actions {
+                guard let payload = (try? JSONSerialization.jsonObject(with: action.data)) as? [String: Any] else {
+                    self.ledger.withLock { _ = $0.retried.remove(action.id) }
+                    continue
+                }
+                self.write(payload, envelopeRequestId: action.id)
+            }
+        }
+        return true
+    }
+
+    func discardUnsentActions() {
+        ledger.withLock { state in
+            for data in state.unsent {
+                if let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                   payload["type"] as? String == "move_work_item_on_board",
+                   let taskID = payload["id"] as? String {
+                    state.retryAdmissionTasks.remove(taskID)
+                }
+            }
+            state.unsent.removeAll()
+        }
+    }
+
+    func finishAdmissionRetry(taskID: String) {
+        let finished = ledger.withLock { state in
+            state.retryAdmissionTasks.remove(taskID) != nil && state.retried.isEmpty && state.retryAdmissionTasks.isEmpty
+        }
+        if finished { emit(.retriedActionsStatus(message: nil)) }
+    }
+
+    /// The user has checked the outcome of every action reported uncertain.
+    func acknowledgeUncertainActions() {
+        ledger.withLock { $0.uncertain.removeAll() }
+    }
+
+    var hasUnsentActions: Bool { ledger.withLock { !$0.unsent.isEmpty } }
+    var hasRetriedActions: Bool { ledger.withLock { !$0.retried.isEmpty || !$0.retryAdmissionTasks.isEmpty } }
+
+    func hasRoomForDisconnectedActions(_ count: Int = 1) -> Bool {
+        ledger.withLock { $0.unsent.count + $0.scheduled.count + count <= Self.maxUnsentActions }
+    }
+
+    func hasUnsentAction(kind: String) -> Bool {
+        ledger.withLock { state in
+            state.unsent.contains {
+                ((try? JSONSerialization.jsonObject(with: $0)) as? [String: Any])?["type"] as? String == kind
+            }
+        }
+    }
+
+    /// Test hooks.
+    var unsentActionCountForTesting: Int { ledger.withLock { $0.unsent.count } }
+    var awaitingReplyCountForTesting: Int { ledger.withLock { $0.awaiting.count } }
+    var uncertainActionsForTesting: [String: String] { ledger.withLock { $0.uncertain } }
+    var failedWriteCompletionsForTesting: Int { failedWriteCompletions.withLock { $0 } }
 
     private static let log = Logger(subsystem: "Boss", category: "EngineClient")
     private static let maxQueuedReads = 64
@@ -296,10 +482,25 @@ final class EngineClient: @unchecked Sendable {
     }
 
     @discardableResult
-    private func write(_ payload: [String: Any], envelopeRequestId: String) -> String? {
+    private func write(
+        _ payload: [String: Any], envelopeRequestId: String,
+        queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true
+    ) -> String? {
         guard let connection else {
-            emit(.notConnected(requestKind: (payload["type"] as? String) ?? "unknown"))
-            return nil
+            let (retained, finished) = ledger.withLock { state in
+                let reserved = state.scheduled.removeValue(forKey: envelopeRequestId)
+                if let reserved { state.unsent.append(reserved) }
+                let finished = state.retried.remove(envelopeRequestId) != nil && state.retried.isEmpty && state.retryAdmissionTasks.isEmpty
+                return (reserved != nil, finished)
+            }
+            if finished { emit(.retriedActionsStatus(message: nil)) }
+            if retained {
+                emit(.notConnected(requestKind: payload["type"] as? String ?? "action"))
+                return nil
+            }
+            return handleDisconnectedSend(
+                payload, envelopeRequestId: envelopeRequestId,
+                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
         }
         do {
             let envelope: [String: Any] = [
@@ -314,14 +515,35 @@ final class EngineClient: @unchecked Sendable {
                                   kind: "coordinator_reset_rpc_send", body: payload)
             }
 
+            // Track every user mutation independently of replay eligibility.
+            if Self.isUserMutation(payload),
+               let saved = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
+                let generation = connectionGeneration
+                let moveTaskID = payload["type"] as? String == "move_work_item_on_board" ? payload["id"] as? String : nil
+                ledger.withLock { state in
+                    state.scheduled.removeValue(forKey: envelopeRequestId)
+                    state.awaiting[envelopeRequestId] = (saved, generation)
+                    if let moveTaskID, state.retryAdmissionTasks.remove(moveTaskID) != nil {
+                        state.retried.insert(envelopeRequestId)
+                    }
+                }
+            }
+
+            beforeWriteHook.withLock { $0 }?(envelopeRequestId, connectionGeneration)
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
-                guard let self, self.connection === connection else { return }
+                guard let self else { return }
                 if let error {
+                    self.failedWriteCompletions.withLock { $0 += 1 }
+                    // Failed completion does not prove that the peer received no bytes.
+                    // Teardown reports unanswered writes as uncertain, never replayable.
+                    guard self.connection === connection else { return }
                     self.emit(.transportError(message: "socket send failed: \(error.localizedDescription)"))
+                    self.closeConnection()
                 }
             })
             return envelopeRequestId
         } catch {
+            ledger.withLock { _ = $0.scheduled.removeValue(forKey: envelopeRequestId) }
             emit(.error(message:"failed to encode payload: \(error.localizedDescription)"))
             return nil
         }
@@ -384,7 +606,36 @@ final class EngineClient: @unchecked Sendable {
     /// have been decoded and emitted, so stale replies from the dropped
     /// connection never arrive after the disconnect.
     private func emitDisconnectedAfterPendingLines() {
-        handoff.afterPendingLines { [weak self] in self?.emit(.disconnected) }
+        let generation = connectionGeneration
+        handoff.afterPendingLines { [weak self] in
+            guard let self else { return }
+            // Only ids that became uncertain on THIS drop are reported; earlier
+            // ones were already surfaced and stay until acknowledged.
+            let (fresh, hadPending) = self.ledger.withLock { state -> ([(id: String, kind: String)], Bool) in
+                let pending = state.awaiting.filter { $0.value.generation == generation }
+                var fresh = [(id: String, kind: String)]()
+                for id in pending.keys.sorted() {
+                    if let data = state.awaiting.removeValue(forKey: id)?.data,
+                       let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                        let kind = payload["type"] as? String ?? "action"
+                        if !Self.isSideEffectFree(kind: kind) {
+                            state.uncertain[id] = kind
+                            fresh.append((id, kind))
+                        }
+                    }
+                    state.retried.remove(id)
+                }
+                return (fresh, !pending.isEmpty)
+            }
+            if !fresh.isEmpty {
+                let actions = fresh.map { Self.describeAction(kind: $0.kind) }.joined(separator: ", ")
+                self.emit(.retriedActionsStatus(message: "Connection lost before confirmation: \(actions). Check whether these actions completed before trying again."))
+            } else if hadPending {
+                // Only read-only evaluations were in flight: settle the retry state.
+                self.emit(.retriedActionsStatus(message: nil))
+            }
+            self.emit(.disconnected)
+        }
     }
 
     /// Pull every complete line out of `buffer`. Framing only — no JSON
@@ -445,6 +696,20 @@ final class EngineClient: @unchecked Sendable {
             workTreeCache.resetBase()
         }
         let envelopeRequestId = envelope["request_id"] as? String
+        let isAdmissionReply = type == "dispatch_admission_evaluated"
+        if let id = envelopeRequestId {
+            let finished = ledger.withLock { state -> Bool in
+                let sent = state.awaiting.removeValue(forKey: id)
+                guard state.retried.remove(id) != nil else { return false }
+                if isAdmissionReply, let sent,
+                   let request = (try? JSONSerialization.jsonObject(with: sent.data)) as? [String: Any],
+                   let taskID = request["work_item_id"] as? String {
+                    state.retryAdmissionTasks.insert(taskID)
+                }
+                return state.retried.isEmpty && state.retryAdmissionTasks.isEmpty
+            }
+            if finished { emit(.retriedActionsStatus(message: nil)) }
+        }
 
         switch type {
         case "topic_event":
@@ -1359,6 +1624,11 @@ final class EngineClient: @unchecked Sendable {
     /// block a specific decode to exercise lifecycle ordering.
     func setDecodeHookForTesting(_ hook: (@Sendable (Data) -> Void)?) {
         decodeHook.withLock { $0 = hook }
+    }
+
+    /// Runs on the socket queue immediately before handing an envelope to Network.
+    func setBeforeWriteHookForTesting(_ hook: (@Sendable (String, Int) -> Void)?) {
+        beforeWriteHook.withLock { $0 = hook }
     }
 
     /// Feed one complete wire envelope through the production decoder.

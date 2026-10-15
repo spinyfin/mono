@@ -102,6 +102,7 @@ private struct AutomationsSidebar: View {
                 AutomationEditSheet(
                     mode: .create(productID: product.id),
                     onSave: { name, cron, tz, instruction, limit, enabled, repo in
+                        guard model.canSubmitUserActions() else { return }
                         model.createAutomation(
                             productID: product.id,
                             name: name,
@@ -397,6 +398,7 @@ private struct AutomationDetailView: View {
             AutomationEditSheet(
                 mode: .edit(automation: automation),
                 onSave: { name, cron, tz, instruction, limit, _, repo in
+                    guard model.canSubmitUserActions() else { return }
                     model.updateAutomation(
                         id: automation.id,
                         name: name,

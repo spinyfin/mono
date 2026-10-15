@@ -55,6 +55,7 @@ extension ChatViewModel {
 
     private func beginCoordinatorReset(token: String, reason: CoordinatorRecreateReason) {
         guard !coordinatorResetWaiting else { return }
+        guard !engine.hasUnsentAction(kind: "recreate_coordinator"), canSubmitUserActions() else { return }
         pendingCoordinatorReset = (token, reason)
         coordinatorResetForced = false
         coordinatorResetDeliveryFailed = false
@@ -64,6 +65,7 @@ extension ChatViewModel {
 
     func forceCoordinatorReset() {
         guard coordinatorResetDeliveryFailed, let pending = pendingCoordinatorReset else { return }
+        guard canSubmitUserActions() else { return }
         coordinatorResetForced = true
         coordinatorResetDeliveryFailed = false
         coordinatorResetWaiting = true

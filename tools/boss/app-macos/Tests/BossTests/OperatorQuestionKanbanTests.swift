@@ -375,7 +375,7 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertTrue(model.operatorAnswerInFlightByTaskID.isEmpty)
     }
 
-    func testAnswerWhileDisconnectedSurfacesAnErrorOnTheCard() {
+    func testAnswerWhileDisconnectedIsSavedForExplicitRetry() {
         let model = makeModel()
         let task = awaiting(id: "task_q")
         model.isConnected = false
@@ -384,8 +384,10 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
         XCTAssertEqual(
             model.operatorAnswerErrorByTaskID["task_q"],
-            "Not connected to the engine — reconnect and try again."
+            "Answer saved. Use Retry after reconnecting to send it."
         )
+        XCTAssertTrue(model.engine.hasUnsentAction(kind: "answer_operator_question"))
+        XCTAssertTrue(model.hasUnsentActions)
         XCTAssertNil(model.operatorAnswerInFlightByTaskID["task_q"])
     }
 

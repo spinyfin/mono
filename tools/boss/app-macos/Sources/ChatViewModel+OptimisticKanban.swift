@@ -67,6 +67,7 @@ extension ChatViewModel {
     /// its groups. That is strictly less intent than a group-qualified drop,
     /// and the engine treats it as such.
     func attemptDrop(_ taskID: String, onColumn column: WorkBoardColumnKey, group: WorkBoardGroupKey?) -> Bool {
+        guard canSubmitUserActions() else { return false }
         guard let task = task(withID: taskID) else { return false }
         let group = group.flatMap { $0.isEngineBoardGroup ? $0 : nil }
 
@@ -137,7 +138,7 @@ extension ChatViewModel {
             // an ordinary drag on the hard-blocker check even with no
             // pause active at all, so it skips evaluation entirely and
             // goes straight to the normal drop below.
-            pendingDragAdmissionCheck = PendingDragAdmissionCheck(taskID: taskID, column: column, group: group)
+            pendingDragAdmissionChecks[taskID] = PendingDragAdmissionCheck(taskID: taskID, column: column, group: group)
             engine.sendEvaluateDispatchAdmission(workItemId: taskID)
             return true
         }
@@ -151,12 +152,13 @@ extension ChatViewModel {
     /// placed drop, offers a pause-only confirmation, or bounces the card
     /// back — see `attemptDrop`'s Doing-column branch for what queued this.
     func handleDispatchAdmissionEvaluated(_ admission: DispatchAdmission) {
-        guard let pending = pendingDragAdmissionCheck, pending.taskID == admission.workItemID else {
-            // Stale reply (superseded by a later drag) or an evaluation the
-            // app requested for some other reason — nothing to forward.
+        guard let pending = pendingDragAdmissionChecks[admission.workItemID] else {
+            engine.finishAdmissionRetry(taskID: admission.workItemID)
+            // Evaluation the app requested for some other reason (or already
+            // settled) — nothing to forward.
             return
         }
-        pendingDragAdmissionCheck = nil
+        pendingDragAdmissionChecks[admission.workItemID] = nil
 
         // Check "is there even a pause to override" FIRST. When there is
         // no active pause, this evaluation exists only to decide whether a
@@ -182,11 +184,13 @@ extension ChatViewModel {
         // force never lifts a hard blocker either.
         let hardBlockers = admission.hardBlockers
         if !hardBlockers.isEmpty {
+            engine.finishAdmissionRetry(taskID: pending.taskID)
             bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "))
             return
         }
 
         if !admission.pause.overridable {
+            engine.finishAdmissionRetry(taskID: pending.taskID)
             let reason = "dispatch is paused" + (admission.pause.reason.map { ": \($0)" } ?? "")
                 + " — this pause is not overridable"
             bounceBackOptimisticMoves(message: reason)
@@ -194,7 +198,7 @@ extension ChatViewModel {
         }
 
         let taskName = task(withID: pending.taskID)?.name ?? pending.taskID
-        pendingPauseOverrideConfirmation = PauseOverrideConfirmation(
+        let confirmation = PauseOverrideConfirmation(
             taskID: pending.taskID,
             taskName: taskName,
             column: pending.column,
@@ -203,13 +207,24 @@ extension ChatViewModel {
             pausedSinceEpochS: admission.pause.pausedSinceEpochS,
             informationalBlockers: admission.blockers.filter { dispatchAdmissionInformationalOnlyBlockerCodes.contains($0.code) }
         )
+        if pendingPauseOverrideConfirmation == nil {
+            pendingPauseOverrideConfirmation = confirmation
+        } else {
+            queuedPauseOverrideConfirmations.append(confirmation)
+        }
+    }
+
+    /// Present the next queued confirmation, if any, once one is settled.
+    private func presentNextPauseOverrideConfirmation() {
+        pendingPauseOverrideConfirmation = queuedPauseOverrideConfirmations.isEmpty
+            ? nil : queuedPauseOverrideConfirmations.removeFirst()
     }
 
     /// Operator confirmed the pause-override dialog: send the drop with
     /// the confirmed bypass and the observed pause generation.
     func confirmPauseOverrideDrag() {
         guard let confirmation = pendingPauseOverrideConfirmation else { return }
-        pendingPauseOverrideConfirmation = nil
+        presentNextPauseOverrideConfirmation()
         engine.sendMoveWorkItemOnBoard(
             id: confirmation.taskID,
             column: confirmation.column,
@@ -222,8 +237,9 @@ extension ChatViewModel {
     /// Operator cancelled the pause-override dialog: bounce the
     /// optimistically-placed card back to its origin column.
     func cancelPauseOverrideDrag() {
-        guard pendingPauseOverrideConfirmation != nil else { return }
-        pendingPauseOverrideConfirmation = nil
+        guard let confirmation = pendingPauseOverrideConfirmation else { return }
+        engine.finishAdmissionRetry(taskID: confirmation.taskID)
+        presentNextPauseOverrideConfirmation()
         bounceBackOptimisticMoves(message: nil)
     }
 
