@@ -337,6 +337,15 @@ extension ChatViewModel {
         return !bouncedIDs.isEmpty
     }
 
+    /// Settle one card's in-flight admission check as failed: drop the check
+    /// and roll back only that card's optimistic placement.
+    func bounceBackAdmissionCheck(taskID: String, message: String) {
+        if pendingDragAdmissionChecks.removeValue(forKey: taskID) != nil {
+            engine.finishAdmissionRetry(taskID: taskID)
+        }
+        bounceBackOptimisticMoves(message: message, taskID: taskID)
+    }
+
     /// Reply handler for `.workItemRefused`: the engine refused or reverted a
     /// board gesture and says why. Bounces the optimistic placement back and
     /// shows the engine's reason on the dragged card (even when no optimistic
@@ -371,9 +380,13 @@ extension ChatViewModel {
     func submitRevision(parentTaskID: String, description: String) {
         let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        if let requestID = engine.sendCreateRevision(parentTaskId: parentTaskID, description: trimmed) {
-            revisionRequestParentIDs[requestID] = parentTaskID
-        }
+        // A full retained-action ledger keeps the composer (and the draft it
+        // alone holds) open instead of silently dropping the request.
+        guard canSubmitUserActions(describing: "Add revision") else { return }
+        let requestID = engine.sendCreateRevision(parentTaskId: parentTaskID, description: trimmed)
+        // `nil` is either a retained request (saved for Retry — safe to close)
+        // or a rejected one, which must not lose the draft.
+        guard requestID != nil || engine.hasUnsentAction(kind: "create_revision") else { return }
         revisionComposerTaskID = nil
     }
 

@@ -229,8 +229,6 @@ extension ChatViewModel {
             // A refused Move Up/Down reorder carries its own request id:
             // show the reason on the card that was moved.
             if settleReorderWorkError(message: message, requestId: requestId) { return }
-            // Likewise a refused "Add revision…": show it on the parent card.
-            if settleRevisionWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
             // The engine's WorkError reply carries no request context, so we
             // can't tell which in-flight list_executions/list_attachments
@@ -338,6 +336,18 @@ extension ChatViewModel {
             // it is the only reply that request gets, so settle it here.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
             handle(.error(message: message))
+        case .revisionRefused(let message, let parentTaskID):
+            settleRevisionRefused(message: message, parentTaskID: parentTaskID)
+        case .dispatchAdmissionDecodeFailed(let message, let taskID):
+            // An undecodable `dispatch_admission_evaluated` reply would
+            // otherwise leave its card optimistically rendered in Doing
+            // forever. Bounce back exactly that card, as a hard-blocker
+            // refusal would. If the client could not say which card the reply
+            // answered, fall back to the cards with an admission check in
+            // flight — never to unrelated optimistic moves.
+            let affected = taskID.map { [$0] } ?? pendingDragAdmissionChecks.keys.sorted()
+            if affected.isEmpty { handle(.error(message: message)); return }
+            for id in affected { bounceBackAdmissionCheck(taskID: id, message: message) }
         case .error(let message, let requestId):
             if let requestId,
                let pending = pendingDragAdmissionChecks.values.first(where: { $0.requestID == requestId }),
