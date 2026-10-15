@@ -189,7 +189,9 @@ impl WorkDb {
         // recommended pairing for WAL — durable across application
         // crashes, only loses commits on OS/power loss, which is fine
         // for engine state we can rebuild.
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        // Same wait as `busy_timeout(SQLITE_BUSY_TIMEOUT)`, but counts the
+        // failures it gives up on for the per-minute lock summary.
+        super::lock_stats::install_busy_counter(conn)?;
         if set_wal {
             conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         }
@@ -213,7 +215,6 @@ impl WorkDb {
     /// once up front. `WorkDb::connect()` just locks this connection's
     /// mutex — see the docs on `WorkDb::conn`.
     pub(in crate::work) fn open_raw_connection(path: &Path, memory: Option<&InMemoryAnchor>) -> Result<Connection> {
-        super::lock_stats::install_busy_hook();
         let mut conn = if let Some(mem) = memory {
             // For in-memory databases, connect via the named shared-cache URI.
             Connection::open_with_flags(

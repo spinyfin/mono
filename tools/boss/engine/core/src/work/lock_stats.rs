@@ -7,12 +7,15 @@
 //! `db lock summary` INFO line per minute that saw anything, and the same
 //! numbers on the metrics registry.
 //!
-//! Accumulation takes only this module's own tiny mutex, and callers record
-//! after releasing the work DB connection, so it never extends a DB critical
-//! section and never touches the connection.
+//! Timing accumulation takes only this module's own tiny mutex, and callers
+//! record after releasing the work DB connection, so it never extends a DB
+//! critical section. Busy failures are counted in a lock-free atomic from the
+//! connection's busy handler, so that path never takes any lock.
 use boss_metrics::Registry;
+use rusqlite::Connection;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How often the window is flushed.
@@ -44,7 +47,6 @@ pub fn register_metrics(registry: &Registry) {
 #[derive(Default)]
 struct Window {
     events: u64,
-    busy: u64,
     longest: Option<(Duration, String)>,
     callers: HashMap<String, (u64, Duration)>,
 }
@@ -52,6 +54,7 @@ struct Window {
 #[derive(Default)]
 pub(crate) struct LockStats {
     window: Mutex<Window>,
+    busy: AtomicU64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -89,13 +92,14 @@ impl LockStats {
     }
 
     pub(crate) fn record_busy(&self) {
-        self.window().busy += 1;
+        self.busy.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Drain the window; `None` when the interval saw no events at all.
     pub(crate) fn take_summary(&self) -> Option<Summary> {
         let window = std::mem::take(&mut *self.window());
-        if window.events == 0 && window.busy == 0 {
+        let busy = self.busy.swap(0, Ordering::Relaxed);
+        if window.events == 0 && busy == 0 {
             return None;
         }
         let (longest, longest_caller) = window.longest.unwrap_or_default();
@@ -112,7 +116,7 @@ impl LockStats {
         top.truncate(TOP_CALLERS);
         Some(Summary {
             events: window.events,
-            busy: window.busy,
+            busy,
             longest_hold_ms: longest.as_millis() as u64,
             longest_caller,
             top,
@@ -162,22 +166,60 @@ pub fn spawn_summary_task(registry: Arc<Registry>) -> tokio::task::JoinHandle<()
     })
 }
 
-/// Count SQLITE_BUSY failures via SQLite's process-wide error log, which sees
-/// every connection without touching any call site. Must run before SQLite
-/// initializes; if it already has, busy failures simply go uncounted.
-pub(crate) fn install_busy_hook() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        fn on_log(code: std::ffi::c_int, _msg: &str) {
-            if code & 0xff == rusqlite::ffi::SQLITE_BUSY {
-                global().record_busy();
-            }
+#[cfg(test)]
+thread_local! {
+    /// Test-only per-thread override of the busy limit, in milliseconds.
+    /// SQLite invokes the busy handler on the calling thread, so this lets a
+    /// test use a short limit without affecting concurrently running tests.
+    static LIMIT_OVERRIDE_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn busy_limit_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = LIMIT_OVERRIDE_MS.with(std::cell::Cell::get) {
+        return ms;
+    }
+    super::SQLITE_BUSY_TIMEOUT.as_millis() as u64
+}
+
+/// SQLite's own `busy_timeout` backoff schedule (`sqliteDefaultBusyCallback`),
+/// reproduced so replacing the handler leaves waiting behaviour unchanged.
+const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+const TOTALS_MS: [u64; 12] = [0, 1, 3, 8, 18, 33, 53, 78, 103, 128, 178, 228];
+
+/// Milliseconds to sleep before retrying invocation `n`, or `None` once the
+/// `limit_ms` budget is spent (SQLite then returns SQLITE_BUSY to the caller).
+fn next_delay_ms(n: u64, limit_ms: u64) -> Option<u64> {
+    let (delay, prior) = if (n as usize) < DELAYS_MS.len() {
+        (DELAYS_MS[n as usize], TOTALS_MS[n as usize])
+    } else {
+        (100, 228 + 100 * (n - 11))
+    };
+    let delay = delay.min(limit_ms.saturating_sub(prior));
+    (delay > 0).then_some(delay)
+}
+
+fn busy_handler(n: i32) -> bool {
+    match next_delay_ms(n.max(0) as u64, busy_limit_ms()) {
+        Some(delay) => {
+            std::thread::sleep(Duration::from_millis(delay));
+            true
         }
-        // SAFETY: config_log must precede SQLite initialization; failure is benign.
-        if unsafe { rusqlite::trace::config_log(Some(on_log)) }.is_err() {
-            tracing::debug!("sqlite already initialized; busy failures will not be counted");
+        None => {
+            // The wait is exhausted: SQLite now returns SQLITE_BUSY ("database
+            // is locked") for this statement, including a timed-out
+            // `BEGIN IMMEDIATE`. Count exactly that, once per failure.
+            global().record_busy();
+            false
         }
-    });
+    }
+}
+
+/// Install the counting busy handler on a work DB connection. It waits exactly
+/// as long as `busy_timeout(SQLITE_BUSY_TIMEOUT)` would, and counts each
+/// failure it gives up on. Must be called instead of `busy_timeout`.
+pub(crate) fn install_busy_counter(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_handler(Some(busy_handler))
 }
 
 #[cfg(test)]
@@ -236,6 +278,63 @@ mod tests {
                 .insert(key, (1, Duration::from_millis(u64::from(line) * 10)));
         }
         assert_eq!(stats.take_summary().unwrap().top.len(), 5);
+    }
+
+    #[test]
+    fn delay_schedule_matches_sqlite_default_and_respects_limit() {
+        let total = |limit| (0..).map_while(|n| next_delay_ms(n, limit)).sum::<u64>();
+        assert_eq!(next_delay_ms(0, 5000), Some(1));
+        assert_eq!(next_delay_ms(11, 5000), Some(100));
+        assert_eq!(next_delay_ms(12, 5000), Some(100));
+        assert_eq!(total(5000), 5000);
+        assert_eq!(total(250), 250);
+        assert_eq!(total(2), 2);
+        assert_eq!(next_delay_ms(0, 0), None);
+    }
+
+    #[test]
+    fn real_busy_failure_reaches_summary_and_counter() {
+        use rusqlite::{ErrorCode, TransactionBehavior};
+        LIMIT_OVERRIDE_MS.with(|l| l.set(Some(30)));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.db");
+        let mut holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t(x);")
+            .unwrap();
+        let mut waiter = Connection::open(&path).unwrap();
+        install_busy_counter(&waiter).unwrap();
+        waiter.set_transaction_behavior(TransactionBehavior::Immediate);
+        let _ = global().take_summary();
+
+        let held = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        // The contended case: `BEGIN IMMEDIATE` timing out.
+        let err = waiter.transaction().expect_err("must fail while the writer is held");
+        assert_eq!(err.sqlite_error_code(), Some(ErrorCode::DatabaseBusy), "{err:?}");
+        drop(held);
+        LIMIT_OVERRIDE_MS.with(|l| l.set(None));
+
+        let registry = Registry::new();
+        register_metrics(&registry);
+        let summary = global().take_summary().expect("busy failure must produce a summary");
+        assert_eq!(summary.busy, 1);
+        // Feed the drained window through flush's publishing path.
+        let stats = LockStats::default();
+        stats.busy.store(summary.busy, Ordering::Relaxed);
+        flush(&stats, &registry);
+        let value = registry
+            .counter_snapshots()
+            .into_iter()
+            .find(|s| s.name == "db_lock.busy_failures")
+            .unwrap()
+            .value;
+        assert_eq!(value, 1);
+
+        // A successful wait (writer released) is not a failure.
+        waiter.transaction().unwrap().commit().unwrap();
+        assert!(global().take_summary().is_none_or(|s| s.busy == 0));
     }
 
     #[test]
