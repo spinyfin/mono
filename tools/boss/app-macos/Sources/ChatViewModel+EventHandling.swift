@@ -193,6 +193,7 @@ extension ChatViewModel {
         case .workItemUpdated(let item):
             handleUpdatedWorkItem(item)
         case .projectTasksReordered(let projectId, _):
+            settleReorderSuccess(projectID: projectId)
             if let productID = project(withID: projectId)?.productID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
@@ -216,6 +217,9 @@ extension ChatViewModel {
             // Likewise a refused project archive: the row drops its pending
             // mark and the message surfaces, with no other state touched.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
+            // A refused Move Up/Down reorder carries its own request id:
+            // show the reason on the card that was moved.
+            if settleReorderWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
             // The engine's WorkError reply carries no request context, so we
             // can't tell which in-flight list_executions/list_attachments

@@ -919,9 +919,39 @@ pub(crate) fn refuse_manual_move_off_blocked_while_gated(
     if gating.is_empty() {
         return Ok(());
     }
-    let names = gating.join(", ");
-    bail!("cannot move {work_item_id} to {new_status}: gated by [{names}] (use `boss <kind> depend rm` to remove)");
+    Err(GatedByPrerequisites {
+        work_item_id: work_item_id.to_owned(),
+        new_status: new_status.to_owned(),
+        prerequisites: gating,
+    }
+    .into())
 }
+
+/// Typed marker for "this item is gated behind unmet prerequisites, so it
+/// cannot leave `blocked`". A distinct type lets board gestures phrase the
+/// refusal for the user by downcasting instead of matching message text; the
+/// `Display` text is what CLI and log output show.
+#[derive(Debug)]
+pub(crate) struct GatedByPrerequisites {
+    pub(crate) work_item_id: String,
+    pub(crate) new_status: String,
+    /// Ids of the unmet prerequisites.
+    pub(crate) prerequisites: Vec<String>,
+}
+
+impl std::fmt::Display for GatedByPrerequisites {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot move {} to {}: gated by [{}] (use `boss <kind> depend rm` to remove)",
+            self.work_item_id,
+            self.new_status,
+            self.prerequisites.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for GatedByPrerequisites {}
 
 pub(crate) fn lookup_blocked_reason(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
     if work_item_id.starts_with("task_") {

@@ -283,65 +283,39 @@ extension ChatViewModel {
         guard tasks.indices.contains(destination) else { return }
 
         tasks.swapAt(currentIndex, destination)
-        engine.sendReorderProjectTasks(projectId: projectID, taskIds: tasks.map(\.id))
+        if let requestID = engine.sendReorderProjectTasks(projectId: projectID, taskIds: tasks.map(\.id)) {
+            reorderRequestTaskIDs[requestID] = task.id
+        }
+    }
+
+    /// A `work_error` carrying a pending reorder's own request id belongs to
+    /// the card that was moved: show it there. Returns whether the request
+    /// id matched a reorder.
+    func settleReorderWorkError(message: String, requestId: String?) -> Bool {
+        guard let requestId, let taskID = reorderRequestTaskIDs.removeValue(forKey: requestId) else { return false }
+        dragRefusalNotice = DragRefusalNotice(taskID: taskID, message: message)
+        scheduleDragRefusalDismiss(for: taskID)
+        return true
+    }
+
+    /// The engine accepted a reorder for `projectID`: its pending marks can
+    /// never see an error reply.
+    func settleReorderSuccess(projectID: String) {
+        reorderRequestTaskIDs = reorderRequestTaskIDs.filter { task(withID: $0.value)?.projectID != projectID }
     }
 
     /// Apply an explicit column choice from the work-card popover's "Move"
-    /// buttons. The drag path does not come through here — it reports its
-    /// drop target and the engine resolves it
-    /// (`sendMoveWorkItemOnBoard`). Two extra concerns vs. a pure status
-    /// edit, both per `tools/boss/docs/designs/work-kanban.md`:
-    ///
-    /// - Choosing Doing (target status `active`) also fires
-    ///   `RequestExecution` so the engine schedules a worker. The
-    ///   engine is idempotent — a non-terminal execution already
-    ///   running for this work item won't get a duplicate.
-    /// - Move OUT of Doing while a live worker is attached is
-    ///   blocked — except for two intentional gestures:
-    ///   (a) Choosing Backlog (`todo`): engine stops the worker,
-    ///       releases the lease, and parks the card — no autostart.
-    ///   (b) Terminal transitions (`done`, `archived`): these mirror the
-    ///       engine's own lifecycle resolutions and are always allowed.
+    /// buttons. Same gesture as a drop on that column (see `attemptDrop`):
+    /// the engine resolves it, including dispatching a worker on a move into
+    /// Doing, and a move out of Doing with a live worker attached is refused
+    /// except to Backlog (stop + park) or Done.
     func moveTask(_ taskID: String, to column: WorkBoardColumnKey) {
-        guard let task = task(withID: taskID) else { return }
-        let targetStatus = column.targetStatus
-        guard task.status != targetStatus else { return }
-
-        if task.status == "active"
-            && !Self.terminalKanbanStatuses.contains(targetStatus)
-            && column != .backlog  // backlog drag = stop+park: engine handles teardown
-            && hasLiveWorker(forTaskID: taskID)
-        {
-            appendSystemMessage(
-                "\(task.name) is being worked on by a live worker. Stop the worker before moving the card out of Doing.",
-                alwaysShow: true
-            )
-            return
-        }
-
-        // Optimistic update: move the card to the destination column immediately
-        // before the RPC completes. The engine remains the authority — on failure
-        // we bounce back via bounceBackOptimisticMoves.
-        let originColumn = effectiveBoardColumn(for: task)
-        pendingMoveOriginByTaskID[taskID] = originColumn
-        optimisticColumnByTaskID[taskID] = column
-        invalidateWorkCache()
-
-        engine.sendUpdateWorkItem(id: task.id, patch: ["status": targetStatus])
-
-        if targetStatus == "active" {
-            engine.sendRequestExecution(workItemId: task.id)
-        }
+        // An explicit Move is the same gesture as dropping the card on that
+        // column: route it through the drop path so the engine resolves it,
+        // refusals come back as `work_item_refused`, and the live-worker
+        // guard shows its message on the card.
+        _ = attemptDrop(taskID, onColumn: column, group: nil)
     }
-
-    /// Statuses that the engine itself can drive a chore into at run
-    /// completion. The kanban must allow the human to mirror those
-    /// transitions even from `active` so a successful PR-merge flow
-    /// can move a card to Done without first stopping the worker.
-    private static let terminalKanbanStatuses: Set<String> = [
-        "done",
-        "archived",
-    ]
 
     /// True iff the work item has a non-terminal worker currently
     /// attached (running, paused on input, or idle between turns). Shared
