@@ -3,6 +3,7 @@
 use super::*;
 use boss_protocol::{OpenMergeRevision, ReviewGuideFindings};
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub fn review_guide_findings(&self, root_id: &str, pr_url: &str) -> Result<Option<ReviewGuideFindings>> {
         let conn = self.connect()?;

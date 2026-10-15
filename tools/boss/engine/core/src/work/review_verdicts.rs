@@ -219,6 +219,7 @@ fn latest_review_verdict_in(conn: &rusqlite::Connection, work_item_id: &str) -> 
     .map_err(Into::into)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Insert the durable per-pass review verdict row for `execution_id`,
     /// against an already-open transaction. Called from

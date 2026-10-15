@@ -122,6 +122,7 @@ const SHARED_PR_SQL: &str = "EXISTS (
                         AND o.kind != 'revision'
                     )";
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Expected branch names ([`crate::completion::expected_branch_name`]) of
     /// every primary implementation execution of `work_item_id`, newest first.

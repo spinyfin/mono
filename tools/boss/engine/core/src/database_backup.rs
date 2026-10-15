@@ -97,8 +97,10 @@ pub fn take_backup(work_db: &WorkDb, dest: &Path) -> Result<()> {
     // hold up every other operation on `work_db` for its duration. WAL mode
     // lets it run alongside concurrent reads and writes on the real connection.
     let conn = work_db.connect_new()?;
-    conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))
-        .with_context(|| format!("VACUUM INTO {}", dest.display()))?;
+    crate::work::lock_stats::returned(
+        conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))
+            .with_context(|| format!("VACUUM INTO {}", dest.display())),
+    )?;
     Ok(())
 }
 

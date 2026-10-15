@@ -24,6 +24,7 @@ struct ExecutionDriverRow {
     product_default_driver: Option<String>,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Resolve the driver slug for `execution_id`'s worker, applying the
     /// same precedence used at spawn time. A claimed worker slot is the

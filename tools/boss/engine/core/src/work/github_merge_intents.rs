@@ -51,6 +51,7 @@ fn map_github_merge_intent(row: &Row<'_>) -> rusqlite::Result<GithubMergeIntent>
     })
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Atomically record a successful GitHub-native merge request and place
     /// its card in Merging. A duplicate for the same PR/head is harmless;

@@ -4,6 +4,7 @@ use super::*;
 /// `(per_pr_override, product_default, attempts_used, status, blocked_reason)`.
 type CiBudgetRow = (Option<i64>, i64, i64, Option<String>, Option<String>);
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Chores and project_tasks the engine previously flagged with
     /// `blocked: merge_conflict`. The merge poller iterates this list

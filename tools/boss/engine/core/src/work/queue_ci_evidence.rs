@@ -436,6 +436,7 @@ pub(crate) fn record_delivery(conn: &Connection, execution_id: &str, payload: &R
     Ok(())
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Restore a falsely retired queue episode and its parent in one transaction.
     /// Clean head CI must still see an active queue-side attempt after the audit.

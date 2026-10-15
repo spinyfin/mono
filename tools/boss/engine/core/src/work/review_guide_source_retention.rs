@@ -49,6 +49,7 @@ pub(super) fn packet_store_lock(root: &Path, exclusive: bool) -> Result<Option<P
     Ok(Some(PacketStoreLock(file)))
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub(super) fn prune_pr_review_guide_sources(&self, policy: SourceRetentionPolicy) -> Result<()> {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();

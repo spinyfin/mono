@@ -1,5 +1,6 @@
 use super::*;
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Fetch a single project by id. Used by the runner when it
     /// composes the worker prompt for a `kind = 'design'` task —

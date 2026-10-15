@@ -93,6 +93,7 @@ pub(super) fn accept(
     }))
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub(crate) fn validate_review_guide_at_workspace(
         &self,

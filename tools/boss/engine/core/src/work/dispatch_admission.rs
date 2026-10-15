@@ -179,6 +179,7 @@ pub(crate) fn primary_pr_awaits_review(conn: &Connection, work_item_id: &str) ->
     }))
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub(crate) fn dispatch_admission_facts(&self, work_item_id: &str) -> Result<DispatchAdmissionFacts> {
         // Every raw query against `conn` happens in this inner block, which

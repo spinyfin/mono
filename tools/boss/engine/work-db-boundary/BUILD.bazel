@@ -1,0 +1,12 @@
+load("@rules_rust//rust:defs.bzl", "rust_proc_macro")
+
+rust_proc_macro(
+    name = "work_db_boundary",
+    srcs = ["src/lib.rs"],
+    edition = "2024",
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = [
+        "@@rules_rust++crate+mono_crates__quote-1.0.45//:quote",
+        "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
+    ],
+)

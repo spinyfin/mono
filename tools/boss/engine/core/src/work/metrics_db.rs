@@ -1,5 +1,6 @@
 use super::*;
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Load every persisted counter and gauge row for the
     /// metrics-framework startup rehydrate. Order is unspecified

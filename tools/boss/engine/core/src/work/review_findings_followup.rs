@@ -224,6 +224,7 @@ pub(crate) fn insert_review_findings_followup(conn: &Connection, input: ReviewFi
     )
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Create a review-findings follow-up against `main` for a merged (or
     /// closed) origin PR. Idempotent on `created_via`.

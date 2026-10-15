@@ -39,6 +39,7 @@ pub(super) fn context_for_create(
     Ok(Some(context))
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Reuse exact/fuzzy matching only within the selected immutable version.
     /// Display resolution never rewrites the original quote, hash, or status.

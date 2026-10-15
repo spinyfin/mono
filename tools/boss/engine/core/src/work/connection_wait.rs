@@ -22,6 +22,22 @@
 use super::{Connection, Mutex, PooledConnection, Result};
 use std::sync::TryLockError;
 
+// Lock acquisition cannot return SQLite errors. Keep this outside the result
+// boundary so track_caller forwards the original call site without a closure.
+impl super::WorkDb {
+    /// Borrow the shared connection. Every call site gets what looks like
+    /// its own `Connection` (via `Deref`/`DerefMut`) but is really a mutex
+    /// guard over the one connection this `WorkDb` (and every clone of it)
+    /// shares — see the docs on `WorkDb::conn`. A function that already
+    /// holds a `connect()` guard must drop it (e.g. scope it in a block)
+    /// before calling anything that connects again, or it deadlocks against
+    /// itself.
+    #[track_caller]
+    pub(crate) fn connect(&self) -> Result<PooledConnection<'_>> {
+        super::connection_wait::acquire(&self.conn)
+    }
+}
+
 pub(crate) struct ConnectionGuard<'a> {
     guard: Option<std::sync::MutexGuard<'a, Connection>>,
     caller: &'static std::panic::Location<'static>,
@@ -60,9 +76,6 @@ impl std::ops::DerefMut for ConnectionGuard<'_> {
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
         let held = self.acquired.elapsed();
-        if let Some(conn) = self.guard.as_deref() {
-            super::lock_stats::count_returned_busy(conn);
-        }
         // Logging must not extend the critical section being measured.
         drop(self.guard.take());
         if held.max(self.waited) >= std::time::Duration::from_millis(100) {

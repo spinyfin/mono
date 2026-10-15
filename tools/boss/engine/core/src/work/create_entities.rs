@@ -52,6 +52,7 @@ pub(crate) fn create_project_in_tx(
     query_project(conn, &id)?.with_context(|| format!("missing project after insert: {id}"))
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub fn open(path: PathBuf) -> Result<Self> {
         if path == Path::new(":memory:") {

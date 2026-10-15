@@ -10,10 +10,9 @@
 //! Timing accumulation takes only this module's own tiny mutex, and callers
 //! record after releasing the work DB connection, so it never extends a DB
 //! critical section. Busy failures are classified by primary result code when
-//! the connection guard is released and counted in a lock-free atomic. Waiting
+//! a WorkDb method returns and counted in a lock-free atomic. Waiting
 //! is SQLite's native `busy_timeout`; nothing here changes timeouts or retry.
 use boss_metrics::Registry;
-use rusqlite::Connection;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -178,7 +177,6 @@ pub(crate) fn is_busy_code(extended_code: i32) -> bool {
 }
 
 /// Classify a returned rusqlite error by its primary result code.
-#[cfg(test)]
 pub(crate) fn is_busy_error(error: &rusqlite::Error) -> bool {
     match error {
         rusqlite::Error::SqliteFailure(err, _) => is_busy_code(err.extended_code),
@@ -186,26 +184,45 @@ pub(crate) fn is_busy_error(error: &rusqlite::Error) -> bool {
     }
 }
 
-/// Count the SQLITE_BUSY the connection last returned, once, as its guard is
-/// released. SQLite returns BUSY without consulting the busy handler in some
-/// cases (e.g. `SQLITE_BUSY_SNAPSHOT`) and every work DB call site propagates
-/// rusqlite errors itself, so the connection's own last-error state is the one
-/// place that sees every returned failure, writer and reader alike, without
-/// counting again as the error propagates. The error state is then cleared by
-/// a successful no-op statement so a later guard cannot re-count it.
-pub(crate) fn count_returned_busy(conn: &Connection) {
-    // SAFETY: `conn.handle()` is the live handle owned by `conn`, and
-    // `sqlite3_extended_errcode` only reads connection state.
-    let code = unsafe { rusqlite::ffi::sqlite3_extended_errcode(conn.handle()) };
-    if is_busy_code(code) {
-        global().record_busy();
-        let _ = conn.execute_batch("");
+/// The result boundary for WorkDb methods and independent connection operations.
+/// Inspect the returned error after transaction cleanup, never connection state.
+/// The typed context prevents recounting when nested WorkDb calls propagate an
+/// error; anyhow preserves downcasts to the underlying rusqlite error.
+pub(crate) fn returned<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    returned_with(global(), result)
+}
+
+#[derive(Debug)]
+struct CountedBusy;
+
+impl std::fmt::Display for CountedBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("work database busy")
     }
 }
+
+fn returned_with<T>(stats: &LockStats, result: anyhow::Result<T>) -> anyhow::Result<T> {
+    result.map_err(|error| {
+        if error.downcast_ref::<CountedBusy>().is_none()
+            && error.downcast_ref::<rusqlite::Error>().is_some_and(is_busy_error)
+        {
+            stats.record_busy();
+            error.context(CountedBusy)
+        } else {
+            error
+        }
+    })
+}
+
+#[cfg(test)]
+#[path = "lock_stats_busy_tests.rs"]
+mod busy_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static GLOBAL_TEST: Mutex<()> = Mutex::new(());
     use crate::test_support::log_capture;
 
     #[track_caller]
@@ -290,6 +307,7 @@ mod tests {
 
     #[test]
     fn real_writer_busy_failure_reaches_global_flush_and_counter() {
+        let _serial = GLOBAL_TEST.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let db = crate::work::WorkDb::open(path).unwrap();
@@ -313,49 +331,6 @@ mod tests {
             .unwrap()
             .value;
         assert!(value >= 1, "global flush must publish the failure, got {value}");
-    }
-
-    #[test]
-    fn busy_without_handler_is_counted_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = crate::work::WorkDb::open(dir.path().join("state.db")).unwrap();
-        let holder = db.connect_new().unwrap();
-        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
-        // No busy handler at all: SQLite returns BUSY immediately.
-        db.connect().unwrap().busy_handler(None).unwrap();
-
-        let before = global_busy();
-        assert!(db.set_metadata("k", "v").is_err());
-        let after = global_busy();
-        assert!(after > before);
-        // A later guard with no failing call must not re-count it.
-        db.get_metadata("k").ok();
-        drop(db.connect().unwrap());
-        assert!(global_busy() - after < 5, "stale error state must not be re-counted");
-        holder.execute_batch("ROLLBACK").unwrap();
-    }
-
-    #[test]
-    fn reader_busy_failure_is_counted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollback.db");
-        let raw = Connection::open(&path).unwrap();
-        raw.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
-            .unwrap();
-        let reader = crate::work::WorkDb::open_read_only(path).unwrap();
-        // Rollback-journal mode: an exclusive writer blocks readers.
-        raw.execute_batch("BEGIN EXCLUSIVE").unwrap();
-
-        let before = global_busy();
-        {
-            let conn = reader.connect().unwrap();
-            let err = conn
-                .query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0))
-                .expect_err("reader blocked by exclusive lock");
-            assert!(is_busy_error(&err), "{err:?}");
-        }
-        assert!(global_busy() > before, "reader busy must be counted");
-        raw.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]

@@ -39,6 +39,7 @@ enum PreMergeTargetFreshness {
     Unknown,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Apply every still-`proposed` `review_verdict`. Safe to call
     /// redundantly: a proposal already applied is skipped, and the

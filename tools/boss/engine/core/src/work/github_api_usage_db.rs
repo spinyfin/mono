@@ -53,6 +53,7 @@ pub struct GithubApiUsageBucket {
     pub rate_limited: i64,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Insert a batch of observed calls in one transaction.
     ///

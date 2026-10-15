@@ -87,6 +87,7 @@ pub(super) fn allocate(conn: &Connection, run_id: &str) -> Result<bool> {
     Ok(restored.is_none() && persona.starts_with("Ensign "))
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Apply the authoritative startup death verdict before dispatch reconciliation.
     pub(crate) fn reap_startup_dead_execution(

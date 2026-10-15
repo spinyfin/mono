@@ -98,6 +98,7 @@ impl LocalCapabilityRefresh {
     }
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Delete every `auto`-sourced capability row for the `local` host,
     /// leaving operator `--tag` rows alone. Startup calls this *before* the
@@ -262,6 +263,7 @@ fn run_one(argv: &[&str]) -> Option<String> {
 
 // ── WorkDb impl: host CRUD ────────────────────────────────────────────────────
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub fn list_hosts(&self) -> Result<Vec<Host>> {
         let conn = self.connect()?;

@@ -22,6 +22,7 @@ pub(super) enum ClaimOutcome {
     NoneLeft,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Resolve the doc's owner, apply the revision-vs-chore decision table,
     /// create the work item, and stamp/transition the addressed comments —

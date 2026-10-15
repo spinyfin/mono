@@ -119,6 +119,7 @@ pub struct ExecutionPruneOutcome {
     pub codex_homes_reclaimed: u64,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Prune (or, with `dry_run`, just count) terminal `work_executions`
     /// rows past `policy`'s bound. `now_epoch` is UTC epoch seconds —

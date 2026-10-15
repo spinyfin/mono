@@ -90,6 +90,7 @@ impl Drop for BoothbyActionGuard<'_> {
     }
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Arm the journal for the actor-boothby mutations made while the
     /// returned guard is alive. Disarms on drop.

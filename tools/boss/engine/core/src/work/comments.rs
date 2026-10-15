@@ -141,6 +141,7 @@ pub(super) fn wire_resolution(resolution: AnchorResolution) -> CommentResolution
     }
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Create an `active` comment. Returns the inserted row.
     pub fn create_comment(&self, input: CreateCommentInput) -> Result<WorkComment> {

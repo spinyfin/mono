@@ -1133,6 +1133,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
     }
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Atomically create a review batch and all of its initial member attempts.
     ///

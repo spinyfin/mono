@@ -23,6 +23,7 @@ pub(crate) struct TriggerTaskSnapshot {
     pub completed_at: Option<String>,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Every live (non-deleted) trigger-count task
     /// (`project_task`/`design`/`investigation`) for a project, with
@@ -68,6 +69,7 @@ impl WorkDb {
     }
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Most recently created `design_postmortem` task for `project_id`
     /// (deleted or not), or `None` if the project has never had one.

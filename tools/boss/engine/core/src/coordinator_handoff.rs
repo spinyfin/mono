@@ -186,6 +186,7 @@ impl From<&CoordinatorTmuxRecord> for PreviousSession {
     }
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Read the stored handoff. Never errors: every failure mode is a
     /// [`HandoffState`] variant so callers cannot accidentally treat a

@@ -190,6 +190,7 @@ struct FailureProvenance<'a> {
     build: &'a str,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Admit a request for the selected comparison, reusing a live request
     /// for that comparison or atomically replacing an obsolete request.

@@ -27,6 +27,7 @@ pub struct CancelExecutionOpts {
     pub record_failure_reason: bool,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Mark an execution `cancelled` and stamp `finished_at`. Errors
     /// when the execution is unknown or already in a terminal status

@@ -87,6 +87,7 @@ impl DispatchClass {
     }
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Look up the [`DispatchClass`] for `work_item_id`, for dispatch-trace
     /// logging at pickup time. Mirrors the classification

@@ -33,6 +33,7 @@ pub(crate) fn migrate_project_postmortem_signals(conn: &Connection) -> Result<()
     Ok(())
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub(crate) fn has_project_postmortem_signal(&self, project_id: &str) -> Result<bool> {
         Ok(self.connect()?.query_row(

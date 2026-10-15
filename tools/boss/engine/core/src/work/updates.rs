@@ -212,6 +212,7 @@ pub(crate) fn apply_tag_patch(
     Ok(tags)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub(crate) fn update_product(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;

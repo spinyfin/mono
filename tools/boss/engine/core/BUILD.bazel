@@ -41,7 +41,7 @@ rust_library(
     crate_name = "boss_engine",
     crate_root = "src/lib.rs",
     edition = "2024",
-    proc_macro_deps = all_crate_deps(proc_macro = True),
+    proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(proc_macro = True),
     rustc_env = {
         # Absolute path to the generated build-info constants file.
         # rules_rust prefixes $(execpath) values with ${pwd} and resolves
@@ -248,7 +248,7 @@ rust_test(
         "HOME": "/tmp",
     },
     experimental_enable_sharding = True,
-    proc_macro_deps = all_crate_deps(
+    proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),

@@ -30,6 +30,7 @@ impl FeedbackTarget {
     }
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Resolve a comment artifact to a typed feedback target.
     ///

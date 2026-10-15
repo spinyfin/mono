@@ -1,6 +1,7 @@
 use super::*;
 use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, PointerSnapshot};
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Live local recovery records of the PR-owning chain: the root item and
     /// every revision share the PR branch in the shared store, so an engine

@@ -279,6 +279,7 @@ pub(crate) fn load_driver_traffic_split_conn(conn: &Connection) -> Result<Driver
     }
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// [`load_driver_traffic_split_conn`], but opens its own connection.
     /// For callers (RPC handlers, CLI) that are not already inside a

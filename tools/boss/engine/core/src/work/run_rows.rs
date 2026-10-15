@@ -46,6 +46,7 @@ pub struct BackfillDurableTranscriptPathsOutcome {
     pub skipped: u64,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub fn create_run(&self, input: CreateRunInput) -> Result<WorkRun> {
         let mut conn = self.connect()?;

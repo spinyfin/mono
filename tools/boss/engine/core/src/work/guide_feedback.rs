@@ -26,6 +26,7 @@ pub struct RecordedGuideCommentOutcome {
     pub regeneration: Option<Result<RetryReviewGuideOutcome, String>>,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Same-PR revision for a `pr_review_guide` artifact. Claims comments and
     /// inserts the revision in one transaction so a losing concurrent claim

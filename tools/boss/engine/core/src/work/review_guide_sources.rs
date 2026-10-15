@@ -73,6 +73,7 @@ pub enum PrSourceCapturePersistOutcome {
     IgnoredStaleObservation,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Allocate the global observation order before starting an asynchronous
     /// source read. The returned sequence, rather than a response timestamp,

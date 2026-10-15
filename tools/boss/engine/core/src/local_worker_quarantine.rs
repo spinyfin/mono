@@ -45,6 +45,7 @@ pub(crate) struct StartupQuarantineReport {
     pub scan_failed: bool,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     fn read_local_worker_quarantine(&self) -> Result<Quarantine> {
         self.get_metadata(METADATA_KEY)?
