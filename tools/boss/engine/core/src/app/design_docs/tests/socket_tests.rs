@@ -168,7 +168,7 @@ async fn cached_read_burst() {
     );
     let registry = state.design_doc_revalidation.clone();
     let (client, server) = UnixStream::pair().unwrap();
-    let handler = tokio::spawn(handle_frontend_connection(server, state, None));
+    let handler = tokio::spawn(handle_frontend_connection(server, state.clone(), None));
     let (read, mut write) = client.into_split();
     let mut lines = BufReader::new(read).lines();
     for index in 0..32 {
@@ -191,22 +191,29 @@ async fn cached_read_burst() {
     .await
     .unwrap();
     wait_started(&source, 2).await;
+    // Identical reads pipelined on one session share a handler run
+    // (`read_coalesce`), so the burst registers with the ladder once per
+    // run, not once per request; every request is one or the other.
+    let runs = usize::try_from(state.read_coalescing.leaders()).unwrap();
+    let followers = usize::try_from(state.read_coalescing.followers()).unwrap();
+    assert_eq!(runs + followers, 32);
+    assert!(runs >= 1);
     // Responses are queued before handlers register with the revalidation
-    // ladder. Keep its fetch blocked until every request has joined; otherwise
+    // ladder. Keep its fetch blocked until every run has joined; otherwise
     // the last handler can start a second ladder after the first one finishes.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let registered = registry.in_flight.lock().unwrap()[&key(PATH)]
                 .registered_requests
                 .load(Ordering::SeqCst);
-            if registered == 32 {
+            if registered == runs {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("not all cached reads joined the revalidation ladder");
+    .expect("not all cached read handler runs joined the revalidation ladder");
     assert_eq!(
         source.started.load(Ordering::SeqCst),
         2,
