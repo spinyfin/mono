@@ -778,15 +778,83 @@ final class BoardRefusalTrackingTests: XCTestCase {
         model.engine.simulateConnectedForTesting = true
 
         model.submitRevision(parentTaskID: task.id, description: "tighten the error text")
-        XCTAssertEqual(model.revisionRequestParentIDs.count, 1)
-        let requestId = model.revisionRequestParentIDs.keys.first!
+        XCTAssertNil(model.revisionComposerTaskID)
 
-        model.applyEventForTest(.workError(message: "PR is merged", requestId: requestId))
+        model.applyEventForTest(.revisionRefused(message: "PR is merged", parentTaskID: task.id))
 
         XCTAssertEqual(model.dragRefusalNotice?.taskID, task.id)
         XCTAssertEqual(model.dragRefusalNotice?.message, "PR is merged")
         XCTAssertNil(model.workErrorMessage)
-        XCTAssertTrue(model.revisionRequestParentIDs.isEmpty)
+    }
+
+    func testRevisionRefusalLeavesAnotherCardsPendingMoveAlone() {
+        let model = makeModel()
+        let parent = makeTask(status: "in_review")
+        let other = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [parent, other]]
+        model.engine.simulateConnectedForTesting = true
+        _ = model.attemptDrop(other.id, onColumn: .review, group: nil)
+
+        model.applyEventForTest(.revisionRefused(message: "PR is closed", parentTaskID: parent.id))
+
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, parent.id)
+        XCTAssertNotNil(model.pendingMoveOriginByTaskID[other.id], "the other card's move must stay pending")
+    }
+
+    func testSubmitRevisionKeepsComposerOpenWhenQueueIsFull() {
+        let model = makeModel()
+        let task = makeTask(status: "in_review")
+        model.choresByProductID = ["prod_test": [task]]
+        model.revisionComposerTaskID = task.id
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+        for index in 0..<EngineClient.maxUnsentActions {
+            _ = model.engine.sendLine(["type": "create_chore", "name": "queued-\(index)"])
+        }
+
+        model.submitRevision(parentTaskID: task.id, description: "keep my draft")
+
+        XCTAssertEqual(model.revisionComposerTaskID, task.id, "a rejected submit must keep the composer and its draft")
+        XCTAssertFalse(sent.contains { $0["type"] as? String == "create_revision" })
+    }
+
+    // MARK: - Admission decode failure
+
+    func testUndecodableAdmissionReplyBouncesOnlyItsOwnCard() {
+        let model = makeModel()
+        let a = makeTask(status: "todo")
+        let b = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [a, b]]
+        model.engine.simulateConnectedForTesting = true
+        _ = model.attemptDrop(b.id, onColumn: .review, group: nil)
+        _ = model.attemptDrop(a.id, onColumn: .doing, group: nil)
+        XCTAssertNotNil(model.pendingDragAdmissionChecks[a.id])
+
+        model.applyEventForTest(.dispatchAdmissionDecodeFailed(message: "bad admission", taskID: a.id))
+
+        XCTAssertNil(model.pendingDragAdmissionChecks[a.id])
+        XCTAssertNil(model.pendingMoveOriginByTaskID[a.id])
+        XCTAssertNotNil(model.pendingMoveOriginByTaskID[b.id], "an unrelated ordinary move must stay pending")
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, a.id)
+    }
+
+    func testUnattributedAdmissionDecodeFailureBouncesOnlyAdmissionCards() {
+        let model = makeModel()
+        let a = makeTask(status: "todo")
+        let b = makeTask(status: "todo")
+        let c = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [a, b, c]]
+        model.engine.simulateConnectedForTesting = true
+        _ = model.attemptDrop(c.id, onColumn: .review, group: nil)
+        _ = model.attemptDrop(a.id, onColumn: .doing, group: nil)
+        _ = model.attemptDrop(b.id, onColumn: .doing, group: nil)
+
+        model.applyEventForTest(.dispatchAdmissionDecodeFailed(message: "bad admission", taskID: nil))
+
+        XCTAssertTrue(model.pendingDragAdmissionChecks.isEmpty)
+        XCTAssertNil(model.pendingMoveOriginByTaskID[a.id])
+        XCTAssertNil(model.pendingMoveOriginByTaskID[b.id])
+        XCTAssertNotNil(model.pendingMoveOriginByTaskID[c.id])
     }
 
     // MARK: - Helpers

@@ -11,6 +11,32 @@ use boss_protocol::{
     WorkItemPatch,
 };
 
+/// Like `test_server_state_with_fakes`, with the PR open/merged/closed probe
+/// answering `pr_state` for every PR.
+fn state_with_pr_state(pr_state: crate::work::PrOpenState) -> (Arc<ServerState>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        ServerStateOverrides {
+            cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
+            pr_state_checker: Some(Arc::new(crate::work::FakePrStateChecker::always(pr_state))),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (state, temp)
+}
+
 fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>) -> Dispatch {
     Dispatch::builder()
         .server_state(state.clone())
@@ -25,9 +51,14 @@ fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>) -> Dispatch {
 
 async fn sole_response(sink: &SessionSink) -> FrontendEvent {
     sink.close();
-    let response = sink.next().await.expect("handler must send a response").payload;
+    let envelope = sink.next().await.expect("handler must send a response");
+    assert_eq!(
+        envelope.request_id.as_deref(),
+        Some("req-board-drag-refusal"),
+        "the response must carry the request's id so the app can correlate it"
+    );
     assert!(sink.next().await.is_none(), "handler must send exactly one response");
-    response
+    envelope.payload
 }
 
 fn drop_on(id: &str, column: BoardColumn) -> FrontendRequest {
@@ -45,7 +76,7 @@ fn drop_on(id: &str, column: BoardColumn) -> FrontendRequest {
 /// back, and the reply names the PR and points at revisions.
 #[tokio::test]
 async fn drag_to_doing_of_item_with_bound_pr_is_refused_with_code_and_reason() {
-    let (state, _dir) = test_server_state_with_fakes();
+    let (state, _dir) = state_with_pr_state(crate::work::PrOpenState::Open);
     let product = create_test_product_with_repo(
         &state.work_db,
         "BoardDragRefusal",
@@ -218,11 +249,65 @@ async fn drag_of_merged_item_to_doing_offers_no_revision() {
     }
 }
 
+/// Drag an item with a bound PR (still `todo`) to Doing under a probe that
+/// reports `pr_state`, and return the refusal.
+async fn bound_pr_refusal(
+    pr_state: crate::work::PrOpenState,
+) -> (Option<BoardRefusalAction>, BoardRefusalCode, String) {
+    let (state, _dir) = state_with_pr_state(pr_state);
+    let product = create_test_product_with_repo(&state.work_db, "ProbeBoard", Some("git@example.com:board/probe.git"));
+    let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "Probed");
+    bind_pr(&state, &chore.id, None);
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(dispatch(&state, &sink), drop_on(&chore.id, BoardColumn::Doing)).await;
+    match sole_response(&sink).await {
+        FrontendEvent::WorkItemRefused {
+            code,
+            message,
+            suggested_action,
+            ..
+        } => (suggested_action, code, message),
+        other => panic!("expected WorkItemRefused, got {other:?}"),
+    }
+}
+
+/// A closed-unmerged PR cannot take a revision, so no revision is offered.
+#[tokio::test]
+async fn drag_of_item_with_closed_unmerged_pr_offers_no_revision() {
+    let (action, code, message) = bound_pr_refusal(crate::work::PrOpenState::ClosedUnmerged).await;
+    assert_eq!(code, BoardRefusalCode::BoundPrNotRevisable);
+    assert_eq!(action, None);
+    assert!(
+        message.contains("#3170") && message.contains("closed"),
+        "got: {message}"
+    );
+    assert!(!message.contains("add a revision"), "got: {message}");
+}
+
+/// A merged PR whose card has not reached Done yet (cached status is not
+/// Done) is still not revisable: the live probe is what says so.
+#[tokio::test]
+async fn drag_of_merged_pr_item_not_yet_done_offers_no_revision() {
+    let (action, code, message) = bound_pr_refusal(crate::work::PrOpenState::Merged).await;
+    assert_eq!(code, BoardRefusalCode::BoundPrNotRevisable);
+    assert_eq!(action, None);
+    assert!(message.contains("merged"), "got: {message}");
+    assert!(!message.contains("add a revision"), "got: {message}");
+}
+
+/// An open PR is the one case that offers the revision action.
+#[tokio::test]
+async fn drag_of_item_with_open_pr_offers_add_revision() {
+    let (action, code, _) = bound_pr_refusal(crate::work::PrOpenState::Open).await;
+    assert_eq!(code, BoardRefusalCode::BoundPr);
+    assert_eq!(action, Some(BoardRefusalAction::AddRevision));
+}
+
 /// An explicit-status board request is refused with the same structured
 /// result as a drop, not a bare `WorkError`.
 #[tokio::test]
 async fn refused_explicit_status_board_request_returns_work_item_refused() {
-    let (state, _dir) = test_server_state_with_fakes();
+    let (state, _dir) = state_with_pr_state(crate::work::PrOpenState::Open);
     let product = create_test_product_with_repo(
         &state.work_db,
         "ExplicitRefused",

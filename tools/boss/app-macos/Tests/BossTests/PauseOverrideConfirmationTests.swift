@@ -261,8 +261,9 @@ final class PauseOverrideConfirmationTests: XCTestCase {
     }
 
     func testInvalidAdmissionPayloadErrorBouncesPendingCheck() {
-        // EngineClient emits `.error` (never `.dispatchAdmissionEvaluated`)
-        // when a dispatch_admission_evaluated payload fails to decode —
+        // EngineClient emits `.dispatchAdmissionDecodeFailed` (never
+        // `.dispatchAdmissionEvaluated`) when a dispatch_admission_evaluated
+        // payload fails to decode —
         // that reply can never clear the pending check in the expected
         // shape, so the card must bounce rather than strand in Doing.
         let model = makeModel()
@@ -274,7 +275,8 @@ final class PauseOverrideConfirmationTests: XCTestCase {
         _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
         XCTAssertNotNil(model.pendingDragAdmissionCheck)
 
-        model.applyEventForTest(.error(message: "received invalid dispatch_admission_evaluated payload", requestId: model.pendingDragAdmissionCheck?.requestID))
+        model.applyEventForTest(.dispatchAdmissionDecodeFailed(
+            message: "received invalid dispatch_admission_evaluated payload", taskID: task.id))
 
         XCTAssertNil(model.pendingDragAdmissionCheck)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog,

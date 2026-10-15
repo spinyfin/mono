@@ -951,7 +951,14 @@ pub(super) async fn apply_work_item_patch_from(
                     .with_details(details),
                 )
                 .await;
-            let refusal = BoardRefusal::from_dispatch_error(&work_db, &id, &err, BoardRefusalCode::MissingRepo, None);
+            let refusal = BoardRefusal::from_dispatch_error(
+                &work_db,
+                &id,
+                &err,
+                BoardRefusalCode::MissingRepo,
+                None,
+                server_state.pr_state_checker.as_ref(),
+            );
             send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             return;
         }
@@ -1182,6 +1189,7 @@ pub(super) async fn apply_work_item_patch_from(
                                     &err,
                                     BoardRefusalCode::PauseOverrideRefused,
                                     previous_task_status.clone(),
+                                    server_state.pr_state_checker.as_ref(),
                                 );
                                 let reason = format!("{err:#}");
                                 dispatch_failure_response = Some(refusal);
@@ -1210,6 +1218,7 @@ pub(super) async fn apply_work_item_patch_from(
                                     &err,
                                     BoardRefusalCode::DispatchRefused,
                                     previous_task_status.clone(),
+                                    server_state.pr_state_checker.as_ref(),
                                 );
                                 let reason = format!("{err:#}");
                                 dispatch_failure_response = Some(refusal);
