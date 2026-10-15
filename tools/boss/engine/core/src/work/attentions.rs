@@ -415,6 +415,7 @@ pub(crate) fn create_attention_in_tx(
     Ok((attention, group))
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Create a new attention member, reconciling (or creating) its owning
     /// group. Returns the member plus its group so the caller can push an
@@ -1156,6 +1157,7 @@ fn action_followup_group(
     Ok(("tasks".to_owned(), reference, created_ids))
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Action an open / partially-answered attention group: produce the single
     /// downstream artifact and transition the group to `actioned` (terminal),
@@ -1302,6 +1304,7 @@ fn map_attention_merge(row: &Row<'_>) -> rusqlite::Result<AttentionMerge> {
     })
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Append one row to the `attention_merges` provenance ledger. Returns the
     /// generated `id` of the new row.

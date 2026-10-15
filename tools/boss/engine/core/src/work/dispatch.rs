@@ -1,6 +1,7 @@
 use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
 use super::*;
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Returns or creates a ready execution for `work_item_id`, applying any
     /// priority / preferred-workspace overrides from the request.

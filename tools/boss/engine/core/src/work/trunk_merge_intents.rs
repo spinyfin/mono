@@ -116,6 +116,7 @@ fn map_trunk_merge_intent(row: &Row<'_>) -> rusqlite::Result<TrunkMergeIntent> {
     })
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Insert a fresh `active` `trunk_merge_intents` row for `input`.
     ///

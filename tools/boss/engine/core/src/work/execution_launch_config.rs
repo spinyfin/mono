@@ -1,5 +1,6 @@
 use super::*;
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Persist the resolved worker launch configuration exactly once per
     /// execution. This is deliberately stamped after the runner successfully

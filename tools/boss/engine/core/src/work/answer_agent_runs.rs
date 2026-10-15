@@ -50,6 +50,7 @@ pub(crate) fn latest_answer_agent_run_for_comment_on(
         .map_err(Into::into)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Insert a `running` answer-agent run row and return it. `thread_turn` is
     /// `0` for the first answer on a comment and `1+` for re-entered follow-ups.

@@ -6,6 +6,7 @@
 
 use super::*;
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Non-terminal executions whose latest run landed on a host that is
     /// no longer eligible to run it — the host was disabled (operator

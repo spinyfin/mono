@@ -80,6 +80,7 @@ const SELECT_PLANNER_RUN: &str = "SELECT id, project_id, product_id, design_task
 
 // ---- WorkDb accessors ----
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Mark every Planner run inherited from a previous engine instance as
     /// failed, releasing each project's idempotency gate for a later retry.

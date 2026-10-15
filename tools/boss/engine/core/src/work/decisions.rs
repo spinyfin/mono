@@ -46,6 +46,7 @@ fn query_decision(conn: &Connection, id: &str) -> Result<Option<Decision>> {
     Ok(row)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Insert a new `active` product decision and return the row.
     pub fn create_decision(&self, input: CreateDecisionInput) -> Result<Decision> {

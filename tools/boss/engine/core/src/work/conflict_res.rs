@@ -20,6 +20,7 @@ const RUNG_FULL_WORKER: i64 = 3;
 /// `blocked_attempt_id` points at a row that no longer exists.
 type OrphanedLadderCandidate = (String, String, String, Option<String>, Option<String>, Option<i64>);
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Read the unified auto-maintenance opt-out flag for a product.
     /// Defaults to `true` when the column is unset or the product row

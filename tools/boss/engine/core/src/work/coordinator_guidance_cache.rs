@@ -36,6 +36,7 @@ fn key(product_id: &str) -> String {
     format!("{KEY_PREFIX}{product_id}")
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Save `entry` as the product's cached guidance unless a read that
     /// started later has already saved one. Concurrent reads of the same

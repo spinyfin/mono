@@ -2472,6 +2472,9 @@ pub async fn serve_with_overrides(
     let _metrics_flush_handle =
         crate::metrics::spawn_flush_task(server_state.metrics.clone(), server_state.work_db.clone());
 
+    // Once-a-minute work DB lock-contention summary (log line + metrics).
+    let _db_lock_summary_handle = crate::work::lock_stats::spawn_summary_task(server_state.metrics.clone());
+
     // Periodic stalled-spawn + stale-activity honesty timers. Two complementary
     // Spawning-lie fixes share one 10s tick so agents-list activity stays
     // trustworthy after events.sock degrades:

@@ -1,5 +1,6 @@
 use super::*;
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// For a `revision` task, walk the parent chain to the chain root and
     /// return the chain root's bound `pr_url`, or `None` if the chain root

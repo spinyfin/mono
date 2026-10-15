@@ -125,6 +125,7 @@ pub(crate) fn reraise_open_execution_attention(
     Ok(existing)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Stamp a re-raise onto the open work-item-scoped `kind` item for
     /// `work_item_id`, returning its id when one existed.

@@ -26,6 +26,7 @@ pub struct ClearedExecutionWorkspace {
     pub workspace_path: Option<String>,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
     /// `workspace_path` on `execution_id`. Returns the prior lease id

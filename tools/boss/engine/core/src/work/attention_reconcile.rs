@@ -170,6 +170,7 @@ fn resolve_one_kind(conn: &Connection, now: &str, lifecycle: &AttentionLifecycle
     Ok(rows)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Resolve every open attention item whose declared clearing evidence has
     /// arrived, and clear stale dispatch-failure banners on the same basis.

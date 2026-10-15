@@ -15,6 +15,7 @@ const COMMAND_MAX_BYTES: usize = 4096;
 /// Default row limit for [`WorkDb::list_editorial_actions`].
 pub const LIST_EDITORIAL_ACTIONS_DEFAULT_LIMIT: u32 = 50;
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Load the product_id, compiled EditorialRules, and workspace_path for
     /// an execution in one synchronous DB round-trip. Used by the PreToolUse

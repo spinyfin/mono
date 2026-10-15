@@ -49,6 +49,7 @@ pub(crate) struct CoordinatorTmuxRecord {
     pub(crate) liveness_passed_at: Option<i64>,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub(crate) fn coordinator_tmux_record(&self) -> Result<Option<CoordinatorTmuxRecord>> {
         let conn = self.connect()?;

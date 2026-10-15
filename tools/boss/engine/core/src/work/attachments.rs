@@ -89,6 +89,7 @@ fn find_by_digest(conn: &Connection, execution_id: &str, content_digest: &str) -
         .map_err(Into::into)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Count live attachments this run and this work item have already stored.
     ///

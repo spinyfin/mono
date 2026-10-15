@@ -255,6 +255,7 @@ pub struct PendingMergeCheck {
     pub pr_url: String,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Shared body of every merge-poller candidate list
     /// ([`Self::list_chores_pending_merge_check`],

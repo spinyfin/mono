@@ -146,6 +146,7 @@ pub(super) fn find_worker_proposal_by_id(conn: &Connection, id: &str) -> Result<
 
 // ---- WorkDb accessors ----
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Read-only replay lookup for `(execution_id, idempotency_key)`, so a
     /// caller can tell a replay from a fresh submission before applying
@@ -645,6 +646,7 @@ pub(crate) fn mark_followup_proposal_decided_in_tx(
     Ok(())
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Read this execution's terminal `run_done` declaration, if the worker has made one.
     pub fn execution_run_done_outcome(&self, execution_id: &str) -> Result<Option<boss_protocol::RunDoneOutcome>> {

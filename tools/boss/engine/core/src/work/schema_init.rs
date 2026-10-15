@@ -55,6 +55,7 @@ fn schema_objects(conn: &Connection) -> Result<std::collections::BTreeSet<String
         .collect::<rusqlite::Result<_>>()?)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Install the floor directly on empty databases. Existing databases
     /// must meet the floor before any data or schema changes are attempted.
@@ -189,7 +190,7 @@ impl WorkDb {
         // recommended pairing for WAL — durable across application
         // crashes, only loses commits on OS/power loss, which is fine
         // for engine state we can rebuild.
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        conn.busy_timeout(super::SQLITE_BUSY_TIMEOUT)?;
         if set_wal {
             conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         }
@@ -227,18 +228,6 @@ impl WorkDb {
         };
         Self::configure_connection(&mut conn, true)?;
         Ok(conn)
-    }
-
-    /// Borrow the shared connection. Every call site gets what looks like
-    /// its own `Connection` (via `Deref`/`DerefMut`) but is really a mutex
-    /// guard over the one connection this `WorkDb` (and every clone of it)
-    /// shares — see the docs on `WorkDb::conn`. A function that already
-    /// holds a `connect()` guard must drop it (e.g. scope it in a block)
-    /// before calling anything that connects again, or it deadlocks against
-    /// itself.
-    #[track_caller]
-    pub(crate) fn connect(&self) -> Result<PooledConnection<'_>> {
-        super::connection_wait::acquire(&self.conn)
     }
 
     /// Escape hatch: open a brand-new connection to this database instead of

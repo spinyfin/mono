@@ -23,6 +23,7 @@ pub struct DeferredReviewAdmissionCandidate {
     pub cycle_root_id: String,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Record that a worker produced a PR for `execution_id`. In a single
     /// transaction:
@@ -1796,6 +1797,7 @@ pub struct QueuedMergeQueueMember {
     pub merge_queue_detail: Option<String>,
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Every task in `product_id` currently in GitHub's merge queue
     /// (`merge_queue_state = 'queued'`). Used by the merge poller's
@@ -1847,6 +1849,7 @@ impl WorkDb {
     }
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Return `(review_cycle, last_reviewed_sha)` for `task_id`.
     ///
@@ -2053,6 +2056,7 @@ const OPERATOR_QUESTION_RECORD_SELECT: &str = "SELECT *, (SELECT json_extract(pa
      FROM worker_proposals WHERE worker_proposals.id = operator_questions.proposal_id) AS run_summary \
      FROM operator_questions";
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub fn list_operator_questions(&self, work_item_id: &str) -> Result<Vec<OperatorQuestionRecord>> {
         let conn = self.connect()?;

@@ -42,6 +42,7 @@ pub(crate) fn query_automation(conn: &Connection, id: &str) -> Result<Option<bos
         .map_err(Into::into)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Create a new automation and return the inserted row.
     pub fn create_automation(&self, input: CreateAutomationInput) -> Result<boss_protocol::Automation> {

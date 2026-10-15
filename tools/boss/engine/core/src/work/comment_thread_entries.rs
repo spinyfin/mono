@@ -45,6 +45,7 @@ pub(crate) fn list_comment_thread_entries_on(conn: &Connection, comment_id: &str
     collect_rows(rows)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Append a thread entry to a comment. `entry_kind` must be one of
     /// `answer` / `operator_followup` ([`boss_protocol::THREAD_ENTRY_KIND_ANSWER`]

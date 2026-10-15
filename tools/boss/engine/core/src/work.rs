@@ -671,6 +671,7 @@ mod host_reconcile_queries;
 mod ideas;
 mod insert_helpers;
 mod list_filter;
+pub mod lock_stats;
 mod mappers;
 mod metrics_db;
 mod output_types;

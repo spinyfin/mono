@@ -51,6 +51,7 @@ fn map_cost_run_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
     })
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Every `work_runs` row for `work_item_id`'s executions, oldest
     /// first. Backs `boss cost task <id>`.

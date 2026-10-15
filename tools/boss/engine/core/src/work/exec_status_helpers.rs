@@ -477,6 +477,7 @@ pub(crate) fn resolve_execution_repo_remote_url(
     })
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Public wrapper for [`resolve_repo_for_work_item`] — the multi-repo
     /// design's single resolution point (R1 mitigation) — for callers

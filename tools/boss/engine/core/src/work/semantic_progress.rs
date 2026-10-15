@@ -10,6 +10,7 @@ use super::*;
 use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, tool_condition_signal};
 use boss_protocol::WorkerEvent;
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Record a driver-originated progress event against the run's
     /// agent-session row.

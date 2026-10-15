@@ -118,6 +118,7 @@ pub(crate) fn insert_attention_item_row(
     query_attention_item(conn, &id)?.with_context(|| format!("missing attention item after insert: {id}"))
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     pub fn create_attention_item(&self, input: CreateAttentionItemInput) -> Result<WorkAttentionItem> {
         let mut conn = self.connect()?;

@@ -54,6 +54,7 @@ pub(crate) fn list_ideas_in_tx(conn: &Connection, product_id: &str, status: Opti
     collect_rows(rows)
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Create a new `draft` idea and return the row.
     pub fn create_idea(&self, input: CreateIdeaInput) -> Result<Idea> {
