@@ -222,6 +222,13 @@ impl crate::completion::BranchVerifier for SettableHeadRefVerifier {
 pub(super) fn test_server_state_with_fakes_and_branch_verifier(
     branch_verifier: Arc<dyn crate::completion::BranchVerifier>,
 ) -> (Arc<ServerState>, tempfile::TempDir) {
+    test_server_state_with_fakes_branch_verifier_and_pr_state(branch_verifier, None)
+}
+
+pub(super) fn test_server_state_with_fakes_branch_verifier_and_pr_state(
+    branch_verifier: Arc<dyn crate::completion::BranchVerifier>,
+    pr_state_checker: Option<Arc<dyn crate::work::PrStateChecker>>,
+) -> (Arc<ServerState>, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
         crate::config::WorkConfig::builder()
@@ -238,6 +245,7 @@ pub(super) fn test_server_state_with_fakes_and_branch_verifier(
             cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
             execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
             branch_verifier: Some(branch_verifier),
+            pr_state_checker,
             ..Default::default()
         },
     )
@@ -583,4 +591,125 @@ async fn finalization_armed_observation_captures_on_the_canonical_root() {
     assert_eq!(capture.trigger, PrSourceCaptureTrigger::Creation.as_str());
     assert_eq!(capture.packet.head_sha, "head");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Head ref per PR number, so one test can tell the origin PR from the new PR.
+struct PerPrHeadRefVerifier(Arc<std::sync::Mutex<std::collections::HashMap<u64, String>>>);
+
+#[async_trait::async_trait]
+impl crate::completion::BranchVerifier for PerPrHeadRefVerifier {
+    async fn fetch_pr_head_ref(&self, _repo_slug: &str, pr_number: u64) -> anyhow::Result<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&pr_number)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no head ref for PR {pr_number}"))
+    }
+    async fn fetch_pr_head_oid(&self, _: &str, _: u64) -> anyhow::Result<String> {
+        Ok("oid".into())
+    }
+    async fn fetch_pr_head_oid_fresh(&self, _: &str, _: u64) -> anyhow::Result<String> {
+        Ok("oid".into())
+    }
+    async fn fetch_diff_line_count(&self, _: &str, _: &str, _: &str) -> anyhow::Result<u64> {
+        Ok(999)
+    }
+    async fn fetch_pr_base_ref(&self, _: &str, _: u64) -> anyhow::Result<String> {
+        Ok("main".into())
+    }
+    async fn fetch_diff_signature(&self, _: &str, _: &str, _: &str) -> anyhow::Result<String> {
+        Ok("sig".into())
+    }
+    async fn fetch_pr_title_and_body(&self, _: &str, _: u64) -> anyhow::Result<(String, String)> {
+        Ok((String::new(), String::new()))
+    }
+}
+
+/// The incident path end to end through the hook dispatcher: a publish
+/// command whose output cites the origin PR BEFORE the new PR's URL must
+/// stage both, and the capture-time branch check must pick the new PR (the
+/// one whose head is this execution's branch) and evict the origin PR.
+#[tokio::test]
+async fn publish_output_citing_the_origin_pr_first_binds_the_pr_on_the_executions_branch() {
+    const ORIGIN_URL: &str = "https://github.com/spinyfin/mono/pull/9";
+    // The execution id is only known after spawn, so the verifier reads it
+    // from a shared cell filled in below.
+    let heads = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<u64, String>::new()));
+    let (server_state, _dir) = test_server_state_with_fakes_branch_verifier_and_pr_state(
+        Arc::new(PerPrHeadRefVerifier(heads.clone())),
+        Some(Arc::new(crate::work::FakePrStateChecker::always(
+            crate::work::PrOpenState::Open,
+        ))),
+    );
+    let (execution_id, chore_id) = spawned_source_capture_worker(&server_state);
+    {
+        let mut heads = heads.lock().unwrap();
+        heads.insert(9, "boss/exec_some_other_execution".into());
+        heads.insert(
+            25,
+            crate::completion::expected_branch_name(&execution_id, &boss_protocol::BranchNaming::BossExecPrefix, None),
+        );
+    }
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({ "command": "cube pr create --branch b --title t --body-file f" }),
+            tool_response: serde_json::json!({
+                "stdout": format!("checkleft: Found in post-merge review of {ORIGIN_URL}\n{SOURCE_CAPTURE_PR_URL}\n")
+            }),
+        },
+        Some(execution_id.clone()),
+        None,
+    );
+    dispatch_worker_event_fanout(&server_state, &event).await;
+    for _ in 0..200 {
+        if server_state
+            .staged_pr_urls
+            .get_entry(&execution_id)
+            .is_some_and(|e| e.branch_verified)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let entry = server_state.staged_pr_urls.get_entry(&execution_id).unwrap();
+    assert!(entry.branch_verified, "capture-time verification must complete");
+    assert_eq!(entry.pr_url, SOURCE_CAPTURE_PR_URL);
+    assert!(
+        !entry.candidates().contains(&ORIGIN_URL.to_owned()),
+        "the origin PR must be evicted: {:?}",
+        entry.candidates()
+    );
+
+    // The dispatcher's staged cache drives the finalizer: the new PR binds,
+    // never the origin PR the output printed first.
+    let outcome = server_state
+        .completion_handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(&outcome, crate::completion::StopOutcome::ReviewerEnqueued { pr_url } | crate::completion::StopOutcome::PrDetected { pr_url } if pr_url == SOURCE_CAPTURE_PR_URL),
+        "got {outcome:?}"
+    );
+    let task = match server_state.work_db.get_work_item(&chore_id).unwrap() {
+        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t,
+        other => panic!("expected a task row, got {other:?}"),
+    };
+    assert_eq!(task.pr_url.as_deref(), Some(SOURCE_CAPTURE_PR_URL));
+    assert_ne!(
+        task.status,
+        boss_protocol::TaskStatus::Todo,
+        "the task moves on to review"
+    );
+    assert_eq!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .pr_url
+            .as_deref(),
+        Some(SOURCE_CAPTURE_PR_URL)
+    );
 }

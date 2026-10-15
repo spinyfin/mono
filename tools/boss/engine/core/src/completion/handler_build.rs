@@ -271,8 +271,7 @@ impl WorkerCompletionHandler {
     /// Override the PR state checker used by `finalize_pr_review_pass` when
     /// creating a revision. Tests inject
     /// `FakePrStateChecker::always(Open)` to avoid live `gh` calls.
-    #[cfg(test)]
-    pub(super) fn with_pr_state_checker(mut self, checker: Arc<dyn crate::work::PrStateChecker>) -> Self {
+    pub(crate) fn with_pr_state_checker(mut self, checker: Arc<dyn crate::work::PrStateChecker>) -> Self {
         self.pr_state_checker = checker;
         self
     }

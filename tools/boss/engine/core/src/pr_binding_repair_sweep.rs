@@ -35,8 +35,9 @@
 //! Each candidate is then confirmed against GitHub, and the execution's own
 //! branch ([`crate::completion::expected_branch_name`]) is the only selector:
 //!
-//! 1. Fetch the bound PR's `headRefName`. If it identifies this execution's
-//!    work item the binding is right; only a foreign doc pointer (if any) is
+//! 1. Fetch the bound PR's `headRefName`. If it identifies ANY primary
+//!    implementation execution of the row's work item (a resumed execution
+//!    pushes to its predecessor's branch) the binding is right; only a foreign doc pointer (if any) is
 //!    refreshed from that PR.
 //! 2. Otherwise run the branch-keyed detector on the execution's branch. A PR
 //!    there (open or merged) replaces the wrong binding on the task and the
@@ -64,8 +65,8 @@ use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::completion::{
-    BranchVerifier, CommandBranchVerifier, CommandPrDetector, PrDetector, PrStatus, branches_identify_same_work_item,
-    expected_branch_name, parse_repo_slug,
+    BranchVerifier, CommandBranchVerifier, CommandPrDetector, PrDetector, PrStatus, expected_branch_name,
+    head_identifies_any_branch, parse_repo_slug,
 };
 use crate::coordinator::ExecutionCoordinator;
 use crate::sweep_loop::{SweepOutcome, spawn_sweep_loop};
@@ -284,7 +285,7 @@ async fn repair_candidate(
                 let head_ref = verifier.fetch_pr_head_ref(&slug, pr_number).await.map_err(|err| {
                     Inconclusive::GitHub(format!("fetching head ref of {}: {err:#}", candidate.bound_pr_url))
                 })?;
-                branches_identify_same_work_item(&head_ref, &expected_branch)
+                head_identifies_any_branch(&head_ref, &candidate.own_branches)
             }
             None => {
                 tracing::warn!(
@@ -339,10 +340,26 @@ async fn repair_candidate(
     }
 
     // Step 2: the bound PR is not this execution's. Resolve by branch.
-    let status = detector
-        .detect_pr(&candidate.repo_remote_url, &expected_branch)
-        .await
-        .map_err(|err| Inconclusive::GitHub(format!("branch-keyed detection for `{expected_branch}`: {err:#}")))?;
+    // Newest primary execution's branch first; an earlier execution's branch
+    // is where a resumed row's PR lives.
+    let mut status = PrStatus::None;
+    let mut branches: Vec<String> = vec![expected_branch.clone()];
+    branches.extend(
+        candidate
+            .own_branches
+            .iter()
+            .filter(|b| **b != expected_branch)
+            .cloned(),
+    );
+    for branch in &branches {
+        status = detector
+            .detect_pr(&candidate.repo_remote_url, branch)
+            .await
+            .map_err(|err| Inconclusive::GitHub(format!("branch-keyed detection for `{branch}`: {err:#}")))?;
+        if !matches!(status, PrStatus::None) {
+            break;
+        }
+    }
     let (own_pr_url, merged) = match status {
         PrStatus::Fresh { url } | PrStatus::EmptyDiff { url } | PrStatus::Stale { url, .. } => (url, false),
         PrStatus::Merged { url } => (url, true),
@@ -826,6 +843,174 @@ mod tests {
                 .any(|a| a.kind == ATTENTION_KIND_PR_BINDING_REPAIR)
         );
     }
+    /// Second primary execution on `task_id` (a resume / bounce-back), newer
+    /// than the first and never pushed.
+    fn add_resumed_execution(db: &WorkDb, task_id: &str) -> String {
+        let exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(task_id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Completed)
+                    .repo_remote_url(REPO)
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET created_at = '9999-01-01T00:00:00Z' WHERE id = ?1",
+                [&exec.id],
+            )
+            .unwrap();
+        exec.id
+    }
+
+    #[tokio::test]
+    async fn resumed_row_bound_to_a_predecessor_executions_pr_is_left_untouched() {
+        let (_dir, db) = open_db();
+        let (_product, task_id, exec_a) = mis_bound_followup(&db, OWN);
+        let branch_a = expected_branch_name(&exec_a, &Default::default(), None);
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET doc_branch = ?2 WHERE id = ?1", [&task_id, &branch_a])
+            .unwrap();
+        let exec_b = add_resumed_execution(&db, &task_id);
+        assert_ne!(exec_a, exec_b);
+        let verifier = MapVerifier(HashMap::from([(1764, branch_a)]));
+        let detector = FixedDetector(PrStatus::None, StdMutex::default());
+        let docs = RecordingDocRefresher::default();
+        let mut attempts = HashMap::new();
+
+        assert!(
+            db.list_pr_binding_repair_candidates().unwrap().is_empty(),
+            "a doc pointer on the predecessor execution's branch is the row's own"
+        );
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &verifier,
+            &FakePrStateChecker::always(PrOpenState::Open),
+            &docs,
+            &mut attempts,
+        )
+        .await;
+
+        assert_eq!(outcome, PrBindingRepairOutcome::default());
+        let t = task(&db, &task_id);
+        assert_eq!(t.pr_url.as_deref(), Some(OWN));
+        assert_eq!(t.status, TaskStatus::Todo);
+        assert!(detector.1.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resumed_row_whose_origin_binding_is_suspect_but_pr_is_a_predecessors_is_confirmed() {
+        let (_dir, db) = open_db();
+        // Bound to the origin PR number but its head is the predecessor's branch.
+        let (_product, task_id, exec_a) = mis_bound_followup(&db, ORIGIN);
+        add_resumed_execution(&db, &task_id);
+        let verifier = MapVerifier(HashMap::from([(
+            1757,
+            expected_branch_name(&exec_a, &Default::default(), None),
+        )]));
+        let detector = FixedDetector(PrStatus::None, StdMutex::default());
+        let mut attempts = HashMap::new();
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &verifier,
+            &FakePrStateChecker::always(PrOpenState::Open),
+            &RecordingDocRefresher::default(),
+            &mut attempts,
+        )
+        .await;
+        assert_eq!(outcome.confirmed_ok + outcome.doc_repaired, 1, "{outcome:?}");
+        assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(ORIGIN));
+    }
+
+    #[tokio::test]
+    async fn engine_closed_followup_bound_to_its_origin_pr_is_rebound_and_reopened() {
+        let (_dir, db) = open_db();
+        let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'done', last_status_actor = 'engine', completed_at = 'now' WHERE id = ?1",
+                [&task_id],
+            )
+            .unwrap();
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_18dad2723a80ed10_23".to_owned())]));
+        let detector = FixedDetector(PrStatus::Fresh { url: OWN.to_owned() }, StdMutex::default());
+        let mut attempts = HashMap::new();
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &verifier,
+            &FakePrStateChecker::always(PrOpenState::Open),
+            &RecordingDocRefresher::default(),
+            &mut attempts,
+        )
+        .await;
+        assert_eq!(outcome.rebound, 1, "{outcome:?}");
+        let t = task(&db, &task_id);
+        assert_eq!(t.pr_url.as_deref(), Some(OWN));
+        assert_eq!(t.status, TaskStatus::InReview);
+    }
+
+    #[tokio::test]
+    async fn engine_archived_followup_bound_to_its_origin_pr_is_rebound_and_loses_archive_metadata() {
+        let (_dir, db) = open_db();
+        let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'archived', last_status_actor = 'engine', completed_at = 'now',
+                     archived_by = 'engine', archived_at = 'then', archived_reason = 'merged' WHERE id = ?1",
+                [&task_id],
+            )
+            .unwrap();
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_18dad2723a80ed10_23".to_owned())]));
+        let detector = FixedDetector(PrStatus::Fresh { url: OWN.to_owned() }, StdMutex::default());
+        let mut attempts = HashMap::new();
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &verifier,
+            &FakePrStateChecker::always(PrOpenState::Open),
+            &RecordingDocRefresher::default(),
+            &mut attempts,
+        )
+        .await;
+        assert_eq!(outcome.rebound, 1, "{outcome:?}");
+        let t = task(&db, &task_id);
+        assert_eq!(t.pr_url.as_deref(), Some(OWN));
+        assert_eq!(t.status, TaskStatus::InReview);
+        let archive: (Option<String>, Option<String>, Option<String>) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT archived_by, archived_at, archived_reason FROM tasks WHERE id = ?1",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(archive, (None, None, None));
+    }
+
+    #[tokio::test]
+    async fn human_closed_row_bound_to_its_origin_pr_is_not_a_candidate() {
+        let (_dir, db) = open_db();
+        let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'done', last_status_actor = 'human' WHERE id = ?1",
+                [&task_id],
+            )
+            .unwrap();
+        assert!(db.list_pr_binding_repair_candidates().unwrap().is_empty());
+    }
+
     struct RetryDocScanner(std::sync::atomic::AtomicBool);
     #[async_trait]
     impl DocPointerRefresher for RetryDocScanner {

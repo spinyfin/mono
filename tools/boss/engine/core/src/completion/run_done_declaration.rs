@@ -207,11 +207,7 @@ impl WorkerCompletionHandler {
             if execution.kind == ExecutionKind::RevisionImplementation {
                 return self.resolve_verified_pr_state(url).await;
             }
-            let expected = expected_branch_name(
-                &execution.id,
-                &execution.branch_naming,
-                execution.worker_branch_prefix.as_deref(),
-            );
+            let branches = self.work_item_branches(execution);
             if let (Ok(slug), Some(number)) = (parse_repo_slug(&execution.repo_remote_url), pr_number_from_url(&url)) {
                 match tokio::time::timeout(
                     DECLARED_DELIVERY_NETWORK_BUDGET,
@@ -219,7 +215,7 @@ impl WorkerCompletionHandler {
                 )
                 .await
                 {
-                    Ok(Ok(head)) if branches_identify_same_work_item(&head, &expected) => {
+                    Ok(Ok(head)) if head_identifies_any_branch(&head, &branches) => {
                         return self.resolve_verified_pr_state(url).await;
                     }
                     Ok(Ok(_)) => {}
