@@ -236,7 +236,7 @@ async fn gated_revision_dropped_on_doing_is_refused_with_the_gate_named() {
     handle_move_work_item_on_board(ctx, drop_on_doing(&second_findings.id)).await;
 
     match sole_response(&sink).await {
-        FrontendEvent::WorkError { message } => {
+        FrontendEvent::WorkItemRefused { message, .. } => {
             assert!(
                 message.contains("gated by"),
                 "the refusal must say the row is gated, got: {message}"
@@ -305,7 +305,7 @@ async fn chore_gated_on_in_review_prerequisite_dropped_on_doing_is_refused() {
     handle_move_work_item_on_board(ctx, drop_on_doing(&dependent.id)).await;
 
     match sole_response(&sink).await {
-        FrontendEvent::WorkError { message } => {
+        FrontendEvent::WorkItemRefused { message, .. } => {
             assert!(message.contains("gated by"), "got: {message}");
             assert!(message.contains(&prerequisite.id), "got: {message}");
         }
@@ -351,7 +351,7 @@ async fn quarantined_drop_restores_block_and_surfaces_explicit_start_error() {
     let sink = make_session_sink();
     handle_move_work_item_on_board(dispatch(&state, &sink, "quarantined-drop"), drop_on_doing(&task.id)).await;
     match sole_response(&sink).await {
-        FrontendEvent::WorkError { message } => assert_eq!(message, format!("{expected:#}")),
+        FrontendEvent::WorkItemRefused { message, .. } => assert_eq!(message, format!("{expected:#}")),
         other => panic!("expected quarantine refusal, got {other:?}"),
     }
     let after = task_row(&state, &task.id);

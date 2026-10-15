@@ -248,6 +248,19 @@ pub enum FrontendEvent {
     WorkError {
         message: String,
     },
+    /// A board gesture (`MoveWorkItemOnBoard`) was refused or reverted by
+    /// the engine. Sent instead of [`Self::WorkError`] so the app can show
+    /// `message` on the card that was dragged (`id`) and offer
+    /// `suggested_action`, rather than snapping the card back silently.
+    /// `message` is final user-facing text; the engine owns the decision
+    /// and the wording, the app only displays it.
+    WorkItemRefused {
+        id: String,
+        code: BoardRefusalCode,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suggested_action: Option<BoardRefusalAction>,
+    },
     /// Returned instead of `WorkError` when a create is rejected because
     /// a non-deleted task/chore in the same product has an identical name
     /// and was created within the last 60 seconds. Carries enough info for

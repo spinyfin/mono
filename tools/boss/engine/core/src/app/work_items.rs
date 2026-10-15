@@ -5,11 +5,12 @@
 //! behavioural change. See [`super::Dispatch`] for the per-request
 //! context every handler receives.
 
-use anyhow::anyhow;
+use crate::app::handler_helpers::{BoardRefusal, send_refusal};
 use boss_engine_board_gesture::{BoardRow, DropResolution, resolve_drop};
 
 use super::*;
 use crate::protocol::WorkItemPatch;
+use boss_protocol::BoardRefusalCode;
 
 pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -466,7 +467,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
     };
     tracing::Span::current().record("item_id", &id);
     tracing::debug!(target: "work_write_timing", boundary = "handler_entry");
-    apply_work_item_patch(ctx, id, patch, None).await;
+    apply_work_item_patch(ctx, id, patch, None, false).await;
 }
 
 /// Confirmed pause-only override state carried from a `MoveWorkItemOnBoard`
@@ -514,14 +515,16 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
     let id = match ctx.server_state.resolve_work_item_id(&id).await {
         Ok(id) => id,
         Err(err) => {
-            send_work_error(&ctx.sink, &ctx.request_id, &err);
+            let refusal = BoardRefusal::new(BoardRefusalCode::NotACard, format!("{err:#}"));
+            send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
             return;
         }
     };
     let row = match board_row_for_id(&ctx.work_db, &id) {
         Ok(row) => row,
         Err(err) => {
-            send_work_error(&ctx.sink, &ctx.request_id, &err);
+            let refusal = BoardRefusal::new(BoardRefusalCode::NotACard, format!("{err:#}"));
+            send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
             return;
         }
     };
@@ -554,7 +557,10 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
                     ctx.server_state.current_work_revision(),
                     FrontendEvent::WorkItemUpdated { item },
                 ),
-                Err(err) => send_work_error(&ctx.sink, &ctx.request_id, &err),
+                Err(err) => {
+                    let refusal = BoardRefusal::new(BoardRefusalCode::NotACard, format!("{err:#}"));
+                    send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
+                }
             }
         }
         DropResolution::SetStatus(status) => {
@@ -576,12 +582,17 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
                 {
                     Ok(admission) => admission,
                     Err(err) => {
-                        send_work_error(&ctx.sink, &ctx.request_id, err);
+                        let refusal = BoardRefusal::new(BoardRefusalCode::PauseOverrideRefused, err);
+                        send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
                         return;
                     }
                 };
                 if let Err(reason) = pause_bypass_decision(&admission, observed_pause_since_epoch_s) {
-                    send_work_error(&ctx.sink, &ctx.request_id, format!("cannot start {id}: {reason}"));
+                    let refusal = BoardRefusal::new(
+                        BoardRefusalCode::PauseOverrideRefused,
+                        format!("cannot start {id}: {reason}"),
+                    );
+                    send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
                     return;
                 }
             }
@@ -589,15 +600,15 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
             let pause_bypass = bypass_dispatch_pause.then_some(BoardDragPauseBypass {
                 observed_pause_since_epoch_s,
             });
-            apply_work_item_patch(ctx, id, patch, pause_bypass).await;
+            apply_work_item_patch(ctx, id, patch, pause_bypass, true).await;
         }
         DropResolution::ClearAutostart => {
             let patch = WorkItemPatch::builder().autostart(false).build();
-            apply_work_item_patch(ctx, id, patch, None).await;
+            apply_work_item_patch(ctx, id, patch, None, true).await;
         }
         DropResolution::Refused { message } => {
-            let err = anyhow!(message);
-            send_work_error(&ctx.sink, &ctx.request_id, &err);
+            let refusal = BoardRefusal::new(BoardRefusalCode::DropRefused, message);
+            send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
         }
     }
 }
@@ -633,6 +644,7 @@ pub(super) async fn apply_work_item_patch(
     id: String,
     patch: WorkItemPatch,
     pause_bypass: Option<BoardDragPauseBypass>,
+    board_gesture: bool,
 ) {
     let Dispatch {
         server_state,
@@ -646,7 +658,8 @@ pub(super) async fn apply_work_item_patch(
     let id = match server_state.resolve_work_item_id(&id).await {
         Ok(id) => id,
         Err(err) => {
-            send_work_error(&sink, &request_id, &err);
+            let refusal = BoardRefusal::new(BoardRefusalCode::NotACard, format!("{err:#}"));
+            send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             return;
         }
     };
@@ -728,14 +741,15 @@ pub(super) async fn apply_work_item_patch(
                     .with_details(details),
                 )
                 .await;
-            send_work_error(&sink, &request_id, &err);
+            let refusal = BoardRefusal::from_dispatch_error(&work_db, &id, &err, BoardRefusalCode::MissingRepo);
+            send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             return;
         }
         let actor = resolve_status_actor(&server_state, peer_pid);
         match work_db.update_work_item_as_actor(&id, patch, actor) {
             Ok(mut item) => {
                 // Dispatch refusals roll back the move and return the engine reason.
-                let mut dispatch_failure_response: Option<String> = None;
+                let mut dispatch_failure_response: Option<BoardRefusal> = None;
                 // Set only inside the pause-bypass arm's genuine claim branch
                 // (`dispatch_with_pause_bypass` actually claimed a `ready` row
                 // past an active pause). Distinct from `consented_override`
@@ -902,8 +916,14 @@ pub(super) async fn apply_work_item_patch(
                                 (Some(outcome.execution.id), false, Some(reason))
                             }
                             Err(err) => {
+                                let refusal = BoardRefusal::from_dispatch_error(
+                                    &work_db,
+                                    &work_item_id_for_event,
+                                    &err,
+                                    BoardRefusalCode::PauseOverrideRefused,
+                                );
                                 let reason = format!("{err:#}");
-                                dispatch_failure_response = Some(reason.clone());
+                                dispatch_failure_response = Some(refusal);
                                 (None, false, Some(reason))
                             }
                         }
@@ -921,8 +941,14 @@ pub(super) async fn apply_work_item_patch(
                                 (Some(execution.id), true, None)
                             }
                             Err(err) => {
+                                let refusal = BoardRefusal::from_dispatch_error(
+                                    &work_db,
+                                    &work_item_id_for_event,
+                                    &err,
+                                    BoardRefusalCode::DispatchRefused,
+                                );
                                 let reason = format!("{err:#}");
-                                dispatch_failure_response = Some(reason.clone());
+                                dispatch_failure_response = Some(refusal);
                                 (None, false, Some(reason))
                             }
                         }
@@ -946,8 +972,8 @@ pub(super) async fn apply_work_item_patch(
                             ),
                         )
                     };
-                    if let Some(reason) = &dispatch_failure_response {
-                        tracing::warn!(work_item_id = %work_item_id_for_event, %reason,
+                    if let Some(refusal) = &dispatch_failure_response {
+                        tracing::warn!(work_item_id = %work_item_id_for_event, reason = %refusal.message, code = ?refusal.code,
                             "UpdateWorkItem → active: dispatch refused; reverting status");
                         if let Some(prev_status) = &previous_task_status {
                             let (blocked_reason, blocked_detail) = previous_block.clone().unwrap_or_default();
@@ -1128,19 +1154,20 @@ pub(super) async fn apply_work_item_patch(
                     vec![work_item_id(&item)],
                 )
                 .await;
-                if let Some(reason) = dispatch_failure_response {
+                if let Some(refusal) = dispatch_failure_response {
                     // The status patch was reverted above; answer this
                     // request with a refusal (not the reverted item as a
-                    // success) so the client's `.workError` handler
+                    // success) so the client's refusal handler
                     // bounces the optimistic card back instead of the
                     // "dragged it and nothing happened" shape.
-                    send_work_error(&sink, &request_id, reason);
+                    send_refusal(&sink, &request_id, board_gesture, &id, refusal);
                 } else {
                     send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
                 }
             }
             Err(err) => {
-                send_work_error(&sink, &request_id, &err);
+                let refusal = BoardRefusal::new(BoardRefusalCode::UpdateRejected, format!("{err:#}"));
+                send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             }
         }
     }

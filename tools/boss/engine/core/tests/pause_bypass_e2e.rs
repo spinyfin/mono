@@ -240,7 +240,7 @@ async fn board_drag_force_with_stale_pause_generation_refuses_without_activating
         })
         .await?;
     match response {
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkItemRefused { message, .. } => {
             assert!(
                 message.to_lowercase().contains("changed")
                     || message.to_lowercase().contains("pause")
