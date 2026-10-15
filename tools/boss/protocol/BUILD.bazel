@@ -40,7 +40,7 @@ filegroup(
     visibility = ["//tools/boss/engine/core:__pkg__"],
 )
 
-# Keeps the Rust roster, the Swift roster and the crew portrait grid (and the
+# Keeps the Rust roster and the crew portrait grid (and the
 # bundled sheet's size) in step by parsing the real sources.
 sh_test(
     name = "worker_roster_parity_test",

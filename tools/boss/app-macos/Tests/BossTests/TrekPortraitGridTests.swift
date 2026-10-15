@@ -4,12 +4,12 @@ import XCTest
 @testable import Boss
 
 /// Guards the crew portrait grid: the single name → cell table, the
-/// worker roster derived from it, and the slicing of portraits out of
+/// worker crew derived from it, and the slicing of portraits out of
 /// the sheet. Parity with the Rust `ROSTER` is enforced separately by
 /// `tools/boss/protocol/tests/worker_roster_parity_test.py`.
 final class TrekPortraitGridTests: XCTestCase {
-    /// The roster as it stood before the grid extension. Slot ids are
-    /// indexes into the roster, so these must never move.
+    /// The roster as it stood before the grid extension; persona
+    /// assignment order depends on it, so these must never move.
     private let firstFortyWorkerNames = [
         "Riker", "Data", "Worf", "La Forge", "Troi", "Crusher", "Yar", "O'Brien",
         "Kira", "Dax", "Bashir", "Odo", "Quark", "Rom", "Nog", "Garak",
@@ -50,30 +50,19 @@ final class TrekPortraitGridTests: XCTestCase {
         }
     }
 
-    func testWorkerRosterIsGridOrderWithoutTheCoordinator() {
+    func testWorkerCrewIsGridOrderWithoutTheCoordinator() {
         let expected = TrekPortraitGrid.names.flatMap { $0 }.filter { $0 != "Picard" }
-        XCTAssertEqual(WorkerNames.roster, expected)
-        XCTAssertEqual(WorkerNames.roster.count, 55)
-        XCTAssertFalse(WorkerNames.roster.contains(TrekPortraitGrid.coordinatorName))
+        XCTAssertEqual(TrekPortraitGrid.workerNames, expected)
+        XCTAssertEqual(TrekPortraitGrid.workerNames.count, 55)
+        XCTAssertFalse(TrekPortraitGrid.workerNames.contains(TrekPortraitGrid.coordinatorName))
         XCTAssertNotNil(TrekPortraitGrid.cell(forPersona: TrekPortraitGrid.coordinatorName))
-        XCTAssertEqual(Array(WorkerNames.roster.prefix(40)), firstFortyWorkerNames)
+        XCTAssertEqual(Array(TrekPortraitGrid.workerNames.prefix(40)), firstFortyWorkerNames)
     }
 
-    func testEveryRosterNameHasAPortraitCell() {
-        for name in WorkerNames.roster {
+    func testEveryCrewNameHasAPortraitCell() {
+        for name in TrekPortraitGrid.workerNames {
             XCTAssertNotNil(TrekPortraitGrid.cell(forPersona: name), name)
         }
-    }
-
-    func testSlotNamesKeepExistingAssignmentsAndExtendPastForty() {
-        for (index, name) in firstFortyWorkerNames.enumerated() {
-            XCTAssertEqual(WorkerNames.name(forSlot: index + 1), name)
-        }
-        XCTAssertEqual(WorkerNames.name(forSlot: 41), "Sisko")
-        XCTAssertEqual(WorkerNames.name(forSlot: 55), "Rand")
-        XCTAssertEqual(WorkerNames.name(forSlot: 56), "Riker", "wraps after one pass")
-        XCTAssertEqual(WorkerNames.name(forSlot: 200), "Riker (Remote)")
-        XCTAssertEqual(WorkerNames.name(forSlot: 0), "Worker 0")
     }
 
     func testCropRectsAreInBoundsAndNeverShareAPixel() {

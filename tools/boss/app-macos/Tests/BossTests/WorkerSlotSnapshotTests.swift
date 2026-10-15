@@ -46,6 +46,27 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(fallback.displayName, "Worker run-persona")
     }
 
+    func testPersonaFollowsTheRunNotTheSlot() throws {
+        let client = EngineClient(socketPath: "/tmp/persona-reuse-\(UUID().uuidString).sock")
+        func live(run: String, name: String?) throws -> WorkerLiveState {
+            var payload: [String: Any] = [
+                "slot_id": 1, "run_id": run, "model": "opus", "activity": "working",
+            ]
+            payload["name"] = name
+            return try XCTUnwrap(client.parseWorkerLiveState(payload))
+        }
+        // The same slot id is reused by two runs: each keeps the persona the
+        // engine gave it, and a missing name never borrows a slot-derived one.
+        let first = try live(run: "run-a", name: "Worf")
+        let second = try live(run: "run-b", name: "Kirk")
+        let unnamed = try live(run: "run-c", name: nil)
+        XCTAssertEqual(first.displayName, "Worf")
+        XCTAssertEqual(second.displayName, "Kirk")
+        XCTAssertEqual(unnamed.displayName, "Worker run-c")
+        XCTAssertNil(TrekPortraitGrid.cell(forPersona: unnamed.name))
+        XCTAssertNil(TrekIconAssets.portrait(forPersona: unnamed.displayName))
+    }
+
     func testTerminalTitleUsesPersonaAndIgnoresShellTitle() {
         let session = TerminalPaneSession(
             id: "run-example", role: .worker(slot: 1),

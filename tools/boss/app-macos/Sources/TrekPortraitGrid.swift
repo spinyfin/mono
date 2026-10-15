@@ -7,12 +7,12 @@ import Foundation
 /// table; `TrekIconAssets` slices portraits out of the sheet at
 /// runtime and nothing else knows where a character sits.
 ///
-/// The worker roster is this grid in reading order, minus the
-/// coordinator (see `workerNames`). Order is load-bearing — a worker
-/// slot's name is its index in that list — so new characters are
-/// appended (new row, or the end of the last row), never inserted.
-/// `tools/boss/protocol/tests/worker_roster_parity_test.py` keeps
-/// this table, `WorkerNames.swift`, and the Rust `ROSTER` in step.
+/// The engine's persona roster is this grid in reading order, minus the
+/// coordinator. Order is load-bearing for stable persona leases, so new
+/// characters are appended (new row, or the end of the last row), never
+/// inserted. `tools/boss/protocol/tests/worker_roster_parity_test.py`
+/// keeps this table and the Rust `ROSTER` in step. The app never derives
+/// a worker's name from this table; names come from the engine.
 enum TrekPortraitGrid {
     /// Pixel size of `trek-crew-grid.png`. `TrekIconAssets` refuses to
     /// slice a sheet of any other size, so a swapped-in image can't
@@ -44,8 +44,8 @@ enum TrekPortraitGrid {
         let column: Int
     }
 
-    /// Reading-order names with the coordinator removed: the worker
-    /// roster, indexed by slot (`WorkerNames.roster`).
+    /// Reading-order names with the coordinator removed: the crew the
+    /// idle empty state draws its flavour portraits from.
     static let workerNames: [String] = names.flatMap { $0 }.filter { $0 != coordinatorName }
 
     private static let cellsByName: [String: Cell] = {
