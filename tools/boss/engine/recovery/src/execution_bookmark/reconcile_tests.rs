@@ -682,3 +682,26 @@ async fn rebasing_then_losing_baseline_recovers_from_recorded_evolution() {
     assert!(patch.contains("revision.txt"));
     assert!(!patch.contains("pr.txt"));
 }
+
+#[tokio::test]
+async fn abandoned_recorded_baseline_without_a_successor_is_a_typed_missing_baseline() {
+    let s = revision_on_pr_head("exec_abandoned_recorded_base").await;
+    let repo = &s.repo.repo;
+    let pr_head = one(repo, "pr/7");
+    let empty = one(repo, &format!("({pr_head})+ & empty()"));
+    // A legacy-style record whose recorded baseline is cube's empty positioning
+    // commit, which the worker then abandons before anything is pushed.
+    let record = ExecutionBookmark {
+        base_commit: Some(empty.clone()),
+        ..s.record.clone()
+    };
+    JjRepo::run(&s.repo.worker, &["abandon", &empty]);
+    JjRepo::run(repo, &["bookmark", "delete", &record.base()]);
+    let error = diff(&LocalJj, &record).await.unwrap_err();
+    assert_eq!(
+        pointer_integrity_kind(&error),
+        Some(PointerIntegrityKind::MissingBaseline),
+        "{error}"
+    );
+    assert!(is_reconcilable_pointer_error(&error));
+}

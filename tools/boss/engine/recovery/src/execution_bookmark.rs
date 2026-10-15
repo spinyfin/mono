@@ -332,6 +332,31 @@ async fn resolve_optional(jj: &dyn Jj, repo: &Path, bookmark: &str) -> Result<Op
     Ok(ids.first().map(|id| (*id).to_owned()))
 }
 
+/// True when `commit` is an ancestor of (or is) every head of the record.
+async fn commit_in_ancestry(jj: &dyn Jj, record: &ExecutionBookmark, commit: &str, heads: &Heads) -> Result<bool> {
+    let ancestry = heads
+        .named(record)
+        .iter()
+        .map(|(_, head)| format!("::{head}"))
+        .collect::<Vec<_>>()
+        .join(" & ");
+    let out = jj
+        .run(
+            &record.repo_path,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("{commit} & ({ancestry})"),
+                "-T",
+                "commit_id",
+            ],
+        )
+        .await?;
+    Ok(out.trim() == commit)
+}
+
 /// True when `commit` (a full commit id) exists in the store, visible or not.
 async fn commit_exists(jj: &dyn Jj, repo: &Path, commit: &str) -> Result<bool> {
     if commit.is_empty() || !commit.bytes().all(|c| c.is_ascii_hexdigit()) {
@@ -450,7 +475,12 @@ pub(crate) async fn resolve_base(jj: &dyn Jj, record: &ExecutionBookmark, heads:
     if let Some(commit) = &record.base_commit
         && commit_exists(jj, &record.repo_path, commit).await?
     {
-        return Ok((baseline::evolved_baseline(jj, record, commit, heads).await?, false));
+        let evolved = baseline::evolved_baseline(jj, record, commit, heads).await?;
+        // An abandoned commit that was not rewritten and that the heads no
+        // longer descend from cannot serve as a baseline.
+        if evolved != *commit || commit_in_ancestry(jj, record, commit, heads).await? {
+            return Ok((evolved, false));
+        }
     }
     Err(missing_baseline_error(record, heads))
 }

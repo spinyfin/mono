@@ -5,7 +5,10 @@ use boss_engine_recovery::execution_bookmark::{ExecutionBookmark, PointerSnapsho
 impl WorkDb {
     /// Live local recovery records of the PR-owning chain: the root item and
     /// every revision share the PR branch in the shared store, so an engine
-    /// rebase moves all of their pointers.
+    /// rebase moves all of their pointers. Executions with a live worker are
+    /// left out: the rebase also rewrites that worker's working copy, and jj's
+    /// own rewrite-following keeps its bookmarks consistent with it. Restoring
+    /// them to pre-rebase commits would strand them on a divergent twin.
     fn chain_bookmark_records(&self, chain_root_id: &str) -> Vec<ExecutionBookmark> {
         let executions = match self.list_executions_for_chain(chain_root_id) {
             Ok(executions) => executions,
@@ -21,7 +24,7 @@ impl WorkDb {
         let mut seen = std::collections::HashSet::new();
         let mut records = Vec::new();
         for execution in executions {
-            if !seen.insert(execution.id.clone()) {
+            if !seen.insert(execution.id.clone()) || execution.status.is_live() {
                 continue;
             }
             match self.execution_bookmark_optional(&execution.id) {

@@ -392,6 +392,48 @@ async fn speculative_rewrite_restores_original_baseline_before_next_goto() {
     assert!(!patch.contains("upstream.txt"));
 }
 
+#[tokio::test]
+async fn speculative_rewrite_leaves_a_live_workers_pointers_following_its_working_copy() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, chore_id) = rebase_candidate(&db);
+    let live = db
+        .create_execution(
+            crate::work::CreateExecutionInput::builder()
+                .work_item_id(chore_id)
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                .status(boss_protocol::ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let repo = JjRepo::new(dir.path());
+    JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
+    JjRepo::run(&repo.worker, &["new", "main", "-m", "Published implementation"]);
+    std::fs::write(repo.worker.join("pr.txt"), "implementation").unwrap();
+    JjRepo::run(&repo.worker, &["new", "-m", "Revision"]);
+    let record = recovery::create(&LocalJj, &repo.worker, &live.id, "local")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    std::fs::write(repo.worker.join("revision.txt"), "revision").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::run(&repo.repo, &["new", "main", "-m", "Upstream"]);
+    std::fs::write(repo.repo.join("upstream.txt"), "upstream").unwrap();
+    JjRepo::run(&repo.repo, &["bookmark", "set", "upstream", "-r", "@"]);
+    let cube = RecoveryRebaseCube {
+        record: record.clone(),
+        deletions: false,
+    };
+    let metrics = crate::metrics::Registry::new();
+    crate::speculative_conflict::init(&metrics);
+    crate::speculative_conflict::run_in_lease(&db, &cube, &metrics, &candidate, 42, &repo.worker).await;
+    // The live worker's pointers were not rewound: its checkpoint still
+    // resolves and its recorded diff carries the revision work.
+    recovery::checkpoint_baseline(&LocalJj, &record).await.unwrap();
+    let patch = recovery::diff(&LocalJj, &record).await.unwrap();
+    assert!(patch.contains("revision.txt"));
+}
+
 /// Recovery pointers across the engine's own mechanical rebases: the saved
 /// identities are kept across the whole operation (including rung 0's push),
 /// a pushed PR head is adopted by every record that already carries its work,
