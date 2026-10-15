@@ -746,7 +746,14 @@ pub(super) async fn apply_work_item_patch(
                     .with_details(details),
                 )
                 .await;
-            let refusal = BoardRefusal::from_dispatch_error(&work_db, &id, &err, BoardRefusalCode::MissingRepo, None);
+            let refusal = BoardRefusal::from_dispatch_error(
+                &work_db,
+                &id,
+                &err,
+                BoardRefusalCode::MissingRepo,
+                None,
+                server_state.pr_state_checker.as_ref(),
+            );
             send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             return;
         }
@@ -927,6 +934,7 @@ pub(super) async fn apply_work_item_patch(
                                     &err,
                                     BoardRefusalCode::PauseOverrideRefused,
                                     previous_task_status.clone(),
+                                    server_state.pr_state_checker.as_ref(),
                                 );
                                 let reason = format!("{err:#}");
                                 dispatch_failure_response = Some(refusal);
@@ -953,6 +961,7 @@ pub(super) async fn apply_work_item_patch(
                                     &err,
                                     BoardRefusalCode::DispatchRefused,
                                     previous_task_status.clone(),
+                                    server_state.pr_state_checker.as_ref(),
                                 );
                                 let reason = format!("{err:#}");
                                 dispatch_failure_response = Some(refusal);
@@ -1498,7 +1507,9 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
         &sink,
         &session_id,
         &request_id,
-        work_db.create_revision(input, &GhPrStateChecker).map(WorkItem::Task),
+        work_db
+            .create_revision(input, server_state.pr_state_checker.as_ref())
+            .map(WorkItem::Task),
         "revision_created",
         |err| FrontendEvent::WorkError {
             message: err.to_string(),

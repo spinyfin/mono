@@ -54,6 +54,46 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         XCTAssertNil(second.readLine(timeout: 0.2))
     }
 
+    /// A revision filed while disconnected is retained and resent under a fresh
+    /// request id; its refusal must still be attributed to the parent card.
+    func testRetriedCreateRevisionRefusalIsAttributedToItsParent() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let client = EngineClient(socketPath: path)
+        let refusals = OSAllocatedUnfairLock(initialState: [(message: String, parent: String)]())
+        let plainErrors = OSAllocatedUnfairLock(initialState: 0)
+        client.onEvent = { event in
+            switch event {
+            case .revisionRefused(let message, let parent): refusals.withLock { $0.append((message, parent)) }
+            case .workError: plainErrors.withLock { $0 += 1 }
+            default: break
+            }
+        }
+        // Filed before any connection exists: retained for Retry, no request id.
+        XCTAssertNil(client.sendCreateRevision(parentTaskId: "task_parent", description: "tighten it"))
+        XCTAssertEqual(client.unsentActionCountForTesting, 1)
+        client.start()
+        defer { client.stop() }
+        let connection = try XCTUnwrap(server.accept(timeout: 5))
+        defer { connection.close() }
+        XCTAssertTrue(waitUntil(5) { client.isReachable })
+        XCTAssertTrue(client.retryUnsentActions())
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(connection.readLine(timeout: 5))) as? [String: Any])
+        XCTAssertEqual((envelope["payload"] as? [String: Any])?["type"] as? String, "create_revision")
+        let requestID = try XCTUnwrap(envelope["request_id"] as? String)
+        var reply = try JSONSerialization.data(withJSONObject: [
+            "request_id": requestID,
+            "payload": ["type": "work_error", "message": "PR is closed"],
+        ])
+        reply.append(0x0A)
+        connection.sendBytes(reply)
+        XCTAssertTrue(waitUntil(5) { refusals.withLock { !$0.isEmpty } })
+        XCTAssertEqual(refusals.withLock { $0.first?.parent }, "task_parent")
+        XCTAssertEqual(refusals.withLock { $0.first?.message }, "PR is closed")
+        XCTAssertEqual(plainErrors.withLock { $0 }, 0)
+    }
+
     func testBufferedEngineRequestAfterSocketLossCannotEnterRetryBatch() throws {
         let path = socketPath()
         defer { unlink(path) }
