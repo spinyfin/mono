@@ -73,7 +73,7 @@ extension ChatViewModel {
         retryingDisconnectedActions = engine.hasRetriedActions
         if !discardedDragIDs.isEmpty {
             for id in discardedDragIDs { pendingDragAdmissionChecks[id] = nil }
-            bounceBackOptimisticMoves(only: discardedDragIDs, message: nil)
+            bounceBackOptimisticMoves(message: nil, only: discardedDragIDs)
         }
         unsavedActionNotice = nil
         if discardingCoordinatorReset { clearCoordinatorReset() }

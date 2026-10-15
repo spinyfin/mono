@@ -17,6 +17,7 @@ extension ChatViewModel {
 
     /// A drag-to-Doing waiting on its `EvaluateDispatchAdmission` reply.
     struct PendingDragAdmissionCheck: Equatable {
+        var requestID: String = UUID().uuidString
         let taskID: String
         let column: WorkBoardColumnKey
         let group: WorkBoardGroupKey?
@@ -138,8 +139,9 @@ extension ChatViewModel {
             // an ordinary drag on the hard-blocker check even with no
             // pause active at all, so it skips evaluation entirely and
             // goes straight to the normal drop below.
-            pendingDragAdmissionChecks[taskID] = PendingDragAdmissionCheck(taskID: taskID, column: column, group: group)
-            engine.sendEvaluateDispatchAdmission(workItemId: taskID)
+            let pending = PendingDragAdmissionCheck(taskID: taskID, column: column, group: group)
+            pendingDragAdmissionChecks[taskID] = pending
+            engine.sendEvaluateDispatchAdmission(workItemId: taskID, requestId: pending.requestID)
             return true
         }
 
@@ -185,7 +187,7 @@ extension ChatViewModel {
         let hardBlockers = admission.hardBlockers
         if !hardBlockers.isEmpty {
             engine.finishAdmissionRetry(taskID: pending.taskID)
-            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "))
+            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "), only: [pending.taskID])
             return
         }
 
@@ -193,7 +195,7 @@ extension ChatViewModel {
             engine.finishAdmissionRetry(taskID: pending.taskID)
             let reason = "dispatch is paused" + (admission.pause.reason.map { ": \($0)" } ?? "")
                 + " — this pause is not overridable"
-            bounceBackOptimisticMoves(message: reason)
+            bounceBackOptimisticMoves(message: reason, only: [pending.taskID])
             return
         }
 
@@ -240,7 +242,7 @@ extension ChatViewModel {
         guard let confirmation = pendingPauseOverrideConfirmation else { return }
         engine.finishAdmissionRetry(taskID: confirmation.taskID)
         presentNextPauseOverrideConfirmation()
-        bounceBackOptimisticMoves(message: nil)
+        bounceBackOptimisticMoves(message: nil, only: [confirmation.taskID])
     }
 
     /// Which of its column's named groups `task` currently renders in, or
@@ -274,10 +276,6 @@ extension ChatViewModel {
         }
     }
 
-    /// Bounce all unconfirmed in-flight optimistic moves back to their origin
-    /// columns and surface an inline notice. Called when `work_error` arrives
-    /// while moves are pending, or when `workItemUpdated` reports an unexpected
-    /// status (engine silently rejected the transition).
     /// Settles only drags that are not parked for Retry: a parked drag's
     /// request is still in the unsent queue and its continuation must
     /// survive until the user retries or discards it.
@@ -288,16 +286,18 @@ extension ChatViewModel {
         ids.subtract(parked)
         guard !ids.isEmpty else { return }
         for id in ids { pendingDragAdmissionChecks[id] = nil }
-        bounceBackOptimisticMoves(only: ids, message: message)
+        bounceBackOptimisticMoves(message: message, only: ids)
     }
 
-    func bounceBackOptimisticMoves(only: Set<String>, message: String?) {
-        bounceBackOptimisticMoves(message: message, only: only)
-    }
-
+    /// Bounce all unconfirmed in-flight optimistic moves back to their origin
+    /// columns and surface an inline notice. Called when `work_error` arrives
+    /// while moves are pending, or when `workItemUpdated` reports an unexpected
+    /// status (engine silently rejected the transition).
+    /// Parked drags are excluded unless explicitly selected.
     func bounceBackOptimisticMoves(message: String?, only: Set<String>? = nil) {
         guard !pendingMoveOriginByTaskID.isEmpty else { return }
-        let bouncedIDs = pendingMoveOriginByTaskID.keys.filter { only?.contains($0) ?? true }
+        let selected = only ?? Set(pendingMoveOriginByTaskID.keys).subtracting(engine.unsentDragTaskIDs())
+        let bouncedIDs = pendingMoveOriginByTaskID.keys.filter { selected.contains($0) }
         guard !bouncedIDs.isEmpty else { return }
         for id in bouncedIDs {
             optimisticColumnByTaskID.removeValue(forKey: id)

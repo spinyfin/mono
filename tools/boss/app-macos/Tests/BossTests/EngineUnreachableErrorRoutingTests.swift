@@ -33,7 +33,15 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
     func testAutomaticCommentsResolveIsNeverRetainedOrTracked() {
         XCTAssertFalse(EngineClient.isUserMutation(["type": "comments_resolve"]))
         let model = makeModel()
-        model.engine.sendLine(["type": "comments_resolve", "artifact_id": "a", "plain_text": "doc"])
+        var resolveCount = 0
+        model.engine.outboundRecorder = { payload in
+            if payload["type"] as? String == "comments_resolve" { resolveCount += 1 }
+        }
+        let layer = CommentLayer()
+        layer.configure(source: "Document text", baseURL: nil, artifact: .workItem(id: "a"), backend: model.commentBridge)
+        layer.reload()
+        XCTAssertEqual(resolveCount, 2)
+        XCTAssertEqual(model.engine.queuedReadCountForTesting, 2, "only list and banner reads are queued")
         XCTAssertEqual(model.engine.unsentActionCountForTesting, 0)
         XCTAssertFalse(model.hasUnsentActions)
         XCTAssertTrue(model.engine.uncertainActionsForTesting.isEmpty)
@@ -58,6 +66,34 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
         model.applyEventForTest(.error(message: "unrelated"))
         XCTAssertNotNil(model.pendingDragAdmissionChecks["t1"])
         XCTAssertTrue(model.engine.hasUnsentAction(kind: "evaluate_dispatch_admission"))
+    }
+
+    func testUnrelatedWorkErrorPreservesParkedDrag() {
+        let model = makeModel()
+        parkDrag(model, taskID: "parked", retained: true)
+        model.applyEventForTest(.workError(message: "unrelated", requestId: "other"))
+        XCTAssertNotNil(model.pendingDragAdmissionChecks["parked"])
+        XCTAssertEqual(model.optimisticColumnByTaskID["parked"], .doing)
+    }
+
+    func testRetryStatusBouncesOnlyInFlightDrag() {
+        let model = makeModel()
+        parkDrag(model, taskID: "parked", retained: true)
+        parkDrag(model, taskID: "inflight", retained: false)
+        model.applyEventForTest(.retriedActionsStatus(message: "Connection lost"))
+        XCTAssertNotNil(model.pendingDragAdmissionChecks["parked"])
+        XCTAssertEqual(model.optimisticColumnByTaskID["parked"], .doing)
+        XCTAssertNil(model.pendingDragAdmissionChecks["inflight"])
+        XCTAssertNil(model.optimisticColumnByTaskID["inflight"])
+    }
+
+    func testCommentSubmissionAcceptanceClearsUnsavedNotice() {
+        let model = makeModel()
+        model.showActionNotSaved(requestKind: "comment")
+        XCTAssertNotNil(model.unsavedActionNotice)
+        XCTAssertTrue(model.commentBridge.canAcceptUserSubmission(describing: "comment"))
+        XCTAssertNil(model.unsavedActionNotice)
+        XCTAssertNil(model.disconnectedActionNotice)
     }
 
     func testDisconnectBouncesOnlyInFlightDrag() {

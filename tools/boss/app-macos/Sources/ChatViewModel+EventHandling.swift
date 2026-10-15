@@ -328,25 +328,16 @@ extension ChatViewModel {
             // it is the only reply that request gets, so settle it here.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
             handle(.error(message: message))
-        case .error(let message):
-            if handleCoordinatorResetError(message) { return }
-            let parkedDrags = engine.unsentDragTaskIDs()
-            let settleableChecks = pendingDragAdmissionChecks.values.filter { !parkedDrags.contains($0.taskID) }
-            if !settleableChecks.isEmpty {
-                for pending in settleableChecks { engine.finishAdmissionRetry(taskID: pending.taskID) }
-                // A malformed/undecodable `dispatch_admission_evaluated`
-                // reply (EngineClient emits `.error`, never
-                // `.dispatchAdmissionEvaluated`, when the payload fails to
-                // decode) would otherwise leave the card optimistically
-                // rendered in Doing forever — nothing else ever clears
-                // `pendingDragAdmissionCheck` for a reply that never
-                // arrives in the expected shape. Bounce it back exactly as
-                // a hard-blocker refusal would.
-                let settledIDs = Set(settleableChecks.map(\.taskID))
-                for id in settledIDs { pendingDragAdmissionChecks[id] = nil }
-                bounceBackOptimisticMoves(only: settledIDs, message: message)
+        case .error(let message, let requestId):
+            if let requestId,
+               let pending = pendingDragAdmissionChecks.values.first(where: { $0.requestID == requestId }),
+               !engine.unsentDragTaskIDs().contains(pending.taskID) {
+                engine.finishAdmissionRetry(taskID: pending.taskID)
+                pendingDragAdmissionChecks[pending.taskID] = nil
+                bounceBackOptimisticMoves(message: message, only: [pending.taskID])
                 return
             }
+            if handleCoordinatorResetError(message) { return }
             workErrorMessage = message
         case .workerLiveStatesList(let states):
             liveWorkerStates.update(states: states)

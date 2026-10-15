@@ -289,8 +289,7 @@ final class EngineClient: @unchecked Sendable {
     /// self-retrying background polls may opt out of disconnected reports;
     /// user actions must either queue or report a visible failure.
     @discardableResult
-    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true) -> String? {
-        let envelopeRequestId = UUID().uuidString
+    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true, envelopeRequestId: String = UUID().uuidString) -> String? {
         outboundRecorder?(payload)
 
         // Log outbound engine_response messages so both sides of every
@@ -860,7 +859,7 @@ final class EngineClient: @unchecked Sendable {
             ))
         case "error":
             let message = payload["message"] as? String ?? "unknown engine error"
-            emit(.error(message: message))
+            emit(.error(message: message, requestId: envelopeRequestId))
         case "app_session_registered":
             // Only a completed handshake counts as "recovered" — resetting
             // on the raw socket `.ready` state instead would let a session
@@ -1026,7 +1025,7 @@ final class EngineClient: @unchecked Sendable {
                   let admissionData = try? JSONSerialization.data(withJSONObject: admissionPayload),
                   let admission = try? JSONDecoder().decode(DispatchAdmission.self, from: admissionData)
             else {
-                emit(.error(message: "received invalid dispatch_admission_evaluated payload"))
+                emit(.error(message: "received invalid dispatch_admission_evaluated payload", requestId: envelopeRequestId))
                 break
             }
             emit(.dispatchAdmissionEvaluated(admission: admission))

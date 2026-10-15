@@ -657,11 +657,11 @@ extension EngineClient {
     /// request execution, so the app can show a pause-only confirmation (or
     /// bounce the card back) instead of reproducing engine admission rules
     /// client-side. Reply arrives as `.dispatchAdmissionEvaluated`.
-    func sendEvaluateDispatchAdmission(workItemId: String) {
+    func sendEvaluateDispatchAdmission(workItemId: String, requestId: String = UUID().uuidString) {
         sendLine([
             "type": "evaluate_dispatch_admission",
             "work_item_id": workItemId,
-        ])
+        ], envelopeRequestId: requestId)
     }
 
     /// Ask the engine to schedule an execution for `workItemId`.

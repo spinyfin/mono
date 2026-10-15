@@ -274,7 +274,7 @@ final class PauseOverrideConfirmationTests: XCTestCase {
         _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
         XCTAssertNotNil(model.pendingDragAdmissionCheck)
 
-        model.applyEventForTest(.error(message: "received invalid dispatch_admission_evaluated payload"))
+        model.applyEventForTest(.error(message: "received invalid dispatch_admission_evaluated payload", requestId: model.pendingDragAdmissionCheck?.requestID))
 
         XCTAssertNil(model.pendingDragAdmissionCheck)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog,
