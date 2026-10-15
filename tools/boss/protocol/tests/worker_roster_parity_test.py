@@ -1,9 +1,9 @@
 """Keep the Rust roster and the crew portrait grid in step.
 
-The engine persona roster (Rust `ROSTER`) is, by design, the 56-character portrait grid in reading order minus the
-coordinator, Picard. This test parses the real sources, so a hand edit to any
-one of them that forgets the others fails here rather than at runtime, where
-a persona would show the wrong face.
+The engine persona roster (Rust `ROSTER`) is, by design, the 56-character
+portrait grid in reading order minus the coordinator, Picard. This test parses
+the real sources, so a hand edit to any one of them that forgets the others
+fails here rather than at runtime, where a persona would show the wrong face.
 """
 
 import os

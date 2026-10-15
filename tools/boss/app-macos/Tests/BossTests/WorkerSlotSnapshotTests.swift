@@ -55,16 +55,41 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             payload["name"] = name
             return try XCTUnwrap(client.parseWorkerLiveState(payload))
         }
-        // The same slot id is reused by two runs: each keeps the persona the
-        // engine gave it, and a missing name never borrows a slot-derived one.
-        let first = try live(run: "run-a", name: "Worf")
-        let second = try live(run: "run-b", name: "Kirk")
-        let unnamed = try live(run: "run-c", name: nil)
-        XCTAssertEqual(first.displayName, "Worf")
-        XCTAssertEqual(second.displayName, "Kirk")
-        XCTAssertEqual(unnamed.displayName, "Worker run-c")
-        XCTAssertNil(TrekPortraitGrid.cell(forPersona: unnamed.name))
-        XCTAssertNil(TrekIconAssets.portrait(forPersona: unnamed.displayName))
+        let store = LiveWorkerStateStore()
+        let task = WorkTask(
+            id: "task-persona", productID: "product-persona", projectID: nil,
+            kind: "task", name: "Reuse a worker slot", description: "",
+            status: "active", priority: "medium", ordinal: nil, prURL: nil,
+            deletedAt: nil, createdAt: "", updatedAt: ""
+        )
+        let cases: [(String, String?, String)] = [
+            ("run-a", "Worf", "Worf"),
+            ("run-b", "Kirk", "Kirk"),
+            ("run-c", nil, "Worker run-c"),
+        ]
+        for (run, name, expected) in cases {
+            // Each update replaces the previous occupant of the same slot.
+            store.update(states: [try live(run: run, name: name)])
+            XCTAssertEqual(Set(store.byRunID.keys), [run])
+            let current = try XCTUnwrap(store.byRunID[run])
+            let pane = WorkerSlotSnapshot.build(
+                slot: WorkerSlot(slotId: 1, runId: run),
+                liveState: current, liveStatusEnabled: true
+            )
+            let card = WorkCardSnapshot.build(
+                task: task,
+                context: WorkCardSnapshotContext(column: .doing, liveState: current)
+            )
+            let title = WorkBoardCardTitleRowSlice(snapshot: card)
+            XCTAssertEqual(pane.displayName, expected)
+            XCTAssertEqual(title.assignedWorkerName, expected)
+            XCTAssertEqual(title.assignedSlotId, 1)
+            if name == nil {
+                XCTAssertNil(TrekPortraitGrid.cell(forPersona: pane.live?.name))
+                XCTAssertNil(TrekIconAssets.portrait(forPersona: pane.displayName))
+                XCTAssertNil(TrekIconAssets.portrait(forPersona: title.assignedWorkerName))
+            }
+        }
     }
 
     func testTerminalTitleUsesPersonaAndIgnoresShellTitle() {
