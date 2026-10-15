@@ -442,8 +442,8 @@ final class GhosttyRuntime: @unchecked Sendable {
             guard let host = resolved.host else { return }
             let pixels = NSSize(width: Double(size.width), height: Double(size.height))
             guard let cell = Self.workerCellSize(role: host.session.role, host: host, pixels: pixels) else { return }
-            let width = cell.width
-            let height = cell.height
+            let width = Double(cell.width)
+            let height = Double(cell.height)
             let runtime = GhosttyRuntime.shared
             runtime.lastCellSize = (width, height)
             runtime.onCellSizeChanged?(width, height)
