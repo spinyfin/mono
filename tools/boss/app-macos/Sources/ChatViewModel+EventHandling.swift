@@ -119,7 +119,10 @@ extension ChatViewModel {
             // `pendingDragAdmissionCheck` or the optimistic move it guards.
             // A check parked for Retry is still in the unsent queue and is
             // kept; only checks whose request was in flight are settled.
-            bounceUnparkedDrags(message: nil, includeMovesWithoutCheck: false)
+            bounceUnparkedDrags(
+                message: "Connection to the engine was lost before it could answer — try the move again.",
+                includeMovesWithoutCheck: false
+            )
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, let itemIDs, let invalidationClass):
             executionLabelsInvalidatedHandler?()
@@ -219,6 +222,8 @@ extension ChatViewModel {
             handleOperatorQuestionError(message: message, requestId: requestId)
         case .boardReadFailed(let requestId):
             failBoardRead(requestID: requestId)
+        case .workItemRefused(let id, let code, let message, let suggestedAction):
+            handleWorkItemRefused(id: id, code: code, message: message, suggestedAction: suggestedAction)
         case .workError(let message, let requestId):
             if navigatorReviewGuides.fail(message: message, requestID: requestId) { return }
             failBoardRead(requestID: requestId)

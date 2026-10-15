@@ -105,8 +105,7 @@ struct WorkBoardSectionItemsView: View {
                     model: model,
                     revisionHighlight: model.revisionHighlightState(for: task.id),
                     isRevealed: highlightID == task.id,
-                    dragRefusalMessage: dragRefusal?.taskID == task.id
-                        ? dragRefusal?.message : nil,
+                    dragRefusal: dragRefusal?.taskID == task.id ? dragRefusal : nil,
                     mergeFeedbackMessage: mergeFeedback?.taskID == task.id
                         ? mergeFeedback?.message : nil,
                     isRequestingMerge: model.mergingWhenReadyIDs.contains(task.id)
@@ -153,7 +152,7 @@ struct WorkBoardCardItem: View {
     @ObservedObject var revisionHighlight: WorkBoardRevisionHighlightState
     var isRevealed: Bool = false
     /// Pre-resolved by the column container from `dragRefusalNotice`.
-    var dragRefusalMessage: String? = nil
+    var dragRefusal: ChatViewModel.DragRefusalNotice? = nil
     /// Pre-resolved by the column container from `mergeFeedbackNotice`.
     var mergeFeedbackMessage: String? = nil
     var isRequestingMerge = false
@@ -352,8 +351,12 @@ struct WorkBoardCardItem: View {
                 WorkDispatchFailureBanner(reason: dispatchFailedReason, errorText: task.dispatchFailedError)
             }
 
-            if let dragRefusalMessage {
-                WorkDragRefusalBanner(message: dragRefusalMessage) {
+            if let dragRefusal {
+                WorkDragRefusalBanner(
+                    message: dragRefusal.message,
+                    actionTitle: dragRefusal.suggestedAction == "add_revision" ? "Open card" : nil,
+                    onAction: { model.performDragRefusalAction(dragRefusal) }
+                ) {
                     model.clearDragRefusal()
                 }
             }

@@ -99,3 +99,40 @@ impl BoardDropTarget {
         }
     }
 }
+
+/// Why the engine refused (or reverted) a board gesture. Machine-readable
+/// companion to the human-readable `message` on
+/// [`FrontendEvent::WorkItemRefused`](crate::FrontendEvent::WorkItemRefused);
+/// the app displays the message and may key presentation off the code, but
+/// never decides a refusal itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardRefusalCode {
+    /// The item already owns a PR, so a fresh implementation run is refused;
+    /// the way to change it is a revision.
+    BoundPr,
+    /// Dispatch would deterministically fail because no repo resolves.
+    MissingRepo,
+    /// Applying the status/field patch itself was rejected (e.g. the item is
+    /// gated behind an unmet dependency).
+    UpdateRejected,
+    /// The status change landed but dispatching a worker was refused, so the
+    /// engine rolled the status back.
+    DispatchRefused,
+    /// A drag-to-Doing while dispatch is paused could not be forced.
+    PauseOverrideRefused,
+    /// The drop itself has no meaning for this card (e.g. a merging card
+    /// dragged somewhere the engine cannot honour).
+    DropRefused,
+    /// The drop named something that is not a board card or does not exist.
+    NotACard,
+}
+
+/// A follow-up the user can take after a refusal. Advisory: the app maps it
+/// to a button when it has a matching affordance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardRefusalAction {
+    /// Add a revision to the item's existing PR instead of re-running it.
+    AddRevision,
+}

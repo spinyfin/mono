@@ -13,6 +13,7 @@ use crate::tmux_worker_status::TmuxWorkerStatus;
 
 mod type_imports;
 use type_imports::*;
+use crate::{BoardRefusalAction, BoardRefusalCode};
 
 mod topics;
 pub use topics::*;
