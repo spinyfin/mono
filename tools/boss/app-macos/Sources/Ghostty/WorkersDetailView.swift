@@ -371,6 +371,29 @@ struct WorkerSlotView: View, @MainActor Equatable {
     let runtime: GhosttyRuntime
     let snapshot: WorkerSlotSnapshot
     let onToggleLiveStatus: (Bool) -> Void
+    /// Builds the terminal surface for a slot that has a session. Production
+    /// uses `WorkerPaneTerminalView`; tests inject a counting probe to observe
+    /// the representable's create/dismantle lifecycle without a live libghostty
+    /// surface. Outside `==`, like the other closure.
+    let terminalContent: WorkerTerminalContent
+
+    typealias WorkerTerminalContent = @MainActor (GhosttyRuntime, TerminalPaneSession, Bool) -> AnyView
+
+    static let productionTerminalContent: WorkerTerminalContent = { runtime, session, liveStatePresent in
+        AnyView(WorkerPaneTerminalView(runtime: runtime, session: session, liveStatePresent: liveStatePresent))
+    }
+
+    init(
+        runtime: GhosttyRuntime,
+        snapshot: WorkerSlotSnapshot,
+        onToggleLiveStatus: @escaping (Bool) -> Void,
+        terminalContent: @escaping WorkerTerminalContent = WorkerSlotView.productionTerminalContent
+    ) {
+        self.runtime = runtime
+        self.snapshot = snapshot
+        self.onToggleLiveStatus = onToggleLiveStatus
+        self.terminalContent = terminalContent
+    }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.runtime === rhs.runtime
@@ -392,11 +415,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
         if snapshot.isPlaceholder, snapshot.session == nil {
             placeholderCard
         } else if let session = snapshot.session {
-            WorkerPaneTerminalView(
-                runtime: runtime,
-                session: session,
-                liveStatePresent: snapshot.live != nil
-            )
+            terminalContent(runtime, session, snapshot.live != nil)
             .id(session.id)
             .opacity(snapshot.isPlaceholder || snapshot.isExited ? 0.55 : 1)
             .onChange(of: snapshot.displayName, initial: true) { _, name in
@@ -495,7 +514,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
 
             // A finished placeholder is historical text, not an addressable
             // worker: its slot may already belong to a new run.
-            if !snapshot.isPlaceholder {
+            if snapshot.offersLiveStatusToggle {
                 liveStatusToggle
             }
         }

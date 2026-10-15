@@ -315,6 +315,28 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertGreaterThan(grid.layout.capacity, 1)
     }
 
+    func testDefaultInitializerSeedsFallbackAndMeasurementReplacesIt() {
+        let grid = AgentsGridModel()
+        XCTAssertEqual(grid.layout.geometry.cell, AgentsGridModel.fallbackCell)
+        grid.noteArea(width: 1600, height: 1000, inLiveResize: true)
+        grid.liveResizeDidEnd()
+        XCTAssertEqual(grid.layout.geometry.area.width, 1600)
+        XCTAssertGreaterThan(grid.layout.capacity, 1)
+        grid.noteCellSize(width: 9, height: 20)
+        XCTAssertEqual(grid.layout.geometry.cell, PaneSize(width: 9, height: 20))
+    }
+
+    func testPlaceholderSnapshotsDoNotOfferLiveStatusToggle() {
+        func snapshot(placeholder: Bool) -> WorkerSlotSnapshot {
+            WorkerSlotSnapshot(
+                slotId: 1, runId: "run-a", summary: nil, taskTitle: nil, session: nil,
+                liveStatusEnabled: true, live: nil, isPlaceholder: placeholder, cachedPersona: nil
+            )
+        }
+        XCTAssertTrue(snapshot(placeholder: false).offersLiveStatusToggle)
+        XCTAssertFalse(snapshot(placeholder: true).offersLiveStatusToggle)
+    }
+
     func testAgentTypeFromWire() {
         XCTAssertEqual(AgentType.fromWire("coding"), .coding)
         XCTAssertEqual(AgentType.fromWire("review"), .review)
