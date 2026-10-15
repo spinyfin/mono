@@ -776,6 +776,28 @@ async fn resumed_execution_delivering_a_staged_cube_pr_update_url_binds_it() {
 }
 
 #[tokio::test]
+async fn staged_current_execution_pr_wins_over_an_earlier_predecessor_pr() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, task_id, execution_id) = fixture(workspace.path());
+    let predecessor = add_predecessor_execution(&db, &task_id);
+    let staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged.record_command_observation(&execution_id, ORIGIN_PR, true);
+    staged.record_command_observation(&execution_id, OWN_PR, true);
+    let verifier = StubBranchVerifier::ok(&own_branch(&predecessor));
+    verifier.set_head_ref_for(1764, &own_branch(&execution_id));
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_staged_pr_urls(staged).with_branch_verifier(verifier);
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == OWN_PR),
+        "{outcome:?}"
+    );
+    assert_eq!(task_row(&db, &task_id).pr_url.as_deref(), Some(OWN_PR));
+}
+
+#[tokio::test]
 async fn resumed_execution_still_rejects_a_foreign_head() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _, task_id, execution_id) = fixture(workspace.path());

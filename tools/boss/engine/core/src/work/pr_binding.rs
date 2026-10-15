@@ -167,7 +167,8 @@ impl WorkDb {
     /// `archived`). Engine-closed rows stay in: the merge poller closes a
     /// follow-up mis-bound to its merged origin PR as soon as it is
     /// `in_review`, which is exactly the row that needs repair. Only the
-    /// binding signals apply to closed rows, never the doc pointer. A live review does not exclude a row — it is flagged via
+    /// binding signals apply to closed rows, never the doc pointer. A live
+    /// review does not exclude a row — it is flagged via
     /// [`PrBindingRepairCandidate::has_live_review`] so only the doc-pointer
     /// repair runs while it is live.
     pub fn list_pr_binding_repair_candidates(&self) -> Result<Vec<PrBindingRepairCandidate>> {
@@ -364,6 +365,9 @@ impl WorkDb {
                  blocked_attempt_id = NULL,
                  autostart          = 0,
                  completed_at       = NULL,
+                 archived_by        = NULL,
+                 archived_at        = NULL,
+                 archived_reason    = NULL,
                  last_status_actor  = 'engine',
                  updated_at         = ?5
              WHERE id = ?1
