@@ -704,4 +704,41 @@ async fn abandoned_recorded_baseline_without_a_successor_is_a_typed_missing_base
         "{error}"
     );
     assert!(is_reconcilable_pointer_error(&error));
+
+    // No anchor vouches for the preserved work: the PR head lacks the
+    // revision, so reconcile refuses with a typed NotContained and moves
+    // nothing. This is what the coordinator turns into a retirement.
+    let before = snapshot_pointers(&LocalJj, &record).await.unwrap();
+    let refused = reconcile(&LocalJj, &record, Some("pr/7"), "main").await.unwrap_err();
+    assert_eq!(
+        pointer_integrity_kind(&refused),
+        Some(PointerIntegrityKind::NotContained),
+        "{refused}"
+    );
+    assert_eq!(snapshot_pointers(&LocalJj, &record).await.unwrap(), before);
+    let refused = reconcile(&LocalJj, &record, None, "main").await.unwrap_err();
+    assert_eq!(
+        pointer_integrity_kind(&refused),
+        Some(PointerIntegrityKind::NotContained),
+        "{refused}"
+    );
+    assert_eq!(snapshot_pointers(&LocalJj, &record).await.unwrap(), before);
+
+    // Once the PR head carries the preserved work it is adopted as the anchor.
+    let work = one(repo, &revision(&record.head()));
+    bookmark(repo, "pr/7", &work);
+    let reconciled = reconcile(&LocalJj, &record, Some("pr/7"), "main")
+        .await
+        .unwrap()
+        .expect("pointers were damaged");
+    assert_eq!(
+        reconciled.anchor,
+        Anchor::PrHead {
+            bookmark: "pr/7".into(),
+            commit: work.clone()
+        }
+    );
+    pointers_at(repo, &record, &work);
+    let patch = diff(&LocalJj, &record).await.unwrap();
+    assert!(patch.is_empty(), "{patch}");
 }

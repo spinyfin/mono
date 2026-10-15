@@ -164,6 +164,57 @@ async fn closed_pr_does_not_prevent_retiring_a_missing_baseline() {
 }
 
 #[tokio::test]
+async fn abandoned_recorded_baseline_is_retired_and_a_fresh_dispatch_proceeds() {
+    let dir = tempdir().unwrap();
+    let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
+    let repo = JjRepo::new(dir.path());
+    let mut record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+        .await
+        .unwrap();
+    // The record names cube's empty positioning commit as its baseline, which
+    // is then abandoned with its bookmark: no successor, no PR to vouch.
+    JjRepo::run(&repo.repo, &["new", &record.base()]);
+    let empty = JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    JjRepo::run(&repo.repo, &["abandon", "@"]);
+    JjRepo::run(&repo.repo, &["bookmark", "delete", &record.base()]);
+    record.base_commit = Some(empty);
+    db.record_execution_bookmark(&record).unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        workspace_root: Some(dir.path().to_path_buf()),
+        real_bookmarks: true,
+        ..Default::default()
+    });
+    let coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube,
+        Arc::new(FakeExecutionRunner::default()),
+    );
+    let lease = CubeWorkspaceLease {
+        dirty_verified: Some(false),
+        lease_id: "lease".into(),
+        workspace_id: "replacement".into(),
+        workspace_path: repo.replacement.clone(),
+    };
+    assert!(
+        coordinator
+            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_none());
+    // The retired record no longer blocks: a later dispatch starts fresh.
+    assert!(
+        coordinator
+            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn rewrite_checkpoint_survives_baseline_loss_and_record_reload() {
     let dir = tempdir().unwrap();
     let (db, prior, _) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
@@ -390,48 +441,6 @@ async fn speculative_rewrite_restores_original_baseline_before_next_goto() {
     let patch = recovery::diff(&LocalJj, &reloaded).await.unwrap();
     assert!(patch.contains("revision.txt"));
     assert!(!patch.contains("upstream.txt"));
-}
-
-#[tokio::test]
-async fn speculative_rewrite_leaves_a_live_workers_pointers_following_its_working_copy() {
-    let dir = tempdir().unwrap();
-    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-    let (candidate, chore_id) = rebase_candidate(&db);
-    let live = db
-        .create_execution(
-            crate::work::CreateExecutionInput::builder()
-                .work_item_id(chore_id)
-                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
-                .status(boss_protocol::ExecutionStatus::Running)
-                .build(),
-        )
-        .unwrap();
-    let repo = JjRepo::new(dir.path());
-    JjRepo::run(&repo.repo, &["bookmark", "set", "main", "-r", "@"]);
-    JjRepo::run(&repo.worker, &["new", "main", "-m", "Published implementation"]);
-    std::fs::write(repo.worker.join("pr.txt"), "implementation").unwrap();
-    JjRepo::run(&repo.worker, &["new", "-m", "Revision"]);
-    let record = recovery::create(&LocalJj, &repo.worker, &live.id, "local")
-        .await
-        .unwrap();
-    db.record_execution_bookmark(&record).unwrap();
-    std::fs::write(repo.worker.join("revision.txt"), "revision").unwrap();
-    JjRepo::run(&repo.worker, &["status"]);
-    JjRepo::run(&repo.repo, &["new", "main", "-m", "Upstream"]);
-    std::fs::write(repo.repo.join("upstream.txt"), "upstream").unwrap();
-    JjRepo::run(&repo.repo, &["bookmark", "set", "upstream", "-r", "@"]);
-    let cube = RecoveryRebaseCube {
-        record: record.clone(),
-        deletions: false,
-    };
-    let metrics = crate::metrics::Registry::new();
-    crate::speculative_conflict::init(&metrics);
-    crate::speculative_conflict::run_in_lease(&db, &cube, &metrics, &candidate, 42, &repo.worker).await;
-    // The live worker's pointers were not rewound: its checkpoint still
-    // resolves and its recorded diff carries the revision work.
-    recovery::checkpoint_baseline(&LocalJj, &record).await.unwrap();
-    let patch = recovery::diff(&LocalJj, &record).await.unwrap();
-    assert!(patch.contains("revision.txt"));
 }
 
 /// Recovery pointers across the engine's own mechanical rebases: the saved
@@ -805,5 +814,107 @@ mod rebase_adoption {
         let patch = recovery::diff(&LocalJj, &reloaded).await.unwrap();
         assert!(patch.contains("revision.txt"));
         assert!(!patch.contains("upstream.txt"));
+    }
+
+    /// A Running revision execution on the PR chain whose working copy is
+    /// rewritten by the engine's own rebase. The completed root record is
+    /// retired so the only record left is the live worker's.
+    async fn add_live_revision_record(fx: &Fixture) -> ExecutionBookmark {
+        fx.db
+            .retire_execution_bookmark(&fx.root.execution_id, "test: leave only the live worker")
+            .unwrap();
+        let revision = fx
+            .db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(fx.chore_id.clone())
+                    .description("Live revision of the PR")
+                    .created_via("test")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        let execution = fx
+            .db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision.id)
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+        let record = recovery::create(&LocalJj, &fx.repo.worker, &execution.id, "local")
+            .await
+            .unwrap();
+        fx.db.record_execution_bookmark(&record).unwrap();
+        record
+    }
+
+    fn jj_ids(fx: &Fixture, revset: &str) -> Vec<String> {
+        // Divergent commits are listed by template since jj has no revset for them.
+        let template = if revset == "divergent()" {
+            "if(divergent, commit_id ++ \"\\n\")"
+        } else {
+            "commit_id ++ \"\\n\""
+        };
+        let revset = if revset == "divergent()" { "all()" } else { revset };
+        JjRepo::run(&fx.repo.worker, &["log", "--no-graph", "-r", revset, "-T", template])
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The live worker's three pointers must sit on the rebased lineage of its
+    /// working copy (ancestors-or-equal of `@`), with no divergent twin, and
+    /// work done after the rebase must still be recoverable.
+    async fn assert_live_pointers_follow_working_copy(fx: &Fixture, live: &ExecutionBookmark) {
+        // The rebase ran from another workspace, so the worker's copy is stale
+        // until jj rewrites it onto the rebased commit.
+        JjRepo::run(&fx.repo.worker, &["workspace", "update-stale"]);
+        for name in [live.base(), live.head(), live.publication()] {
+            let on_lineage = jj_ids(fx, &format!("bookmarks(exact:\"{name}\") & ::@"));
+            assert_eq!(on_lineage.len(), 1, "{name} is not on the working copy's lineage");
+        }
+        assert!(jj_ids(fx, "divergent()").is_empty(), "rebase left divergent twins");
+        assert!(
+            jj_ids(fx, "@ & descendants(bookmarks(exact:\"upstream\"))").len() == 1,
+            "working copy was rebased onto upstream"
+        );
+        std::fs::write(fx.repo.worker.join("after.txt"), "after the rebase").unwrap();
+        JjRepo::run(&fx.repo.worker, &["status"]);
+        recovery::checkpoint_baseline(&LocalJj, live).await.unwrap();
+        let patch = recovery::diff(&LocalJj, live).await.unwrap();
+        assert!(patch.contains("revision.txt") && patch.contains("after.txt"), "{patch}");
+        assert!(!patch.contains("upstream.txt"), "{patch}");
+    }
+
+    #[tokio::test]
+    async fn rung1_rebase_leaves_a_live_workers_pointers_following_its_working_copy() {
+        let fx = fixture().await;
+        let live = add_live_revision_record(&fx).await;
+        let outcome = run_ladder(&fx, &cube(&fx, false, false)).await;
+        assert_eq!(outcome, LadderOutcome::Retired);
+        assert_live_pointers_follow_working_copy(&fx, &live).await;
+    }
+
+    #[tokio::test]
+    async fn speculative_rewrite_leaves_a_live_workers_pointers_following_its_working_copy() {
+        let fx = fixture().await;
+        let live = add_live_revision_record(&fx).await;
+        let metrics = crate::metrics::Registry::new();
+        crate::speculative_conflict::init(&metrics);
+        crate::speculative_conflict::run_in_lease(
+            &fx.db,
+            &cube(&fx, false, false),
+            &metrics,
+            &fx.candidate,
+            42,
+            &fx.repo.replacement,
+        )
+        .await;
+        assert_eq!(metrics.counter_value("speculative_conflict.clean"), Some(1));
+        assert_live_pointers_follow_working_copy(&fx, &live).await;
     }
 }

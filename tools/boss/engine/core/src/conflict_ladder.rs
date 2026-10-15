@@ -16,8 +16,9 @@
 //!
 //! Every pushed mechanical resolution passes the same both-parent deletion
 //! tripwire as worker resolutions. A flagged deletion halts the attempt in
-//! `blocked: deletion_signoff` until a human explicitly approves it. Neither checkpoint errors nor a clean rebase bypass
-//! this gate. CI and review failures use the ordinary revision lifecycle.
+//! `blocked: deletion_signoff` until a human explicitly approves it.
+//! Neither checkpoint errors nor a clean rebase bypass this gate. CI and
+//! review failures use the ordinary revision lifecycle.
 //! Attempts deduplicate identical base/head states, and the churn guard
 //! bounds attempts across changing states.
 
