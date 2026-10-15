@@ -287,7 +287,7 @@ extension ChatViewModel {
         guard tasks.indices.contains(destination) else { return }
 
         tasks.swapAt(currentIndex, destination)
-        if let requestID = engine.sendReorderProjectTasks(projectId: projectID, taskIds: tasks.map(\.id)) {
+        if let requestID = engine.sendReorderProjectTasks(projectId: projectID, taskIds: tasks.map(\.id), movedTaskId: task.id) {
             reorderRequestTaskIDs[requestID] = task.id
         }
     }
@@ -302,10 +302,22 @@ extension ChatViewModel {
         return true
     }
 
-    /// The engine accepted a reorder for `projectID`: its pending marks can
-    /// never see an error reply.
-    func settleReorderSuccess(projectID: String) {
-        reorderRequestTaskIDs = reorderRequestTaskIDs.filter { task(withID: $0.value)?.projectID != projectID }
+    /// The engine accepted the reorder carrying `requestId`: that request can
+    /// never see an error reply. Other reorders still in flight keep their
+    /// card mapping so their own replies still land on the right card.
+    func settleReorderSuccess(requestId: String?) {
+        guard let requestId else { return }
+        reorderRequestTaskIDs.removeValue(forKey: requestId)
+    }
+
+    /// A `work_error` carrying a pending "Add revision…" request's id belongs
+    /// to the parent card the revision was filed against: show it there.
+    /// Returns whether the request id matched.
+    func settleRevisionWorkError(message: String, requestId: String?) -> Bool {
+        guard let requestId, let parentID = revisionRequestParentIDs.removeValue(forKey: requestId) else { return false }
+        dragRefusalNotice = DragRefusalNotice(taskID: parentID, message: message, code: "create_revision_failed")
+        scheduleDragRefusalDismiss(for: parentID)
+        return true
     }
 
     /// Apply an explicit column choice from the work-card popover's "Move"
@@ -318,6 +330,18 @@ extension ChatViewModel {
         // column: route it through the drop path so the engine resolves it,
         // refusals come back as `work_item_refused`, and the live-worker
         // guard shows its message on the card.
+        //
+        // A blocked card is the exception: its popover button stays enabled
+        // in the column it already sits in, where a drop would be a no-op
+        // reorder. That button means "put it in this status" (unblock), so
+        // send the explicit status and let the engine apply and vet it.
+        if let task = task(withID: taskID),
+           task.status == "blocked",
+           effectiveBoardColumn(for: task) == column
+        {
+            engine.sendMoveWorkItemOnBoard(id: taskID, column: column, group: nil, explicitStatus: column.targetStatus)
+            return
+        }
         _ = attemptDrop(taskID, onColumn: column, group: nil)
     }
 
