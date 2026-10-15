@@ -916,7 +916,7 @@ final class EngineClient: @unchecked Sendable {
         case "project_tasks_reordered":
             let projectId = payload["project_id"] as? String ?? ""
             let taskIds = payload["task_ids"] as? [String] ?? []
-            emit(.projectTasksReordered(projectId: projectId, taskIds: taskIds))
+            emit(.projectTasksReordered(projectId: projectId, taskIds: taskIds, requestId: envelopeRequestId))
         case "work_item_deleted":
             let id = payload["id"] as? String ?? ""
             guard !id.isEmpty else {
@@ -939,7 +939,8 @@ final class EngineClient: @unchecked Sendable {
                 id: id,
                 code: payload["code"] as? String ?? "unknown",
                 message: message,
-                suggestedAction: payload["suggested_action"] as? String
+                suggestedAction: payload["suggested_action"] as? String,
+                requestId: envelopeRequestId
             ))
         case "operator_question_error":
             emit(.operatorQuestionError(

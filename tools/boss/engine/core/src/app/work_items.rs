@@ -540,6 +540,7 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
         target,
         bypass_dispatch_pause,
         observed_pause_since_epoch_s,
+        explicit_status,
     } = req
     else {
         unreachable!()
@@ -561,7 +562,13 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
         }
     };
     let current = row.position();
-    let resolution = resolve_drop(&row, target);
+    // An explicit status choice skips drop resolution: it names the status
+    // directly, so a blocked card can be unblocked from its own column
+    // (which `resolve_drop` would read as a reorder).
+    let resolution = match explicit_status {
+        Some(status) => DropResolution::SetStatus(status),
+        None => resolve_drop(&row, target),
+    };
     tracing::debug!(
         work_item_id = %id,
         from = %current.label(),
@@ -771,7 +778,7 @@ pub(super) async fn apply_work_item_patch(
                     .with_details(details),
                 )
                 .await;
-            let refusal = BoardRefusal::from_dispatch_error(&work_db, &id, &err, BoardRefusalCode::MissingRepo);
+            let refusal = BoardRefusal::from_dispatch_error(&work_db, &id, &err, BoardRefusalCode::MissingRepo, None);
             send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             return;
         }
@@ -973,6 +980,7 @@ pub(super) async fn apply_work_item_patch(
                                     &work_item_id_for_event,
                                     &err,
                                     BoardRefusalCode::PauseOverrideRefused,
+                                    previous_task_status.clone(),
                                 );
                                 let reason = format!("{err:#}");
                                 dispatch_failure_response = Some(refusal);
@@ -998,6 +1006,7 @@ pub(super) async fn apply_work_item_patch(
                                     &work_item_id_for_event,
                                     &err,
                                     BoardRefusalCode::DispatchRefused,
+                                    previous_task_status.clone(),
                                 );
                                 let reason = format!("{err:#}");
                                 dispatch_failure_response = Some(refusal);
