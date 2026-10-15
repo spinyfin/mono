@@ -81,6 +81,12 @@ struct WorkersDetailView: View, @MainActor Equatable {
             if grid.layout.selectorsVisible {
                 pageSelectors
             }
+            if let banner = grid.filterClearedBanner {
+                Text(banner)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Color.accentColor)
+                    .transition(.opacity)
+            }
             Spacer(minLength: 8)
             if grid.layout.filter.isActive {
                 hiddenSummary
@@ -184,6 +190,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
                     WorkerSlotView(
                         runtime: workspace.runtime,
                         snapshot: snapshot,
+                        isHighlighted: grid.highlightedRunId == runId,
                         onToggleLiveStatus: { enabled in
                             onToggleLiveStatus(snapshot.slotId, enabled)
                         }
@@ -261,12 +268,28 @@ struct WorkersDetailView: View, @MainActor Equatable {
         workspace.runtime.onWorkerFocus = { [grid] sessionId in
             grid.setFocusedRun(String(sessionId.dropFirst("run-".count)))
         }
+        workspace.agentsRevealHandler = { [grid, workspace, liveStates] runId in
+            // The mode switch that precedes a focus request has not rendered
+            // yet, so make the grid visible and current before revealing.
+            grid.setVisible(true)
+            Self.applyMembership(grid: grid, workspace: workspace, liveStates: liveStates)
+            return grid.reveal(runId: runId)
+        }
         syncGrid()
     }
 
     private func syncGrid() {
         grid.setVisible(isVisible)
         guard isVisible else { return }
+        Self.applyMembership(grid: grid, workspace: workspace, liveStates: liveStates)
+        refreshSnapshots()
+    }
+
+    private static func applyMembership(
+        grid: AgentsGridModel,
+        workspace: WorkersWorkspaceModel,
+        liveStates: LiveWorkerStateStore
+    ) {
         grid.apply(
             states: Array(liveStates.byRunID.values),
             viewers: workspace.viewersByRunId,
@@ -275,7 +298,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
             reviewPoolSize: workspace.reviewSlotCount,
             feedUnavailable: liveStates.feedUnavailable
         )
-        refreshSnapshots()
     }
 
     private func refreshSnapshots() {
@@ -377,11 +399,14 @@ private struct AgentsPaneSizeKey: PreferenceKey {
 struct WorkerSlotView: View, @MainActor Equatable {
     let runtime: GhosttyRuntime
     let snapshot: WorkerSlotSnapshot
+    /// Outline shown on the cell a focus request just revealed.
+    var isHighlighted = false
     let onToggleLiveStatus: (Bool) -> Void
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.runtime === rhs.runtime
             && lhs.snapshot == rhs.snapshot
+            && lhs.isHighlighted == rhs.isHighlighted
     }
 
     var body: some View {
@@ -392,6 +417,13 @@ struct WorkerSlotView: View, @MainActor Equatable {
             slotBody
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .overlay {
+            if isHighlighted {
+                Rectangle()
+                    .strokeBorder(Color.accentColor, lineWidth: 3)
+                    .allowsHitTesting(false)
+            }
+        }
     }
 
     @ViewBuilder

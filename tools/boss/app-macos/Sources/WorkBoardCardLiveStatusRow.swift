@@ -31,6 +31,7 @@ struct WorkBoardCardLiveStatusRowSlice: Equatable {
 struct WorkBoardCardLiveStatusRow: View, @MainActor Equatable {
     let slice: WorkBoardCardLiveStatusRowSlice
     var onRevealBlocker: ((DispatchWaitBlocker) -> Void)? = nil
+    var onFocusAgent: (() -> Void)? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slice == rhs.slice
@@ -59,6 +60,15 @@ struct WorkBoardCardLiveStatusRow: View, @MainActor Equatable {
                 .truncationMode(.tail)
                 .help(slice.liveStatus)
                 .accessibilityLabel("Live status: \(slice.liveStatus)")
+            if let onFocusAgent {
+                Button(action: onFocusAgent) {
+                    Image(systemName: "person.crop.rectangle")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Show this agent in the Agents view")
+                .accessibilityLabel("Show agent")
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

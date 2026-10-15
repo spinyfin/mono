@@ -186,7 +186,7 @@ struct ContentView: View {
                 workspace.detachWorkerPane(runId: runId)
             }
             model.paneFocusHandler = { [workspace = workersWorkspace] runId in
-                workspace.focusWorkerPane(runId: runId)
+                workspace.revealAgent(runId: runId)
             }
             model.paneListHostedHandler = { [workspace = workersWorkspace] in
                 workspace.listHostedPanes()
