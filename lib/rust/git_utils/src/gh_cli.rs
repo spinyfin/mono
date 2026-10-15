@@ -152,6 +152,41 @@ pub async fn fetch_pr_base_ref(repo_slug: &str, pr_number: u64) -> Result<String
     Ok(base_ref)
 }
 
+/// Return the base of an open PR; closed and merged PRs cannot anchor recovery.
+pub async fn fetch_open_pr_base(repo_slug: &str, pr_number: u64) -> Result<Option<String>> {
+    let output = run_gh(
+        &[
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "-R",
+            repo_slug,
+            "--json",
+            "state,baseRefName",
+            "--jq",
+            ".state, .baseRefName",
+        ],
+        "gh pr view recovery anchor",
+    )
+    .await?;
+    parse_open_pr_base(&output)
+}
+
+fn parse_open_pr_base(output: &str) -> Result<Option<String>> {
+    let mut lines = output.lines();
+    match lines.next() {
+        Some("OPEN") => {
+            let base = lines
+                .next()
+                .filter(|s| !s.is_empty() && *s != "null")
+                .ok_or_else(|| anyhow!("open PR has no baseRefName"))?;
+            Ok(Some(base.to_owned()))
+        }
+        Some("CLOSED" | "MERGED") => Ok(None),
+        _ => Err(anyhow!("PR lookup returned an unknown state")),
+    }
+}
+
 /// Validate and return the SHA string from `gh pr view ... --jq .headRefOid`
 /// stdout. Returns an error when the output is empty (which means GitHub
 /// returned a null or the JQ filter found nothing).
@@ -165,6 +200,17 @@ pub(crate) fn parse_head_sha_output(sha: String, pr_number: u64, repo_slug: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_anchor_requires_structured_open_state() {
+        assert_eq!(parse_open_pr_base("OPEN\nmain").unwrap(), Some("main".into()));
+        for state in ["CLOSED", "MERGED"] {
+            assert_eq!(parse_open_pr_base(&format!("{state}\nmain")).unwrap(), None);
+        }
+        for invalid in ["OPEN", "OPEN\nnull", "unknown\nmain"] {
+            assert!(parse_open_pr_base(invalid).is_err());
+        }
+    }
 
     #[test]
     fn parse_head_sha_output_returns_sha_unchanged() {

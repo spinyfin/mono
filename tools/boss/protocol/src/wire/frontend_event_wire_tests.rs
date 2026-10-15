@@ -1778,6 +1778,11 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "shutdown_accepted",
         },
         TagCase {
+            label: "CoordinatorRecreated",
+            event: FrontendEvent::CoordinatorRecreated,
+            expected_tag: "coordinator_recreated",
+        },
+        TagCase {
             label: "ShutdownRejected",
             event: FrontendEvent::ShutdownRejected {
                 reason: "token_mismatch".into(),
@@ -2327,6 +2332,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkItemRevealed { .. }
         | FrontendEvent::DocumentOpened { .. }
         | FrontendEvent::ShutdownAccepted
+        | FrontendEvent::CoordinatorRecreated
         | FrontendEvent::ShutdownRejected { .. }
         | FrontendEvent::GitHubAuthState { .. }
         | FrontendEvent::TrunkStatus { .. }

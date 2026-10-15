@@ -1476,6 +1476,7 @@ fn move_on_board_request(id: &str, column: BoardColumn, group: Option<BoardGroup
         target: BoardDropTarget::new(column, group),
         bypass_dispatch_pause: false,
         observed_pause_since_epoch_s: None,
+        explicit_status: None,
     }
 }
 

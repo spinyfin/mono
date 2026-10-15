@@ -18,12 +18,11 @@ extension ChatViewModel {
         guard operatorAnswerInFlightByTaskID[task.id] == nil else { return false }
         operatorAnswerErrorByTaskID.removeValue(forKey: task.id)
         operatorAnswerErrorQuestionIDByTaskID.removeValue(forKey: task.id)
-        guard isConnected else {
-            setOperatorAnswerError("Not connected to the engine — reconnect and try again.", taskID: task.id, questionID: question.id)
-            return false
-        }
+        guard canSubmitUserActions() else { return false }
         guard let requestID = engine.sendAnswerOperatorQuestion(id: question.id, answer: answer) else {
-            setOperatorAnswerError("Couldn't send the answer to the engine. Try again.", taskID: task.id, questionID: question.id)
+            refreshUnsentActions()
+            showDisconnectedActionNotice()
+            setOperatorAnswerError("Answer saved. Use Retry after reconnecting to send it.", taskID: task.id, questionID: question.id)
             return false
         }
         operatorAnswerInFlightByTaskID[task.id] = requestID

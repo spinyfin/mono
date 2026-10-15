@@ -681,6 +681,33 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.comments[0].status, .answered)
     }
 
+    func testRejectedFollowupAndCommentKeepDraftWhenQueueFull() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([
+            Self.wireComment(id: "cmt_1", exact: "some text", body: "a note", status: "answered")
+        ])
+        backend.acceptsSubmissions = false
+        XCTAssertFalse(layer.postFollowup(body: "draft reply", for: layer.comments[0]))
+        XCTAssertTrue(backend.postFollowupCalls.isEmpty)
+        layer.addComment(quoted: "some text", body: "new comment")
+        XCTAssertTrue(backend.createCalls.isEmpty)
+        backend.acceptsSubmissions = true
+        XCTAssertTrue(layer.postFollowup(body: "draft reply", for: layer.comments[0]))
+        XCTAssertEqual(backend.postFollowupCalls.count, 1)
+    }
+
+    @MainActor
+    func testFullQueueNoticeIdentifiesFollowupAsUnsaved() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        for index in 0..<EngineClient.maxUnsentActions {
+            model.engine.sendLine(["type": "create_product", "name": "p\(index)"])
+        }
+        XCTAssertFalse(model.commentBridge.canAcceptUserSubmission(describing: "Your follow-up reply"))
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("Your follow-up reply was not saved") == true)
+    }
+
     // MARK: - Engine-backed path
 
     func testConfigureRegistersAndListsWhenArtifactPresent() {
@@ -1177,6 +1204,8 @@ final class FakeCommentBackend: CommentBackend {
     var fetchBannerStateCalls: [(kind: String, id: String)] = []
     var reviseDocCalls: [(kind: String, id: String)] = []
     var postFollowupCalls: [(commentId: String, body: String)] = []
+    var acceptsSubmissions = true
+    func canAcceptUserSubmission(describing action: String) -> Bool { acceptsSubmissions }
 
     func registerCommentLayer(_ layer: CommentLayer, artifactKind: String, artifactId: String) {
         registerCount += 1

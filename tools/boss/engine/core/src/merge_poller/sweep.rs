@@ -1192,7 +1192,10 @@ pub(crate) async fn sweep_pending_pr(
         // A `run_done` declaration finalizes synchronously from the
         // SubmitProposal RPC handler (`app::proposals`), never from
         // `recheck_for_pr` — covered for exhaustiveness.
-        | StopOutcome::RunDoneDeclaredWithoutDelivery { .. } => {}
+        | StopOutcome::RunDoneDeclaredWithoutDelivery { .. }
+        // The foreign-PR guard already failed the execution and filed its
+        // attention item; nothing further for the sweep to do.
+        | StopOutcome::ForeignPrRefused { .. } => {}
     }
 }
 
@@ -1299,7 +1302,11 @@ pub(crate) async fn sweep_late_pr(
         // A `run_done` declaration finalizes synchronously from the
         // SubmitProposal RPC handler (`app::proposals`), never from a
         // late-PR recheck — covered for exhaustiveness.
-        | StopOutcome::RunDoneDeclaredWithoutDelivery { .. } => {}
+        | StopOutcome::RunDoneDeclaredWithoutDelivery { .. }
+        // The late-PR recheck binds through `bind_pr_to_active_task_from_terminal_execution`,
+        // never through `finalize_pr_transition`, so the foreign-PR guard's
+        // refusal cannot surface here — covered for exhaustiveness.
+        | StopOutcome::ForeignPrRefused { .. } => {}
     }
 }
 

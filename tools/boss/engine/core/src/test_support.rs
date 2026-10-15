@@ -894,6 +894,7 @@ macro_rules! stub_cube_client {
                     execution_id: execution_id.to_owned(),
                     repo_path: workspace.to_path_buf(),
                     host_id: "local".to_owned(),
+                    base_commit: None,
                 })
             }
         }

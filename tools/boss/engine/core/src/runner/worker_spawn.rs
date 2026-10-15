@@ -723,6 +723,7 @@ pub(crate) async fn compose_worker_spawn(
         .map(|kind| crate::structured_output::default_path_string(&execution.id, kind));
     let bookmark_recovery = work_db.bookmark_recovery(&execution.id)?;
     let restore_report = work_db.execution_restore_report(&execution.id)?;
+    let reconciliation_note = work_db.bookmark_reconciliation_note(&execution.id)?;
     let prompt_text = if execution.kind == ExecutionKind::AutomationTriage {
         match work_db.get_automation(&execution.work_item_id) {
             Ok(Some(automation)) => {
@@ -789,6 +790,7 @@ pub(crate) async fn compose_worker_spawn(
                         .workspace_path(workspace_path)
                         .maybe_bookmark_recovery(bookmark_recovery.as_ref())
                         .maybe_restore_report(restore_report.as_ref())
+                        .maybe_reconciliation_note(reconciliation_note.as_deref())
                         .maybe_parent_project(parent_project.as_ref())
                         .maybe_cube_change_id(cube_change_id)
                         .maybe_conflict_attempt(conflict_attempt.as_ref())
@@ -822,6 +824,7 @@ pub(crate) async fn compose_worker_spawn(
                     .workspace_path(workspace_path)
                     .maybe_bookmark_recovery(bookmark_recovery.as_ref())
                     .maybe_restore_report(restore_report.as_ref())
+                    .maybe_reconciliation_note(reconciliation_note.as_deref())
                     .maybe_parent_project(parent_project.as_ref())
                     .maybe_cube_change_id(cube_change_id)
                     .maybe_conflict_attempt(conflict_attempt.as_ref())
@@ -1089,6 +1092,7 @@ pub(crate) async fn compose_worker_spawn(
                 .workspace_path(workspace_path)
                 .maybe_bookmark_recovery(bookmark_recovery.as_ref())
                 .maybe_restore_report(restore_report.as_ref())
+                .maybe_reconciliation_note(reconciliation_note.as_deref())
                 .maybe_parent_project(parent_project.as_ref())
                 .maybe_cube_change_id(cube_change_id)
                 .maybe_conflict_attempt(conflict_attempt.as_ref())
@@ -2811,6 +2815,7 @@ mod compose_worker_spawn_tests {
             execution_id: execution.id.clone(),
             repo_path: workspace.path().to_path_buf(),
             host_id: "local".into(),
+            base_commit: None,
         })
         .unwrap();
         db.record_bookmark_recovery(&execution.id, "exec_prior", false).unwrap();

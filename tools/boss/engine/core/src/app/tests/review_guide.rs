@@ -30,7 +30,10 @@ impl Fixture {
             })
         });
         let collector = crate::review_guide_capture::SourcePacketCollector::fixture(collect, packet);
-        let (state, dir) = test_server_state_with_source_collector(collector);
+        // This test drives the manual capture path, which never consults
+        // the branch verifier; any verifier satisfies the builder.
+        let (state, dir) =
+            test_server_state_with_source_collector(collector, Arc::new(SettableHeadRefVerifier::default()));
         let db = &state.work_db;
         let product = create_product(db);
         let root = create_active_chore(db, &product, "Existing PR");

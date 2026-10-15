@@ -3,6 +3,7 @@
 //! a bare error string, so the app can show it next to the dragged card.
 
 use super::*;
+use crate::app::projects::handle_reorder_project_tasks;
 use crate::app::work_items::{handle_move_work_item_on_board, handle_update_work_item};
 use crate::test_support::{create_test_chore_manual, create_test_product_with_repo};
 use boss_protocol::{
@@ -35,6 +36,7 @@ fn drop_on(id: &str, column: BoardColumn) -> FrontendRequest {
         target: BoardDropTarget::new(column, None),
         bypass_dispatch_pause: false,
         observed_pause_since_epoch_s: None,
+        explicit_status: None,
     }
 }
 
@@ -175,6 +177,158 @@ async fn plain_update_work_item_refusal_stays_a_work_error() {
         FrontendEvent::WorkError { message } => {
             assert_eq!(message, "Work already has a bound PR; use a revision to change it");
         }
+        other => panic!("expected WorkError for a non-board caller, got {other:?}"),
+    }
+}
+
+fn bind_pr(state: &Arc<ServerState>, id: &str, status: Option<&str>) {
+    let mut patch = WorkItemPatch::builder()
+        .pr_url("https://github.com/example/repo/pull/3170")
+        .build();
+    patch.status = status.map(str::to_owned);
+    state.work_db.update_work_item(id, patch).expect("bind a PR");
+}
+
+/// A merged item (status `done`) can't take a revision, so its bound-PR
+/// refusal must not offer one and must not tell the user to add one.
+#[tokio::test]
+async fn drag_of_merged_item_to_doing_offers_no_revision() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let product =
+        create_test_product_with_repo(&state.work_db, "MergedBoard", Some("git@example.com:board/merged.git"));
+    let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "Already shipped");
+    bind_pr(&state, &chore.id, Some("done"));
+
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(dispatch(&state, &sink), drop_on(&chore.id, BoardColumn::Doing)).await;
+
+    match sole_response(&sink).await {
+        FrontendEvent::WorkItemRefused {
+            code,
+            message,
+            suggested_action,
+            ..
+        } => {
+            assert_eq!(code, BoardRefusalCode::BoundPrNotRevisable);
+            assert_eq!(suggested_action, None, "a merged PR cannot take a revision");
+            assert!(message.contains("#3170"), "must name the PR, got: {message}");
+            assert!(!message.contains("add a revision"), "got: {message}");
+        }
+        other => panic!("expected WorkItemRefused, got {other:?}"),
+    }
+}
+
+/// An explicit-status board request is refused with the same structured
+/// result as a drop, not a bare `WorkError`.
+#[tokio::test]
+async fn refused_explicit_status_board_request_returns_work_item_refused() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let product = create_test_product_with_repo(
+        &state.work_db,
+        "ExplicitRefused",
+        Some("git@example.com:board/explicit.git"),
+    );
+    let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "Has a PR");
+    bind_pr(&state, &chore.id, None);
+
+    let sink = make_session_sink();
+    let req = FrontendRequest::MoveWorkItemOnBoard {
+        id: chore.id.clone(),
+        target: BoardDropTarget::new(BoardColumn::Backlog, None),
+        bypass_dispatch_pause: false,
+        observed_pause_since_epoch_s: None,
+        explicit_status: Some(TaskStatus::Active),
+    };
+    handle_move_work_item_on_board(dispatch(&state, &sink), req).await;
+
+    match sole_response(&sink).await {
+        FrontendEvent::WorkItemRefused { id, code, .. } => {
+            assert_eq!(id, chore.id);
+            assert_eq!(code, BoardRefusalCode::BoundPr);
+        }
+        other => panic!("expected WorkItemRefused, got {other:?}"),
+    }
+}
+
+/// A blocked card dropped on its own column is a reorder, but an explicit
+/// status choice still unblocks it.
+#[tokio::test]
+async fn explicit_status_unblocks_a_blocked_card_in_its_own_column() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let product = create_test_product_with_repo(
+        &state.work_db,
+        "ExplicitUnblock",
+        Some("git@example.com:board/unblock.git"),
+    );
+    let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "Stuck");
+    state
+        .work_db
+        .update_work_item(&chore.id, WorkItemPatch::builder().status("blocked").build())
+        .expect("block");
+
+    let sink = make_session_sink();
+    let req = FrontendRequest::MoveWorkItemOnBoard {
+        id: chore.id.clone(),
+        target: BoardDropTarget::new(BoardColumn::Backlog, None),
+        bypass_dispatch_pause: false,
+        observed_pause_since_epoch_s: None,
+        explicit_status: Some(TaskStatus::Todo),
+    };
+    handle_move_work_item_on_board(dispatch(&state, &sink), req).await;
+
+    match sole_response(&sink).await {
+        FrontendEvent::WorkItemUpdated {
+            item: WorkItem::Task(t) | WorkItem::Chore(t),
+        } => assert_eq!(t.status, TaskStatus::Todo),
+        other => panic!("expected WorkItemUpdated, got {other:?}"),
+    }
+}
+
+/// A rejected Move Up/Down reorder (the ordering names a task that is not in
+/// the project) is a coded refusal on the moved card; the CLI form (no moved
+/// card) stays a plain `WorkError`.
+#[tokio::test]
+async fn rejected_reorder_is_refused_with_code_on_the_moved_card() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let product = create_test_product_with_repo(
+        &state.work_db,
+        "ReorderRefused",
+        Some("git@example.com:board/reorder.git"),
+    );
+    let project = state
+        .work_db
+        .create_project(boss_protocol::CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "P".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .expect("project");
+
+    let reorder = |moved_task_id: Option<String>| FrontendRequest::ReorderProjectTasks {
+        project_id: project.id.clone(),
+        task_ids: vec!["task_not_in_project".to_owned()],
+        moved_task_id,
+    };
+
+    let sink = make_session_sink();
+    handle_reorder_project_tasks(dispatch(&state, &sink), reorder(Some("task_moved".to_owned()))).await;
+    match sole_response(&sink).await {
+        FrontendEvent::WorkItemRefused { id, code, message, .. } => {
+            assert_eq!(id, "task_moved");
+            assert_eq!(code, BoardRefusalCode::ReorderRejected);
+            assert!(!message.contains("task_not_in_project"), "got: {message}");
+        }
+        other => panic!("expected WorkItemRefused, got {other:?}"),
+    }
+
+    let sink = make_session_sink();
+    handle_reorder_project_tasks(dispatch(&state, &sink), reorder(None)).await;
+    match sole_response(&sink).await {
+        FrontendEvent::WorkError { .. } => {}
         other => panic!("expected WorkError for a non-board caller, got {other:?}"),
     }
 }

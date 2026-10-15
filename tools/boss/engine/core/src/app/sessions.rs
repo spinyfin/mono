@@ -768,7 +768,11 @@ impl CoordinatorReset {
             // (`recreate_after_confirmation`'s `create_tmux` argument, above) —
             // it never lands on the legacy `-L boss` server, even when the old
             // session being replaced did, so this attach always targets `tmux`.
-            Ok(record) => request_coordinator_attachment(server_state, &tmux, record).await,
+            Ok(record) => {
+                // Correlated completion so the app settles its retry ledger.
+                send_response(&sink, &request_id, FrontendEvent::CoordinatorRecreated);
+                request_coordinator_attachment(server_state, &tmux, record).await
+            }
             Err(error) => send_response(
                 &sink,
                 &request_id,

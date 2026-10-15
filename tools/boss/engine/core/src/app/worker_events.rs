@@ -853,16 +853,26 @@ pub(super) async fn dispatch_live_worker_state(
         {
             // Check for any PR URL first so we can log a rejection
             // when the command isn't a gh/cube pr invocation.
-            if let Some(pr_url) = crate::pr_url_capture::extract_pr_url_from_text(&feed.output_text) {
+            //
+            // EVERY distinct URL the command printed is a candidate, in
+            // output order. Nothing here picks one: a `cube pr create`
+            // whose output echoes the PR body (a follow-up body cites its
+            // origin PR) prints the origin URL before the URL of the PR it
+            // just opened, and binding the first one is exactly how
+            // follow-ups got bound to their origin PR. The branch check
+            // (`verified_staged_pr_url`) selects the candidate whose PR
+            // head is this execution's branch and evicts the rest.
+            let observed_urls = crate::pr_url_capture::extract_all_pr_urls_from_text(&feed.output_text);
+            if !observed_urls.is_empty() {
                 if !crate::pr_url_capture::is_pr_url_binding_command_str(&feed.command) {
                     tracing::info!(
                         execution_id = run_id,
-                        rejected_url = %pr_url,
+                        rejected_urls = ?observed_urls,
                         reason = "not_a_pr_url_binding_command",
                         "pr_url_capture_rejected: URL in Bash stdout rejected — command is not a gh pr invocation",
                     );
                 } else {
-                    // Gate the URL against the product's repo before
+                    // Gate every URL against the product's repo before
                     // staging. Workers running tests can emit fixture
                     // URLs (e.g. `https://github.com/foo/bar/pull/42`)
                     // in tool output; without this gate those bind
@@ -872,69 +882,79 @@ pub(super) async fn dispatch_live_worker_state(
                         .work_db
                         .get_execution(execution_id)
                         .map(|e| e.repo_remote_url);
-                    let valid = match repo_url_result {
-                        Ok(ref repo_url) => match crate::pr_url_capture::validate_pr_url(&pr_url, repo_url) {
-                            Ok(()) => true,
-                            Err(reason) => {
-                                tracing::info!(
-                                    execution_id,
-                                    rejected_url = %pr_url,
-                                    %reason,
-                                    "pr_url_capture: dropping URL — failed product-repo gate",
-                                );
-                                false
-                            }
-                        },
+                    let candidates: Vec<String> = match repo_url_result {
+                        Ok(ref repo_url) => observed_urls
+                            .iter()
+                            .filter(
+                                |pr_url| match crate::pr_url_capture::validate_pr_url(pr_url, repo_url) {
+                                    Ok(()) => true,
+                                    Err(reason) => {
+                                        tracing::info!(
+                                            execution_id,
+                                            rejected_url = %pr_url,
+                                            %reason,
+                                            "pr_url_capture: dropping URL — failed product-repo gate",
+                                        );
+                                        false
+                                    }
+                                },
+                            )
+                            .cloned()
+                            .collect(),
                         Err(err) => {
                             tracing::warn!(
                                 execution_id,
-                                rejected_url = %pr_url,
+                                rejected_urls = ?observed_urls,
                                 ?err,
                                 "pr_url_capture: could not load execution to validate URL; dropping for safety",
                             );
-                            false
+                            Vec::new()
                         }
                     };
-                    if valid {
+                    if !candidates.is_empty() {
                         let finalization_armed =
                             crate::pr_url_capture::is_pr_url_finalization_command_str(&feed.command);
-                        let outcome =
-                            server_state
-                                .staged_pr_urls
-                                .record_command_observation(run_id, &pr_url, finalization_armed);
+                        let outcome = server_state.staged_pr_urls.record_command_observations(
+                            run_id,
+                            &candidates,
+                            finalization_armed,
+                        );
                         match outcome {
                             crate::pr_url_capture::RecordCommandObservationOutcome::Bound
-                            | crate::pr_url_capture::RecordCommandObservationOutcome::Armed => {
+                            | crate::pr_url_capture::RecordCommandObservationOutcome::Armed
+                            | crate::pr_url_capture::RecordCommandObservationOutcome::CandidateAdded => {
                                 tracing::info!(
                                     execution_id = run_id,
-                                    pr_url = %pr_url,
+                                    pr_urls = ?candidates,
                                     finalization_armed,
                                     ?outcome,
-                                    "pr_url_capture: bound PR URL from worker progress stream",
+                                    "pr_url_capture: staged PR URL candidate(s) from worker progress stream; \
+                                     binding is decided by the PR head branch, not by text position",
                                 );
-                                // A publishing command has supplied both a
-                                // repository-validated PR URL and a verified
-                                // execution association. Capture source
-                                // material immediately, before Stop or the
-                                // next merge-poller pass; the reconciler
-                                // itself remains rollout-gated and resolves
-                                // revision executions to their canonical root.
-                                if finalization_armed {
-                                    server_state
-                                        .completion_handler
-                                        .reconcile_review_guide_source_for_execution(
-                                            run_id,
-                                            &pr_url,
-                                            crate::work::PrSourceCaptureTrigger::Creation,
-                                        );
-                                }
+                                // Resolve the binding now, off the hook path:
+                                // verify which candidate's PR head is this
+                                // execution's branch, evict the rest, and —
+                                // for a publishing command — capture
+                                // review-guide source material for the
+                                // verified PR immediately, before Stop or the
+                                // next merge-poller pass. Doing this here
+                                // means the `run_done` declaration path
+                                // usually finds an already-verified entry and
+                                // needs no GitHub call of its own.
+                                let handler = Arc::clone(&server_state.completion_handler);
+                                let execution_id = run_id.to_owned();
+                                tokio::spawn(async move {
+                                    handler
+                                        .verify_staged_pr_url_after_capture(&execution_id, finalization_armed)
+                                        .await;
+                                });
                             }
                             crate::pr_url_capture::RecordCommandObservationOutcome::Unchanged => {
                                 tracing::debug!(
                                     execution_id = run_id,
-                                    pr_url = %pr_url,
+                                    pr_urls = ?candidates,
                                     finalization_armed,
-                                    "pr_url_capture: re-observation left staged PR URL unchanged",
+                                    "pr_url_capture: re-observation left staged PR URL candidates unchanged",
                                 );
                             }
                         }

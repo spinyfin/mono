@@ -17,7 +17,16 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 42;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 43;
+
+/// Schema 43: the baseline commit a recovery record was created at, the
+/// pointer-reconciliation note for the worker prompt, and the retirement
+/// marker that stops a record being a recovery source.
+pub(in crate::work) const EXECUTION_BOOKMARK_COLUMNS_43: &str =
+    "ALTER TABLE execution_bookmarks ADD COLUMN base_commit TEXT;
+     ALTER TABLE execution_bookmarks ADD COLUMN reconciliation_note TEXT;
+     ALTER TABLE execution_bookmarks ADD COLUMN retired_at TEXT;
+     ALTER TABLE execution_bookmarks ADD COLUMN retired_reason TEXT";
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -89,7 +98,7 @@ impl WorkDb {
         }
         if version < 39 {
             // Data only: restart items blocked by the false ancestry failure.
-            execution_recovery_rearm::migrate(&tx)?;
+            execution_recovery_rearm::migrate(&tx, execution_recovery_rearm::is_false_not_descended_blocker)?;
         }
         if version < 40 {
             tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")?;
@@ -99,6 +108,14 @@ impl WorkDb {
         }
         if version < 42 {
             review_guide_jobs::guide_updates::migrate(&tx)?;
+        }
+        if version < 43 {
+            tx.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43)?;
+            // Restart items wedged by baseline loss or diverged pointers.
+            execution_recovery_rearm::migrate(
+                &tx,
+                boss_engine_recovery::execution_bookmark::is_legacy_reconcilable_blocker,
+            )?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -600,6 +617,7 @@ mod floor_tests {
             38,
             40,
             41,
+            42,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -642,6 +660,9 @@ mod floor_tests {
             if version >= 42 {
                 review_guide_jobs::guide_updates::migrate(&conn).unwrap();
             }
+            if version >= 43 {
+                conn.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -671,6 +692,7 @@ mod floor_tests {
                 .execute_batch("ALTER TABLE ci_remediations ADD COLUMN requeue_enqueued_at INTEGER")
                 .unwrap();
             review_guide_jobs::guide_updates::migrate(&expected).unwrap();
+            expected.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

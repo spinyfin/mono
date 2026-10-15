@@ -25,14 +25,14 @@ enum EngineEvent {
     /// user's current selection/filters — it's a passive data refresh.
     case workItemsCreated(items: [WorkItemPayload])
     case workItemUpdated(item: WorkItemPayload)
-    case projectTasksReordered(projectId: String, taskIds: [String])
+    case projectTasksReordered(projectId: String, taskIds: [String], requestId: String? = nil)
     case workItemDeleted(id: String)
     case workError(message: String, requestId: String?)
     /// The engine refused or reverted a board gesture. `code` is the
     /// machine-readable reason (`bound_pr`, `update_rejected`, …), `message`
     /// is final user-facing text, and `suggestedAction` (`add_revision`) is
     /// an optional next step. The app displays this next to the dragged card.
-    case workItemRefused(id: String, code: String, message: String, suggestedAction: String?)
+    case workItemRefused(id: String, code: String, message: String, suggestedAction: String?, requestId: String? = nil)
     /// A `work_item_updated` reply whose payload failed to decode. Carries
     /// the envelope request id so a pending request waiting on that reply
     /// (e.g. a project archive) can settle instead of waiting forever.
@@ -45,9 +45,13 @@ enum EngineEvent {
     /// Socket-level failure (connect/send/receive). Never drives a modal:
     /// the debounced connection-lost banner is the user-facing signal.
     case transportError(message: String)
-    /// A request was issued while the socket was down and could not be
-    /// queued (non-idempotent). `requestKind` is the wire `type`.
+    /// A request was issued while the socket was down. Mutations are held
+    /// for explicit Retry, never automatically replayed. `requestKind` is
+    /// the wire `type`.
     case notConnected(requestKind: String)
+    case actionNotSaved(requestKind: String)
+    /// A retried batch was acknowledged (nil) or its delivery is uncertain.
+    case retriedActionsStatus(message: String?)
     /// Snapshot of every allocated worker slot's live runtime state.
     /// Delivered both as a one-shot reply to
     /// `list_worker_live_states` and as a topic push on

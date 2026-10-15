@@ -1,37 +1,65 @@
-//! One-shot re-arm of work items wedged by the false "not descended" recovery
-//! failure. The ancestry check compared change ids, so a divergent change made
-//! it report a pointer that really descends from its baseline as unrelated;
-//! the coordinator treats that as permanent and blocks the item with
-//! `execution_recovery_failed` and `autostart = 0`, and every later execution
-//! recovers from the same predecessor and fails identically. With the check
-//! fixed those items can run again, but nothing would ever restart them.
+//! One-shot re-arm of work items wedged by a recovery failure that dispatch
+//! can now repair. The coordinator treats a pointer-integrity failure as
+//! permanent and blocks the item with `execution_recovery_failed` and
+//! `autostart = 0`, and every later execution recovers from the same
+//! predecessor and fails identically. Once the engine learns to repair a
+//! class of failure, the items it wedged can run again, but nothing would
+//! ever restart them: this runs once per schema step, with the recognizer
+//! for exactly the blocker texts that step made repairable.
+//!
+//! Schema 39 re-armed the false "not descended" failure (the ancestry check
+//! compared change ids, so a divergent change made a pointer that really
+//! descends from its baseline look unrelated). Schema 43 re-arms the three
+//! failures dispatch now reconciles against engine-recorded pointers: a
+//! stranded baseline, diverged heads, and a missing baseline bookmark.
 
 use boss_engine_recovery::execution_bookmark::NOT_DESCENDED_MESSAGE;
 
 use super::*;
 
-/// Items whose recorded blocker is exactly the not-descended failure: the
-/// message, then the engine-created baseline `boss-base/exec_<id>`. Any other
-/// recovery failure (missing or conflicted pointers, a foreign host) is a real
-/// pointer problem that re-running cannot repair, so it is left blocked.
-/// Rearmed items still run the (now correct) check, so a pointer that truly
-/// does not descend blocks again, loudly.
-pub(super) fn migrate(conn: &Connection) -> Result<usize> {
-    let prefix = format!("{NOT_DESCENDED_MESSAGE} boss-base/exec_");
-    let mut statement = conn.prepare(
-        "UPDATE tasks
-         SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL, autostart = 1,
-             last_status_actor = 'engine', updated_at = ?2
-         WHERE status = 'blocked'
-           AND blocked_reason = 'execution_recovery_failed'
-           AND deleted_at IS NULL
-           AND substr(blocked_detail, 1, length(?1)) = ?1
-           AND substr(blocked_detail, length(?1) + 1) NOT GLOB '*[^A-Za-z0-9_]*'
-         RETURNING id",
-    )?;
-    let ids = statement
-        .query_map(params![prefix, now_string()], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+/// The schema-39 recognizer: exactly the not-descended message followed by
+/// the engine-created baseline `boss-base/exec_<id>`.
+pub(super) fn is_false_not_descended_blocker(detail: &str) -> bool {
+    detail
+        .strip_prefix(NOT_DESCENDED_MESSAGE)
+        .and_then(|rest| rest.strip_prefix(" boss-base/exec_"))
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+}
+
+/// Items whose recorded blocker `recognizes` as repairable are moved back to
+/// `todo` with autostart on. Any other recovery failure (missing or
+/// conflicted heads, a foreign host, a precise not-contained report) is a
+/// real pointer problem that re-running cannot repair, so it is left
+/// blocked. Rearmed items still run the integrity check, so a pointer that
+/// truly cannot be vouched for blocks again, loudly, with the new precise
+/// text that this recognizer does not match.
+pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result<usize> {
+    let candidates: Vec<(String, String)> = {
+        let mut statement = conn.prepare(
+            "SELECT id, blocked_detail FROM tasks
+             WHERE status = 'blocked'
+               AND blocked_reason = 'execution_recovery_failed'
+               AND blocked_detail IS NOT NULL
+               AND deleted_at IS NULL",
+        )?;
+        statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let ids: Vec<String> = candidates
+        .into_iter()
+        .filter(|(_, detail)| recognizes(detail))
+        .map(|(id, _)| id)
+        .collect();
+    for id in &ids {
+        conn.execute(
+            "UPDATE tasks
+             SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL, autostart = 1,
+                 last_status_actor = 'engine', updated_at = ?2
+             WHERE id = ?1",
+            params![id, now_string()],
+        )?;
+    }
     let rearmed = ids.len();
     for id in ids {
         let Some(previous) = query_latest_execution_for_work_item(conn, &id)? else {
@@ -82,7 +110,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<usize> {
     if rearmed > 0 {
         tracing::info!(
             rearmed,
-            "re-armed work items blocked by the false recovery ancestry failure"
+            "re-armed work items blocked by a now-repairable recovery failure"
         );
     }
     Ok(rearmed)
@@ -91,6 +119,25 @@ pub(super) fn migrate(conn: &Connection) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boss_engine_recovery::execution_bookmark::{
+        DIVERGED_MESSAGE, UNRESOLVED_MESSAGE, is_legacy_reconcilable_blocker,
+    };
+
+    /// Undo every schema step after 38 so reopening replays them.
+    const RESET_TO_38: &str = "ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at;
+        ALTER TABLE ci_remediations DROP COLUMN queue_base_sha;
+        ALTER TABLE execution_bookmarks DROP COLUMN base_commit;
+        ALTER TABLE execution_bookmarks DROP COLUMN reconciliation_note;
+        ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
+        ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
+        UPDATE metadata SET value = '38' WHERE key = 'schema_version';";
+
+    /// Undo only schema 43 so reopening replays its re-arm.
+    const RESET_TO_42: &str = "ALTER TABLE execution_bookmarks DROP COLUMN base_commit;
+        ALTER TABLE execution_bookmarks DROP COLUMN reconciliation_note;
+        ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
+        ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
+        UPDATE metadata SET value = '42' WHERE key = 'schema_version';";
 
     /// Create a chore under a fresh product and park it the way the
     /// coordinator does after a pointer-integrity failure.
@@ -146,8 +193,12 @@ mod tests {
         ];
 
         let conn = db.connect().unwrap();
-        assert_eq!(migrate(&conn).unwrap(), 1);
-        assert_eq!(migrate(&conn).unwrap(), 0, "a second run is a no-op");
+        assert_eq!(migrate(&conn, is_false_not_descended_blocker).unwrap(), 1);
+        assert_eq!(
+            migrate(&conn, is_false_not_descended_blocker).unwrap(),
+            0,
+            "a second run is a no-op"
+        );
         drop(conn);
 
         assert_eq!(state(&db, &wedged), ("todo".to_owned(), None, None, 1));
@@ -224,10 +275,7 @@ mod tests {
                             .build(),
                     )
                     .unwrap();
-                db.connect()
-                    .unwrap()
-                    .execute_batch("ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at; ALTER TABLE ci_remediations DROP COLUMN queue_base_sha; UPDATE metadata SET value = '38' WHERE key = 'schema_version';")
-                    .unwrap();
+                db.connect().unwrap().execute_batch(RESET_TO_38).unwrap();
                 (product_id, id, failed.id, prerequisite)
             };
             let db = WorkDb::open(path.clone()).unwrap();
@@ -308,10 +356,7 @@ mod tests {
                         .build(),
                 )
                 .unwrap();
-            db.connect()
-                .unwrap()
-                .execute_batch("ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at; ALTER TABLE ci_remediations DROP COLUMN queue_base_sha; UPDATE metadata SET value = '38' WHERE key = 'schema_version';")
-                .unwrap();
+            db.connect().unwrap().execute_batch(RESET_TO_38).unwrap();
             (product_id, id, pending.id, failed.id, prerequisite)
         };
         let db = WorkDb::open(path).unwrap();
@@ -371,10 +416,7 @@ mod tests {
             let db = WorkDb::open(path.clone()).unwrap();
             let product_id = product(&db);
             let wedged = insert_blocked(&db, &product_id, "wedged", "execution_recovery_failed", &stale);
-            db.connect()
-                .unwrap()
-                .execute_batch("ALTER TABLE ci_remediations DROP COLUMN requeue_enqueued_at; ALTER TABLE ci_remediations DROP COLUMN queue_base_sha; UPDATE metadata SET value = '38' WHERE key = 'schema_version';")
-                .unwrap();
+            db.connect().unwrap().execute_batch(RESET_TO_38).unwrap();
             (product_id, wedged)
         };
         let db = WorkDb::open(path.clone()).unwrap();
@@ -383,6 +425,126 @@ mod tests {
         // The migration is stamped done: a later block with the same text (a
         // pointer that genuinely does not descend) stays blocked across restarts.
         let real = insert_blocked(&db, &product_id, "genuine", "execution_recovery_failed", &stale);
+        drop(db);
+        let db = WorkDb::open(path).unwrap();
+        assert_eq!(state(&db, &real).0, "blocked");
+    }
+
+    #[test]
+    fn schema_43_rearms_every_now_reconcilable_shape_and_nothing_else() {
+        let db = WorkDb::open_in_memory().unwrap();
+        let product = product(&db);
+        let id = "exec_18dd8e49b9602c50_16a";
+        let wedged = [
+            insert_blocked(
+                &db,
+                &product,
+                "stranded baseline",
+                "execution_recovery_failed",
+                &format!("{NOT_DESCENDED_MESSAGE} boss-base/{id}"),
+            ),
+            insert_blocked(
+                &db,
+                &product,
+                "diverged pointers",
+                "execution_recovery_failed",
+                &format!("preserved pointers boss-recovery/{id} and boss/{id} {DIVERGED_MESSAGE}"),
+            ),
+            insert_blocked(
+                &db,
+                &product,
+                "missing baseline",
+                "execution_recovery_failed",
+                &format!("recovery bookmark boss-base/{id} {UNRESOLVED_MESSAGE}; found 0"),
+            ),
+        ];
+        let others = [
+            insert_blocked(
+                &db,
+                &product,
+                "missing heads",
+                "execution_recovery_failed",
+                "expected recovery pointer boss-recovery/exec_1 or boss/exec_1 to resolve to exactly one change; both are missing",
+            ),
+            insert_blocked(
+                &db,
+                &product,
+                "conflicted baseline",
+                "execution_recovery_failed",
+                &format!("recovery bookmark boss-base/{id} {UNRESOLVED_MESSAGE}; found 2"),
+            ),
+            insert_blocked(
+                &db,
+                &product,
+                "precise not-contained report",
+                "execution_recovery_failed",
+                &format!("preserved work of execution {id} is not contained in PR head pr/1 (abc): …"),
+            ),
+            insert_blocked(
+                &db,
+                &product,
+                "other reason",
+                "worker_failed",
+                &format!("{NOT_DESCENDED_MESSAGE} boss-base/{id}"),
+            ),
+        ];
+        let conn = db.connect().unwrap();
+        assert_eq!(migrate(&conn, is_legacy_reconcilable_blocker).unwrap(), 3);
+        assert_eq!(
+            migrate(&conn, is_legacy_reconcilable_blocker).unwrap(),
+            0,
+            "a second run is a no-op"
+        );
+        drop(conn);
+        for id in &wedged {
+            assert_eq!(state(&db, id), ("todo".to_owned(), None, None, 1), "{id}");
+        }
+        for id in &others {
+            let (status, reason, detail, autostart) = state(&db, id);
+            assert_eq!(status, "blocked", "{id}");
+            assert!(reason.is_some() && detail.is_some(), "{id}");
+            assert_eq!(autostart, 0, "{id}");
+        }
+    }
+
+    #[test]
+    fn opening_a_schema_40_database_rearms_baseline_and_divergence_wedges_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work.db");
+        let id = "exec_18dd8e49b9602c50_16a";
+        let missing = format!("recovery bookmark boss-base/{id} {UNRESOLVED_MESSAGE}; found 0");
+        let (product_id, wedged, diverged) = {
+            let db = WorkDb::open(path.clone()).unwrap();
+            let product_id = product(&db);
+            let wedged = insert_blocked(
+                &db,
+                &product_id,
+                "missing baseline",
+                "execution_recovery_failed",
+                &missing,
+            );
+            let diverged = insert_blocked(
+                &db,
+                &product_id,
+                "diverged",
+                "execution_recovery_failed",
+                &format!("preserved pointers boss-recovery/{id} and boss/{id} {DIVERGED_MESSAGE}"),
+            );
+            db.connect().unwrap().execute_batch(RESET_TO_42).unwrap();
+            (product_id, wedged, diverged)
+        };
+        let db = WorkDb::open(path.clone()).unwrap();
+        assert_eq!(state(&db, &wedged), ("todo".to_owned(), None, None, 1));
+        assert_eq!(state(&db, &diverged), ("todo".to_owned(), None, None, 1));
+        // The columns the same step adds are present afterwards.
+        db.connect()
+            .unwrap()
+            .execute_batch(
+                "SELECT base_commit, reconciliation_note, retired_at, retired_reason FROM execution_bookmarks",
+            )
+            .unwrap();
+        // Stamped done: a later block with the same text stays blocked.
+        let real = insert_blocked(&db, &product_id, "genuine", "execution_recovery_failed", &missing);
         drop(db);
         let db = WorkDb::open(path).unwrap();
         assert_eq!(state(&db, &real).0, "blocked");

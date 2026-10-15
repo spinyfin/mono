@@ -146,10 +146,25 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
     // accepts it as `Fresh`. The stub detector swaps to mirror
     // that real-world transition. All three stuck chores must
     // bind their `pr_url` and transition to `in_review` on this
-    // pass — without coordinator backfill.
-    *detector.result.lock().await = Ok(PrStatus::Fresh {
-        url: "https://github.com/spinyfin/mono/pull/433".into(),
-    });
+    // pass — without coordinator backfill. Branch-keyed detection
+    // returns each execution's OWN PR: three branches, three PRs (one
+    // PR bound to three work items would be refused by the foreign-PR
+    // guard, exactly as it should be).
+    let recovered: Vec<(&str, &str, String)> = [
+        (c1.as_str(), e1.as_str(), 433),
+        (chore2.id.as_str(), exec2.id.as_str(), 434),
+        (chore3.id.as_str(), exec3.id.as_str(), 435),
+    ]
+    .into_iter()
+    .map(|(chore_id, execution_id, pr_number)| {
+        let url = format!("https://github.com/spinyfin/mono/pull/{pr_number}");
+        detector.set_fresh_for_branch(
+            &expected_branch_name(execution_id, &BranchNaming::BossExecPrefix, None),
+            &url,
+        );
+        (chore_id, execution_id, url)
+    })
+    .collect();
     let outcome2 =
         crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler), None).await;
     assert_eq!(
@@ -162,7 +177,7 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
     );
     // chore_implementation holds tasks in `active` while
     // reviewers are enqueued (not advanced to in_review yet).
-    for chore_id in [c1.as_str(), chore2.id.as_str(), chore3.id.as_str()] {
+    for (chore_id, _execution_id, own_pr_url) in &recovered {
         let item = db.get_work_item(chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
@@ -173,8 +188,8 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
                 );
                 assert_eq!(
                     t.pr_url.as_deref(),
-                    Some("https://github.com/spinyfin/mono/pull/433"),
-                    "chore {chore_id} must have pr_url bound on the recovery pass",
+                    Some(own_pr_url.as_str()),
+                    "chore {chore_id} must have its OWN pr_url bound on the recovery pass",
                 );
             }
             other => panic!("expected chore, got {other:?}"),

@@ -90,6 +90,10 @@ final class ChatViewModel: ObservableObject {
     /// generic error banner.
     var reorderRequestTaskIDs: [String: String] = [:]
 
+    /// Envelope request id of each "Add revision…" `create_revision` → the
+    /// parent card it was filed against, so a refusal shows on that card.
+    var revisionRequestParentIDs: [String: String] = [:]
+
     /// Card whose "Add revision…" composer is open (see
     /// `performDragRefusalAction`). `nil` when no composer is showing.
     @Published var revisionComposerTaskID: String?
@@ -344,6 +348,15 @@ final class ChatViewModel: ObservableObject {
     @Published var pendingWorkEditRequest: WorkEditRequest?
     @Published var workErrorMessage: String?
     @Published var disconnectedActionNotice: String?
+    var uncertainActionNotice: String?
+    /// One entry per drop that left actions unconfirmed; cleared only by
+    /// `acknowledgeUncertainActions`.
+    var uncertainActionMessages: [String] = []
+    var unsavedActionNotice: String?
+    var retryingDisconnectedActions = false
+    /// Mirror of `engine.hasUnsentActions`, refreshed on connection and
+    /// action events so the banner never queries the engine from a view body.
+    @Published var hasUnsentActions = false
     /// Current state of an in-flight `evaluate_editorial_rules` RPC.
     @Published var editorialEvaluationState: EditorialEvaluationState = .idle
     @Published var workSearchText: String = "" {
@@ -851,6 +864,9 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func commonInit() {
+        commentBridge.onSubmissionRejected = { [weak self] action in
+            self?.showActionNotSaved(requestKind: action)
+        }
 
         if let rawMode = defaults.string(forKey: navigationModeDefaultsKey),
            let persistedMode = NavigationMode(rawValue: rawMode) {
@@ -1231,11 +1247,15 @@ final class ChatViewModel: ObservableObject {
     /// previous notice is replaced when a new refusal fires.
     @Published var dragRefusalNotice: DragRefusalNotice?
 
-    /// A drag-to-Doing whose `EvaluateDispatchAdmission` reply is still
-    /// in flight. Single-slot, like `dragRefusalNotice` — a second drag
-    /// landing before the first's reply arrives simply supersedes it; the
-    /// stale reply is dropped by `taskID` mismatch in the event handler.
-    var pendingDragAdmissionCheck: PendingDragAdmissionCheck?
+    /// Drag-to-Doing gestures whose `EvaluateDispatchAdmission` reply is
+    /// still in flight, keyed by task id so several drags queued during a
+    /// connection gap each keep their own continuation through Retry. A
+    /// newer drag of the same task supersedes its earlier entry.
+    var pendingDragAdmissionChecks: [String: PendingDragAdmissionCheck] = [:]
+    /// Any in-flight admission check (nil when none).
+    var pendingDragAdmissionCheck: PendingDragAdmissionCheck? { pendingDragAdmissionChecks.values.first }
+    /// Confirmations that arrived while another pause-override alert was up.
+    var queuedPauseOverrideConfirmations: [PauseOverrideConfirmation] = []
 
     /// Set once `EvaluateDispatchAdmission` reports an active, overridable
     /// pause and no other blocker — the confirmation dialog binds to this.

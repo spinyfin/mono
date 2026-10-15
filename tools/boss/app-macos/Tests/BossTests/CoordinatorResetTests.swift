@@ -23,6 +23,7 @@ final class CoordinatorResetTests: XCTestCase {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         var requests: [[String: Any]] = []
         model.outboundRecorder = { requests.append($0) }
+        model.engine.simulateConnectedForTesting = true
         model.attachedCoordinatorSpawnToken = "original"
         model.resetCoordinator()
         XCTAssertTrue(model.coordinatorResetWaiting)
@@ -33,6 +34,7 @@ final class CoordinatorResetTests: XCTestCase {
         XCTAssertTrue(model.coordinatorResetDeliveryFailed)
         XCTAssertNil(model.workErrorMessage)
         // Force must retain the confirmed token, even if the attached session changed.
+        model.engine.simulateConnectedForTesting = true
         model.attachedCoordinatorSpawnToken = "newer"
         model.forceCoordinatorReset()
         XCTAssertEqual(model.pendingCoordinatorReset?.token, "original")
@@ -43,18 +45,25 @@ final class CoordinatorResetTests: XCTestCase {
         XCTAssertEqual(requests.last?["reason"] as? String, "operator_reset")
     }
 
-    func testNotConnectedResetRequestClearsWaiting() {
+    func testDisconnectedResetRetainsContextUntilDiscard() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         model.attachedCoordinatorSpawnToken = "original"
         model.resetCoordinator()
         XCTAssertTrue(model.coordinatorResetWaiting)
         model.applyEventForTest(.notConnected(requestKind: "recreate_coordinator"))
         XCTAssertFalse(model.coordinatorResetWaiting)
+        XCTAssertEqual(model.pendingCoordinatorReset?.token, "original")
+        XCTAssertTrue(model.engine.hasUnsentAction(kind: "recreate_coordinator"))
+        model.applyEventForTest(.disconnected)
+        XCTAssertEqual(model.pendingCoordinatorReset?.token, "original")
+        model.dismissDisconnectedActions()
         XCTAssertNil(model.pendingCoordinatorReset)
+        XCTAssertFalse(model.engine.hasUnsentActions)
     }
 
     func testModelMismatchUsesSameWaitAndRetainsReasonForForce() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.engine.simulateConnectedForTesting = true
         model.attachedCoordinatorSpawnToken = "original"
         model.attachedCoordinatorModel = "opus"
         model.coordinatorModelConfigured("sonnet")
@@ -68,6 +77,7 @@ final class CoordinatorResetTests: XCTestCase {
 
     func testOtherResetErrorsAndDisconnectClearWaiting() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.engine.simulateConnectedForTesting = true
         model.attachedCoordinatorSpawnToken = "original"
         model.resetCoordinator()
         model.applyEventForTest(.error(message: "recreate_coordinator: coordinator changed before confirmation"))
@@ -82,6 +92,7 @@ final class CoordinatorResetTests: XCTestCase {
 
     func testReplacementClearsWaitingEvenIfViewerCannotAttach() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.engine.simulateConnectedForTesting = true
         model.attachedCoordinatorSpawnToken = "original"
         model.resetCoordinator()
         model.applyEventForTest(.engineRequest(

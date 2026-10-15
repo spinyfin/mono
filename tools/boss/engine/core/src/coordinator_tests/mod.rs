@@ -11,6 +11,7 @@ mod helpers;
 mod local_worker_quarantine;
 mod pause_admission;
 mod pause_bypass;
+mod pointer_reconciliation;
 mod pool;
 mod pool_contract;
 mod post_merge_review_dispatch;
