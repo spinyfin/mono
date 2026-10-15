@@ -523,17 +523,19 @@ impl WorkDb {
         // CI/conflict recovery sweeps. Those rows keep status/reason/pr_url;
         // the diagnostic is folded into `blocked_detail` when a reason
         // already exists (blocked_detail cannot outlive blocked_reason).
+        // Kind-agnostic: a chore or followup parks on a question exactly like
+        // a task does. The question card is what lets the operator answer,
+        // so folding the question into a `worker_failed` detail would leave
+        // the row looking failed when it is waiting on a human.
         match query_task(&tx, &work_item_id)? {
-            Some(task)
+            Some(_)
                 if question.is_some()
-                    && !matches!(task.kind, TaskKind::Chore | TaskKind::Followup)
                     && !tx.query_row(
                         "SELECT EXISTS(SELECT 1 FROM operator_questions WHERE execution_id = ?1 AND status = 'open')",
                         [execution_id],
                         |row| row.get::<_, bool>(0),
                     )? => {}
             Some(task) if matches!(task.status, TaskStatus::Active | TaskStatus::Todo) => {
-                let question = question.filter(|_| !matches!(task.kind, TaskKind::Chore | TaskKind::Followup));
                 tx.execute(
                     "UPDATE tasks
                      SET status = 'blocked', blocked_reason = ?4, blocked_detail = ?2,
@@ -1986,13 +1988,14 @@ pub(super) fn insert_question(
     question: &OperatorQuestion,
 ) -> Result<()> {
     let execution = query_execution(conn, execution_id).require("execution", execution_id)?;
-    // Chores retain the question in their proposal and failure diagnostic.
+    // Every work-item kind that can run a worker gets a question row: a
+    // chore or followup that stops on a human decision is waiting on that
+    // decision exactly like a task is, and the kanban card is the only
+    // surface that lets the operator answer it. The row is `open` only when
+    // the item can actually park on it (see `record_worker_failure_or_question`).
     let Some(task) = query_task(conn, &execution.work_item_id)? else {
         return Ok(());
     };
-    if matches!(task.kind, TaskKind::Chore | TaskKind::Followup) {
-        return Ok(());
-    }
     let parkable = task.deleted_at.is_none() && matches!(task.status, TaskStatus::Active | TaskStatus::Todo);
     conn.execute(
         "INSERT INTO operator_questions

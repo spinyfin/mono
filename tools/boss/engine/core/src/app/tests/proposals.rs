@@ -290,6 +290,7 @@ The operator recorded this answer on the kanban. It is explicit, human-granted a
         }} if state == "answered"));
 }
 
+mod chore_questions;
 mod prerequisites;
 
 #[tokio::test]
@@ -567,64 +568,6 @@ async fn question_restart_delete_and_edits_withdraw_atomically() {
                 error: boss_protocol::OperatorQuestionError::Conflict { state, .. }
             } if state == "withdrawn"));
         }
-    }
-}
-
-#[tokio::test]
-async fn question_on_chore_folds_into_failure_and_unparkable_task_withdraws() {
-    for kind in ["chore", "followup", "project_task"] {
-        let (state, _dir, execution_id, task_id) = live_chore_execution();
-        if kind == "followup" {
-            state
-                .work_db
-                .connect()
-                .unwrap()
-                .execute(
-                    "UPDATE tasks SET kind = ?2 WHERE id = ?1",
-                    rusqlite::params![task_id, kind],
-                )
-                .unwrap();
-        }
-        if kind == "project_task" {
-            state
-                .work_db
-                .connect()
-                .unwrap()
-                .execute(
-                    "UPDATE tasks SET kind = 'project_task', status = 'in_review' WHERE id = ?1",
-                    [&task_id],
-                )
-                .unwrap();
-        }
-        submitted(
-            call_with_peer(
-                &state,
-                Some(std::process::id() as libc::pid_t),
-                submit_request(&execution_id, ProposalKind::RunDone, operator_question_payload()),
-            )
-            .await,
-        );
-        let item = state.work_db.get_work_item(&task_id).unwrap();
-        match item {
-            crate::work::WorkItem::Chore(task) => {
-                assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
-                let detail = task.blocked_detail.unwrap();
-                assert!(detail.contains("Approve raising the file limit from 30 to 48?"));
-                assert!(detail.contains("All 48 files are needed"));
-                assert!(state.work_db.list_operator_questions(&task_id).unwrap().is_empty());
-            }
-            crate::work::WorkItem::Task(task) => {
-                assert_eq!(task.status, boss_protocol::TaskStatus::InReview);
-                assert!(task.operator_question.is_none());
-                let record = state.work_db.list_operator_questions(&task_id).unwrap().remove(0);
-                assert_eq!(record.withdrawn_reason.as_deref(), Some("task_not_parkable"));
-            }
-            _ => panic!("expected task or chore"),
-        }
-        assert_eq!(
-            state.work_db.get_execution(&execution_id).unwrap().status,
-            boss_protocol::ExecutionStatus::Failed
-        );
     }
 }
 
