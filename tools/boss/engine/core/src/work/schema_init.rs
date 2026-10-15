@@ -189,9 +189,7 @@ impl WorkDb {
         // recommended pairing for WAL — durable across application
         // crashes, only loses commits on OS/power loss, which is fine
         // for engine state we can rebuild.
-        // Same wait as `busy_timeout(SQLITE_BUSY_TIMEOUT)`, but counts the
-        // failures it gives up on for the per-minute lock summary.
-        super::lock_stats::install_busy_counter(conn)?;
+        conn.busy_timeout(super::SQLITE_BUSY_TIMEOUT)?;
         if set_wal {
             conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         }

@@ -60,6 +60,9 @@ impl std::ops::DerefMut for ConnectionGuard<'_> {
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
         let held = self.acquired.elapsed();
+        if let Some(conn) = self.guard.as_deref() {
+            super::lock_stats::count_returned_busy(conn);
+        }
         // Logging must not extend the critical section being measured.
         drop(self.guard.take());
         if held.max(self.waited) >= std::time::Duration::from_millis(100) {
