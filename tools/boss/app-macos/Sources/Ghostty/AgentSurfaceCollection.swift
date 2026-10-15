@@ -25,23 +25,6 @@ struct AgentSurfaceCollection<Content: View>: View {
     }
 
     private func placement(for runId: String) -> (frame: CGRect, visible: Bool) {
-        for page in layout.pages {
-            for cell in page.cells {
-                let id: String?
-                switch cell.content {
-                case .occupied(let member): id = member.runId
-                case .placeholder(let run): id = run
-                case .empty: id = nil
-                }
-                if id == runId {
-                    let width = max(1, (area.width - CGFloat(page.shape.columns - 1)) / CGFloat(page.shape.columns))
-                    let height = max(1, (area.height - CGFloat(page.shape.rows - 1)) / CGFloat(page.shape.rows))
-                    let position = page.shape.position(ofLocalIndex: cell.localIndex)
-                    return (CGRect(x: CGFloat(position.column) * (width + 1), y: CGFloat(position.row) * (height + 1), width: width, height: height), page.index == layout.selectedPage)
-                }
-            }
-        }
-        // Unplaced viewers still need a usable terminal size.
-        return (CGRect(x: 0, y: 0, width: max(420, area.width), height: max(356, area.height)), false)
+        AgentsGridModel.placement(for: runId, area: area, layout: layout)
     }
 }
