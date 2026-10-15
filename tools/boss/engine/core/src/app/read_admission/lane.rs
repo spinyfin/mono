@@ -64,6 +64,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::GetConflictHotspots { .. }
         | R::GetConflictResolution { .. }
         | R::GetCoordinatorHandoff
+        | R::VerifyCoordinatorResetRequest { .. }
         | R::GetCostWindowReport { .. }
         | R::GetDecision { .. }
         | R::GetDispatchConcurrency

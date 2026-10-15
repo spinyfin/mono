@@ -1145,6 +1145,10 @@ pub enum FrontendEvent {
     CoordinatorHandoffResult {
         handoff: Option<CoordinatorHandoffView>,
     },
+    /// Reply for [`FrontendRequest::VerifyCoordinatorResetRequest`].
+    CoordinatorResetRequestStatus {
+        pending: bool,
+    },
     /// Reply for [`FrontendRequest::SetCoordinatorHandoff`]: the handoff
     /// as persisted, stamped with the write time and writer session.
     CoordinatorHandoffSet {

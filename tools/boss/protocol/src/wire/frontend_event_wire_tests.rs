@@ -1545,6 +1545,11 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "coordinator_handoff_result",
         },
         TagCase {
+            label: "CoordinatorResetRequestStatus",
+            event: FrontendEvent::CoordinatorResetRequestStatus { pending: true },
+            expected_tag: "coordinator_reset_request_status",
+        },
+        TagCase {
             label: "CoordinatorHandoffSet",
             event: FrontendEvent::CoordinatorHandoffSet {
                 handoff: coordinator_handoff(),
@@ -2319,6 +2324,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::PrBodyResult { .. }
         | FrontendEvent::CoordinatorHandoffResult { .. }
         | FrontendEvent::CoordinatorHandoffSet { .. }
+        | FrontendEvent::CoordinatorResetRequestStatus { .. }
         | FrontendEvent::CoordinatorGuidanceList { .. }
         | FrontendEvent::WorkerTierDenied { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }

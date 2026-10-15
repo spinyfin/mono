@@ -425,12 +425,121 @@ async fn delivery_failure_leaves_the_session_and_reports_a_forceable_error() {
 }
 
 #[test]
-fn handoff_request_expires_after_delivery_deadline() {
-    let prompt = super::reset_handoff::handoff_request_prompt(1000);
-    let expiry = 1000 + super::inbox::DELIVERY_TIMEOUT.as_secs() + 15;
+fn handoff_request_names_an_id_the_coordinator_must_verify() {
+    let prompt = super::reset_handoff::handoff_request_prompt("abc123");
+    assert!(prompt.starts_with("[Boss reset request id=abc123]"), "{prompt}");
+    assert!(prompt.contains("boss handoff verify abc123"), "{prompt}");
+    assert!(prompt.contains("ignore this message"), "{prompt}");
+}
+
+/// Captures the request id from the delivered prompt and checks it while the
+/// engine is waiting, so the test exercises the id the coordinator would see.
+struct CapturingDelivery(std::sync::Mutex<Option<String>>);
+#[async_trait::async_trait]
+impl crate::coordinator_tmux::inbox::HandoffDelivery for CapturingDelivery {
+    async fn deliver(&self, _: &Tmux, _: &CoordinatorTmuxRecord, prompt: &str) -> Result<()> {
+        let id = prompt
+            .strip_prefix("[Boss reset request id=")
+            .and_then(|rest| rest.split(']').next())
+            .unwrap()
+            .to_owned();
+        assert!(
+            super::reset_handoff::is_request_pending(&id),
+            "pending while delivering"
+        );
+        *self.0.lock().unwrap() = Some(id);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_request_id_is_pending_only_until_the_reset_finishes() {
+    use super::reset_handoff::is_request_pending;
+    let (db, tmux, _server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let delivery = CapturingDelivery(Default::default());
+    let lock = tokio::sync::Mutex::new(());
+    let written = Notify::new();
+    let fresh = crate::coordinator_tmux::reset_handoff::request_and_wait(
+        HandoffRequest::builder()
+            .work_db(&db)
+            .tmux(&tmux)
+            .lifecycle_lock(&lock)
+            .written(&written)
+            .expected_token("token")
+            .force(false)
+            .timeout(Duration::from_millis(30))
+            .delivery(&delivery)
+            .build(),
+    )
+    .await
+    .unwrap();
+    assert!(!fresh, "grace expired without a write");
+    let id = delivery.0.lock().unwrap().clone().unwrap();
+    // A message released after Boss gave up carries an id that is no longer pending.
+    assert!(!is_request_pending(&id));
+    assert!(!is_request_pending(""));
+    assert!(!is_request_pending("forged"));
+}
+
+#[tokio::test]
+async fn a_failed_delivery_withdraws_the_request_id() {
+    struct Fails(std::sync::Mutex<String>);
+    #[async_trait::async_trait]
+    impl crate::coordinator_tmux::inbox::HandoffDelivery for Fails {
+        async fn deliver(&self, _: &Tmux, _: &CoordinatorTmuxRecord, prompt: &str) -> Result<()> {
+            *self.0.lock().unwrap() = prompt.to_owned();
+            bail!("refused")
+        }
+    }
+    let (db, tmux, _server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let delivery = Fails(Default::default());
+    let result = crate::coordinator_tmux::reset_handoff::request_and_wait(
+        HandoffRequest::builder()
+            .work_db(&db)
+            .tmux(&tmux)
+            .lifecycle_lock(&tokio::sync::Mutex::new(()))
+            .written(&Notify::new())
+            .expected_token("token")
+            .force(false)
+            .timeout(Duration::from_millis(30))
+            .delivery(&delivery)
+            .build(),
+    )
+    .await;
+    assert!(result.is_err());
+    let prompt = delivery.0.lock().unwrap().clone();
+    let id = prompt
+        .strip_prefix("[Boss reset request id=")
+        .and_then(|rest| rest.split(']').next())
+        .unwrap();
+    assert!(!super::reset_handoff::is_request_pending(id));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lifecycle_lock_held_too_long_fails_the_reset_loudly_instead_of_stalling() {
+    let (db, tmux, server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let lock = tokio::sync::Mutex::new(());
+    // A competing lifecycle operation (supervisor restart, app attach) never lets go.
+    let _competing = lock.lock().await;
+    let written = Notify::new();
+    let error = tokio::time::timeout(
+        crate::coordinator_tmux::reset_handoff::LOCK_WAIT_TIMEOUT + Duration::from_secs(1),
+        request_and_wait(&db, &tmux, &lock, &written, "token", false, Duration::from_secs(30)),
+    )
+    .await
+    .expect("the wait for the lock is bounded")
+    .unwrap_err();
+    let message = format!("{error:#}");
     assert!(
-        prompt.starts_with(&format!("[Boss reset request expires={expiry}]")),
-        "{prompt}"
+        message.starts_with(crate::coordinator_tmux::reset_handoff::DELIVERY_FAILED_PREFIX),
+        "the app keeps the reset UI open and offers a forced reset: {message}"
     );
-    assert!(prompt.contains("ignore it"), "{prompt}");
+    assert!(
+        server.calls().is_empty(),
+        "nothing touched the session: {:?}",
+        server.calls()
+    );
 }
