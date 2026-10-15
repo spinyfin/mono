@@ -571,6 +571,7 @@ final class GhosttyTerminalHostView: NSView {
 
     override func becomeFirstResponder() -> Bool {
         let accepted = super.becomeFirstResponder()
+        if accepted, case .worker = session.role { runtime.onWorkerFocus?(session.id) }
         if accepted, let surface {
             UISignpost.signposter.emitEvent(UISignpost.Name.focusSwitch, "become")
             // Dispatch off the main thread — see focusQueue doc-comment above.

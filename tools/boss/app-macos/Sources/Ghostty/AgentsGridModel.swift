@@ -1,0 +1,202 @@
+import Foundation
+import PaneLayout
+
+/// Joins engine local membership with the run-keyed viewer map and drives
+/// `PaneLayoutModel`. Cell, page, and order stay app-local; run id is
+/// identity. Filters stay `.all` here — filter controls are a later task.
+@MainActor
+final class AgentsGridModel: ObservableObject {
+    static let geometryQuietInterval: TimeInterval = 0.3
+
+    @Published private(set) var layout: PaneLayoutModel
+    @Published private(set) var poolStrip = AgentsGridModel.defaultPoolStrip
+    @Published private(set) var feedUnavailable = false
+    /// Attached viewers whose run is not in any layout cell (engine
+    /// released and compacted, detach not yet arrived). Keep their
+    /// surfaces mounted until `DetachWorkerPane`.
+    private var viewers: [String: WorkerSlot] = [:]
+    var unplacedViewers: [WorkerSlot] {
+        viewers.values.filter { $0.session != nil && !placedRunIds(in: layout).contains($0.runId ?? "") }
+            .sorted { $0.slotId < $1.slotId }
+    }
+    private var inLiveResize = false
+
+    private var personaByRun: [String: String] = [:]
+    private var pendingArea: PaneSize?
+    private var lastCell = PaneSize(width: 0, height: 0)
+    private var quietTask: Task<Void, Never>?
+
+    static let defaultPoolStrip = "Interactive 0/16 · Automation 0/8 · Review 0/16"
+
+    init(
+        policy: PaneCapacityPolicy = .standard,
+        geometry: PaneGeometry = PaneGeometry(
+            area: PaneSize(width: 800, height: 600),
+            cell: PaneSize(width: 0, height: 0)
+        ),
+        isVisible: Bool = true
+    ) {
+        lastCell = geometry.cell
+        layout = PaneLayoutModel(policy: policy, geometry: geometry, isVisible: isVisible)
+    }
+
+    func personaName(for runId: String) -> String? {
+        personaByRun[runId]
+    }
+
+    func setVisible(_ visible: Bool) {
+        replaceLayout { $0.setVisible(visible) }
+    }
+
+    func selectPage(_ page: Int) {
+        replaceLayout { $0.selectPage(page) }
+    }
+
+    func tidy() {
+        replaceLayout { $0.tidy() }
+    }
+
+    func setFocusedRun(_ runId: String?) {
+        replaceLayout { $0.setFocusedRun(runId) }
+    }
+
+    /// Authoritative membership + current viewer map. Callers must pass
+    /// only an accepted live-state snapshot: duplicates and a disconnected
+    /// feed are handled by `LiveWorkerStateStore` before they reach here.
+    func apply(
+        states: [WorkerLiveState],
+        viewers: [String: WorkerSlot],
+        interactivePoolSize: Int,
+        automationPoolSize: Int,
+        reviewPoolSize: Int,
+        feedUnavailable: Bool
+    ) {
+        if self.feedUnavailable != feedUnavailable {
+            self.feedUnavailable = feedUnavailable
+        }
+        self.viewers = viewers
+        let local = states.filter(\.isLocalMember)
+        for state in local {
+            if let name = state.name, !name.isEmpty {
+                personaByRun[state.runId] = name
+            }
+        }
+
+        let members = local.map { state in
+            PaneMember(
+                runId: state.runId,
+                startedAt: state.startedAt.flatMap(WorkerStaleness.parse) ?? .distantFuture,
+                project: state.agentProject,
+                type: state.badgeType,
+                isWaiting: state.activity == .waitingForInput,
+                hasViewer: viewers[state.runId]?.session != nil
+            )
+        }
+        replaceLayout { $0.updateMembers(members) }
+
+        let placed = placedRunIds(in: layout)
+        let needed = Set(local.map(\.runId))
+            .union(placed)
+            .union(viewers.keys)
+        personaByRun = personaByRun.filter { needed.contains($0.key) }
+
+        let strip = Self.poolStrip(
+            states: local,
+            interactivePoolSize: interactivePoolSize,
+            automationPoolSize: automationPoolSize,
+            reviewPoolSize: reviewPoolSize
+        )
+        if poolStrip != strip {
+            poolStrip = strip
+        }
+    }
+
+    func noteArea(width: Double, height: Double, inLiveResize: Bool) {
+        guard width > 0, height > 0, width.isFinite, height.isFinite else { return }
+        pendingArea = PaneSize(width: width, height: height)
+        self.inLiveResize = inLiveResize
+        if inLiveResize {
+            quietTask?.cancel()
+            quietTask = nil
+            return
+        }
+        scheduleQuietApply()
+    }
+
+    func noteCellSize(width: Double, height: Double) {
+        lastCell = PaneSize(width: width, height: height)
+        applyPendingGeometry()
+    }
+
+    func liveResizeWillStart() {
+        inLiveResize = true
+        quietTask?.cancel()
+        quietTask = nil
+    }
+
+    func liveResizeDidEnd() {
+        inLiveResize = false
+        quietTask?.cancel()
+        quietTask = nil
+        applyPendingGeometry()
+    }
+
+    /// Test seam: skip the 300 ms quiet window.
+    func flushGeometryForTesting() {
+        liveResizeDidEnd()
+    }
+
+    static func poolStrip(
+        states: [WorkerLiveState],
+        interactivePoolSize: Int,
+        automationPoolSize: Int,
+        reviewPoolSize: Int
+    ) -> String {
+        let main = states.filter { $0.pool == "main" }.count
+        let automation = states.filter { $0.pool == "automation" }.count
+        let review = states.filter { $0.pool == "review" }.count
+        return "Interactive \(main)/\(interactivePoolSize) · Automation \(automation)/\(automationPoolSize) · Review \(review)/\(reviewPoolSize)"
+    }
+
+    private func scheduleQuietApply() {
+        quietTask?.cancel()
+        quietTask = Task { [weak self] in
+            let nanos = UInt64(AgentsGridModel.geometryQuietInterval * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
+            guard !Task.isCancelled else { return }
+            self?.applyPendingGeometry()
+        }
+    }
+
+    private func applyPendingGeometry() {
+        guard !inLiveResize else { return }
+        let area = pendingArea ?? layout.geometry.area
+        let cell = (lastCell.width > 0 && lastCell.height > 0) ? lastCell : layout.geometry.cell
+        replaceLayout { $0.updateGeometry(PaneGeometry(area: area, cell: cell)) }
+    }
+
+    private func replaceLayout(_ mutate: (inout PaneLayoutModel) -> Void) {
+        var next = layout
+        mutate(&next)
+        if next != layout {
+            layout = next
+        }
+    }
+
+    private func placedRunIds(in layout: PaneLayoutModel) -> Set<String> {
+        var ids = Set<String>()
+        for page in layout.pages {
+            for cell in page.cells {
+                switch cell.content {
+                case .occupied(let member):
+                    ids.insert(member.runId)
+                case .placeholder(let runId):
+                    ids.insert(runId)
+                case .empty:
+                    break
+                }
+            }
+        }
+        return ids
+    }
+}

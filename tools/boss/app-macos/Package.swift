@@ -37,6 +37,7 @@ let package = Package(
                 "UpdateCore",
                 "DiagnosticIO",
                 "CrashWatchdog",
+                "PaneLayout",
             ],
             path: "Sources",
             exclude: ["DiagnosticIO", "UpdateCore", "CrashWatchdog", "PaneLayout"],
@@ -56,7 +57,7 @@ let package = Package(
         ),
         .testTarget(
             name: "BossTests",
-            dependencies: ["Boss"],
+            dependencies: ["Boss", "PaneLayout"],
             path: "Tests/BossTests"
         ),
         .testTarget(

@@ -9,6 +9,26 @@ public enum AgentType: String, CaseIterable, Hashable, Sendable {
     case automation
     case answer
     case unknown
+
+    /// Map a wire `agent_type` to a badge. Missing and unrecognised values
+    /// become `unknown` so they stay visible and filterable.
+    public static func fromWire(_ value: String?) -> AgentType {
+        guard let value, !value.isEmpty else { return .unknown }
+        return AgentType(rawValue: value) ?? .unknown
+    }
+
+    /// Title-case badge label. `unknown` stays "Unknown" even when the
+    /// raw wire value is shown beside it.
+    public var badgeLabel: String {
+        switch self {
+        case .coding: "Coding"
+        case .design: "Design"
+        case .review: "Review"
+        case .automation: "Automation"
+        case .answer: "Answer"
+        case .unknown: "Unknown"
+        }
+    }
 }
 
 /// Project attribution. Work with no project is `unfiled`; it is never
