@@ -19,6 +19,7 @@ pub(crate) fn register_metrics(registry: &crate::metrics::Registry) {
 pub(super) fn new_metrics_registry() -> Arc<crate::metrics::Registry> {
     let registry = Arc::new(crate::metrics::Registry::new());
     register_metrics(&registry);
+    crate::work::db_diagnostics::register_metrics(&registry);
     registry
 }
 

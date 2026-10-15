@@ -664,6 +664,7 @@ mod queued_wait;
 mod read_only_tests;
 pub(crate) use feedback_target::FeedbackTarget;
 mod connection_wait;
+pub(crate) mod db_diagnostics;
 mod description_guard;
 mod guide_comments;
 mod guide_feedback;
