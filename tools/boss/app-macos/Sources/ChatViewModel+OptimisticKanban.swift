@@ -13,6 +13,11 @@ extension ChatViewModel {
     struct DragRefusalNotice: Equatable {
         let taskID: String
         let message: String
+        /// Machine-readable engine reason (`bound_pr`, …); nil for refusals
+        /// the client detected itself.
+        var code: String? = nil
+        /// Engine-suggested next step (`add_revision`), if any.
+        var suggestedAction: String? = nil
     }
 
     /// A drag-to-Doing waiting on its `EvaluateDispatchAdmission` reply.
@@ -105,10 +110,10 @@ extension ChatViewModel {
            column != .done,
            hasLiveWorker(forTaskID: taskID)
         {
-            appendSystemMessage(
-                "\(task.name) is being worked on by a live worker. Stop the worker before moving the card out of Doing.",
-                alwaysShow: true
-            )
+            let message = "\(task.name) is being worked on by a live worker. Stop the worker before moving the card out of Doing."
+            appendSystemMessage(message, alwaysShow: true)
+            dragRefusalNotice = DragRefusalNotice(taskID: taskID, message: message)
+            scheduleDragRefusalDismiss(for: taskID)
             return false
         }
 
@@ -278,7 +283,12 @@ extension ChatViewModel {
     /// columns and surface an inline notice. Called when `work_error` arrives
     /// while moves are pending, or when `workItemUpdated` reports an unexpected
     /// status (engine silently rejected the transition).
-    func bounceBackOptimisticMoves(message: String?) {
+    func bounceBackOptimisticMoves(
+        message: String?,
+        taskID: String? = nil,
+        code: String? = nil,
+        suggestedAction: String? = nil
+    ) {
         guard !pendingMoveOriginByTaskID.isEmpty else { return }
         let bouncedIDs = Array(pendingMoveOriginByTaskID.keys)
         for id in bouncedIDs {
@@ -286,10 +296,38 @@ extension ChatViewModel {
             pendingMoveOriginByTaskID.removeValue(forKey: id)
         }
         invalidateWorkCache()
-        if let firstID = bouncedIDs.first, let message {
-            dragRefusalNotice = DragRefusalNotice(taskID: firstID, message: message)
-            scheduleDragRefusalDismiss(for: firstID)
+        if let noticeID = taskID ?? bouncedIDs.first, let message {
+            dragRefusalNotice = DragRefusalNotice(
+                taskID: noticeID, message: message, code: code, suggestedAction: suggestedAction
+            )
+            scheduleDragRefusalDismiss(for: noticeID)
         }
+    }
+
+    /// Reply handler for `.workItemRefused`: the engine refused or reverted a
+    /// board gesture and says why. Bounces the optimistic placement back and
+    /// shows the engine's reason on the dragged card (even when no optimistic
+    /// move is pending), with the engine's suggested next step if any.
+    func handleWorkItemRefused(id: String, code: String, message: String, suggestedAction: String?) {
+        if pendingDragAdmissionCheck?.taskID == id {
+            pendingDragAdmissionCheck = nil
+        }
+        bounceBackOptimisticMoves(message: message, taskID: id, code: code, suggestedAction: suggestedAction)
+        if dragRefusalNotice?.taskID != id || dragRefusalNotice?.message != message {
+            // No optimistic move was pending (nothing to bounce); still surface it.
+            dragRefusalNotice = DragRefusalNotice(
+                taskID: id, message: message, code: code, suggestedAction: suggestedAction
+            )
+            scheduleDragRefusalDismiss(for: id)
+        }
+    }
+
+    /// Follow the engine's suggested next step from a refusal notice. The app
+    /// has no in-place revision composer, so `add_revision` opens the card,
+    /// where its PR and revisions live.
+    func performDragRefusalAction(_ notice: DragRefusalNotice) {
+        selectWorkCard(notice.taskID)
+        clearDragRefusal()
     }
 
     /// After the engine's work tree arrives and `tasksByProjectID` reflects

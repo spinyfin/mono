@@ -28,6 +28,11 @@ enum EngineEvent {
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
     case workError(message: String, requestId: String?)
+    /// The engine refused or reverted a board gesture. `code` is the
+    /// machine-readable reason (`bound_pr`, `update_rejected`, …), `message`
+    /// is final user-facing text, and `suggestedAction` (`add_revision`) is
+    /// an optional next step. The app displays this next to the dragged card.
+    case workItemRefused(id: String, code: String, message: String, suggestedAction: String?)
     /// A `work_item_updated` reply whose payload failed to decode. Carries
     /// the envelope request id so a pending request waiting on that reply
     /// (e.g. a project archive) can settle instead of waiting forever.

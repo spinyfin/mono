@@ -461,6 +461,7 @@ mod app_channel;
 mod attachments;
 mod awaiting_input_status;
 mod board_drag_gated_revision;
+mod board_drag_refusal;
 mod context;
 mod coordinator_guidance;
 mod coordinator_handoff;
