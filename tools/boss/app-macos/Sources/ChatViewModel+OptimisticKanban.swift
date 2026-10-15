@@ -98,13 +98,13 @@ extension ChatViewModel {
 
         // The engine owns dependency admission through `gating_prereqs_for`,
         // as for an explicit `RequestExecution`: an `in_review` prerequisite
-        // satisfies a revision. Forward the drop; refusals return as
-        // `work_error`, and `bounceBackOptimisticMoves` shows the reason on
-        // the card. Display helpers do not decide admission.
+        // satisfies a revision. Forward the drop; the engine answers a
+        // refusal with `work_item_refused`, and `handleWorkItemRefused` shows
+        // the reason on the card. Display helpers do not decide admission.
 
-        // Moving out of Doing while a live worker is attached is blocked
-        // except for two intentional gestures — see `moveTask`, which applies
-        // the same rule to the popover's explicit Move buttons.
+        // Moving out of Doing while a live worker is attached is allowed only
+        // to Backlog (stop + park) or Done. The popover's Move buttons reach
+        // this same check through `moveTask`.
         if origin == .doing,
            column != .backlog,
            column != .done,
@@ -118,7 +118,7 @@ extension ChatViewModel {
         }
 
         // Optimistic reposition: draw the card at the drop site until the
-        // engine's answer arrives. `bounceBackOptimisticMoves` returns it to
+        // engine's answer arrives. `handleWorkItemRefused` returns it to
         // `origin` if the engine refuses, and `reconcileOptimisticOverrides`
         // drops the override once real state agrees.
         pendingMoveOriginByTaskID[taskID] = origin
@@ -190,7 +190,7 @@ extension ChatViewModel {
         let hardBlockers = admission.hardBlockers
         if !hardBlockers.isEmpty {
             engine.finishAdmissionRetry(taskID: pending.taskID)
-            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "))
+            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "), taskID: pending.taskID)
             return
         }
 
@@ -198,7 +198,7 @@ extension ChatViewModel {
             engine.finishAdmissionRetry(taskID: pending.taskID)
             let reason = "dispatch is paused" + (admission.pause.reason.map { ": \($0)" } ?? "")
                 + " — this pause is not overridable"
-            bounceBackOptimisticMoves(message: reason)
+            bounceBackOptimisticMoves(message: reason, taskID: pending.taskID)
             return
         }
 
@@ -245,7 +245,7 @@ extension ChatViewModel {
         guard let confirmation = pendingPauseOverrideConfirmation else { return }
         engine.finishAdmissionRetry(taskID: confirmation.taskID)
         presentNextPauseOverrideConfirmation()
-        bounceBackOptimisticMoves(message: nil)
+        bounceBackOptimisticMoves(message: nil, taskID: confirmation.taskID)
     }
 
     /// Which of its column's named groups `task` currently renders in, or
@@ -317,9 +317,18 @@ extension ChatViewModel {
     /// board gesture and says why. Bounces the optimistic placement back and
     /// shows the engine's reason on the dragged card (even when no optimistic
     /// move is pending), with the engine's suggested next step if any.
-    func handleWorkItemRefused(id: String, code: String, message: String, suggestedAction: String?) {
-        if pendingDragAdmissionCheck?.taskID == id {
-            pendingDragAdmissionCheck = nil
+    func handleWorkItemRefused(
+        id: String,
+        code: String,
+        message: String,
+        suggestedAction: String?,
+        requestId: String? = nil
+    ) {
+        if let requestId {
+            reorderRequestTaskIDs.removeValue(forKey: requestId)
+        }
+        if pendingDragAdmissionChecks.removeValue(forKey: id) != nil {
+            engine.finishAdmissionRetry(taskID: id)
         }
         bounceBackOptimisticMoves(message: message, taskID: id, code: code, suggestedAction: suggestedAction)
     }
@@ -338,7 +347,9 @@ extension ChatViewModel {
     func submitRevision(parentTaskID: String, description: String) {
         let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        engine.sendCreateRevision(parentTaskId: parentTaskID, description: trimmed)
+        if let requestID = engine.sendCreateRevision(parentTaskId: parentTaskID, description: trimmed) {
+            revisionRequestParentIDs[requestID] = parentTaskID
+        }
         revisionComposerTaskID = nil
     }
 

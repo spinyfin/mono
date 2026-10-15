@@ -126,6 +126,12 @@ pub enum BoardRefusalCode {
     DropRefused,
     /// The drop named something that is not a board card or does not exist.
     NotACard,
+    /// The item's PR is already merged or closed, so a fresh run is refused
+    /// and a revision cannot be added either: there is no open PR to change.
+    BoundPrNotRevisable,
+    /// A Move Up/Down reorder was rejected (e.g. the ordering names a task
+    /// that is not in the project).
+    ReorderRejected,
 }
 
 /// A follow-up the user can take after a refusal. Advisory: the app maps it

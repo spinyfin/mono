@@ -599,3 +599,265 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         return model
     }
 }
+
+/// Refusals that the app can tie to one card must land on, and roll back,
+/// only that card — and Move Up/Down, popover Move and "Add revision…"
+/// requests track their own request ids.
+@MainActor
+final class BoardRefusalTrackingTests: XCTestCase {
+
+    // MARK: - Per-card rollback on card-attributed failures
+
+    func testHardBlockerBouncesOnlyTheBlockedCard() {
+        let model = makeModel()
+        let a = makeTask(status: "todo")
+        let b = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [a, b]]
+        _ = model.attemptDrop(b.id, onColumn: .review, group: nil)
+        _ = model.attemptDrop(a.id, onColumn: .doing, group: nil)
+
+        var blocked = admission(workItemID: a.id, pauseActive: true, overridable: true)
+        blocked.blockers = [DispatchAdmissionBlocker(code: "no_repo", message: "no repository")]
+        model.applyEventForTest(.dispatchAdmissionEvaluated(admission: blocked))
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: a), .backlog)
+        XCTAssertEqual(model.effectiveBoardColumn(for: b), .review, "the other in-flight move must stay")
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, a.id)
+    }
+
+    func testNonOverridablePauseBouncesOnlyTheDraggedCard() {
+        let model = makeModel()
+        let a = makeTask(status: "todo")
+        let b = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [a, b]]
+        _ = model.attemptDrop(b.id, onColumn: .review, group: nil)
+        _ = model.attemptDrop(a.id, onColumn: .doing, group: nil)
+
+        model.applyEventForTest(.dispatchAdmissionEvaluated(admission: admission(
+            workItemID: a.id, pauseActive: true, overridable: false
+        )))
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: a), .backlog)
+        XCTAssertEqual(model.effectiveBoardColumn(for: b), .review)
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, a.id)
+    }
+
+    func testCancelPauseOverrideBouncesOnlyTheDraggedCard() {
+        let model = makeModel()
+        let a = makeTask(status: "todo")
+        let b = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [a, b]]
+        _ = model.attemptDrop(b.id, onColumn: .review, group: nil)
+        _ = model.attemptDrop(a.id, onColumn: .doing, group: nil)
+        model.applyEventForTest(.dispatchAdmissionEvaluated(admission: admission(
+            workItemID: a.id, pauseActive: true, overridable: true
+        )))
+        XCTAssertNotNil(model.pendingPauseOverrideConfirmation)
+
+        model.cancelPauseOverrideDrag()
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: a), .backlog)
+        XCTAssertEqual(model.effectiveBoardColumn(for: b), .review, "cancelling one drag must not roll back another")
+    }
+
+    func testUnexpectedStatusBouncesOnlyThatCard() {
+        let model = makeModel()
+        let a = makeTask(status: "todo")
+        let b = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [a, b]]
+        _ = model.attemptDrop(b.id, onColumn: .review, group: nil)
+        _ = model.attemptDrop(a.id, onColumn: .done, group: nil)
+        // Still in flight: only A's update arrives, and it did not apply the move.
+        model.applyEventForTest(.workItemUpdated(item: .chore(a)))
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: a), .backlog)
+        XCTAssertEqual(model.effectiveBoardColumn(for: b), .review)
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, a.id)
+    }
+
+    // MARK: - Reorder tracking
+
+    func testMoveSelectedTaskTracksRequestIdAndRefusalLandsOnMovedCard() {
+        let model = makeModel()
+        let first = makeProjectTask(id: "task_1", ordinal: 1)
+        let second = makeProjectTask(id: "task_2", ordinal: 2)
+        model.tasksByProjectID = ["proj_test": [first, second]]
+        model.selectedWorkCardID = second.id
+        model.engine.simulateConnectedForTesting = true
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+
+        model.moveSelectedTask(offset: -1)
+
+        XCTAssertEqual(sent.first?["type"] as? String, "reorder_project_tasks")
+        XCTAssertEqual(sent.first?["moved_task_id"] as? String, second.id)
+        XCTAssertEqual(model.reorderRequestTaskIDs.count, 1)
+        let requestId = model.reorderRequestTaskIDs.keys.first!
+        XCTAssertEqual(model.reorderRequestTaskIDs[requestId], second.id)
+
+        model.applyEventForTest(.workItemRefused(
+            id: second.id, code: "reorder_rejected", message: "Couldn't move that task.",
+            suggestedAction: nil, requestId: requestId
+        ))
+
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, second.id)
+        XCTAssertEqual(model.dragRefusalNotice?.code, "reorder_rejected")
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertTrue(model.reorderRequestTaskIDs.isEmpty, "a settled reorder is no longer tracked")
+    }
+
+    func testReorderSuccessClearsOnlyItsOwnRequest() {
+        let model = makeModel()
+        let one = makeProjectTask(id: "task_1", ordinal: 1)
+        let two = makeProjectTask(id: "task_2", ordinal: 2)
+        model.tasksByProjectID = ["proj_test": [one, two]]
+        model.reorderRequestTaskIDs = ["req-1": one.id, "req-2": two.id]
+
+        model.applyEventForTest(.projectTasksReordered(projectId: "proj_test", taskIds: [], requestId: "req-1"))
+        XCTAssertEqual(model.reorderRequestTaskIDs, ["req-2": two.id], "only the answered request is cleared")
+
+        model.applyEventForTest(.workError(message: "cannot reorder", requestId: "req-2"))
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, two.id, "the second reorder's failure still lands on its card")
+        XCTAssertNil(model.workErrorMessage)
+    }
+
+    // MARK: - Popover Move
+
+    func testMoveTaskOnBlockedBacklogCardSendsExplicitTodo() {
+        let model = makeModel()
+        let task = makeTask(status: "blocked")
+        model.choresByProductID = ["prod_test": [task]]
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+
+        model.moveTask(task.id, to: .backlog)
+
+        XCTAssertEqual(sent.count, 1, "a blocked card's own-column Move must reach the engine")
+        XCTAssertEqual(sent.first?["type"] as? String, "move_work_item_on_board")
+        XCTAssertEqual(sent.first?["explicit_status"] as? String, "todo")
+    }
+
+    func testMoveTaskOnReviewBlockedReviewCardSendsExplicitInReview() {
+        let model = makeModel()
+        var task = makeTask(status: "blocked")
+        task.prURL = "https://github.com/example/repo/pull/1"
+        task.blockedReason = "ci_failure"
+        model.choresByProductID = ["prod_test": [task]]
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+
+        model.moveTask(task.id, to: .review)
+
+        XCTAssertEqual(sent.first?["explicit_status"] as? String, "in_review")
+    }
+
+    func testMoveTaskForOrdinaryColumnChangeOmitsExplicitStatus() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+
+        model.moveTask(task.id, to: .done)
+
+        XCTAssertNil(sent.first?["explicit_status"])
+    }
+
+    // MARK: - Add revision
+
+    func testRefusedCreateRevisionShowsOnParentCard() {
+        let model = makeModel()
+        let task = makeTask(status: "done")
+        model.choresByProductID = ["prod_test": [task]]
+        model.engine.simulateConnectedForTesting = true
+
+        model.submitRevision(parentTaskID: task.id, description: "tighten the error text")
+        XCTAssertEqual(model.revisionRequestParentIDs.count, 1)
+        let requestId = model.revisionRequestParentIDs.keys.first!
+
+        model.applyEventForTest(.workError(message: "PR is merged", requestId: requestId))
+
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, task.id)
+        XCTAssertEqual(model.dragRefusalNotice?.message, "PR is merged")
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertTrue(model.revisionRequestParentIDs.isEmpty)
+    }
+
+    // MARK: - Helpers
+
+    private func admission(
+        workItemID: String,
+        pauseActive: Bool,
+        overridable: Bool
+    ) -> DispatchAdmission {
+        DispatchAdmission(
+            workItemID: workItemID,
+            wouldDispatch: false,
+            pause: DispatchPauseSnapshot(
+                active: pauseActive,
+                origin: pauseActive ? "operator" : nil,
+                reason: pauseActive ? "test pause" : nil,
+                pausedSinceEpochS: pauseActive ? 1_700_000_000 : nil,
+                overridable: overridable
+            ),
+            blockers: []
+        )
+    }
+
+    private func makeTask(status: String) -> WorkTask {
+        WorkTask(
+            id: "task_\(UUID().uuidString)",
+            productID: "prod_test",
+            projectID: nil,
+            kind: "chore",
+            name: "Test",
+            description: "",
+            status: status,
+            priority: "medium",
+            ordinal: nil,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-06-01T00:00:00Z",
+            updatedAt: "2026-06-01T00:00:00Z",
+            autostart: false
+        )
+    }
+
+    private func makeProjectTask(id: String, ordinal: Int) -> WorkTask {
+        WorkTask(
+            id: id,
+            productID: "prod_test",
+            projectID: "proj_test",
+            kind: "project_task",
+            name: "Project task \(id)",
+            description: "",
+            status: "todo",
+            priority: "medium",
+            ordinal: ordinal,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-06-01T00:00:00Z",
+            updatedAt: "2026-06-01T00:00:00Z"
+        )
+    }
+
+    private func makeModel() -> ChatViewModel {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.products = [
+            WorkProduct(
+                id: "prod_test",
+                name: "Test Product",
+                slug: "test",
+                description: "",
+                repoRemoteURL: nil,
+                status: "active",
+                createdAt: "2026-06-01T00:00:00Z",
+                updatedAt: "2026-06-01T00:00:00Z"
+            ),
+        ]
+        model.selectedWorkProductID = "prod_test"
+        return model
+    }
+}
