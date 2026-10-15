@@ -1,0 +1,13 @@
+# Resolve project design documents on click
+
+The app previously resolved every project with a design-document pointer after every work-tree snapshot. A board with 61 pointers sent 61 RPCs per update. Each handler scanned full in-flight execution rows to find leased workspaces, multiplying database contention even when nobody opened a document.
+
+Project icons now depend only on `designDocPath != nil` in the work tree. This applies to project headers, the sidebar, and design/design-postmortem cards and their detail popovers. There is no periodic or batch refresh. A click sends one existing `ResolveProjectDesignDoc` request. Its reply opens the document through the existing dispatcher, reports the engine's broken-pointer reason, or does nothing for `not_set`. Only the latest clicked project's response may open a viewer; duplicate responses and late responses for another project cannot reopen it. Broken-pointer warnings therefore appear on click rather than during board refresh.
+
+The engine uses `list_in_flight_repo_workspaces`, selecting only repository URLs and workspace paths for nonterminal leased executions. The first workspace in creation-time/id order wins for each repository. Schema 45 adds `work_executions_in_flight_idx`, a partial index with that order and projection, so terminal history and a temporary sort are unnecessary. The resolver drops its connection guard before URL rendering and workspace lookup.
+
+Attention reconciliation releases its connection after each attention kind, checks for open candidates before running the evidence query, and acquires a separate guard for stale dispatch banners. Other callers can acquire the shared connection between kinds.
+
+The query, index, and connection-lifetime fixes were salvaged from `db-contention-preserved` (commit `42cc49c5fc857c449884d6907bf8c8dc162e77cc`). Its batching and minute-based refresh approach was superseded by the owner's resolve-on-click decision. This change deliberately excludes read-transaction/read-ordering changes, the database-failure churn exemption, diagnostics, metrics, spawn wrappers, and the rusqlite observer patch; those are separate concerns, not prerequisites for on-click resolution.
+
+Regression coverage checks zero resolve requests across repeated work trees, one request per click and response handling, pointer-based icon visibility, the indexed query plan against a large history, selection from many active leases, concurrent reads/writes, connection release before workspace lookup, and connection release between attention kinds. Schema tests cover upgrades from older supported versions and repeated opens. All databases in these tests are temporary fixtures.

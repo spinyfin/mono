@@ -538,14 +538,9 @@ final class ChatViewModel: ObservableObject {
     /// Defaults to `.disconnected` until the engine's first reply lands.
     @Published var gitHubAuthState: GitHubAuthState = .disconnected
 
-    /// Resolved design-doc pointer state per project. Populated lazily
-    /// when a project surface (kanban project header, future detail
-    /// view) calls `resolveProjectDesignDoc(_:)`; refreshed whenever
-    /// the engine pushes a fresh `WorkTree` so a re-pointing or unset
-    /// from another session lands in the icon without a manual reload.
-    /// A missing entry means "we haven't asked yet" — the affordance
-    /// stays hidden until the engine replies.
+    /// Last click's resolve result; never used to refresh or decide icon visibility.
     @Published var designDocStateByProjectID: [String: ProjectDesignDocState] = [:]
+    var pendingProjectDesignDocOpen: WorkProject?
     /// Designs-tab markdown listings, keyed by product id. A missing
     /// entry means "not asked yet"; the value is the engine's classified
     /// outcome (loaded / no repo / unreachable / rate-limited / empty).
@@ -561,23 +556,6 @@ final class ChatViewModel: ObservableObject {
     @Published var designDocContentByRef: [DesignDocRef: DesignDocContent] = [:]
     /// The document the Designs tab reader pane is showing, if any.
     @Published var selectedDesignDocRef: DesignDocRef?
-    /// In-flight resolve-RPC batch. The engine resolves design-doc
-    /// pointers in lock-step (responses arrive back-to-back regardless of
-    /// per-project work), so stamping each project with its own
-    /// start-to-response delta produces N near-identical numbers and
-    /// destroys per-project attribution. Instead we track one batch per
-    /// `refreshDesignDocStates` call and emit a single
-    /// `phase=resolve project=batch count=<n>` summary when the last
-    /// pending response arrives. Stray responses for projects outside the
-    /// current batch (a refresh that landed mid-flight) still update
-    /// state — they just don't drive timing.
-    struct DesignDocResolveBatch {
-        var startDate: Date
-        var pendingProjectIDs: Set<String>
-        let initialCount: Int
-    }
-    var currentDesignDocResolveBatch: DesignDocResolveBatch?
-
     /// Engine-tab attempt list, freshest first. Refreshed on Engine-tab
     /// entry, on `conflict_resolution_*` topic pushes, and on `Refresh`
     /// button taps. Phase 5 #14 of the merge-conflict design.

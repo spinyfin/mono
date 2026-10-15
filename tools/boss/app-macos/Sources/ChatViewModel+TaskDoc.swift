@@ -1,29 +1,16 @@
 import Foundation
 
 extension ChatViewModel {
-    /// Effective doc-link state for a work item, independent of `kind`.
-    ///
-    /// Design / design-postmortem cards with a project still prefer the
-    /// **project-level** design-doc pointer when that pointer actually
-    /// presents (resolved or broken) — that is a separate concept from
-    /// the per-task `doc_*` columns. Otherwise the per-task
-    /// `docLinkState` is used, so a chore, investigation, revision, or
-    /// any other kind with an attached doc shows the same affordance.
-    func workItemDocState(for task: WorkTask) -> ProjectDesignDocState? {
-        let projectState: ProjectDesignDocState? = {
-            guard task.kind == "design" || task.kind == "design_postmortem",
-                  let projectID = task.projectID else { return nil }
-            return designDocStateByProjectID[projectID] ?? .notSet
-        }()
-        if let projectState,
-           ProjectDesignDocAffordancePresentation.from(state: projectState) != nil {
-            return projectState
+    /// Design cards prefer their project's pointer, without resolving it.
+    /// Other cards keep the engine-provided per-task doc presentation.
+    func workItemDocPresentation(for task: WorkTask) -> ProjectDesignDocAffordancePresentation? {
+        if (task.kind == "design" || task.kind == "design_postmortem"),
+           let projectID = task.projectID,
+           let project = project(withID: projectID),
+           let presentation = ProjectDesignDocAffordancePresentation.from(project: project) {
+            return presentation
         }
-        if let taskState = task.docLinkState,
-           ProjectDesignDocAffordancePresentation.from(state: taskState) != nil {
-            return taskState
-        }
-        return projectState ?? task.docLinkState
+        return task.docLinkState.flatMap { ProjectDesignDocAffordancePresentation.from(state: $0) }
     }
 
     /// Open the doc attached to a work item. Prefers a presentable
@@ -33,8 +20,7 @@ extension ChatViewModel {
         if (task.kind == "design" || task.kind == "design_postmortem"),
            let projectID = task.projectID,
            let project = project(withID: projectID) {
-            let projectState = designDocStateByProjectID[project.id] ?? .notSet
-            if ProjectDesignDocAffordancePresentation.from(state: projectState) != nil {
+            if project.designDocPath != nil {
                 openProjectDesignDoc(project)
                 return
             }
