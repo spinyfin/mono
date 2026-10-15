@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Shared by Settings and the main window; each surface presents its own
-/// confirmation only after its timeout action is selected.
+/// confirmation only after its delivery-failure action is selected.
 struct CoordinatorResetStatus: ViewModifier {
     @ObservedObject var model: ChatViewModel
     @State private var confirmForce = false
@@ -19,9 +19,9 @@ struct CoordinatorResetStatus: ViewModifier {
                     .padding()
                     .frame(maxWidth: .infinity)
                     .background(.regularMaterial)
-                } else if model.coordinatorResetTimedOut {
+                } else if model.coordinatorResetDeliveryFailed {
                     VStack(spacing: 8) {
-                        Text("The coordinator did not write a handoff within 120s. Its session is still running.")
+                        Text("Boss could not deliver the handoff request to the coordinator. Its session is still running.")
                         HStack {
                             Button("Reset anyway (no fresh handoff)") { confirmForce = true }
                             Button("Keep session") { model.clearCoordinatorReset() }

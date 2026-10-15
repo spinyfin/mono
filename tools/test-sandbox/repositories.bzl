@@ -256,3 +256,25 @@ host_tmux_repository = repository_rule(
     implementation = _host_tmux_repository_impl,
     local = True,
 )
+
+def _host_claude_repository_impl(repository_ctx):
+    # Only the explicitly selected inbox compatibility test receives this
+    # executable; it is never added to the shared test runtime or PATH.
+    binary = repository_ctx.which("claude")
+    if binary:
+        repository_ctx.symlink(binary.realpath, "claude")
+    else:
+        repository_ctx.file(
+            "claude",
+            content = "#!/bin/sh\nprintf '%s\\n' 'Claude Code is not installed on this host' >&2\nexit 127\n",
+            executable = True,
+        )
+    repository_ctx.file(
+        "BUILD.bazel",
+        content = 'exports_files(["claude"], visibility = ["@@//tools/boss/engine/core:__pkg__"])\n',
+    )
+
+host_claude_repository = repository_rule(
+    implementation = _host_claude_repository_impl,
+    local = True,
+)

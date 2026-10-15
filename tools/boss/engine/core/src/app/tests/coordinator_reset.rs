@@ -1,8 +1,7 @@
 // Tests for `FrontendRequest::RecreateCoordinator`: the handoff wait must be
 // detached from the connection's read loop, wired to the same `Notify` the
-// handoff writer fires, reported as a `recreate_coordinator:`-prefixed error
-// on the original request id, and followed by a real replacement once the
-// handoff lands.
+// handoff writer fires, and report a missing handoff on the original request
+// id before replacing the session when the grace period expires.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -117,11 +116,22 @@ impl CommandRunner for LiveCoordinatorRunner {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::coordinator_tmux::inbox::HandoffDelivery for LiveCoordinatorRunner {
+    async fn deliver(&self, _: &Tmux, _: &crate::work::CoordinatorTmuxRecord, prompt: &str) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(vec!["inbox".into(), prompt.into(), "delivered".into()]);
+        Ok(())
+    }
+}
+
 impl LiveCoordinatorRunner {
     fn prompted(&self) -> bool {
         self.calls()
             .iter()
-            .any(|c| c.get(2).map(String::as_str) == Some("send-keys") && c.iter().any(|a| a == "-l"))
+            .any(|c| c.first().map(String::as_str) == Some("inbox"))
     }
 
     fn calls(&self) -> Vec<Vec<String>> {
@@ -161,6 +171,7 @@ async fn fixture(timeout: Duration) -> Fixture {
         None,
         ServerStateOverrides::builder()
             .coordinator_handoff_timeout(timeout)
+            .coordinator_handoff_delivery(runner.clone())
             .coordinator_tmux(
                 Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap(),
             )
@@ -257,23 +268,52 @@ async fn timeout_is_reported_on_the_original_request_without_blocking_the_handle
         "{message}"
     );
 
-    let (request_id, event) = next_event(&sink).await;
-    assert_eq!(request_id, "reset-1");
-    let FrontendEvent::Error { message } = event else {
-        panic!("expected Error, got {event:?}")
+    // Engine requests have priority in SessionSink, so the attachment may
+    // overtake the warning. Both must be delivered, with their own identities.
+    let first = next_event(&sink).await;
+    let second = next_event(&sink).await;
+    let (warning, attachment) = if matches!(first.1, FrontendEvent::Error { .. }) {
+        (first, second)
+    } else {
+        (second, first)
     };
-    assert!(message.starts_with("recreate_coordinator: "), "{message}");
-    assert!(message.contains("did not write a handoff"), "{message}");
-
-    // The in-flight guard clears so a later reset request is accepted.
+    assert_eq!(warning.0, "reset-1");
+    let FrontendEvent::Error { message } = warning.1 else {
+        panic!("missing timeout warning");
+    };
+    assert!(message.contains("no fresh handoff was written"), "{message}");
+    let FrontendEvent::EngineRequest {
+        request_id,
+        request: EngineToAppRequest::AttachCoordinatorPane(attach),
+    } = attachment.1
+    else {
+        panic!("expected replacement attachment");
+    };
+    assert_ne!(attach.spawn_token, TOKEN);
+    assert!(runner.position("kill-session").unwrap() < runner.position("new-session").unwrap());
     assert!(
-        !state
+        runner.position("send-keys").is_none(),
+        "the composer must stay untouched"
+    );
+    state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::AttachCoordinatorPane {
+                result: Ok(boss_protocol::AttachCoordinatorPaneResult {}),
+            },
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state
             .coordinator_reset_in_flight
             .load(std::sync::atomic::Ordering::Acquire)
-    );
-    // The timed-out reset left the session untouched.
-    assert!(runner.position("kill-session").is_none());
-    assert!(runner.position("new-session").is_none());
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("reset must finish after attachment");
 }
 
 #[tokio::test]
@@ -442,6 +482,8 @@ async fn pending_reset_does_not_stall_the_connection_read_loop() {
     let started = std::time::Instant::now();
     send_frame(&mut writer, "reset-1", serde_json::to_value(reset_request()).unwrap()).await;
     wait_for_prompt(&runner).await;
+    eprintln!("isolated reset RPC to prompt: {}ms", started.elapsed().as_millis());
+    assert!(started.elapsed() < Duration::from_secs(1));
     assert!(
         state
             .coordinator_reset_in_flight
@@ -495,10 +537,7 @@ async fn pending_reset_does_not_stall_the_connection_read_loop() {
     let reply = read_frame_where(&mut reader, |f| f["request_id"] == "reset-1").await;
     assert_eq!(reply["payload"]["type"], "error");
     let message = reply["payload"]["message"].as_str().unwrap();
-    assert!(
-        message.starts_with("recreate_coordinator: ") && message.contains("did not write a handoff"),
-        "{message}"
-    );
+    assert!(message.contains("no fresh handoff was written"), "{message}");
 
     drop(writer);
     let _ = tokio::time::timeout(Duration::from_secs(2), conn).await;

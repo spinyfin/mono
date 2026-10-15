@@ -19,7 +19,19 @@ Unannounced termination gives the outgoing session no chance to run anything. Ev
 
 A shutdown-only write cannot protect against unannounced termination. Instead the coordinator keeps a **rolling handoff** and rewrites it at natural boundaries: whenever the operator states a fact that changes the world (a host taken down or brought back, a flag or setting flipped, dispatch paused or resumed), makes a decision, or says not to do something; when an open thread starts or resolves; and before acknowledging a request to restart, update, or reset it. Each write replaces the whole handoff, carrying forward what is still true. The "Session handoff" section of the coordinator prompt (`bossSystemPrompt` in `tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift`) is what binds the coordinator to this.
 
-Confirmed resets (including model changes) additionally ask the live coordinator to write a fresh handoff, then wait up to 120 seconds for a write stamped with the outgoing spawn token and a timestamp at or after the request. A timeout leaves the session running and offers “Reset anyway (no fresh handoff)”. This explicit override skips the wait and labels any saved handoff STALE in the new brief. Dead or missing sessions skip the request because there is nothing left to ask.
+### Delivery and the grace period
+
+The request is delivered through Claude Code's local inbox, never the composer, so any unsent text in the coordinator's composer is untouched. The production coordinator is launched with `--settings '{"crossSessionInbound":"accept"}'` so delivery does not depend on user or default inbound policy. The message begins with `[Boss reset request expires=<epoch seconds>]`, and the coordinator prompt tells the coordinator to trust it even though Claude labels it as coming from another session. If Claude Code holds the message past the delivery deadline, Boss reports failure and has no operation to withdraw it; the expiry lets the coordinator ignore a request released late, when no reset is pending. A coordinator that ignores an expired request has written no handoff, so a later reset still requests a fresh one.
+
+**Sessions launched before this change** have neither `--settings` nor the marker guidance in their prompt, so they follow the user's inbound policy and may not trust the request. The first reset after an upgrade can therefore fail delivery or go unobeyed; the app offers "Reset anyway (no fresh handoff)", and the replacement session launches with the new settings and guidance.
+
+Delivery has its own bound (`DELIVERY_TIMEOUT`, 15 s) that does not consume the grace period. A `held` receipt is pending, not failure: the wait ends on a correlated transcript record or `delivered` receipt, or fails on an explicit `denied`/`expired`/`refused`/`dropped` receipt or the deadline. Stray or malformed receipt-socket traffic is ignored. If delivery fails, the session is left running and the error begins `coordinator did not receive the handoff request`; the app keeps the reset UI open and offers "Reset anyway (no fresh handoff)".
+
+After delivery, the 30 s grace period ends at the first of: a fresh handoff write, the end of the turn the request started (an assistant `end_turn` record descends from the injected request UUID; if no write landed, the missing-handoff warning is shown), or the deadline.
+
+Each persisted handoff has a unique `write_id`, so an earlier write cannot satisfy the wait even when its body and second-resolution timestamp match. A fresh write wakes reset immediately. If grace expires without one, Boss logs an error, displays the missing-context warning, replaces the session, and labels an older saved handoff STALE.
+
+The transcript cursor is captured before sending the frame, so completion before delivery confirmation or between reads is retained. The lifecycle lock protects validation and frame send, then is released before awaiting confirmation. Recreation rechecks the spawn token under the lock. Dead or missing sessions skip delivery.
 
 The handoff is written by the coordinator session itself. The engine never synthesizes one from logs or transcripts.
 
@@ -28,7 +40,7 @@ The handoff is written by the coordinator session itself. The engine never synth
 One JSON value in the `metadata` table of the engine's own database, under the key `coordinator.handoff`:
 
 ```json
-{ "body": "...", "written_at": 1756800000, "writer_spawn_token": "…" }
+{ "body": "...", "written_at": 1756800000, "writer_spawn_token": "…", "write_id": "…" }
 ```
 
 `written_at` is Unix epoch seconds; `writer_spawn_token` is the spawn token of the coordinator record that was live when the write happened. This is coordinator-private state — it never enters a repo — and it is engine-owned, so it survives app restarts and is reachable only through the engine's RPC surface (`boss handoff …`), never by reading the database.
@@ -40,7 +52,7 @@ Alongside it, the coordinator record now stamps `coordinator.tmux_spawned_at` (w
 Every _fresh_ coordinator session is launched with a **session-start brief** as `claude`'s positional initial prompt — the same mechanism worker panes use for their initial prompt. The engine composes the brief in `start_new` (`tools/boss/engine/core/src/coordinator_tmux.rs`, `prepare_session_start_brief`), writes it to `.claude/handoff-brief.txt` in the coordinator session directory, and launches:
 
 ```
-exec claude --model <model> --permission-mode auto "$(cat '<session dir>/.claude/handoff-brief.txt')"
+exec claude --model <model> --permission-mode auto --settings '{"crossSessionInbound":"accept"}' "$(cat '<session dir>/.claude/handoff-brief.txt')"
 ```
 
 So the incoming session reads the handoff on its very first turn, before the operator types anything, with no pane injection to time and no dependence on the model choosing to open a file. If the brief file cannot be written, the engine launches with a short inline notice instead (naming the error and pointing at `boss handoff show`), never a bare session.
@@ -95,9 +107,23 @@ boss handoff show --json
 
 ## Forensics
 
-Two `engine-audit.log` events (see [forensic-surfaces.md](forensic-surfaces.md)):
+The handoff's durable `engine-audit.log` events (see [forensic-surfaces.md](forensic-surfaces.md)) include:
 
 - `coordinator_handoff_written` — every successful write: byte count, writer spawn token, `written_at`.
 - `coordinator_handoff_brief` — every fresh coordinator launch: `outcome` (`present` / `missing` / `unreadable`, or `brief_unwritable` when the file could not be written), `start_reason`, the previous session's spawn token and start time, and whether the handoff was written by that previous session.
 
 Together they answer "was a handoff available when session X started, and who wrote it?" without opening the database.
+
+Reset timing is also recorded at each boundary. The app's IPC JSONL records `coordinator_reset_gesture` (Settings or update banner), `coordinator_reset_confirmed`, and `coordinator_reset_rpc_send`. These carry millisecond wall-clock timestamps. Engine audit records `coordinator_reset_rpc_received`, `coordinator_reset_handler_started`, `coordinator_handoff_delivery_started`, `coordinator_handoff_lock_acquired`, `coordinator_handoff_requested` (confirmed delivery), `coordinator_handoff_grace_started`, and `coordinator_handoff_received` or `coordinator_handoff_timeout` (grace end), with millisecond timestamps and elapsed delivery/lock timing. Join the app's RPC send and engine receipt by request ID, then the handoff events by spawn token. Draft text and inbox authentication data are never logged.
+
+To locate where time went in a slow reset, compare the timestamps in order: `coordinator_reset_rpc_send` → `coordinator_reset_rpc_received` → `coordinator_handoff_lock_acquired` → `coordinator_handoff_requested` → `coordinator_handoff_grace_started`. A long gap before `rpc_send` is app or dialog time; `rpc_send` to `rpc_received` is the RPC path; `delivery_started` to `lock_acquired` is `coordinator_tmux` lock contention; `lock_acquired` to `requested` is inbox delivery; `grace_started` to `received`, `timeout` or `turn_ended_without_write` is time spent waiting on the coordinator itself. Both reset UI entry points share the same RPC path, and the grace timer starts only after delivery is confirmed.
+
+Inbox delivery also records `coordinator_inbox_delivery_stage` for registration read, connection, frame write, lifecycle lock release, and transcript or receipt confirmation. Each includes an elapsed duration and wall-clock timestamp. These measurements distinguish a slow transport from waiting for Claude to accept input.
+
+### Verification and evidence limits
+
+The native concurrent compatibility run on Claude Code 2.1.300 confirmed inputs in 152–157 ms: connection and frame write took 0–1 ms, and confirmation followed the existing 150 ms macOS transport delay. Both idle delivery assertions remain one second. The terminal case uses the production launch helper, loads a user setting of `crossSessionInbound: refuse`, confirms the command-line `accept` override, preserves the draft, and observes the request-correlated assistant completion.
+
+These measurements do not establish the cause of the historical delay before the handoff request. No incident trace spanning the Settings or update-banner confirmation through lock acquisition was supplied. The full isolated headless-engine reproduction of both UI entry points, including supervisor/attach contention, remains unverified; the new transport measurements must not be presented as that reproduction. Lock contention is a candidate, not an established historical cause. Delivery confirmation no longer holds the lifecycle lock, and a regression test withholds confirmation until a second lifecycle operation acquires that lock.
+
+The opt-in `coordinator_inbox_real_model_test` exercises a real model with a private configuration and a local `boss handoff write` sink. It is not scheduled by the wildcard suite. Its attempted run failed because the mandatory hermetic test wrapper strips `ANTHROPIC_API_KEY`, including when supplied with `--test_env`. Real-model obedience therefore remains unverified. Running this check requires a repository-approved credential fixture; passing the environment variable alone is insufficient, and bypassing the wrapper is not supported.

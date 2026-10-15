@@ -423,6 +423,7 @@ private struct WorkerSettingsPane: View {
                         }
                     }
                     Button(role: .destructive) {
+                        chatModel.logCoordinatorReset("gesture", source: "settings")
                         showCoordinatorResetConfirm = true
                     } label: {
                         Text("Reset Coordinator Session…")
@@ -464,9 +465,9 @@ private struct WorkerSettingsPane: View {
 enum CoordinatorResetCopy {
     static let title = "Reset the coordinator?"
     static let message =
-        "Boss will ask the coordinator to write a fresh handoff and wait up to 120 seconds. " +
+        "Boss will ask the coordinator to write a fresh handoff and wait up to 30 seconds after delivery. " +
         "Then its current conversation permanently ends and a new session starts with that handoff, " +
-        "the current claude binary, and instructions. If no handoff arrives, the session stays running."
+        "the current claude binary, and instructions. If no handoff arrives, Boss warns that context may be missing and restarts anyway."
 }
 
 private struct SettingToggleRow: View {

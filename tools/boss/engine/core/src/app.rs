@@ -574,6 +574,7 @@ struct ServerStateOverrides {
     pr_detector: Option<Arc<dyn PrDetector>>,
     /// Coordinator-reset handoff wait. `None` uses the production timeout.
     coordinator_handoff_timeout: Option<std::time::Duration>,
+    coordinator_handoff_delivery: Option<Arc<dyn crate::coordinator_tmux::inbox::HandoffDelivery>>,
     /// Tmux handle used for every coordinator lifecycle path (app-registration
     /// attach, supervisor, UI-confirmed reset). `None` resolves the preflighted
     /// executable.
@@ -723,6 +724,8 @@ struct ServerState {
     /// Tests inject a short value.
     #[builder(default = crate::coordinator_tmux::reset_handoff::HANDOFF_TIMEOUT)]
     coordinator_handoff_timeout: std::time::Duration,
+    #[builder(default = Arc::new(crate::coordinator_tmux::inbox::ClaudeInbox))]
+    coordinator_handoff_delivery: Arc<dyn crate::coordinator_tmux::inbox::HandoffDelivery>,
     /// Set while a detached coordinator reset is running, so a repeated
     /// request is refused instead of stacking a second handoff wait.
     #[builder(default)]
@@ -1228,6 +1231,7 @@ impl ServerState {
             source_packet_collector: source_packet_collector_override,
             pr_detector: pr_detector_override,
             coordinator_handoff_timeout: coordinator_handoff_timeout_override,
+            coordinator_handoff_delivery: coordinator_handoff_delivery_override,
             coordinator_tmux: coordinator_tmux_override,
             coordinator_working_directory: coordinator_working_directory_override,
         } = overrides;
@@ -1686,6 +1690,7 @@ impl ServerState {
             ServerState::builder()
                 .work_db(work_db)
                 .maybe_coordinator_handoff_timeout(coordinator_handoff_timeout_override)
+                .maybe_coordinator_handoff_delivery(coordinator_handoff_delivery_override)
                 .maybe_coordinator_tmux_override(coordinator_tmux_override)
                 .maybe_coordinator_working_directory_override(coordinator_working_directory_override)
                 .tmux_socket_path(cfg.work.resolved_tmux_socket_path())
@@ -2452,6 +2457,18 @@ async fn handle_frontend_connection(
         let decode_ms = crate::population_timing::elapsed_ms(decode_start);
         let request_id = envelope.request_id.clone();
         let request = envelope.payload;
+        if let FrontendRequest::RecreateCoordinator {
+            expected_spawn_token, ..
+        } = &request
+        {
+            crate::audit::record_event(
+                "coordinator_reset_rpc_received",
+                &serde_json::json!({
+                    "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(),
+                    "request_id": request_id, "spawn_token": expected_spawn_token,
+                }),
+            );
+        }
 
         // The worker verb gate, ahead of dispatch: a refused verb never
         // reaches its handler, so there is no path by which a partially

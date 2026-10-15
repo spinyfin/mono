@@ -309,6 +309,11 @@ final class EngineClient: @unchecked Sendable {
             var data = try JSONSerialization.data(withJSONObject: envelope, options: [])
             data.append(0x0A)
 
+            if payload["type"] as? String == "recreate_coordinator" {
+                IpcLog.shared.log(requestId: envelopeRequestId, direction: "app→engine",
+                                  kind: "coordinator_reset_rpc_send", body: payload)
+            }
+
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
                 guard let self, self.connection === connection else { return }
                 if let error {

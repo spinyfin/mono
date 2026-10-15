@@ -6,6 +6,11 @@ import Foundation
 /// itself; the visible tmux client is only a viewer and cannot be its
 /// trust root.
 extension ChatViewModel {
+    func logCoordinatorReset(_ stage: String, source: String) {
+        IpcLog.shared.log(requestId: attachedCoordinatorSpawnToken ?? "unattached",
+                          direction: "app", kind: "coordinator_reset_\(stage)",
+                          body: ["source": source])
+    }
     func coordinatorModelConfigured(_ model: String) {
         let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !model.isEmpty else { return }
@@ -25,6 +30,7 @@ extension ChatViewModel {
 
     func confirmCoordinatorModelRecreate() {
         guard let confirmation = coordinatorModelRecreateConfirmation else { return }
+        logCoordinatorReset("confirmed", source: "model_change")
         coordinatorModelRecreateConfirmation = nil
         beginCoordinatorReset(token: confirmation.expectedSpawnToken, reason: .modelMismatch)
     }
@@ -43,6 +49,7 @@ extension ChatViewModel {
     /// currently attached (nothing to reset).
     func resetCoordinator() {
         guard let token = attachedCoordinatorSpawnToken else { return }
+        logCoordinatorReset("confirmed", source: "operator_reset")
         beginCoordinatorReset(token: token, reason: .operatorReset)
     }
 
@@ -50,15 +57,15 @@ extension ChatViewModel {
         guard !coordinatorResetWaiting else { return }
         pendingCoordinatorReset = (token, reason)
         coordinatorResetForced = false
-        coordinatorResetTimedOut = false
+        coordinatorResetDeliveryFailed = false
         coordinatorResetWaiting = true
         engine.sendRecreateCoordinator(expectedSpawnToken: token, reason: reason)
     }
 
     func forceCoordinatorReset() {
-        guard coordinatorResetTimedOut, let pending = pendingCoordinatorReset else { return }
+        guard coordinatorResetDeliveryFailed, let pending = pendingCoordinatorReset else { return }
         coordinatorResetForced = true
-        coordinatorResetTimedOut = false
+        coordinatorResetDeliveryFailed = false
         coordinatorResetWaiting = true
         engine.sendRecreateCoordinator(
             expectedSpawnToken: pending.token, reason: pending.reason, forceWithoutHandoff: true
@@ -68,16 +75,16 @@ extension ChatViewModel {
     func clearCoordinatorReset() {
         coordinatorResetForced = false
         coordinatorResetWaiting = false
-        coordinatorResetTimedOut = false
+        coordinatorResetDeliveryFailed = false
         pendingCoordinatorReset = nil
     }
 
-    /// Returns true only when the reset UI owns the timeout error.
+    /// Returns true only when the reset UI owns the delivery failure.
     func handleCoordinatorResetError(_ message: String) -> Bool {
         guard message.hasPrefix("recreate_coordinator:"), pendingCoordinatorReset != nil else { return false }
         coordinatorResetWaiting = false
-        if message.contains("coordinator did not write a handoff within") {
-            coordinatorResetTimedOut = true
+        if message.contains("coordinator did not receive the handoff request") {
+            coordinatorResetDeliveryFailed = true
             return true
         }
         clearCoordinatorReset()

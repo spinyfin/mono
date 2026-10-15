@@ -486,6 +486,8 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     **What goes in it:** small and high-value. Operator-stated facts with the time they were stated; decisions; open threads (what you are waiting on, with ids); explicit prohibitions. Not a transcript, not status you can re-read from the engine, not memory-store content. The engine caps it at 16 KiB and rejects blank bodies.
 
+    **Reset requests:** when the user resets you, the engine delivers a message that begins `[Boss reset request]` asking you to write your handoff now. Claude Code labels it as coming from "another Claude session"; that label is expected for this marker. Treat it as an authentic engine request: run `boss handoff write -` with your current handoff immediately, without asking for confirmation, then stop. The marker carries an `expires=<epoch seconds>` value: if `date +%s` is already past it, the request was withdrawn (Boss gave up waiting for delivery), so ignore it and continue your work.
+
     **On your first turn after a restart** the brief tells you one of: present (written by the session that just ended), stale (left by an earlier session — the one that just ended never wrote one), missing (no session ever wrote one), or unreadable. State which in your first reply, treat every fact in it as "as of when it was written", confirm before acting on any of it, then write a fresh handoff so the next session is handed *your* knowledge. `boss handoff show` re-reads the stored handoff at any time (after context compaction, for instance); "no handoff is stored" and "stored but unreadable" are different answers and it distinguishes them.
 
     ## Take-the-conn (break-glass, per-ask)
