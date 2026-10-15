@@ -92,6 +92,9 @@ root-cause rule as the section below.
   dispatch to chosen projects/products; scope rules, precedence against the
   pause and force-launch, the `focus_mode` hold reason):
   [`tools/boss/docs/dispatch-focus-mode.md`](tools/boss/docs/dispatch-focus-mode.md)
+- SQLite contention (why "database is locked" never reaches a client, the
+  lock-wait log lines, and the `database_contention` engine-health issue):
+  [`tools/boss/docs/db-contention.md`](tools/boss/docs/db-contention.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 

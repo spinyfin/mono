@@ -115,6 +115,7 @@ impl WorkDb {
             persona_metrics: personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),
+            contention_health: Arc::default(),
         })
     }
 
@@ -145,6 +146,7 @@ impl WorkDb {
             persona_metrics: personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),
+            contention_health: Arc::default(),
         })
     }
 
