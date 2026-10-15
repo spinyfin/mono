@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import PaneLayout
 
@@ -11,15 +12,6 @@ final class AgentsGridModel: ObservableObject {
 
     @Published private(set) var layout: PaneLayoutModel
     @Published private(set) var poolStrip = AgentsGridModel.defaultPoolStrip
-    @Published private(set) var feedUnavailable = false
-    /// Attached viewers whose run is not in any layout cell (engine
-    /// released and compacted, detach not yet arrived). Keep their
-    /// surfaces mounted until `DetachWorkerPane`.
-    private var viewers: [String: WorkerSlot] = [:]
-    var unplacedViewers: [WorkerSlot] {
-        viewers.values.filter { $0.session != nil && !placedRunIds(in: layout).contains($0.runId ?? "") }
-            .sorted { $0.slotId < $1.slotId }
-    }
     /// Display names for projects seen on live members, keyed by project id.
     @Published private(set) var projectNames: [String: String] = [:]
     /// Projects with at least one live local member, in display order.
@@ -218,18 +210,37 @@ final class AgentsGridModel: ObservableObject {
     /// Authoritative membership + current viewer map. Callers must pass
     /// only an accepted live-state snapshot: duplicates and a disconnected
     /// feed are handled by `LiveWorkerStateStore` before they reach here.
+    ///
+    /// `isVisible` orders the visibility change around the membership
+    /// update. Going hidden hides first, and coming back shows last, so
+    /// the snapshot lands while the model is hidden and applies at once;
+    /// entering Agents then repacks current membership, not stale membership.
+    func apply(
+        isVisible: Bool,
+        states: [WorkerLiveState],
+        viewers: [String: WorkerSlot],
+        interactivePoolSize: Int,
+        automationPoolSize: Int,
+        reviewPoolSize: Int
+    ) {
+        if !isVisible { setVisible(false) }
+        apply(
+            states: states,
+            viewers: viewers,
+            interactivePoolSize: interactivePoolSize,
+            automationPoolSize: automationPoolSize,
+            reviewPoolSize: reviewPoolSize
+        )
+        if isVisible { setVisible(true) }
+    }
+
     func apply(
         states: [WorkerLiveState],
         viewers: [String: WorkerSlot],
         interactivePoolSize: Int,
         automationPoolSize: Int,
-        reviewPoolSize: Int,
-        feedUnavailable: Bool
+        reviewPoolSize: Int
     ) {
-        if self.feedUnavailable != feedUnavailable {
-            self.feedUnavailable = feedUnavailable
-        }
-        self.viewers = viewers
         let local = states.filter(\.isLocalMember)
         engineTerminalRunIds = Set(local.filter { WorkerSlotLiveSlice($0).isEngineTerminal }.map(\.runId))
         for state in local {
@@ -261,9 +272,8 @@ final class AgentsGridModel: ObservableObject {
         }
         replaceLayout { $0.updateMembers(members) }
 
-        let placed = placedRunIds(in: layout)
         let needed = Set(local.map(\.runId))
-            .union(placed)
+            .union(placedRunIds(in: layout))
             .union(viewers.keys)
         personaByRun = personaByRun.filter { needed.contains($0.key) }
 
@@ -313,9 +323,48 @@ final class AgentsGridModel: ObservableObject {
         applyPendingGeometry()
     }
 
-    /// Test seam: skip the 300 ms quiet window.
-    func flushGeometryForTesting() {
-        liveResizeDidEnd()
+    /// Run ids whose surfaces must stay mounted: every placed run (occupied
+    /// or placeholder) plus every attached viewer, so an engine release that
+    /// compacts the run out of the layout never tears down its surface before
+    /// `DetachWorkerPane` arrives.
+    func renderRunIds(attached: some Collection<String>) -> [String] {
+        placedRunIds(in: layout).union(attached).sorted()
+    }
+
+    /// Frame and visibility for a run's surface within `area`. Pane
+    /// rectangles use the same `policy.gap` the capacity and shape math
+    /// scores with. A run in no cell (released, detach pending) gets a usable
+    /// hidden frame.
+    func placement(for runId: String, area: CGSize) -> (frame: CGRect, visible: Bool) {
+        Self.placement(for: runId, area: area, layout: layout)
+    }
+
+    static func placement(for runId: String, area: CGSize, layout: PaneLayoutModel) -> (frame: CGRect, visible: Bool) {
+        let gap = CGFloat(layout.policy.gap)
+        for page in layout.pages {
+            for cell in page.cells {
+                let id: String?
+                switch cell.content {
+                case .occupied(let member): id = member.runId
+                case .placeholder(let run): id = run
+                case .empty: id = nil
+                }
+                guard id == runId else { continue }
+                let columns = CGFloat(page.shape.columns)
+                let rows = CGFloat(page.shape.rows)
+                let width = max(1, (area.width - (columns - 1) * gap) / columns)
+                let height = max(1, (area.height - (rows - 1) * gap) / rows)
+                let position = page.shape.position(ofLocalIndex: cell.localIndex)
+                let frame = CGRect(
+                    x: CGFloat(position.column) * (width + gap),
+                    y: CGFloat(position.row) * (height + gap),
+                    width: width,
+                    height: height
+                )
+                return (frame, page.index == layout.selectedPage)
+            }
+        }
+        return (CGRect(x: 0, y: 0, width: max(420, area.width), height: max(356, area.height)), false)
     }
 
     static func poolStrip(
