@@ -767,17 +767,22 @@ final class EngineClient: @unchecked Sendable {
         }
         let envelopeRequestId = envelope["request_id"] as? String
         let isAdmissionReply = type == "dispatch_admission_evaluated"
+        // The request this reply answers, as the ledger recorded it when it was
+        // written (under the id it actually carried, so a Retry's fresh id
+        // still resolves). Used to attribute a failed reply to its own card.
+        var answeredRequest: [String: Any]?
         if let id = envelopeRequestId {
-            let finished = ledger.withLock { state -> Bool in
+            let (finished, sentData) = ledger.withLock { state -> (Bool, Data?) in
                 let sent = state.awaiting.removeValue(forKey: id)
-                guard state.retried.remove(id) != nil else { return false }
+                guard state.retried.remove(id) != nil else { return (false, sent?.data) }
                 if isAdmissionReply, let sent,
                    let request = (try? JSONSerialization.jsonObject(with: sent.data)) as? [String: Any],
                    let taskID = request["work_item_id"] as? String {
                     state.retryAdmissionTasks.insert(taskID)
                 }
-                return state.retried.isEmpty && state.retryAdmissionTasks.isEmpty
+                return (state.retried.isEmpty && state.retryAdmissionTasks.isEmpty, sent?.data)
             }
+            answeredRequest = sentData.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
             if finished { emit(.retriedActionsStatus(message: nil)) }
         }
 
@@ -925,6 +930,14 @@ final class EngineClient: @unchecked Sendable {
             emit(.workItemDeleted(id: id))
         case "work_error":
             let message = payload["message"] as? String ?? "unknown work error"
+            // A refused "Add revision…" belongs to the parent card it was filed
+            // against; the request itself (not the id it first carried) says
+            // which, so this holds for a request retained and resent on Retry.
+            if answeredRequest?["type"] as? String == "create_revision",
+               let parentTaskID = answeredRequest?["parent_task_id"] as? String {
+                emit(.revisionRefused(message: message, parentTaskID: parentTaskID))
+                break
+            }
             emit(.workError(message: message, requestId: envelopeRequestId))
         case "operator_decision_snapshot":
             if let raw = payload["questions"],
@@ -1115,7 +1128,12 @@ final class EngineClient: @unchecked Sendable {
                   let admissionData = try? JSONSerialization.data(withJSONObject: admissionPayload),
                   let admission = try? JSONDecoder().decode(DispatchAdmission.self, from: admissionData)
             else {
-                emit(.error(message: "received invalid dispatch_admission_evaluated payload", requestId: envelopeRequestId))
+                // The reply never decoded, so only the request it answered can
+                // say which card was waiting on it.
+                emit(.dispatchAdmissionDecodeFailed(
+                    message: "received invalid dispatch_admission_evaluated payload",
+                    taskID: answeredRequest?["work_item_id"] as? String
+                ))
                 break
             }
             emit(.dispatchAdmissionEvaluated(admission: admission))

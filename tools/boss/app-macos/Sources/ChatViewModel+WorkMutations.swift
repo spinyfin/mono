@@ -310,14 +310,12 @@ extension ChatViewModel {
         reorderRequestTaskIDs.removeValue(forKey: requestId)
     }
 
-    /// A `work_error` carrying a pending "Add revision…" request's id belongs
-    /// to the parent card the revision was filed against: show it there.
-    /// Returns whether the request id matched.
-    func settleRevisionWorkError(message: String, requestId: String?) -> Bool {
-        guard let requestId, let parentID = revisionRequestParentIDs.removeValue(forKey: requestId) else { return false }
-        dragRefusalNotice = DragRefusalNotice(taskID: parentID, message: message, code: "create_revision_failed")
-        scheduleDragRefusalDismiss(for: parentID)
-        return true
+    /// A refused "Add revision…" (attributed by the engine client to its
+    /// parent card, whichever request id the request finally went out under)
+    /// shows on that card.
+    func settleRevisionRefused(message: String, parentTaskID: String) {
+        dragRefusalNotice = DragRefusalNotice(taskID: parentTaskID, message: message, code: "create_revision_failed")
+        scheduleDragRefusalDismiss(for: parentTaskID)
     }
 
     /// Apply an explicit column choice from the work-card popover's "Move"

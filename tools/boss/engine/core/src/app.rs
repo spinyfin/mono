@@ -598,9 +598,9 @@ struct ServerStateOverrides {
     source_packet_collector: Option<crate::review_guide_capture::SourcePacketCollector>,
     /// Fake PR detector. `None` uses `CommandPrDetector` (shells out to `gh`).
     pr_detector: Option<Arc<dyn PrDetector>>,
-    /// Fake PR lifecycle checker for the completion handler. `None` uses the
-    /// `gh`-backed default.
-    pr_state_checker: Option<Arc<dyn crate::work::PrStateChecker>>,
++    /// Fake PR lifecycle checker for the completion handler. `None` uses the
++    /// `gh`-backed default.
++    pr_state_checker: Option<Arc<dyn crate::work::PrStateChecker>>,
     /// Coordinator-reset handoff wait. `None` uses the production timeout.
     coordinator_handoff_timeout: Option<std::time::Duration>,
     coordinator_handoff_delivery: Option<Arc<dyn crate::coordinator_tmux::inbox::HandoffDelivery>>,
@@ -659,6 +659,10 @@ struct ServerState {
     /// so exercising the Direct routing decision never shells out to a real
     /// `gh` process.
     direct_merge_executor: Arc<dyn merge_when_ready::DirectMergeExecutor>,
+    /// Live PR open/merged/closed probe behind `create_revision`'s gate and the
+    /// board's "add a revision" offer, so both judge eligibility from the same
+    /// facts. Production uses `GhPrStateChecker`; tests inject a fake.
+    pr_state_checker: Arc<dyn crate::work::PrStateChecker>,
     /// Shared dispatch-event sink. The execution coordinator emits
     /// the per-stage events into this sink during dispatch; the
     /// `UpdateWorkItem` handler emits a `StatusTransition` event
@@ -1740,6 +1744,7 @@ impl ServerState {
                 .publisher(publisher_for_state)
                 .merge_probe(merge_probe_for_state)
                 .direct_merge_executor(direct_merge_executor_for_state)
+                .pr_state_checker(pr_state_checker_override.unwrap_or_else(|| Arc::new(GhPrStateChecker)))
                 .dispatch_events(dispatch_events_for_state)
                 .dispatch_event_root(dispatch_event_root_for_state)
                 .topic_broker(topic_broker)

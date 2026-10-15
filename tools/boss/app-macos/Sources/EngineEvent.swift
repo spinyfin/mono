@@ -72,6 +72,12 @@ enum EngineEvent {
     /// the envelope request id so a pending request waiting on that reply
     /// (e.g. a project archive) can settle instead of waiting forever.
     case workItemUpdateDecodeFailed(message: String, requestId: String?)
+    /// A `create_revision` the engine refused, attributed by the client to the
+    /// parent card the revision was filed against.
+    case revisionRefused(message: String, parentTaskID: String)
+    /// A `dispatch_admission_evaluated` reply that failed to decode. `taskID`
+    /// is the card whose admission check it answered, when the client knows.
+    case dispatchAdmissionDecodeFailed(message: String, taskID: String?)
     /// Typed refusal of an `answer_operator_question` request (`not_found`,
     /// `conflict`, `validation_failed`). `message` is user-readable;
     /// `requestId` is the envelope id of the answer request it refuses.
