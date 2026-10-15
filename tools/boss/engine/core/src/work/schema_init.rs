@@ -213,6 +213,7 @@ impl WorkDb {
     /// once up front. `WorkDb::connect()` just locks this connection's
     /// mutex — see the docs on `WorkDb::conn`.
     pub(in crate::work) fn open_raw_connection(path: &Path, memory: Option<&InMemoryAnchor>) -> Result<Connection> {
+        super::lock_stats::install_busy_hook();
         let mut conn = if let Some(mem) = memory {
             // For in-memory databases, connect via the named shared-cache URI.
             Connection::open_with_flags(

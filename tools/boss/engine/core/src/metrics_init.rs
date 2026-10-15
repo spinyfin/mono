@@ -70,6 +70,9 @@ pub fn init_all(registry: &Registry) {
     // dynamically on first use (the caller x bucket axis isn't a
     // compile-time-known set), so only the statics land here.
     crate::github_api_usage::register_metrics(registry);
+    // Work DB lock-contention rollup: timing-event / busy-failure counters
+    // and the longest-hold-per-minute gauge.
+    crate::work::lock_stats::register_metrics(registry);
 }
 
 #[cfg(test)]
@@ -112,6 +115,8 @@ mod tests {
                 "database_backup.offsite.copies_succeeded",
                 "database_backup.offsite.retention_failed",
                 "database_backup.offsite.success_record_failed",
+                "db_lock.busy_failures",
+                "db_lock.timing_events",
                 "dispatch.completed",
                 "dispatcher.hook_events.dropped_missing_run_id",
                 "dispatcher.hook_events.for_terminal_execution",
@@ -220,6 +225,7 @@ mod tests {
             gauge_names,
             vec![
                 "database_backup.offsite.last_success_age_secs",
+                "db_lock.longest_hold_ms",
                 "dependency_unblock.longest_stale_seconds",
                 "dispatch.drain_pass_duration_ms",
                 "dispatch.queue_depth.automation",

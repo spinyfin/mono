@@ -65,6 +65,7 @@ impl Drop for ConnectionGuard<'_> {
         if held.max(self.waited) >= std::time::Duration::from_millis(100) {
             tracing::warn!(wait_ms = self.waited.as_millis() as u64, held_ms = held.as_millis() as u64, caller = %self.caller,
                 "work DB connection lock timing");
+            super::lock_stats::global().record_timing(self.caller, held);
         }
     }
 }
