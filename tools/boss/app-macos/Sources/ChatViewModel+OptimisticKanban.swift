@@ -278,9 +278,27 @@ extension ChatViewModel {
     /// columns and surface an inline notice. Called when `work_error` arrives
     /// while moves are pending, or when `workItemUpdated` reports an unexpected
     /// status (engine silently rejected the transition).
-    func bounceBackOptimisticMoves(message: String?) {
+    /// Settles only drags that are not parked for Retry: a parked drag's
+    /// request is still in the unsent queue and its continuation must
+    /// survive until the user retries or discards it.
+    func bounceUnparkedDrags(message: String?, includeMovesWithoutCheck: Bool = true) {
+        let parked = engine.unsentDragTaskIDs()
+        var ids = Set(pendingDragAdmissionChecks.keys)
+        if includeMovesWithoutCheck { ids.formUnion(pendingMoveOriginByTaskID.keys) }
+        ids.subtract(parked)
+        guard !ids.isEmpty else { return }
+        for id in ids { pendingDragAdmissionChecks[id] = nil }
+        bounceBackOptimisticMoves(only: ids, message: message)
+    }
+
+    func bounceBackOptimisticMoves(only: Set<String>, message: String?) {
+        bounceBackOptimisticMoves(message: message, only: only)
+    }
+
+    func bounceBackOptimisticMoves(message: String?, only: Set<String>? = nil) {
         guard !pendingMoveOriginByTaskID.isEmpty else { return }
-        let bouncedIDs = Array(pendingMoveOriginByTaskID.keys)
+        let bouncedIDs = pendingMoveOriginByTaskID.keys.filter { only?.contains($0) ?? true }
+        guard !bouncedIDs.isEmpty else { return }
         for id in bouncedIDs {
             optimisticColumnByTaskID.removeValue(forKey: id)
             pendingMoveOriginByTaskID.removeValue(forKey: id)

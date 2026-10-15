@@ -123,10 +123,9 @@ extension ChatViewModel {
             // flight: the socket drop means no `dispatch_admission_evaluated`
             // reply is ever coming, so nothing else would clear
             // `pendingDragAdmissionCheck` or the optimistic move it guards.
-            if !pendingDragAdmissionChecks.isEmpty && !engine.hasUnsentAction(kind: "evaluate_dispatch_admission") {
-                pendingDragAdmissionChecks.removeAll()
-                bounceBackOptimisticMoves(message: nil)
-            }
+            // A check parked for Retry is still in the unsent queue and is
+            // kept; only checks whose request was in flight are settled.
+            bounceUnparkedDrags(message: nil, includeMovesWithoutCheck: false)
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, let itemIDs):
             if CommentEngineBridge.isCommentTopic(topic) {
@@ -298,11 +297,10 @@ extension ChatViewModel {
             if let message {
                 uncertainActionMessages.append(message)
                 uncertainActionNotice = uncertainActionMessages.joined(separator: "\n")
-                if !engine.hasUnsentAction(kind: "move_work_item_on_board") && !engine.hasUnsentAction(kind: "evaluate_dispatch_admission") {
-                    bounceBackOptimisticMoves(message: nil)
-                }
+                bounceUnparkedDrags(message: nil)
             }
             retryingDisconnectedActions = false
+            if engine.hasRoomForDisconnectedActions() { unsavedActionNotice = nil }
             refreshUnsentActions()
             showDisconnectedActionNotice()
         case .notConnected(let requestKind):
@@ -317,15 +315,14 @@ extension ChatViewModel {
                 settleAllArchiveRequests()
             }
             // Only the drag's own requests may clear admission/optimistic state.
-            if (requestKind == "evaluate_dispatch_admission" || requestKind == "move_work_item_on_board") && !engine.hasUnsentAction(kind: requestKind) {
-                pendingDragAdmissionChecks.removeAll()
-                bounceBackOptimisticMoves(message: "Not connected to the engine — reconnect and try again.")
+            if requestKind == "evaluate_dispatch_admission" || requestKind == "move_work_item_on_board" {
+                bounceUnparkedDrags(message: "Lost connection to the engine; this move was not sent.")
             }
             // Only kinds retained for Retry earn the "your actions are saved" notice.
             if refreshUnsentActions() { showDisconnectedActionNotice() }
             appendSystemMessage("Not connected to the engine; \(requestKind) was not sent.", alwaysShow: true)
         case .actionNotSaved(let requestKind):
-            showActionNotSaved(requestKind: requestKind)
+            showActionNotSaved(requestKind: EngineClient.describeAction(kind: requestKind))
         case .workItemUpdateDecodeFailed(let message, let requestId):
             // The reply a pending archive was waiting on arrived undecodable;
             // it is the only reply that request gets, so settle it here.
@@ -333,8 +330,10 @@ extension ChatViewModel {
             handle(.error(message: message))
         case .error(let message):
             if handleCoordinatorResetError(message) { return }
-            if !pendingDragAdmissionChecks.isEmpty {
-                for pending in pendingDragAdmissionChecks.values { engine.finishAdmissionRetry(taskID: pending.taskID) }
+            let parkedDrags = engine.unsentDragTaskIDs()
+            let settleableChecks = pendingDragAdmissionChecks.values.filter { !parkedDrags.contains($0.taskID) }
+            if !settleableChecks.isEmpty {
+                for pending in settleableChecks { engine.finishAdmissionRetry(taskID: pending.taskID) }
                 // A malformed/undecodable `dispatch_admission_evaluated`
                 // reply (EngineClient emits `.error`, never
                 // `.dispatchAdmissionEvaluated`, when the payload fails to
@@ -343,8 +342,9 @@ extension ChatViewModel {
                 // `pendingDragAdmissionCheck` for a reply that never
                 // arrives in the expected shape. Bounce it back exactly as
                 // a hard-blocker refusal would.
-                pendingDragAdmissionChecks.removeAll()
-                bounceBackOptimisticMoves(message: message)
+                let settledIDs = Set(settleableChecks.map(\.taskID))
+                for id in settledIDs { pendingDragAdmissionChecks[id] = nil }
+                bounceBackOptimisticMoves(only: settledIDs, message: message)
                 return
             }
             workErrorMessage = message

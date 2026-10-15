@@ -48,18 +48,34 @@ final class EngineClient: @unchecked Sendable {
         kind.replacingOccurrences(of: "_", with: " ")
     }
 
-    /// Reads and session housekeeping have no user mutation to recover.
+    /// Request kinds a person initiates and can lose to a dropped connection.
+    /// An explicit allowlist: automatic traffic (reads, session housekeeping,
+    /// the comment layer's `comments_resolve` re-anchor on every reload) must
+    /// never be retained for Retry or reported as an uncertain action.
+    static let userMutationKinds: Set<String> = [
+        "create_task", "create_chore", "create_idea", "create_project", "create_product",
+        "create_automation", "delete_work_item", "update_idea", "update_automation",
+        "enable_automation", "disable_automation", "delete_automation", "set_automation_paused",
+        "reorder_project_tasks", "merge_when_ready", "request_execution", "release_project",
+        "unpopulate_project", "answer_attention", "dismiss_attention",
+        "comments_create", "comments_set_status", "comments_set_intent",
+        "comments_dismiss", "comments_post_followup", "comments_update_anchor",
+        "set_setting", "set_feature_flag", "set_dispatch_paused", "set_live_status_enabled",
+        "set_driver_traffic_split", "set_offsite_backup", "set_product_editorial_rules",
+        "set_product_external_tracker", "set_product_merge_mechanism", "set_host_enabled",
+        "add_host", "remove_host", "add_host_tag", "remove_host_tag",
+        "update_work_item", "move_work_item_on_board", "evaluate_dispatch_admission",
+        "evaluate_editorial_rules",
+        "accept_deferred_scope_attention", "action_attention_group", "answer_operator_question",
+        "create_task_from_deferred_scope_attention", "comments_revise_doc", "retry_review_guide",
+        "recreate_coordinator", "generate_review_guide", "open_live_workspace_terminal",
+        "open_review_terminal", "git_hub_auth_start", "git_hub_auth_cancel",
+        "git_hub_auth_disconnect", "trunk_set_token", "shutdown",
+    ]
+
     static func isUserMutation(_ payload: [String: Any]) -> Bool {
         guard let kind = payload["type"] as? String else { return false }
-        return !kind.hasPrefix("get_") && !kind.hasPrefix("list_") && ![
-            "engine_response", "subscribe", "unsubscribe", "register_capabilities",
-            "register_app_session", "report_selected_product", "spawn_capability_restored",
-            "metrics_list_live", "git_hub_auth_status", "trunk_status", "execution_transcript",
-            "comments_list", "comments_banner_state", "resolve_project_design_doc",
-            "release_review_terminal", "kick_pr_reconcilers", "comments_get", "metrics_show_live",
-            "worker_pool_summary", "workspace_pool_summary", "find_work_items_by_pr", "tail_run_transcript",
-            "probe_status", "debug_live_status_pipeline",
-        ].contains(kind)
+        return userMutationKinds.contains(kind)
     }
     private var buffer = Data()
     /// Connection whose read loop is suspended by decode backpressure.
@@ -447,6 +463,23 @@ final class EngineClient: @unchecked Sendable {
             state.unsent.contains {
                 ((try? JSONSerialization.jsonObject(with: $0)) as? [String: Any])?["type"] as? String == kind
             }
+        }
+    }
+
+    /// Task ids whose drag (admission check or board move) is parked in the
+    /// unsent queue awaiting Retry, as opposed to in flight or settled.
+    func unsentDragTaskIDs() -> Set<String> {
+        ledger.withLock { state in
+            var ids = Set<String>()
+            for data in state.unsent {
+                guard let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+                switch payload["type"] as? String {
+                case "evaluate_dispatch_admission": if let id = payload["work_item_id"] as? String { ids.insert(id) }
+                case "move_work_item_on_board": if let id = payload["id"] as? String { ids.insert(id) }
+                default: break
+                }
+            }
+            return ids
         }
     }
 

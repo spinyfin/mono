@@ -64,6 +64,8 @@ final class CommentEngineBridge: CommentBackend {
     var guideCommentDrafts: GuideCommentDrafts? { draftStore }
     /// Told when the retry queue is full so the owner can surface the notice.
     var onSubmissionRejected: ((String) -> Void)?
+    /// Told when a submission is accepted, so a stale "not saved" notice clears.
+    var onSubmissionAccepted: (() -> Void)?
 
     /// Active registrations keyed by the layer's identity. Weak layer refs so a
     /// closed viewer deallocates; stale entries are pruned lazily on routing.
@@ -179,6 +181,7 @@ final class CommentEngineBridge: CommentBackend {
             onSubmissionRejected?(action)
             return false
         }
+        onSubmissionAccepted?()
         return true
     }
 

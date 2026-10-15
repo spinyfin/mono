@@ -266,6 +266,8 @@ final class PauseOverrideConfirmationTests: XCTestCase {
         // that reply can never clear the pending check in the expected
         // shape, so the card must bounce rather than strand in Doing.
         let model = makeModel()
+        // Connected, so the check is in flight rather than parked for Retry.
+        model.engine.simulateConnectedForTesting = true
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 

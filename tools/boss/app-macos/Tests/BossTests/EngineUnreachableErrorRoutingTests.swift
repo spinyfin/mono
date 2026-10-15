@@ -26,6 +26,58 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
         model.engine.sendLine(["type": "create_product", "name": "first-overflow"])
         try? await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertTrue(model.disconnectedActionNotice?.contains("was not saved") == true)
+        model.dismissDisconnectedActions()
+        XCTAssertFalse(model.disconnectedActionNotice?.contains("was not saved") == true, "Discard clears the overflow line")
+    }
+
+    func testAutomaticCommentsResolveIsNeverRetainedOrTracked() {
+        XCTAssertFalse(EngineClient.isUserMutation(["type": "comments_resolve"]))
+        let model = makeModel()
+        model.engine.sendLine(["type": "comments_resolve", "artifact_id": "a", "plain_text": "doc"])
+        XCTAssertEqual(model.engine.unsentActionCountForTesting, 0)
+        XCTAssertFalse(model.hasUnsentActions)
+        XCTAssertTrue(model.engine.uncertainActionsForTesting.isEmpty)
+    }
+
+    func testRawWireKindIsDescribedInNotSavedNotice() {
+        let model = makeModel()
+        model.applyEventForTest(.actionNotSaved(requestKind: "create_product"))
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("create product was not saved") == true)
+    }
+
+    private func parkDrag(_ model: ChatViewModel, taskID: String, retained: Bool) {
+        model.pendingDragAdmissionChecks[taskID] = .init(taskID: taskID, column: .doing, group: nil)
+        model.pendingMoveOriginByTaskID[taskID] = .backlog
+        model.optimisticColumnByTaskID[taskID] = .doing
+        if retained { model.engine.sendLine(["type": "evaluate_dispatch_admission", "work_item_id": taskID]) }
+    }
+
+    func testUnrelatedErrorDoesNotClearParkedDrag() {
+        let model = makeModel()
+        parkDrag(model, taskID: "t1", retained: true)
+        model.applyEventForTest(.error(message: "unrelated"))
+        XCTAssertNotNil(model.pendingDragAdmissionChecks["t1"])
+        XCTAssertTrue(model.engine.hasUnsentAction(kind: "evaluate_dispatch_admission"))
+    }
+
+    func testDisconnectBouncesOnlyInFlightDrag() {
+        let model = makeModel()
+        parkDrag(model, taskID: "parked", retained: true)
+        parkDrag(model, taskID: "inflight", retained: false)
+        model.applyEventForTest(.disconnected)
+        XCTAssertNotNil(model.pendingDragAdmissionChecks["parked"])
+        XCTAssertNil(model.pendingDragAdmissionChecks["inflight"])
+        XCTAssertNotNil(model.optimisticColumnByTaskID["parked"])
+        XCTAssertNil(model.optimisticColumnByTaskID["inflight"])
+    }
+
+    func testDiscardBouncesOnlyParkedDrag() {
+        let model = makeModel()
+        parkDrag(model, taskID: "parked", retained: true)
+        parkDrag(model, taskID: "inflight", retained: false)
+        model.dismissDisconnectedActions()
+        XCTAssertNil(model.pendingDragAdmissionChecks["parked"])
+        XCTAssertNotNil(model.pendingDragAdmissionChecks["inflight"])
     }
 
     /// `socket waiting:` is what `NWConnection`'s `.waiting` state
