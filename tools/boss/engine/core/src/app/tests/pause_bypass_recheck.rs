@@ -3,7 +3,7 @@
 //! status patch has already landed (the narrow window between the board-
 //! handler pre-check and `dispatch_with_pause_bypass`), the row must be
 //! reverted, no execution left behind, and the client answered with a
-//! `work_error` rather than a success `WorkItemUpdated`.
+//! `WorkItemRefused` rather than a success `WorkItemUpdated`.
 
 use super::*;
 use crate::app::work_items::{BoardDragPauseBypass, apply_work_item_patch};
@@ -37,7 +37,7 @@ async fn sole_response(sink: &SessionSink) -> FrontendEvent {
 /// to `active` first, then `dispatch_with_pause_bypass` refuses because the
 /// observed pause generation is stale. Asserts the three contracts the
 /// revert arm exists for: status is back at its previous value, no
-/// execution row was created, and the client receives a `work_error`.
+/// execution row was created, and the client receives a `WorkItemRefused`.
 #[tokio::test]
 async fn pause_bypass_recheck_refusal_reverts_status_and_answers_work_item_refused() {
     let (server_state, _dir) = test_server_state();

@@ -250,3 +250,42 @@ struct WorkFilterBanner: View {
 /// clipped — the recurring regression in #1172. Flowing the cluster instead
 /// constrains every chip to the lane width: the row grows downward rather
 /// than running off the side.
+
+/// Sheet for the "Add revision…" action on a refused board gesture: collects
+/// what should change and hands it to `onSubmit`. Holds no model reference so
+/// the card decides where the text goes.
+struct WorkRevisionComposer: View {
+    let taskName: String
+    let onSubmit: (String) -> Void
+    let onCancel: () -> Void
+
+    @State private var text = ""
+
+    private var trimmed: String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Add revision to \"\(taskName)\"")
+                .font(.headline)
+            Text("Describe what should change. The revision adds a commit to the existing PR.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextEditor(text: $text)
+                .font(.body)
+                .frame(minWidth: 360, minHeight: 120)
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.3)))
+                .accessibilityLabel("Revision description")
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Add Revision") { onSubmit(trimmed) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(trimmed.isEmpty)
+            }
+        }
+        .padding(16)
+    }
+}

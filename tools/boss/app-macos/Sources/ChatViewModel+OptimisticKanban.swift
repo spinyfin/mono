@@ -294,11 +294,14 @@ extension ChatViewModel {
         bounceBackOptimisticMoves(message: message, only: ids)
     }
 
-    /// Bounce all unconfirmed in-flight optimistic moves back to their origin
-    /// columns and surface an inline notice. Called when `work_error` arrives
-    /// while moves are pending, or when `workItemUpdated` reports an unexpected
-    /// status (engine silently rejected the transition).
-    /// Parked drags are excluded unless explicitly selected.
+    /// Bounce unconfirmed in-flight optimistic moves back to their origin
+    /// columns and surface an inline notice. With a `taskID` (the engine
+    /// named the card it refused) only that card is bounced — other cards'
+    /// moves are still in flight and unaffected. Without one (an error that
+    /// cannot be attributed to a card: `work_error` while moves are pending,
+    /// or `workItemUpdated` reporting an unexpected status) every pending
+    /// move is bounced, except drags parked for Retry unless explicitly
+    /// selected with `only`.
     /// Returns whether any card was bounced, so a caller can fall back to a
     /// modal error when nothing was eligible (e.g. only parked drags pending).
     @discardableResult
@@ -309,22 +312,29 @@ extension ChatViewModel {
         code: String? = nil,
         suggestedAction: String? = nil
     ) -> Bool {
-        guard !pendingMoveOriginByTaskID.isEmpty else { return false }
-        let selected = only ?? Set(pendingMoveOriginByTaskID.keys).subtracting(engine.unsentDragTaskIDs())
-        let bouncedIDs = pendingMoveOriginByTaskID.keys.filter { selected.contains($0) }
-        guard !bouncedIDs.isEmpty else { return false }
+        let bouncedIDs: [String]
+        if let taskID {
+            bouncedIDs = pendingMoveOriginByTaskID[taskID] != nil ? [taskID] : []
+        } else {
+            guard !pendingMoveOriginByTaskID.isEmpty else { return false }
+            let selected = only ?? Set(pendingMoveOriginByTaskID.keys).subtracting(engine.unsentDragTaskIDs())
+            bouncedIDs = pendingMoveOriginByTaskID.keys.filter { selected.contains($0) }
+            guard !bouncedIDs.isEmpty else { return false }
+        }
         for id in bouncedIDs {
             optimisticColumnByTaskID.removeValue(forKey: id)
             pendingMoveOriginByTaskID.removeValue(forKey: id)
         }
-        invalidateWorkCache()
+        if !bouncedIDs.isEmpty {
+            invalidateWorkCache()
+        }
         if let noticeID = taskID ?? bouncedIDs.first, let message {
             dragRefusalNotice = DragRefusalNotice(
                 taskID: noticeID, message: message, code: code, suggestedAction: suggestedAction
             )
             scheduleDragRefusalDismiss(for: noticeID)
         }
-        return true
+        return !bouncedIDs.isEmpty
     }
 
     /// Reply handler for `.workItemRefused`: the engine refused or reverted a
@@ -334,21 +344,28 @@ extension ChatViewModel {
     func handleWorkItemRefused(id: String, code: String, message: String, suggestedAction: String?) {
         pendingDragAdmissionChecks[id] = nil
         bounceBackOptimisticMoves(message: message, taskID: id, code: code, suggestedAction: suggestedAction)
-        if dragRefusalNotice?.taskID != id || dragRefusalNotice?.message != message {
-            // No optimistic move was pending (nothing to bounce); still surface it.
-            dragRefusalNotice = DragRefusalNotice(
-                taskID: id, message: message, code: code, suggestedAction: suggestedAction
-            )
-            scheduleDragRefusalDismiss(for: id)
-        }
     }
 
-    /// Follow the engine's suggested next step from a refusal notice. The app
-    /// has no in-place revision composer, so `add_revision` opens the card,
-    /// where its PR and revisions live.
+    /// Follow the engine's suggested next step from a refusal notice.
+    /// `add_revision` opens the revision composer for the refused card.
     func performDragRefusalAction(_ notice: DragRefusalNotice) {
-        selectWorkCard(notice.taskID)
+        if notice.suggestedAction == "add_revision" {
+            revisionComposerTaskID = notice.taskID
+        }
         clearDragRefusal()
+    }
+
+    /// File the revision typed into the composer against its parent card.
+    /// Blank text is ignored (the composer keeps its Create button disabled).
+    func submitRevision(parentTaskID: String, description: String) {
+        let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        engine.sendCreateRevision(parentTaskId: parentTaskID, description: trimmed)
+        revisionComposerTaskID = nil
+    }
+
+    func cancelRevisionComposer() {
+        revisionComposerTaskID = nil
     }
 
     /// After the engine's work tree arrives and `tasksByProjectID` reflects

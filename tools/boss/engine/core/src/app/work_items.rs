@@ -582,16 +582,13 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
                 {
                     Ok(admission) => admission,
                     Err(err) => {
-                        let refusal = BoardRefusal::new(BoardRefusalCode::PauseOverrideRefused, err);
+                        let refusal = BoardRefusal::pause_override(&ctx.work_db, &id, format!("{err:#}"));
                         send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
                         return;
                     }
                 };
                 if let Err(reason) = pause_bypass_decision(&admission, observed_pause_since_epoch_s) {
-                    let refusal = BoardRefusal::new(
-                        BoardRefusalCode::PauseOverrideRefused,
-                        format!("cannot start {id}: {reason}"),
-                    );
+                    let refusal = BoardRefusal::pause_override(&ctx.work_db, &id, reason);
                     send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
                     return;
                 }
@@ -689,8 +686,9 @@ pub(super) async fn apply_work_item_patch(
         // `UpdateWorkItem` outright instead of letting the
         // status flip land and then swallowing the dispatch
         // error in a `WARN`. The card stays in its previous
-        // column and the user sees a `WorkError` toast naming
-        // the missing repo. Skips when an existing non-terminal
+        // column and the user sees a refusal naming the missing
+        // repo (a `WorkItemRefused` for a board gesture, a
+        // `WorkError` for every other caller). Skips when an existing non-terminal
         // execution would already own the dispatch slot —
         // there's no point validating a code path we won't run.
         let intends_active_transition = patch.status.as_deref() == Some("active")
@@ -1166,7 +1164,7 @@ pub(super) async fn apply_work_item_patch(
                 }
             }
             Err(err) => {
-                let refusal = BoardRefusal::new(BoardRefusalCode::UpdateRejected, format!("{err:#}"));
+                let refusal = BoardRefusal::from_update_error(&work_db, &id, &err);
                 send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             }
         }
