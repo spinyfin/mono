@@ -162,6 +162,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         ClearedBy::ProducerReconciles,
         "The bookmark sweep resolves this signal when the execution has no remaining unpublished work.",
     ),
+    entry(
+        crate::execution_bookmark_recovery::RECOVERY_RETIRED,
+        ClearedBy::HumanDecision,
+        "The engine already started the item fresh; the superseded commits it names stay in the shared store until a human inspects or discards them, which no later run can prove happened.",
+    ),
     // ── Cleared by work resuming ────────────────────────────────────────
     entry(
         crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND,
@@ -712,6 +717,7 @@ mod tests {
             crate::abandoned_branch_pr_sweep::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,
             crate::execution_bookmark_recovery::CREATE_FAILED,
             crate::execution_bookmark_recovery::RECOVERY_FAILED,
+            crate::execution_bookmark_recovery::RECOVERY_RETIRED,
             crate::abandoned_execution_bookmarks::RECOVERABLE_WORK,
             crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND,
             crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND,

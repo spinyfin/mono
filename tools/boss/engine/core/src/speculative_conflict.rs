@@ -262,7 +262,7 @@ async fn check_one(work_db: &WorkDb, cube_client: &dyn CubeClient, metrics: &Reg
 /// engine-direct rebase, and record the outcome. Split out so the caller
 /// can release the lease unconditionally regardless of which branch this
 /// returns from.
-async fn run_in_lease(
+pub(crate) async fn run_in_lease(
     work_db: &WorkDb,
     cube_client: &dyn CubeClient,
     metrics: &Registry,
@@ -270,7 +270,9 @@ async fn run_in_lease(
     pr_number: u64,
     workspace_path: &Path,
 ) {
+    let saved = work_db.snapshot_rebase_pointers(&candidate.work_item_id).await;
     if let Err(err) = cube_client.goto_workspace(workspace_path, pr_number).await {
+        work_db.restore_rebase_pointers(&saved).await;
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
             pr = pr_number,
@@ -283,6 +285,7 @@ async fn run_in_lease(
     let rebase = match cube_client.rebase_workspace_no_push(workspace_path, pr_number).await {
         Ok(outcome) => outcome,
         Err(err) => {
+            work_db.restore_rebase_pointers(&saved).await;
             // Includes the default trait-method error on any `CubeClient`
             // that hasn't implemented the no-push rebase — expected and
             // silent-ish (debug, not warn) for every test double and for
@@ -296,6 +299,8 @@ async fn run_in_lease(
             return;
         }
     };
+
+    work_db.restore_rebase_pointers(&saved).await;
 
     if rebase.clean {
         SPECULATIVE_CONFLICT_CLEAN.inc(metrics);

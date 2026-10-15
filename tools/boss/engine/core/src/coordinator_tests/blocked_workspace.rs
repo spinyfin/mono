@@ -1,6 +1,6 @@
 use super::helpers::*;
 
-fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecution, WorkExecution) {
+pub(super) fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecution, WorkExecution) {
     let db = Arc::new(WorkDb::open(path.to_path_buf()).unwrap());
     let product = create_test_product(&db);
     let chore = create_test_chore_manual(&db, product.id, "Blocked revision");
@@ -184,7 +184,7 @@ async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
             dirty_verified,
         };
         let recovered = coordinator
-            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None)
+            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, None)
             .await
             .unwrap();
         assert!(recovered.is_none());
@@ -240,7 +240,7 @@ async fn self_retry_with_deleted_own_heads_drops_the_stale_row_and_continues() {
         dirty_verified: None,
     };
     let recovered = coordinator
-        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None)
+        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, None)
         .await
         .unwrap();
     assert!(recovered.is_none());
@@ -350,7 +350,7 @@ async fn non_implementation_with_deleted_predecessor_heads_continues_without_rec
         dirty_verified: None,
     };
     let recovered = coordinator
-        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None)
+        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", None, None)
         .await
         .unwrap();
     assert!(recovered.is_none());
@@ -476,6 +476,168 @@ async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_wo
         );
         assert!(cube.create_calls.lock().await.is_empty());
         assert!(cube.lease_calls.lock().await[0].1.starts_with(&format!("{} ", next.id)));
+    }
+}
+
+/// Dispatch against a predecessor whose baseline bookmark is gone and whose
+/// record predates the baseline commit (MissingBaseline). With the PR head carrying
+/// the work, dispatch resumes from it; otherwise it retires the record,
+/// files attention, and starts fresh instead of wedging on every attempt.
+#[tokio::test]
+async fn blocked_revision_dispatch_resumes_from_pr_head_or_retires_an_unvouched_pointer() {
+    for pr_carries_work in [true, false] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        let (db, prior, next) = blocked_pair(&path);
+        seed_local_claude_driver(&db);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET pr_url = 'https://github.com/spinyfin/mono/pull/99' WHERE id = ?1",
+                [&next.id],
+            )
+            .unwrap();
+        let next = db.get_execution(&next.id).unwrap();
+        use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+        use boss_engine_test_git::jj::JjRepo;
+        let repo = JjRepo::new(dir.path());
+        super::recovery::configure_recovery_origin(&repo.repo);
+        JjRepo::run(&repo.repo, &["bookmark", "set", "pr/99", "-r", "main"]);
+        let record = create(&LocalJj, &repo.worker, &prior.id, "local").await.unwrap();
+        db.record_execution_bookmark(&record).unwrap();
+        std::fs::write(repo.worker.join("revision.txt"), "unpushed revision").unwrap();
+        JjRepo::run(&repo.worker, &["describe", "-m", "Revision work"]);
+        let work = JjRepo::run(
+            &repo.repo,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("bookmarks(exact:\"boss-recovery/{}\")", prior.id),
+                "-T",
+                "commit_id",
+            ],
+        );
+        // A record from before the baseline commit was recorded, whose
+        // bookmark a worker's `jj abandon` took with it.
+        JjRepo::run(&repo.repo, &["bookmark", "delete", &record.base()]);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE execution_bookmarks SET base_commit = NULL WHERE execution_id = ?1",
+                [&prior.id],
+            )
+            .unwrap();
+        if pr_carries_work {
+            JjRepo::run(
+                &repo.repo,
+                &["bookmark", "set", "pr/99", "-r", &work, "--allow-backwards"],
+            );
+        }
+        let cube = Arc::new(FakeCubeClient {
+            workspace_root: Some(dir.path().to_path_buf()),
+            next_workspace_id: Mutex::new(Some("replacement".into())),
+            real_bookmarks: true,
+            ..FakeCubeClient::default()
+        });
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner,
+        ));
+        let worker = coordinator
+            .pool_for_execution(&next)
+            .claim_worker(&next.id, None)
+            .await
+            .unwrap();
+        coordinator
+            .schedule_execution(&next, &worker, DispatchAdmission::Queued)
+            .await
+            .unwrap();
+        assert!(
+            !cube.goto_calls.lock().await.is_empty(),
+            "the bound PR is resolved before reconciling"
+        );
+        let heads_exist = JjRepo::run(
+            &repo.repo,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "list",
+                "-T",
+                "name ++ \"\\n\"",
+                &record.head(),
+            ],
+        );
+        let retired_attention: Vec<_> = db
+            .list_attention_items(&prior.id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
+            .collect();
+        if pr_carries_work {
+            assert_eq!(
+                db.bookmark_recovery(&next.id).unwrap(),
+                Some((prior.id.clone(), false)),
+                "the work is in the PR"
+            );
+            let note = db
+                .bookmark_reconciliation_note(&next.id)
+                .unwrap()
+                .expect("reconciliation note stored");
+            assert!(note.contains("resumed from the PR head `pr/99`"), "{note}");
+            assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+            assert!(retired_attention.is_empty());
+            let base = JjRepo::run(
+                &repo.repo,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("bookmarks(exact:\"{}\")", record.base()),
+                    "-T",
+                    "commit_id",
+                ],
+            );
+            assert_eq!(base, work, "the baseline was rebuilt at the PR head");
+        } else {
+            assert_eq!(
+                db.bookmark_recovery(&next.id).unwrap(),
+                None,
+                "a fresh start recovers nothing"
+            );
+            assert!(db.bookmark_reconciliation_note(&next.id).unwrap().is_none());
+            assert!(
+                db.execution_bookmark_optional(&prior.id).unwrap().is_none(),
+                "the record is no longer a recovery source"
+            );
+            let reason = db
+                .execution_bookmark_retired_reason(&prior.id)
+                .unwrap()
+                .expect("retired");
+            assert!(
+                reason.contains("found 0") && reason.contains("Revision work"),
+                "{reason}"
+            );
+            assert_eq!(retired_attention.len(), 1, "{retired_attention:?}");
+            assert!(retired_attention[0].body_markdown.contains(&next.id));
+            assert!(
+                heads_exist.lines().any(|l| l == record.head()),
+                "a predecessor's pointers stay for inspection"
+            );
+            assert!(db.execution_restore_report(&next.id).unwrap().is_none());
+        }
+        assert!(
+            db.execution_bookmark_optional(&next.id).unwrap().is_some(),
+            "the new run has its own pointers"
+        );
     }
 }
 
@@ -963,7 +1125,7 @@ async fn revision_recovery_selects_the_repo_by_id_not_by_stored_url() {
         };
         let recovered = h
             .coordinator
-            .recover_execution_bookmark(&h.next, &lease, &h.coordinator.host_adapter, "mono", Some(99))
+            .recover_execution_bookmark(&h.next, &lease, &h.coordinator.host_adapter, "mono", Some(99), Some(99))
             .await
             .unwrap();
         assert!(recovered.is_some(), "{spelling}");

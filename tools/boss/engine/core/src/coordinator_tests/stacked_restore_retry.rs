@@ -14,6 +14,20 @@ struct FlakyRestoreAdapter {
 
 #[async_trait]
 impl HostAdapter for FlakyRestoreAdapter {
+    async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
+        self.inner.checkpoint_execution_baseline(record).await
+    }
+
+    async fn prepare_recovery_pr(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        repo_id: &str,
+        pr: u64,
+    ) -> Result<bool> {
+        self.inner.prepare_recovery_pr(record, workspace, repo_id, pr).await
+    }
+
     async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
         self.inner.recovery_pr_base(origin, pr).await
     }
@@ -150,7 +164,7 @@ async fn transient_restore_failure_keeps_the_stacked_parent_base_on_retry() {
     // fallback restage onto main.
     let err = h
         .coordinator
-        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99))
+        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
         .await
         .expect_err("a transient restore failure must propagate, not fall back");
     assert!(
@@ -170,7 +184,7 @@ async fn transient_restore_failure_keeps_the_stacked_parent_base_on_retry() {
 
     // The retry restages onto the same parent and keeps the preserved work.
     h.coordinator
-        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99))
+        .recover_execution_bookmark(&h.next, &lease, &adapter, "mono", Some(99), Some(99))
         .await
         .unwrap();
     let report = h

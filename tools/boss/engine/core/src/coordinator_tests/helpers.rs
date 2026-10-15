@@ -111,6 +111,8 @@ pub(super) struct FakeCubeClient {
     pub(super) real_bookmarks: bool,
     pub(super) bookmark_calls: Mutex<Vec<String>>,
     pub(super) fail_goto: bool,
+    pub(super) closed_pr: bool,
+    pub(super) goto_reset_bookmark: Option<String>,
     /// Make `recovery_pr_base` fail, as for a non-GitHub origin or a deleted PR base.
     pub(super) fail_pr_base: AtomicBool,
     /// Base branch `recovery_pr_base` reports; defaults to `main`.
@@ -276,8 +278,14 @@ crate::stub_cube_client! { FakeCubeClient {
             .lock()
             .await
             .push((workspace_path.display().to_string(), pr));
+        if self.closed_pr {
+            return Err(anyhow!("unexpected goto of a closed PR"));
+        }
         if self.fail_goto {
             return Err(anyhow!("cube workspace goto failed"));
+        }
+        if let Some(bookmark) = &self.goto_reset_bookmark {
+            boss_engine_test_git::jj::JjRepo::run(workspace_path, &["bookmark", "set", bookmark, "-r", &format!("pr/{pr}"), "--allow-backwards"]);
         }
         Ok(())
     }
@@ -355,6 +363,9 @@ crate::stub_cube_client! { FakeCubeClient {
         Ok(repos)
     }
     async fn recovery_pr_base(&self, _origin: &str, _pr: u64) -> Result<String> {
+        if self.closed_pr {
+            return Err(crate::host_adapter::closed_recovery_pr_error());
+        }
         if self.fail_pr_base.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(boss_engine_recovery::execution_bookmark::base_unresolvable_error("PR base unavailable"));
         }
@@ -369,7 +380,7 @@ crate::stub_cube_client! { FakeCubeClient {
             ).await;
         }
         Ok(boss_engine_recovery::execution_bookmark::ExecutionBookmark {
-            execution_id: execution_id.to_owned(), repo_path: workspace.to_path_buf(), host_id: "local".to_owned(),
+            execution_id: execution_id.to_owned(), repo_path: workspace.to_path_buf(), host_id: "local".to_owned(), base_commit: None,
         })
     }
 } }

@@ -10,6 +10,9 @@ use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution};
 
 pub(crate) const RECOVERY_FAILED: &str = "execution_bookmark_recovery_failed";
 pub(crate) const CREATE_FAILED: &str = "execution_bookmark_create_failed";
+/// The engine retired a recovery record whose baseline was gone and whose
+/// heads nothing it recorded could vouch for, and started the item fresh.
+pub(crate) const RECOVERY_RETIRED: &str = "execution_bookmark_recovery_retired";
 
 pub(crate) fn worker_instructions(execution: &WorkExecution) -> String {
     let bookmark = format!("boss-recovery/{}", execution.id);
@@ -20,15 +23,21 @@ pub(crate) fn worker_instructions(execution: &WorkExecution) -> String {
     text
 }
 
+/// `reconciliation_note` is the persisted [`Reconciliation::note`] when
+/// dispatch had to re-anchor the preserved pointers before recovering them.
+///
+/// [`Reconciliation::note`]: boss_engine_recovery::execution_bookmark::Reconciliation::note
 pub(crate) fn recovery_instructions(
     recovery: Option<&(String, bool)>,
     report: Option<&boss_engine_recovery::execution_bookmark::RestoreReport>,
+    reconciliation_note: Option<&str>,
 ) -> String {
+    let note = reconciliation_note.unwrap_or_default();
     if let Some(report) = report {
-        return report.instructions();
+        return format!("{}{note}", report.instructions());
     }
     let Some((predecessor, has_work)) = recovery else {
-        return String::new();
+        return note.to_owned();
     };
     let state = if *has_work {
         "Unpublished changes and their history were recovered into this lease. Stay at `@`; do not reset or repeat PR checkout instructions."
@@ -36,7 +45,7 @@ pub(crate) fn recovery_instructions(
         "The predecessor has no unpublished changes to recover. The engine positioned this lease normally."
     };
     format!(
-        "## EXECUTION BOOKMARK RECOVERY\n\nThe engine resolved predecessor `{predecessor}` through its recorded bookmark in the shared jj store. {state} The old workspace was not used. Inspect `jj status`, `jj diff --stat`, and the inherited history. Re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n"
+        "## EXECUTION BOOKMARK RECOVERY\n\nThe engine resolved predecessor `{predecessor}` through its recorded bookmark in the shared jj store. {state} The old workspace was not used. Inspect `jj status`, `jj diff --stat`, and the inherited history. Re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n{note}"
     )
 }
 
