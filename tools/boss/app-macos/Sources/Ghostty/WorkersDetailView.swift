@@ -77,10 +77,14 @@ struct WorkersDetailView: View, @MainActor Equatable {
                     .foregroundStyle(.orange)
                     .help("The engine feed is disconnected. Membership is the last accepted snapshot.")
             }
+            filterMenus
             if grid.layout.selectorsVisible {
                 pageSelectors
             }
             Spacer(minLength: 8)
+            if grid.layout.filter.isActive {
+                hiddenSummary
+            }
             if grid.layout.waitingCount > 0 {
                 Text("Needs input \(grid.layout.waitingCount)")
                     .font(.caption.weight(.medium))
@@ -99,6 +103,59 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var filterMenus: some View {
+        HStack(spacing: 6) {
+            Menu {
+                ForEach(grid.projectOptions, id: \.self) { project in
+                    Toggle(grid.projectLabel(project), isOn: Binding(
+                        get: { grid.layout.filter.projects?.contains(project) ?? false },
+                        set: { _ in grid.toggleProject(project) }
+                    ))
+                }
+            } label: {
+                Text(filterTitle("Project", count: grid.layout.filter.projects?.count))
+            }
+            Menu {
+                ForEach(grid.typeOptions, id: \.self) { type in
+                    Toggle(type.badgeLabel, isOn: Binding(
+                        get: { grid.layout.filter.types?.contains(type) ?? false },
+                        set: { _ in grid.toggleType(type) }
+                    ))
+                }
+            } label: {
+                Text(filterTitle("Type", count: grid.layout.filter.types?.count))
+            }
+            if grid.layout.filter.isActive {
+                Button("Clear") { grid.clearFilter(); refreshSnapshots() }
+                    .help("Show all agents again.")
+            }
+        }
+        .font(.caption)
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    private func filterTitle(_ name: String, count: Int?) -> String {
+        guard let count else { return "\(name): All" }
+        return "\(name): \(count)"
+    }
+
+    /// Hidden agents keep running and streaming; a hidden agent that needs
+    /// input is called out so a filter cannot bury it.
+    private var hiddenSummary: some View {
+        HStack(spacing: 6) {
+            Text("\(grid.layout.hiddenCount) hidden")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if grid.layout.hiddenWaitingCount > 0 {
+                Text("\(grid.layout.hiddenWaitingCount) need input")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .help("Filtered-out agents are still running; filtering only changes what is shown.")
     }
 
     private var pageSelectors: some View {
@@ -181,7 +238,8 @@ struct WorkersDetailView: View, @MainActor Equatable {
                     .frame(maxWidth: 220, maxHeight: 240)
                     .opacity(0.85)
             }
-            Text("No agents running")
+            Text(grid.layout.filter.isActive && grid.layout.hiddenCount > 0
+                ? "No agents match the filter" : "No agents running")
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(Color.white.opacity(0.85))
             Text(TrekIdleFlavor.line(for: character, cycle: emptyFlavorCycle))

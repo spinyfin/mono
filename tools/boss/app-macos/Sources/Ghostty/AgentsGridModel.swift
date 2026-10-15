@@ -3,7 +3,8 @@ import PaneLayout
 
 /// Joins engine local membership with the run-keyed viewer map and drives
 /// `PaneLayoutModel`. Cell, page, and order stay app-local; run id is
-/// identity. Filters stay `.all` here — filter controls are a later task.
+/// identity. The project/type filter starts at `.all` on every launch (this
+/// model is created fresh with the view) and is never persisted.
 @MainActor
 final class AgentsGridModel: ObservableObject {
     static let geometryQuietInterval: TimeInterval = 0.3
@@ -19,6 +20,10 @@ final class AgentsGridModel: ObservableObject {
         viewers.values.filter { $0.session != nil && !placedRunIds(in: layout).contains($0.runId ?? "") }
             .sorted { $0.slotId < $1.slotId }
     }
+    /// Display names for projects seen on live members, keyed by project id.
+    @Published private(set) var projectNames: [String: String] = [:]
+    /// Projects with at least one live local member, in display order.
+    @Published private(set) var memberProjects: [AgentProject] = []
     private var inLiveResize = false
 
     private var personaByRun: [String: String] = [:]
@@ -56,6 +61,57 @@ final class AgentsGridModel: ObservableObject {
         replaceLayout { $0.tidy() }
     }
 
+    // MARK: - Filters
+
+    /// Project choices: projects with live members, any project still checked
+    /// (so it can be unchecked), and always Unfiled. Unfiled sorts last.
+    var projectOptions: [AgentProject] {
+        var options = Set(memberProjects)
+        options.formUnion(layout.filter.projects ?? [])
+        options.insert(.unfiled)
+        return options.sorted { lhs, rhs in
+            switch (lhs, rhs) {
+            case (.unfiled, .unfiled): return false
+            case (.unfiled, _): return false
+            case (_, .unfiled): return true
+            default: return projectLabel(lhs).localizedCaseInsensitiveCompare(projectLabel(rhs)) == .orderedAscending
+            }
+        }
+    }
+
+    /// Every badge type is offered, including Unknown, so a worker with a
+    /// missing or unrecognised wire type can always be filtered to.
+    var typeOptions: [AgentType] { AgentType.allCases }
+
+    func projectLabel(_ project: AgentProject) -> String {
+        switch project {
+        case .unfiled: return "Unfiled"
+        case .project(let id): return projectNames[id].flatMap { $0.isEmpty ? nil : $0 } ?? id
+        }
+    }
+
+    func toggleProject(_ project: AgentProject) {
+        var next = layout.filter
+        next.toggle(project: project)
+        setFilter(next)
+    }
+
+    func toggleType(_ type: AgentType) {
+        var next = layout.filter
+        next.toggle(type: type)
+        setFilter(next)
+    }
+
+    func clearFilter() {
+        setFilter(.all)
+    }
+
+    /// A filter change ends the layout epoch. It only changes which members
+    /// get cells; viewers, membership and execution are untouched.
+    func setFilter(_ filter: PaneFilter) {
+        replaceLayout { $0.setFilter(filter) }
+    }
+
     func setFocusedRun(_ runId: String?) {
         replaceLayout { $0.setFocusedRun(runId) }
     }
@@ -81,6 +137,16 @@ final class AgentsGridModel: ObservableObject {
                 personaByRun[state.runId] = name
             }
         }
+
+        var names: [String: String] = [:]
+        for state in local {
+            if let id = state.projectId, !id.isEmpty, let name = state.projectName, !name.isEmpty {
+                names[id] = name
+            }
+        }
+        if projectNames != names { projectNames = names }
+        let projects = Array(Set(local.map(\.agentProject)))
+        if Set(memberProjects) != Set(projects) { memberProjects = projects }
 
         let members = local.map { state in
             PaneMember(

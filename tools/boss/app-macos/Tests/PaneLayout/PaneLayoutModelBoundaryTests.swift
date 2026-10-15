@@ -91,6 +91,24 @@ final class PaneLayoutModelBoundaryTests: XCTestCase {
         XCTAssertTrue(model.filter.isActive)
     }
 
+    func testToggleBuildsMultiSelectAndLastUncheckReturnsToAll() {
+        let alpha = AgentProject.project(id: "alpha")
+        var filter = PaneFilter.all
+        filter.toggle(project: alpha)
+        filter.toggle(project: .unfiled)
+        XCTAssertEqual(filter.projects, [alpha, .unfiled])
+        filter.toggle(project: alpha)
+        filter.toggle(project: .unfiled)
+        XCTAssertNil(filter.projects)
+        XCTAssertFalse(filter.isActive)
+
+        filter.toggle(type: .unknown)
+        XCTAssertEqual(filter.types, [.unknown])
+        XCTAssertTrue(filter.isActive)
+        filter.toggle(type: .unknown)
+        XCTAssertEqual(filter, .all)
+    }
+
     func testPaginationFollowsTheFilteredSetNotTheTotal() {
         var model = F.model()
         let fleet = (0...11).map { F.member($0, project: $0 < 3 ? alpha : beta) }

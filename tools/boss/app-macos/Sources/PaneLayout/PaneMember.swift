@@ -91,6 +91,22 @@ public struct PaneFilter: Equatable, Sendable {
 
     public var isActive: Bool { projects != nil || types != nil }
 
+    /// Checks or unchecks one project. Unchecking the last one returns the
+    /// dimension to "all".
+    public mutating func toggle(project: AgentProject) {
+        var set = projects ?? []
+        if set.contains(project) { set.remove(project) } else { set.insert(project) }
+        projects = set.isEmpty ? nil : set
+    }
+
+    /// Checks or unchecks one type. Unchecking the last one returns the
+    /// dimension to "all".
+    public mutating func toggle(type: AgentType) {
+        var set = types ?? []
+        if set.contains(type) { set.remove(type) } else { set.insert(type) }
+        types = set.isEmpty ? nil : set
+    }
+
     public func admits(_ member: PaneMember) -> Bool {
         if let projects, !projects.contains(member.project) { return false }
         if let types, !types.contains(member.type) { return false }
