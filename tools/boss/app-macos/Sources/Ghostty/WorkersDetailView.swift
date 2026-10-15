@@ -160,6 +160,9 @@ struct WorkersDetailView: View, @MainActor Equatable {
 
     private var pageSelectors: some View {
         HStack(spacing: 6) {
+            Text("Page:")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             ForEach(grid.layout.pageSelectors, id: \.index) { selector in
                 AgentPageSelectorChip(
                     selector: selector,
@@ -173,9 +176,10 @@ struct WorkersDetailView: View, @MainActor Equatable {
 
     // A single flat collection owns surfaces for their entire attached lifetime.
     private var paneArea: some View {
-        GeometryReader { geo in
+        let layout = grid.layout
+        return GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                AgentSurfaceCollection(runIds: renderRunIds, placement: { placement(for: $0, area: geo.size) }) { runId in
+                AgentSurfaceCollection(runIds: renderRunIds, layout: layout, area: geo.size) { runId in
                     let snapshot = renderSnapshot(runId: runId)
                     WorkerSlotView(
                         runtime: workspace.runtime,
@@ -202,27 +206,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
             return cached
         }
         return snapshot(runId: runId, isPlaceholder: false)
-    }
-
-    private func placement(for runId: String, area: CGSize) -> (frame: CGRect, visible: Bool) {
-        for page in grid.layout.pages {
-            for cell in page.cells {
-                let id: String?
-                switch cell.content {
-                case .occupied(let member): id = member.runId
-                case .placeholder(let run): id = run
-                case .empty: id = nil
-                }
-                if id == runId {
-                    let width = max(1, (area.width - CGFloat(page.shape.columns - 1)) / CGFloat(page.shape.columns))
-                    let height = max(1, (area.height - CGFloat(page.shape.rows - 1)) / CGFloat(page.shape.rows))
-                    let position = page.shape.position(ofLocalIndex: cell.localIndex)
-                    return (CGRect(x: CGFloat(position.column) * (width + 1), y: CGFloat(position.row) * (height + 1), width: width, height: height), page.index == grid.layout.selectedPage)
-                }
-            }
-        }
-        // Unplaced viewers still need a usable terminal size.
-        return (CGRect(x: 0, y: 0, width: max(420, area.width), height: max(356, area.height)), false)
     }
 
     private var emptyState: some View {
@@ -346,6 +329,8 @@ private struct AgentPageSelectorChip: View {
             HStack(spacing: 4) {
                 Text(pageLabel)
                     .font(.caption.weight(.semibold))
+                Text("·")
+                    .foregroundStyle(.secondary)
                 Text(occupiedLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -370,7 +355,9 @@ private struct AgentPageSelectorChip: View {
     }
 
     private var pageLabel: String { String(selector.index + 1) }
-    private var occupiedLabel: String { String(selector.occupiedCount) }
+    private var occupiedLabel: String {
+        "\(selector.occupiedCount) \(selector.occupiedCount == 1 ? "Agent" : "Agents")"
+    }
 }
 
 private struct AgentsPaneSizeKey: PreferenceKey {
