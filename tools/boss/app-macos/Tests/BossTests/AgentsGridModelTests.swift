@@ -429,7 +429,7 @@ final class AgentsGridModelTests: XCTestCase {
             makeState(runId: "c", slotId: 3, agentType: "mystery"),
         ]
         grid.apply(states: states, viewers: workspace.viewersByRunId, interactivePoolSize: 16,
-                   automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false)
+                   automationPoolSize: 8, reviewPoolSize: 16)
         XCTAssertFalse(grid.layout.filter.isActive)
         XCTAssertEqual(grid.projectOptions, [.project(id: "p1"), .project(id: "p2"), .unfiled])
         XCTAssertEqual(grid.projectLabel(.project(id: "p2")), "Beta")
@@ -442,7 +442,12 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertEqual(grid.layout.hiddenWaitingCount, 1)
         // Hidden runs keep their mounted viewers; they are just unplaced.
         for (run, session) in sessions { XCTAssertTrue(workspace.viewersByRunId[run]?.session === session) }
-        XCTAssertEqual(Set(grid.unplacedViewers.compactMap(\.runId)), ["b", "c"])
+        let mounted = grid.renderRunIds(attached: workspace.viewersByRunId.keys)
+        XCTAssertEqual(mounted, ["a", "b", "c"])
+        XCTAssertEqual(Set(mounted.filter { grid.layout.logicalCellIndex(ofRun: $0) == nil }), ["b", "c"])
+        for run in ["b", "c"] {
+            XCTAssertFalse(grid.placement(for: run, area: CGSize(width: 800, height: 600)).visible)
+        }
 
         grid.clearFilter()
         grid.toggleProject(.unfiled)
@@ -455,7 +460,10 @@ final class AgentsGridModelTests: XCTestCase {
 
         grid.clearFilter()
         XCTAssertEqual(grid.layout.visibleCount, 3)
-        XCTAssertTrue(grid.unplacedViewers.isEmpty)
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["a", "b", "c"])
+        for run in ["a", "b", "c"] {
+            XCTAssertNotNil(grid.layout.logicalCellIndex(ofRun: run))
+        }
     }
 
     func testFilterStartsAtAllOnEveryNewModel() {
