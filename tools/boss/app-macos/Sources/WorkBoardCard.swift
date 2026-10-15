@@ -293,7 +293,7 @@ struct WorkBoardCardItem: View {
             if let dragRefusal {
                 WorkDragRefusalBanner(
                     message: dragRefusal.message,
-                    actionTitle: dragRefusal.suggestedAction == "add_revision" ? "Open card" : nil,
+                    actionTitle: dragRefusal.suggestedAction == "add_revision" ? "Add revision…" : nil,
                     onAction: { model.performDragRefusalAction(dragRefusal) }
                 ) {
                     model.clearDragRefusal()
@@ -305,6 +305,20 @@ struct WorkBoardCardItem: View {
                     model.clearMergeFeedback()
                 }
             }
+        }
+        .sheet(isPresented: Binding(
+            get: { model.revisionComposerTaskID == task.id },
+            set: { presented in
+                if !presented, model.revisionComposerTaskID == task.id {
+                    model.cancelRevisionComposer()
+                }
+            }
+        )) {
+            WorkRevisionComposer(
+                taskName: task.name,
+                onSubmit: { model.submitRevision(parentTaskID: task.id, description: $0) },
+                onCancel: { model.cancelRevisionComposer() }
+            )
         }
         .onAppear { logDocLinkState("appeared") }
         .onChange(of: task.prURL) { _, _ in logDocLinkState("prURL-changed") }

@@ -733,11 +733,25 @@ extension EngineClient {
         ])
     }
 
-    func sendReorderProjectTasks(projectId: String, taskIds: [String]) {
+    /// Returns the envelope request id so a `work_error` reply can be
+    /// correlated back to the card whose Move Up/Down produced it.
+    @discardableResult
+    func sendReorderProjectTasks(projectId: String, taskIds: [String]) -> String? {
         sendLine([
             "type": "reorder_project_tasks",
             "project_id": projectId,
             "task_ids": taskIds,
+        ])
+    }
+
+    /// File a revision on `parentTaskId`'s open PR. The worker's deliverable
+    /// is a new commit on the parent's PR branch, not a new PR.
+    func sendCreateRevision(parentTaskId: String, description: String) {
+        sendLine([
+            "type": "create_revision",
+            "parent_task_id": parentTaskId,
+            "description": description,
+            "created_via": "operator",
         ])
     }
 

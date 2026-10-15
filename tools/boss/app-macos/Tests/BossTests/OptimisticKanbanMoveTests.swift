@@ -169,8 +169,104 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         XCTAssertNil(model.workErrorMessage, "a board refusal is inline, not modal")
 
         model.performDragRefusalAction(model.dragRefusalNotice!)
-        XCTAssertEqual(model.selectedWorkCardID, task.id, "the action opens the card")
+        XCTAssertEqual(model.revisionComposerTaskID, task.id, "the action opens the revision composer for the refused card")
         XCTAssertNil(model.dragRefusalNotice)
+    }
+
+    /// Submitting the composer files a revision against the refused card.
+    func testSubmitRevisionSendsCreateRevisionForParent() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+        model.revisionComposerTaskID = task.id
+
+        model.submitRevision(parentTaskID: task.id, description: "   ")
+        XCTAssertTrue(sent.isEmpty, "blank text must not file a revision")
+        XCTAssertEqual(model.revisionComposerTaskID, task.id)
+
+        model.submitRevision(parentTaskID: task.id, description: "  tighten the error text \n")
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?["type"] as? String, "create_revision")
+        XCTAssertEqual(sent.first?["parent_task_id"] as? String, task.id)
+        XCTAssertEqual(sent.first?["description"] as? String, "tighten the error text")
+        XCTAssertNil(model.revisionComposerTaskID)
+    }
+
+    /// A refusal for one card must not roll back another card's in-flight move.
+    func testWorkItemRefusedBouncesOnlyTheRefusedCard() {
+        let model = makeModel()
+        let a = makeTask(status: "todo")
+        let b = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [a, b]]
+        _ = model.attemptDrop(a.id, onColumn: .doing, group: nil)
+        _ = model.attemptDrop(b.id, onColumn: .doing, group: nil)
+
+        model.applyEventForTest(.workItemRefused(
+            id: a.id, code: "update_rejected", message: "nope", suggestedAction: nil
+        ))
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: a), .backlog, "refused card bounces")
+        XCTAssertEqual(model.effectiveBoardColumn(for: b), .doing, "other card's move stays in flight")
+        XCTAssertNotNil(model.pendingMoveOriginByTaskID[b.id])
+        XCTAssertNil(model.pendingMoveOriginByTaskID[a.id])
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, a.id)
+    }
+
+    /// A refusal for a card with no pending move leaves every pending move alone.
+    func testWorkItemRefusedForNonPendingCardKeepsPendingMoves() {
+        let model = makeModel()
+        let moving = makeTask(status: "todo")
+        let idle = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [moving, idle]]
+        _ = model.attemptDrop(moving.id, onColumn: .doing, group: nil)
+
+        model.applyEventForTest(.workItemRefused(
+            id: idle.id, code: "bound_pr", message: "already has a PR", suggestedAction: nil
+        ))
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: moving), .doing)
+        XCTAssertNotNil(model.pendingMoveOriginByTaskID[moving.id])
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, idle.id)
+    }
+
+    /// The popover's Move buttons go through the board-drop RPC, so the engine
+    /// can answer with a structured refusal.
+    func testMoveTaskSendsMoveWorkItemOnBoard() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+
+        model.moveTask(task.id, to: .done)
+
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?["type"] as? String, "move_work_item_on_board")
+        XCTAssertEqual(sent.first?["id"] as? String, task.id)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .done)
+
+        model.applyEventForTest(.workItemRefused(
+            id: task.id, code: "bound_pr", message: "already has a PR", suggestedAction: "add_revision"
+        ))
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
+        XCTAssertEqual(model.dragRefusalNotice?.code, "bound_pr")
+    }
+
+    /// A refused Move Up/Down reorder lands on the moved card, not a modal.
+    func testReorderWorkErrorShowsOnMovedCard() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+        model.reorderRequestTaskIDs["req-1"] = task.id
+
+        model.applyEventForTest(.workError(message: "cannot reorder", requestId: "req-1"))
+
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, task.id)
+        XCTAssertEqual(model.dragRefusalNotice?.message, "cannot reorder")
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertTrue(model.reorderRequestTaskIDs.isEmpty)
     }
 
     /// A refusal still surfaces on the card when no optimistic move is pending.
