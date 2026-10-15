@@ -444,7 +444,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                         // "Waiting" caption.
                         let state = server_state.clone();
                         let delay = (record.expires_at_epoch - now).max(0) as u64 + 1;
-                        tokio::spawn(async move {
+                        crate::work::db_diagnostics::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                             state.broadcast_live_worker_states().await;
                         });
@@ -741,8 +741,8 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             if let Some(proposal_id) = apply_proposal_id {
                 let work_db = Arc::clone(&work_db);
                 let publisher = server_state.publisher.clone();
-                tokio::spawn(async move {
-                    let created = tokio::task::spawn_blocking(move || {
+                crate::work::db_diagnostics::spawn(async move {
+                    let created = crate::work::db_diagnostics::spawn_blocking(move || {
                         work_db.apply_review_verdict_proposal(&proposal_id, &crate::work::GhPrStateChecker)
                     })
                     .await;

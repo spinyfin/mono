@@ -5,7 +5,7 @@
 //! identical loop body:
 //!
 //! ```ignore
-//! tokio::spawn(async move {
+//! crate::work::db_diagnostics::spawn(async move {
 //!     loop {
 //!         let outcome = run_one_pass(...).await;
 //!         if outcome.has_activity() {
@@ -137,13 +137,14 @@ pub(crate) trait SweepOutcome {
 /// initial sleep) so state left behind by a previous engine run is
 /// reconciled at boot without waiting for the first interval — the
 /// behaviour every sweep relies on.
+#[track_caller]
 pub(crate) fn spawn_sweep_loop<O, Fut, F>(interval: Duration, mut pass_fn: F) -> tokio::task::JoinHandle<()>
 where
     O: SweepOutcome + Send,
     Fut: Future<Output = O> + Send,
     F: FnMut() -> Fut + Send + 'static,
 {
-    tokio::spawn(async move {
+    crate::work::db_diagnostics::spawn(async move {
         loop {
             let outcome = pass_fn().await;
             if outcome.has_activity() {
@@ -179,6 +180,7 @@ type SweepPassFuture<'a, O> = Pin<Box<dyn Future<Output = O> + Send + 'a>>;
 /// (`LiveWorkerConvergence`) to hand a live-worker contradiction to.
 ///
 /// Inherits [`spawn_sweep_loop`]'s fire-immediately-on-spawn contract.
+#[track_caller]
 pub(crate) fn spawn_work_sweep_loop<O, F>(
     work_db: Arc<WorkDb>,
     coordinator: Arc<ExecutionCoordinator>,

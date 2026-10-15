@@ -205,6 +205,7 @@ impl WorkDb {
         // the write lock up front so the second caller waits inside
         // the busy handler instead of racing.
         conn.set_transaction_behavior(TransactionBehavior::Immediate);
+        super::db_diagnostics::install_update_observer(conn);
         Ok(())
     }
 
@@ -238,7 +239,7 @@ impl WorkDb {
     /// itself.
     #[track_caller]
     pub(crate) fn connect(&self) -> Result<PooledConnection<'_>> {
-        super::connection_wait::acquire(&self.conn)
+        super::connection_wait::acquire(&self.conn, &self.persona_metrics)
     }
 
     /// Escape hatch: open a brand-new connection to this database instead of
@@ -247,8 +248,12 @@ impl WorkDb {
     /// snapshot that must not hold up every other operation on this `WorkDb`
     /// for its duration (see `database_backup::take_backup`). Most callers
     /// want [`Self::connect`], not this.
-    pub(crate) fn connect_new(&self) -> Result<Connection> {
-        Self::open_raw_connection(&self.path, self.memory.as_ref())
+    #[track_caller]
+    pub(crate) fn connect_new(&self) -> Result<super::db_diagnostics::OwnedConnection> {
+        Ok(super::db_diagnostics::OwnedConnection::new(
+            Self::open_raw_connection(&self.path, self.memory.as_ref())?,
+            self.persona_metrics.clone(),
+        ))
     }
 
     /// Inspect an existing database without migrations, journal-mode changes,

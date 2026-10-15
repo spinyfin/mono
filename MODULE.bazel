@@ -248,6 +248,14 @@ crate.annotation(
     crate = "libsqlite3-sys",
     repositories = ["mono_crates"],
 )
+
+# Observe SQLite call duration/result without changing busy handling or trace hooks.
+crate.annotation(
+    crate = "rusqlite",
+    patch_args = ["-p1"],
+    patches = ["//third_party/patches:rusqlite-0.37.0-call-observer.patch"],
+    repositories = ["mono_crates"],
+)
 crate.from_cargo(
     name = "mono_crates",
     cargo_lockfile = "//:Cargo.lock",
