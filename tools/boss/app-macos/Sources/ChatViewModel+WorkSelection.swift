@@ -12,6 +12,18 @@ extension ChatViewModel {
         defaults.set(width, forKey: bossPanelWidthDefaultsKey)
     }
 
+    /// Run-keyed focus shared by `bossctl agents focus` and Doing-card clicks:
+    /// switch to Agents, then let the pane handler clear a hiding filter,
+    /// select the run's page, focus its terminal, and outline it.
+    @discardableResult
+    func focusAgentRun(_ runId: String) -> EngineFocusResult {
+        guard let handler = paneFocusHandler else {
+            return .failure(.internalFailure(Self.noPaneAllocatorReason))
+        }
+        setNavigationMode(.agents)
+        return handler(runId)
+    }
+
     func setNavigationMode(_ mode: NavigationMode) {
         // Instrument the tab switch so the pane-grid relayout it provokes
         // (how many panes rebuild, the settle wall-time, any unexpected

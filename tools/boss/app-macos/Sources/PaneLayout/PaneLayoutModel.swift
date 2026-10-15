@@ -160,6 +160,18 @@ public struct PaneLayoutModel: Equatable, Sendable {
         focusedRunId = runId
     }
 
+    /// Brings a run into view for an explicit focus request. Clears a filter
+    /// that hides it, then focuses it and selects its page. A layout boundary.
+    /// Unknown runs change nothing.
+    public mutating func reveal(runId: String) -> PaneRevealOutcome {
+        guard let member = members[runId] else { return .notMember }
+        let clearedFilter = !filter.admits(member)
+        if clearedFilter { filter = .all }
+        focusedRunId = runId
+        repack(anchor: runId)
+        return clearedFilter ? .revealedClearingFilter : .revealed
+    }
+
     /// Entering the view is a layout boundary; leaving it changes nothing but
     /// makes later updates apply immediately.
     public mutating func setVisible(_ visible: Bool) {
