@@ -1,3 +1,4 @@
+import AppKit
 import PaneLayout
 import XCTest
 @testable import Boss
@@ -302,6 +303,75 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertEqual(AgentType.unknown.badgeLabel, "Unknown")
     }
 
+    func testQuietTaskAndCellCallbackWaitForResizeBoundary() async throws {
+        let grid = AgentsGridModel()
+        let before = grid.layout.geometry
+        grid.noteArea(width: 1200, height: 900, inLiveResize: false)
+        grid.noteArea(width: 1400, height: 1000, inLiveResize: true)
+        grid.noteCellSize(width: 6, height: 13)
+        try await Task.sleep(nanoseconds: 450_000_000)
+        XCTAssertEqual(grid.layout.geometry, before)
+        grid.liveResizeDidEnd()
+        XCTAssertEqual(grid.layout.geometry.area.width, 1400)
+        XCTAssertEqual(grid.layout.geometry.cell.width, 6)
+    }
+
+    func testFocusedSeventhRunFollowsCapacityShrink() {
+        let grid = AgentsGridModel(
+            policy: PaneCapacityPolicy(minColumns: 1, minRows: 1, headerHeight: 0, maxPanesPerPage: 8, gap: 0, deadBand: 0),
+            geometry: PaneGeometry(area: PaneSize(width: 400, height: 200), cell: PaneSize(width: 100, height: 100))
+        )
+        grid.apply(states: (0..<8).map { makeState(runId: "run-\($0)", slotId: $0) },
+                   viewers: [:], interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false)
+        grid.setFocusedRun("run-6")
+        grid.noteArea(width: 200, height: 200, inLiveResize: true)
+        grid.liveResizeDidEnd()
+        XCTAssertEqual(grid.layout.capacity, 4)
+        XCTAssertEqual(grid.layout.selectedPage, 1)
+        XCTAssertEqual(grid.layout.focusedRunId, "run-6")
+    }
+
+    func testAttachedOwnershipSurvivesGrowthTidyCollapseAndGeometry() {
+        let workspace = WorkersWorkspaceModel()
+        let grid = AgentsGridModel(
+            policy: PaneCapacityPolicy(minColumns: 1, minRows: 1, headerHeight: 0, maxPanesPerPage: 8, gap: 0, deadBand: 0),
+            geometry: PaneGeometry(area: PaneSize(width: 400, height: 200), cell: PaneSize(width: 100, height: 100))
+        )
+        for index in 0..<9 { _ = workspace.attachWorkerPane(makeAttach(runId: "run-\(index)", slot: index + 1)) }
+        let sessions = workspace.viewersByRunId.mapValues { $0.session }
+        func apply(_ count: Int) {
+            grid.apply(states: (0..<count).map { makeState(runId: "run-\($0)", slotId: $0 + 1) },
+                       viewers: workspace.viewersByRunId, interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false)
+            for (run, session) in sessions { XCTAssertTrue(workspace.viewersByRunId[run]?.session === session) }
+        }
+        apply(0) // Attached before membership.
+        XCTAssertEqual(grid.unplacedViewers.count, 9)
+        apply(4)
+        apply(6) // Shape growth.
+        grid.tidy()
+        apply(9)
+        XCTAssertEqual(grid.layout.pageCount, 2)
+        apply(8) // Forced nine-to-eight compaction.
+        XCTAssertEqual(grid.layout.pageCount, 1)
+        apply(2)
+        apply(1) // Retained released viewer.
+        grid.tidy()
+        grid.selectPage(0)
+        grid.noteArea(width: 200, height: 200, inLiveResize: true)
+        grid.liveResizeDidEnd()
+        XCTAssertEqual(Set(grid.unplacedViewers.compactMap(\.runId)), Set((1..<9).map { "run-\($0)" }))
+    }
+
+    func testWorkerCellMeasurementIgnoresBossAndNormalizesBackingScale() {
+        let one = BackingScaleView(scale: 1)
+        let two = BackingScaleView(scale: 2)
+        let points = NSSize(width: 6, height: 13)
+        XCTAssertEqual(GhosttyRuntime.workerCellSize(role: .worker(slot: 1), host: one, pixels: points), points)
+        XCTAssertEqual(GhosttyRuntime.workerCellSize(role: .worker(slot: 1), host: two, pixels: NSSize(width: 12, height: 26)), points)
+        XCTAssertNil(GhosttyRuntime.workerCellSize(role: .boss, host: one, pixels: points))
+        XCTAssertNil(GhosttyRuntime.workerCellSize(role: .worker(slot: 1), host: one, pixels: .zero))
+    }
+
     private func makeAttach(runId: String, slot: Int) -> EngineAttachRequest {
         EngineAttachRequest(
             runId: runId,
@@ -342,5 +412,19 @@ final class AgentsGridModelTests: XCTestCase {
             startedAt: startedAt,
             pool: pool
         )
+    }
+}
+
+
+@MainActor
+private final class BackingScaleView: NSView {
+    let scale: CGFloat
+    init(scale: CGFloat) {
+        self.scale = scale
+        super.init(frame: .zero)
+    }
+    required init?(coder: NSCoder) { nil }
+    override func convertFromBacking(_ size: NSSize) -> NSSize {
+        NSSize(width: size.width / scale, height: size.height / scale)
     }
 }

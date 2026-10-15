@@ -31,7 +31,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             store.update(states: [live])
             XCTAssertEqual(store.byRunID["run-persona"]?.displayName, expected)
             let snapshot = WorkerSlotSnapshot.build(
-                slot: WorkerSlot(slotId: 1, runId: "run-persona", idleFlavorCycle: 0),
+                slot: WorkerSlot(slotId: 1, runId: "run-persona"),
                 liveState: live, liveStatusEnabled: true
             )
             XCTAssertEqual(snapshot.displayName, expected)
@@ -40,7 +40,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             previous = snapshot
         }
         let fallback = WorkerSlotSnapshot.build(
-            slot: WorkerSlot(slotId: 9, runId: "run-persona", idleFlavorCycle: 0),
+            slot: WorkerSlot(slotId: 9, runId: "run-persona"),
             liveState: nil, liveStatusEnabled: true
         )
         XCTAssertEqual(fallback.displayName, "Worker run-persona")
@@ -132,7 +132,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     // MARK: - Snapshot equality
 
     func testIdenticalInputsProduceEqualSnapshots() {
-        let slot = WorkerSlot(slotId: 1, idleFlavorCycle: 3)
+        let slot = WorkerSlot(slotId: 1)
         let live = Self.makeLiveState()
         let a = WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true)
         let b = WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true)
@@ -140,7 +140,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     }
 
     func testNonRenderedLiveStateFieldsPreserveEquality() {
-        let slot = WorkerSlot(slotId: 1, runId: "exec-1", idleFlavorCycle: 0)
+        let slot = WorkerSlot(slotId: 1, runId: "exec-1")
         let base = Self.makeLiveState()
         let baseSnap = WorkerSlotSnapshot.build(
             slot: slot,
@@ -211,7 +211,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     }
 
     func testRenderedLiveStateFieldsFlipEquality() {
-        let slot = WorkerSlot(slotId: 1, runId: "exec-1", idleFlavorCycle: 0)
+        let slot = WorkerSlot(slotId: 1, runId: "exec-1")
         let base = Self.makeLiveState()
         let baseSnap = WorkerSlotSnapshot.build(
             slot: slot,
@@ -248,8 +248,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             slotId: 1,
             runId: "exec-1",
             summary: "fixing the scraper",
-            taskTitle: "kanban cards",
-            idleFlavorCycle: 3
+            taskTitle: "kanban cards"
         )
         let live = Self.makeLiveState()
         let baseSnap = WorkerSlotSnapshot.build(
@@ -265,8 +264,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                     slotId: 2,
                     runId: base.runId,
                     summary: base.summary,
-                    taskTitle: base.taskTitle,
-                    idleFlavorCycle: base.idleFlavorCycle
+                    taskTitle: base.taskTitle
                 ),
                 liveState: live,
                 liveStatusEnabled: true
@@ -279,8 +277,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                     slotId: base.slotId,
                     runId: "exec-2",
                     summary: base.summary,
-                    taskTitle: base.taskTitle,
-                    idleFlavorCycle: base.idleFlavorCycle
+                    taskTitle: base.taskTitle
                 ),
                 liveState: live,
                 liveStatusEnabled: true
@@ -293,8 +290,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                     slotId: base.slotId,
                     runId: base.runId,
                     summary: "rewriting the fencer",
-                    taskTitle: base.taskTitle,
-                    idleFlavorCycle: base.idleFlavorCycle
+                    taskTitle: base.taskTitle
                 ),
                 liveState: live,
                 liveStatusEnabled: true
@@ -307,38 +303,27 @@ final class WorkerSlotSnapshotTests: XCTestCase {
                     slotId: base.slotId,
                     runId: base.runId,
                     summary: base.summary,
-                    taskTitle: "other title",
-                    idleFlavorCycle: base.idleFlavorCycle
+                    taskTitle: "other title"
                 ),
                 liveState: live,
                 liveStatusEnabled: true
             )
         )
-        XCTAssertNotEqual(
-            baseSnap,
-            WorkerSlotSnapshot.build(
-                slot: WorkerSlot(
-                    slotId: base.slotId,
-                    runId: base.runId,
-                    summary: base.summary,
-                    taskTitle: base.taskTitle,
-                    idleFlavorCycle: 99
-                ),
-                liveState: live,
-                liveStatusEnabled: true
-            )
-        )
+        var attached = base
+        attached.session = Self.makeSession(id: "run-exec-1")
+        XCTAssertNotEqual(baseSnap, WorkerSlotSnapshot.build(slot: attached, liveState: live, liveStatusEnabled: true))
+
     }
 
     func testLiveStatusEnabledFlipsEquality() {
-        let slot = WorkerSlot(slotId: 1, idleFlavorCycle: 0)
+        let slot = WorkerSlot(slotId: 1)
         let a = WorkerSlotSnapshot.build(slot: slot, liveState: nil, liveStatusEnabled: true)
         let b = WorkerSlotSnapshot.build(slot: slot, liveState: nil, liveStatusEnabled: false)
         XCTAssertNotEqual(a, b)
     }
 
     func testNilVsPresentLiveStateFlipsEquality() {
-        let slot = WorkerSlot(slotId: 1, runId: "exec-1", idleFlavorCycle: 0)
+        let slot = WorkerSlot(slotId: 1, runId: "exec-1")
         let with = WorkerSlotSnapshot.build(
             slot: slot,
             liveState: Self.makeLiveState(),
@@ -355,11 +340,11 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testSessionIdentityParticipatesInEquality() {
         let sessionA = Self.makeSession(id: "run-a")
         let sessionB = Self.makeSession(id: "run-b")
-        var slotA = WorkerSlot(slotId: 1, runId: "a", idleFlavorCycle: 0)
+        var slotA = WorkerSlot(slotId: 1, runId: "a")
         slotA.session = sessionA
-        var slotB = WorkerSlot(slotId: 1, runId: "a", idleFlavorCycle: 0)
+        var slotB = WorkerSlot(slotId: 1, runId: "a")
         slotB.session = sessionB
-        var slotAAgain = WorkerSlot(slotId: 1, runId: "a", idleFlavorCycle: 0)
+        var slotAAgain = WorkerSlot(slotId: 1, runId: "a")
         slotAAgain.session = sessionA
 
         let snapA = WorkerSlotSnapshot.build(slot: slotA, liveState: nil, liveStatusEnabled: true)
@@ -373,7 +358,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
 
     func testSlotViewEquatableIgnoresClosures() {
         let snap = WorkerSlotSnapshot.build(
-            slot: WorkerSlot(slotId: 1, idleFlavorCycle: 0),
+            slot: WorkerSlot(slotId: 1),
             liveState: nil,
             liveStatusEnabled: true
         )
@@ -388,7 +373,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let a = WorkerSlotView(
             runtime: runtime,
             snapshot: WorkerSlotSnapshot.build(
-                slot: WorkerSlot(slotId: 1, idleFlavorCycle: 0),
+                slot: WorkerSlot(slotId: 1),
                 liveState: nil,
                 liveStatusEnabled: true
             ),
@@ -397,7 +382,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let b = WorkerSlotView(
             runtime: runtime,
             snapshot: WorkerSlotSnapshot.build(
-                slot: WorkerSlot(slotId: 1, idleFlavorCycle: 1),
+                slot: WorkerSlot(slotId: 2),
                 liveState: nil,
                 liveStatusEnabled: true
             ),
@@ -407,7 +392,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     }
 
     func testPlaceholderAndViewerMissingFlipEquality() {
-        let slot = WorkerSlot(slotId: 1, runId: "exec-1", idleFlavorCycle: 0)
+        let slot = WorkerSlot(slotId: 1, runId: "exec-1")
         let live = Self.makeLiveState()
         let occupied = WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true)
         let placeholder = WorkerSlotSnapshot.build(

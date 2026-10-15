@@ -207,10 +207,6 @@ struct WorkerSlot: Identifiable, Equatable {
     /// `summary` is nil — rendered as `"<WorkerName>: <taskTitle>"`
     /// so the header still identifies the task without a gerund.
     var taskTitle: String?
-    /// Bumped every time the slot re-enters idle so the flavor line
-    /// changes between idle bouts; kept stable for the lifetime of a
-    /// single bout so renders don't flicker.
-    var idleFlavorCycle: Int = 0
 
     var id: Int { slotId }
 
@@ -219,7 +215,6 @@ struct WorkerSlot: Identifiable, Equatable {
             && lhs.runId == rhs.runId
             && lhs.summary == rhs.summary
             && lhs.taskTitle == rhs.taskTitle
-            && lhs.idleFlavorCycle == rhs.idleFlavorCycle
             && lhs.session === rhs.session
     }
 }

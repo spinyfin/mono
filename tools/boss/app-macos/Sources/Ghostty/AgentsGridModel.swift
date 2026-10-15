@@ -14,7 +14,12 @@ final class AgentsGridModel: ObservableObject {
     /// Attached viewers whose run is not in any layout cell (engine
     /// released and compacted, detach not yet arrived). Keep their
     /// surfaces mounted until `DetachWorkerPane`.
-    @Published private(set) var unplacedViewers: [WorkerSlot] = []
+    private var viewers: [String: WorkerSlot] = [:]
+    var unplacedViewers: [WorkerSlot] {
+        viewers.values.filter { $0.session != nil && !placedRunIds(in: layout).contains($0.runId ?? "") }
+            .sorted { $0.slotId < $1.slotId }
+    }
+    private var inLiveResize = false
 
     private var personaByRun: [String: String] = [:]
     private var pendingArea: PaneSize?
@@ -69,6 +74,7 @@ final class AgentsGridModel: ObservableObject {
         if self.feedUnavailable != feedUnavailable {
             self.feedUnavailable = feedUnavailable
         }
+        self.viewers = viewers
         let local = states.filter(\.isLocalMember)
         for state in local {
             if let name = state.name, !name.isEmpty {
@@ -89,16 +95,6 @@ final class AgentsGridModel: ObservableObject {
         replaceLayout { $0.updateMembers(members) }
 
         let placed = placedRunIds(in: layout)
-        let nextUnplaced = viewers.values
-            .filter { viewer in
-                guard viewer.session != nil, let runId = viewer.runId else { return false }
-                return !placed.contains(runId)
-            }
-            .sorted { $0.slotId < $1.slotId }
-        if unplacedViewers != nextUnplaced {
-            unplacedViewers = nextUnplaced
-        }
-
         let needed = Set(local.map(\.runId))
             .union(placed)
             .union(viewers.keys)
@@ -118,7 +114,12 @@ final class AgentsGridModel: ObservableObject {
     func noteArea(width: Double, height: Double, inLiveResize: Bool) {
         guard width > 0, height > 0, width.isFinite, height.isFinite else { return }
         pendingArea = PaneSize(width: width, height: height)
-        if inLiveResize { return }
+        self.inLiveResize = inLiveResize
+        if inLiveResize {
+            quietTask?.cancel()
+            quietTask = nil
+            return
+        }
         scheduleQuietApply()
     }
 
@@ -127,7 +128,14 @@ final class AgentsGridModel: ObservableObject {
         applyPendingGeometry()
     }
 
+    func liveResizeWillStart() {
+        inLiveResize = true
+        quietTask?.cancel()
+        quietTask = nil
+    }
+
     func liveResizeDidEnd() {
+        inLiveResize = false
         quietTask?.cancel()
         quietTask = nil
         applyPendingGeometry()
@@ -161,6 +169,7 @@ final class AgentsGridModel: ObservableObject {
     }
 
     private func applyPendingGeometry() {
+        guard !inLiveResize else { return }
         let area = pendingArea ?? layout.geometry.area
         let cell = (lastCell.width > 0 && lastCell.height > 0) ? lastCell : layout.geometry.cell
         replaceLayout { $0.updateGeometry(PaneGeometry(area: area, cell: cell)) }

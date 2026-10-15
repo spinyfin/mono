@@ -9,7 +9,7 @@ import SwiftUI
 /// outside `==` so a parent rebuild of the toggle handler cannot defeat
 /// `.equatable()` at the call site.
 ///
-/// Every page of the grid stays in the `ZStack` so pagination is a display
+/// Every attached run stays in the `ZStack` so pagination is a display
 /// filter — no `dismantleNSView`, no libghostty surface teardown. Off-page
 /// and unplaced attached surfaces stay mounted at zero opacity.
 struct WorkersDetailView: View, @MainActor Equatable {
@@ -20,6 +20,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
     let onToggleLiveStatus: (Int, Bool) -> Void
 
     @StateObject private var grid = AgentsGridModel()
+    @State private var cachedSnapshots: [String: WorkerSlotSnapshot] = [:]
     @State private var emptyFlavorCycle = Int.random(in: 0...10_000)
 
     init(
@@ -51,6 +52,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
         }
         .background(Color(nsColor: .separatorColor))
         .onAppear(perform: bindAndSync)
+        .onChange(of: grid.layout) { _, _ in if isVisible { refreshSnapshots() } }
         .onChange(of: isVisible) { _, _ in syncGrid() }
         .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
         .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
@@ -59,6 +61,9 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .onChange(of: workspace.automationPoolSize) { _, _ in syncGrid() }
         .onChange(of: workspace.reviewSlotCount) { _, _ in syncGrid() }
         .onChange(of: liveStatusDisabledSlotIDs) { _, _ in syncGrid() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willStartLiveResizeNotification)) { _ in
+            grid.liveResizeWillStart()
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEndLiveResizeNotification)) { _ in
             grid.liveResizeDidEnd()
         }
@@ -81,7 +86,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.orange)
             }
-            Button("Tidy") { grid.tidy() }
+            Button("Tidy") { grid.tidy(); refreshSnapshots() }
                 .font(.caption)
                 .disabled(!grid.layout.isTidyHighlighted)
                 .opacity(grid.layout.isTidyHighlighted ? 1 : 0.45)
@@ -109,50 +114,58 @@ struct WorkersDetailView: View, @MainActor Equatable {
         }
     }
 
+    // A single flat collection owns surfaces for their entire attached lifetime.
     private var paneArea: some View {
-        ZStack {
-            ForEach(grid.layout.pages, id: \.index) { page in
-                AgentPageGrid(
-                    runtime: workspace.runtime,
-                    page: page,
-                    snapshots: snapshots(for: page),
-                    onToggleLiveStatus: onToggleLiveStatus
-                )
-                .equatable()
-                .opacity(page.index == grid.layout.selectedPage && !grid.layout.isEmpty ? 1 : 0)
-                .allowsHitTesting(page.index == grid.layout.selectedPage && !grid.layout.isEmpty)
-            }
-            unplacedSurfaceHost
-            if grid.layout.isEmpty {
-                emptyState
+        GeometryReader { geo in
+            ZStack(alignment: .topLeading) {
+                AgentSurfaceCollection(runIds: renderRunIds, placement: { placement(for: $0, area: geo.size) }) { runId in
+                    let snapshot = renderSnapshot(runId: runId)
+                    WorkerSlotView(
+                        runtime: workspace.runtime,
+                        snapshot: snapshot,
+                        onToggleLiveStatus: { enabled in
+                            onToggleLiveStatus(snapshot.slotId, enabled)
+                        }
+                    )
+                    .equatable()
+                }
+                if grid.layout.isEmpty { emptyState }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(paneSizeReader)
     }
 
-    /// Surfaces whose run is no longer in a layout cell. Kept mounted
-    /// until the engine detaches them; never invent membership.
-    private var unplacedSurfaceHost: some View {
-        ZStack {
-            ForEach(grid.unplacedViewers.filter { $0.runId != nil }, id: \.slotId) { slot in
-                WorkerSlotView(
-                    runtime: workspace.runtime,
-                    snapshot: WorkerSlotSnapshot.build(
-                        slot: slot,
-                        liveState: slot.runId.flatMap { liveStates.byRunID[$0] },
-                        liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slot.slotId)
-                    ),
-                    onToggleLiveStatus: { enabled in
-                        onToggleLiveStatus(slot.slotId, enabled)
-                    }
-                )
+    private var renderRunIds: [String] {
+        Set(cachedSnapshots.keys).union(workspace.viewersByRunId.keys).sorted()
+    }
+
+    private func renderSnapshot(runId: String) -> WorkerSlotSnapshot {
+        if let cached = cachedSnapshots[runId],
+           cached.session === workspace.viewersByRunId[runId]?.session {
+            return cached
+        }
+        return snapshot(runId: runId, isPlaceholder: false)
+    }
+
+    private func placement(for runId: String, area: CGSize) -> (frame: CGRect, visible: Bool) {
+        for page in grid.layout.pages {
+            for cell in page.cells {
+                let id: String?
+                switch cell.content {
+                case .occupied(let member): id = member.runId
+                case .placeholder(let run): id = run
+                case .empty: id = nil
+                }
+                if id == runId {
+                    let width = max(1, (area.width - CGFloat(page.shape.columns - 1)) / CGFloat(page.shape.columns))
+                    let height = max(1, (area.height - CGFloat(page.shape.rows - 1)) / CGFloat(page.shape.rows))
+                    let position = page.shape.position(ofLocalIndex: cell.localIndex)
+                    return (CGRect(x: CGFloat(position.column) * (width + 1), y: CGFloat(position.row) * (height + 1), width: width, height: height), page.index == grid.layout.selectedPage)
+                }
             }
         }
-        .frame(width: 0, height: 0)
-        .opacity(0)
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
+        // Unplaced viewers still need a usable terminal size.
+        return (CGRect(x: 0, y: 0, width: max(420, area.width), height: max(356, area.height)), false)
     }
 
     private var emptyState: some View {
@@ -204,11 +217,15 @@ struct WorkersDetailView: View, @MainActor Equatable {
                 grid.noteCellSize(width: width, height: height)
             }
         }
+        workspace.runtime.onWorkerFocus = { [grid] sessionId in
+            grid.setFocusedRun(String(sessionId.dropFirst("run-".count)))
+        }
         syncGrid()
     }
 
     private func syncGrid() {
         grid.setVisible(isVisible)
+        guard isVisible else { return }
         grid.apply(
             states: Array(liveStates.byRunID.values),
             viewers: workspace.viewersByRunId,
@@ -217,16 +234,17 @@ struct WorkersDetailView: View, @MainActor Equatable {
             reviewPoolSize: workspace.reviewSlotCount,
             feedUnavailable: liveStates.feedUnavailable
         )
+        refreshSnapshots()
     }
 
-    private func snapshots(for page: PaneLayoutPage) -> [Int: WorkerSlotSnapshot] {
-        var result: [Int: WorkerSlotSnapshot] = [:]
-        for cell in page.cells {
-            if let snapshot = snapshot(for: cell) {
-                result[cell.localIndex] = snapshot
+    private func refreshSnapshots() {
+        var next: [String: WorkerSlotSnapshot] = [:]
+        for page in grid.layout.pages {
+            for cell in page.cells {
+                if let value = snapshot(for: cell), let runId = value.runId { next[runId] = value }
             }
         }
-        return result
+        if cachedSnapshots != next { cachedSnapshots = next }
     }
 
     private func snapshot(for cell: PaneCell) -> WorkerSlotSnapshot? {
@@ -242,7 +260,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
 
     private func snapshot(runId: String, isPlaceholder: Bool) -> WorkerSlotSnapshot {
         let viewer = workspace.viewersByRunId[runId]
-        let live = liveStates.byRunID[runId]
+        let live = isVisible ? liveStates.byRunID[runId] : nil
         let slotId = viewer?.slotId ?? live?.slotId ?? 0
         let slot = viewer ?? WorkerSlot(
             slotId: slotId,
@@ -304,54 +322,6 @@ private struct AgentsPaneSizeKey: PreferenceKey {
     }
 }
 
-/// Eager grid of one layout page. Not lazy: a `LazyVStack` would let
-/// SwiftUI dismantle off-screen `NSViewRepresentable`s.
-private struct AgentPageGrid: View, @MainActor Equatable {
-    let runtime: GhosttyRuntime
-    let page: PaneLayoutPage
-    let snapshots: [Int: WorkerSlotSnapshot]
-    let onToggleLiveStatus: (Int, Bool) -> Void
-
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.runtime === rhs.runtime
-            && lhs.page == rhs.page
-            && lhs.snapshots == rhs.snapshots
-    }
-
-    var body: some View {
-        let columns = max(1, page.shape.columns)
-        let rows = stride(from: 0, to: page.cells.count, by: columns).map { start in
-            Array(page.cells[start..<min(start + columns, page.cells.count)])
-        }
-        VStack(spacing: 1) {
-            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                HStack(spacing: 1) {
-                    ForEach(row, id: \.localIndex) { cell in
-                        cellView(cell)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func cellView(_ cell: PaneCell) -> some View {
-        if let snapshot = snapshots[cell.localIndex] {
-            WorkerSlotView(
-                runtime: runtime,
-                snapshot: snapshot,
-                onToggleLiveStatus: { enabled in
-                    onToggleLiveStatus(snapshot.slotId, enabled)
-                }
-            )
-            .equatable()
-        } else {
-            Color(nsColor: .windowBackgroundColor)
-        }
-    }
-}
-
 /// One worker slot. Equatable over `WorkerSlotSnapshot` so
 /// `.equatable()` at the call site skips body evaluation when this
 /// slot's own data has not changed. Closures are outside `==`.
@@ -389,29 +359,13 @@ struct WorkerSlotView: View, @MainActor Equatable {
                 session: session,
                 liveStatePresent: snapshot.live != nil
             )
-            // Pin view identity to the session, not just to this `if`
-            // branch's position in the tree. A slot can be released and
-            // respawned into a NEW session within the same SwiftUI
-            // update pass (no intervening render of the `idlePaneView`
-            // branch to force teardown) — without an explicit `.id()`,
-            // SwiftUI would treat the two sessions as "the same view"
-            // and reuse the OLD `GhosttyTerminalHostView`/libghostty
-            // surface untouched (`updateNSView` never rebinds it), so
-            // the new execution's pane would render against the
-            // PREVIOUS tenant's scrollback under the new header. Keying
-            // on `session.id` (`"run-<runId>"`, unique per execution)
-            // forces `dismantleNSView`/`makeNSView` on every rebind, so
-            // the old surface is always torn down and a fresh one
-            // created before the new run's output ever lands.
             .id(session.id)
             .opacity(snapshot.isPlaceholder || snapshot.isExited ? 0.55 : 1)
             .onChange(of: snapshot.displayName, initial: true) { _, name in
                 session.setWorkerName(name)
             }
-        } else if snapshot.isViewerMissing {
-            viewerMissingCard
         } else {
-            idlePaneView
+            viewerMissingCard
         }
     }
 
@@ -459,47 +413,6 @@ struct WorkerSlotView: View, @MainActor Equatable {
                 .frame(maxWidth: large ? 220 : 96, maxHeight: large ? 240 : 120)
                 .opacity(0.85)
         }
-    }
-
-    /// Idle / free slot treatment: large character portrait + crew name
-    /// + a stable in-character recreational flavor line. The line is
-    /// keyed on `snapshot.idleFlavorCycle`, which the workspace model
-    /// bumps when the slot re-enters idle, so within one idle bout
-    /// the line never flickers.
-    @ViewBuilder
-    private var idlePaneView: some View {
-        let persona = snapshot.live?.name
-        VStack(spacing: 14) {
-            Spacer()
-            if let nsImage = TrekIconAssets.portrait(forPersona: persona),
-               let name = TrekPortraitGrid.name(forPersona: persona) {
-                Image(nsImage: nsImage)
-                    .resizable()
-                    .interpolation(.none)
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: 220, maxHeight: 240)
-                    .opacity(0.85)
-                Text(snapshot.displayName)
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(Color.white.opacity(0.85))
-                Text(TrekIdleFlavor.line(for: name, cycle: snapshot.idleFlavorCycle))
-                    .font(.callout)
-                    .foregroundStyle(Color.white.opacity(0.6))
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 24)
-                    .lineLimit(3)
-            } else {
-                Text(snapshot.displayName)
-                    .font(.caption2)
-                    .foregroundStyle(Color.white.opacity(0.45))
-                Text("Free")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(Color.white.opacity(0.7))
-            }
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .black))
     }
 
     private var slotHeader: some View {
@@ -717,7 +630,7 @@ struct AgentTypeBadge: View {
     let raw: String?
 
     var body: some View {
-        Text(type.badgeLabel)
+        Text(type == .unknown && !(raw ?? "").isEmpty ? "Unknown: \(raw ?? "")" : type.badgeLabel)
             .font(.caption2.weight(.semibold))
             .lineLimit(1)
             .padding(.horizontal, 6)

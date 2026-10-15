@@ -50,7 +50,6 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     let runId: String?
     let summary: String?
     let taskTitle: String?
-    let idleFlavorCycle: Int
     /// Compared by identity in `==`. `nil` with a run means the
     /// viewer-missing card; non-nil means `WorkerPaneTerminalView`
     /// stays mounted.
@@ -64,7 +63,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
 
     var displayName: String {
         if let cachedPersona, !cachedPersona.isEmpty { return cachedPersona }
-        guard let runId else { return "Slot \(slotId)" }
+        let runId = runId ?? ""
         return WorkerLiveState.displayName(name: live?.name, runId: runId)
     }
 
@@ -77,7 +76,6 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             && lhs.runId == rhs.runId
             && lhs.summary == rhs.summary
             && lhs.taskTitle == rhs.taskTitle
-            && lhs.idleFlavorCycle == rhs.idleFlavorCycle
             && lhs.session === rhs.session
             && lhs.liveStatusEnabled == rhs.liveStatusEnabled
             && lhs.live == rhs.live
@@ -97,7 +95,6 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             runId: slot.runId,
             summary: slot.summary,
             taskTitle: slot.taskTitle,
-            idleFlavorCycle: slot.idleFlavorCycle,
             session: slot.session,
             liveStatusEnabled: liveStatusEnabled,
             live: liveState.map(WorkerSlotLiveSlice.init),
