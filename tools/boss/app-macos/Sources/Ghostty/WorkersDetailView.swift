@@ -55,7 +55,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .onChange(of: grid.layout) { _, _ in if isVisible { refreshSnapshots() } }
         .onChange(of: isVisible) { _, _ in syncGrid() }
         .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
-        .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
         .onChange(of: workspace.viewersByRunId) { _, _ in syncGrid() }
         .onChange(of: workspace.interactivePoolSize) { _, _ in syncGrid() }
         .onChange(of: workspace.automationPoolSize) { _, _ in syncGrid() }
@@ -179,7 +178,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
         let layout = grid.layout
         return GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                AgentSurfaceCollection(runIds: renderRunIds, layout: layout, area: geo.size) { runId in
+                AgentSurfaceCollection(runIds: grid.renderRunIds(attached: workspace.viewersByRunId.keys), layout: layout, area: geo.size) { runId in
                     let snapshot = renderSnapshot(runId: runId)
                     WorkerSlotView(
                         runtime: workspace.runtime,
@@ -194,10 +193,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
             }
         }
         .background(paneSizeReader)
-    }
-
-    private var renderRunIds: [String] {
-        Set(cachedSnapshots.keys).union(workspace.viewersByRunId.keys).sorted()
     }
 
     private func renderSnapshot(runId: String) -> WorkerSlotSnapshot {
@@ -265,17 +260,15 @@ struct WorkersDetailView: View, @MainActor Equatable {
     }
 
     private func syncGrid() {
-        grid.setVisible(isVisible)
-        guard isVisible else { return }
         grid.apply(
+            isVisible: isVisible,
             states: Array(liveStates.byRunID.values),
             viewers: workspace.viewersByRunId,
             interactivePoolSize: workspace.interactivePoolSize,
             automationPoolSize: workspace.automationPoolSize,
-            reviewPoolSize: workspace.reviewSlotCount,
-            feedUnavailable: liveStates.feedUnavailable
+            reviewPoolSize: workspace.reviewSlotCount
         )
-        refreshSnapshots()
+        if isVisible { refreshSnapshots() }
     }
 
     private func refreshSnapshots() {
@@ -500,7 +493,11 @@ struct WorkerSlotView: View, @MainActor Equatable {
                 WorkerSlotFallbackMonitorPill(session: session)
             }
 
-            liveStatusToggle
+            // A finished placeholder is historical text, not an addressable
+            // worker: its slot may already belong to a new run.
+            if !snapshot.isPlaceholder {
+                liveStatusToggle
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
