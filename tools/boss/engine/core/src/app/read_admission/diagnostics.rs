@@ -30,7 +30,7 @@ struct Entry {
     request: String,
     verb: String,
     stage: &'static str,
-    /// Opaque identity of the ordering key (the response view), so separate
+    /// Opaque identity of the response view, so separate
     /// views of one verb can be told apart.
     key: u64,
     /// Opaque identity of the connection the read arrived on.
@@ -46,21 +46,18 @@ pub(super) enum Wait {
     ConnectionQueue,
     /// The engine-wide pending queue was full.
     EngineQueue,
-    /// An earlier read with the same ordering key held the turn.
-    Ordering,
     /// Connection or engine active permits; the entry's stage says which.
     Permit,
 }
 
 impl Wait {
-    const KINDS: usize = 4;
+    const KINDS: usize = 3;
 
     fn index(self) -> usize {
         match self {
             Self::ConnectionQueue => 0,
             Self::EngineQueue => 1,
-            Self::Ordering => 2,
-            Self::Permit => 3,
+            Self::Permit => 2,
         }
     }
 }
@@ -95,7 +92,7 @@ impl Diagnostics {
                 .session(session)
                 .request(request)
                 .verb(verb)
-                .stage("ordering")
+                .stage("admission")
                 .key(key)
                 .connection(connection)
                 .build(),
@@ -197,7 +194,7 @@ fn select_blockers(
     let rejected_entry = rejected.and_then(|id| snapshot.iter().find(|(entry_id, _)| *entry_id == id));
     // Pending permits are released once a read is admitted, so only reads
     // still waiting for admission fill a pending queue.
-    let holds_pending = |stage: &str| matches!(stage, "ordering" | "connection permit" | "engine permit");
+    let holds_pending = |stage: &str| matches!(stage, "admission" | "connection permit" | "engine permit");
     let holds_connection_permit = |stage: &str| matches!(stage, "engine permit" | "blocking queue" | "handler");
     let holds_engine_permit = |stage: &str| matches!(stage, "blocking queue" | "handler");
     // Engine permits are shared across connections; everything else is
@@ -212,7 +209,6 @@ fn select_blockers(
             }
             match wait {
                 Wait::ConnectionQueue | Wait::EngineQueue => holds_pending(entry.stage),
-                Wait::Ordering => rejected_entry.is_some_and(|(rejected_id, r)| id < rejected_id && entry.key == r.key),
                 Wait::Permit if engine_wide => holds_engine_permit(entry.stage),
                 Wait::Permit => holds_connection_permit(entry.stage),
             }
@@ -296,18 +292,14 @@ mod tests {
             .build()
     }
 
-    /// Sixteen-plus older long-running reads elsewhere must not hide the
-    /// predecessor that an ordering timeout was actually waiting behind.
+    /// Unrelated connections must not hide the connection permit holders.
     #[test]
     fn blockers_name_the_relevant_reads_despite_many_older_unrelated_reads() {
         let mut snapshot: Vec<(u64, Entry)> = (0..20).map(|id| (id, entry("other", "handler", 7, 2))).collect();
         // Same connection, but a different view of the same verb.
         snapshot.push((20, entry("app", "handler", 8, 1)));
         snapshot.push((21, entry("app", "handler", 9, 1)));
-        snapshot.push((22, entry("app", "ordering", 9, 1)));
-        let blockers = select_blockers(&snapshot, Wait::Ordering, Some(22), 1);
-        assert_eq!(blockers.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![21]);
-
+        snapshot.push((22, entry("app", "admission", 9, 1)));
         // Connection permit: only the app connection's permit holders.
         snapshot.push((23, entry("app", "connection permit", 10, 1)));
         let blockers = select_blockers(&snapshot, Wait::Permit, Some(23), 1);
@@ -332,7 +324,7 @@ mod tests {
         let mut snapshot: Vec<(u64, Entry)> = (0..20).map(|id| (id, entry("old", "handler", 7, 2))).collect();
         snapshot.push((20, entry("other", "connection permit", 8, 2)));
         snapshot.push((21, entry("third", "engine permit", 9, 3)));
-        snapshot.push((22, entry("other", "ordering", 9, 3)));
+        snapshot.push((22, entry("other", "admission", 9, 3)));
         // The rejected connection (1) has nothing pending at all.
         let blockers = select_blockers(&snapshot, Wait::EngineQueue, None, 1);
         assert_eq!(blockers.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![20, 21, 22]);
@@ -347,14 +339,13 @@ mod tests {
         diagnostics.report("second", Wait::ConnectionQueue, None, None, 1);
         diagnostics.report("third", Wait::ConnectionQueue, None, None, 1);
         let counts = |d: &Diagnostics| d.suppressed.each_ref().map(|c| c.load(Ordering::Relaxed));
-        assert_eq!(counts(&diagnostics), [2, 0, 0, 0]);
+        assert_eq!(counts(&diagnostics), [2, 0, 0]);
 
         // A deadline report right after a queue-full flood is not suppressed.
-        diagnostics.report("ordering", Wait::Ordering, None, None, 1);
         diagnostics.report("permit", Wait::Permit, None, None, 1);
-        assert_eq!(counts(&diagnostics), [2, 0, 0, 0]);
+        assert_eq!(counts(&diagnostics), [2, 0, 0]);
         // A second report of the same deadline kind still is, and is attributed to it.
         diagnostics.report("permit again", Wait::Permit, None, None, 1);
-        assert_eq!(counts(&diagnostics), [2, 0, 0, 1]);
+        assert_eq!(counts(&diagnostics), [2, 0, 1]);
     }
 }

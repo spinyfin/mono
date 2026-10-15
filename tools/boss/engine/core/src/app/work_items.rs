@@ -1309,61 +1309,70 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         crate::population_timing::PopulationTrace::new(product_id.clone(), request_id.clone(), fetch_seq, recv_instant);
     trace.record_plain(crate::population_timing::segment::DECODE, decode_ms);
 
-    // Read admission can run requests from this connection concurrently.
-    // Serialize snapshot acquisition as well as diff/enqueue, so an older
-    // database snapshot cannot overtake a newer one in the patch sequence.
-    let mut cache = sink.work_tree_cache.lock().expect("work tree cache poisoned");
-    match work_db.get_work_tree_instrumented(&product_id, &mut trace) {
-        Ok(tree) => {
-            if delta {
-                match cache.update(&tree) {
-                    Ok(update) => {
-                        trace.mark_enqueued();
-                        sink.stash_population_trace(&request_id, trace);
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            server_state.current_work_revision(),
-                            FrontendEvent::WorkTreeUpdate { update },
-                        );
-                    }
-                    Err(err) => send_work_error(&sink, &request_id, &err),
+    // Reads run concurrently. Only diff/enqueue is serialized. If another
+    // response overtakes this snapshot, read again without holding the cache
+    // lock so we never append an older snapshot to a newer patch chain.
+    loop {
+        let generation = sink.work_tree_generation.load(std::sync::atomic::Ordering::Acquire);
+        match work_db.get_work_tree_instrumented(&product_id, &mut trace) {
+            Ok(tree) => {
+                let mut cache = sink.work_tree_cache.lock().expect("work tree cache poisoned");
+                if generation != sink.work_tree_generation.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
                 }
-                return;
+                sink.work_tree_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                if delta {
+                    match cache.update(&tree) {
+                        Ok(update) => {
+                            trace.mark_enqueued();
+                            sink.stash_population_trace(&request_id, trace);
+                            send_response_with_revision(
+                                &sink,
+                                &request_id,
+                                server_state.current_work_revision(),
+                                FrontendEvent::WorkTreeUpdate { update },
+                            );
+                        }
+                        Err(err) => send_work_error(&sink, &request_id, &err),
+                    }
+                    return;
+                }
+                cache.clear();
+                // Mark the handoff instant so the writer task can attribute the
+                // time this trace spends sitting in the session's writer queue
+                // (queue_wait), then stash BEFORE enqueueing: the writer task
+                // runs concurrently and must find the trace by `request_id`
+                // when it pops this response.
+                trace.mark_enqueued();
+                sink.stash_population_trace(&request_id, trace);
+                send_response_with_revision(
+                    &sink,
+                    &request_id,
+                    server_state.current_work_revision(),
+                    FrontendEvent::WorkTree {
+                        product: tree.product,
+                        projects: tree.projects,
+                        tasks: tree.tasks,
+                        chores: tree.chores,
+                        task_runtimes: tree.task_runtimes,
+                        dependencies: tree.dependencies,
+                        ideas: tree.ideas,
+                    },
+                );
             }
-            cache.clear();
-            // Mark the handoff instant so the writer task can attribute the
-            // time this trace spends sitting in the session's writer queue
-            // (queue_wait), then stash BEFORE enqueueing: the writer task
-            // runs concurrently and must find the trace by `request_id`
-            // when it pops this response.
-            trace.mark_enqueued();
-            sink.stash_population_trace(&request_id, trace);
-            send_response_with_revision(
-                &sink,
-                &request_id,
-                server_state.current_work_revision(),
-                FrontendEvent::WorkTree {
-                    product: tree.product,
-                    projects: tree.projects,
-                    tasks: tree.tasks,
-                    chores: tree.chores,
-                    task_runtimes: tree.task_runtimes,
-                    dependencies: tree.dependencies,
-                    ideas: tree.ideas,
-                },
-            );
+            Err(err) => {
+                // Error path: drop the trace (no serialize/write to attribute).
+                // A decode failure here (e.g. an out-of-enum `status` column)
+                // blanks this product's entire board and kills its dispatch
+                // reconciliation until the bad row is fixed — log it loudly so
+                // the next occurrence is diagnosable from the trace rather than
+                // from a screenshot of the resulting "Work Error" modal.
+                tracing::error!(product_id = %product_id, error = %err, "get_work_tree failed: product board unavailable");
+                send_work_error(&sink, &request_id, &err);
+            }
         }
-        Err(err) => {
-            // Error path: drop the trace (no serialize/write to attribute).
-            // A decode failure here (e.g. an out-of-enum `status` column)
-            // blanks this product's entire board and kills its dispatch
-            // reconciliation until the bad row is fixed — log it loudly so
-            // the next occurrence is diagnosable from the trace rather than
-            // from a screenshot of the resulting "Work Error" modal.
-            tracing::error!(product_id = %product_id, error = %err, "get_work_tree failed: product board unavailable");
-            send_work_error(&sink, &request_id, &err);
-        }
+        break;
     }
 }
 

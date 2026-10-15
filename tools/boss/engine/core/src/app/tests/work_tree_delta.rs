@@ -1,9 +1,19 @@
 use super::*;
 
 async fn fetch(state: &Arc<ServerState>, sink: &Arc<SessionSink>, product: &str, delta: bool) -> FrontendEvent {
+    fetch_with_db(state, sink, product, delta, state.work_db.clone()).await
+}
+
+async fn fetch_with_db(
+    state: &Arc<ServerState>,
+    sink: &Arc<SessionSink>,
+    product: &str,
+    delta: bool,
+    db: Arc<crate::work::WorkDb>,
+) -> FrontendEvent {
     let ctx = Dispatch::builder()
         .server_state(state.clone())
-        .work_db(state.work_db.clone())
+        .work_db(db)
         .sink(sink.clone())
         .session_id("board")
         .request_id("fetch")
@@ -30,36 +40,71 @@ fn update(event: FrontendEvent) -> boss_protocol::work_tree_delta::WorkTreeUpdat
 }
 
 #[test]
-fn work_tree_snapshot_lock_precedes_database_read_for_concurrent_admission() {
+fn slow_board_read_does_not_block_a_later_read_on_the_same_session() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let _entered = runtime.enter();
     let (state, _dir) = test_server_state();
-    let product = crate::test_support::create_test_product_named(&state.work_db, "ordered");
+    let product = crate::test_support::create_test_product_named(&state.work_db, "concurrent");
+    for i in 0..64 {
+        crate::test_support::create_test_chore(&state.work_db, &product.id, format!("fixture-{i}"));
+    }
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute("UPDATE tasks SET name = 'before'", [])
+        .unwrap();
     let sink = make_session_sink();
-    // Stall the reader at the DB boundary. It must already own the session's
-    // snapshot lock, otherwise a second admitted read can overtake its result.
-    let connection = state.work_db.connect().unwrap();
+    let slow_db = Arc::new(state.work_db.query_connection().unwrap());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut first = true;
+    slow_db
+        .connect()
+        .unwrap()
+        .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            if first
+                && matches!(
+                    ctx.action,
+                    rusqlite::hooks::AuthAction::Read {
+                        table_name: "projects",
+                        ..
+                    }
+                )
+            {
+                first = false;
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
     let reader_state = state.clone();
     let reader_sink = sink.clone();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let product_id = product.id.clone();
     let reader = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        started_tx.send(()).unwrap();
-        runtime.block_on(fetch(&reader_state, &reader_sink, &product.id, true))
+        tokio::runtime::Runtime::new().unwrap().block_on(fetch_with_db(
+            &reader_state,
+            &reader_sink,
+            &product_id,
+            true,
+            slow_db,
+        ))
     });
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut locked = false;
-    while Instant::now() < deadline {
-        if sink.work_tree_cache.try_lock().is_err() {
-            locked = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    drop(connection);
-    assert!(update(reader.join().unwrap()).base_sequence.is_none());
-    assert!(locked, "snapshot lock must cover the database read, not just enqueue");
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute("UPDATE tasks SET name = 'after'", [])
+        .unwrap();
+    let fast_db = Arc::new(state.work_db.reader().unwrap());
+    let fast = update(runtime.block_on(fetch_with_db(&state, &sink, &product.id, true, fast_db)));
+    assert!(fast.base_sequence.is_none());
+    assert_eq!(fast.changes["chores"][0]["name"], "after");
+    release_tx.send(()).unwrap();
+    let slow = update(reader.join().unwrap());
+    assert_eq!(slow.base_sequence, Some(fast.sequence));
+    assert_eq!(slow.changes, serde_json::json!({}));
 }
 
 #[tokio::test]

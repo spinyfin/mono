@@ -384,6 +384,8 @@ pub(super) struct SessionSink {
     #[builder(default)]
     pop_traces: StdMutex<HashMap<String, crate::population_timing::PopulationTrace>>,
     #[builder(default)]
+    pub(super) work_tree_generation: std::sync::atomic::AtomicU64,
+    #[builder(default)]
     pub(super) work_tree_cache: StdMutex<boss_protocol::work_tree_delta::WorkTreeCache>,
     /// One-shot acknowledgements for responses whose producer must know that
     /// the writer has flushed the frame before it can safely tear down the

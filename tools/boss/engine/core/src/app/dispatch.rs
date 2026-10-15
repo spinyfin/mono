@@ -3,7 +3,10 @@ use super::*;
 
 pub(super) async fn dispatch_request(mut ctx: Dispatch, request: FrontendRequest, bulk_read: bool) {
     if bulk_read {
-        let connection = if matches!(request, FrontendRequest::ListProposals { .. }) {
+        let connection = if matches!(
+            request,
+            FrontendRequest::ListProposals { .. } | FrontendRequest::GetWorkTree { .. }
+        ) {
             ctx.work_db.reader()
         } else {
             ctx.work_db.query_connection()

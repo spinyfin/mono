@@ -1073,7 +1073,7 @@ impl WorkDb {
     pub fn get_work_tree_instrumented(&self, product_id: &str, trace: &mut PopulationTrace) -> Result<WorkTree> {
         let mut connection = self.connect()?;
         // All projections must describe one consistent database snapshot.
-        let conn = connection.transaction()?;
+        let conn = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
 
         let t = Instant::now();
         let product = query_product(&conn, product_id).require("product", product_id)?;

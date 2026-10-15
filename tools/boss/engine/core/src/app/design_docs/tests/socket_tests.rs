@@ -109,24 +109,57 @@ async fn blocked_document_holds_real_dispatch_admission_until_response() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_cached_reads_start_one_revalidation_fetch() {
-    cached_read_burst(false).await;
+    cached_read_burst().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cached_read_burst_waits_for_slow_first_response_without_admission_errors() {
-    cached_read_burst(true).await;
-}
-
-async fn cached_read_burst(slow_first: bool) {
+async fn identical_cold_reads_start_without_waiting_for_the_first_response() {
     let source = Arc::new(GatedSource {
         inner: FakeSource::new(),
-        gate: Arc::new(tokio::sync::Semaphore::new(usize::from(!slow_first))),
+        gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        started: AtomicUsize::new(0),
+    });
+    let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
+        ServerStateOverrides::builder()
+            .design_docs(Arc::new(DesignDocsService::with_source(source.clone())))
+            .build(),
+    );
+    let (client, server) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(handle_frontend_connection(server, state, None));
+    let (read, mut write) = client.into_split();
+    let mut lines = BufReader::new(read).lines();
+    send(&mut write, "first", get(PATH, GIT_REF)).await;
+    wait_started(&source, 1).await;
+    send(&mut write, "second", get(PATH, GIT_REF)).await;
+    // Neither fetch can finish yet: the second must enter independently.
+    wait_started(&source, 2).await;
+    source.gate.add_permits(2);
+    let mut ids = std::collections::HashSet::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ids.len() < 2 {
+            let env: FrontendEventEnvelope = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            if let Some(id) = env.request_id {
+                assert!(matches!(env.payload, FrontendEvent::ProductDesignDocContent { .. }));
+                assert!(ids.insert(id));
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ids, ["first".to_string(), "second".to_string()].into_iter().collect());
+    drop(write);
+    drop(lines);
+    handler.await.unwrap().unwrap();
+}
+
+async fn cached_read_burst() {
+    let source = Arc::new(GatedSource {
+        inner: FakeSource::new(),
+        gate: Arc::new(tokio::sync::Semaphore::new(1)),
         started: AtomicUsize::new(0),
     });
     let svc = Arc::new(DesignDocsService::with_source(source.clone()));
-    if !slow_first {
-        svc.open_markdown_doc(FLUNGE, PATH, GIT_REF).await;
-    }
+    svc.open_markdown_doc(FLUNGE, PATH, GIT_REF).await;
     let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
         ServerStateOverrides::builder()
             .design_docs(svc)
@@ -140,14 +173,6 @@ async fn cached_read_burst(slow_first: bool) {
     let mut lines = BufReader::new(read).lines();
     for index in 0..32 {
         send(&mut write, &format!("cached-{index}"), get(PATH, GIT_REF)).await;
-    }
-    if slow_first {
-        wait_started(&source, 1).await;
-        // Exceed the explicit 500 ms admission wait while all 31
-        // successors queue for their ordering turn on this same view.
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert_eq!(source.started.load(Ordering::SeqCst), 1);
-        source.gate.add_permits(1);
     }
     let mut ids = std::collections::HashSet::new();
     tokio::time::timeout(Duration::from_secs(5), async {
