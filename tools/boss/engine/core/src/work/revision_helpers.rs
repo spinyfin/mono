@@ -1019,6 +1019,9 @@ pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task
     }
     // Reads `ai_review_state`, so it must follow attach_ai_review_state.
     attach_review_section(&mut tasks, &mut chores);
+    if let Err(err) = attach_pr_updated_at(conn, &mut tasks, &mut chores) {
+        tracing::warn!(?err, task_id = %task.id, "attach_task_derived_projections: pr_updated_at failed; ignoring");
+    }
     if let Err(err) = attach_has_attachments_flag_for_ids(conn, &mut tasks, &mut chores) {
         tracing::warn!(
             ?err,

@@ -208,6 +208,7 @@ async fn question_summary_survives_upgrade_of_existing_projection() {
          ALTER TABLE execution_bookmarks DROP COLUMN reconciliation_note;
          ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
          ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
+         ALTER TABLE tasks DROP COLUMN pr_updated_at;
          DROP VIEW open_operator_questions;
          CREATE VIEW open_operator_questions AS
          SELECT work_item_id, json_patch(question_json,

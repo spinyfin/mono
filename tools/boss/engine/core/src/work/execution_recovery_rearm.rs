@@ -130,6 +130,7 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN reconciliation_note;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
+        ALTER TABLE tasks DROP COLUMN pr_updated_at;
         UPDATE metadata SET value = '38' WHERE key = 'schema_version';";
 
     /// Undo only schema 43 so reopening replays its re-arm.
@@ -137,6 +138,7 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN reconciliation_note;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
+        ALTER TABLE tasks DROP COLUMN pr_updated_at;
         UPDATE metadata SET value = '42' WHERE key = 'schema_version';";
 
     /// Create a chore under a fresh product and park it the way the

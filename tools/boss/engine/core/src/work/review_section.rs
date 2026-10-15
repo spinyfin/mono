@@ -10,7 +10,10 @@
 use boss_engine_board_gesture::BoardRow;
 use boss_protocol::{BoardColumn, ReviewSection, Task, TaskStatus};
 
-use super::{AI_REVIEW_STATE_REVIEW_QUEUED, AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS, AI_REVIEW_STATE_REVIEWING};
+use super::{
+    AI_REVIEW_STATE_REVIEW_QUEUED, AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS, AI_REVIEW_STATE_REVIEWING, Connection,
+    Result,
+};
 
 /// Resolve the Review-column section of `task`, or `None` when the row is not
 /// a Review-lane card (its board position is some other column, or it sits in
@@ -90,6 +93,35 @@ pub(crate) fn attach_review_section(tasks: &mut [Task], chores: &mut [Task]) {
     for task in tasks.iter_mut().chain(chores.iter_mut()) {
         task.review_section = classify_review_section(task);
     }
+}
+
+/// Set `pr_updated_at` on every Review-lane card from `tasks.pr_updated_at`
+/// (GitHub's `updatedAt` for the bound PR, written by the merge poller). One
+/// batched query over the cards that can use it; every other row keeps `None`.
+pub(crate) fn attach_pr_updated_at(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
+    let ids: Vec<String> = tasks
+        .iter()
+        .chain(chores.iter())
+        .filter(|row| row.review_section.is_some())
+        .map(|row| row.id.clone())
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, pr_updated_at FROM tasks WHERE id IN ({placeholders}) AND NULLIF(pr_updated_at, '') IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let found: std::collections::HashMap<String, String> = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for row in tasks.iter_mut().chain(chores.iter_mut()) {
+        row.pr_updated_at = found.get(&row.id).cloned();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1145,6 +1145,18 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_section: Option<ReviewSection>,
 
+    /// GitHub's `updatedAt` for this card's bound PR (RFC 3339), as of the
+    /// merge poller's last probe. `None` until a probe has reported one, or
+    /// when the row has no PR. Read by the macOS client, together with
+    /// `updated_at`, to order the Review column's Pending section by most
+    /// recent activity. Unlike `pr_state_polled_at` it moves only when the PR
+    /// itself changes, not on every poll.
+    ///
+    /// Populated from the `tasks.pr_updated_at` column by the engine's
+    /// `attach_pr_updated_at` on the `get_work_tree` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_updated_at: Option<String>,
+
     /// Resolved doc-link state for this work item, derived from the
     /// task's own `doc_*` columns. Independent of `kind`: any work item
     /// may carry a per-task doc pointer. The engine resolves those

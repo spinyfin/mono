@@ -1555,7 +1555,8 @@ impl WorkDb {
                  merge_queue_detail     = CASE WHEN ?8 THEN merge_queue_detail ELSE ?7 END,
                  pr_mergeable_state     = ?9,
                  pr_merge_state_status  = ?10,
-                 pr_head_sha            = ?11
+                 pr_head_sha            = ?11,
+                 pr_updated_at          = COALESCE(?12, pr_updated_at)
              WHERE id = ?1
                AND deleted_at IS NULL
                AND (COALESCE(ci_required_state, '') != ?2
@@ -1564,7 +1565,8 @@ impl WorkDb {
                                     OR COALESCE(merge_queue_detail, '') != COALESCE(?7, '')))
                     OR COALESCE(pr_mergeable_state, '') != ?9
                     OR COALESCE(pr_merge_state_status, '') != COALESCE(?10, '')
-                    OR COALESCE(pr_head_sha, '') != COALESCE(?11, ''))",
+                    OR COALESCE(pr_head_sha, '') != COALESCE(?11, '')
+                    OR COALESCE(pr_updated_at, '') != COALESCE(?12, pr_updated_at, ''))",
             params![
                 work_item_id,
                 input.ci_required_state,
@@ -1577,6 +1579,7 @@ impl WorkDb {
                 input.pr_mergeable_state,
                 input.pr_merge_state_status,
                 input.pr_head_sha,
+                input.pr_updated_at,
             ],
         )?;
         tx.commit()?;
@@ -1747,6 +1750,10 @@ pub struct PrPollStateInput<'a> {
     /// `WorkExecution::pr_head_before` (the snapshot at a specific
     /// execution's run start).
     pub pr_head_sha: Option<&'a str>,
+    /// GitHub's `updatedAt` for the PR at probe time (RFC 3339). `None` when
+    /// GitHub didn't report one; the stored value is then kept. Backs
+    /// `Task::pr_updated_at`, the Review column's Pending-section recency key.
+    pub pr_updated_at: Option<&'a str>,
     /// When `true`, `merge_queue_state`/`merge_queue_detail` are left
     /// untouched regardless of the values above. Used for Trunk-owned rows
     /// and a GitHub-native intent's empty first observation; both have a

@@ -83,7 +83,8 @@ extension ChatViewModel {
     /// Build the Review column's labelled sections from each card's
     /// engine-computed `reviewSection`, in `ReviewSection.allCases` order.
     /// Empty sections are omitted rather than rendered as empty headers, and
-    /// `items` keeps its incoming order within each section.
+    /// `items` keeps its incoming order within each section, except Pending,
+    /// which is ordered by most recent activity (see `pendingRecencySort`).
     ///
     /// The client does not classify: a card the engine sent no section for
     /// (an engine that predates the field, or a card optimistically moved
@@ -97,11 +98,29 @@ extension ChatViewModel {
             return WorkBoardSection(
                 id: "review-\(section.rawValue)",
                 title: section.title,
-                items: sectionItems,
+                items: section == .pending ? sectionItems.sorted(by: pendingRecencySort) : sectionItems,
                 isCollapsible: true,
                 defaultExpanded: true
             )
         }
+    }
+
+    /// Pending-section order: newest activity first, where activity is the
+    /// later of the work item's `updatedAt` and its PR's `prUpdatedAt`. Ties
+    /// (and unparseable timestamps, which sort last) break on id so cards do
+    /// not jitter between refreshes.
+    static func pendingRecencySort(_ lhs: WorkTask, _ rhs: WorkTask) -> Bool {
+        let l = lastActivity(of: lhs), r = lastActivity(of: rhs)
+        if l != r { return l > r }
+        return lhs.id < rhs.id
+    }
+
+    private static func lastActivity(of task: WorkTask) -> Date {
+        let formatters = [ISO8601DateFormatter.fractional, ISO8601DateFormatter.plain]
+        let dates = [task.updatedAt, task.prUpdatedAt ?? ""].compactMap {
+            parseUpdatedAt($0, isoFormatters: formatters)
+        }
+        return dates.max() ?? .distantPast
     }
 
     /// Bucket completed tasks by recency for the Done lane:
@@ -399,4 +418,17 @@ extension ChatViewModel {
     func taskRuntime(for taskID: String) -> WorkTaskRuntime? {
         taskRuntimesByID[taskID]
     }
+}
+
+private extension ISO8601DateFormatter {
+    nonisolated(unsafe) static let fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    nonisolated(unsafe) static let plain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
 }

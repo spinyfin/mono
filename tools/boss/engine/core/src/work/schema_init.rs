@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 44;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 45;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -27,6 +27,10 @@ pub(in crate::work) const EXECUTION_BOOKMARK_COLUMNS_43: &str =
      ALTER TABLE execution_bookmarks ADD COLUMN reconciliation_note TEXT;
      ALTER TABLE execution_bookmarks ADD COLUMN retired_at TEXT;
      ALTER TABLE execution_bookmarks ADD COLUMN retired_reason TEXT";
+
+/// Schema 45: GitHub's `updatedAt` for the task's PR, written by the merge
+/// poller. The Review column orders its Pending section by it.
+const TASKS_PR_UPDATED_AT_45: &str = "ALTER TABLE tasks ADD COLUMN pr_updated_at TEXT";
 
 /// Serves the shared-PR probes (`o.pr_url = t.pr_url`, `pr_url = ?`) so they
 /// are index lookups instead of full `tasks` scans.
@@ -124,6 +128,9 @@ impl WorkDb {
         }
         if version < 44 {
             tx.execute_batch(TASKS_PR_URL_INDEX_SQL)?;
+        }
+        if version < 45 {
+            tx.execute_batch(TASKS_PR_UPDATED_AT_45)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -627,6 +634,7 @@ mod floor_tests {
             41,
             42,
             43,
+            44,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -675,6 +683,9 @@ mod floor_tests {
             if version >= 44 {
                 conn.execute_batch(TASKS_PR_URL_INDEX_SQL).unwrap();
             }
+            if version >= 45 {
+                conn.execute_batch(TASKS_PR_UPDATED_AT_45).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -706,6 +717,7 @@ mod floor_tests {
             review_guide_jobs::guide_updates::migrate(&expected).unwrap();
             expected.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap();
             expected.execute_batch(TASKS_PR_URL_INDEX_SQL).unwrap();
+            expected.execute_batch(TASKS_PR_UPDATED_AT_45).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {
