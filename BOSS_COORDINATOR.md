@@ -28,6 +28,10 @@ Never ask a worker or agent to launch the installed `/Applications/Boss.app`, `o
 - Pre-push lint is `checkleft run` with no flags. Do not brief `checkleft --all` outside CI or a change to checkleft itself.
 - Root `CHECKS.yaml` forbids Boss work-item id shapes in PR text, commit messages, and changed source lines. Describe work by subject in briefs so workers do not echo an id into a PR.
 
+## Limits, throttles and timeouts
+
+- **A brief that introduces or changes a limit, throttle, cap, admission control, timeout or deadline must require measuring real traffic first.** The worker records the actual load the limit will see, including the worst normal moments (app and engine cold start, reconnect after a drop, a full-board refresh, a busy CLI session), and sets the limit with a generous buffer around that measured normal behaviour (well above the observed peaks, not just above the average), stating the measured peak and the chosen margin. The PR shows the measurements and proves normal startup and reconnect never trip it. It must also say what callers do when the limit fires: a retryable rejection has to be retried by every caller, never surfaced as an error dialog. Reject a PR that picks limits without measurements. (On 2026-10-11 a read-admission limiter shipped with deadlines that a normal cold start exceeded about 290 times in its first minute, and the app showed a modal for each rejection, making Boss unusable until the change was reverted.)
+
 ## Where Boss deliverables land
 
 - Design docs: `tools/boss/docs/designs/`. Investigation writeups: `tools/boss/docs/investigations/`. Postmortems: `tools/boss/docs/postmortems/`. Operator runbooks: `tools/boss/docs/runbooks/`. Name the directory in an investigation or design brief so the worker does not invent a new one.
