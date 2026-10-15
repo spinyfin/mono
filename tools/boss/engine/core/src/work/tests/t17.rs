@@ -149,7 +149,7 @@ fn queued_wait_payload_preserves_holds_and_clears_the_blocker() {
     for reason in [
         "dispatch_paused",
         "pool_exhausted",
-        "Held by the interactive concurrency cap (3/3 workers live) — dispatches as workers finish",
+        "Waiting for an available worker (3 working)",
         "custom hold",
     ] {
         db.set_dispatch_wait_reason(&execution.id, reason).unwrap();
