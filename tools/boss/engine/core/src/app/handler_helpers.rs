@@ -572,6 +572,80 @@ pub(super) fn send_work_error(sink: &SessionSink, request_id: &str, err: impl st
     );
 }
 
+/// A board gesture the engine refused or reverted: what to tell the user
+/// next to the dragged card. Carried to the app as
+/// [`FrontendEvent::WorkItemRefused`].
+#[derive(Debug, Clone)]
+pub(super) struct BoardRefusal {
+    pub(super) code: boss_protocol::BoardRefusalCode,
+    pub(super) message: String,
+    pub(super) action: Option<boss_protocol::BoardRefusalAction>,
+}
+
+impl BoardRefusal {
+    pub(super) fn new(code: boss_protocol::BoardRefusalCode, message: impl std::fmt::Display) -> Self {
+        Self {
+            code,
+            message: message.to_string(),
+            action: None,
+        }
+    }
+
+    /// Classify a dispatch failure. A bound-PR refusal names the PR and
+    /// points at revisions; anything else keeps the engine's own text under
+    /// `fallback`.
+    pub(super) fn from_dispatch_error(
+        work_db: &WorkDb,
+        id: &str,
+        err: &anyhow::Error,
+        fallback: boss_protocol::BoardRefusalCode,
+    ) -> Self {
+        if err.downcast_ref::<crate::work::BoundPrRefusal>().is_some() {
+            let pr_url = match work_db.get_work_item(id) {
+                Ok(WorkItem::Task(task)) | Ok(WorkItem::Chore(task)) => task.pr_url,
+                _ => None,
+            };
+            let pr_number = pr_url
+                .as_deref()
+                .and_then(|url| url.trim_end_matches('/').rsplit('/').next())
+                .filter(|tail| !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()));
+            let message = match pr_number {
+                Some(number) => {
+                    format!("This item already has a PR (#{number}). To change it, add a revision.")
+                }
+                None => "This item already has a PR. To change it, add a revision.".to_owned(),
+            };
+            return Self {
+                code: boss_protocol::BoardRefusalCode::BoundPr,
+                message,
+                action: Some(boss_protocol::BoardRefusalAction::AddRevision),
+            };
+        }
+        Self::new(fallback, format!("{err:#}"))
+    }
+}
+
+/// Answer a request with a refusal: the structured
+/// [`FrontendEvent::WorkItemRefused`] for a board gesture (`board_gesture`),
+/// a plain [`FrontendEvent::WorkError`] for every other caller, whose
+/// clients match on that shape.
+pub(super) fn send_refusal(sink: &SessionSink, request_id: &str, board_gesture: bool, id: &str, refusal: BoardRefusal) {
+    if board_gesture {
+        send_response(
+            sink,
+            request_id,
+            FrontendEvent::WorkItemRefused {
+                id: id.to_owned(),
+                code: refusal.code,
+                message: refusal.message,
+                suggested_action: refusal.action,
+            },
+        );
+    } else {
+        send_work_error(sink, request_id, refusal.message);
+    }
+}
+
 pub(super) fn send_response_with_revision(sink: &SessionSink, request_id: &str, revision: u64, payload: FrontendEvent) {
     sink.enqueue(FrontendEventEnvelope::response_with_revision(
         request_id.to_owned(),

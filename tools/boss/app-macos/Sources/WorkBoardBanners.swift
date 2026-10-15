@@ -104,6 +104,9 @@ struct WorkDispatchFailureBanner: View {
 
 struct WorkDragRefusalBanner: View {
     let message: String
+    /// Title of the engine-suggested next step; nil hides the button.
+    var actionTitle: String? = nil
+    var onAction: () -> Void = {}
     let onDismiss: () -> Void
 
     var body: some View {
@@ -117,6 +120,12 @@ struct WorkDragRefusalBanner: View {
                 .foregroundStyle(.primary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 4)
+            if let actionTitle {
+                Button(actionTitle, action: onAction)
+                    .font(.caption)
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel(actionTitle)
+            }
             Button(action: onDismiss) {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundStyle(.secondary)

@@ -1,6 +1,22 @@
 use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
 use super::*;
 
+/// Typed marker for "this item already owns a PR, so a fresh implementation
+/// run is refused". A distinct type (rather than a bare `bail!`) lets board
+/// gestures report a machine-readable refusal code by downcasting instead of
+/// matching message text. The `Display` text is unchanged from the original
+/// `bail!`, so CLI and log output stay the same.
+#[derive(Debug)]
+pub(crate) struct BoundPrRefusal;
+
+impl std::fmt::Display for BoundPrRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Work already has a bound PR; use a revision to change it")
+    }
+}
+
+impl std::error::Error for BoundPrRefusal {}
+
 /// Shared per-product short-id read-modify-write. Reads the current
 /// `next_value` from `table` for `product_id` (defaulting to 1 when no
 /// row exists yet), writes back `next_value + 1`, and returns the value
@@ -1775,7 +1791,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     // Existing live work, queued reviews and CI-remediation retries above
     // remain reusable. Only minting a fresh primary implementation is wrong.
     if primary_pr_awaits_review(conn, &work_item_id)? {
-        bail!("Work already has a bound PR; use a revision to change it");
+        return Err(BoundPrRefusal.into());
     }
     let _ = product_id_for_work_item(conn, &work_item_id)?;
 

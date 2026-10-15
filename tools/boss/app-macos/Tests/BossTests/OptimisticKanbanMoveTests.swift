@@ -150,6 +150,48 @@ final class OptimisticKanbanMoveTests: XCTestCase {
                      "modal must not interrupt when an optimistic move is in-flight")
     }
 
+    /// The engine's structured refusal bounces the card and shows the engine's
+    /// reason, code and suggested next step on the dragged card.
+    func testWorkItemRefusedShowsEngineReasonAndActionOnCard() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+
+        let reason = "This item already has a PR (#3163). To change it, add a revision."
+        model.applyEventForTest(.workItemRefused(
+            id: task.id, code: "bound_pr", message: reason, suggestedAction: "add_revision"
+        ))
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog, "a refused drop bounces back")
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, task.id)
+        XCTAssertEqual(model.dragRefusalNotice?.message, reason)
+        XCTAssertEqual(model.dragRefusalNotice?.code, "bound_pr")
+        XCTAssertEqual(model.dragRefusalNotice?.suggestedAction, "add_revision")
+        XCTAssertNil(model.workErrorMessage, "a board refusal is inline, not modal")
+
+        model.performDragRefusalAction(model.dragRefusalNotice!)
+        XCTAssertEqual(model.selectedWorkCardID, task.id, "the action opens the card")
+        XCTAssertNil(model.dragRefusalNotice)
+    }
+
+    /// A refusal still surfaces on the card when no optimistic move is pending.
+    func testWorkItemRefusedWithoutPendingMoveStillShowsNotice() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+
+        model.applyEventForTest(.workItemRefused(
+            id: task.id, code: "update_rejected", message: "cannot move: gated by [task_p2]", suggestedAction: nil
+        ))
+
+        XCTAssertEqual(model.dragRefusalNotice?.taskID, task.id)
+        XCTAssertEqual(model.dragRefusalNotice?.message, "cannot move: gated by [task_p2]")
+        XCTAssertNil(model.dragRefusalNotice?.suggestedAction)
+    }
+
     func testWorkErrorFallsBackToModalWhenNoMovePending() {
         let model = makeModel()
         // No pending optimistic move.
