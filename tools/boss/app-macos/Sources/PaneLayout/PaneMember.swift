@@ -23,7 +23,7 @@ public enum AgentType: String, CaseIterable, Hashable, Sendable {
         switch self {
         case .coding: "Coding"
         case .design: "Design"
-        case .review: "Review"
+        case .review: "Reviewing"
         case .automation: "Automation"
         case .answer: "Answer"
         case .unknown: "Unknown"
