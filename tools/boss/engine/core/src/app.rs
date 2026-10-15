@@ -572,6 +572,9 @@ struct ServerStateOverrides {
     source_packet_collector: Option<crate::review_guide_capture::SourcePacketCollector>,
     /// Fake PR detector. `None` uses `CommandPrDetector` (shells out to `gh`).
     pr_detector: Option<Arc<dyn PrDetector>>,
+    /// Fake PR lifecycle checker for the completion handler. `None` uses the
+    /// `gh`-backed default.
+    pr_state_checker: Option<Arc<dyn crate::work::PrStateChecker>>,
     /// Coordinator-reset handoff wait. `None` uses the production timeout.
     coordinator_handoff_timeout: Option<std::time::Duration>,
     coordinator_handoff_delivery: Option<Arc<dyn crate::coordinator_tmux::inbox::HandoffDelivery>>,
@@ -1230,6 +1233,7 @@ impl ServerState {
             branch_verifier: branch_verifier_override,
             source_packet_collector: source_packet_collector_override,
             pr_detector: pr_detector_override,
+            pr_state_checker: pr_state_checker_override,
             coordinator_handoff_timeout: coordinator_handoff_timeout_override,
             coordinator_handoff_delivery: coordinator_handoff_delivery_override,
             coordinator_tmux: coordinator_tmux_override,
@@ -1567,6 +1571,9 @@ impl ServerState {
         .with_review_pool_size(cfg.work.review_pool_size);
         if let Some(branch_verifier) = branch_verifier_override {
             completion_handler_builder = completion_handler_builder.with_branch_verifier(branch_verifier);
+        }
+        if let Some(checker) = pr_state_checker_override {
+            completion_handler_builder = completion_handler_builder.with_pr_state_checker(checker);
         }
         if let Some(collector) = source_packet_collector_override {
             completion_handler_builder = completion_handler_builder.with_source_packet_collector(collector);

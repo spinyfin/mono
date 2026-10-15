@@ -222,6 +222,13 @@ impl crate::completion::BranchVerifier for SettableHeadRefVerifier {
 pub(super) fn test_server_state_with_fakes_and_branch_verifier(
     branch_verifier: Arc<dyn crate::completion::BranchVerifier>,
 ) -> (Arc<ServerState>, tempfile::TempDir) {
+    test_server_state_with_fakes_branch_verifier_and_pr_state(branch_verifier, None)
+}
+
+pub(super) fn test_server_state_with_fakes_branch_verifier_and_pr_state(
+    branch_verifier: Arc<dyn crate::completion::BranchVerifier>,
+    pr_state_checker: Option<Arc<dyn crate::work::PrStateChecker>>,
+) -> (Arc<ServerState>, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
         crate::config::WorkConfig::builder()
@@ -238,6 +245,7 @@ pub(super) fn test_server_state_with_fakes_and_branch_verifier(
             cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
             execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
             branch_verifier: Some(branch_verifier),
+            pr_state_checker,
             ..Default::default()
         },
     )
@@ -628,9 +636,13 @@ async fn publish_output_citing_the_origin_pr_first_binds_the_pr_on_the_execution
     // The execution id is only known after spawn, so the verifier reads it
     // from a shared cell filled in below.
     let heads = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<u64, String>::new()));
-    let (server_state, _dir) =
-        test_server_state_with_fakes_and_branch_verifier(Arc::new(PerPrHeadRefVerifier(heads.clone())));
-    let (execution_id, _chore_id) = spawned_source_capture_worker(&server_state);
+    let (server_state, _dir) = test_server_state_with_fakes_branch_verifier_and_pr_state(
+        Arc::new(PerPrHeadRefVerifier(heads.clone())),
+        Some(Arc::new(crate::work::FakePrStateChecker::always(
+            crate::work::PrOpenState::Open,
+        ))),
+    );
+    let (execution_id, chore_id) = spawned_source_capture_worker(&server_state);
     {
         let mut heads = heads.lock().unwrap();
         heads.insert(9, "boss/exec_some_other_execution".into());
@@ -669,5 +681,35 @@ async fn publish_output_citing_the_origin_pr_first_binds_the_pr_on_the_execution
         !entry.candidates().contains(&ORIGIN_URL.to_owned()),
         "the origin PR must be evicted: {:?}",
         entry.candidates()
+    );
+
+    // The dispatcher's staged cache drives the finalizer: the new PR binds,
+    // never the origin PR the output printed first.
+    let outcome = server_state
+        .completion_handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(&outcome, crate::completion::StopOutcome::ReviewerEnqueued { pr_url } | crate::completion::StopOutcome::PrDetected { pr_url } if pr_url == SOURCE_CAPTURE_PR_URL),
+        "got {outcome:?}"
+    );
+    let task = match server_state.work_db.get_work_item(&chore_id).unwrap() {
+        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t,
+        other => panic!("expected a task row, got {other:?}"),
+    };
+    assert_eq!(task.pr_url.as_deref(), Some(SOURCE_CAPTURE_PR_URL));
+    assert_ne!(
+        task.status,
+        boss_protocol::TaskStatus::Todo,
+        "the task moves on to review"
+    );
+    assert_eq!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .pr_url
+            .as_deref(),
+        Some(SOURCE_CAPTURE_PR_URL)
     );
 }

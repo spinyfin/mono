@@ -315,6 +315,9 @@ impl WorkDb {
                  blocked_reason     = NULL,
                  blocked_detail     = NULL,
                  blocked_attempt_id = NULL,
+                 archived_by        = NULL,
+                 archived_at        = NULL,
+                 archived_reason    = NULL,
                  last_status_actor  = 'engine',
                  updated_at         = ?4
              WHERE id = ?1

@@ -958,6 +958,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_archived_followup_bound_to_its_origin_pr_is_rebound_and_loses_archive_metadata() {
+        let (_dir, db) = open_db();
+        let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'archived', last_status_actor = 'engine', completed_at = 'now',
+                     archived_by = 'engine', archived_at = 'then', archived_reason = 'merged' WHERE id = ?1",
+                [&task_id],
+            )
+            .unwrap();
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_18dad2723a80ed10_23".to_owned())]));
+        let detector = FixedDetector(PrStatus::Fresh { url: OWN.to_owned() }, StdMutex::default());
+        let mut attempts = HashMap::new();
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &verifier,
+            &FakePrStateChecker::always(PrOpenState::Open),
+            &RecordingDocRefresher::default(),
+            &mut attempts,
+        )
+        .await;
+        assert_eq!(outcome.rebound, 1, "{outcome:?}");
+        let t = task(&db, &task_id);
+        assert_eq!(t.pr_url.as_deref(), Some(OWN));
+        assert_eq!(t.status, TaskStatus::InReview);
+        let archive: (Option<String>, Option<String>, Option<String>) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT archived_by, archived_at, archived_reason FROM tasks WHERE id = ?1",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(archive, (None, None, None));
+    }
+
+    #[tokio::test]
     async fn human_closed_row_bound_to_its_origin_pr_is_not_a_candidate() {
         let (_dir, db) = open_db();
         let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
