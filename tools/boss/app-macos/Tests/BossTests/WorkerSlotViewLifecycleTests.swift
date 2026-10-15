@@ -34,7 +34,8 @@ final class WorkerSlotViewLifecycleTests: XCTestCase {
         func rootView(placeholder: Bool) -> some View {
             AgentSurfaceCollection(
                 runIds: grid.renderRunIds(attached: workspace.viewersByRunId.keys),
-                placement: { grid.placement(for: $0, area: area) }
+                layout: grid.layout,
+                area: area
             ) { runId in
                 WorkerSlotView(
                     runtime: workspace.runtime,
