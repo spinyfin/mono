@@ -911,6 +911,25 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
         }
     }
 
+    // Foreign-PR guard (the sync twin of `WorkDb::other_work_item_bound_to_pr`,
+    // on this transaction): a PR another work item holds — typically a
+    // follow-up's merged origin PR — is never this execution's deliverable.
+    let holder: Option<String> = tx
+        .query_row(
+            "SELECT id FROM tasks WHERE pr_url = ?1 AND id != ?2 AND deleted_at IS NULL AND kind != 'revision' \
+             ORDER BY created_at ASC, id ASC LIMIT 1",
+            params![payload.pr_url, task.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(holder) = holder {
+        return Ok(ApplyDecision::Rejected(format!(
+            "{} is already bound to work item `{holder}`; a PR that belongs to another work item is never \
+             this execution's deliverable",
+            payload.pr_url
+        )));
+    }
+
     if let Some(existing) = task.pr_url.as_deref().filter(|s| !s.is_empty())
         && existing != payload.pr_url
     {

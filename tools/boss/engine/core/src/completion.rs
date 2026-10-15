@@ -541,6 +541,14 @@ pub(crate) fn branches_identify_same_work_item(a: &str, b: &str) -> bool {
     !suffix_a.is_empty() && suffix_a == branch_work_item_suffix(b)
 }
 
+/// Whether `head` identifies any of `branches` ([`branches_identify_same_work_item`]).
+/// A work item's own PR is on the branch of ANY of its primary implementation
+/// executions (a resumed execution pushes to its predecessor's branch), so
+/// ownership is decided against the whole set, never the latest execution.
+pub(crate) fn head_identifies_any_branch(head: &str, branches: &[String]) -> bool {
+    branches.iter().any(|b| branches_identify_same_work_item(head, b))
+}
+
 /// Probes GitHub for the PR opened against an engine-supplied branch
 /// name and reports whether the PR is open / merged / closed / absent.
 ///

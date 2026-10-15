@@ -185,6 +185,9 @@ impl WorkerCompletionHandler {
             &execution.branch_naming,
             execution.worker_branch_prefix.as_deref(),
         );
+        // A resumed execution's PR is on its predecessor's branch: accept any
+        // primary execution branch of the same work item.
+        let work_item_branches = self.work_item_branches(execution);
         let slug = match parse_repo_slug(&execution.repo_remote_url) {
             Ok(slug) => slug,
             Err(err) => {
@@ -208,7 +211,7 @@ impl WorkerCompletionHandler {
                 continue;
             };
             match self.branch_verifier.fetch_pr_head_ref(&slug, pr_num).await {
-                Ok(ref head_ref) if branches_identify_same_work_item(head_ref, &expected_branch) => {
+                Ok(ref head_ref) if head_identifies_any_branch(head_ref, &work_item_branches) => {
                     if head_ref.as_str() != expected_branch.as_str() {
                         tracing::info!(
                             execution_id,

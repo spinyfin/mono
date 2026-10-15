@@ -29,6 +29,36 @@ pub(super) struct ForeignPrConflict {
 }
 
 impl WorkerCompletionHandler {
+    /// Expected branches of every primary implementation execution of
+    /// `execution`'s work item, this execution's own first. A PR whose head
+    /// identifies any of them ([`head_identifies_any_branch`]) belongs to the
+    /// work item: a resumed or bounced-back execution is told to push to its
+    /// predecessor's branch (`## RESUME EXISTING PR`), so keying ownership on
+    /// this execution's id alone would fail every resume. A lookup failure
+    /// degrades to the execution's own branch.
+    pub(super) fn work_item_branches(&self, execution: &crate::work::WorkExecution) -> Vec<String> {
+        let mut branches = vec![expected_branch_name(
+            &execution.id,
+            &execution.branch_naming,
+            execution.worker_branch_prefix.as_deref(),
+        )];
+        match self.work_db.primary_execution_branches(&execution.work_item_id) {
+            Ok(others) => {
+                for b in others {
+                    if !branches.contains(&b) {
+                        branches.push(b);
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "work-item branch lookup failed; verifying against this execution's branch only",
+            ),
+        }
+        branches
+    }
+
     /// `Some(conflict)` when `pr_url` is already bound to a non-revision work
     /// item (in any status, `done` / `archived` included) other than
     /// `execution`'s own. Only meaningful for primary

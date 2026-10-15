@@ -710,3 +710,90 @@ async fn stored_pr_with_equivalent_branch_is_kept_without_detection() {
     assert_eq!(task_row(&db, &task_id).pr_url.as_deref(), Some(OWN_PR));
     assert_eq!(detector.call_count(), 0);
 }
+
+/// A predecessor execution on the same work item that already opened the PR
+/// (the resume / bounce-back shape: the new execution is told to
+/// `cube pr update` the predecessor's branch).
+fn add_predecessor_execution(db: &WorkDb, task_id: &str) -> String {
+    let predecessor = db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(task_id)
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                .status(boss_protocol::ExecutionStatus::Completed)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    predecessor.id
+}
+
+#[tokio::test]
+async fn resumed_execution_delivering_the_predecessors_stored_pr_binds_it() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, task_id, execution_id) = fixture(workspace.path());
+    let predecessor = add_predecessor_execution(&db, &task_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, OWN_PR],
+        )
+        .unwrap();
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler.with_branch_verifier(StubBranchVerifier::ok(&own_branch(&predecessor)));
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == OWN_PR),
+        "{outcome:?}"
+    );
+    assert_eq!(task_row(&db, &task_id).pr_url.as_deref(), Some(OWN_PR));
+    assert_eq!(detector.call_count(), 0);
+}
+
+#[tokio::test]
+async fn resumed_execution_delivering_a_staged_cube_pr_update_url_binds_it() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, task_id, execution_id) = fixture(workspace.path());
+    let predecessor = add_predecessor_execution(&db, &task_id);
+    let staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged.record_command_observation(&execution_id, OWN_PR, true);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_staged_pr_urls(staged)
+        .with_branch_verifier(StubBranchVerifier::ok(&own_branch(&predecessor)));
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == OWN_PR),
+        "{outcome:?}"
+    );
+    assert_eq!(task_row(&db, &task_id).pr_url.as_deref(), Some(OWN_PR));
+}
+
+#[tokio::test]
+async fn resumed_execution_still_rejects_a_foreign_head() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, task_id, execution_id) = fixture(workspace.path());
+    add_predecessor_execution(&db, &task_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, ORIGIN_PR],
+        )
+        .unwrap();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_branch_verifier(StubBranchVerifier::ok(ORIGIN_BRANCH));
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { .. }),
+        "{outcome:?}"
+    );
+}

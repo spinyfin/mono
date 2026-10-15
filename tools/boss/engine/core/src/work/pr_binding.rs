@@ -50,6 +50,12 @@ pub struct PrBindingRepairCandidate {
     /// `pr_url` nor status); rebinding or parking waits for the review to end.
     #[builder(default)]
     pub has_live_review: bool,
+    /// Expected branches of EVERY primary implementation execution of the
+    /// row, newest first (see [`WorkDb::primary_execution_branches`]). A PR
+    /// whose head matches any of them is the row's own: a resumed or
+    /// bounced-back execution pushes to its predecessor's branch.
+    #[builder(default)]
+    pub own_branches: Vec<String>,
 }
 
 /// Structural signals, each computable from the DB alone, that a row's PR
@@ -76,7 +82,36 @@ impl PrBindingSuspicion {
     }
 }
 
+/// Execution kinds that never open the work item's own PR; every other kind
+/// is a primary implementation execution.
+const NON_PRIMARY_EXECUTION_KINDS_SQL: &str = "'pr_review', 'pr_review_guide', 'revision_implementation', \
+     'ci_remediation', 'conflict_resolution', 'automation_triage', 'answer_agent'";
+
 impl WorkDb {
+    /// Expected branch names ([`crate::completion::expected_branch_name`]) of
+    /// every primary implementation execution of `work_item_id`, newest first.
+    /// A PR head matching any of them belongs to the work item: a resumed
+    /// or bounced-back execution is told to push to its predecessor's branch,
+    /// so ownership is decided by work item, not by the latest execution.
+    pub fn primary_execution_branches(&self, work_item_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, branch_naming, worker_branch_prefix FROM work_executions
+             WHERE work_item_id = ?1 AND kind NOT IN ({NON_PRIMARY_EXECUTION_KINDS_SQL})
+             ORDER BY created_at DESC, id DESC"
+        ))?;
+        let rows = stmt.query_map(params![work_item_id], |row| {
+            let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(1)?.as_deref());
+            let prefix = row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty());
+            Ok(crate::completion::expected_branch_name(
+                &row.get::<_, String>(0)?,
+                &branch_naming,
+                prefix.as_deref(),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     /// The id of a different non-revision work item (in any status, including
     /// `done` / `archived`; only soft-deleted rows are ignored) already bound
     /// to `pr_url`, if any. Revision rows are excluded: a revision's `pr_url`
@@ -107,13 +142,19 @@ impl WorkDb {
     ///
     /// Excludes rows with a live implementation-style execution (the running
     /// worker owns the binding) and rows a human already closed (`done` /
-    /// `archived`). A live review does not exclude a row — it is flagged via
+    /// `archived`). Engine-closed rows stay in: the merge poller closes a
+    /// follow-up mis-bound to its merged origin PR as soon as it is
+    /// `in_review`, which is exactly the row that needs repair. Only the
+    /// binding signals apply to closed rows, never the doc pointer. A live review does not exclude a row — it is flagged via
     /// [`PrBindingRepairCandidate::has_live_review`] so only the doc-pointer
     /// repair runs while it is live.
     pub fn list_pr_binding_repair_candidates(&self) -> Result<Vec<PrBindingRepairCandidate>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT t.id, t.product_id, t.status, t.pr_url, t.origin_pr_number, t.doc_branch,
+        // Scoped so the connection is released before the per-row branch
+        // lookups below take their own.
+        let selected = {
+            let conn = self.connect()?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT t.id, t.product_id, t.status, t.pr_url, t.origin_pr_number, t.doc_branch,
                     we.id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix,
                     (t.origin_pr_number IS NOT NULL
                        AND t.pr_url LIKE '%/pull/' || t.origin_pr_number) AS bound_to_origin,
@@ -138,16 +179,13 @@ impl WorkDb {
                SELECT latest.id
                FROM work_executions latest
                WHERE latest.work_item_id = t.id
-                 AND latest.kind NOT IN (
-                   'pr_review', 'pr_review_guide', 'revision_implementation', 'ci_remediation',
-                   'conflict_resolution', 'automation_triage', 'answer_agent'
-                 )
+                 AND latest.kind NOT IN ({NON_PRIMARY_EXECUTION_KINDS_SQL})
                ORDER BY latest.created_at DESC, latest.id DESC
                LIMIT 1
              )
              WHERE t.deleted_at IS NULL
                AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
-               AND t.status NOT IN ('done', 'archived')
+               AND NOT (t.status IN ('done', 'archived') AND COALESCE(t.last_status_actor, '') != 'engine')
                AND t.pr_url IS NOT NULL
                AND t.pr_url != ''
                AND NOT EXISTS (
@@ -160,50 +198,53 @@ impl WorkDb {
                    )
                )
              ORDER BY t.created_at ASC, t.id ASC",
-        ))?;
-        let rows = stmt.query_map([], |row| {
-            let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(8)?.as_deref());
-            let status: String = row.get(2)?;
-            Ok((
-                PrBindingRepairCandidate {
-                    task_id: row.get(0)?,
-                    product_id: row.get(1)?,
-                    task_status: status.parse::<TaskStatus>().unwrap_or(TaskStatus::Todo),
-                    bound_pr_url: row.get(3)?,
-                    origin_pr_number: row.get(4)?,
-                    doc_branch: row.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
-                    execution_id: row.get(6)?,
-                    repo_remote_url: row.get(7)?,
-                    branch_naming,
-                    worker_branch_prefix: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
-                    reasons: Vec::new(),
-                    has_live_review: row.get::<_, bool>(12)?,
-                },
-                row.get::<_, bool>(10)?,
-                row.get::<_, bool>(11)?,
-            ))
-        })?;
+            ))?;
+            let rows = stmt.query_map([], |row| {
+                let branch_naming: BranchNaming =
+                    deserialize_json_or_default(row.get::<_, Option<String>>(8)?.as_deref());
+                let status: String = row.get(2)?;
+                Ok((
+                    PrBindingRepairCandidate {
+                        task_id: row.get(0)?,
+                        product_id: row.get(1)?,
+                        task_status: status.parse::<TaskStatus>().unwrap_or(TaskStatus::Todo),
+                        bound_pr_url: row.get(3)?,
+                        origin_pr_number: row.get(4)?,
+                        doc_branch: row.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
+                        execution_id: row.get(6)?,
+                        repo_remote_url: row.get(7)?,
+                        branch_naming,
+                        worker_branch_prefix: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
+                        reasons: Vec::new(),
+                        has_live_review: row.get::<_, bool>(12)?,
+                        own_branches: Vec::new(),
+                    },
+                    row.get::<_, bool>(10)?,
+                    row.get::<_, bool>(11)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         let mut candidates = Vec::new();
-        for row in rows {
-            let (mut candidate, bound_to_origin, shared) = row?;
+        for (mut candidate, bound_to_origin, shared) in selected {
             if bound_to_origin {
                 candidate.reasons.push(PrBindingSuspicion::BoundToOriginPr);
             }
             if shared {
                 candidate.reasons.push(PrBindingSuspicion::SharedWithOtherWorkItem);
             }
-            if let Some(doc_branch) = candidate.doc_branch.as_deref() {
-                let expected = crate::completion::expected_branch_name(
-                    &candidate.execution_id,
-                    &candidate.branch_naming,
-                    candidate.worker_branch_prefix.as_deref(),
-                );
-                // Only an engine-shaped branch (`<prefix>/exec_…`) that names a
-                // DIFFERENT execution is evidence of a wrong PR; `main`, a
-                // human branch, or the opaque-hash shape are left alone.
+            let closed = matches!(candidate.task_status, TaskStatus::Done | TaskStatus::Archived);
+            if !candidate.reasons.is_empty() || candidate.doc_branch.is_some() {
+                candidate.own_branches = self.primary_execution_branches(&candidate.task_id)?;
+            }
+            if !closed && let Some(doc_branch) = candidate.doc_branch.as_deref() {
+                // Only an engine-shaped branch (`<prefix>/exec_…`) that names
+                // NO primary execution of this row is evidence of a wrong PR;
+                // `main`, a human branch, or the opaque-hash shape are left
+                // alone, and a predecessor execution's branch is the row's own.
                 let doc_suffix = crate::completion::branch_work_item_suffix(doc_branch);
                 if doc_suffix.starts_with("exec_")
-                    && !crate::completion::branches_identify_same_work_item(doc_branch, &expected)
+                    && !crate::completion::head_identifies_any_branch(doc_branch, &candidate.own_branches)
                 {
                     candidate.reasons.push(PrBindingSuspicion::DocBranchForeign);
                 }
@@ -248,7 +289,8 @@ impl WorkDb {
         let rows = tx.execute(
             "UPDATE tasks
              SET pr_url             = ?3,
-                 status             = CASE WHEN status IN ('todo', 'active', 'blocked') THEN 'in_review' ELSE status END,
+                 status             = CASE WHEN status IN ('todo', 'active', 'blocked', 'done') THEN 'in_review' ELSE status END,
+                 completed_at       = CASE WHEN status = 'done' THEN NULL ELSE completed_at END,
                  blocked_reason     = NULL,
                  blocked_detail     = NULL,
                  blocked_attempt_id = NULL,
@@ -257,7 +299,7 @@ impl WorkDb {
              WHERE id = ?1
                AND deleted_at IS NULL
                AND pr_url = ?2
-               AND status NOT IN ('done', 'archived')",
+               AND NOT (status IN ('done', 'archived') AND COALESCE(last_status_actor, '') != 'engine')",
             params![task_id, old_pr_url, new_pr_url, now],
         )?;
         if rows == 0 {
@@ -297,12 +339,13 @@ impl WorkDb {
                  blocked_detail     = ?4,
                  blocked_attempt_id = NULL,
                  autostart          = 0,
+                 completed_at       = NULL,
                  last_status_actor  = 'engine',
                  updated_at         = ?5
              WHERE id = ?1
                AND deleted_at IS NULL
                AND pr_url = ?2
-               AND status NOT IN ('done', 'archived')",
+               AND NOT (status IN ('done', 'archived') AND COALESCE(last_status_actor, '') != 'engine')",
             params![task_id, old_pr_url, BLOCKED_REASON_PR_BINDING_UNRESOLVED, detail, now],
         )?;
         if rows == 0 {
