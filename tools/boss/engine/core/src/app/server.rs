@@ -2144,21 +2144,11 @@ pub async fn serve_with_overrides(
         transient_error_idle,
     );
 
-    // Periodic abandoned-branch-PR reconciler: catches a terminated worker
-    // that pushed its engine-supplied branch but never got a PR opened for
-    // it (e.g. a GitHub outage on the PR-create path, or a worker that died
-    // before reaching that step). Detects the state directly off the
-    // execution row — terminal, workspace-backed, no `pr_url` anywhere —
-    // independent of whatever kanban status the task fell back to, then
-    // binds an already-existing PR or auto-creates one. Runs on a slow
-    // fixed interval and fires on boot; see that module for the full
-    // incident writeup and retry/backoff rationale.
-    let _abandoned_branch_pr_sweep_handle = crate::abandoned_branch_pr_sweep::spawn_loop(
-        server_state.work_db.clone(),
-        server_state.execution_coordinator.clone(),
-        server_state.dispatch_events.clone(),
-        crate::abandoned_branch_pr_sweep::DEFAULT_INTERVAL,
-    );
+    // Periodic PR-recovery sweeps (abandoned pushed branches with no PR;
+    // rows bound to a PR their own branch did not open). Both fire on boot;
+    // see `pr_recovery_sweeps` and the two sweep modules.
+    let (_abandoned_branch_pr_sweep_handle, _pr_binding_repair_sweep_handle) =
+        pr_recovery_sweeps::spawn_pr_recovery_sweeps(&server_state);
 
     // Engine-restart reattach (distributed-execution PR4): a remote
     // worker is launched detached and survives the engine restarting,
@@ -2993,5 +2983,6 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
     }
 }
 
+mod pr_recovery_sweeps;
 #[cfg(test)]
 mod startup_tests;

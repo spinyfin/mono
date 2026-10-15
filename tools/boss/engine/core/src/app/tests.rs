@@ -103,6 +103,7 @@ pub(super) fn test_server_state_with_fakes() -> (Arc<ServerState>, tempfile::Tem
 /// test sandbox's `gh` process-exec denial to fail the call for us.
 pub(super) fn test_server_state_with_source_collector(
     collector: crate::review_guide_capture::SourcePacketCollector,
+    branch_verifier: Arc<dyn crate::completion::BranchVerifier>,
 ) -> (Arc<ServerState>, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
@@ -120,11 +121,102 @@ pub(super) fn test_server_state_with_source_collector(
             cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
             execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
             source_packet_collector: Some(collector),
+            branch_verifier: Some(branch_verifier),
             ..Default::default()
         },
     )
     .unwrap();
     (state, temp)
+}
+
+/// Like [`test_server_state_with_fakes`], but also swaps in a fake
+/// [`crate::completion::PrDetector`] so a test that drives the `run_done`
+/// delivery path through the real RPC handler gets a deterministic
+/// branch-keyed detection result instead of the sandbox's denied `gh`
+/// process-exec (which the engine correctly reads as "GitHub unreachable",
+/// not as "no PR").
+pub(super) fn test_server_state_with_fakes_and_pr_detector(
+    pr_detector: Arc<dyn crate::completion::PrDetector>,
+) -> (Arc<ServerState>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        ServerStateOverrides {
+            cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
+            pr_detector: Some(pr_detector),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (state, temp)
+}
+
+/// [`crate::completion::PrDetector`] stub returning one canned status for
+/// every branch.
+pub(super) struct FixedPrDetector(pub(super) crate::completion::PrStatus);
+
+#[async_trait::async_trait]
+impl crate::completion::PrDetector for FixedPrDetector {
+    async fn detect_pr(
+        &self,
+        _repo_remote_url: &str,
+        _expected_branch: &str,
+    ) -> anyhow::Result<crate::completion::PrStatus> {
+        Ok(self.0.clone())
+    }
+}
+
+/// [`crate::completion::BranchVerifier`] stub whose `fetch_pr_head_ref`
+/// answers a branch the test sets after it knows the execution id (the
+/// server state — and so the verifier — exists before the execution does).
+#[derive(Default)]
+pub(super) struct SettableHeadRefVerifier {
+    head_ref: std::sync::Mutex<Option<String>>,
+}
+
+impl SettableHeadRefVerifier {
+    pub(super) fn set_head_ref(&self, branch: &str) {
+        *self.head_ref.lock().unwrap() = Some(branch.to_owned());
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::completion::BranchVerifier for SettableHeadRefVerifier {
+    async fn fetch_pr_head_ref(&self, _repo_slug: &str, _pr_number: u64) -> anyhow::Result<String> {
+        self.head_ref
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("head ref not configured"))
+    }
+    async fn fetch_pr_head_oid(&self, _: &str, _: u64) -> anyhow::Result<String> {
+        Ok("oid".into())
+    }
+    async fn fetch_pr_head_oid_fresh(&self, _: &str, _: u64) -> anyhow::Result<String> {
+        Ok("oid".into())
+    }
+    async fn fetch_diff_line_count(&self, _: &str, _: &str, _: &str) -> anyhow::Result<u64> {
+        Ok(999)
+    }
+    async fn fetch_pr_base_ref(&self, _: &str, _: u64) -> anyhow::Result<String> {
+        Ok("main".into())
+    }
+    async fn fetch_diff_signature(&self, _: &str, _: &str, _: &str) -> anyhow::Result<String> {
+        Ok("sig".into())
+    }
+    async fn fetch_pr_title_and_body(&self, _: &str, _: u64) -> anyhow::Result<(String, String)> {
+        Ok((String::new(), String::new()))
+    }
 }
 
 pub(super) fn test_server_state_with_fakes_and_branch_verifier(
@@ -444,18 +536,33 @@ fn spawned_source_capture_worker(server_state: &ServerState) -> (String, String)
     (execution.id, chore.id)
 }
 
+/// Capture-time source collection runs only for a PR URL whose head branch
+/// is this execution's own branch: the dispatcher stages the URL, the
+/// background branch check confirms it, and only then is the review-guide
+/// source captured on the canonical root. Collecting for an unverified URL
+/// would log "canonical PR … is already associated with root task …" for a
+/// PR the execution did not open.
 #[tokio::test]
 async fn finalization_armed_observation_captures_on_the_canonical_root() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let (server_state, _dir) = test_server_state_with_source_collector(counting_source_collector(
-        calls.clone(),
-        source_capture_packet(SOURCE_CAPTURE_PR_URL, "base", "head"),
-    ));
+    let verifier = Arc::new(SettableHeadRefVerifier::default());
+    let (server_state, _dir) = test_server_state_with_source_collector(
+        counting_source_collector(
+            calls.clone(),
+            source_capture_packet(SOURCE_CAPTURE_PR_URL, "base", "head"),
+        ),
+        verifier.clone(),
+    );
     server_state
         .feature_flags
         .set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true)
         .unwrap();
     let (execution_id, chore_id) = spawned_source_capture_worker(&server_state);
+    verifier.set_head_ref(&crate::completion::expected_branch_name(
+        &execution_id,
+        &boss_protocol::BranchNaming::BossExecPrefix,
+        None,
+    ));
     let event = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::PostToolUse {
             session_id: "claude-sess-1".into(),

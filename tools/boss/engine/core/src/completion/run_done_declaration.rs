@@ -25,23 +25,45 @@
 //! No-op declarations wait for the driver terminal boundary: only then has
 //! the driver drained abandoned commands and made command evidence authoritative.
 //!
-//! ## The hard rule this module is built around
+//! ## The two rules this module is built around
 //!
-//! No check that can make a network call may sit in the termination path.
-//! Both production incidents were a worker's declaration applying cleanly
-//! and the *next* thing that had to happen — a `gh` fetch inside the
-//! Stop-boundary satisfied-deliverable gate — failing or hanging. Moving the
-//! declaration off the Stop boundary and onto the submission path only fixes
-//! that if the submission path itself never blocks on GitHub. So:
+//! **No GitHub call may hold the termination path open indefinitely.** Both
+//! production incidents were a worker's declaration applying cleanly and the
+//! *next* thing that had to happen — a `gh` fetch inside the Stop-boundary
+//! satisfied-deliverable gate — failing or hanging. Moving the declaration
+//! off the Stop boundary and onto the submission path only fixes that if the
+//! submission path cannot block on GitHub for long.
+//!
+//! **Nothing binds a PR to a work item unless that PR's head branch is the
+//! execution's own branch.** A `delivered` declaration binds only a PR whose
+//! head is the execution's branch. The post-hoc audit cannot be relied on to
+//! catch a wrong URL: it returns early without a `pr_head_before` snapshot,
+//! which only a small fraction of primary implementations have. Binding
+//! whatever publish-armed URL the hook stream staged would bind a follow-up's
+//! *origin* PR (already merged), echoed by its publish command ahead of the
+//! new PR's URL, instead of the PR it just opened (flunge, 2026-10-05; mono,
+//! 2026-10-13): the reviewer then fails on the merged PR and the real PR is
+//! never reviewed.
+//!
+//! Both rules hold at once because the branch check is **bounded**, and a
+//! miss never falls back to an unverified URL:
 //!
 //! - Resolving the PR a `delivered` declaration binds to
-//!   ([`WorkerCompletionHandler::resolve_declared_pr_url_no_network`]) reads
-//!   only already-stored state: the task/chore's own `pr_url`, the
-//!   revision-chain-root lookup, and the in-memory hook-stream staging cache
-//!   / structured-output artifact this run itself already produced. It does
-//!   NOT call the Layer-2 branch-verification check
-//!   [`WorkerCompletionHandler::verified_staged_pr_url`] uses on the
-//!   Stop-boundary path, because that check is a `gh` call.
+//!   ([`WorkerCompletionHandler::resolve_declared_pr_url`]) first reads
+//!   already-stored state and verifies primary bindings by head branch
+//!   (revisions retain their chain-root lookup). With no verified bound PR it runs the same Layer-2
+//!   branch check the Stop boundary uses
+//!   ([`WorkerCompletionHandler::verified_staged_pr_url`]) over every staged
+//!   candidate, then the branch-keyed detector — each under
+//!   [`DECLARED_DELIVERY_NETWORK_BUDGET`]. The capture-time verification the
+//!   hook dispatcher spawns usually leaves the staged entry already verified,
+//!   so branch verification can reuse that cache; lifecycle state is read
+//!   fresh before deciding between review, completion, and refusal.
+//! - A timeout or transient `gh` failure binds nothing and leaves the
+//!   execution live with its declaration stamped; the Stop boundary and the
+//!   merge-poller recheck — both network-capable, both honouring the stamp —
+//!   finalize it once GitHub answers. A definitive "no PR on this branch"
+//!   fails the run visibly, naming the branch and the URLs it rejected.
 //! - The actual termination writes
 //!   ([`crate::work::WorkDb::record_worker_pr_completion`],
 //!   [`WorkerCompletionHandler::finalize_no_op_completion`],
@@ -50,12 +72,12 @@
 //!   only the local DB, the pane, the driver's local workspace state, and
 //!   the `cube` CLI (a local subprocess, not GitHub).
 //!
-//! Evidence checks do not disappear — they become a **post-hoc audit**,
-//! spawned after the execution is already terminal and torn down
-//! ([`WorkerCompletionHandler::spawn_declared_delivery_audit`]), so a slow or
-//! failing GitHub call can delay a flagged attention item, never a slot
-//! release. A declaration the audit contradicts does not un-terminalize
-//! anything; it only files
+//! The post-hoc audit
+//! ([`WorkerCompletionHandler::spawn_declared_delivery_audit`]) remains as
+//! a second line, spawned after the execution is already terminal and torn
+//! down, so a slow or failing GitHub call can delay a flagged attention item,
+//! never a slot release. A declaration the audit contradicts does not
+//! un-terminalize anything; it only files
 //! [`crate::completion::RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND`] for a human.
 //!
 //! ## What still runs at a Stop boundary
@@ -73,13 +95,38 @@
 
 use super::*;
 
+/// Upper bound on each GitHub call the `delivered` resolver makes inline
+/// (the staged-candidate branch check and the branch-keyed detector). On
+/// expiry the resolver reports [`DeclaredPrResolution::Transient`] and the
+/// execution is left live for the network-capable Stop / recheck paths — it
+/// never binds an unverified URL to make the deadline.
+pub(crate) const DECLARED_DELIVERY_NETWORK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What [`WorkerCompletionHandler::resolve_declared_pr_url`] concluded about
+/// the PR a `delivered` declaration may bind to.
+#[derive(Debug)]
+pub(super) enum DeclaredPrResolution {
+    /// A PR whose head branch is this execution's own branch (or the
+    /// already-bound PR for a resume / revision). `merged` mirrors
+    /// [`PrStatus::Merged`]: the deliverable is done, not reviewable.
+    Bound { pr_url: String, merged: bool },
+    /// GitHub answered and there is definitively no PR on this execution's
+    /// branch. `detail` names the branch, what the detector saw and which
+    /// staged URLs were rejected; it becomes the row's visible failure.
+    NoneFound { detail: String },
+    /// GitHub could not be consulted (error or budget exhausted). Nothing is
+    /// bound; the Stop boundary / merge-poller recheck retry with the
+    /// declaration still stamped.
+    Transient { detail: String },
+}
+
 impl WorkerCompletionHandler {
     /// Finalize delivered/blocked declarations at submit; defer no-op
     /// declarations until the driver terminal boundary. This is the
     /// counterpart to `on_stop`/`on_stop_inner` for every other completion
     /// path, but reached from `app::proposals::handle_submit_proposal`
-    /// instead of a driver Stop hook. See the module doc for why this must
-    /// never make a network call.
+    /// instead of a driver Stop hook. See the module doc for why every GitHub
+    /// call here is bounded and why a miss never binds an unverified URL.
     ///
     /// `outcome` is the worker's own declared
     /// [`boss_protocol::RunDoneOutcome`] — already durably stamped onto the
@@ -121,59 +168,221 @@ impl WorkerCompletionHandler {
         }
     }
 
-    /// Resolve the PR a `delivered` declaration binds to, from sources that
-    /// are all already-stored state — never a network call. In order:
+    /// Resolve the PR a `delivered` declaration binds to. In order:
     ///
     /// 1. The task/chore's own bound PR ([`Self::resolve_bound_pr_url`]:
     ///    `task.pr_url`, or `execution.pr_url` / the chain-root lookup for a
-    ///    revision) — DB reads only.
-    /// 2. The in-memory hook-stream staging cache, if a *publish-armed*
-    ///    observation was captured this run (a `PostToolUse` `gh pr
-    ///    create`/`cube pr create|update` hit) — an in-memory lookup, no I/O.
-    /// 3. The structured-output PR-URL artifact the worker itself wrote this
-    ///    run ([`Self::stage_pr_url_from_artifact`]) — a local file read.
+    ///    revision), with branch verification for primary executions.
+    /// 2. A **branch-verified** staged candidate: the hook-stream staging
+    ///    cache (a *publish-armed* `PostToolUse` `gh pr create` / `cube pr
+    ///    create|update` hit) plus the structured-output PR-URL artifact the
+    ///    worker wrote, passed through [`Self::verified_staged_pr_url`]. The
+    ///    capture-time verification the hook dispatcher spawns usually has
+    ///    already marked the entry verified, in which case this is an
+    ///    in-memory read; otherwise it is one bounded `gh` call per
+    ///    candidate.
+    /// 3. The branch-keyed detector ([`PrDetector::detect_pr`] on
+    ///    [`expected_branch_name`]) — the durable pointer the engine itself
+    ///    created. One bounded `gh` call.
     ///
-    /// Deliberately does NOT call [`Self::verified_staged_pr_url`] (the
-    /// Stop-boundary path's Layer-2 branch-name check) or the driver-prose
-    /// transcript fallback: both exist on the Stop path as defense-in-depth
-    /// for a signal this function's callers don't need to fully trust ahead
-    /// of time — an unverified staged/artifact URL that turns out wrong is
-    /// exactly what [`Self::spawn_declared_delivery_audit`]'s post-hoc check
-    /// exists to catch, off the termination path.
-    fn resolve_declared_pr_url_no_network(&self, execution: &crate::work::WorkExecution) -> Option<String> {
-        if let Some(url) = self.resolve_bound_pr_url(execution) {
-            return Some(url);
+    /// A staged or artifact URL is never trusted on its own. The post-hoc
+    /// audit ([`Self::spawn_declared_delivery_audit`]) cannot catch a wrong
+    /// URL: it returns early without a `pr_head_before` snapshot, stamped for
+    /// only a small fraction of primary implementations. A follow-up's origin
+    /// PR, echoed in the publish command's output ahead of the new PR's URL,
+    /// would bind unopposed and the real PR would never be reviewed (flunge,
+    /// 2026-10-05; mono, 2026-10-13).
+    ///
+    /// Every network step is wrapped in [`DECLARED_DELIVERY_NETWORK_BUDGET`].
+    /// A timeout or transient failure yields
+    /// [`DeclaredPrResolution::Transient`]: the declaration stays stamped,
+    /// the execution stays live, and the Stop boundary / merge-poller recheck
+    /// — both network-capable and both honouring the stamped declaration —
+    /// finalize it. That keeps the module's rule that a GitHub hang can never
+    /// hold a slot indefinitely, without binding anything unverified.
+    async fn resolve_declared_pr_url(&self, execution: &crate::work::WorkExecution) -> DeclaredPrResolution {
+        let mut transient_detail: Option<String> = None;
+        let stored_url = self.resolve_bound_pr_url(execution);
+        if let Some(url) = stored_url.clone() {
+            if execution.kind == ExecutionKind::RevisionImplementation {
+                return self.resolve_verified_pr_state(url).await;
+            }
+            let expected = expected_branch_name(
+                &execution.id,
+                &execution.branch_naming,
+                execution.worker_branch_prefix.as_deref(),
+            );
+            if let (Ok(slug), Some(number)) = (parse_repo_slug(&execution.repo_remote_url), pr_number_from_url(&url)) {
+                match tokio::time::timeout(
+                    DECLARED_DELIVERY_NETWORK_BUDGET,
+                    self.branch_verifier.fetch_pr_head_ref(&slug, number),
+                )
+                .await
+                {
+                    Ok(Ok(head)) if branches_identify_same_work_item(&head, &expected) => {
+                        return self.resolve_verified_pr_state(url).await;
+                    }
+                    Ok(Ok(_)) => {}
+                    _ => transient_detail = Some(format!("could not verify stored PR {url}")),
+                }
+            }
         }
-        if let Some(entry) = self.staged_pr_urls.get_entry(&execution.id)
-            && entry.finalization_armed
-        {
-            return Some(entry.pr_url);
+        self.stage_pr_url_from_artifact(execution);
+        let mut candidates_before = self.staged_pr_urls.candidates(&execution.id);
+        if let Some(url) = stored_url {
+            candidates_before.push(url);
         }
-        if self.stage_pr_url_from_artifact(execution)
-            && let Some(entry) = self.staged_pr_urls.get_entry(&execution.id)
-        {
-            return Some(entry.pr_url);
+        let staged_armed = self
+            .staged_pr_urls
+            .get_entry(&execution.id)
+            .is_some_and(|entry| entry.finalization_armed);
+        if staged_armed {
+            match tokio::time::timeout(
+                DECLARED_DELIVERY_NETWORK_BUDGET,
+                self.verified_staged_pr_url(&execution.id, execution, "run_done"),
+            )
+            .await
+            {
+                Ok(Some(url)) => {
+                    return self.resolve_verified_pr_state(url).await;
+                }
+                Ok(None) => {
+                    // Candidates that survived are transient failures the next
+                    // pass should retry; an empty cache means every candidate
+                    // definitively failed the branch check.
+                    if !self.staged_pr_urls.candidates(&execution.id).is_empty() {
+                        transient_detail =
+                            Some("branch verification of the staged PR URL(s) failed transiently".to_owned());
+                    }
+                }
+                Err(_) => {
+                    transient_detail = Some(format!(
+                        "branch verification of the staged PR URL(s) did not finish within {}s",
+                        DECLARED_DELIVERY_NETWORK_BUDGET.as_secs()
+                    ));
+                }
+            }
         }
-        None
+        let expected_branch = expected_branch_name(
+            &execution.id,
+            &execution.branch_naming,
+            execution.worker_branch_prefix.as_deref(),
+        );
+        let detected = tokio::time::timeout(
+            DECLARED_DELIVERY_NETWORK_BUDGET,
+            self.pr_detector.detect_pr(&execution.repo_remote_url, &expected_branch),
+        )
+        .await;
+        let rejected = if candidates_before.is_empty() {
+            "The worker's hook stream and structured-output artifact carried no PR URL.".to_owned()
+        } else {
+            format!(
+                "Stored or staged PR URL(s) that could not be verified on this execution's branch: {}.",
+                candidates_before.join(", ")
+            )
+        };
+        match detected {
+            Ok(Ok(PrStatus::Fresh { url })) => DeclaredPrResolution::Bound {
+                pr_url: url,
+                merged: false,
+            },
+            Ok(Ok(PrStatus::Merged { url })) => DeclaredPrResolution::Bound {
+                pr_url: url,
+                merged: true,
+            },
+            Ok(Ok(
+                status @ (PrStatus::None
+                | PrStatus::Closed { .. }
+                | PrStatus::Stale { .. }
+                | PrStatus::EmptyDiff { .. }),
+            )) => {
+                if let Some(detail) = transient_detail {
+                    return DeclaredPrResolution::Transient { detail };
+                }
+                let detector_says = match status {
+                    PrStatus::None => "no PR has that branch as its head".to_owned(),
+                    PrStatus::Closed { url } => format!("the PR on that branch, {url}, is closed without merging"),
+                    PrStatus::Stale { url, reason } => format!("the PR on that branch, {url}, is stale ({reason})"),
+                    PrStatus::EmptyDiff { url } => format!("the PR on that branch, {url}, has an empty diff"),
+                    PrStatus::Fresh { .. } | PrStatus::Merged { .. } => unreachable!("matched above"),
+                };
+                DeclaredPrResolution::NoneFound {
+                    detail: format!(
+                        "no PR could be bound from this execution's own branch `{expected_branch}`: \
+                         {detector_says}. {rejected} The engine binds a PR only when its head branch is \
+                         the execution's branch; URLs in the brief, provenance or PR body text are never \
+                         used."
+                    ),
+                }
+            }
+            Ok(Err(err)) => DeclaredPrResolution::Transient {
+                detail: format!("branch-keyed PR detection for `{expected_branch}` failed: {err:#}"),
+            },
+            Err(_) => DeclaredPrResolution::Transient {
+                detail: format!(
+                    "branch-keyed PR detection for `{expected_branch}` did not finish within {}s",
+                    DECLARED_DELIVERY_NETWORK_BUDGET.as_secs()
+                ),
+            },
+        }
     }
 
-    /// `delivered`: terminalize against a resolvable PR
-    /// ([`Self::resolve_declared_pr_url_no_network`]), or fall back to
-    /// [`Self::finalize_declared_delivery_without_pr`] when none exists.
+    /// Branch identity is already verified; read lifecycle fresh because a
+    /// capture-time branch cache cannot certify that a PR is still open.
+    async fn resolve_verified_pr_state(&self, pr_url: String) -> DeclaredPrResolution {
+        let checker = Arc::clone(&self.pr_state_checker);
+        let url = pr_url.clone();
+        let check = tokio::task::spawn_blocking(move || checker.check(&url));
+        match tokio::time::timeout(DECLARED_DELIVERY_NETWORK_BUDGET, check).await {
+            Ok(Ok(Ok(crate::work::PrOpenState::Open))) => DeclaredPrResolution::Bound { pr_url, merged: false },
+            Ok(Ok(Ok(crate::work::PrOpenState::Merged))) => DeclaredPrResolution::Bound { pr_url, merged: true },
+            Ok(Ok(Ok(crate::work::PrOpenState::ClosedUnmerged))) => DeclaredPrResolution::NoneFound {
+                detail: format!("PR {pr_url} is closed without merging"),
+            },
+            result => DeclaredPrResolution::Transient {
+                detail: format!("could not determine state of PR {pr_url}: {result:?}"),
+            },
+        }
+    }
+
+    /// `delivered`: terminalize against the PR this execution opened
+    /// ([`Self::resolve_declared_pr_url`]), or fail visibly via
+    /// [`Self::finalize_declared_delivery_without_pr`] when there is none.
     ///
     /// Mirrors [`Self::finalize_pr_transition`]'s termination write and
-    /// teardown exactly, but never makes a network call inline — see the
-    /// module doc. Every network-touching step that function layers on top
-    /// (reviewer-batch enqueue, doc-link detection) instead runs in
+    /// teardown exactly. The only inline network calls are the bounded
+    /// branch check and branch-keyed detection the resolver performs — see
+    /// the module doc. Every other network-touching step that function
+    /// layers on top (reviewer-batch enqueue, doc-link detection) runs in
     /// [`Self::spawn_declared_delivery_post_effects`], the same best-effort,
     /// fire-and-forget background spawn [`Self::spawn_declared_delivery_audit`]
     /// already uses: the execution is already terminal and torn down by the
     /// time either task runs, so a slow or failing `gh` call can delay those
     /// side effects, never a slot release.
-    async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
-        let Some(pr_url) = self.resolve_declared_pr_url_no_network(execution) else {
-            return self.finalize_declared_delivery_without_pr(execution).await;
+    pub(super) async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        let (pr_url, merged) = match self.resolve_declared_pr_url(execution).await {
+            DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged),
+            DeclaredPrResolution::NoneFound { detail } => {
+                return self.finalize_declared_delivery_without_pr(execution, &detail).await;
+            }
+            DeclaredPrResolution::Transient { detail } => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    %detail,
+                    "run_done finalize (delivered): PR resolution inconclusive; leaving the execution live \
+                     with its declaration stamped — the Stop boundary / merge-poller recheck will finalize it \
+                     once GitHub answers",
+                );
+                return StopOutcome::DetectorFailed;
+            }
         };
+        if execution.kind != ExecutionKind::RevisionImplementation
+            && let Some(conflict) = self.foreign_pr_binding_conflict(execution, &pr_url)
+        {
+            return self
+                .refuse_foreign_pr_binding(execution, &pr_url, &conflict, "run_done")
+                .await;
+        }
 
         // Captured before `record_worker_pr_completion` nulls
         // `workspace_path` in the same transaction that terminalizes the
@@ -183,10 +392,15 @@ impl WorkerCompletionHandler {
         let teardown = self.begin_teardown(&execution.id);
         // The local completion write must preserve the same hold used by
         // Stop-triggered reviewer admission. Network-dependent refinement
-        // and enqueue happen after teardown below.
-        let reviewer_triggering = should_enqueue_reviewer_for_primary(&execution.kind)
-            || (execution.kind == ExecutionKind::RevisionImplementation && self.enable_revision_triggered_reviews);
-        let target = if reviewer_triggering {
+        // and enqueue happen after teardown below. A PR that is already
+        // merged is done, not reviewable — the same target the Stop path
+        // uses for `PrStatus::Merged`.
+        let reviewer_triggering = !merged
+            && (should_enqueue_reviewer_for_primary(&execution.kind)
+                || (execution.kind == ExecutionKind::RevisionImplementation && self.enable_revision_triggered_reviews));
+        let target = if merged {
+            WorkerPrCompletionTarget::Done
+        } else if reviewer_triggering {
             WorkerPrCompletionTarget::PendingReview
         } else {
             WorkerPrCompletionTarget::InReview
@@ -247,21 +461,27 @@ impl WorkerCompletionHandler {
         );
 
         self.spawn_declared_delivery_audit(execution, &work_item_id, &pr_url);
+        if merged {
+            return StopOutcome::PrMerged { pr_url };
+        }
         self.spawn_declared_delivery_post_effects(execution, &work_item_id, &pr_url);
 
         StopOutcome::PrDetected { pr_url }
     }
 
-    /// An unverifiable delivery fails visibly without performing network I/O.
-    /// It uses the same atomic failure/teardown as a declared blocker.
-    async fn finalize_declared_delivery_without_pr(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+    /// A delivery with no PR on this execution's own branch fails visibly.
+    /// `reason` names what was looked for and what was rejected, so the row
+    /// says why it is parked instead of silently showing no (or the wrong)
+    /// PR. It uses the same atomic failure/teardown as a declared blocker.
+    async fn finalize_declared_delivery_without_pr(
+        &self,
+        execution: &crate::work::WorkExecution,
+        reason: &str,
+    ) -> StopOutcome {
         let detail = format!(
-            "Execution `{}` declared `boss propose done --outcome delivered`, but the engine \
-             could not resolve any PR for it without a network call — no bound task/chore \
-             `pr_url`, no `execution.pr_url` (revision chain root), and nothing staged from the \
-             hook stream or structured-output artifact this run. The declaration is still \
-             terminal: the run has ended and its slot and lease are released. The task/chore's \
-             status records a worker failure with this diagnostic.",
+            "Execution `{}` declared `boss propose done --outcome delivered`, but {reason} The \
+             declaration is still terminal: the run has ended and its slot and lease are released. \
+             The task/chore's status records a worker failure with this diagnostic.",
             execution.id
         );
         if !self.finalize_worker_failure(execution, &detail).await {

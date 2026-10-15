@@ -150,6 +150,18 @@ impl WorkerCompletionHandler {
         // teardown still runs per this function's contract, but the failure
         // must be loud rather than silently collapsed into `None`.
         let execution_result = self.work_db.get_execution(execution_id);
+        // Foreign-PR guard: branch verification / the branch-keyed detector
+        // established that `pr_url`'s head is this execution's branch; now
+        // make sure the engine does not already hold that PR against another
+        // work item. Refusing here covers every Stop / recheck source at
+        // once (the declaration path runs the same guard itself).
+        if let Ok(execution) = execution_result.as_ref()
+            && let Some(conflict) = self.foreign_pr_binding_conflict(execution, &pr_url)
+        {
+            return self
+                .refuse_foreign_pr_binding(execution, &pr_url, &conflict, source)
+                .await;
+        }
         let workspace_path = match &execution_result {
             Ok(execution) => execution.workspace_path.clone(),
             Err(err) => {

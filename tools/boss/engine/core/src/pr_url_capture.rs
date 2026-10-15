@@ -31,11 +31,20 @@
 //!   read-only and metadata commands from authorizing a recheck teardown.
 //! - [`StagedPrUrlCache`] — a thread-safe `HashMap<execution_id,
 //!   StagedPrUrlEntry>` that callers populate from progress events and the
-//!   `on_stop` handler reads on Stop. First-writer-wins among observations
-//!   of equal strength (armed vs armed, unarmed vs unarmed). A later publish
-//!   command may replace a binding-only URL and arm finalization. Each entry
-//!   also stamps `staged_at` so the merge-poller recheck can bound mid-turn
-//!   deferral.
+//!   `on_stop` handler reads on Stop. Every distinct URL a publish command
+//!   printed is staged as a candidate; the Layer-2 branch check
+//!   (`WorkerCompletionHandler::verified_staged_pr_url`) is the only thing
+//!   that chooses among them, by the PR's head branch. A later publish
+//!   command may replace a binding-only entry and arm finalization. Each
+//!   entry also stamps `staged_at` so the merge-poller recheck can bound
+//!   mid-turn deferral.
+//!
+//!   Why candidates, not "the first URL": a follow-up's PR body must cite
+//!   its origin PR, and a `cube pr create` whose output echoes that body
+//!   prints the origin URL before the URL of the PR it just opened. Taking
+//!   the first URL bound two post-merge follow-ups (flunge, 2026-10-05;
+//!   mono, 2026-10-13) to a merged PR they never opened, so their reviews
+//!   failed and the real PRs were never reviewed.
 //!
 //! The reconciliation path (`completion::detect_pr` →
 //! `jj_candidate_commit_shas` → GitHub commits/{sha}/pulls) is
@@ -60,7 +69,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use boss_engine_gh_invocation::{GhNoun, classify};
-use boss_engine_structured_output::pr_url::find_first_pr_url;
+use boss_engine_structured_output::pr_url::{find_all_pr_urls, find_first_pr_url};
 
 /// Well-known placeholder owner/repo slugs used in tests and documentation
 /// (compared case-insensitively). These are rejected as a belt-and-suspenders
@@ -119,6 +128,15 @@ pub fn validate_pr_url(pr_url: &str, product_repo_remote_url: &str) -> Result<()
 /// [`boss_engine_driver::AgentDriver::pr_url_capture_feed`].
 pub fn extract_pr_url_from_text(text: &str) -> Option<String> {
     find_first_pr_url(text)
+}
+
+/// Every distinct canonical GitHub PR URL in `text`, in first-appearance
+/// order. The live capture path stages all of them as candidates: which one
+/// binds is decided by the PR's head branch
+/// (`WorkerCompletionHandler::verified_staged_pr_url`), never by position
+/// in the output — see [`StagedPrUrlEntry`].
+pub fn extract_all_pr_urls_from_text(text: &str) -> Vec<String> {
+    find_all_pr_urls(text)
 }
 
 /// Scan a Claude-shaped Bash `tool_response` JSON value for a GitHub PR URL.
@@ -418,33 +436,103 @@ pub enum RecordCommandObservationOutcome {
     Armed,
     /// Equal-strength re-observation; the entry was left unchanged.
     Unchanged,
+    /// Equal-strength re-observation that surfaced at least one URL the
+    /// entry had not seen before; it was appended as an alternate candidate
+    /// for branch verification. The entry's primary URL is unchanged.
+    CandidateAdded,
 }
 
-/// One staged PR URL plus the wall-clock instant it was first recorded.
-/// The merge-poller recheck path uses [`StagedPrUrlEntry::staged_at`] to
-/// bound mid-turn deferral: a staged URL is evidence the worker *has* a
-/// PR, not that it is *done*, so a live mid-turn worker must not be
-/// finalized immediately — but a worker that never reaches a Stop still
-/// needs a finite bound.
+/// Upper bound on distinct candidate URLs retained per execution. Branch
+/// verification costs one GitHub call per candidate until one matches, so
+/// the list is bounded; a worker whose publish command echoes more PR URLs
+/// than this is not a shape the engine has ever observed. When a command
+/// prints more, the latest URLs are kept (the new PR's URL prints after the
+/// URLs echoed from its body).
+pub const MAX_STAGED_PR_URL_CANDIDATES: usize = 8;
+
+/// The staged PR-URL candidates for one execution plus the wall-clock
+/// instant they were first recorded. The merge-poller recheck path uses
+/// [`StagedPrUrlEntry::staged_at`] to bound mid-turn deferral: a staged URL
+/// is evidence the worker *has* a PR, not that it is *done*, so a live
+/// mid-turn worker must not be finalized immediately — but a worker that
+/// never reaches a Stop still needs a finite bound.
+///
+/// A publish command's output can carry more than one PR URL — a
+/// follow-up's PR body legitimately cites its origin PR, and a `cube pr
+/// create` whose output echoes that body prints the origin URL before the
+/// URL of the PR it just opened. The engine therefore never selects a URL by
+/// text position: every distinct URL the command printed is staged
+/// (`pr_url` first, the rest in [`Self::alternates`]) and
+/// `WorkerCompletionHandler::verified_staged_pr_url` picks the one whose PR
+/// head branch is this execution's own branch. Until that check has run,
+/// `pr_url` is only "the first candidate", not a binding.
 #[derive(Debug, Clone)]
 pub struct StagedPrUrlEntry {
+    /// The current primary candidate. Once [`Self::branch_verified`] is set,
+    /// this is the URL whose head branch was confirmed to be the
+    /// execution's own branch.
     pub pr_url: String,
+    /// Further candidate URLs observed alongside `pr_url`, in observation
+    /// order. Empty once a candidate has been branch-verified.
+    pub alternates: Vec<String>,
     pub staged_at: Instant,
     /// Whether the command that bound this URL also demonstrated that the
     /// worker published or pushed it. Binding alone is not permission for the
     /// merge-poller recheck or Stop staged arm to finalize and reap.
     pub finalization_armed: bool,
+    /// Whether `pr_url` has passed the Layer-2 branch check (its PR's head
+    /// ref identifies this execution's work item). Set by
+    /// [`StagedPrUrlCache::mark_branch_verified`]; a verified entry needs
+    /// no further GitHub call to be trusted by any completion path.
+    pub branch_verified: bool,
 }
 
-/// In-memory `execution_id → pr_url` staging cache. Populated by the
-/// `PostToolUse` hook dispatcher when a Bash event surfaces a PR
-/// URL; consumed by `WorkerCompletionHandler::on_stop` on the
-/// matching Stop hook.
+impl StagedPrUrlEntry {
+    fn new(urls: &[String], finalization_armed: bool) -> Option<Self> {
+        let mut distinct: Vec<String> = Vec::new();
+        for url in urls {
+            if !distinct.contains(url) {
+                distinct.push(url.clone());
+            }
+        }
+        // Over the cap, keep the LAST candidates: a publish command echoes
+        // the PR body's cited URLs before the URL of the PR it just opened,
+        // so the one that verifies is the one most likely to come last.
+        let skip = distinct.len().saturating_sub(MAX_STAGED_PR_URL_CANDIDATES);
+        let mut kept = distinct.into_iter().skip(skip);
+        let first = kept.next()?;
+        Some(Self {
+            alternates: kept.collect(),
+            pr_url: first,
+            staged_at: Instant::now(),
+            finalization_armed,
+            branch_verified: false,
+        })
+    }
+
+    /// Every candidate URL, primary first.
+    pub fn candidates(&self) -> Vec<String> {
+        std::iter::once(self.pr_url.clone())
+            .chain(self.alternates.iter().cloned())
+            .collect()
+    }
+
+    fn contains(&self, url: &str) -> bool {
+        self.pr_url == url || self.alternates.iter().any(|u| u == url)
+    }
+}
+
+/// In-memory `execution_id → staged PR-URL candidates` cache. Populated by
+/// the `PostToolUse` hook dispatcher when a Bash event surfaces one or more
+/// PR URLs; consumed by `WorkerCompletionHandler::on_stop`, the
+/// merge-poller recheck and the `run_done` declaration path, each of which
+/// branch-verifies the candidates before trusting any of them.
 ///
-/// First-writer-wins among observations of equal strength. A later publish
-/// command (`finalization_armed = true`) outranks a binding-only entry: it
-/// overwrites the URL, refreshes `staged_at`, and arms finalization. Equal-
-/// strength armed observations keep the first URL.
+/// A later publish command (`finalization_armed = true`) outranks a
+/// binding-only entry: it replaces the candidate list, refreshes
+/// `staged_at`, and arms finalization. Equal-strength observations keep the
+/// existing primary and append any new URLs as alternates — selection among
+/// candidates is by branch, never by which was seen first.
 #[derive(Debug, Default)]
 pub struct StagedPrUrlCache {
     inner: Mutex<HashMap<String, StagedPrUrlEntry>>,
@@ -464,14 +552,62 @@ impl StagedPrUrlCache {
         } else {
             guard.insert(
                 execution_id.to_owned(),
-                StagedPrUrlEntry {
-                    pr_url: pr_url.to_owned(),
-                    staged_at: Instant::now(),
-                    finalization_armed: true,
-                },
+                StagedPrUrlEntry::new(&[pr_url.to_owned()], true).expect("one URL"),
             );
             StagePrUrlOutcome::Staged
         }
+    }
+
+    /// Every staged candidate URL for `execution_id`, primary first; empty
+    /// when nothing is staged.
+    pub fn candidates(&self, execution_id: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("StagedPrUrlCache mutex poisoned")
+            .get(execution_id)
+            .map(StagedPrUrlEntry::candidates)
+            .unwrap_or_default()
+    }
+
+    /// Record that `pr_url` passed the branch check for `execution_id`: it
+    /// becomes the sole, verified candidate. A no-op when `pr_url` is not
+    /// among the staged candidates (the cache was replaced or forgotten
+    /// while the check ran).
+    pub fn mark_branch_verified(&self, execution_id: &str, pr_url: &str) {
+        let mut guard = self.inner.lock().expect("StagedPrUrlCache mutex poisoned");
+        if let Some(entry) = guard.get_mut(execution_id)
+            && entry.contains(pr_url)
+        {
+            entry.pr_url = pr_url.to_owned();
+            entry.alternates.clear();
+            entry.branch_verified = true;
+        }
+    }
+
+    /// Drop one candidate that definitively failed the branch check. When it
+    /// was the primary, the next alternate is promoted; when it was the last
+    /// candidate the whole entry is removed. Returns `true` while candidates
+    /// remain staged for `execution_id`.
+    pub fn evict_candidate(&self, execution_id: &str, pr_url: &str) -> bool {
+        let mut guard = self.inner.lock().expect("StagedPrUrlCache mutex poisoned");
+        let Some(entry) = guard.get_mut(execution_id) else {
+            return false;
+        };
+        if entry.pr_url == pr_url {
+            match entry.alternates.first().cloned() {
+                Some(next) => {
+                    entry.alternates.remove(0);
+                    entry.pr_url = next;
+                }
+                None => {
+                    guard.remove(execution_id);
+                    return false;
+                }
+            }
+        } else {
+            entry.alternates.retain(|u| u != pr_url);
+        }
+        true
     }
 
     /// Read the staged URL for `execution_id`, if any. Does not
@@ -497,43 +633,78 @@ impl StagedPrUrlCache {
             .cloned()
     }
 
-    /// Bind a URL observed in command output, optionally granting
-    /// finalization permission when that command published or pushed work.
-    ///
-    /// Equal-strength observations are first-writer-wins on the URL. A later
-    /// publishing command (`finalization_armed = true`) outranks a binding-
-    /// only entry: it overwrites `pr_url`, refreshes `staged_at`, and sets
-    /// the armed flag. A read-only/metadata command can never downgrade an
-    /// already-published observation.
+    /// Single-URL convenience wrapper over
+    /// [`Self::record_command_observations`].
     pub fn record_command_observation(
         &self,
         execution_id: &str,
         pr_url: &str,
         finalization_armed: bool,
     ) -> RecordCommandObservationOutcome {
+        self.record_command_observations(execution_id, &[pr_url.to_owned()], finalization_armed)
+    }
+
+    /// Stage every URL one command observation printed, optionally granting
+    /// finalization permission when that command published or pushed work.
+    ///
+    /// `pr_urls` is the ordered, distinct list of URLs in the command's
+    /// output. Nothing here chooses among them — that is the branch check's
+    /// job (`WorkerCompletionHandler::verified_staged_pr_url`), which keeps
+    /// the candidate whose PR head is this execution's branch and evicts the
+    /// rest.
+    ///
+    /// A later publishing command (`finalization_armed = true`) outranks a
+    /// binding-only entry: it replaces the candidates, refreshes `staged_at`,
+    /// and sets the armed flag. Equal-strength observations keep the existing
+    /// primary and append unseen URLs as alternates (bounded by
+    /// [`MAX_STAGED_PR_URL_CANDIDATES`]); an already branch-verified entry
+    /// accepts no new alternates. A read-only/metadata command can never
+    /// downgrade or widen an already-published observation.
+    pub fn record_command_observations(
+        &self,
+        execution_id: &str,
+        pr_urls: &[String],
+        finalization_armed: bool,
+    ) -> RecordCommandObservationOutcome {
+        if pr_urls.is_empty() {
+            return RecordCommandObservationOutcome::Unchanged;
+        }
         let mut guard = self.inner.lock().expect("StagedPrUrlCache mutex poisoned");
         match guard.get_mut(execution_id) {
             Some(entry) if finalization_armed && !entry.finalization_armed => {
-                // Publish evidence outranks inspection: replace the bound URL.
-                entry.pr_url = pr_url.to_owned();
-                entry.staged_at = Instant::now();
-                entry.finalization_armed = true;
+                // Publish evidence outranks inspection: replace the candidates.
+                *entry = StagedPrUrlEntry::new(pr_urls, true).expect("non-empty");
                 RecordCommandObservationOutcome::Armed
             }
-            Some(entry) if finalization_armed => {
-                // Already armed: keep first URL, no-op.
-                let _ = entry;
-                RecordCommandObservationOutcome::Unchanged
+            Some(entry) if finalization_armed == entry.finalization_armed => {
+                if entry.branch_verified {
+                    return RecordCommandObservationOutcome::Unchanged;
+                }
+                let mut added = false;
+                for url in pr_urls {
+                    if entry.contains(url) {
+                        continue;
+                    }
+                    if entry.alternates.len() + 1 >= MAX_STAGED_PR_URL_CANDIDATES {
+                        // Full: drop the oldest alternate so the newest
+                        // observation (the PR just opened prints last)
+                        // survives.
+                        entry.alternates.remove(0);
+                    }
+                    entry.alternates.push(url.clone());
+                    added = true;
+                }
+                if added {
+                    RecordCommandObservationOutcome::CandidateAdded
+                } else {
+                    RecordCommandObservationOutcome::Unchanged
+                }
             }
             Some(_) => RecordCommandObservationOutcome::Unchanged,
             None => {
                 guard.insert(
                     execution_id.to_owned(),
-                    StagedPrUrlEntry {
-                        pr_url: pr_url.to_owned(),
-                        staged_at: Instant::now(),
-                        finalization_armed,
-                    },
+                    StagedPrUrlEntry::new(pr_urls, finalization_armed).expect("non-empty"),
                 );
                 RecordCommandObservationOutcome::Bound
             }
@@ -1033,25 +1204,33 @@ mod tests {
 
     #[test]
     fn equal_strength_observations_keep_first_url() {
+        // The first URL stays the primary candidate; a later equal-strength
+        // URL is appended as an alternate for the branch check to decide
+        // between — never silently dropped, never silently preferred.
         let cache = StagedPrUrlCache::new();
         cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/100", true);
         assert_eq!(
             cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/200", true),
-            RecordCommandObservationOutcome::Unchanged,
+            RecordCommandObservationOutcome::CandidateAdded,
         );
         assert_eq!(
             cache.get("exec_abc").as_deref(),
             Some("https://github.com/spinyfin/mono/pull/100"),
         );
+        assert_eq!(
+            cache.get_entry("exec_abc").unwrap().alternates,
+            vec!["https://github.com/spinyfin/mono/pull/200".to_owned()],
+        );
         cache.record_command_observation("exec_b", "https://github.com/spinyfin/mono/pull/1", false);
         assert_eq!(
             cache.record_command_observation("exec_b", "https://github.com/spinyfin/mono/pull/2", false),
-            RecordCommandObservationOutcome::Unchanged,
+            RecordCommandObservationOutcome::CandidateAdded,
         );
         assert_eq!(
             cache.get("exec_b").as_deref(),
             Some("https://github.com/spinyfin/mono/pull/1"),
         );
+        assert!(!cache.get_entry("exec_b").unwrap().finalization_armed);
     }
 
     #[test]
@@ -1361,6 +1540,92 @@ mod tests {
             Some("spinyfin/mono".to_owned()),
         );
         assert_eq!(parse_product_slug("https://gitlab.com/foo/bar"), None);
+    }
+
+    #[test]
+    fn extract_all_returns_every_url_in_output_order() {
+        // A `cube pr create` whose checkleft gate echoed the PR body: the
+        // body's origin-PR citation comes before the URL of the new PR.
+        let output = "boss-ism/pr-text-leakage: Found in post-merge review of \
+                      https://github.com/brianduff/flunge/pull/1757\n\
+                      https://github.com/brianduff/flunge/pull/1764\n";
+        assert_eq!(
+            extract_all_pr_urls_from_text(output),
+            vec![
+                "https://github.com/brianduff/flunge/pull/1757".to_owned(),
+                "https://github.com/brianduff/flunge/pull/1764".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn staged_candidates_keep_every_url_and_verification_selects_one() {
+        let cache = StagedPrUrlCache::new();
+        let origin = "https://github.com/brianduff/flunge/pull/1757".to_owned();
+        let own = "https://github.com/brianduff/flunge/pull/1764".to_owned();
+        assert_eq!(
+            cache.record_command_observations("exec_1", &[origin.clone(), own.clone()], true),
+            RecordCommandObservationOutcome::Bound,
+        );
+        let entry = cache.get_entry("exec_1").unwrap();
+        assert!(!entry.branch_verified);
+        assert_eq!(entry.candidates(), vec![origin.clone(), own.clone()]);
+
+        // The branch check rejects the origin PR: the next candidate is
+        // promoted rather than the whole entry being lost.
+        assert!(cache.evict_candidate("exec_1", &origin));
+        assert_eq!(cache.get("exec_1").as_deref(), Some(own.as_str()));
+
+        cache.mark_branch_verified("exec_1", &own);
+        let entry = cache.get_entry("exec_1").unwrap();
+        assert!(entry.branch_verified);
+        assert!(entry.alternates.is_empty());
+        // A verified entry accepts no further candidates.
+        assert_eq!(
+            cache.record_command_observations("exec_1", std::slice::from_ref(&origin), true),
+            RecordCommandObservationOutcome::Unchanged,
+        );
+        // Evicting the last candidate removes the entry.
+        assert!(!cache.evict_candidate("exec_1", &own));
+        assert!(cache.get_entry("exec_1").is_none());
+    }
+
+    #[test]
+    fn equal_strength_reobservation_appends_unseen_candidates() {
+        let cache = StagedPrUrlCache::new();
+        let a = "https://github.com/spinyfin/mono/pull/1".to_owned();
+        let b = "https://github.com/spinyfin/mono/pull/2".to_owned();
+        assert_eq!(
+            cache.record_command_observation("exec_2", &a, true),
+            RecordCommandObservationOutcome::Bound,
+        );
+        assert_eq!(
+            cache.record_command_observation("exec_2", &a, true),
+            RecordCommandObservationOutcome::Unchanged,
+        );
+        assert_eq!(
+            cache.record_command_observation("exec_2", &b, true),
+            RecordCommandObservationOutcome::CandidateAdded,
+        );
+        assert_eq!(cache.candidates("exec_2"), vec![a.clone(), b.clone()]);
+        // Inspection (unarmed) can never widen a publish-armed entry.
+        let c = "https://github.com/spinyfin/mono/pull/3".to_owned();
+        assert_eq!(
+            cache.record_command_observation("exec_2", &c, false),
+            RecordCommandObservationOutcome::Unchanged,
+        );
+        assert_eq!(cache.candidates("exec_2"), vec![a, b]);
+        // A publish observation replaces an unarmed entry's candidates.
+        cache.record_command_observation("exec_3", &c, false);
+        assert_eq!(
+            cache.record_command_observations("exec_3", &[a2(), c.clone()], true),
+            RecordCommandObservationOutcome::Armed,
+        );
+        assert_eq!(cache.candidates("exec_3"), vec![a2(), c]);
+    }
+
+    fn a2() -> String {
+        "https://github.com/spinyfin/mono/pull/10".to_owned()
     }
 
     #[test]
