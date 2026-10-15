@@ -36,7 +36,7 @@ enum EngineEvent {
     /// `conflict`, `validation_failed`). `message` is user-readable;
     /// `requestId` is the envelope id of the answer request it refuses.
     case operatorQuestionError(message: String, requestId: String?)
-    case error(message: String)
+    case error(message: String, requestId: String? = nil)
     /// Socket-level failure (connect/send/receive). Never drives a modal:
     /// the debounced connection-lost banner is the user-facing signal.
     case transportError(message: String)

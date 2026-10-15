@@ -49,6 +49,7 @@ extension ChatViewModel {
         if engine.retryUnsentActions() {
             if retryingCoordinatorReset { coordinatorResetWaiting = true }
             retryingDisconnectedActions = true
+            unsavedActionNotice = nil
             showDisconnectedActionNotice()
         } else {
             showDisconnectedActionNotice()
@@ -66,14 +67,15 @@ extension ChatViewModel {
     }
 
     func dismissDisconnectedActions() {
-        let discardingDrag = engine.hasUnsentAction(kind: "evaluate_dispatch_admission") || engine.hasUnsentAction(kind: "move_work_item_on_board")
+        let discardedDragIDs = engine.unsentDragTaskIDs()
         let discardingCoordinatorReset = engine.hasUnsentAction(kind: "recreate_coordinator")
         engine.discardUnsentActions()
         retryingDisconnectedActions = engine.hasRetriedActions
-        if discardingDrag {
-            pendingDragAdmissionChecks.removeAll()
-            bounceBackOptimisticMoves(message: nil)
+        if !discardedDragIDs.isEmpty {
+            for id in discardedDragIDs { pendingDragAdmissionChecks[id] = nil }
+            bounceBackOptimisticMoves(message: nil, only: discardedDragIDs)
         }
+        unsavedActionNotice = nil
         if discardingCoordinatorReset { clearCoordinatorReset() }
         refreshUnsentActions()
         showDisconnectedActionNotice()

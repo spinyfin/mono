@@ -147,22 +147,14 @@ final class EngineReconnectIntegrationTests: XCTestCase {
             }
         }
         defer { client.setDecodeHookForTesting(nil) }
-        let kinds = [
-            "create_task", "create_chore", "create_idea", "create_project", "create_product",
-            "create_automation", "delete_work_item", "update_idea", "update_automation",
-            "enable_automation", "disable_automation", "delete_automation", "set_automation_paused",
-            "reorder_project_tasks", "merge_when_ready", "request_execution", "release_project",
-            "unpopulate_project", "answer_attention", "dismiss_attention",
-            "comments_create", "comments_resolve", "comments_set_status", "comments_set_intent",
-            "comments_dismiss", "comments_post_followup", "comments_update_anchor",
-            "set_setting", "set_feature_flag", "set_dispatch_paused", "set_live_status_enabled",
-            "set_driver_traffic_split", "set_offsite_backup", "set_product_editorial_rules",
-            "set_product_external_tracker", "set_product_merge_mechanism", "set_host_enabled",
-            "add_host", "remove_host", "add_host_tag", "remove_host_tag",
-            "update_work_item", "move_work_item_on_board", "evaluate_dispatch_admission",
-            "accept_deferred_scope_attention", "action_attention_group", "answer_operator_question",
-            "create_task_from_deferred_scope_attention", "comments_revise_doc", "retry_review_guide", "recreate_coordinator",
+        // Kinds whose fixture needs more than a bogus payload (process-wide
+        // effects or external services), so they are not driven end to end.
+        let notDrivenHere: Set<String> = [
+            "shutdown", "open_live_workspace_terminal", "open_review_terminal",
+            "git_hub_auth_start", "git_hub_auth_cancel", "git_hub_auth_disconnect",
+            "trunk_set_token", "generate_review_guide", "evaluate_editorial_rules",
         ]
+        let kinds = EngineClient.userMutationKinds.subtracting(notDrivenHere).sorted()
         for kind in kinds {
             var payload: [String: Any] = [
                 "type": kind, "id": "missing", "product_id": "missing", "project_id": "missing",

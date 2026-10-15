@@ -51,7 +51,7 @@ final class EngineClientLargeMessageFramingTests: XCTestCase {
         let received = expectation(description: "fresh connection decodes normally")
         let client = EngineClient(socketPath: path)
         client.onEvent = { event in
-            if case .error(let message) = event {
+            if case .error(let message, _) = event {
                 XCTAssertEqual(message, "recovered", "transport failures must not become modal work errors")
                 if message == "recovered" { received.fulfill() }
             }
@@ -86,7 +86,7 @@ final class EngineClientLargeMessageFramingTests: XCTestCase {
         let exp = expectation(description: "large error event received")
         let client = EngineClient(socketPath: socketPath)
         client.onEvent = { event in
-            if case .error(let message) = event, message == bigString {
+            if case .error(let message, _) = event, message == bigString {
                 received.withLock { $0 = message }
                 exp.fulfill()
             }

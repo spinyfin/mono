@@ -148,6 +148,8 @@ _COMMENTS_TRANSCRIPT_SHARD_SRCS = [
 ]
 
 _SHARD1_SRCS = [
+    "Tests/BossTests/AdmissionErrorCorrelationTests.swift",
+    "Tests/BossTests/TestSocketServer.swift",
     "Tests/BossTests/APIKeyStoreTests.swift",
     "Tests/BossTests/ApplyAttentionGroupsListTests.swift",
     "Tests/BossTests/AttachmentAffordanceTests.swift",

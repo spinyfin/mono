@@ -112,6 +112,8 @@ final class OptimisticKanbanMoveTests: XCTestCase {
 
     func testWorkErrorBouncesCardBack() {
         let model = makeModel()
+        // This refusal answers an in-flight move, not a drag parked for Retry.
+        model.engine.simulateConnectedForTesting = true
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
@@ -132,6 +134,8 @@ final class OptimisticKanbanMoveTests: XCTestCase {
 
     func testWorkErrorShowsInlineNoticeNotModal() {
         let model = makeModel()
+        // This refusal answers an in-flight move, not a drag parked for Retry.
+        model.engine.simulateConnectedForTesting = true
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 

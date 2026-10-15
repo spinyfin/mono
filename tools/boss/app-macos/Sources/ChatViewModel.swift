@@ -854,6 +854,11 @@ final class ChatViewModel: ObservableObject {
         commentBridge.onSubmissionRejected = { [weak self] action in
             self?.showActionNotSaved(requestKind: action)
         }
+        commentBridge.onSubmissionAccepted = { [weak self] in
+            guard let self, self.unsavedActionNotice != nil else { return }
+            self.unsavedActionNotice = nil
+            self.showDisconnectedActionNotice()
+        }
 
         if let rawMode = defaults.string(forKey: navigationModeDefaultsKey),
            let persistedMode = NavigationMode(rawValue: rawMode) {

@@ -15,7 +15,7 @@ final class EngineClient: @unchecked Sendable {
     /// state stays value-typed.
     private struct ActionLedger {
         /// Never reached the wire; safe to resend on explicit Retry.
-        var unsent: [Data] = []
+        var unsent: [(id: String, data: Data)] = []
         /// Accepted by the caller, but still waiting on the socket queue.
         /// Reserve retry capacity before a form is allowed to close.
         var scheduled: [String: Data] = [:]
@@ -48,18 +48,34 @@ final class EngineClient: @unchecked Sendable {
         kind.replacingOccurrences(of: "_", with: " ")
     }
 
-    /// Reads and session housekeeping have no user mutation to recover.
+    /// Request kinds a person initiates and can lose to a dropped connection.
+    /// An explicit allowlist: automatic traffic (reads, session housekeeping,
+    /// the comment layer's `comments_resolve` re-anchor on every reload) must
+    /// never be retained for Retry or reported as an uncertain action.
+    static let userMutationKinds: Set<String> = [
+        "create_task", "create_chore", "create_idea", "create_project", "create_product",
+        "create_automation", "delete_work_item", "update_idea", "update_automation",
+        "enable_automation", "disable_automation", "delete_automation", "set_automation_paused",
+        "reorder_project_tasks", "merge_when_ready", "request_execution", "release_project",
+        "unpopulate_project", "answer_attention", "dismiss_attention",
+        "comments_create", "comments_set_status", "comments_set_intent",
+        "comments_dismiss", "comments_post_followup", "comments_update_anchor",
+        "set_setting", "set_feature_flag", "set_dispatch_paused", "set_live_status_enabled",
+        "set_driver_traffic_split", "set_offsite_backup", "set_product_editorial_rules",
+        "set_product_external_tracker", "set_product_merge_mechanism", "set_host_enabled",
+        "add_host", "remove_host", "add_host_tag", "remove_host_tag",
+        "update_work_item", "move_work_item_on_board", "evaluate_dispatch_admission",
+        "evaluate_editorial_rules",
+        "accept_deferred_scope_attention", "action_attention_group", "answer_operator_question",
+        "create_task_from_deferred_scope_attention", "comments_revise_doc", "retry_review_guide",
+        "recreate_coordinator", "generate_review_guide", "open_live_workspace_terminal",
+        "open_review_terminal", "git_hub_auth_start", "git_hub_auth_cancel",
+        "git_hub_auth_disconnect", "trunk_set_token", "shutdown",
+    ]
+
     static func isUserMutation(_ payload: [String: Any]) -> Bool {
         guard let kind = payload["type"] as? String else { return false }
-        return !kind.hasPrefix("get_") && !kind.hasPrefix("list_") && ![
-            "engine_response", "subscribe", "unsubscribe", "register_capabilities",
-            "register_app_session", "report_selected_product", "spawn_capability_restored",
-            "metrics_list_live", "git_hub_auth_status", "trunk_status", "execution_transcript",
-            "comments_list", "comments_banner_state", "resolve_project_design_doc",
-            "release_review_terminal", "kick_pr_reconcilers", "comments_get", "metrics_show_live",
-            "worker_pool_summary", "workspace_pool_summary", "find_work_items_by_pr", "tail_run_transcript",
-            "probe_status", "debug_live_status_pipeline",
-        ].contains(kind)
+        return userMutationKinds.contains(kind)
     }
     private var buffer = Data()
     /// Connection whose read loop is suspended by decode backpressure.
@@ -273,8 +289,7 @@ final class EngineClient: @unchecked Sendable {
     /// self-retrying background polls may opt out of disconnected reports;
     /// user actions must either queue or report a visible failure.
     @discardableResult
-    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true) -> String? {
-        let envelopeRequestId = UUID().uuidString
+    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true, envelopeRequestId: String = UUID().uuidString) -> String? {
         outboundRecorder?(payload)
 
         // Log outbound engine_response messages so both sides of every
@@ -354,7 +369,7 @@ final class EngineClient: @unchecked Sendable {
             Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
             return nil
         }
-        if retainUnsent(payload) == .full {
+        if retainUnsent(payload, envelopeRequestId: envelopeRequestId) == .full {
             emit(.actionNotSaved(requestKind: kind))
             return nil
         }
@@ -365,7 +380,7 @@ final class EngineClient: @unchecked Sendable {
     private enum RetentionOutcome { case retained, ineligible, full }
 
     /// Explicit outcome prevents a rejected action being described as saved.
-    private func retainUnsent(_ payload: [String: Any]) -> RetentionOutcome {
+    private func retainUnsent(_ payload: [String: Any], envelopeRequestId: String) -> RetentionOutcome {
         let kind = (payload["type"] as? String) ?? "unknown"
         guard Self.isRetainable(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
@@ -373,13 +388,13 @@ final class EngineClient: @unchecked Sendable {
             Self.log.info("not retaining \(kind, privacy: .public); not an eligible user mutation")
             return .ineligible
         }
-        return retainUnsent(data, kind: kind)
+        return retainUnsent(data, id: envelopeRequestId, kind: kind)
     }
 
-    private func retainUnsent(_ data: Data, kind: String) -> RetentionOutcome {
+    private func retainUnsent(_ data: Data, id: String, kind: String) -> RetentionOutcome {
         let retained = ledger.withLock { state -> Bool in
             guard state.unsent.count + state.scheduled.count < Self.maxUnsentActions else { return false }
-            state.unsent.append(data)
+            state.unsent.append((id: id, data: data))
             return true
         }
         Self.log.info("\(retained ? "retained" : "dropped (buffer full)", privacy: .public) \(kind, privacy: .public); awaiting explicit retry")
@@ -391,7 +406,9 @@ final class EngineClient: @unchecked Sendable {
     func retryUnsentActions() -> Bool {
         guard reachableState.withLock({ $0 }) else { return false }
         let actions = ledger.withLock { state -> [(id: String, data: Data)] in
-            let drained = state.unsent.map { (id: UUID().uuidString, data: $0) }
+            // Reuse each action's original envelope id so a reply to the retried
+            // send still correlates with the caller's pending state.
+            let drained = state.unsent
             state.unsent.removeAll()
             for action in drained { state.scheduled[action.id] = action.data }
             // Registered before the write so a fast reply cannot race it.
@@ -412,8 +429,8 @@ final class EngineClient: @unchecked Sendable {
 
     func discardUnsentActions() {
         ledger.withLock { state in
-            for data in state.unsent {
-                if let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            for action in state.unsent {
+                if let payload = (try? JSONSerialization.jsonObject(with: action.data)) as? [String: Any],
                    payload["type"] as? String == "move_work_item_on_board",
                    let taskID = payload["id"] as? String {
                     state.retryAdmissionTasks.remove(taskID)
@@ -445,8 +462,25 @@ final class EngineClient: @unchecked Sendable {
     func hasUnsentAction(kind: String) -> Bool {
         ledger.withLock { state in
             state.unsent.contains {
-                ((try? JSONSerialization.jsonObject(with: $0)) as? [String: Any])?["type"] as? String == kind
+                ((try? JSONSerialization.jsonObject(with: $0.data)) as? [String: Any])?["type"] as? String == kind
             }
+        }
+    }
+
+    /// Task ids whose drag (admission check or board move) is parked in the
+    /// unsent queue awaiting Retry, as opposed to in flight or settled.
+    func unsentDragTaskIDs() -> Set<String> {
+        ledger.withLock { state in
+            var ids = Set<String>()
+            for action in state.unsent {
+                guard let payload = (try? JSONSerialization.jsonObject(with: action.data)) as? [String: Any] else { continue }
+                switch payload["type"] as? String {
+                case "evaluate_dispatch_admission": if let id = payload["work_item_id"] as? String { ids.insert(id) }
+                case "move_work_item_on_board": if let id = payload["id"] as? String { ids.insert(id) }
+                default: break
+                }
+            }
+            return ids
         }
     }
 
@@ -489,7 +523,7 @@ final class EngineClient: @unchecked Sendable {
         guard let connection else {
             let (retained, finished) = ledger.withLock { state in
                 let reserved = state.scheduled.removeValue(forKey: envelopeRequestId)
-                if let reserved { state.unsent.append(reserved) }
+                if let reserved { state.unsent.append((id: envelopeRequestId, data: reserved)) }
                 let finished = state.retried.remove(envelopeRequestId) != nil && state.retried.isEmpty && state.retryAdmissionTasks.isEmpty
                 return (reserved != nil, finished)
             }
@@ -827,7 +861,7 @@ final class EngineClient: @unchecked Sendable {
             ))
         case "error":
             let message = payload["message"] as? String ?? "unknown engine error"
-            emit(.error(message: message))
+            emit(.error(message: message, requestId: envelopeRequestId))
         case "app_session_registered":
             // Only a completed handshake counts as "recovered" — resetting
             // on the raw socket `.ready` state instead would let a session
@@ -993,7 +1027,7 @@ final class EngineClient: @unchecked Sendable {
                   let admissionData = try? JSONSerialization.data(withJSONObject: admissionPayload),
                   let admission = try? JSONDecoder().decode(DispatchAdmission.self, from: admissionData)
             else {
-                emit(.error(message: "received invalid dispatch_admission_evaluated payload"))
+                emit(.error(message: "received invalid dispatch_admission_evaluated payload", requestId: envelopeRequestId))
                 break
             }
             emit(.dispatchAdmissionEvaluated(admission: admission))

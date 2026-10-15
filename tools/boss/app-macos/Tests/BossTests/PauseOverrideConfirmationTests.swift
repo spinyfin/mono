@@ -266,13 +266,15 @@ final class PauseOverrideConfirmationTests: XCTestCase {
         // that reply can never clear the pending check in the expected
         // shape, so the card must bounce rather than strand in Doing.
         let model = makeModel()
+        // Connected, so the check is in flight rather than parked for Retry.
+        model.engine.simulateConnectedForTesting = true
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
         _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
         XCTAssertNotNil(model.pendingDragAdmissionCheck)
 
-        model.applyEventForTest(.error(message: "received invalid dispatch_admission_evaluated payload"))
+        model.applyEventForTest(.error(message: "received invalid dispatch_admission_evaluated payload", requestId: model.pendingDragAdmissionCheck?.requestID))
 
         XCTAssertNil(model.pendingDragAdmissionCheck)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog,
