@@ -594,6 +594,10 @@ struct ServerState {
     read_admission: Arc<read_admission::ReadAdmission>,
     #[builder(default = Arc::new(read_admission::ReadAdmission::live()))]
     live_read_admission: Arc<read_admission::ReadAdmission>,
+    /// How many admitted reads ran a handler versus were answered from an
+    /// identical in-flight read (see `read_coalesce`).
+    #[builder(default)]
+    read_coalescing: Arc<read_coalesce::Stats>,
 
     work_db: Arc<WorkDb>,
     /// Socket this engine's tmux handle must target. Resolved once from
@@ -2298,6 +2302,7 @@ impl crate::external_tracker::reconcile::WorkInvalidationPublisher for ServerSta
 
 mod dispatch;
 mod read_admission;
+mod read_coalesce;
 mod session_queue;
 mod session_write;
 use session_queue::*;
@@ -2332,6 +2337,7 @@ async fn handle_frontend_connection(
     }
     let peer_is_worker = peer_class.is_worker();
     let mut read_ordering = read_admission::ReadOrdering::default();
+    let mut read_coalescer = read_coalesce::ReadCoalescer::default();
     let connection_reads = server_state.read_admission.connection();
     let connection_live_reads = server_state.live_read_admission.connection();
 
@@ -2508,34 +2514,43 @@ async fn handle_frontend_connection(
             read_admission::ReadLane::Live => Some((&server_state.live_read_admission, &connection_live_reads)),
             read_admission::ReadLane::Ordered => None,
         };
+        let verb = variant_name(&request);
+        let mut read_batch = None;
         let waiting_read = if let Some((admission, connection)) = read_lane {
-            let verb = variant_name(&request);
-            match admission.enqueue_as(
-                connection,
-                Some(read_admission::Identity {
-                    session: &session_id,
-                    request: &request_id,
-                    verb: &verb,
-                }),
-            ) {
-                Ok(waiting) => Some(waiting.identify(
-                    &session_id,
-                    &request_id,
-                    verb,
-                    read_admission::ReadOrdering::key_id(&request),
-                )),
-                Err(message) => {
-                    tracing::warn!(%session_id, %request_id, ?lane, "read RPC rejected: queue full");
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: message.into(),
-                        },
-                    );
-                    continue;
+            // Waits for queue space rather than rejecting: while this
+            // connection's queue is full, no further request is read from
+            // its socket, which is the backpressure.
+            let waiting = admission
+                .enqueue_as(
+                    connection,
+                    Some(read_admission::Identity {
+                        session: &session_id,
+                        request: &request_id,
+                        verb: &verb,
+                    }),
+                )
+                .await;
+            let waiting = if read_coalesce::coalescable(&request) {
+                match read_coalescer.join(&request, &request_id, waiting, &server_state.read_coalescing) {
+                    // Answered from the identical read already in flight,
+                    // once it runs; it has not started, so its snapshot is
+                    // no older than this request.
+                    read_coalesce::Role::Follow => continue,
+                    read_coalesce::Role::Lead { batch, waiting } => {
+                        sink.tap_response(&request_id, batch.clone());
+                        read_batch = Some(batch);
+                        waiting
+                    }
                 }
-            }
+            } else {
+                waiting
+            };
+            Some(waiting.identify(
+                &session_id,
+                &request_id,
+                verb.clone(),
+                read_admission::ReadOrdering::key_id(&request),
+            ))
         } else {
             None
         };
@@ -2554,56 +2569,58 @@ async fn handle_frontend_connection(
         } else {
             None
         };
-        let dispatch_fut = dispatch::dispatch_request(ctx, request, bulk_read);
+        // Name the request kind to the DB layer so a SQLite lock wait under
+        // this handler is logged against it (see `work::contention`).
+        let dispatch_fut = crate::work::contention::REQUEST_KIND.scope(
+            Arc::from(verb.as_str()),
+            dispatch::dispatch_request(ctx, request, bulk_read),
+        );
         if let Some(waiting) = waiting_read {
             let sink = sink.clone();
             let session_id = session_id.clone();
             tokio::spawn(async move {
-                match waiting
+                let permits = waiting
                     .acquire_ordered(turn.expect("admitted read has a FIFO turn"))
-                    .await
-                {
-                    Ok(permits) => {
-                        // Synchronous SQLite work must not occupy the async
-                        // runtime threads that serve writes and live status.
-                        // Keep permits inside the blocking job even if its
-                        // client disconnects; cancellation cannot inflate capacity.
-                        let runtime = tokio::runtime::Handle::current();
-                        let result = tokio::task::spawn_blocking(move || {
-                            permits.0.started();
-                            let _permits = permits;
-                            runtime.block_on(dispatch_fut);
-                        })
-                        .await;
-                        if let Err(err) = result {
-                            tracing::error!(?err, %session_id, "read RPC handler failed");
-                            send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::Error {
-                                    message: "read RPC handler failed".into(),
-                                },
-                            );
+                    .await;
+                // Synchronous SQLite work must not occupy the async
+                // runtime threads that serve writes and live status.
+                // Keep permits inside the blocking job even if its
+                // client disconnects; cancellation cannot inflate capacity.
+                let runtime = tokio::runtime::Handle::current();
+                let batch = read_batch.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    permits.0.started();
+                    let _permits = permits;
+                    if let Some(batch) = &batch {
+                        // From here identical reads start a new batch: this
+                        // handler's snapshot predates them.
+                        batch.start();
+                    }
+                    runtime.block_on(dispatch_fut);
+                })
+                .await;
+                match result {
+                    Ok(()) => {
+                        if let Some(batch) = &read_batch {
+                            batch.finish(&sink);
                         }
                     }
-                    Err(rejection) => {
-                        let message = rejection.message();
-                        match rejection {
-                            read_admission::Rejection::OrderingWait => {
-                                tracing::warn!(%session_id, %request_id, ?lane, wait_ms = recv_instant.elapsed().as_millis() as u64, "read RPC rejected: ordering deadline expired");
-                            }
-                            read_admission::Rejection::AdmissionWait => {
-                                tracing::warn!(%session_id, %request_id, ?lane, wait_ms = recv_instant.elapsed().as_millis() as u64, "read RPC rejected: admission deadline expired");
-                            }
-                        }
+                    Err(err) => {
+                        tracing::error!(?err, %session_id, "read RPC handler failed");
                         send_response(
                             &sink,
                             &request_id,
                             FrontendEvent::Error {
-                                message: message.into(),
+                                message: "read RPC handler failed".into(),
                             },
                         );
+                        if let Some(batch) = &read_batch {
+                            batch.fail(&sink, "read RPC handler failed");
+                        }
                     }
+                }
+                if let Some(batch) = &read_batch {
+                    sink.untap_response(batch.leader_request_id());
                 }
             });
         } else {

@@ -29,7 +29,7 @@ async fn background_database_contention_keeps_read_admission_running() {
         let connection = gate.connection();
         let mut ordering = ReadOrdering::default();
         let turn = ordering.reserve(&boss_protocol::FrontendRequest::ListProducts).await;
-        gate.enqueue(&connection).unwrap().acquire_ordered(turn).await.unwrap();
+        drop(gate.enqueue(&connection).await.acquire_ordered(turn).await);
     });
     let result = tokio::time::timeout(Duration::from_secs(1), read).await;
     let released_before_escape = release_tx.send(()).is_ok();
@@ -78,7 +78,7 @@ async fn more_background_waiters_than_workers_keep_read_admission_running() {
         let connection = gate.connection();
         let mut ordering = ReadOrdering::default();
         let turn = ordering.reserve(&boss_protocol::FrontendRequest::ListProducts).await;
-        gate.enqueue(&connection).unwrap().acquire_ordered(turn).await.unwrap();
+        drop(gate.enqueue(&connection).await.acquire_ordered(turn).await);
     });
     let result = tokio::time::timeout(Duration::from_secs(1), read).await;
     let released_before_escape = release_tx.send(()).is_ok();
@@ -95,22 +95,23 @@ async fn more_background_waiters_than_workers_keep_read_admission_running() {
         .unwrap();
 }
 
-/// Over the wire: a read stuck behind an identical, never-finishing earlier
-/// read is answered with the ordering-deadline text, not the generic one.
-/// Paused time lets the 60 s ordering deadline pass without waiting.
-#[tokio::test(start_paused = true)]
-async fn ordering_deadline_rejection_reaches_the_wire_with_ordering_text() {
+/// Over the wire: a read behind an identical earlier read that cannot be
+/// admitted for longer than the old 60 s ordering deadline is still
+/// answered with data once the permit frees — and shares the earlier
+/// read's handler run. Paused time lets the minutes pass without waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_behind_a_long_held_identical_read_is_answered_not_rejected() {
     use boss_protocol::{FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let gate = Arc::new(ReadAdmission::new(1, 1, 8, Duration::from_secs(3600)));
+    let gate = Arc::new(ReadAdmission::new(1, 1, 8, Duration::from_millis(50)));
     let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
         crate::app::ServerStateOverrides::builder()
             .read_admission(gate.clone())
             .build(),
     );
     // With the engine's only permit held, the first ListProducts waits for
-    // admission while keeping the ordering turn the identical second read needs.
+    // admission while the identical second read joins it.
     let held = gate.active.clone().acquire_owned().await.unwrap();
     let (client, server) = tokio::net::UnixStream::pair().unwrap();
     let handler = tokio::spawn(crate::app::handle_frontend_connection(server, state.clone(), None));
@@ -126,31 +127,47 @@ async fn ordering_deadline_rejection_reaches_the_wire_with_ordering_text() {
             .await
             .unwrap();
     }
-    let message = loop {
-        let line = lines.next_line().await.unwrap().unwrap();
-        let event: FrontendEventEnvelope = serde_json::from_str(&line).unwrap();
-        if event.request_id.as_deref() == Some("second") {
-            match event.payload {
-                FrontendEvent::Error { message } => break message,
-                other => panic!("expected an ordering rejection, got {other:?}"),
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state.read_coalescing.followers() < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the second read must join the first");
+    // Well past the slow-wait threshold: logged, not rejected.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(held);
+    let mut answered = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while answered.len() < 2 {
+            let line = lines.next_line().await.unwrap().unwrap();
+            let event: FrontendEventEnvelope = serde_json::from_str(&line).unwrap();
+            if let Some(id) = event.request_id {
+                assert!(
+                    matches!(event.payload, FrontendEvent::ProductsList { .. }),
+                    "{id}: {:?}",
+                    event.payload
+                );
+                answered.push(id);
             }
         }
-    };
-    assert_eq!(message, Rejection::OrderingWait.message());
-    drop(held);
+    })
+    .await
+    .expect("both reads must be answered");
+    assert_eq!(answered, ["first", "second"]);
+    assert_eq!(state.read_coalescing.leaders(), 1);
     drop(lines);
     drop(write);
     handler.await.unwrap().unwrap();
 }
 
 #[test]
-fn rejection_messages_distinguish_queue_ordering_and_permit_deadlines() {
-    assert!(QUEUE_FULL.contains("queue full"));
-    assert!(Rejection::OrderingWait.message().contains("ordering deadline expired"));
-    assert!(
-        Rejection::AdmissionWait
-            .message()
-            .contains("admission deadline expired")
-    );
-    assert_ne!(Rejection::OrderingWait.message(), Rejection::AdmissionWait.message());
+fn slow_wait_reasons_say_the_read_is_waiting_and_name_the_cause() {
+    for reason in [SLOW_QUEUE, SLOW_ORDERING, SLOW_PERMIT] {
+        assert!(reason.starts_with("read waiting:"), "{reason}");
+        assert!(!reason.contains("busy") && !reason.contains("retry"), "{reason}");
+    }
+    assert!(SLOW_QUEUE.contains("queue full"));
+    assert!(SLOW_ORDERING.contains("identical read"));
+    assert!(SLOW_PERMIT.contains("permits"));
 }

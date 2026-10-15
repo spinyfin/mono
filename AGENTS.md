@@ -66,6 +66,9 @@ root-cause rule as the section below.
   Bazel build in a worker, how the composed `PATH` is sealed across
   driver tool shells, and what that seal does not cover):
   [`tools/boss/docs/worker-tool-environment.md`](tools/boss/docs/worker-tool-environment.md)
+- SQLite contention (why "database is locked" never reaches a client, the
+  lock-wait log lines, and the `database_contention` engine-health issue):
+  [`tools/boss/docs/db-contention.md`](tools/boss/docs/db-contention.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 

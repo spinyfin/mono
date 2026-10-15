@@ -10,15 +10,6 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::event_publish::{PendingEvents, commit_and_publish};
 
-/// How long sqlite will internally retry on `SQLITE_BUSY` before
-/// surfacing the error to the caller. We funnel concurrent CLI writes
-/// against the same `state.db` (multiple `boss chore bind-pr` etc.
-/// landing in the engine in parallel) — without this the second writer
-/// would fail with "database is locked" even though the first writer
-/// finishes in microseconds. Five seconds is overkill for the in-engine
-/// case (writes are tiny) but cheap when uncontended.
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// SQL fragment for the set of task kinds that behave like chores: they own
 /// their own PR and follow the active → in_review → done lifecycle. Used in
 /// every `kind IN (...)` filter that drives the merge-poller and blocking
@@ -601,6 +592,10 @@ pub struct WorkDb {
     /// instance subscribers attach to.
     event_bus: Arc<EventBus>,
     persona_metrics: Arc<crate::metrics::Registry>,
+    /// SQLite lock-contention registry for this database, shared by every
+    /// clone and by the per-query connections `query_connection` hands out,
+    /// so the engine health report sees every wait on it. See `contention`.
+    contention_health: Arc<contention::Health>,
 }
 
 impl Clone for WorkDb {
@@ -612,7 +607,15 @@ impl Clone for WorkDb {
             boothby_action: Arc::clone(&self.boothby_action),
             event_bus: Arc::clone(&self.event_bus),
             persona_metrics: Arc::clone(&self.persona_metrics),
+            contention_health: Arc::clone(&self.contention_health),
         }
+    }
+}
+
+impl WorkDb {
+    /// This database's SQLite lock-contention registry.
+    pub(crate) fn contention_health(&self) -> &Arc<contention::Health> {
+        &self.contention_health
     }
 }
 
@@ -664,6 +667,7 @@ mod queued_wait;
 mod read_only_tests;
 pub(crate) use feedback_target::FeedbackTarget;
 mod connection_wait;
+pub(crate) mod contention;
 mod description_guard;
 mod guide_comments;
 mod guide_feedback;

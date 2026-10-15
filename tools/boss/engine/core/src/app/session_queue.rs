@@ -390,6 +390,15 @@ pub(super) struct SessionSink {
     /// caller's process tree.
     #[builder(default)]
     delivery_waiters: StdMutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// Response taps for coalesced reads, keyed by the leading request id:
+    /// every envelope enqueued under that id is also recorded on the batch so
+    /// its followers can be answered from it (see `read_coalesce`). Checked
+    /// on every enqueue, so the count short-circuits the lock when no read
+    /// is being coalesced.
+    #[builder(default)]
+    response_taps: StdMutex<HashMap<String, Arc<super::read_coalesce::Batch>>>,
+    #[builder(default)]
+    tap_count: std::sync::atomic::AtomicUsize,
 }
 
 impl SessionSink {
@@ -415,7 +424,40 @@ impl SessionSink {
             .remove(request_id)
     }
 
+    /// Record every response under `request_id` on `batch` until
+    /// [`Self::untap_response`].
+    pub(super) fn tap_response(&self, request_id: &str, batch: Arc<super::read_coalesce::Batch>) {
+        self.response_taps
+            .lock()
+            .expect("response taps lock poisoned")
+            .insert(request_id.to_owned(), batch);
+        self.tap_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn untap_response(&self, request_id: &str) {
+        if self
+            .response_taps
+            .lock()
+            .expect("response taps lock poisoned")
+            .remove(request_id)
+            .is_some()
+        {
+            self.tap_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     pub(super) fn enqueue(&self, env: FrontendEventEnvelope) -> EnqueueOutcome {
+        if self.tap_count.load(Ordering::Relaxed) > 0
+            && let Some(request_id) = env.request_id.as_deref()
+            && let Some(batch) = self
+                .response_taps
+                .lock()
+                .expect("response taps lock poisoned")
+                .get(request_id)
+                .cloned()
+        {
+            batch.record(&env);
+        }
         let outcome = self.queue.lock().expect("session queue lock poisoned").enqueue(env);
         match outcome {
             EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Degraded => {

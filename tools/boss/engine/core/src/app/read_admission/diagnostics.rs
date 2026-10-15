@@ -10,9 +10,10 @@ use std::{
 
 /// Most blockers named in one holder dump.
 const MAX_BLOCKERS: usize = 16;
-/// Holder dumps are rate limited per wait kind so a queue-full flood adds
-/// neither lock contention nor log volume of its own, yet cannot suppress the
-/// rare deadline dump that names the real blocker.
+/// Holder dumps are rate limited per wait kind so a flood of slow queue
+/// waits adds neither lock contention nor log volume of its own, yet cannot
+/// suppress the rare slow permit or ordering dump that names the real
+/// blocker.
 const DUMP_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
@@ -39,10 +40,10 @@ struct Entry {
     since: Instant,
 }
 
-/// What the rejected read was waiting for.
+/// What the slow read is waiting for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Wait {
-    /// The rejected connection's own pending queue was full.
+    /// The waiting connection's own pending queue was full.
     ConnectionQueue,
     /// The engine-wide pending queue was full.
     EngineQueue,
@@ -65,7 +66,7 @@ impl Wait {
     }
 }
 
-/// Identity of a read rejected before it was tracked (queue full).
+/// Identity of a read waiting before it is tracked (queue full).
 #[derive(Clone, Copy, Debug)]
 pub(in crate::app) struct Identity<'a> {
     pub(in crate::app) session: &'a str,
@@ -106,14 +107,14 @@ impl Diagnostics {
         }
     }
 
-    /// Logs the reads that were actually holding up the rejected one.
-    /// Queue-full rejections happen before the read is tracked, so the
-    /// caller passes its `identity` instead; `connection` scopes selection.
+    /// Logs the reads that are actually holding up the slow one. A
+    /// queue-full wait happens before the read is tracked, so the caller
+    /// passes its `identity` instead; `connection` scopes selection.
     pub(super) fn report(
         &self,
         reason: &str,
         wait: Wait,
-        rejected: Option<&TrackedRead>,
+        waiting: Option<&TrackedRead>,
         identity: Option<Identity<'_>>,
         connection: usize,
     ) {
@@ -134,17 +135,17 @@ impl Diagnostics {
             .iter()
             .map(|(id, entry)| (*id, entry.clone()))
             .collect();
-        let rejected_id = rejected.map(|read| read.id);
+        let waiting_id = waiting.map(|read| read.id);
         let outstanding = snapshot.len();
         let active = snapshot
             .iter()
             .filter(|(_, entry)| matches!(entry.stage, "blocking queue" | "handler"))
             .count();
-        let blockers: Vec<String> = select_blockers(&snapshot, wait, rejected_id, connection)
+        let blockers: Vec<String> = select_blockers(&snapshot, wait, waiting_id, connection)
             .into_iter()
             .map(|(id, entry)| describe(*id, entry))
             .collect();
-        let rejected = rejected_id
+        let waiting = waiting_id
             .and_then(|id| {
                 snapshot
                     .iter()
@@ -163,7 +164,7 @@ impl Diagnostics {
         tracing::warn!(
             reason,
             ?wait,
-            ?rejected,
+            ?waiting,
             outstanding,
             active,
             suppressed_dumps = suppressed,
@@ -185,34 +186,34 @@ fn describe(id: u64, entry: &Entry) -> String {
     )
 }
 
-/// Oldest-first reads that hold what the rejected read waited for, bounded
+/// Oldest-first reads that hold what the slow read is waiting for, bounded
 /// to `MAX_BLOCKERS` after relevance filtering so unrelated long-running
 /// reads cannot crowd the real blocker out of the sample.
 fn select_blockers(
     snapshot: &[(u64, Entry)],
     wait: Wait,
-    rejected: Option<u64>,
+    waiting: Option<u64>,
     connection: usize,
 ) -> Vec<&(u64, Entry)> {
-    let rejected_entry = rejected.and_then(|id| snapshot.iter().find(|(entry_id, _)| *entry_id == id));
+    let waiting_entry = waiting.and_then(|id| snapshot.iter().find(|(entry_id, _)| *entry_id == id));
     // Pending permits are released once a read is admitted, so only reads
     // still waiting for admission fill a pending queue.
     let holds_pending = |stage: &str| matches!(stage, "ordering" | "connection permit" | "engine permit");
     let holds_connection_permit = |stage: &str| matches!(stage, "engine permit" | "blocking queue" | "handler");
     let holds_engine_permit = |stage: &str| matches!(stage, "blocking queue" | "handler");
     // Engine permits are shared across connections; everything else is
-    // scoped to the rejected read's own connection.
+    // scoped to the waiting read's own connection.
     let engine_wide = wait == Wait::EngineQueue
-        || (wait == Wait::Permit && rejected_entry.is_some_and(|(_, r)| r.stage == "engine permit"));
+        || (wait == Wait::Permit && waiting_entry.is_some_and(|(_, r)| r.stage == "engine permit"));
     snapshot
         .iter()
         .filter(|(id, entry)| {
-            if Some(*id) == rejected || (entry.connection != connection && !engine_wide) {
+            if Some(*id) == waiting || (entry.connection != connection && !engine_wide) {
                 return false;
             }
             match wait {
                 Wait::ConnectionQueue | Wait::EngineQueue => holds_pending(entry.stage),
-                Wait::Ordering => rejected_entry.is_some_and(|(rejected_id, r)| id < rejected_id && entry.key == r.key),
+                Wait::Ordering => waiting_entry.is_some_and(|(waiting_id, r)| id < waiting_id && entry.key == r.key),
                 Wait::Permit if engine_wide => holds_engine_permit(entry.stage),
                 Wait::Permit => holds_connection_permit(entry.stage),
             }
@@ -239,7 +240,7 @@ impl Drop for TrackedRead {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn diagnostics_follow_permits_until_handler_drop_and_cleanup_cancelled_waiters() {
         let gate = Arc::new(super::super::ReadAdmission::new(
             1,
@@ -250,9 +251,9 @@ mod tests {
         let connection = gate.connection();
         let waiting = gate
             .enqueue(&connection)
-            .unwrap()
+            .await
             .identify("app", "first", "ListProducts".into(), 1);
-        let permits = waiting.acquire().await.unwrap();
+        let permits = waiting.acquire().await;
         permits.started();
         {
             let reads = gate.diagnostics.reads.lock().unwrap();
@@ -269,20 +270,27 @@ mod tests {
         }
         let waiting = gate
             .enqueue(&connection)
-            .unwrap()
+            .await
             .identify("app", "second", "ListHosts".into(), 2);
         assert_eq!(gate.diagnostics.reads.lock().unwrap().len(), 2);
-        assert_eq!(waiting.acquire().await.unwrap_err(), super::super::DEADLINE);
-        assert_eq!(gate.diagnostics.reads.lock().unwrap().len(), 1);
+        // The second read waits (past the slow-wait threshold, which only
+        // logs) rather than being rejected, and stays tracked meanwhile.
+        let mut second = tokio::spawn(waiting.acquire());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!second.is_finished());
+        assert_eq!(gate.diagnostics.reads.lock().unwrap().len(), 2);
         let cancelled = gate
             .enqueue(&connection)
-            .unwrap()
+            .await
             .identify("app", "cancelled", "ListHosts".into(), 2);
         drop(cancelled);
-        assert_eq!(gate.diagnostics.reads.lock().unwrap().len(), 1);
+        assert_eq!(gate.diagnostics.reads.lock().unwrap().len(), 2);
         drop(permits);
+        let second_permits = (&mut second).await.unwrap();
+        assert_eq!(gate.diagnostics.reads.lock().unwrap().len(), 1);
+        drop(second_permits);
         assert!(gate.diagnostics.reads.lock().unwrap().is_empty());
-        assert!(gate.enqueue(&connection).unwrap().acquire().await.is_ok());
+        drop(gate.enqueue(&connection).await.acquire().await);
     }
 
     fn entry(session: &str, stage: &'static str, key: u64, connection: usize) -> Entry {

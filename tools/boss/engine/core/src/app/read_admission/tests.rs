@@ -4,38 +4,77 @@ fn is_bulk_read(request: &boss_protocol::FrontendRequest) -> bool {
     read_lane(request) == ReadLane::Bulk
 }
 
-#[tokio::test]
-async fn limits_queue_deadline_and_release_are_bounded() {
+/// A pending future that must not have completed within `wait`.
+async fn still_pending<T>(task: &mut tokio::task::JoinHandle<T>, wait: Duration) {
+    tokio::time::sleep(wait).await;
+    assert!(!task.is_finished(), "must still be waiting");
+}
+
+/// Limits bound concurrency and queue depth, but a read that hits either
+/// waits for its turn — past the slow-wait threshold, which only logs —
+/// and is never rejected.
+#[tokio::test(start_paused = true)]
+async fn limits_and_full_queues_make_reads_wait_instead_of_rejecting() {
     let gate = Arc::new(ReadAdmission::new(2, 1, 8, Duration::from_millis(30)));
     let a = gate.connection();
     let b = gate.connection();
-    let first = gate.enqueue(&a).unwrap().acquire().await.unwrap();
+    let first = gate.enqueue(&a).await.acquire().await;
     // One connection cannot consume the second global slot, even while
-    // that slot is free. A different connection can still use it.
-    let start = std::time::Instant::now();
-    assert_eq!(gate.enqueue(&a).unwrap().acquire().await.unwrap_err(), DEADLINE);
-    assert!(start.elapsed() < Duration::from_secs(1));
-    let second = gate.enqueue(&b).unwrap().acquire().await.unwrap();
+    // that slot is free: its second read waits. A different connection can
+    // still use the slot.
+    let mut second_on_a = tokio::spawn({
+        let (gate, a) = (gate.clone(), a.clone());
+        async move { gate.enqueue(&a).await.acquire().await }
+    });
+    still_pending(&mut second_on_a, Duration::from_millis(200)).await;
+    let second = gate.enqueue(&b).await.acquire().await;
+    still_pending(&mut second_on_a, Duration::from_millis(50)).await;
     drop(first);
+    let second_on_a = (&mut second_on_a).await.unwrap();
     drop(second);
-    assert!(gate.enqueue(&a).unwrap().acquire().await.is_ok());
-    let queued: Vec<_> = (0..4).map(|_| gate.enqueue(&a).unwrap()).collect();
-    assert!(matches!(gate.enqueue(&a), Err(QUEUE_FULL)));
+    drop(second_on_a);
+    drop(gate.enqueue(&a).await.acquire().await);
+    // The connection queue holds four pending reads; a fifth waits for a
+    // slot rather than being rejected, and gets one as soon as any frees.
+    let mut queued = Vec::new();
+    for _ in 0..4 {
+        queued.push(gate.enqueue(&a).await);
+    }
+    let mut fifth = tokio::spawn({
+        let (gate, a) = (gate.clone(), a.clone());
+        async move { gate.enqueue(&a).await }
+    });
+    still_pending(&mut fifth, Duration::from_millis(200)).await;
+    drop(queued.pop());
+    let fifth = (&mut fifth).await.unwrap();
+    drop(fifth);
     drop(queued);
-    assert!(gate.enqueue(&a).is_ok());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn global_queue_and_concurrency_apply_across_connections() {
     let gate = Arc::new(ReadAdmission::new(1, 2, 2, Duration::from_millis(30)));
-    let active = gate.enqueue(&gate.connection()).unwrap().acquire().await.unwrap();
-    let first = gate.enqueue(&gate.connection()).unwrap();
-    let second = gate.enqueue(&gate.connection()).unwrap();
-    assert!(matches!(gate.enqueue(&gate.connection()), Err(QUEUE_FULL)));
-    assert_eq!(first.acquire().await.unwrap_err(), DEADLINE);
-    assert_eq!(second.acquire().await.unwrap_err(), DEADLINE);
+    let active = gate.enqueue(&gate.connection()).await.acquire().await;
+    let first = gate.enqueue(&gate.connection()).await;
+    let second = gate.enqueue(&gate.connection()).await;
+    let mut third = tokio::spawn({
+        let gate = gate.clone();
+        async move { gate.enqueue(&gate.connection()).await }
+    });
+    still_pending(&mut third, Duration::from_millis(200)).await;
+    let mut first = tokio::spawn(first.acquire());
+    let mut second = tokio::spawn(second.acquire());
+    still_pending(&mut first, Duration::from_millis(200)).await;
+    assert!(!second.is_finished());
     drop(active);
-    assert!(gate.enqueue(&gate.connection()).unwrap().acquire().await.is_ok());
+    let first = (&mut first).await.unwrap();
+    assert!(!second.is_finished());
+    drop(first);
+    let second = (&mut second).await.unwrap();
+    // Admitted reads release their queue slot, so the third's wait ends.
+    let third = (&mut third).await.unwrap();
+    drop(second);
+    drop(third.acquire().await);
 }
 
 #[test]
@@ -75,11 +114,17 @@ fn pr_status_refresh_probe_does_not_hold_a_bulk_slot() {
 async fn default_budget_admits_app_session_fan_out_behind_a_slow_read() {
     let gate = Arc::new(ReadAdmission::default());
     let connection = gate.connection();
-    let slow = gate.enqueue(&connection).unwrap().acquire().await.unwrap();
+    let slow = gate.enqueue(&connection).await.acquire().await;
     let mut held = Vec::new();
     for _ in 0..15 {
-        let waiting = gate.enqueue(&connection).expect("fan-out must be queueable");
-        held.push(waiting.acquire().await.expect("fan-out read rejected as busy"));
+        let waiting = tokio::time::timeout(Duration::from_secs(1), gate.enqueue(&connection))
+            .await
+            .expect("fan-out must be queueable");
+        held.push(
+            tokio::time::timeout(Duration::from_secs(1), waiting.acquire())
+                .await
+                .expect("fan-out read held up behind the slow read"),
+        );
     }
     drop(held);
     drop(slow);
@@ -155,9 +200,9 @@ fn default_limits_waits_and_reply_headroom() {
     assert_eq!(live.per_connection, 1024);
     for lane in [&bulk, &live] {
         assert_eq!(lane.pending.available_permits(), 100_000);
-        assert_eq!(lane.wait, Duration::from_secs(60));
+        assert_eq!(lane.slow_wait, Duration::from_secs(60));
     }
-    assert_eq!(ORDER_WAIT, Duration::from_secs(60));
+    assert_eq!(SLOW_ORDER_WAIT, Duration::from_secs(60));
     assert_eq!(reply_headroom(&bulk, &live), MAX_REPLY_RESERVE);
     assert_eq!(MAX_REPLY_RESERVE, 128);
     let small = ReadAdmission::new(2, 2, 8, Duration::from_secs(1));
@@ -192,22 +237,22 @@ async fn same_kind_reads_keep_receive_order_even_when_tasks_poll_in_reverse() {
     drop(unrelated_guard);
 }
 
+/// A read behind an identical earlier read waits past the slow-wait
+/// threshold (an hour here, in paused time), keeps its place, and runs when
+/// the predecessor finishes; the read behind it is still held in order.
 #[tokio::test(start_paused = true)]
-async fn expired_ordering_wait_does_not_release_predecessor_or_leak_capacity() {
+async fn patient_ordering_wait_completes_after_predecessor_without_leaking_capacity() {
     use boss_protocol::FrontendRequest as R;
     let gate = Arc::new(ReadAdmission::new(2, 2, 8, Duration::from_millis(20)));
     let connection = gate.connection();
     let mut ordering = ReadOrdering::default();
     let first = ordering.reserve(&R::ListProducts).await.await;
     let second = ordering.reserve(&R::ListProducts).await;
-    assert_eq!(
-        gate.enqueue(&connection)
-            .unwrap()
-            .acquire_ordered(second)
-            .await
-            .unwrap_err(),
-        Rejection::OrderingWait
-    );
+    let mut second_read = tokio::spawn({
+        let (gate, connection) = (gate.clone(), connection.clone());
+        async move { gate.enqueue(&connection).await.acquire_ordered(second).await }
+    });
+    still_pending(&mut second_read, SLOW_ORDER_WAIT + Duration::from_secs(1)).await;
     let mut third = ordering.reserve(&R::ListProducts).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(10), &mut third)
@@ -215,14 +260,22 @@ async fn expired_ordering_wait_does_not_release_predecessor_or_leak_capacity() {
             .is_err()
     );
     drop(first);
-    assert!(gate.enqueue(&connection).unwrap().acquire_ordered(third).await.is_ok());
+    let (permits, turn) = (&mut second_read).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut third)
+            .await
+            .is_err()
+    );
+    drop(turn);
+    drop(permits);
+    drop(gate.enqueue(&connection).await.acquire_ordered(third).await);
 }
 
-/// A slow read must not turn later reads BUSY: a different key proceeds
-/// immediately, and an identical read waits past the admission deadline for
-/// its turn rather than being rejected.
+/// A slow read must not hold up later reads of other keys: a different key
+/// proceeds immediately, and an identical read waits past the slow-wait
+/// threshold for its turn rather than being rejected.
 #[tokio::test(start_paused = true)]
-async fn slow_read_does_not_reject_other_keys_or_patient_same_key_reads() {
+async fn slow_read_does_not_hold_up_other_keys_and_same_key_reads_wait() {
     use boss_protocol::FrontendRequest as R;
     let gate = Arc::new(ReadAdmission::new(4, 4, 8, Duration::from_millis(20)));
     let connection = gate.connection();
@@ -235,11 +288,13 @@ async fn slow_read_does_not_reject_other_keys_or_patient_same_key_reads() {
     let slow = ordering.reserve(&doc("a")).await.await;
     let same = ordering.reserve(&doc("a")).await;
     let other = ordering.reserve(&doc("b")).await;
-    assert!(gate.enqueue(&connection).unwrap().acquire_ordered(other).await.is_ok());
-    let waiting = gate.enqueue(&connection).unwrap();
-    let same_read = tokio::spawn(async move { waiting.acquire_ordered(same).await.is_ok() });
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!same_read.is_finished());
+    drop(gate.enqueue(&connection).await.acquire_ordered(other).await);
+    let waiting = gate.enqueue(&connection).await;
+    let mut same_read = tokio::spawn(async move {
+        drop(waiting.acquire_ordered(same).await);
+        true
+    });
+    still_pending(&mut same_read, Duration::from_millis(500)).await;
     drop(slow);
     assert!(same_read.await.unwrap());
 }

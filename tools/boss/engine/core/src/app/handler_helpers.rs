@@ -217,6 +217,50 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         });
     }
 
+    let contention = server_state.work_db.contention_health().snapshot();
+    if !contention.stuck.is_empty() {
+        let longest = contention
+            .stuck
+            .iter()
+            .map(|wait| wait.since.elapsed())
+            .max()
+            .unwrap_or_default();
+        let holders = contention
+            .stuck
+            .iter()
+            .map(|wait| {
+                format!(
+                    "{} ({}, {} attempts, {} s)",
+                    wait.request,
+                    wait.caller,
+                    wait.attempts,
+                    wait.since.elapsed().as_secs()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        issues.push(EngineHealthIssue {
+            kind: "database_contention".to_owned(),
+            severity: "error".to_owned(),
+            title: format!(
+                "Database lock held for {} s; {} engine operation{} waiting",
+                longest.as_secs(),
+                contention.stuck.len(),
+                if contention.stuck.len() == 1 { " is" } else { "s are" }
+            ),
+            body: format!(
+                "Another process holds the engine database's write lock and has not released it. \
+                 The engine keeps retrying rather than failing these operations, so they complete \
+                 once the lock is released; nothing is lost. Waiting:\n{holders}\n\n\
+                 Lifetime: {} lock waits, {} longer than {} s, longest {} ms.",
+                contention.waits,
+                contention.long_waits,
+                crate::work::contention::HEALTH_THRESHOLD.as_secs(),
+                contention.longest_ms
+            ),
+        });
+    }
+
     let automation_paused = server_state.execution_coordinator.is_automation_paused();
     if automation_paused {
         // Relative elapsed ("3 days ago") matching the macOS app's
@@ -538,9 +582,24 @@ pub(super) fn duplicate_or_work_error(err: anyhow::Error) -> FrontendEvent {
             age_secs: dup.age_secs,
         }
     } else {
+        note_contention_leak(&err);
         FrontendEvent::WorkError {
             message: err.to_string(),
         }
+    }
+}
+
+/// Transient SQLite contention is absorbed below the transaction boundary
+/// (`crate::work::contention`), so it should never reach a client as an
+/// error. If one does, say so loudly where an operator will see it — the
+/// text itself is passed through unchanged, never relabelled or dropped.
+fn note_contention_leak(err: &anyhow::Error) {
+    if let Some(contention) = crate::work::contention::classify(err) {
+        tracing::error!(
+            ?contention,
+            error = %err,
+            "transient SQLite contention reached a client response; the busy handler did not absorb it"
+        );
     }
 }
 

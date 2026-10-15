@@ -183,13 +183,13 @@ impl WorkDb {
     /// existing database must not change its journal mode.
     fn configure_connection(conn: &mut Connection, set_wal: bool) -> Result<()> {
         // WAL lets readers and writers coexist (read-side concurrency
-        // is unaffected by an in-flight write) and `busy_timeout`
-        // turns lock contention into latency rather than an error
-        // returned to the caller. `synchronous = NORMAL` is the
-        // recommended pairing for WAL — durable across application
-        // crashes, only loses commits on OS/power loss, which is fine
-        // for engine state we can rebuild.
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        // is unaffected by an in-flight write) and the contention busy
+        // handler turns lock contention into latency — never into an
+        // error returned to the caller (see `contention`).
+        // `synchronous = NORMAL` is the recommended pairing for WAL —
+        // durable across application crashes, only loses commits on
+        // OS/power loss, which is fine for engine state we can rebuild.
+        super::contention::install(conn)?;
         if set_wal {
             conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         }
@@ -201,9 +201,10 @@ impl WorkDb {
         // `BEGIN DEFERRED`, two concurrent writers could each open a
         // read-mode transaction, then both try to upgrade to write,
         // and the loser fails with `SQLITE_BUSY_SNAPSHOT` — which the
-        // busy-timeout handler does NOT retry. `IMMEDIATE` acquires
-        // the write lock up front so the second caller waits inside
-        // the busy handler instead of racing.
+        // busy handler is NOT invoked for. `IMMEDIATE` acquires the
+        // write lock up front, before any row is touched, so the
+        // second caller waits inside the busy handler instead of
+        // racing — and a retried write is applied exactly once.
         conn.set_transaction_behavior(TransactionBehavior::Immediate);
         Ok(())
     }
@@ -238,7 +239,7 @@ impl WorkDb {
     /// itself.
     #[track_caller]
     pub(crate) fn connect(&self) -> Result<PooledConnection<'_>> {
-        super::connection_wait::acquire(&self.conn)
+        super::connection_wait::acquire(&self.conn, &self.contention_health)
     }
 
     /// Escape hatch: open a brand-new connection to this database instead of
@@ -256,7 +257,9 @@ impl WorkDb {
     pub fn open_read_only(path: PathBuf) -> Result<Self> {
         let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening existing database {} for inspection", path.display()))?;
-        conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        // A WAL reader only ever waits for recovery or a truncating
+        // checkpoint; even that wait is absorbed rather than reported.
+        super::contention::install(&conn)?;
         Ok(Self {
             path,
             memory: None,
@@ -264,6 +267,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             persona_metrics: super::personas::new_metrics_registry(),
+            contention_health: Arc::default(),
         })
     }
 
@@ -289,6 +293,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             persona_metrics: super::personas::new_metrics_registry(),
+            contention_health: Arc::default(),
         })
     }
 
