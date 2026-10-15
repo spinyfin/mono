@@ -173,13 +173,13 @@ fn rearm_parent_failure_signal(work_db: &crate::work::WorkDb, execution_id: &str
             return false;
         }
     }
-    match work_db.rearm_blocked_ci_failure_signal(&attempt.work_item_id) {
+    match work_db.rearm_audited_queue_failure(attempt) {
         Ok(rearmed) => {
             if !rearmed {
                 tracing::warn!(
                     execution_id,
                     parent_work_item_id = %attempt.work_item_id,
-                    "queue CI evidence audit: parent is not blocked on CI; nothing to re-arm"
+                    "queue CI evidence audit: episode or parent no longer eligible for re-arm"
                 );
             }
             rearmed
@@ -481,8 +481,8 @@ mod tests {
         assert_eq!(found.corrected_boundary, rfc3339_epoch("2026-07-27T22:00:00Z"));
     }
 
-    #[test]
-    fn rearm_restores_the_parent_signal_not_the_revisions() {
+    #[tokio::test]
+    async fn rearm_restores_the_parent_signal_not_the_revisions() {
         let (_dir, db) = crate::test_support::open_db();
         let product = crate::test_support::create_test_product(&db);
         let parent = crate::test_support::create_test_chore(&db, product.id.clone(), "Parent");
@@ -496,7 +496,23 @@ mod tests {
             .unwrap();
         }
         let mut audit = input(&parent.id, true);
-        audit.attempt.id = "att_missing".into();
+        audit.attempt = db
+            .insert_ci_remediation(crate::work::CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: parent.id.clone(),
+                pr_url: "https://github.com/foo/bar/pull/1".into(),
+                pr_number: 1,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: format!("mq:{HEAD}@queue"),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+                failure_kind: "merge_queue_rebounce".into(),
+                before_commit_sha: Some("queue".into()),
+            })
+            .unwrap()
+            .unwrap();
+        db.connect().unwrap().execute("UPDATE ci_remediations SET status = 'abandoned', failure_reason = 'verified_requeue', requeue_enqueued_at = 1 WHERE id = ?1", [&audit.attempt.id]).unwrap();
         // The revision itself is not blocked: re-arming it would be a no-op.
         assert!(!db.rearm_blocked_ci_failure_signal(&revision.id).unwrap());
         assert!(rearm_parent_failure_signal(&db, "exec", &audit));
@@ -508,6 +524,90 @@ mod tests {
             .collect();
         assert_eq!(reasons, vec!["ci_failure"]);
         assert!(db.active_blocked_signals(&revision.id).unwrap().is_empty());
+        let restored = db.get_ci_remediation(&audit.attempt.id).unwrap().unwrap();
+        assert_eq!(restored.status, "pending");
+        assert_eq!(restored.head_sha_at_trigger, format!("mq:{HEAD}"));
+        let boundary: Option<i64> = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT requeue_enqueued_at FROM ci_remediations WHERE id = ?1",
+                [&restored.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(boundary.is_none());
+        assert!(restored.failure_reason.is_none());
+        let candidate = crate::work::PendingMergeCheck {
+            work_item_id: parent.id.clone(),
+            product_id: product.id,
+            pr_url: restored.pr_url,
+        };
+        let probe = crate::merge_poller::PrLifecycleProbe::builder()
+            .labels(vec![])
+            .review(crate::merge_poller::PrReviewState::Unknown)
+            .url(&candidate.pr_url)
+            .state(crate::merge_poller::PrLifecycleState::Open(
+                crate::merge_poller::OpenPrStatus {
+                    mergeability: crate::merge_poller::OpenPrMergeability::Clean,
+                    ci: crate::merge_poller::OpenPrCiStatus::Clean,
+                },
+            ))
+            .build();
+        let mut outcome = crate::merge_poller::SweepOutcome::default();
+        crate::merge_poller::maybe_clear_blocked(
+            &db,
+            &crate::coordinator::NoopExecutionPublisher,
+            (None, None),
+            &candidate,
+            &probe,
+            (&crate::merge_poller::OpenPrCiStatus::Clean, true),
+            &mut outcome,
+        )
+        .await;
+        assert_eq!(
+            db.task_blocked_reason(&parent.id).unwrap().as_deref(),
+            Some("ci_failure")
+        );
+        // A sweep may have already cleared the block before the audit ran.
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review', blocked_reason = NULL WHERE id = ?1",
+            [&parent.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE ci_remediations SET status = 'abandoned', failure_reason = 'verified_requeue' WHERE id = ?1",
+            [&audit.attempt.id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(rearm_parent_failure_signal(&db, "exec", &audit));
+        assert_eq!(
+            db.task_blocked_reason(&parent.id).unwrap().as_deref(),
+            Some("ci_failure")
+        );
+        assert!(!rearm_parent_failure_signal(&db, "exec", &audit), "rearm is idempotent");
+        // An explicit human suppression must still win over the audit.
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review', blocked_reason = NULL WHERE id = ?1",
+            [&parent.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE ci_remediations SET status = 'abandoned', failure_reason = 'verified_requeue' WHERE id = ?1",
+            [&audit.attempt.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ci_failure_suppressions (work_item_id, head_sha, created_at) VALUES (?1, ?2, '0')",
+            rusqlite::params![parent.id, HEAD],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(!rearm_parent_failure_signal(&db, "exec", &audit));
+        assert!(db.task_blocked_reason(&parent.id).unwrap().is_none());
     }
 
     #[test]

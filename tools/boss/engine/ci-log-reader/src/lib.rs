@@ -468,9 +468,15 @@ pub struct TrunkEvictionBuild {
     /// parse, so callers can hand the result straight to those helpers.
     pub web_url: String,
     pub failed_job_ids: Vec<String>,
-    /// Buildkite step key (or, failing that, job name) of each entry in
-    /// `failed_job_ids`, index-aligned; empty when the job carries neither.
-    pub failed_job_labels: Vec<String>,
+    /// Display labels and stable identities, index-aligned with `failed_job_ids`.
+    pub failed_job_details: Vec<TrunkJobDetails>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrunkJobDetails {
+    pub label: String,
+    /// A stable step key, never a display-name fallback.
+    pub step_key: Option<String>,
 }
 
 /// Pages of the org-wide failed-build search [`find_trunk_merge_eviction_build`]
@@ -482,29 +488,34 @@ pub struct TrunkEvictionBuild {
 /// lookup that is already degrading gracefully to an empty result.
 const MAX_EVICTION_BUILD_SEARCH_PAGES: u32 = 3;
 
-/// Resolve a provider job UUID to the stable pipeline step key.
-pub async fn fetch_buildkite_step_key(binary: &str, url: &str, job_id: &str) -> Result<String> {
+/// Fetch every stable job identity in a build with one org-relative request.
+pub async fn fetch_buildkite_step_keys(binary: &str, url: &str) -> Result<std::collections::BTreeMap<String, String>> {
+    let url = url.split('#').next().unwrap_or(url);
     let path = url
         .strip_prefix("https://buildkite.com/")
         .context("invalid Buildkite URL")?;
-    let parts: Vec<_> = path.split('#').next().unwrap_or_default().split('/').collect();
+    let parts: Vec<_> = path.split('/').collect();
     anyhow::ensure!(parts.len() == 4 && parts[2] == "builds", "invalid Buildkite build URL");
-    let endpoint = format!("/organizations/{}/pipelines/{}/builds/{}", parts[0], parts[1], parts[3]);
+    let endpoint = format!("/pipelines/{}/builds/{}", parts[1], parts[3]);
     let output = run_capture(binary, &["api", &endpoint]).await?;
-    parse_buildkite_step_key(&output, job_id)
+    parse_buildkite_step_keys(&output, url)
 }
 
-fn parse_buildkite_step_key(output: &str, job_id: &str) -> Result<String> {
+fn parse_buildkite_step_keys(output: &str, url: &str) -> Result<std::collections::BTreeMap<String, String>> {
     let build: serde_json::Value = serde_json::from_str(output)?;
-    build["jobs"]
+    // bk scopes requests to its configured organization. Reject a different
+    // organization's response before using any job identities from it.
+    anyhow::ensure!(
+        build["web_url"].as_str() == Some(url),
+        "Buildkite build URL differs from configured organization's response"
+    );
+    Ok(build["jobs"]
         .as_array()
         .context("missing jobs")?
         .iter()
-        .find(|job| job["id"].as_str() == Some(job_id))
-        .and_then(|job| job["step_key"].as_str())
-        .filter(|key| !key.is_empty())
-        .map(str::to_owned)
-        .context("missing stable Buildkite step key")
+        .filter_map(|job| Some((job["id"].as_str()?.to_owned(), job["step_key"].as_str()?.to_owned())))
+        .filter(|(_, key)| !key.trim().is_empty())
+        .collect())
 }
 
 /// Discover the newest failed/failing Buildkite build whose branch is the
@@ -576,7 +587,7 @@ fn parse_trunk_eviction_build(builds: &serde_json::Value, branch_prefix: &str) -
         let pipeline_slug = build.get("pipeline")?.get("slug")?.as_str()?.to_owned();
         let build_number = build.get("number")?.as_u64()?.to_string();
         let web_url = build.get("web_url")?.as_str()?.to_owned();
-        let (failed_job_ids, failed_job_labels) = build
+        let (failed_job_ids, failed_job_details) = build
             .get("jobs")?
             .as_array()?
             .iter()
@@ -588,7 +599,16 @@ fn parse_trunk_eviction_build(builds: &serde_json::Value, branch_prefix: &str) -
                     .find_map(|k| job.get(*k)?.as_str().filter(|s| !s.trim().is_empty()))
                     .unwrap_or_default()
                     .to_owned();
-                Some((id, label))
+                Some((
+                    id,
+                    TrunkJobDetails {
+                        label,
+                        step_key: job["step_key"]
+                            .as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(str::to_owned),
+                    },
+                ))
             })
             .unzip();
         Some(TrunkEvictionBuild {
@@ -596,7 +616,7 @@ fn parse_trunk_eviction_build(builds: &serde_json::Value, branch_prefix: &str) -
             build_number,
             web_url,
             failed_job_ids,
-            failed_job_labels,
+            failed_job_details,
         })
     })
 }
@@ -798,7 +818,13 @@ mod tests {
         assert_eq!(found.build_number, "2364");
         assert_eq!(found.web_url, "https://buildkite.com/flunge/flunge-ci/builds/2364");
         assert_eq!(found.failed_job_ids, vec!["job-abc".to_owned()]);
-        assert_eq!(found.failed_job_labels, vec!["job-abc-key".to_owned()]);
+        assert_eq!(
+            found.failed_job_details,
+            vec![TrunkJobDetails {
+                label: "job-abc-key".into(),
+                step_key: Some("job-abc-key".into())
+            }]
+        );
     }
 
     #[test]
@@ -878,6 +904,29 @@ exit 2
         assert_eq!(found.pipeline_slug, "flunge-ci");
         assert_eq!(found.build_number, "2364");
         assert_eq!(found.failed_job_ids, vec!["job-uuid-1".to_owned()]);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn step_keys_use_org_relative_endpoint_and_reject_other_orgs() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+[ "$1" = "api" ] && [ "$2" = "/pipelines/mono/builds/7" ] || exit 2
+printf '%s\n' '{"web_url":"https://buildkite.com/expected/mono/builds/7","jobs":[{"id":"one","step_key":"tests"},{"id":"two","step_key":"lint"},{"id":"three","name":"display only"}]}'
+"#;
+        let path = write_script(dir.path(), "bk", script);
+        let binary = path.to_str().unwrap();
+        let keys = fetch_buildkite_step_keys(binary, "https://buildkite.com/expected/mono/builds/7#one")
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys["one"], "tests");
+        assert_eq!(keys["two"], "lint");
+        assert!(
+            fetch_buildkite_step_keys(binary, "https://buildkite.com/other/mono/builds/7")
+                .await
+                .is_err()
+        );
     }
 
     /// A full first page (100 results) with no branch-prefix match must
@@ -1338,14 +1387,10 @@ exit 2
 mod verification_identity_tests {
     #[test]
     fn step_key_is_resolved_by_job_id_never_by_display_label() {
-        let build = r#"{"jobs":[{"id":"other","step_key":"frontend"},{"id":"failed","name":"Friendly label","step_key":"mac-app-build"}]}"#;
-        assert_eq!(
-            super::parse_buildkite_step_key(build, "failed").unwrap(),
-            "mac-app-build"
-        );
-        assert!(super::parse_buildkite_step_key(build, "absent").is_err());
-        assert!(
-            super::parse_buildkite_step_key(r#"{"jobs":[{"id":"failed","name":"label-only"}]}"#, "failed").is_err()
-        );
+        let build = r#"{"web_url":"url","jobs":[{"id":"other","step_key":"frontend"},{"id":"failed","name":"Friendly label","step_key":"mac-app-build"},{"id":"unkeyed","name":"label-only"}]}"#;
+        let keys = super::parse_buildkite_step_keys(build, "url").unwrap();
+        assert_eq!(keys["failed"], "mac-app-build");
+        assert!(!keys.contains_key("absent"));
+        assert!(!keys.contains_key("unkeyed"));
     }
 }

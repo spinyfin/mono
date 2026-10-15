@@ -188,6 +188,7 @@ fn probe_ci_failing(pr: &str, head_sha: &str) -> PrLifecycleProbe {
         .url(pr.to_owned())
         .state(PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![
             RequiredCheckFailure {
+                job_key: None,
                 name: "ci/test".into(),
                 conclusion: "FAILURE".into(),
                 target_url: "".into(),
@@ -452,6 +453,7 @@ fn leaf_tag(v: &super::LeafVerdict) -> String {
 /// the rest are filler.
 fn failure(name: &str, conclusion: &str) -> RequiredCheckFailure {
     RequiredCheckFailure {
+        job_key: None,
         name: name.to_owned(),
         conclusion: conclusion.to_owned(),
         target_url: String::new(),

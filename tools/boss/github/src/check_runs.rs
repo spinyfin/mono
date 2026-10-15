@@ -63,8 +63,11 @@ pub enum CiProvider {
 /// at the provider's job page; `provider` is inferred from its host;
 /// `provider_job_id` is parsed from the URL when possible and `None`
 /// when the format is unrecognised.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct RequiredCheckFailure {
+    /// Stable pipeline/step identity when already captured from the provider.
+    pub job_key: Option<String>,
     pub name: String,
     pub conclusion: String,
     pub target_url: String,
@@ -253,6 +256,7 @@ pub fn parse_check_runs_for_failures(body: &[u8]) -> Vec<RequiredCheckFailure> {
         let provider = provider_for_url(&target_url);
         let provider_job_id = parse_provider_job_id(provider, &target_url);
         failures.push(RequiredCheckFailure {
+            job_key: None,
             name,
             conclusion: conclusion.to_owned(),
             target_url,
@@ -298,6 +302,7 @@ pub fn parse_commit_statuses_for_failures(body: &[u8]) -> Vec<RequiredCheckFailu
         let provider = provider_for_url(&target_url);
         let provider_job_id = parse_provider_job_id(provider, &target_url);
         failures.push(RequiredCheckFailure {
+            job_key: None,
             name,
             conclusion,
             target_url,

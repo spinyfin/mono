@@ -21,7 +21,7 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
 
     let flipped = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "synthetic-merge-sha-abc",
@@ -131,7 +131,7 @@ async fn rebounce_with_legacy_status_context_failures_flips_the_row() {
 
     let flipped = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         discriminator,
@@ -174,7 +174,7 @@ async fn rebounce_with_empty_failures_still_flips_with_generic_directive() {
 
     let flipped = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         sha,
@@ -203,7 +203,7 @@ async fn rebounce_with_empty_failures_still_flips_with_generic_directive() {
     // — the pre-fix refusal path re-fired every poll forever with no row.
     let again = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         sha,
@@ -233,6 +233,7 @@ async fn rebounce_stores_failing_checks_from_failures_slice() {
     let pub_ = Arc::new(RecordingPublisher::default());
 
     let failures = vec![RequiredCheckFailure {
+        job_key: None,
         name: "ci/build".into(),
         conclusion: "failure".into(),
         target_url: "https://buildkite.com/org/mono/builds/1666#job-abc-uuid".into(),
@@ -242,7 +243,7 @@ async fn rebounce_stores_failing_checks_from_failures_slice() {
 
     let flipped = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "synthetic-merge-sha-xyz",
@@ -295,7 +296,7 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
     // Step 1: detect the rebounce — chore flips to blocked: ci_failure.
     let flipped = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "synthetic-sha-xyz",
@@ -346,7 +347,7 @@ async fn rebounce_block_not_cleared_by_inflight_head_branch_ci() {
 
     let flipped = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "synthetic-sha-inflight",
@@ -412,7 +413,7 @@ async fn rebounce_does_not_flap_across_repeated_sweeps() {
         // The rebounce pass re-sees the same dequeue event on every sweep.
         if on_merge_queue_rebounce_detected(
             &db,
-            pub_.as_ref(),
+            crate::queue_ci_contract::test_context(pub_.as_ref()),
             &cand,
             "pr-head-at-trigger",
             sha,
@@ -462,7 +463,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
 
     let first = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "sha-A",
@@ -474,7 +475,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
     // appears in the timeline across consecutive sweeps).
     let second = on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "sha-A",
@@ -529,7 +530,7 @@ async fn rebounce_block_clears_after_worker_succeeds() {
     // 1. Detect.
     on_merge_queue_rebounce_detected(
         &db,
-        pub_.as_ref(),
+        crate::queue_ci_contract::test_context(pub_.as_ref()),
         &candidate(&product, &chore, pr),
         "pr-head-at-trigger",
         "sha-Q",

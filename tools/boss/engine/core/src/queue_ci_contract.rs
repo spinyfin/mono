@@ -51,12 +51,12 @@ pub(crate) fn validate_contract(runs: &[RequiredRun]) -> Result<()> {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait ContractFetcher: Send + Sync {
+pub trait ContractFetcher: Send + Sync {
     async fn config(&self, pr_url: &str) -> Result<Option<String>>;
-    async fn step_key(&self, url: &str, id: &str) -> Result<String>;
+    async fn step_keys(&self, url: &str) -> Result<BTreeMap<String, String>>;
 }
 
-struct ProviderFetcher;
+pub struct ProviderFetcher;
 
 #[async_trait::async_trait]
 impl ContractFetcher for ProviderFetcher {
@@ -70,18 +70,9 @@ impl ContractFetcher for ProviderFetcher {
         .context("contract fetch timed out")??)
     }
 
-    async fn step_key(&self, url: &str, id: &str) -> Result<String> {
-        Ok(tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            boss_ci_log_reader::fetch_buildkite_step_key("bk", url, id),
-        )
-        .await
-        .context("step lookup timed out")??)
+    async fn step_keys(&self, url: &str) -> Result<BTreeMap<String, String>> {
+        boss_ci_log_reader::fetch_buildkite_step_keys("bk", url).await
     }
-}
-
-pub(crate) async fn snapshot(pr_url: &str, encoded_checks: &str) -> Result<String> {
-    snapshot_with(&ProviderFetcher, pr_url, encoded_checks).await
 }
 
 pub(crate) async fn snapshot_with(fetcher: &dyn ContractFetcher, pr_url: &str, encoded_checks: &str) -> Result<String> {
@@ -99,15 +90,20 @@ pub(crate) async fn snapshot_with(fetcher: &dyn ContractFetcher, pr_url: &str, e
         validate_contract(runs)?;
     }
     let mut checks: Vec<serde_json::Value> = serde_json::from_str(encoded_checks)?;
+    let mut builds = BTreeMap::new();
     for check in &mut checks {
         check
             .as_object_mut()
             .context("invalid failed check")?
             .remove("verification");
-        check["job_key"] = serde_json::Value::Null;
+
         // Only Buildkite has a stable declaration identity. Actions job IDs
         // identify one run, not a job a product can declare ahead of time.
         if check["provider"] != "buildkite" {
+            continue;
+        }
+        if let Some(key) = check["job_key"].as_str().map(str::to_owned) {
+            attach(check, &key, &contracts)?;
             continue;
         }
         let (Some(url), Some(id)) = (check["target_url"].as_str(), check["provider_job_id"].as_str()) else {
@@ -119,14 +115,22 @@ pub(crate) async fn snapshot_with(fetcher: &dyn ContractFetcher, pr_url: &str, e
         if id.is_empty() {
             continue;
         }
-        // One bounded lookup per check: provider errors must not suppress
-        // this failure or a declared sibling's contract.
-        let step = match fetcher.step_key(url, id).await {
-            Ok(step) if !step.is_empty() => step,
-            result => {
-                tracing::warn!(?result, "queue CI identity unresolved; using heuristic verification");
-                continue;
-            }
+        let build_url = url.split('#').next().unwrap_or(url);
+        if !builds.contains_key(build_url) {
+            // Cache errors too: a degraded build is fetched only once and
+            // leaves its jobs unresolved without dropping resolved siblings.
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), fetcher.step_keys(build_url)).await;
+            let keys = match result {
+                Ok(Ok(keys)) => keys,
+                result => {
+                    tracing::warn!(?result, "queue CI identity unresolved; using heuristic verification");
+                    BTreeMap::new()
+                }
+            };
+            builds.insert(build_url.to_owned(), keys);
+        }
+        let Some(step) = builds[build_url].get(id) else {
+            continue;
         };
         attach(check, &format!("{pipeline}/{step}"), &contracts)?;
     }
@@ -186,3 +190,18 @@ pub(crate) async fn surface_error(
 #[cfg(test)]
 #[path = "queue_ci_contract_tests.rs"]
 pub(crate) mod tests;
+
+/// External dependencies for queue failure detection, separate from events.
+#[derive(Clone, Copy)]
+pub struct DetectionContext<'a> {
+    pub publisher: &'a dyn crate::coordinator::ExecutionPublisher,
+    pub fetcher: &'a dyn ContractFetcher,
+}
+
+#[cfg(test)]
+pub(crate) fn test_context(publisher: &dyn crate::coordinator::ExecutionPublisher) -> DetectionContext<'_> {
+    DetectionContext {
+        publisher,
+        fetcher: &tests::FakeFetcher(None),
+    }
+}

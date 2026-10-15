@@ -126,13 +126,14 @@ fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck,
 /// detection-time record — the protocol `CiRemediation` exposes the
 /// list as a raw `failed_checks: String` so the schema can roll
 /// forward without bumping the wire type.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
 struct FailedCheckRecord<'a> {
     name: &'a str,
     conclusion: &'a str,
     target_url: &'a str,
     provider: &'a str,
     provider_job_id: Option<&'a str>,
+    job_key: Option<&'a str>,
 }
 
 /// Attention kind used when CI remediation exhausts its attempt budget.
@@ -1063,13 +1064,14 @@ async fn fetch_and_store_log_excerpt(
 /// Returns `true` when the parent transitions to `blocked: ci_failure`.
 pub async fn on_merge_queue_rebounce_detected(
     work_db: &WorkDb,
-    publisher: &dyn ExecutionPublisher,
+    context: crate::queue_ci_contract::DetectionContext<'_>,
     candidate: &PendingMergeCheck,
     pr_head_sha: &str,
     before_commit_sha: &str,
     queue_base_sha: Option<&str>,
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    let publisher = context.publisher;
     match work_db.ci_remediation_exists_for_merge_queue_episode(&candidate.work_item_id, pr_head_sha, before_commit_sha)
     {
         Ok(true) => return false,
@@ -1083,6 +1085,7 @@ pub async fn on_merge_queue_rebounce_detected(
     on_queue_side_failure_detected(
         work_db,
         publisher,
+        context.fetcher,
         candidate,
         None,
         QueueSideFailureEpisode {
@@ -1136,6 +1139,7 @@ struct QueueSideFailureEpisode<'a> {
 async fn on_queue_side_failure_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
+    fetcher: &dyn crate::queue_ci_contract::ContractFetcher,
     candidate: &PendingMergeCheck,
     head_ref_name: Option<&str>,
     episode: QueueSideFailureEpisode<'_>,
@@ -1328,9 +1332,12 @@ async fn on_queue_side_failure_detected(
     // duplicate detection must not spend another remediation budget. Verified
     // requeue delivery archives that key by queue SHA, admitting a later failed
     // construction at the same head while preserving dedup of the old episode.
-    let failed_checks = match publisher
-        .snapshot_queue_ci_contract(&candidate.pr_url, &encode_failed_checks(failures))
-        .await
+    let failed_checks = match crate::queue_ci_contract::snapshot_with(
+        fetcher,
+        &candidate.pr_url,
+        &encode_failed_checks(failures),
+    )
+    .await
     {
         Ok(checks) => checks,
         Err(err) => {
@@ -1660,17 +1667,19 @@ pub(crate) fn trunk_eviction_discriminator(trunk_entry_id: &str, trunk_state_cha
 /// Returns `true` when the parent transitions to `blocked: ci_failure`.
 pub async fn on_trunk_queue_eviction_detected(
     work_db: &WorkDb,
-    publisher: &dyn ExecutionPublisher,
+    context: crate::queue_ci_contract::DetectionContext<'_>,
     candidate: &PendingMergeCheck,
     head_branch: Option<&str>,
     trunk_entry_id: &str,
     trunk_state_changed_at: &str,
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    let publisher = context.publisher;
     let discriminator = trunk_eviction_discriminator(trunk_entry_id, trunk_state_changed_at);
     on_queue_side_failure_detected(
         work_db,
         publisher,
+        context.fetcher,
         candidate,
         head_branch,
         QueueSideFailureEpisode {
@@ -1702,7 +1711,7 @@ pub async fn on_trunk_queue_eviction_detected(
 /// declined so an abandoned queue attempt is not resurrected.
 pub async fn on_trunk_head_check_eviction_detected(
     work_db: &WorkDb,
-    publisher: &dyn ExecutionPublisher,
+    context: crate::queue_ci_contract::DetectionContext<'_>,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
 ) -> bool {
@@ -1754,7 +1763,7 @@ pub async fn on_trunk_head_check_eviction_detected(
     // never started a build.
     on_trunk_queue_eviction_detected(
         work_db,
-        publisher,
+        context,
         candidate,
         probe.head_ref_name.as_deref(),
         &format!("check:{head_sha}"),
@@ -1780,9 +1789,14 @@ pub(crate) fn trunk_eviction_failures_from_build(
         .iter()
         .enumerate()
         .map(|(i, job_id)| RequiredCheckFailure {
+            job_key: build
+                .failed_job_details
+                .get(i)
+                .and_then(|job| job.step_key.as_ref())
+                .map(|step| format!("{}/{step}", build.pipeline_slug)),
             // The job label is the last `/` segment, which is what the queue
             // evidence gate classifies (lint vs. test) a failed job by.
-            name: match build.failed_job_labels.get(i).map(|l| l.replace('/', "-")) {
+            name: match build.failed_job_details.get(i).map(|job| job.label.replace('/', "-")) {
                 Some(label) if !label.trim().is_empty() => {
                     format!("Trunk merge queue: {}/{}", build.pipeline_slug, label.trim())
                 }
@@ -2613,7 +2627,7 @@ pub fn classify_noop_validation(probe: &PrLifecycleProbe) -> NoopValidation {
     }
 }
 
-fn encode_failed_checks(failures: &[RequiredCheckFailure]) -> String {
+pub(crate) fn encode_failed_checks(failures: &[RequiredCheckFailure]) -> String {
     let records: Vec<FailedCheckRecord<'_>> = failures
         .iter()
         .map(|f| FailedCheckRecord {
@@ -2622,6 +2636,7 @@ fn encode_failed_checks(failures: &[RequiredCheckFailure]) -> String {
             target_url: &f.target_url,
             provider: provider_str(f.provider),
             provider_job_id: f.provider_job_id.as_deref(),
+            job_key: f.job_key.as_deref(),
         })
         .collect();
     serde_json::to_string(&records).unwrap_or_else(|_| "[]".to_owned())

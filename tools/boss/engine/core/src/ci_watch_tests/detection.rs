@@ -957,6 +957,7 @@ async fn in_flight_supersede_closes_the_stale_remediations_revision() {
 #[test]
 fn encode_failed_checks_round_trip() {
     let json = encode_failed_checks(&[RequiredCheckFailure {
+        job_key: None,
         name: "ci/test".into(),
         conclusion: "FAILURE".into(),
         target_url: "https://github.com/foo/bar/actions/runs/1/job/2".into(),

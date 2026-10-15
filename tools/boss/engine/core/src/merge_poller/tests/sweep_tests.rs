@@ -1975,6 +1975,7 @@ async fn cross_flow_conflict_then_ci_fires_in_order() {
     let probe = StubProbe::new();
     let publisher = Arc::new(RecordingPublisher::default());
     let failures = vec![RequiredCheckFailure {
+        job_key: None,
         name: "ci/test".into(),
         conclusion: "FAILURE".into(),
         target_url: "https://buildkite.com/anthropic/mono/builds/1#job".into(),
@@ -2092,7 +2093,7 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
     };
     let flipped = ci_watch::on_merge_queue_rebounce_detected(
         &db,
-        publisher.as_ref(),
+        crate::queue_ci_contract::test_context(publisher.as_ref()),
         &rebounce_candidate,
         "original-pr-head",
         "synthetic-merge-sha",
@@ -2101,6 +2102,7 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
         // failure with none is refused outright (there would be nothing for
         // the fix revision to act on).
         &[RequiredCheckFailure {
+            job_key: None,
             name: "ci/test".to_owned(),
             conclusion: "FAILURE".to_owned(),
             target_url: "https://buildkite.com/foo/bar/builds/42#job-uuid".to_owned(),
@@ -2196,12 +2198,13 @@ async fn advanced_pr_head_retires_queue_attempt_and_new_failure_mints_again() {
     assert!(
         ci_watch::on_merge_queue_rebounce_detected(
             &db,
-            publisher.as_ref(),
+            crate::queue_ci_contract::test_context(publisher.as_ref()),
             &candidate,
             "original-pr-head",
             "synthetic-queue-commit",
             None,
             &[RequiredCheckFailure {
+                job_key: None,
                 name: "ci/test".to_owned(),
                 conclusion: "FAILURE".to_owned(),
                 target_url: "https://buildkite.com/foo/bar/builds/1".to_owned(),
@@ -2238,6 +2241,7 @@ async fn advanced_pr_head_retires_queue_attempt_and_new_failure_mints_again() {
             mergeability: OpenPrMergeability::Clean,
             ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "ci/test".to_owned(),
                     conclusion: "FAILURE".to_owned(),
                     target_url: "https://buildkite.com/foo/bar/builds/2".to_owned(),

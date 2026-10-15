@@ -252,6 +252,7 @@ impl StubEvictionEvidence {
         Self {
             answers: StubEvictionEvidenceAnswers {
                 failing_jobs: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "Trunk merge queue: flunge-ci".to_owned(),
                     conclusion: "failure".to_owned(),
                     target_url: "https://buildkite.com/flunge/flunge-ci/builds/2364#job-uuid".to_owned(),
@@ -485,6 +486,7 @@ async fn no_active_intents_means_no_trunk_traffic() {
     let outcome = probe
         .run_pass(
             &TrunkSweepContext {
+                contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
@@ -518,6 +520,7 @@ async fn intents_sharing_a_repo_and_branch_cost_one_get_queue_call() {
     let outcome = probe
         .run_pass(
             &TrunkSweepContext {
+                contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
@@ -544,6 +547,7 @@ async fn a_queue_is_not_re_probed_before_its_tier_interval_elapses() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -572,6 +576,7 @@ async fn a_testing_entry_pulls_the_queue_onto_the_fifteen_second_tier() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -606,6 +611,7 @@ async fn writes_queued_state_with_a_one_based_position_and_section_order() {
     let outcome = probe
         .run_pass(
             &TrunkSweepContext {
+                contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
@@ -664,6 +670,7 @@ async fn an_unchanged_queue_state_is_not_republished_every_cycle() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -696,6 +703,7 @@ async fn a_cancelled_entry_retires_the_intent_and_snaps_the_card_back_to_review(
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -742,6 +750,7 @@ async fn a_merged_entry_retires_the_intent_but_leaves_the_columns_to_the_github_
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -778,6 +787,7 @@ async fn an_evicted_entry_keeps_its_intent_active_for_the_remediation_path() {
     // behaviour must be unchanged by eviction-cause classification.
     let mut probe = probe_with(Arc::new(StubEvictionEvidence::with_failing_job()));
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -835,6 +845,7 @@ async fn an_evicted_entry_with_state_changed_at_triggers_ci_watch() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe_with(Arc::new(StubEvictionEvidence::with_failing_job()));
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -980,6 +991,7 @@ async fn an_eviction_boss_did_not_initiate_is_adopted_and_remediated() {
     let evidence = Arc::new(StubEvictionEvidence {
         answers: StubEvictionEvidenceAnswers {
             failing_jobs: vec![RequiredCheckFailure {
+                job_key: None,
                 name: "Trunk merge queue: flunge-ci".to_owned(),
                 conclusion: "failure".to_owned(),
                 target_url: "https://buildkite.com/flunge/flunge-ci/builds/2837#019fb6c1-0457-482f-9181-3f18f31701e7"
@@ -994,6 +1006,7 @@ async fn an_eviction_boss_did_not_initiate_is_adopted_and_remediated() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe_with(evidence);
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -1084,6 +1097,7 @@ async fn run_eviction(
     let publisher = RecordingPublisher::default();
     let mut probe = probe_with(evidence);
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: db,
         publisher: &publisher,
         api: &api,
@@ -1447,6 +1461,7 @@ async fn a_conflict_handover_sentinel_survives_the_reconciliation_backstop() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -1658,6 +1673,7 @@ async fn a_resubmitted_entry_returns_to_the_merging_lane() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -1697,6 +1713,7 @@ async fn an_intent_awaiting_resubmit_is_resubmitted_and_returns_to_the_merging_l
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -1753,6 +1770,7 @@ async fn run_pass_over_a_parked_intent(db: &WorkDb, task_id: &str, seconds_ago: 
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: db,
         publisher: &publisher,
         api: &api,
@@ -1845,6 +1863,7 @@ async fn the_stalled_backstop_files_one_item_not_one_per_sweep() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -1874,6 +1893,7 @@ async fn a_failed_resubmit_leaves_the_sentinel_for_the_next_cycle() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -1916,6 +1936,7 @@ async fn a_live_intent_superseded_by_conflict_is_cancelled_before_its_sentinel_c
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -1955,6 +1976,7 @@ async fn an_intent_superseded_by_conflict_is_cancelled_and_the_sentinel_persists
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -1993,6 +2015,7 @@ async fn a_cancel_that_finds_no_live_entry_is_not_a_probe_failure() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2016,6 +2039,7 @@ async fn an_entry_unknown_to_trunk_leaves_the_intent_untouched() {
     let outcome = probe
         .run_pass(
             &TrunkSweepContext {
+                contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
@@ -2048,6 +2072,7 @@ async fn an_intent_whose_task_already_finished_is_retired_without_any_trunk_call
     let outcome = probe
         .run_pass(
             &TrunkSweepContext {
+                contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
@@ -2072,6 +2097,7 @@ async fn repeated_failures_back_the_queue_off_before_the_next_probe() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2103,6 +2129,7 @@ async fn a_queue_unreachable_for_fifteen_minutes_files_exactly_one_attention_ite
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2136,6 +2163,7 @@ async fn a_rejected_token_is_reported_immediately_and_once() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2172,6 +2200,7 @@ async fn recovery_re_arms_the_unreachable_attention_for_the_next_outage() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2217,6 +2246,7 @@ async fn a_paused_queue_files_one_attention_item_per_episode() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2257,6 +2287,7 @@ async fn an_unparseable_repo_slug_parks_the_queue_instead_of_calling_trunk() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2315,6 +2346,7 @@ async fn section_order_is_a_contiguous_rank_across_only_the_boss_tracked_members
     probe
         .run_pass(
             &TrunkSweepContext {
+                contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
@@ -2351,6 +2383,7 @@ async fn a_stable_queue_does_not_re_renumber_every_pass() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2388,6 +2421,7 @@ async fn the_reconciliation_backstop_catches_a_transition_the_point_probes_misse
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2426,6 +2460,7 @@ async fn the_reconciliation_backstop_does_not_fire_before_its_own_cadence() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2461,6 +2496,7 @@ async fn a_failed_reconciliation_call_does_not_advance_the_since_cursor() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,
@@ -2503,6 +2539,7 @@ async fn the_reconciliation_backstop_follows_next_cursor_into_a_second_page() {
     let publisher = RecordingPublisher::default();
     let mut probe = probe();
     let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
         work_db: &db,
         publisher: &publisher,
         api: &api,

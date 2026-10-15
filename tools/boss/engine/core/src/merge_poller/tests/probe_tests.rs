@@ -461,6 +461,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "ci/test".into(),
                     conclusion: "FAILURE".into(),
                     target_url: "".into(),
@@ -481,6 +482,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "ci/test".into(),
                     conclusion: "FAILURE".into(),
                     target_url: "".into(),
@@ -522,6 +524,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "ci/build".into(),
                     conclusion: "STARTUP_FAILURE".into(),
                     target_url: "".into(),
@@ -536,6 +539,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "ci/test".into(),
                     conclusion: "TIMED_OUT".into(),
                     target_url: "".into(),
@@ -583,6 +587,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "ci/test".into(),
                     conclusion: "FAILURE".into(),
                     target_url: "".into(),
@@ -605,6 +610,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "ci/test".into(),
                     conclusion: "FAILURE".into(),
                     target_url: "".into(),
@@ -630,6 +636,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "buildkite/mono/checks".into(),
                     conclusion: "FAILURE".into(),
                     target_url: "https://buildkite.com/acme/mono/builds/99".into(),
@@ -644,6 +651,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "ci/test".into(),
                     conclusion: "FAILURE".into(),
                     target_url: "".into(),
@@ -662,6 +670,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "buildkite/mono".into(),
                     conclusion: "FAILURE".into(),
                     target_url: "https://buildkite.com/anthropic/mono/builds/42#01h-job-uuid".into(),
@@ -680,6 +689,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "gha/build".into(),
                     conclusion: "FAILURE".into(),
                     target_url: "https://github.com/anthropic/mono/actions/runs/12345/job/67890".into(),
@@ -740,6 +750,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "buildkite/mono".into(),
                     conclusion: "FAILURE".into(),
                     target_url: "https://buildkite.com/flunge/mono/builds/91#019e".into(),
@@ -760,6 +771,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
             combined_state: None,
             expect_ci: OpenPrCiStatus::Failing {
                 failures: vec![RequiredCheckFailure {
+                    job_key: None,
                     name: "buildkite/mono".into(),
                     conclusion: "ERROR".into(),
                     target_url: "".into(),

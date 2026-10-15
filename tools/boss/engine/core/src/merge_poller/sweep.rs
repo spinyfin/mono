@@ -1610,7 +1610,17 @@ pub(crate) async fn sweep_one(
         // the failed Trunk check on the probe is then the only signal,
         // and we mint from it here. Conflict and in-flight CI are
         // declined inside the callee (waiting vs stuck).
-        if ci_watch::on_trunk_head_check_eviction_detected(work_db, publisher, candidate, &probe_result).await {
+        if ci_watch::on_trunk_head_check_eviction_detected(
+            work_db,
+            crate::queue_ci_contract::DetectionContext {
+                publisher,
+                fetcher: &crate::queue_ci_contract::ProviderFetcher,
+            },
+            candidate,
+            &probe_result,
+        )
+        .await
+        {
             outcome.ci_flagged += 1;
         }
     }

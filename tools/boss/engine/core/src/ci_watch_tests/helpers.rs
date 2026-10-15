@@ -59,6 +59,7 @@ pub(super) fn probe_with_labels(pr_url: &str, head_sha: &str, labels: &[&str]) -
 
 pub(super) fn failure(name: &str, conclusion: &str) -> RequiredCheckFailure {
     RequiredCheckFailure {
+        job_key: None,
         name: name.into(),
         conclusion: conclusion.into(),
         target_url: "https://buildkite.com/foo/bar/builds/1#x".into(),
@@ -69,6 +70,7 @@ pub(super) fn failure(name: &str, conclusion: &str) -> RequiredCheckFailure {
 
 pub(super) fn one_failure() -> Vec<RequiredCheckFailure> {
     vec![RequiredCheckFailure {
+        job_key: None,
         name: "ci/test".into(),
         conclusion: "FAILURE".into(),
         target_url: "https://buildkite.com/anthropic/mono/builds/42#job-uuid".into(),

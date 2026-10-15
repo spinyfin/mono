@@ -183,12 +183,13 @@ async fn unchanged_pr_head_keeps_queue_failure_active_and_visible() {
     assert!(
         ci_watch::on_merge_queue_rebounce_detected(
             &db,
-            publisher.as_ref(),
+            crate::queue_ci_contract::test_context(publisher.as_ref()),
             &candidate,
             "pr-head-under-test",
             "synthetic-squash-commit",
             None,
             &[RequiredCheckFailure {
+                job_key: None,
                 name: "buildkite/checks".to_owned(),
                 conclusion: "FAILURE".to_owned(),
                 target_url: "https://buildkite.com/foo/bar/builds/1".to_owned(),
@@ -243,7 +244,7 @@ async fn legacy_queue_attempt_with_live_revision_stays_pending_when_head_advance
     assert!(
         ci_watch::on_merge_queue_rebounce_detected(
             &db,
-            publisher.as_ref(),
+            crate::queue_ci_contract::test_context(publisher.as_ref()),
             &candidate,
             "original-pr-head",
             "synthetic-legacy-sha",
@@ -308,7 +309,7 @@ async fn legacy_queue_attempt_with_concluded_revision_retires_and_unpins() {
     assert!(
         ci_watch::on_merge_queue_rebounce_detected(
             &db,
-            publisher.as_ref(),
+            crate::queue_ci_contract::test_context(publisher.as_ref()),
             &candidate,
             "original-pr-head",
             "synthetic-legacy-sha",
@@ -394,7 +395,7 @@ async fn rebounce_at_a_head_with_branch_ci_remediation_still_mints_attempt() {
     assert!(
         ci_watch::on_merge_queue_rebounce_detected(
             &db,
-            publisher.as_ref(),
+            crate::queue_ci_contract::test_context(publisher.as_ref()),
             &candidate,
             "shared-pr-head",
             "synthetic-queue-sha",
@@ -445,7 +446,14 @@ async fn dequeue_event_head_gate_skips_superseded_and_admits_current_head() {
     let mut stale_events = HashMap::new();
     stale_events.insert(pr.to_owned(), vec![stale.clone()]);
     let mut outcome = SweepOutcome::default();
-    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &stale_events, &mut outcome).await;
+    check_merge_queue_rebounce(
+        &db,
+        crate::queue_ci_contract::test_context(publisher.as_ref()),
+        &candidate,
+        &stale_events,
+        &mut outcome,
+    )
+    .await;
     assert!(
         db.list_ci_remediations(None, &[], Some(&chore), None)
             .unwrap()
@@ -460,7 +468,14 @@ async fn dequeue_event_head_gate_skips_superseded_and_admits_current_head() {
     assert!(dequeue_event_is_for_current_pr_head(&current, Some("head-2")));
     let mut current_events = HashMap::new();
     current_events.insert(pr.to_owned(), vec![current]);
-    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &current_events, &mut outcome).await;
+    check_merge_queue_rebounce(
+        &db,
+        crate::queue_ci_contract::test_context(publisher.as_ref()),
+        &candidate,
+        &current_events,
+        &mut outcome,
+    )
+    .await;
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
 }
 
@@ -483,7 +498,7 @@ async fn queue_failure_detail_falls_back_when_failed_checks_empty() {
     assert!(
         ci_watch::on_merge_queue_rebounce_detected(
             &db,
-            publisher.as_ref(),
+            crate::queue_ci_contract::test_context(publisher.as_ref()),
             &candidate,
             "pr-head-empty-checks",
             "synthetic-empty-checks",
@@ -539,12 +554,13 @@ async fn advanced_pr_head_with_clean_rollup_unpins_ci_required_state() {
     assert!(
         ci_watch::on_merge_queue_rebounce_detected(
             &db,
-            publisher.as_ref(),
+            crate::queue_ci_contract::test_context(publisher.as_ref()),
             &candidate,
             "original-pr-head",
             "synthetic-queue-commit",
             None,
             &[RequiredCheckFailure {
+                job_key: None,
                 name: "ci/test".to_owned(),
                 conclusion: "FAILURE".to_owned(),
                 target_url: "https://buildkite.com/foo/bar/builds/1".to_owned(),
@@ -1551,7 +1567,7 @@ async fn verified_same_head_requeue_allows_a_later_queue_failure() {
     assert!(
         ci_watch::on_merge_queue_rebounce_detected(
             &db,
-            publisher.as_ref(),
+            crate::queue_ci_contract::test_context(publisher.as_ref()),
             &candidate,
             &head,
             &queue,
@@ -1665,13 +1681,34 @@ async fn verified_same_head_requeue_allows_a_later_queue_failure() {
     ];
     let mut outcome = SweepOutcome::default();
     let replay = |timeline: &Vec<MergeQueueDequeueEvent>| HashMap::from([(pr.to_owned(), timeline.clone())]);
-    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &replay(&timeline), &mut outcome).await;
+    check_merge_queue_rebounce(
+        &db,
+        crate::queue_ci_contract::test_context(publisher.as_ref()),
+        &candidate,
+        &replay(&timeline),
+        &mut outcome,
+    )
+    .await;
     assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
     // After the attempt was detected but long before the proposal applied.
     timeline.push(event(&next_queue, "2024-01-01T00:00:00Z"));
-    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &replay(&timeline), &mut outcome).await;
-    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &replay(&timeline), &mut outcome).await;
+    check_merge_queue_rebounce(
+        &db,
+        crate::queue_ci_contract::test_context(publisher.as_ref()),
+        &candidate,
+        &replay(&timeline),
+        &mut outcome,
+    )
+    .await;
+    check_merge_queue_rebounce(
+        &db,
+        crate::queue_ci_contract::test_context(publisher.as_ref()),
+        &candidate,
+        &replay(&timeline),
+        &mut outcome,
+    )
+    .await;
     let next = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
     assert_ne!(next.id, attempt.id);
     assert_eq!(next.before_commit_sha.as_deref(), Some(next_queue.as_str()));

@@ -1737,15 +1737,6 @@ fn slot_busy_occupant(err: &anyhow::Error) -> Option<Option<String>> {
 /// to the topic broker; tests use a no-op or recording double.
 #[async_trait]
 pub trait ExecutionPublisher: Send + Sync {
-    /// Resolve external job declarations before publishing a remediation.
-    async fn snapshot_queue_ci_contract(&self, pr_url: &str, checks: &str) -> Result<String> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            crate::queue_ci_contract::snapshot(pr_url, checks),
-        )
-        .await?
-    }
-
     async fn publish(&self, execution_id: &str, work_item_id: &str, status: &str, reason: &str);
 
     /// Publish a work-tree invalidation on the work item's product
@@ -1776,11 +1767,6 @@ pub struct NoopExecutionPublisher;
 
 #[async_trait]
 impl ExecutionPublisher for NoopExecutionPublisher {
-    #[cfg(test)]
-    async fn snapshot_queue_ci_contract(&self, _: &str, checks: &str) -> Result<String> {
-        Ok(checks.to_owned())
-    }
-
     async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
     async fn publish_work_item_changed(&self, _: &str, _: &str, _: &str) {}
     async fn publish_frontend_event_on_product(&self, _: &str, _: FrontendEvent) {}
