@@ -355,6 +355,10 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::IdeaGraduated { .. }
         | FrontendEvent::OperatorQuestionsList { .. }
         | FrontendEvent::OperatorQuestionError { .. }
-        | FrontendEvent::DispatchAdmissionEvaluated { .. }) => passthrough,
+        | FrontendEvent::DispatchAdmissionEvaluated { .. }
+        | FrontendEvent::BoothbyPassesList { .. }
+        | FrontendEvent::BoothbyState { .. }
+        | FrontendEvent::BoothbyPassStarted { .. }
+        | FrontendEvent::BoothbyActivity { .. }) => passthrough,
     }
 }

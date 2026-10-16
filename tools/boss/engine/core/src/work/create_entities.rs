@@ -79,6 +79,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             persona_metrics: personas::new_metrics_registry(),
+            boothby_event_queue: Arc::default(),
         };
         let init_started = std::time::Instant::now();
         db.init()?;
@@ -108,6 +109,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             persona_metrics: personas::new_metrics_registry(),
+            boothby_event_queue: Arc::default(),
         };
         db.init()?;
         Ok(db)

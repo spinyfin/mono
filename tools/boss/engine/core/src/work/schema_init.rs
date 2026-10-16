@@ -260,6 +260,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             persona_metrics: super::personas::new_metrics_registry(),
+            boothby_event_queue: Arc::default(),
         })
     }
 
@@ -285,6 +286,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             persona_metrics: super::personas::new_metrics_registry(),
+            boothby_event_queue: Arc::default(),
         })
     }
 
