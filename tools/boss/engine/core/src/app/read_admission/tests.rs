@@ -163,9 +163,9 @@ fn default_limits_waits_and_reply_headroom() {
     assert_eq!(reply_headroom(&small, &small), 2 * 5 * 2 + 1);
 }
 
-// Identical requests have no separate turn: admission capacity is the only gate.
+// Acquired permits have no expiry; only waiting for admission has a deadline.
 #[tokio::test(start_paused = true)]
-async fn slow_read_does_not_block_later_reads_on_the_same_connection() {
+async fn active_permits_do_not_expire_after_the_admission_deadline() {
     let gate = Arc::new(ReadAdmission::new(2, 2, 8, Duration::from_millis(20)));
     let connection = gate.connection();
     let slow = gate.enqueue(&connection).unwrap().acquire().await.unwrap();

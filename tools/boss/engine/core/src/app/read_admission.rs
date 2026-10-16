@@ -210,7 +210,7 @@ mod lane;
 pub(super) use lane::{ReadLane, read_lane};
 
 mod view;
-pub(super) use view::key_id;
+pub(super) use view::{key, key_id};
 
 #[cfg(test)]
 mod burst_tests;

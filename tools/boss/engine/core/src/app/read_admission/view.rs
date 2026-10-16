@@ -1,4 +1,4 @@
-//! Request view identity for admission diagnostics; no read serialization.
+//! Request view identity for admission diagnostics and response freshness.
 use boss_protocol::FrontendRequest;
 /// Opaque identity of the request's response view, for diagnostics.
 pub(in crate::app) fn key_id(request: &FrontendRequest) -> u64 {
@@ -8,7 +8,7 @@ pub(in crate::app) fn key_id(request: &FrontendRequest) -> u64 {
     hasher.finish()
 }
 
-fn key(request: &FrontendRequest) -> String {
+pub(in crate::app) fn key(request: &FrontendRequest) -> String {
     // Refresh changes how a listing is loaded, not its destination view.
     match request {
         FrontendRequest::GetDriverQuotaUsage { .. } => {

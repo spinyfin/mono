@@ -11,12 +11,14 @@ async fn fetch_with_db(
     delta: bool,
     db: Arc<crate::work::WorkDb>,
 ) -> FrontendEvent {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = format!("fetch-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let ctx = Dispatch::builder()
         .server_state(state.clone())
         .work_db(db)
         .sink(sink.clone())
         .session_id("board")
-        .request_id("fetch")
+        .request_id(id.clone())
         .recv_instant(Instant::now())
         .decode_ms(0.0)
         .build();
@@ -29,7 +31,9 @@ async fn fetch_with_db(
         },
     )
     .await;
-    sink.next().await.unwrap().payload
+    let reply = sink.next().await.unwrap();
+    assert_eq!(reply.request_id.as_deref(), Some(id.as_str()));
+    reply.payload
 }
 
 fn update(event: FrontendEvent) -> boss_protocol::work_tree_delta::WorkTreeUpdate {
@@ -41,7 +45,16 @@ fn update(event: FrontendEvent) -> boss_protocol::work_tree_delta::WorkTreeUpdat
 
 #[test]
 fn slow_board_read_does_not_block_a_later_read_on_the_same_session() {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    repeated_overtaking(false);
+    repeated_overtaking(true);
+}
+
+fn repeated_overtaking(other_product: bool) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
     let _entered = runtime.enter();
     let (state, _dir) = test_server_state();
     let product = crate::test_support::create_test_product_named(&state.work_db, "concurrent");
@@ -54,7 +67,10 @@ fn slow_board_read_does_not_block_a_later_read_on_the_same_session() {
         .unwrap()
         .execute("UPDATE tasks SET name = 'before'", [])
         .unwrap();
+    let other = crate::test_support::create_test_product_named(&state.work_db, "other");
     let sink = make_session_sink();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = attempts.clone();
     let slow_db = Arc::new(state.work_db.query_connection().unwrap());
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -63,6 +79,14 @@ fn slow_board_read_does_not_block_a_later_read_on_the_same_session() {
         .connect()
         .unwrap()
         .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(
+                ctx.action,
+                rusqlite::hooks::AuthAction::Transaction {
+                    operation: rusqlite::hooks::TransactionOperation::Begin
+                }
+            ) {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if first
                 && matches!(
                     ctx.action,
@@ -91,6 +115,7 @@ fn slow_board_read_does_not_block_a_later_read_on_the_same_session() {
         ))
     });
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    runtime.block_on(tokio::time::advance(Duration::from_secs(61)));
     state
         .work_db
         .connect()
@@ -98,13 +123,27 @@ fn slow_board_read_does_not_block_a_later_read_on_the_same_session() {
         .execute("UPDATE tasks SET name = 'after'", [])
         .unwrap();
     let fast_db = Arc::new(state.work_db.reader().unwrap());
-    let fast = update(runtime.block_on(fetch_with_db(&state, &sink, &product.id, true, fast_db)));
+    let fast_product = if other_product { &other.id } else { &product.id };
+    let fast = update(runtime.block_on(fetch_with_db(&state, &sink, fast_product, true, fast_db)));
     assert!(fast.base_sequence.is_none());
-    assert_eq!(fast.changes["chores"][0]["name"], "after");
+    if !other_product {
+        assert_eq!(fast.changes["chores"][0]["name"], "after");
+    }
+    let mut last = fast.sequence;
+    for _ in 0..8 {
+        let id = if other_product { &other.id } else { &product.id };
+        last = update(runtime.block_on(fetch(&state, &sink, id, true))).sequence;
+    }
     release_tx.send(()).unwrap();
     let slow = update(reader.join().unwrap());
-    assert_eq!(slow.base_sequence, Some(fast.sequence));
-    assert_eq!(slow.changes, serde_json::json!({}));
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+    if other_product {
+        assert!(slow.base_sequence.is_none());
+        assert_eq!(slow.changes["chores"][0]["name"], "before");
+    } else {
+        assert_eq!(slow.base_sequence, Some(last));
+        assert_eq!(slow.changes, serde_json::json!({}));
+    }
 }
 
 #[tokio::test]
