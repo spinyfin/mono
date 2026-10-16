@@ -49,6 +49,16 @@ final class AgentsGridModel: ObservableObject {
         personaByRun[runId]
     }
 
+    /// Idle crew for the page's empty rectangles. Personas already assigned
+    /// to any agent (visible or not) are excluded.
+    func idleCells(for page: PaneLayoutPage) -> [IdleGridCell] {
+        IdleGridCellPlanner.cells(
+            for: page,
+            busyPersonas: Set(personaByRun.values),
+            seedRunIds: Array(placedRunIds(in: layout))
+        )
+    }
+
     func setVisible(_ visible: Bool) {
         replaceLayout { $0.setVisible(visible) }
     }
