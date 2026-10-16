@@ -682,3 +682,63 @@ async fn rebasing_then_losing_baseline_recovers_from_recorded_evolution() {
     assert!(patch.contains("revision.txt"));
     assert!(!patch.contains("pr.txt"));
 }
+
+#[tokio::test]
+async fn abandoned_recorded_baseline_without_a_successor_is_a_typed_missing_baseline() {
+    let s = revision_on_pr_head("exec_abandoned_recorded_base").await;
+    let repo = &s.repo.repo;
+    let pr_head = one(repo, "pr/7");
+    let empty = one(repo, &format!("({pr_head})+ & empty()"));
+    // A legacy-style record whose recorded baseline is cube's empty positioning
+    // commit, which the worker then abandons before anything is pushed.
+    let record = ExecutionBookmark {
+        base_commit: Some(empty.clone()),
+        ..s.record.clone()
+    };
+    JjRepo::run(&s.repo.worker, &["abandon", &empty]);
+    JjRepo::run(repo, &["bookmark", "delete", &record.base()]);
+    let error = diff(&LocalJj, &record).await.unwrap_err();
+    assert_eq!(
+        pointer_integrity_kind(&error),
+        Some(PointerIntegrityKind::MissingBaseline),
+        "{error}"
+    );
+    assert!(is_reconcilable_pointer_error(&error));
+
+    // No anchor vouches for the preserved work: the PR head lacks the
+    // revision, so reconcile refuses with a typed NotContained and moves
+    // nothing. This is what the coordinator turns into a retirement.
+    let before = snapshot_pointers(&LocalJj, &record).await.unwrap();
+    let refused = reconcile(&LocalJj, &record, Some("pr/7"), "main").await.unwrap_err();
+    assert_eq!(
+        pointer_integrity_kind(&refused),
+        Some(PointerIntegrityKind::NotContained),
+        "{refused}"
+    );
+    assert_eq!(snapshot_pointers(&LocalJj, &record).await.unwrap(), before);
+    let refused = reconcile(&LocalJj, &record, None, "main").await.unwrap_err();
+    assert_eq!(
+        pointer_integrity_kind(&refused),
+        Some(PointerIntegrityKind::NotContained),
+        "{refused}"
+    );
+    assert_eq!(snapshot_pointers(&LocalJj, &record).await.unwrap(), before);
+
+    // Once the PR head carries the preserved work it is adopted as the anchor.
+    let work = one(repo, &revision(&record.head()));
+    bookmark(repo, "pr/7", &work);
+    let reconciled = reconcile(&LocalJj, &record, Some("pr/7"), "main")
+        .await
+        .unwrap()
+        .expect("pointers were damaged");
+    assert_eq!(
+        reconciled.anchor,
+        Anchor::PrHead {
+            bookmark: "pr/7".into(),
+            commit: work.clone()
+        }
+    );
+    pointers_at(repo, &record, &work);
+    let patch = diff(&LocalJj, &record).await.unwrap();
+    assert!(patch.is_empty(), "{patch}");
+}

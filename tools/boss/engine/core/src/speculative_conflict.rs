@@ -1,4 +1,4 @@
-//! Layer 4 speculative conflict prediction (T10, `future / not a v1
+//! Layer 4 speculative conflict prediction (`future / not a v1
 //! blocker` in
 //! `docs/designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
 //!
@@ -20,7 +20,7 @@
 //! Deliberately out of scope here (see this task's PR description):
 //! pre-emptively running rung 0/1 resolution against a predicted conflict,
 //! and converting two mutually-predicted-to-conflict in-flight branches
-//! into an ordered stack (T11) — the design marks both as separate,
+//! into an ordered stack — the design marks both as separate,
 //! optional follow-on work.
 //!
 //! Gated by the `speculative_conflict_prediction` feature flag (default

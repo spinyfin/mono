@@ -39,7 +39,7 @@ pub(super) async fn evolved_baseline(
                 "log",
                 "--no-graph",
                 "-r",
-                &format!("{change} & ({common})"),
+                &format!("present({change}) & ({common})"),
                 "-T",
                 "commit_id ++ \"\\n\"",
             ],
