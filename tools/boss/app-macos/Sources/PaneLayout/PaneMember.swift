@@ -75,6 +75,16 @@ public struct PaneMember: Equatable, Sendable, Identifiable {
     }
 }
 
+/// Result of an explicit request to bring a run into view.
+public enum PaneRevealOutcome: Equatable, Sendable {
+    /// The run is not an engine-reported local member.
+    case notMember
+    /// The run was already admitted by the filter; its page is now selected.
+    case revealed
+    /// A filter was hiding the run; it was cleared and the page selected.
+    case revealedClearingFilter
+}
+
 /// Project and type multi-selects. `nil` means "all"; a non-nil set admits only
 /// its members, so an empty set admits nothing. The UI should map "nothing
 /// checked" back to `nil`.

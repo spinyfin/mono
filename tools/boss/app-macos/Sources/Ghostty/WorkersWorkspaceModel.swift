@@ -2,6 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 import GhosttyKit
+import PaneLayout
 
 @MainActor
 final class WorkersWorkspaceModel: ObservableObject {
@@ -161,6 +162,32 @@ final class WorkersWorkspaceModel: ObservableObject {
                 taskTitle: slot.taskTitle
             )
         }
+    }
+
+    /// Installed by the Agents view. Applies the run-keyed reveal (filter
+    /// clear, page select, outline) on the view's grid model, forcing the
+    /// grid visible and current first so a request that arrives while another
+    /// mode is showing still resolves against live membership.
+    var agentsRevealHandler: ((String) -> PaneRevealOutcome)?
+
+    /// Run-keyed focus used by `bossctl agents focus` and Doing-card clicks.
+    /// Reveals the run's cell in the Agents view, then focuses its terminal
+    /// once layout has placed it; a run without a viewer is revealed as its
+    /// "Viewer not attached" card. A run unknown to both membership and the
+    /// viewer map fails as `.unknownSlot`.
+    func revealAgent(runId: String) -> EngineFocusResult {
+        let outcome = agentsRevealHandler?(runId) ?? .notMember
+        let viewer = viewersByRunId[runId]
+        guard outcome != .notMember || viewer != nil else {
+            return .failure(.unknownSlot)
+        }
+        if viewer?.session != nil {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                _ = self?.focusWorkerPane(runId: runId)
+            }
+        }
+        return .success
     }
 
     /// Bring the slot's libghostty surface to first responder and
