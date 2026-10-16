@@ -18,7 +18,7 @@ final class AgentSurfaceCollectionTests: XCTestCase {
             )
         }
         grid.apply(states: states, viewers: [:], interactivePoolSize: 16,
-                   automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false)
+                   automationPoolSize: 8, reviewPoolSize: 16)
         XCTAssertEqual(grid.layout.pageCount, 2)
         let recorder = MountRecorder()
         let host = NSHostingView(rootView: PageHarness(grid: grid, recorder: recorder))

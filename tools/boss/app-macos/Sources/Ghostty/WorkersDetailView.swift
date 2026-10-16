@@ -55,7 +55,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .onChange(of: grid.layout) { _, _ in if isVisible { refreshSnapshots() } }
         .onChange(of: isVisible) { _, _ in syncGrid() }
         .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
-        .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
         .onChange(of: workspace.viewersByRunId) { _, _ in syncGrid() }
         .onChange(of: workspace.interactivePoolSize) { _, _ in syncGrid() }
         .onChange(of: workspace.automationPoolSize) { _, _ in syncGrid() }
@@ -179,7 +178,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
         let layout = grid.layout
         return GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                AgentSurfaceCollection(runIds: renderRunIds, layout: layout, area: geo.size) { runId in
+                AgentSurfaceCollection(runIds: grid.renderRunIds(attached: workspace.viewersByRunId.keys), layout: layout, area: geo.size) { runId in
                     let snapshot = renderSnapshot(runId: runId)
                     WorkerSlotView(
                         runtime: workspace.runtime,
@@ -194,10 +193,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
             }
         }
         .background(paneSizeReader)
-    }
-
-    private var renderRunIds: [String] {
-        Set(cachedSnapshots.keys).union(workspace.viewersByRunId.keys).sorted()
     }
 
     private func renderSnapshot(runId: String) -> WorkerSlotSnapshot {
@@ -265,17 +260,15 @@ struct WorkersDetailView: View, @MainActor Equatable {
     }
 
     private func syncGrid() {
-        grid.setVisible(isVisible)
-        guard isVisible else { return }
         grid.apply(
+            isVisible: isVisible,
             states: Array(liveStates.byRunID.values),
             viewers: workspace.viewersByRunId,
             interactivePoolSize: workspace.interactivePoolSize,
             automationPoolSize: workspace.automationPoolSize,
-            reviewPoolSize: workspace.reviewSlotCount,
-            feedUnavailable: liveStates.feedUnavailable
+            reviewPoolSize: workspace.reviewSlotCount
         )
-        refreshSnapshots()
+        if isVisible { refreshSnapshots() }
     }
 
     private func refreshSnapshots() {
@@ -378,6 +371,29 @@ struct WorkerSlotView: View, @MainActor Equatable {
     let runtime: GhosttyRuntime
     let snapshot: WorkerSlotSnapshot
     let onToggleLiveStatus: (Bool) -> Void
+    /// Builds the terminal surface for a slot that has a session. Production
+    /// uses `WorkerPaneTerminalView`; tests inject a counting probe to observe
+    /// the representable's create/dismantle lifecycle without a live libghostty
+    /// surface. Outside `==`, like the other closure.
+    let terminalContent: WorkerTerminalContent
+
+    typealias WorkerTerminalContent = @MainActor (GhosttyRuntime, TerminalPaneSession, Bool) -> AnyView
+
+    static let productionTerminalContent: WorkerTerminalContent = { runtime, session, liveStatePresent in
+        AnyView(WorkerPaneTerminalView(runtime: runtime, session: session, liveStatePresent: liveStatePresent))
+    }
+
+    init(
+        runtime: GhosttyRuntime,
+        snapshot: WorkerSlotSnapshot,
+        onToggleLiveStatus: @escaping (Bool) -> Void,
+        terminalContent: @escaping WorkerTerminalContent = WorkerSlotView.productionTerminalContent
+    ) {
+        self.runtime = runtime
+        self.snapshot = snapshot
+        self.onToggleLiveStatus = onToggleLiveStatus
+        self.terminalContent = terminalContent
+    }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.runtime === rhs.runtime
@@ -399,11 +415,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
         if snapshot.isPlaceholder, snapshot.session == nil {
             placeholderCard
         } else if let session = snapshot.session {
-            WorkerPaneTerminalView(
-                runtime: runtime,
-                session: session,
-                liveStatePresent: snapshot.live != nil
-            )
+            terminalContent(runtime, session, snapshot.live != nil)
             .id(session.id)
             .opacity(snapshot.isPlaceholder || snapshot.isExited ? 0.55 : 1)
             .onChange(of: snapshot.displayName, initial: true) { _, name in
@@ -500,7 +512,11 @@ struct WorkerSlotView: View, @MainActor Equatable {
                 WorkerSlotFallbackMonitorPill(session: session)
             }
 
-            liveStatusToggle
+            // A finished placeholder is historical text, not an addressable
+            // worker: its slot may already belong to a new run.
+            if snapshot.offersLiveStatusToggle {
+                liveStatusToggle
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)

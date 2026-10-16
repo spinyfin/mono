@@ -69,6 +69,8 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
 
     var badgeType: AgentType { live?.badgeType ?? .unknown }
     var isExited: Bool { live?.isExited == true }
+    /// A finished placeholder is historical text, not an addressable worker.
+    var offersLiveStatusToggle: Bool { !isPlaceholder }
     var isViewerMissing: Bool { runId != nil && session == nil && !isPlaceholder }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
