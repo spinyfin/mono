@@ -123,6 +123,10 @@ binary_path() {
   printf '%s\n' "${path}"
 }
 
+# Local cube workspaces get the same bin/ layout from .cube/setup.yaml via
+# tools/repobin/shim/install-workspace-shims.sh (symlinks that build repobin
+# on first use, since a lease cannot afford a bazel build). Keep the two in
+# step: bin/checkleft must mean the same binary there as it does here.
 echo "+++ installing repobin tools into bin/"
 bazel build //tools/repobin:repobin
 ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
