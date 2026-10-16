@@ -32,7 +32,7 @@ struct ContentView: View {
     @AppStorage("boss.ui.standardSearch", store: BossDefaults.store) private var useStandardSearch: Bool = false
     @AppStorage(KanbanBoardStyle.storageKey, store: BossDefaults.store) private var kanbanBoardStyle: KanbanBoardStyle = .productDefault
 
-    var body: some View {
+    private var navigationContent: some View {
         // Work and Agents stay mounted via opacity + hit-testing. Switching
         // either tree to `if navigationMode ==` would call
         // `GhosttyTerminalView.dismantleNSView` → `ghostty_surface_free` on
@@ -112,6 +112,10 @@ struct ContentView: View {
                 IdeasView(chat: model)
             }
         }
+    }
+
+    private var configuredContent: some View {
+        navigationContent
         // Chrome banners live in the window's titlebar-accessory slot: below
         // the toolbar, above the content, with AppKit shrinking
         // `contentLayoutRect` by the bar's own measured height. That reserves
@@ -322,6 +326,10 @@ struct ContentView: View {
                 UpdateBadgeToolbarButton(updateModel: updateModel, quitRequest: updateQuitRequest)
             }
         }
+    }
+
+    var body: some View {
+        configuredContent
         .onChange(of: model.navigationMode) { _, newMode in
             isSearchExpanded = false
             if useStandardSearch && newMode != .work {

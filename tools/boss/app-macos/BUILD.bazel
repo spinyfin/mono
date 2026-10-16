@@ -17,6 +17,11 @@ config_setting(
     values = {"collect_code_coverage": "true"},
 )
 
+config_setting(
+    name = "fastbuild_mode",
+    values = {"compilation_mode": "fastbuild"},
+)
+
 _COVERAGE_LINKOPTS = select({
     ":coverage_enabled": ["-fprofile-instr-generate"],
     "//conditions:default": [],
@@ -83,7 +88,16 @@ swift_library(
         "-swift-version",
         "6",
         "-strict-concurrency=complete",
-    ],
+    ] + select({
+        # Bazel accounts for this entire action as one CPU, including driver
+        # subprocesses. Keep the default modest on shared CI hosts.
+        # Opt and dbg retain their existing driver arguments.
+        ":fastbuild_mode": [
+            "-j",
+            "2",
+        ],
+        "//conditions:default": [],
+    }),
     module_name = "Boss",
     deps = [
         "//tools/boss/app-macos/Sources/CrashWatchdog",
