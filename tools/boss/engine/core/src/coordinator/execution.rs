@@ -401,36 +401,31 @@ impl ExecutionCoordinator {
                     "review-guide submissions require a local worker; SSH proposal attribution is unsupported"
                 );
             }
-            return self.pick_host(work_item, Some("local".to_owned()), requested, Some("codex".to_owned()));
+            return self.pick_host(
+                work_item,
+                Some("local".to_owned()),
+                requested,
+                self.resolve_spawn_driver(execution, worker_id)?,
+            );
         }
-        // Resolved driver is a hard requirement. Prefer the claimed
-        // worker's pool policy (review/automation) so placement matches
-        // the driver spawn will actually launch; otherwise use the same
-        // row/product/allocation resolution the events socket and spawn
-        // path use.
-        let required_driver = if execution.kind == ExecutionKind::PrReview {
-            self.work_db
-                .review_batch_member_for_execution(&execution.id)?
-                .map(|member| member.requested_driver)
-        } else {
-            None
-        }
-        .or_else(|| {
-            crate::coordinator::pool_dispatch_policy_for_worker_id(worker_id).map(|policy| policy.driver.to_owned())
-        })
-        .or_else(|| {
-            self.work_db
-                .get_execution_driver_slug(&execution.id)
-                .unwrap_or_else(|err| {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        error = %format!("{err:#}"),
-                        "host-selection: failed to resolve driver slug; treating as none",
-                    );
-                    None
-                })
-        });
+        let required_driver = self.resolve_spawn_driver(execution, worker_id)?;
         self.pick_host(work_item, pinned, requested, required_driver)
+    }
+
+    /// Resolve the driver used by both host placement and spawn-failure alerts.
+    pub(crate) fn resolve_spawn_driver(&self, execution: &WorkExecution, worker_id: &str) -> Result<Option<String>> {
+        if execution.kind == ExecutionKind::PrReviewGuide {
+            return Ok(Some(crate::runner::REVIEW_GUIDE_DRIVER.to_owned()));
+        }
+        if execution.kind == ExecutionKind::PrReview
+            && let Some(member) = self.work_db.review_batch_member_for_execution(&execution.id)?
+        {
+            return Ok(Some(member.requested_driver));
+        }
+        if let Some(policy) = crate::coordinator::pool_dispatch_policy_for_worker_id(worker_id) {
+            return Ok(Some(policy.driver.to_owned()));
+        }
+        self.work_db.get_execution_driver_slug(&execution.id)
     }
 
     /// Take one `ready` execution all the way to a running worker: guards,

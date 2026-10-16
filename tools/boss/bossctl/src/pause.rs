@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
-use boss_protocol::{FrontendEvent, FrontendRequest};
+use boss_protocol::{FrontendEvent, FrontendRequest, SpawnFailureStreak};
 
 use super::{PauseArg, PauseSystem, connect, resolve_state_root};
 
@@ -424,11 +424,60 @@ pub(super) fn format_state_summary(paused: bool, paused_since_epoch_s: Option<u6
     }
 }
 
-/// Show pause status for every system in the registry in one view.
-/// Backs both `bossctl state` and `bossctl pause state`.
+/// Active pre-start spawn-failure streak alerts, read from the engine
+/// health report — the same report the app's banner renders, so the CLI and
+/// the app can never disagree about whether an alert is up.
+async fn get_spawn_failure_streaks_raw(socket_path: &Option<String>) -> Result<Vec<SpawnFailureStreak>> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::GetEngineHealth)
+        .await
+        .context("sending GetEngineHealth")?;
+    match response {
+        FrontendEvent::EngineHealthResult { report } => Ok(report.spawn_failure_streaks),
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected GetEngineHealth: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+/// Text lines for the spawn-alert section of `bossctl state`. One summary
+/// line, then per alert: the combination with its live count and times, and
+/// the latest error in full (every line of it, indented) — never truncated,
+/// since the error text is the actionable part.
+pub(super) fn format_spawn_failure_streak_lines(streaks: &[SpawnFailureStreak]) -> Vec<String> {
+    if streaks.is_empty() {
+        return vec!["spawn alerts: none".to_string()];
+    }
+    let mut lines = vec![format!("spawn alerts: {} active", streaks.len())];
+    for streak in streaks {
+        lines.push(format!(
+            "            {} {}: {} consecutive pre-start failures, none succeeded",
+            streak.driver, streak.worker_kind, streak.consecutive_failures
+        ));
+        lines.push(format!(
+            "              first failure: epoch {}; latest: epoch {} ({})",
+            streak.first_failure_epoch_s, streak.latest_failure_epoch_s, streak.latest_execution_id
+        ));
+        lines.push("              latest error:".to_string());
+        lines.extend(
+            streak
+                .latest_error
+                .lines()
+                .map(|line| format!("                {line}")),
+        );
+    }
+    lines
+}
+
+/// Show pause status for every system in the registry in one view, plus
+/// any active pre-start spawn-failure streak alert. Backs both `bossctl
+/// state` and `bossctl pause state`.
 pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> Result<()> {
     let dispatch = get_dispatch_state_raw(socket_path).await?;
     let automation = get_automation_state_raw(socket_path).await?;
+    let spawn_failure_streaks = get_spawn_failure_streaks_raw(socket_path).await?;
 
     if json {
         println!(
@@ -445,6 +494,7 @@ pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> R
                     "paused_since_epoch_s": automation.paused_since_epoch_s,
                     "reason": automation.reason,
                 },
+                "spawn_failure_streaks": spawn_failure_streaks,
             })
         );
     } else {
@@ -471,6 +521,9 @@ pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> R
             && let Some(reason) = &automation.reason
         {
             println!("            reason: {reason}");
+        }
+        for line in format_spawn_failure_streak_lines(&spawn_failure_streaks) {
+            println!("{line}");
         }
     }
     Ok(())
