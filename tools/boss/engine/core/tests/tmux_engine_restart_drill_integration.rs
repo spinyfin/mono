@@ -256,6 +256,7 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
                 .task_kind("chore")
                 .driver(Arc::new(ClaudeDriver))
                 .tmux_host(TmuxWorkerHost::new(tmux.clone(), spawn_store, session_name.clone()))
+                .pr_created_proposals_seam_enabled(false)
                 .build(),
             Duration::from_secs(5),
         )
