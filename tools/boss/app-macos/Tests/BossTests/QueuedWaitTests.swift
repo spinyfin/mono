@@ -9,8 +9,8 @@ final class QueuedWaitTests: XCTestCase {
             "waiting_dependency": "Queued — waiting for a dependency",
             "dispatch_paused": "Queued — dispatch paused",
             "automation_paused": "Queued — automation paused",
-            "Held by the interactive concurrency cap (3/3 workers live) — dispatches as workers finish":
-                "Queued — Held by the interactive concurrency cap (3/3 workers live) — dispatches as workers finish",
+            "Waiting for an available worker (3 working)":
+                "Queued — Waiting for an available worker (3 working)",
             "pool_exhausted": "Queued — worker pool full",
             "blocked by an earlier review": "Queued — blocked by an earlier review"
         ]

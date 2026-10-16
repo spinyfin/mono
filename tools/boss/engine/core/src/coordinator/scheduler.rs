@@ -1228,10 +1228,7 @@ impl ExecutionCoordinator {
                         .await;
                     changed_waits.extend(self.record_dispatch_wait_reason(
                         &execution,
-                        &format!(
-                            "Held by the interactive concurrency cap ({live_workers}/{cap} \
-                             workers live) — dispatches as workers finish"
-                        ),
+                        &format!("Waiting for an available worker ({live_workers} working)"),
                         None,
                     ));
                     continue;

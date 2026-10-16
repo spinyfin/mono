@@ -669,8 +669,8 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
     assert_eq!(held.status, ExecutionStatus::Ready);
     let reason = held.dispatch_wait_reason.unwrap_or_default();
     assert!(
-        reason.contains("interactive concurrency cap"),
-        "wait reason should name the cap, got: {reason}",
+        reason.contains("Waiting for an available worker"),
+        "wait reason should say it is waiting for a worker, got: {reason}",
     );
 
     // `bossctl dispatch stats` derives the held-row view entirely from

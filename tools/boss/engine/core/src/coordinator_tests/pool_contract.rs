@@ -70,7 +70,7 @@ async fn interactive_cap_only_holds_new_main_pool_admission() {
     assert!(
         held.dispatch_wait_reason
             .unwrap()
-            .contains("interactive concurrency cap")
+            .contains("Waiting for an available worker")
     );
     // Lowering the cap changes admission, never the pool or existing claims.
     coordinator.set_max_concurrent_interactive_workers(4).unwrap();
