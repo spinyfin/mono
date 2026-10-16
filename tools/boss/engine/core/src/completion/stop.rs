@@ -1522,14 +1522,15 @@ must not be asked to open one",
                 }
                 // Sanctioned no-op terminal: a primary-implementation
                 // worker (chore / task) that investigated and found the work
-                // ALREADY DONE — the change is already on `main`, `jj diff -r @`
-                // is empty, nothing to commit/push. We are at a real Stop
-                // boundary (`waiting_human`), there is no PR on this branch
-                // (PrStatus::None) and none bound to the chore (the
-                // resolve_bound_pr_url branch above returned), so the structural
-                // state confirms an empty contribution. If the worker declared
-                // `propose done --outcome no-changes-needed`, this is a SUCCESS, not a
-                // failure to be nudged: close the task as done without a PR.
+                // ALREADY DONE. The declaration is a self-report: alongside the real
+                // Stop boundary (`waiting_human`), no PR on this branch
+                // (PrStatus::None), and none bound to the chore (the
+                // resolve_bound_pr_url branch above returned), we require positive
+                // `workspace_diff_verifier` evidence that `jj diff --from
+                // main@origin --to @ --summary` is empty. Negative or unavailable
+                // evidence refuses the claim. If all checks pass, the sanctioned
+                // no-changes-needed declaration is a SUCCESS, not a failure to be
+                // nudged: close the task as done without a PR.
                 //
                 // Requiring the explicit declaration is what distinguishes "verified
                 // already done" from "gave up without trying": a worker that
@@ -1558,16 +1559,8 @@ must not be asked to open one",
                     // that follows gets a fair no-changes-needed evaluation.
                     if self.refuse_no_op_declaration(&execution) {
                         return self.nudge_refused_no_op(&execution).await;
-                    } else {
-                        tracing::info!(
-                            execution_id,
-                            expected_branch = %expected_branch,
-                            kind = %execution.kind,
-                            "stop event: worker declared no-changes-needed with no PR produced — \
-                             work already done; closing task as a no-op (no PR, no nudge)"
-                        );
-                        return self.finalize_no_op_completion(&execution, None, None).await;
                     }
+                    return self.finalize_no_op_completion(&execution, None, None).await;
                 }
                 tracing::info!(
                     execution_id,

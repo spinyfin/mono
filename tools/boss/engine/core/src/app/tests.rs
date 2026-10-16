@@ -134,9 +134,11 @@ pub(super) fn test_server_state_with_source_collector(
 /// delivery path through the real RPC handler gets a deterministic
 /// branch-keyed detection result instead of the sandbox's denied `gh`
 /// process-exec (which the engine correctly reads as "GitHub unreachable",
-/// not as "no PR").
+/// not as "no PR"). `workspace_diff_verifier` likewise replaces the
+/// jj-subprocess workspace check when a test supplies explicit evidence.
 pub(super) fn test_server_state_with_fakes_and_pr_detector(
     pr_detector: Arc<dyn crate::completion::PrDetector>,
+    workspace_diff_verifier: Option<Arc<dyn crate::completion::WorkspaceDiffVerifier>>,
 ) -> (Arc<ServerState>, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
@@ -154,6 +156,7 @@ pub(super) fn test_server_state_with_fakes_and_pr_detector(
             cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
             execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
             pr_detector: Some(pr_detector),
+            workspace_diff_verifier,
             ..Default::default()
         },
     )
