@@ -34,10 +34,11 @@
 //! off the Stop boundary and onto the submission path only fixes that if the
 //! submission path cannot block on GitHub for long.
 //!
-//! **Nothing binds a PR to a work item unless that PR's head branch is the
-//! execution's own branch.** A `delivered` declaration binds only a PR whose
-//! head is the execution's branch. The post-hoc audit cannot be relied on to
-//! catch a wrong URL: it returns early without a `pr_head_before` snapshot,
+//! A primary implementation's `delivered` declaration binds only a PR whose
+//! head identifies a primary execution of the same work item. Prefer the
+//! current execution's branch over predecessors when both are staged.
+//! The post-hoc audit cannot be relied on to catch a wrong URL: it returns
+//! early without a `pr_head_before` snapshot,
 //! which only a small fraction of primary implementations have. Binding
 //! whatever publish-armed URL the hook stream staged would bind a follow-up's
 //! *origin* PR (already merged), echoed by its publish command ahead of the

@@ -105,8 +105,8 @@ impl WorkerCompletionHandler {
     }
 
     /// Layer-2 defence-in-depth for the staged-PR-URL primary path:
-    /// return the one staged candidate for `execution_id` whose PR actually
-    /// belongs to this execution's branch.
+    /// choose a staged PR belonging to a primary execution of this work item,
+    /// preferring the current execution's branch over a predecessor's branch.
     ///
     /// Shared by `on_stop_inner`'s primary path, `recheck_for_pr`'s mirror
     /// of it, the capture-time verification the hook dispatcher spawns, and
@@ -200,6 +200,9 @@ impl WorkerCompletionHandler {
                 return None;
             }
         };
+        let mut own_candidate = None;
+        let mut predecessor_candidate = None;
+        let mut rejected_candidates = Vec::new();
         for staged_url in entry.candidates() {
             let Some(pr_num) = pr_number_from_url(&staged_url) else {
                 tracing::warn!(
@@ -207,22 +210,16 @@ impl WorkerCompletionHandler {
                     staged_pr_url = %staged_url,
                     "{log_ctx}: cannot parse PR number from staged URL; dropping that candidate for safety",
                 );
-                self.staged_pr_urls.evict_candidate(execution_id, &staged_url);
+                rejected_candidates.push(staged_url);
                 continue;
             };
             match self.branch_verifier.fetch_pr_head_ref(&slug, pr_num).await {
                 Ok(ref head_ref) if head_identifies_any_branch(head_ref, &work_item_branches) => {
-                    if head_ref.as_str() != expected_branch.as_str() {
-                        tracing::info!(
-                            execution_id,
-                            staged_pr_url = %staged_url,
-                            staged_pr_branch = %head_ref,
-                            %expected_branch,
-                            "{log_ctx}: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
-                        );
+                    if super::branches_identify_same_work_item(head_ref, &expected_branch) {
+                        own_candidate.get_or_insert(staged_url);
+                    } else {
+                        predecessor_candidate.get_or_insert(staged_url);
                     }
-                    self.staged_pr_urls.mark_branch_verified(execution_id, &staged_url);
-                    return Some(staged_url);
                 }
                 Ok(head_ref) => {
                     tracing::warn!(
@@ -230,10 +227,10 @@ impl WorkerCompletionHandler {
                         staged_pr_url = %staged_url,
                         staged_pr_branch = %head_ref,
                         %expected_branch,
-                        "pr_recheck_staged_branch_mismatch: staged PR's head branch is not this execution's branch; dropping that candidate",
+                        "pr_recheck_staged_branch_mismatch: staged PR's head branch is not a primary execution branch of this work item; dropping that candidate",
                     );
                     PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
-                    self.staged_pr_urls.evict_candidate(execution_id, &staged_url);
+                    rejected_candidates.push(staged_url);
                 }
                 Err(err) => {
                     // Transient API failure: cannot verify this candidate on
@@ -241,7 +238,7 @@ impl WorkerCompletionHandler {
                     // candidate is still staged and verification is retried —
                     // dropping here would strand the worker if the cold path
                     // also fails. A definitive branch-name mismatch (the
-                    // Ok(head_ref) arm above) still evicts immediately.
+                    // Ok(head_ref) arm above) evicts after selection.
                     tracing::warn!(
                         execution_id,
                         staged_pr_url = %staged_url,
@@ -252,7 +249,14 @@ impl WorkerCompletionHandler {
                 }
             }
         }
-        None
+        let selected = own_candidate.or(predecessor_candidate);
+        for rejected in rejected_candidates {
+            self.staged_pr_urls.evict_candidate(execution_id, &rejected);
+        }
+        if let Some(ref url) = selected {
+            self.staged_pr_urls.mark_branch_verified(execution_id, url);
+        }
+        selected
     }
 
     /// Capture-time branch verification, spawned by the `PostToolUse` hook

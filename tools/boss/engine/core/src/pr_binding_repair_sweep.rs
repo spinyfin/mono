@@ -32,21 +32,21 @@
 //! Those are structural signals, not text heuristics — nothing here reads a
 //! description or PR body.
 //!
-//! Each candidate is then confirmed against GitHub, and the execution's own
-//! branch ([`crate::completion::expected_branch_name`]) is the only selector:
+//! Each candidate is confirmed against GitHub using the work item's primary
+//! execution branches as the ownership selector:
 //!
 //! 1. Fetch the bound PR's `headRefName`. If it identifies ANY primary
 //!    implementation execution of the row's work item (a resumed execution
-//!    pushes to its predecessor's branch) the binding is right; only a foreign doc pointer (if any) is
-//!    refreshed from that PR.
-//! 2. Otherwise run the branch-keyed detector on the execution's branch. A PR
+//!    pushes to its predecessor's branch) the binding is right; only a foreign
+//!    doc pointer (if any) is refreshed from that PR.
+//! 2. Otherwise run the detector on every primary execution branch. A PR
 //!    there (open or merged) replaces the wrong binding on the task and the
 //!    execution, the doc pointer is re-derived from it, the row moves to
 //!    `in_review`, and — for an open PR — a review is requested, exactly as
 //!    `bossctl review start` would.
-//! 3. No PR on the branch: the wrong binding is cleared and the row is
-//!    parked `blocked:pr_binding_unresolved` with a detail naming the branch
-//!    and the rejected PR. It never keeps pointing at a PR it did not open.
+//! 3. No PR on any primary execution branch: the wrong binding is cleared and
+//!    the row is parked `blocked:pr_binding_unresolved` with a detail naming
+//!    the searched branches and rejected PR. It never keeps a foreign binding.
 //!
 //! A PR already bound to a different work item is never adopted (step 2
 //! checks [`WorkDb::other_work_item_bound_to_pr`]); that case parks the row
@@ -365,17 +365,16 @@ async fn repair_candidate(
         PrStatus::Merged { url } => (url, true),
         PrStatus::None | PrStatus::Closed { .. } => {
             let what = match status {
-                PrStatus::Closed { url } => format!("the PR on that branch, {url}, is closed without merging"),
-                _ => "no PR has that branch as its head".to_owned(),
+                PrStatus::Closed { url } => format!("the detected PR, {url}, is closed without merging"),
+                _ => "no PR has any searched branch as its head".to_owned(),
             };
             let detail = format!(
-                "This row was bound to {bound}, a PR its own execution (`{exec}`) did not open — its head is not \
-                 `{expected_branch}`. No PR could be bound from that branch either: {what}. The engine cleared the \
-                 wrong binding rather than leave the row pointing at a PR it did not open. If the worker's branch \
-                 was pushed, open a PR from `{expected_branch}` and re-bind with `boss task update --pr-url`; \
-                 otherwise re-run the task.",
+                "This row was bound to {bound}, a PR whose head does not identify a primary execution of this \
+                 work item. Searched branches: {searched}. No PR could be bound from those branches: {what}. \
+                 The engine cleared the wrong binding. If the worker's branch was pushed, open a PR from \
+                 `{expected_branch}` and re-bind with `boss task update --pr-url`; otherwise re-run the task.",
                 bound = candidate.bound_pr_url,
-                exec = candidate.execution_id,
+                searched = branches.join(", "),
             );
             return park_unresolved(work_db, candidate, &detail, outcome);
         }
@@ -995,6 +994,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(archive, (None, None, None));
+    }
+
+    #[tokio::test]
+    async fn engine_closed_rows_without_an_own_pr_are_parked_and_clear_provenance() {
+        for status in ["done", "archived"] {
+            let (_dir, db) = open_db();
+            let (_, task_id, _) = mis_bound_followup(&db, ORIGIN);
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET status = ?2, last_status_actor = 'engine', completed_at = 'now',
+                 archived_by = 'engine_status_change', archived_at = 'then', archived_reason = 'merged'
+                 WHERE id = ?1",
+                    rusqlite::params![task_id, status],
+                )
+                .unwrap();
+            let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_18dad2723a80ed10_23".to_owned())]));
+            let outcome = run_one_pass(
+                &db,
+                &FixedDetector(PrStatus::None, StdMutex::default()),
+                &verifier,
+                &FakePrStateChecker::always(PrOpenState::Open),
+                &RecordingDocRefresher::default(),
+                &mut HashMap::new(),
+            )
+            .await;
+            let row = task(&db, &task_id);
+            assert_eq!(row.status, TaskStatus::Blocked, "{status}: {outcome:?}");
+            assert_eq!(row.pr_url, None);
+            assert_eq!(row.completed_at, None);
+            let archive: (Option<String>, Option<String>, Option<String>) = db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT archived_by, archived_at, archived_reason FROM tasks WHERE id = ?1",
+                    [&task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(archive, (None, None, None));
+        }
     }
 
     #[tokio::test]

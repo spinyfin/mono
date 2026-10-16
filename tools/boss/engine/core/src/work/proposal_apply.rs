@@ -911,11 +911,11 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
         }
     }
 
-    // Foreign-PR guard (shares `WorkDb::other_work_item_bound_to_pr`'s query,
-    // on this transaction): a PR another work item holds — typically a
-    // follow-up's merged origin PR — is never this execution's deliverable.
-    let holder = super::pr_binding::query_other_work_item_bound_to_pr(tx, &payload.pr_url, &task.id)?;
-    if let Some(holder) = holder {
+    // Primary implementations cannot deliver another work item's PR. Revisions
+    // deliver their chain root's PR, which the root legitimately holds.
+    if execution.kind != ExecutionKind::RevisionImplementation
+        && let Some(holder) = super::pr_binding::query_other_work_item_bound_to_pr(tx, &payload.pr_url, &task.id)?
+    {
         return Ok(ApplyDecision::Rejected(format!(
             "{} is already bound to work item `{holder}`; a PR that belongs to another work item is never \
              this execution's deliverable",
@@ -1222,6 +1222,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(own.proposal.state, ProposalState::Applied);
+    }
+
+    #[test]
+    fn revision_pr_created_accepts_its_chain_roots_pr() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let root = crate::test_support::create_test_chore(&db, product.id, "Root");
+        let url = "https://github.com/spinyfin/mono/pull/77";
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = ?2, status = 'in_review' WHERE id = ?1",
+                params![root.id, url],
+            )
+            .unwrap();
+        let revision = db
+            .create_revision(
+                boss_protocol::CreateRevisionInput::builder()
+                    .parent_task_id(root.id)
+                    .description("Address review findings")
+                    .build(),
+                &crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open),
+            )
+            .unwrap();
+        let execution = db.list_executions(Some(&revision.id)).unwrap().pop().unwrap();
+        let outcome = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &revision.id,
+                kind: ProposalKind::PrCreated,
+                payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/77"}"#,
+                idempotency_key: "revision-pr",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        let after = query_task(&db.connect().unwrap(), &revision.id).unwrap().unwrap();
+        assert_eq!(after.pr_url.as_deref(), Some(url));
     }
 
     /// Binding a PR via `pr_created` must stamp `updated_at`, mirroring
