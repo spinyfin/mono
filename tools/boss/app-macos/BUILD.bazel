@@ -382,12 +382,11 @@ filegroup(
     visibility = ["//tools/boss/engine/core:__pkg__"],
 )
 
-# The Swift roster, the portrait grid table and the bundled sheet, scanned by
+# The portrait grid table and the bundled sheet, scanned by
 # `//tools/boss/protocol:worker_roster_parity_test` against the Rust roster.
 filegroup(
     name = "crew_roster_sources",
     srcs = [
-        "Sources/Ghostty/WorkerNames.swift",
         "Sources/TrekPortraitGrid.swift",
         "//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons",
     ],
