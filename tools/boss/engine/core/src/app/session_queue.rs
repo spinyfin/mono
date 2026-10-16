@@ -384,6 +384,10 @@ pub(super) struct SessionSink {
     #[builder(default)]
     pop_traces: StdMutex<HashMap<String, crate::population_timing::PopulationTrace>>,
     #[builder(default)]
+    pub(super) board_reads: StdMutex<super::read_freshness::ReadFreshness<boss_protocol::WorkTree>>,
+    #[builder(default)]
+    pub(super) view_reads: StdMutex<super::read_freshness::ReadFreshness<FrontendEventEnvelope>>,
+    #[builder(default)]
     pub(super) work_tree_cache: StdMutex<boss_protocol::work_tree_delta::WorkTreeCache>,
     /// One-shot acknowledgements for responses whose producer must know that
     /// the writer has flushed the frame before it can safely tear down the
@@ -415,7 +419,19 @@ impl SessionSink {
             .remove(request_id)
     }
 
-    pub(super) fn enqueue(&self, env: FrontendEventEnvelope) -> EnqueueOutcome {
+    pub(super) fn enqueue(&self, mut env: FrontendEventEnvelope) -> EnqueueOutcome {
+        let mut reads = self.view_reads.lock().expect("view reads poisoned");
+        if let Some(id) = env.request_id.clone() {
+            if matches!(
+                env.payload,
+                FrontendEvent::Error { .. } | FrontendEvent::WorkError { .. }
+            ) {
+                reads.cancel(&id);
+            } else {
+                env = reads.finish(&id, env);
+            }
+            env.request_id = Some(id);
+        }
         let outcome = self.queue.lock().expect("session queue lock poisoned").enqueue(env);
         match outcome {
             EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Degraded => {

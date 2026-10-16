@@ -47,3 +47,106 @@ fn admitted_queries_do_not_wait_for_the_engine_connection_mutex() {
     reader.set_metadata("refresh", "value").unwrap();
     drop(held);
 }
+
+/// File-backed WAL connections reproduce production: every board must finish
+/// while a writer owns the reservation, including the writable query opener.
+#[test]
+fn concurrent_boards_and_review_accounting_do_not_take_the_writer_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("state.db")).unwrap();
+    let products: Vec<_> = (0..16)
+        .map(|i| {
+            let product = crate::test_support::create_test_product_named(&db, &format!("product-{i}"));
+            for j in 0..8 {
+                crate::test_support::create_test_chore(&db, &product.id, format!("fixture-{i}-{j}"));
+            }
+            product
+        })
+        .collect();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET name = 'before'", [])
+        .unwrap();
+    let writer = db.connect_new().unwrap();
+    writer
+        .execute_batch("BEGIN IMMEDIATE; UPDATE tasks SET name = 'uncommitted'")
+        .unwrap();
+    std::thread::scope(|scope| {
+        for product in &products {
+            let db = &db;
+            scope.spawn(move || {
+                for reader in [db.reader().unwrap(), db.query_connection().unwrap()] {
+                    let tree = reader.get_work_tree(&product.id).unwrap();
+                    assert_eq!(tree.chores.len(), 8);
+                    assert!(tree.chores.iter().all(|task| task.name == "before"));
+                    assert!(
+                        reader
+                            .can_admit_review_batch(boss_protocol::ReviewBatchPhase::PreMerge)
+                            .unwrap()
+                    );
+                    assert_eq!(reader.review_pool_reserved_units().unwrap(), (0, 0));
+                }
+            });
+        }
+    });
+    writer.execute_batch("COMMIT").unwrap();
+    assert!(
+        db.reader()
+            .unwrap()
+            .get_work_tree(&products[0].id)
+            .unwrap()
+            .chores
+            .iter()
+            .all(|task| task.name == "uncommitted")
+    );
+}
+
+#[test]
+fn board_projections_share_one_snapshot_while_a_writer_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("state.db")).unwrap();
+    let product = crate::test_support::create_test_product_named(&db, "before");
+    for i in 0..64 {
+        crate::test_support::create_test_chore(&db, &product.id, format!("fixture-{i}"));
+    }
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET name = 'before'", [])
+        .unwrap();
+    let reader = db.reader().unwrap();
+    let writer = db.connect_new().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut first = true;
+    // Preparing the projects projection follows the completed product read,
+    // so the snapshot is established before the writer is released.
+    reader
+        .connect()
+        .unwrap()
+        .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            if first
+                && matches!(
+                    ctx.action,
+                    rusqlite::hooks::AuthAction::Read {
+                        table_name: "projects",
+                        ..
+                    }
+                )
+            {
+                first = false;
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
+    let handle = std::thread::spawn(move || reader.get_work_tree(&product.id).unwrap());
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    writer
+        .execute_batch("BEGIN IMMEDIATE; UPDATE products SET name = 'after'; UPDATE tasks SET name = 'after'; COMMIT")
+        .unwrap();
+    release_tx.send(()).unwrap();
+    let tree = handle.join().unwrap();
+    assert_eq!(tree.product.name, "before");
+    assert_eq!(tree.chores.len(), 64);
+    assert!(tree.chores.iter().all(|task| task.name == "before"));
+}
