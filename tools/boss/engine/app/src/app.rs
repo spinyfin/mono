@@ -2883,9 +2883,18 @@ async fn handle_frontend_connection(
                 )
                 .await;
             let waiting = if read_coalesce::coalescable(&request) {
-                match read_coalescer.join(&request, &request_id, waiting, &server_state.read_coalescing) {
+                let register = || {
+                    // The follower's answer is delivered under the same
+                    // per-view ordering as a read of its own, from this
+                    // arrival onward.
+                    sink.view_reads
+                        .lock()
+                        .expect("view reads poisoned")
+                        .begin(&request_id, read_admission::key(&request));
+                };
+                match read_coalescer.join(&request, &request_id, waiting, &server_state.read_coalescing, register) {
                     // Answered from the identical read already in flight,
-                    // once it runs; it has not started, so its snapshot is
+                    // once it runs; its snapshot is not taken yet, so it is
                     // no older than this request.
                     read_coalesce::Role::Follow => continue,
                     read_coalesce::Role::Lead { batch, waiting } => {
@@ -2917,6 +2926,12 @@ async fn handle_frontend_connection(
             Arc::from(verb.as_str()),
             dispatch::dispatch_request(ctx, request, bulk_read),
         );
+        // A coalescing leader reports to its batch whether it is blocked on a
+        // SQLite lock, which is what keeps the batch open to followers.
+        let dispatch_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match &read_batch {
+            Some(batch) => Box::pin(boss_work_db::contention::READ_WAIT.scope(batch.wait(), dispatch_fut)),
+            None => Box::pin(dispatch_fut),
+        };
         if let Some(waiting) = waiting_read {
             let sink = sink.clone();
             let session_id = session_id.clone();

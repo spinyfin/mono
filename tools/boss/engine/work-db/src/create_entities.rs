@@ -103,7 +103,11 @@ impl WorkDb {
 
     /// The writer handle startup uses, with no schema work done through it.
     fn open_writer(path: PathBuf) -> Result<Self> {
-        let conn = Self::open_raw_connection(&path, None)?;
+        let contention_health = Arc::<contention::Health>::default();
+        let conn = {
+            let _holder = contention::HolderScope::enter(contention::Holder::here(&contention_health));
+            Self::open_raw_connection(&path, None)?
+        };
         Ok(Self {
             ingress_writer: Default::default(),
             path,
@@ -115,7 +119,7 @@ impl WorkDb {
             persona_metrics: personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),
-            contention_health: Arc::default(),
+            contention_health,
         })
     }
 
@@ -134,7 +138,11 @@ impl WorkDb {
         let id = NEXT_MEM_DB_ID.fetch_add(1, Ordering::Relaxed);
         let uri = format!("file:boss_mem_{id}?mode=memory&cache=shared");
         let anchor = InMemoryAnchor { uri };
-        let conn = Self::open_raw_connection(&PathBuf::from(":memory:"), Some(&anchor))?;
+        let contention_health = Arc::<contention::Health>::default();
+        let conn = {
+            let _holder = contention::HolderScope::enter(contention::Holder::here(&contention_health));
+            Self::open_raw_connection(&PathBuf::from(":memory:"), Some(&anchor))?
+        };
         Ok(Self {
             ingress_writer: Default::default(),
             path: PathBuf::from(":memory:"),
@@ -146,7 +154,7 @@ impl WorkDb {
             persona_metrics: personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),
-            contention_health: Arc::default(),
+            contention_health,
         })
     }
 

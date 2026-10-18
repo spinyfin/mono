@@ -216,3 +216,185 @@ fn a_wait_past_the_threshold_is_reported_to_engine_health_until_it_clears() {
     assert!(after.longest_ms >= HEALTH_THRESHOLD.as_millis() as u64);
     assert_eq!(db.get_metadata("contended").unwrap().as_deref(), Some("value"));
 }
+
+/// Production connections are files without shared cache and every write
+/// transaction begins `IMMEDIATE`, so the two codes SQLite never hands to a
+/// busy handler — `SQLITE_LOCKED` and `SQLITE_BUSY_SNAPSHOT` — cannot occur
+/// there. A conflict surfaces as plain `SQLITE_BUSY` at `BEGIN`, which the
+/// handler absorbs.
+#[test]
+fn production_connections_conflict_as_plain_busy_at_begin() {
+    let (_dir, db) = open_db();
+    let holder = hold_write_lock(&db, Duration::from_millis(500));
+
+    let raw = db.connect_new().unwrap();
+    raw.busy_timeout(Duration::ZERO).unwrap();
+    let err = raw.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+    let contention = classify_sqlite(&err).expect("a write conflict is contention");
+    assert_eq!(contention.extended_code, ffi::SQLITE_BUSY, "{err}");
+
+    // The default transaction of an engine connection takes the lock at
+    // BEGIN, before reading anything it could later fail to upgrade.
+    let per_query = db.query_connection().unwrap();
+    let mut conn = per_query.connect().unwrap();
+    conn.busy_timeout(Duration::ZERO).unwrap();
+    let err = conn.transaction().expect_err("the lock is held");
+    let contention = classify_sqlite(&err).expect("a write conflict is contention");
+    assert_eq!(contention.extended_code, ffi::SQLITE_BUSY, "{err}");
+    drop(conn);
+    holder.join().unwrap();
+}
+
+/// Connections the engine hands out share the database's contention
+/// registry, so a stuck wait on any of them reaches the health report.
+#[test]
+fn every_handle_on_a_database_reports_to_its_health_registry() {
+    let (_dir, db) = open_db();
+    let registry = db.contention_health();
+    assert!(Arc::ptr_eq(registry, db.reader().unwrap().contention_health()));
+    assert!(Arc::ptr_eq(
+        registry,
+        db.query_connection().unwrap().contention_health()
+    ));
+    assert!(Arc::ptr_eq(registry, db.clone().contention_health()));
+}
+
+/// A wait on an independent connection is attributed to the code that opened
+/// it and to the request being served, and counted against the database.
+#[test]
+fn a_wait_on_an_independent_connection_is_attributed_and_counted() {
+    let buffer = log_capture::install();
+    let (_dir, db) = open_db();
+    let waits = db.contention_health().snapshot().waits;
+    let from = buffer.lock().len();
+    let holder = hold_write_lock(&db, Duration::from_millis(250));
+    db.with_independent_connection(|conn| {
+        conn.execute_batch("BEGIN IMMEDIATE; COMMIT")?;
+        Ok(())
+    })
+    .unwrap();
+    holder.join().unwrap();
+
+    let lines = wait_lines(&buffer, from, "SQLite lock wait cleared");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("contention_tests.rs"), "{}", lines[0]);
+    assert!(lines[0].contains("request=internal"), "{}", lines[0]);
+    assert_eq!(db.contention_health().snapshot().waits, waits + 1);
+}
+
+/// The reported wait ends when the lock is taken, not when the connection
+/// guard is released: work done under the lock afterwards is not contention.
+#[test]
+fn reported_wait_excludes_work_done_after_the_lock_was_taken() {
+    let buffer = log_capture::install();
+    let (_dir, db) = open_db();
+    let from = buffer.lock().len();
+    let holder = hold_write_lock(&db, Duration::from_millis(200));
+    {
+        let mut conn = db.connect().unwrap();
+        let tx = conn.transaction().unwrap();
+        thread::sleep(Duration::from_millis(900));
+        tx.commit().unwrap();
+    }
+    holder.join().unwrap();
+    let lines = wait_lines(&buffer, from, "SQLite lock wait cleared");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let waited_ms: u64 = lines[0]
+        .split("waited_ms=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no waited_ms in {}", lines[0]));
+    assert!(
+        (100..700).contains(&waited_ms),
+        "waited_ms={waited_ms} should cover the ~200 ms lock wait, not the 900 ms held after it"
+    );
+}
+
+/// The CLI constructors give up after a bounded wait instead of hanging on
+/// a stuck lock; the engine's own constructors keep waiting until it clears.
+#[test]
+fn bounded_connections_fail_where_absorbing_ones_wait() {
+    let (dir, db) = open_db();
+    let path = dir.path().join("state.db");
+    let holder = hold_write_lock(&db, Duration::from_millis(1200));
+
+    let bounded = WorkDb::attach_existing(
+        path.clone(),
+        Arc::default(),
+        LockWait::Bounded(Duration::from_millis(150)),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let err = bounded
+        .connect()
+        .unwrap()
+        .transaction()
+        .expect_err("a bounded wait gives up while the lock is held");
+    assert!(classify_sqlite(&err).is_some(), "{err}");
+    assert!(started.elapsed() < Duration::from_millis(1000));
+
+    let absorbing = WorkDb::attach_existing(path, Arc::default(), LockWait::Absorb).unwrap();
+    absorbing.connect().unwrap().transaction().unwrap().commit().unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "the absorbing wait did not wait"
+    );
+    holder.join().unwrap();
+}
+
+/// A thread that holds the write lock through one engine connection and asks
+/// for it through another is waiting for itself. The wait fails loudly once
+/// past the health threshold instead of hanging the thread forever.
+#[test]
+fn a_thread_waiting_for_its_own_write_lock_fails_loudly() {
+    let buffer = log_capture::install();
+    let (_dir, db) = open_db();
+    let from = buffer.lock().len();
+    let mut outer = db.connect().unwrap();
+    let _outer_tx = outer.transaction().unwrap();
+
+    let other = db.query_connection().unwrap();
+    let started = Instant::now();
+    let err = other
+        .connect()
+        .unwrap()
+        .transaction()
+        .expect_err("a self-deadlock must fail, not hang");
+    assert!(classify_sqlite(&err).is_some(), "{err}");
+    assert!(started.elapsed() >= HEALTH_THRESHOLD);
+    let errors = wait_lines(&buffer, from, "probably waiting for itself");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+/// A stuck wait leaves the health report once it stops retrying, even if the
+/// waiting thread keeps its connection guard long afterwards.
+#[test]
+fn a_stuck_wait_clears_when_it_stops_retrying_not_when_the_guard_drops() {
+    let (_dir, db) = open_db();
+    let holder = hold_write_lock(&db, HEALTH_THRESHOLD + Duration::from_millis(500));
+    let writer = thread::spawn({
+        let db = db.clone();
+        move || {
+            let mut conn = db.connect().unwrap();
+            let tx = conn.transaction().unwrap();
+            thread::sleep(STALE_AFTER + Duration::from_secs(2));
+            tx.commit().unwrap();
+        }
+    });
+    let deadline = Instant::now() + HEALTH_THRESHOLD + Duration::from_millis(500);
+    while db.contention_health().snapshot().stuck.is_empty() {
+        assert!(Instant::now() < deadline, "stuck wait never reported");
+        thread::sleep(Duration::from_millis(50));
+    }
+    holder.join().unwrap();
+    // The lock was taken just after the holder committed; the writer is still
+    // inside its transaction but no longer waiting.
+    thread::sleep(STALE_AFTER + Duration::from_millis(300));
+    assert!(
+        db.contention_health().snapshot().stuck.is_empty(),
+        "{:?}",
+        db.contention_health().snapshot().stuck
+    );
+    writer.join().unwrap();
+}
