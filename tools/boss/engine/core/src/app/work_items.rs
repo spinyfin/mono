@@ -1309,12 +1309,15 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         crate::population_timing::PopulationTrace::new(product_id.clone(), request_id.clone(), fetch_seq, recv_instant);
     trace.record_plain(crate::population_timing::segment::DECODE, decode_ms);
 
-    // Read admission can run requests from this connection concurrently.
-    // Serialize snapshot acquisition as well as diff/enqueue, so an older
-    // database snapshot cannot overtake a newer one in the patch sequence.
-    let mut cache = sink.work_tree_cache.lock().expect("work tree cache poisoned");
+    sink.board_reads
+        .lock()
+        .expect("board reads poisoned")
+        .begin(&request_id, product_id.clone());
     match work_db.get_work_tree_instrumented(&product_id, &mut trace) {
         Ok(tree) => {
+            let mut reads = sink.board_reads.lock().expect("board reads poisoned");
+            let tree = reads.finish(&request_id, tree);
+            let mut cache = sink.work_tree_cache.lock().expect("work tree cache poisoned");
             if delta {
                 match cache.update(&tree) {
                     Ok(update) => {
@@ -1355,6 +1358,10 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
             );
         }
         Err(err) => {
+            sink.board_reads
+                .lock()
+                .expect("board reads poisoned")
+                .cancel(&request_id);
             // Error path: drop the trace (no serialize/write to attribute).
             // A decode failure here (e.g. an out-of-enum `status` column)
             // blanks this product's entire board and kills its dispatch

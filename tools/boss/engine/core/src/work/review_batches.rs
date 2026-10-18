@@ -1177,7 +1177,7 @@ impl WorkDb {
     /// cannot oversubscribe the physical pool.
     pub fn can_admit_review_batch_for_pool(&self, phase: ReviewBatchPhase, review_pool_size: usize) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         can_admit_review_batch_in_tx(&tx, phase, reservation_capacity(review_pool_size))
     }
 
@@ -1186,7 +1186,7 @@ impl WorkDb {
     /// `review_pool.reserved_units` gauge.
     pub fn review_pool_reserved_units(&self) -> Result<(i64, i64)> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let pre = reserved_batch_count_in_tx(&tx, ReviewBatchPhase::PreMerge)? * PRE_MERGE_BATCH_RESERVATION_UNITS;
         let post = reserved_batch_count_in_tx(&tx, ReviewBatchPhase::PostMerge)? * POST_MERGE_BATCH_RESERVATION_UNITS;
         Ok((pre, post))

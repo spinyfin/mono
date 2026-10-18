@@ -142,9 +142,22 @@ async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency()
                 call(state.clone(), FrontendRequest::ListTmuxWorkerStatuses, None).await,
                 FrontendEvent::TmuxWorkerStatusesList { .. }
             ));
+            assert!(matches!(
+                call(
+                    state.clone(),
+                    FrontendRequest::GetWorkTree {
+                        product_id: chore.product_id.clone(),
+                        fetch_seq: None,
+                        delta: true,
+                    },
+                    None
+                )
+                .await,
+                FrontendEvent::WorkTreeUpdate { .. }
+            ));
         })
         .await
-        .expect("agents list exceeded two seconds");
+        .expect("app status and board reads exceeded two seconds");
         eprintln!(
             "{count}-way burst: worker write {write_ms}ms, agents list {}ms (bound 2000ms)",
             start.elapsed().as_millis()
@@ -426,10 +439,9 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
         .unwrap();
 }
 
-/// End to end: identical pipelined reads on one socket are answered in the
-/// order they were received.
+/// Concurrent identical reads retain exactly-once request correlation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn identical_reads_on_one_socket_reply_in_receive_order() {
+async fn identical_reads_on_one_socket_reply_to_every_request() {
     let (state, _dir) = crate::app::tests::test_server_state();
     let (client, server) = UnixStream::pair().unwrap();
     let handler = tokio::spawn(handle_frontend_connection(server, state, None));
@@ -454,6 +466,7 @@ async fn identical_reads_on_one_socket_reply_in_receive_order() {
             seen.push(id);
         }
     }
+    seen.sort();
     assert_eq!(seen, ids);
     drop(lines);
     drop(write);

@@ -2298,6 +2298,7 @@ impl crate::external_tracker::reconcile::WorkInvalidationPublisher for ServerSta
 
 mod dispatch;
 mod read_admission;
+mod read_freshness;
 mod session_queue;
 mod session_write;
 use session_queue::*;
@@ -2331,7 +2332,6 @@ async fn handle_frontend_connection(
         );
     }
     let peer_is_worker = peer_class.is_worker();
-    let mut read_ordering = read_admission::ReadOrdering::default();
     let connection_reads = server_state.read_admission.connection();
     let connection_live_reads = server_state.live_read_admission.connection();
 
@@ -2518,12 +2518,7 @@ async fn handle_frontend_connection(
                     verb: &verb,
                 }),
             ) {
-                Ok(waiting) => Some(waiting.identify(
-                    &session_id,
-                    &request_id,
-                    verb,
-                    read_admission::ReadOrdering::key_id(&request),
-                )),
+                Ok(waiting) => Some(waiting.identify(&session_id, &request_id, verb, read_admission::key_id(&request))),
                 Err(message) => {
                     tracing::warn!(%session_id, %request_id, ?lane, "read RPC rejected: queue full");
                     send_response(
@@ -2549,20 +2544,12 @@ async fn handle_frontend_connection(
             .recv_instant(recv_instant)
             .decode_ms(decode_ms)
             .build();
-        let turn = if waiting_read.is_some() {
-            Some(read_ordering.reserve(&request).await)
-        } else {
-            None
-        };
         let dispatch_fut = dispatch::dispatch_request(ctx, request, bulk_read);
         if let Some(waiting) = waiting_read {
             let sink = sink.clone();
             let session_id = session_id.clone();
             tokio::spawn(async move {
-                match waiting
-                    .acquire_ordered(turn.expect("admitted read has a FIFO turn"))
-                    .await
-                {
+                match waiting.acquire().await {
                     Ok(permits) => {
                         // Synchronous SQLite work must not occupy the async
                         // runtime threads that serve writes and live status.
@@ -2570,7 +2557,7 @@ async fn handle_frontend_connection(
                         // client disconnects; cancellation cannot inflate capacity.
                         let runtime = tokio::runtime::Handle::current();
                         let result = tokio::task::spawn_blocking(move || {
-                            permits.0.started();
+                            permits.started();
                             let _permits = permits;
                             runtime.block_on(dispatch_fut);
                         })
@@ -2586,16 +2573,8 @@ async fn handle_frontend_connection(
                             );
                         }
                     }
-                    Err(rejection) => {
-                        let message = rejection.message();
-                        match rejection {
-                            read_admission::Rejection::OrderingWait => {
-                                tracing::warn!(%session_id, %request_id, ?lane, wait_ms = recv_instant.elapsed().as_millis() as u64, "read RPC rejected: ordering deadline expired");
-                            }
-                            read_admission::Rejection::AdmissionWait => {
-                                tracing::warn!(%session_id, %request_id, ?lane, wait_ms = recv_instant.elapsed().as_millis() as u64, "read RPC rejected: admission deadline expired");
-                            }
-                        }
+                    Err(message) => {
+                        tracing::warn!(%session_id, %request_id, ?lane, wait_ms = recv_instant.elapsed().as_millis() as u64, "read RPC rejected: admission deadline expired");
                         send_response(
                             &sink,
                             &request_id,

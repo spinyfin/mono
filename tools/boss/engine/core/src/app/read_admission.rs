@@ -9,10 +9,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Queued (not yet active) reads allowed per active permit on one connection.
 const PENDING_PER_ACTIVE: usize = 4;
 
-/// Longest a read waits for an identical earlier read on the connection.
-/// Exceeds the 45 s on-demand fetch budget of the slowest network-bound read.
-const ORDER_WAIT: Duration = Duration::from_secs(60);
-
 const QUEUE_FULL: &str = "engine busy, retry: read admission queue full";
 const DEADLINE: &str = "engine busy, retry: read admission deadline expired";
 mod diagnostics;
@@ -151,48 +147,8 @@ impl ReadAdmission {
     }
 }
 
-/// Why an accepted read was rejected while waiting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Rejection {
-    /// Expired behind an earlier identical read (fixed `ORDER_WAIT`).
-    OrderingWait,
-    /// Expired waiting for admission permits (`BOSS_RPC_*_READ_WAIT_MS`).
-    AdmissionWait,
-}
-
-impl Rejection {
-    pub(super) fn message(self) -> &'static str {
-        match self {
-            Self::OrderingWait => "engine busy, retry: read ordering deadline expired behind an earlier read",
-            Self::AdmissionWait => DEADLINE,
-        }
-    }
-}
-
 impl WaitingRead {
-    pub(super) async fn acquire_ordered(
-        mut self,
-        order: ordering::Turn,
-    ) -> Result<(ReadPermits, tokio::sync::OwnedMutexGuard<()>), Rejection> {
-        // Waiting behind an identical in-flight read is not admission
-        // pressure, so it has its own deadline; the admission deadline starts
-        // once this read's turn comes up.
-        let turn = tokio::time::timeout(ORDER_WAIT, order).await.map_err(|_| {
-            self.engine.diagnostics.report(
-                Rejection::OrderingWait.message(),
-                Wait::Ordering,
-                self.tracked.as_ref(),
-                None,
-                self.connection_id(),
-            );
-            Rejection::OrderingWait
-        })?;
-        self.deadline = tokio::time::Instant::now() + self.engine.wait;
-        let permits = self.acquire().await.map_err(|_| Rejection::AdmissionWait)?;
-        Ok((permits, turn))
-    }
-
-    /// `key` is `ReadOrdering::key_id` of the request.
+    /// `key` is `view::key_id` of the request.
     pub(super) fn identify(mut self, session: &str, request: &str, verb: String, key: u64) -> Self {
         self.tracked = Some(
             self.engine
@@ -253,8 +209,8 @@ impl WaitingRead {
 mod lane;
 pub(super) use lane::{ReadLane, read_lane};
 
-mod ordering;
-pub(super) use ordering::ReadOrdering;
+mod view;
+pub(super) use view::{key, key_id};
 
 #[cfg(test)]
 mod burst_tests;

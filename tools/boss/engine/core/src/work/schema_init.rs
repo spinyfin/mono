@@ -288,8 +288,9 @@ impl WorkDb {
         })
     }
 
-    /// Give an admitted frontend query its own connection. Some Get RPCs
-    /// refresh persisted state, so retain write capability and the event bus.
+    /// Give an admitted frontend query its own connection, preserving the
+    /// shared WorkDb write semantics and event bus. Board reads use reader();
+    /// read-only snapshots on any connection must explicitly use Deferred.
     pub(crate) fn query_connection(&self) -> Result<Self> {
         if self.memory.is_some() {
             return Ok(self.clone());
