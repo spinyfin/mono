@@ -92,8 +92,9 @@ impl WorkDb {
     /// reviews and two duplicate findings revisions from a single push.
     ///
     /// The `Immediate` transaction acquires sqlite's write lock at `BEGIN`,
-    /// so a concurrent caller blocks (up to the configured `busy_timeout`)
-    /// until this one commits, instead of racing the same check-then-insert.
+    /// so a concurrent caller waits in the contention busy handler (see
+    /// `contention`) until this one commits, instead of racing the same
+    /// check-then-insert.
     ///
     /// Returns `(execution, is_new)`; `is_new = false` means an existing
     /// live/non-terminal `pr_review` execution was reused rather than a

@@ -55,26 +55,28 @@ async fn limits_and_full_queues_make_reads_wait_instead_of_rejecting() {
 async fn global_queue_and_concurrency_apply_across_connections() {
     let gate = Arc::new(ReadAdmission::new(1, 2, 2, Duration::from_millis(30)));
     let active = gate.enqueue(&gate.connection()).await.acquire().await;
+    // Queueing on a connection never waits on the engine-wide queue, so a
+    // session's reader loop keeps serving its socket however full it is.
     let first = gate.enqueue(&gate.connection()).await;
     let second = gate.enqueue(&gate.connection()).await;
-    let mut third = tokio::spawn({
-        let gate = gate.clone();
-        async move { gate.enqueue(&gate.connection()).await }
-    });
-    still_pending(&mut third, Duration::from_millis(200)).await;
+    let third = gate.enqueue(&gate.connection()).await;
     let mut first = tokio::spawn(first.acquire());
     let mut second = tokio::spawn(second.acquire());
+    let mut third = tokio::spawn(third.acquire());
     still_pending(&mut first, Duration::from_millis(200)).await;
     assert!(!second.is_finished());
+    assert!(!third.is_finished());
     drop(active);
     let first = (&mut first).await.unwrap();
     assert!(!second.is_finished());
+    assert!(!third.is_finished());
     drop(first);
     let second = (&mut second).await.unwrap();
-    // Admitted reads release their queue slot, so the third's wait ends.
-    let third = (&mut third).await.unwrap();
+    // The engine-wide queue holds two reads; the third's wait ends once an
+    // admitted read releases its slot.
+    assert!(!third.is_finished());
     drop(second);
-    drop(third.acquire().await);
+    drop((&mut third).await.unwrap());
 }
 
 #[test]

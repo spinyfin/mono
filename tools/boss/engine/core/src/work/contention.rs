@@ -5,19 +5,27 @@
 //! connection, possibly in another process, holds the lock) or
 //! `SQLITE_LOCKED` (a conflict inside one process's shared cache). Neither is
 //! something a client can act on: the right response is to wait and try
-//! again. Until this module existed the engine's connections used a fixed
-//! `busy_timeout`, after which the statement failed and the text "database
-//! is locked" travelled to the macOS app as a modal and to the CLI as exit 6.
+//! again, so the engine's connections never surface them as "database is
+//! locked" to the macOS app or the CLI.
 //!
-//! The busy handler installed by [`install`] replaces that timeout. It
-//! retries the lock acquisition with SQLite's own backoff schedule and does
-//! not give up: a wait that never clears is reported through the engine
-//! health surface ([`snapshot`]) as an engine problem, not through the
-//! failing operation. Because the handler runs *inside* the statement that
-//! could not take the lock, the enclosing transaction is never rolled back
-//! and retried from outside — for a `BEGIN IMMEDIATE` or autocommit
-//! statement the lock is taken before any row is touched, so a retried
-//! write is applied exactly once.
+//! The busy handler installed by [`install`] retries the lock acquisition
+//! with SQLite's own backoff schedule and does not give up: a wait that never
+//! clears is reported through the engine health surface ([`Health::snapshot`]) as an
+//! engine problem, not through the failing operation. Because the handler
+//! runs *inside* the statement that could not take the lock, the enclosing
+//! transaction is never rolled back and retried from outside — for a
+//! `BEGIN IMMEDIATE` or autocommit statement the lock is taken before any row
+//! is touched, so a retried write is applied exactly once.
+//!
+//! The handler is not invoked for `SQLITE_LOCKED` or `SQLITE_BUSY_SNAPSHOT`.
+//! Neither can occur on a production connection: those databases are files,
+//! opened without shared cache (so there is no `SQLITE_LOCKED`), and every
+//! write transaction begins `IMMEDIATE` (so a transaction never upgrades from
+//! a stale read snapshot). `contention_tests` pins both invariants.
+//!
+//! Connections opened for CLI inspection (`bossctl`) do not use the
+//! absorbing handler; they wait a bounded time and then fail with SQLite's
+//! own error, so an operator tool never hangs on a stuck lock.
 //!
 //! Every wait is logged with the caller that holds the connection, the
 //! frontend request kind being served (when known), the attempt count and
@@ -26,7 +34,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -63,19 +71,32 @@ pub(crate) fn classify(err: &anyhow::Error) -> Option<Contention> {
         .find_map(|cause| cause.downcast_ref::<rusqlite::Error>().and_then(classify_sqlite))
 }
 
-/// Install the absorbing busy handler on `conn`, replacing any
-/// `busy_timeout`. Every connection the engine configures gets this.
-pub(crate) fn install(conn: &Connection) -> rusqlite::Result<()> {
-    conn.busy_handler(Some(absorb))
+/// How a connection waits for a lock another connection holds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LockWait {
+    /// Retry until the lock is free (see [`absorb`]). Every connection the
+    /// engine opens uses this.
+    Absorb,
+    /// Fail with SQLite's own error after this long. For CLI inspection
+    /// connections, which must not hang on a stuck lock.
+    Bounded(Duration),
 }
 
-/// A wait longer than this is an engine-health problem. It is the
-/// `busy_timeout` the engine ran with before contention was absorbed: every
-/// wait past it used to reach the user as "database is locked", so it is the
-/// empirically established point at which contention was already
-/// user-visible. Engine write transactions hold the lock for milliseconds
-/// (see the PR that introduced this module for the measurement), so a wait
-/// this long means another holder is stuck, not that the engine is busy.
+impl LockWait {
+    pub(crate) fn apply(self, conn: &Connection) -> rusqlite::Result<()> {
+        match self {
+            Self::Absorb => conn.busy_handler(Some(absorb)),
+            Self::Bounded(limit) => conn.busy_timeout(limit),
+        }
+    }
+}
+
+/// A wait longer than this is an engine-health problem. The connection layer
+/// logs any lock hold of 100 ms or more (`connection_wait`), and engine write
+/// transactions are expected to commit well inside that, so a wait of five
+/// seconds is fifty times the point at which a hold is already considered
+/// slow: another holder is stuck, not the engine busy. It is also the bound
+/// the CLI's direct-DB connections wait before failing.
 pub(crate) const HEALTH_THRESHOLD: Duration = Duration::from_secs(5);
 
 /// First progress line for a wait still in flight, then every
@@ -88,10 +109,18 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 /// promptly, long enough that a stuck lock costs no CPU.
 const BACKOFF_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
 
+/// A stuck wait whose last attempt is older than this is treated as cleared:
+/// the longest backoff step plus slack for a descheduled thread. A wait that
+/// is genuinely still stuck retries at least every 100 ms.
+const STALE_AFTER: Duration = Duration::from_secs(2);
+
 tokio::task_local! {
     /// The frontend request kind being served by the current task, set by
     /// the dispatch loop so the DB layer can name it in contention logs.
     pub(crate) static REQUEST_KIND: Arc<str>;
+    /// Whether the read being served is blocked in the busy handler, set for
+    /// reads that coalesce (see `app::read_coalesce`).
+    pub(crate) static READ_WAIT: Arc<ReadWait>;
 }
 
 /// Request kind for the current task, or `"internal"` outside a frontend
@@ -101,6 +130,23 @@ pub(crate) fn current_request_kind() -> Arc<str> {
     REQUEST_KIND
         .try_with(|kind| kind.clone())
         .unwrap_or_else(|_| Arc::from("internal"))
+}
+
+/// Set while a read's database call is waiting for a SQLite lock. A read
+/// that is still waiting has not taken its snapshot yet, so an identical read
+/// that arrives meanwhile can be answered from it without being answered
+/// from older data.
+#[derive(Debug, Default)]
+pub(crate) struct ReadWait(AtomicBool);
+
+impl ReadWait {
+    pub(crate) fn is_waiting(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn set(&self, waiting: bool) {
+        self.0.store(waiting, Ordering::Release);
+    }
 }
 
 /// Who holds the connection on this thread: pushed by the connection guard
@@ -113,15 +159,44 @@ pub(crate) struct Holder {
     pub(crate) health: Arc<Health>,
 }
 
+impl Holder {
+    /// The calling code as holder, for the current request, reporting to
+    /// `health`.
+    #[track_caller]
+    pub(crate) fn here(health: &Arc<Health>) -> Self {
+        Self {
+            caller: std::panic::Location::caller(),
+            request: current_request_kind(),
+            health: health.clone(),
+        }
+    }
+}
+
 /// One lock wait in flight on this thread.
+#[derive(bon::Builder)]
 struct Wait {
     started: Instant,
+    /// When the most recent backoff sleep ended. The lock is taken on the
+    /// attempt that follows it, so this is the wait's end as far as the
+    /// handler can tell.
+    last_attempt: Instant,
+    #[builder(default)]
     attempts: u32,
     next_progress: Duration,
     holder: Holder,
+    /// Callers of the other connection guards this thread held when the wait
+    /// began. Non-empty means the wait may be against the thread itself.
+    thread_holders: Vec<String>,
+    read_wait: Option<Arc<ReadWait>>,
     /// Set once the wait is past [`HEALTH_THRESHOLD`] and registered as
     /// stuck, to the id it is registered under.
     reported: Option<u64>,
+}
+
+impl Wait {
+    fn waited(&self) -> Duration {
+        self.last_attempt.saturating_duration_since(self.started)
+    }
 }
 
 thread_local! {
@@ -137,6 +212,8 @@ pub(crate) struct HolderScope;
 
 impl HolderScope {
     pub(crate) fn enter(holder: Holder) -> Self {
+        // A wait still recorded here ended before this scope began.
+        finish_wait();
         HOLDERS.with(|holders| holders.borrow_mut().push(holder));
         Self
     }
@@ -151,9 +228,9 @@ impl Drop for HolderScope {
     }
 }
 
-/// The innermost guard on this thread, or — for a raw connection used
-/// without one (`WorkDb::connect_new`) — an anonymous holder reporting to
-/// the process-wide fallback registry.
+/// The innermost guard on this thread, or — for a connection used without
+/// one (tests, which open independent connections directly) — an anonymous
+/// holder reporting to the process-wide fallback registry.
 fn current_holder() -> Holder {
     HOLDERS
         .with(|holders| holders.borrow().last().cloned())
@@ -164,29 +241,58 @@ fn current_holder() -> Holder {
         })
 }
 
+/// Callers of every guard on this thread except the innermost.
+fn outer_holders() -> Vec<String> {
+    HOLDERS.with(|holders| {
+        let holders = holders.borrow();
+        holders
+            .iter()
+            .take(holders.len().saturating_sub(1))
+            .map(|holder| holder.caller.to_string())
+            .collect()
+    })
+}
+
+fn begin_wait() {
+    let holder = current_holder();
+    let read_wait = READ_WAIT.try_with(Arc::clone).ok();
+    if let Some(read_wait) = &read_wait {
+        read_wait.set(true);
+    }
+    let now = Instant::now();
+    WAIT.with(|wait| {
+        *wait.borrow_mut() = Some(
+            Wait::builder()
+                .started(now)
+                .last_attempt(now)
+                .next_progress(PROGRESS_FIRST)
+                .holder(holder)
+                .thread_holders(outer_holders())
+                .maybe_read_wait(read_wait)
+                .build(),
+        )
+    });
+}
+
 /// The busy handler. `attempt` is SQLite's count of retries for the
 /// current lock acquisition, starting at 0; returning `true` asks SQLite to
 /// try again. A new acquisition (attempt 0) ends any previous wait on this
 /// thread, which is the only signal SQLite gives that a wait cleared short
 /// of the guard being dropped.
+///
+/// It returns `false` only for a wait that has outlasted [`HEALTH_THRESHOLD`]
+/// on a thread that already holds another engine connection: if that other
+/// connection holds the write lock, nothing can ever release it, and failing
+/// loudly beats hanging the thread (and the writer mutex) forever.
 fn absorb(attempt: i32) -> bool {
     if attempt == 0 {
         finish_wait();
-        let holder = current_holder();
-        WAIT.with(|wait| {
-            *wait.borrow_mut() = Some(Wait {
-                started: Instant::now(),
-                attempts: 0,
-                next_progress: PROGRESS_FIRST,
-                holder,
-                reported: None,
-            })
-        });
+        begin_wait();
     }
-    let delay = WAIT.with(|wait| {
+    let step = WAIT.with(|wait| {
         let mut wait = wait.borrow_mut();
         let Some(wait) = wait.as_mut() else {
-            return Duration::from_millis(100);
+            return Step::Retry(Duration::from_millis(100));
         };
         wait.attempts = wait.attempts.saturating_add(1);
         let waited = wait.started.elapsed();
@@ -201,20 +307,60 @@ fn absorb(attempt: i32) -> bool {
             );
         }
         if waited >= HEALTH_THRESHOLD {
+            if !wait.thread_holders.is_empty() {
+                return Step::GiveUp;
+            }
             let id = *wait
                 .reported
                 .get_or_insert_with(|| NEXT_WAIT_ID.fetch_add(1, Ordering::Relaxed));
             wait.holder.health.stuck(id, &wait.holder, wait.started, wait.attempts);
         }
-        Duration::from_millis(
+        Step::Retry(Duration::from_millis(
             BACKOFF_MS
                 .get(usize::try_from(attempt).unwrap_or(usize::MAX).min(BACKOFF_MS.len()))
                 .copied()
                 .unwrap_or(100),
-        )
+        ))
     });
-    sleep_yielding(delay);
-    true
+    match step {
+        Step::Retry(delay) => {
+            sleep_yielding(delay);
+            WAIT.with(|wait| {
+                if let Some(wait) = wait.borrow_mut().as_mut() {
+                    wait.last_attempt = Instant::now();
+                }
+            });
+            true
+        }
+        Step::GiveUp => {
+            give_up();
+            false
+        }
+    }
+}
+
+enum Step {
+    Retry(Duration),
+    GiveUp,
+}
+
+/// Abandon the wait in flight on this thread, logging why.
+fn give_up() {
+    let Some(wait) = WAIT.with(|wait| wait.borrow_mut().take()) else {
+        return;
+    };
+    if let Some(read_wait) = &wait.read_wait {
+        read_wait.set(false);
+    }
+    tracing::error!(
+        caller = %wait.holder.caller,
+        request = %wait.holder.request,
+        attempts = wait.attempts,
+        waited_ms = wait.started.elapsed().as_millis() as u64,
+        thread_holders = ?wait.thread_holders,
+        "work DB contention: this thread already holds another engine connection and has waited past the \
+         health threshold for the SQLite lock; it is probably waiting for itself, so the statement fails"
+    );
 }
 
 /// End the wait in flight on this thread, logging its summary.
@@ -222,7 +368,10 @@ fn finish_wait() {
     let Some(wait) = WAIT.with(|wait| wait.borrow_mut().take()) else {
         return;
     };
-    let waited = wait.started.elapsed();
+    if let Some(read_wait) = &wait.read_wait {
+        read_wait.set(false);
+    }
+    let waited = wait.waited();
     if let Some(id) = wait.reported {
         wait.holder.health.cleared(id);
     }
@@ -250,8 +399,9 @@ fn sleep_yielding(delay: Duration) {
 
 /// One database's view of its contention, for the health surface. Shared
 /// by every `WorkDb` handle on that database (including the per-query
-/// connections `query_connection` hands out). Counters cover the handle's
-/// lifetime; `stuck` holds only waits currently past [`HEALTH_THRESHOLD`].
+/// connections `query_connection` and `reader` hand out). Counters cover the
+/// handle's lifetime; `stuck` holds only waits currently past
+/// [`HEALTH_THRESHOLD`] that are still retrying.
 #[derive(Debug, Default)]
 pub(crate) struct Health {
     waits: AtomicU64,
@@ -266,6 +416,7 @@ pub(crate) struct StuckWait {
     pub(crate) request: String,
     pub(crate) since: Instant,
     pub(crate) attempts: u32,
+    last_attempt: Instant,
 }
 
 /// Point-in-time copy for the health report.
@@ -294,8 +445,10 @@ impl Health {
             request: holder.request.to_string(),
             since,
             attempts,
+            last_attempt: Instant::now(),
         });
         entry.attempts = attempts;
+        entry.last_attempt = Instant::now();
     }
 
     fn cleared(&self, id: u64) {
@@ -303,23 +456,21 @@ impl Health {
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot {
+        let mut stuck = self.stuck.lock().expect("contention health lock poisoned");
+        // A wait that stopped retrying has ended even if nothing has
+        // recorded that yet (its thread has not released its guard).
+        stuck.retain(|_, wait| wait.last_attempt.elapsed() <= STALE_AFTER);
         Snapshot {
             waits: self.waits.load(Ordering::Relaxed),
             long_waits: self.long_waits.load(Ordering::Relaxed),
             longest_ms: self.longest_ms.load(Ordering::Relaxed),
-            stuck: self
-                .stuck
-                .lock()
-                .expect("contention health lock poisoned")
-                .values()
-                .cloned()
-                .collect(),
+            stuck: stuck.values().cloned().collect(),
         }
     }
 }
 
-/// Registry for waits on connections that have no guard, and so no
-/// `WorkDb`, to report to.
+/// Registry for waits on connections used without a guard or scope, and so
+/// no `WorkDb`, to report to.
 pub(crate) fn fallback_health() -> Arc<Health> {
     static HEALTH: std::sync::OnceLock<Arc<Health>> = std::sync::OnceLock::new();
     HEALTH.get_or_init(Arc::default).clone()

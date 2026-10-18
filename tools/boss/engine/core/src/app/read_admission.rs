@@ -3,11 +3,13 @@
 //! single pipelined connection cannot occupy the engine's whole wait queue.
 //!
 //! Admission bounds concurrency; it never turns waiting into a client
-//! error. A read that finds its queue full or every permit taken waits —
-//! the reader loop stops taking requests off that socket until a queue slot
-//! frees, which is the backpressure — and a wait longer than the lane's
-//! slow-wait threshold logs the reads holding it up so the cause stays
-//! visible to operators.
+//! error. A read that finds its connection's queue full waits — the reader
+//! loop stops taking requests off that socket until a queue slot frees, which
+//! is the backpressure. The engine-wide queue and the active permits are
+//! waited for in the read's own task, so one session filling the engine-wide
+//! queue never stops another session's reader loop from serving its writes
+//! and live-lane reads. A wait longer than the lane's slow-wait threshold
+//! logs the reads holding it up so the cause stays visible to operators.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +41,9 @@ pub(super) struct ConnectionReads {
 pub(super) struct WaitingRead {
     engine: Arc<ReadAdmission>,
     connection: Arc<ConnectionReads>,
-    _pending: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    /// This connection's queue slot. The engine-wide slot is taken in
+    /// [`WaitingRead::acquire`].
+    _pending: OwnedSemaphorePermit,
     tracked: Option<TrackedRead>,
 }
 
@@ -47,8 +51,8 @@ pub(super) struct WaitingRead {
 // earlier defaults (32 active, 500 ms wait) rejected the macOS app's own
 // startup reads after a cold engine start. These match the overrides that
 // restored normal use. Lower them only from measured data, with a generous
-// buffer above the observed peak. The env overrides below still apply; the
-// `_WAIT_MS` ones now set the slow-wait log threshold, never a deadline.
+// buffer above the observed peak. The env overrides below apply; the
+// `_WAIT_MS` ones set the slow-wait log threshold, never a deadline.
 impl Default for ReadAdmission {
     fn default() -> Self {
         Self::new(
@@ -129,9 +133,10 @@ impl ReadAdmission {
         })
     }
 
-    /// Bound task allocation as well as active handlers. A full queue makes
-    /// the caller wait for a slot (the reader loop stops reading that socket
-    /// meanwhile); a slow wait logs the reads filling the queue.
+    /// Bound each connection's queued reads as well as active handlers. A
+    /// full connection queue makes the caller wait for a slot (the reader
+    /// loop stops reading that socket meanwhile); a slow wait logs the reads
+    /// filling the queue.
     #[cfg(test)]
     pub(super) async fn enqueue(self: &Arc<Self>, connection: &Arc<ConnectionReads>) -> WaitingRead {
         self.enqueue_as(connection, None).await
@@ -153,15 +158,10 @@ impl ReadAdmission {
         })
         .await
         .expect("connection pending semaphore is never closed");
-        let global = report_if_slow(self.pending.clone().acquire_owned(), self.slow_wait, || {
-            slow(Wait::EngineQueue)
-        })
-        .await
-        .expect("engine pending semaphore is never closed");
         WaitingRead {
             engine: self.clone(),
             connection: connection.clone(),
-            _pending: (global, local),
+            _pending: local,
             tracked: None,
         }
     }
@@ -182,9 +182,25 @@ impl WaitingRead {
         Arc::as_ptr(&self.connection) as usize
     }
 
-    /// Wait for the connection permit, then the engine permit. A wait past
-    /// the lane's slow-wait threshold logs the permit holders once.
+    /// Wait for an engine-wide queue slot, then the connection permit, then
+    /// the engine permit. A wait past the lane's slow-wait threshold logs the
+    /// holders once.
     pub(super) async fn acquire(self) -> ReadPermits {
+        let _engine_pending = report_if_slow(
+            self.engine.pending.clone().acquire_owned(),
+            self.engine.slow_wait,
+            || {
+                self.engine.diagnostics.report(
+                    SLOW_QUEUE,
+                    Wait::EngineQueue,
+                    self.tracked.as_ref(),
+                    None,
+                    self.connection_id(),
+                );
+            },
+        )
+        .await
+        .expect("engine pending semaphore is never closed");
         let permits = report_if_slow(
             async {
                 if let Some(read) = &self.tracked {

@@ -10,17 +10,14 @@
 //! Coordinator-only at the worker-tier gate
 //! (`boss_worker_policy::worker_verb_decision`).
 //!
-//! Foreground fetches retain bulk admission and the ordering turn through the
-//! correlated response, with an additional global fetch limit.
+//! Foreground fetches retain bulk admission through the correlated response,
+//! with an additional global fetch limit. A fetch past the limit waits for a
+//! slot; it is never answered with an error.
 
 use super::*;
 
 /// Concurrent guidance fetches, across all connections.
 pub(super) const MAX_CONCURRENT_FETCHES: usize = 4;
-
-/// Reply when the guidance-fetch cap above is full. Distinct from read
-/// admission's rejections: this cap is not part of that gate.
-pub(super) const FETCH_LIMIT: &str = "engine busy, retry: coordinator guidance fetch limit reached";
 
 pub(super) async fn handle_list_coordinator_guidance(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -55,13 +52,20 @@ pub(super) async fn handle_list_coordinator_guidance(ctx: Dispatch, req: Fronten
         },
     };
 
-    let Ok(permit) = server_state.guidance_fetches.clone().try_acquire_owned() else {
-        tracing::warn!(
-            %request_id,
-            "coordinator guidance fetch rejected: concurrent fetch limit reached"
-        );
-        send_work_error(&sink, &request_id, FETCH_LIMIT);
-        return;
+    let permit = match server_state.guidance_fetches.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::info!(
+                %request_id,
+                "coordinator guidance fetch waiting: concurrent fetch limit reached"
+            );
+            server_state
+                .guidance_fetches
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("guidance fetch semaphore is never closed")
+        }
     };
     let design_docs = server_state.design_docs.clone();
     let _permit = permit;

@@ -3,20 +3,34 @@
 //! A burst of identical refreshes (the app re-reading one view several
 //! times, or pipelining the same list on one socket) costs one handler run:
 //! the first request leads, later identical ones follow and are answered
-//! from the leader's responses under their own request ids. A follower
-//! joins only a leader that has not started executing, so its answer is
-//! never older than its own arrival — a read issued after a write on the
-//! same session can only share a read whose snapshot is taken after that
-//! write committed. Once a leader has started, the next identical read
+//! from the leader's responses under their own request ids.
+//!
+//! A follower may only join a leader whose snapshot is not yet taken, so its
+//! answer is never older than its own arrival — a read issued after a write
+//! on the same session can only share a read whose snapshot is taken after
+//! that write committed. That is the case while the leader is queued for
+//! admission, and while its handler is blocked on a SQLite lock
+//! ([`ReadWait`]): a write transaction holds the lock from the moment the
+//! leader's wait ends until it commits, so no write the follower could have
+//! waited on lands between the follower's arrival and the leader's snapshot.
+//! Once the leader's handler is past its lock wait, the next identical read
 //! leads a new batch that runs after it.
 //!
 //! Followers keep their admission queue permits until they are answered, so
 //! the reader loop's reply-headroom accounting (every outstanding read holds
-//! a pending or active permit) stays exact. Scope is one session: a session
-//! has its own work-tree delta cache and its own worker-tier sanitisation,
-//! so responses are not shared across sessions.
+//! a pending or active permit) stays exact. A follower is also registered
+//! with the session's per-view freshness tracking at the moment it joins, so
+//! its answer is delivered under the same ordering rule as the leader's: if a
+//! later batch for the same view has already replied, the follower receives
+//! that newer snapshot rather than overwriting it with an older one.
+//!
+//! Scope is one session: authorization and worker-tier sanitisation are
+//! per-session, so whole responses are not shared across sessions. The
+//! database load behind `GetWorkTree`, which is a pure function of the
+//! database, is shared engine-wide instead (see `work_tree_flight`).
 use super::read_admission::WaitingRead;
 use super::session_queue::SessionSink;
+use crate::work::contention::ReadWait;
 use boss_protocol::{FrontendEvent, FrontendEventEnvelope, FrontendRequest};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,7 +57,8 @@ impl Stats {
 
 /// Whether identical requests may share one handler run. `GetWorkTree`
 /// encodes its response against the session's delta cache, which the first
-/// response mutates, so a replayed copy would be wrong for the second.
+/// response mutates, so a replayed copy would be wrong for the second; it
+/// shares only its database load, per waiter (see `work_tree_flight`).
 pub(in crate::app) fn coalescable(request: &FrontendRequest) -> bool {
     !matches!(request, FrontendRequest::GetWorkTree { .. })
 }
@@ -64,14 +79,17 @@ pub(in crate::app) enum Role {
 
 impl ReadCoalescer {
     /// Join `request` to the open batch for its exact serialisation, or
-    /// open a new one if there is none or the existing leader has started.
-    /// A follower parks `pending` (its queue permits) until it is answered.
+    /// open a new one if there is none or the existing leader's snapshot is
+    /// taken. A follower parks `pending` (its queue permits) until it is
+    /// answered; `register` runs under the batch's lock once the follower has
+    /// joined, so the answer cannot be sent before it has run.
     pub(in crate::app) fn join(
         &mut self,
         request: &FrontendRequest,
         request_id: &str,
         pending: WaitingRead,
         stats: &Stats,
+        register: impl FnOnce(),
     ) -> Role {
         // A batch nobody else references any more has finished and been
         // untapped; only the map keeps it alive.
@@ -82,7 +100,7 @@ impl ReadCoalescer {
             _pending: pending,
         };
         let follower = match self.batches.get(&key) {
-            Some(batch) => match batch.try_follow(follower) {
+            Some(batch) => match batch.try_follow(follower, register) {
                 Ok(()) => {
                     stats.followers.fetch_add(1, Ordering::Relaxed);
                     return Role::Follow;
@@ -95,6 +113,7 @@ impl ReadCoalescer {
             leader_request_id: request_id.to_owned(),
             state: Mutex::new(State::default()),
             responses: Mutex::new(Vec::new()),
+            wait: Arc::default(),
         });
         self.batches.insert(key, batch.clone());
         stats.leaders.fetch_add(1, Ordering::Relaxed);
@@ -112,7 +131,11 @@ struct Follower {
 
 #[derive(Default)]
 struct State {
+    /// The leader's handler has begun. From then on the batch is joinable
+    /// only while that handler is blocked on a SQLite lock.
     started: bool,
+    /// The leader has returned (or failed): nothing may join.
+    closed: bool,
     followers: Vec<Follower>,
 }
 
@@ -122,6 +145,8 @@ pub(in crate::app) struct Batch {
     state: Mutex<State>,
     /// The leader's response envelopes, captured by the session sink's tap.
     responses: Mutex<Vec<FrontendEventEnvelope>>,
+    /// Set by the DB layer while the leader's handler waits for a SQLite lock.
+    wait: Arc<ReadWait>,
 }
 
 impl Batch {
@@ -129,12 +154,20 @@ impl Batch {
         &self.leader_request_id
     }
 
-    fn try_follow(&self, follower: Follower) -> Result<(), Follower> {
+    /// The flag the DB layer sets while the leader's handler is blocked on a
+    /// SQLite lock, installed as [`crate::work::contention::READ_WAIT`] around
+    /// the leader's dispatch.
+    pub(in crate::app) fn wait(&self) -> Arc<ReadWait> {
+        self.wait.clone()
+    }
+
+    fn try_follow(&self, follower: Follower, register: impl FnOnce()) -> Result<(), Follower> {
         let mut state = self.state.lock().expect("read batch lock poisoned");
-        if state.started {
+        if state.closed || (state.started && !self.wait.is_waiting()) {
             return Err(follower);
         }
         state.followers.push(follower);
+        register();
         Ok(())
     }
 
@@ -147,8 +180,9 @@ impl Batch {
     }
 
     /// The leader is about to run its handler: from here on, identical
-    /// reads open a new batch instead of joining this one. Returns the
-    /// number of followers that will share this run.
+    /// reads open a new batch instead of joining this one, unless the handler
+    /// is blocked on a SQLite lock. Returns the number of followers that will
+    /// share this run so far.
     pub(in crate::app) fn start(&self) -> usize {
         let mut state = self.state.lock().expect("read batch lock poisoned");
         state.started = true;
@@ -206,6 +240,7 @@ impl Batch {
     fn take_followers(&self) -> Vec<Follower> {
         let mut state = self.state.lock().expect("read batch lock poisoned");
         state.started = true;
+        state.closed = true;
         std::mem::take(&mut state.followers)
     }
 

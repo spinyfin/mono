@@ -70,7 +70,11 @@ impl WorkDb {
         // fixes when slow.
         let started = std::time::Instant::now();
         tracing::info!(path = %path.display(), "work db: opening");
-        let conn = Self::open_raw_connection(&path, None)?;
+        let contention_health = Arc::<contention::Health>::default();
+        let conn = {
+            let _holder = contention::HolderScope::enter(contention::Holder::here(&contention_health));
+            Self::open_raw_connection(&path, None)?
+        };
         let connect_elapsed = started.elapsed();
         let db = Self {
             path,
@@ -79,7 +83,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             persona_metrics: personas::new_metrics_registry(),
-            contention_health: Arc::default(),
+            contention_health,
         };
         let init_started = std::time::Instant::now();
         db.init()?;
@@ -101,7 +105,11 @@ impl WorkDb {
         let id = NEXT_MEM_DB_ID.fetch_add(1, Ordering::Relaxed);
         let uri = format!("file:boss_mem_{id}?mode=memory&cache=shared");
         let anchor = InMemoryAnchor { uri };
-        let conn = Self::open_raw_connection(&PathBuf::from(":memory:"), Some(&anchor))?;
+        let contention_health = Arc::<contention::Health>::default();
+        let conn = {
+            let _holder = contention::HolderScope::enter(contention::Holder::here(&contention_health));
+            Self::open_raw_connection(&PathBuf::from(":memory:"), Some(&anchor))?
+        };
         let db = Self {
             path: PathBuf::from(":memory:"),
             memory: Some(anchor),
@@ -109,7 +117,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             persona_metrics: personas::new_metrics_registry(),
-            contention_health: Arc::default(),
+            contention_health,
         };
         db.init()?;
         Ok(db)
