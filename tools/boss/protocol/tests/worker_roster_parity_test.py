@@ -1,10 +1,9 @@
-"""Keep the Rust roster, the Swift roster and the crew portrait grid in step.
+"""Keep the Rust roster and the crew portrait grid in step.
 
-The worker roster exists twice (Rust `ROSTER`, Swift `WorkerNames.roster`)
-and is, by design, the 56-character portrait grid in reading order minus the
-coordinator, Picard. This test parses the real sources, so a hand edit to any
-one of them that forgets the others fails here rather than at runtime, where
-a slot would show the wrong name or the wrong face.
+The engine persona roster (Rust `ROSTER`) is, by design, the 56-character
+portrait grid in reading order minus the coordinator, Picard. This test parses
+the real sources, so a hand edit to any one of them that forgets the others
+fails here rather than at runtime, where a persona would show the wrong face.
 """
 
 import os
@@ -18,7 +17,6 @@ GRID_ROWS, GRID_COLUMNS = 7, 8
 
 ROOT = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main") / "tools/boss"
 RUST_NAMES = ROOT / "protocol/src/worker_names.rs"
-SWIFT_NAMES = ROOT / "app-macos/Sources/Ghostty/WorkerNames.swift"
 SWIFT_GRID = ROOT / "app-macos/Sources/TrekPortraitGrid.swift"
 GRID_PNG = ROOT / "app-macos/Sources/Resources/TrekIcons/trek-crew-grid.png"
 
@@ -49,11 +47,6 @@ def rust_roster():
 def swift_grid_rows():
     body = block(SWIFT_GRID.read_text(), "static let names: [[String]] = [", "\n    ]\n", "TrekPortraitGrid.swift")
     return [QUOTED.findall(line) for line in strip_comments(body).splitlines() if QUOTED.search(line)]
-
-
-def swift_roster_is_derived_from_grid():
-    text = SWIFT_NAMES.read_text()
-    return re.search(r"static let roster: \[String\] = TrekPortraitGrid\.workerNames\b", text) is not None
 
 
 def swift_grid_constants(text):
@@ -96,11 +89,6 @@ def main():
             f"{COORDINATOR}.\n  rust only: {[n for n in rust if n not in expected_roster]}"
             f"\n  grid only: {[n for n in expected_roster if n not in rust]}"
             f"\n  rust:  {rust}\n  grid:  {expected_roster}"
-        )
-    if not swift_roster_is_derived_from_grid():
-        failures.append(
-            "WorkerNames.roster must be `TrekPortraitGrid.workerNames`; a separate "
-            "Swift literal would be a third copy of the roster"
         )
 
     width, height = swift_grid_constants(SWIFT_GRID.read_text())

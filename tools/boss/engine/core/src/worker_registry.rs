@@ -34,12 +34,8 @@ const ANCESTOR_WALK_DEPTH: usize = 8;
 /// runs — far more than any real deployment. See
 /// [`WorkerRegistry::get_or_allocate_remote_slot`].
 ///
-/// This re-exports `boss_protocol::REMOTE_SLOT_BASE` rather than
-/// defining its own value: `boss_protocol::name_for_slot` needs the
-/// same threshold to render the remote range disjointly from the
-/// local pool range, so the protocol crate is the single source of
-/// truth and this alias just keeps the local name workers here
-/// already use.
+/// This re-exports `boss_protocol::REMOTE_SLOT_BASE` so the protocol
+/// crate stays the single source of truth for the threshold.
 pub const REMOTE_SLOT_BASE: u8 = boss_protocol::REMOTE_SLOT_BASE;
 
 #[derive(Clone)]
