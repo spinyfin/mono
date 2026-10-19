@@ -120,8 +120,7 @@ struct WorkBoardCardTitleRow: View, @MainActor Equatable {
                         WorkTagChip(text: "+\(overflow)")
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: 36, alignment: .topLeading)
-                .clipped()
+                .frame(maxWidth: .infinity, alignment: .topLeading)
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Tags: \(tagChips.labels.joined(separator: ", "))")
             }

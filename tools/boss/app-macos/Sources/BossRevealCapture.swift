@@ -19,6 +19,10 @@ enum BossRevealCapture {
 
     static func start(updateModel: UpdateModel) {
         guard let state, let path = BossCaptureArgs.shared.captureTo else { return }
+        if state == "badge-width" {
+            BossBadgeWidthCapture.start(path: path)
+            return
+        }
         if state == "operator-question" {
             BossOperatorQuestionCapture.start(path: path)
             return

@@ -6,11 +6,10 @@ struct FlowLayout: Layout {
     /// Vertical gap between wrapped lines.
     var verticalSpacing: CGFloat = 3
 
-    /// Layout cache: per-subview sizes plus the last row layout for a given max width.
-    /// `sizeThatFits` fills sizes (and rows for its proposal); `placeSubviews` reuses
-    /// sizes always and rows when the width still matches — avoiding a second full
-    /// pass of `subviews[i].sizeThatFits(.unspecified)` on every chip.
+    /// Keep ideal sizes separately so a narrow proposal never poisons a later
+    /// wider layout. Constrained sizes and rows share the same width key.
     struct Cache {
+        var idealSizes: [CGSize] = []
         var sizes: [CGSize] = []
         var rows: [Row] = []
         /// Max width the cached `rows` were computed for; `nil` means rows are invalid.
@@ -18,19 +17,17 @@ struct FlowLayout: Layout {
     }
 
     func makeCache(subviews: Subviews) -> Cache {
-        Cache(sizes: measureSizes(subviews))
+        Cache(idealSizes: measureSizes(subviews))
     }
 
     func updateCache(_ cache: inout Cache, subviews: Subviews) {
-        cache.sizes = measureSizes(subviews)
-        cache.rows = []
-        cache.rowsMaxWidth = nil
+        cache = makeCache(subviews: subviews)
     }
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
         ensureSizes(subviews: subviews, cache: &cache)
-        let maxWidth = proposal.width ?? .infinity
-        let rows = rows(for: maxWidth, cache: &cache)
+        let maxWidth = max(0, proposal.width ?? .infinity)
+        let rows = rows(for: maxWidth, subviews: subviews, cache: &cache)
         let width = rows.map(\.width).max() ?? 0
         let height = rows.reduce(0) { $0 + $1.height }
             + verticalSpacing * CGFloat(max(0, rows.count - 1))
@@ -39,7 +36,7 @@ struct FlowLayout: Layout {
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
         ensureSizes(subviews: subviews, cache: &cache)
-        let rows = rows(for: bounds.width, cache: &cache)
+        let rows = rows(for: max(0, bounds.width), subviews: subviews, cache: &cache)
         var y = bounds.minY
         for row in rows {
             var x = bounds.minX
@@ -71,18 +68,23 @@ struct FlowLayout: Layout {
     /// Defensive refresh if the cache is empty or out of sync with the subview list
     /// (e.g. first call before SwiftUI has driven `makeCache`/`updateCache`).
     private func ensureSizes(subviews: Subviews, cache: inout Cache) {
-        if cache.sizes.count != subviews.count {
-            cache.sizes = measureSizes(subviews)
-            cache.rows = []
-            cache.rowsMaxWidth = nil
+        if cache.idealSizes.count != subviews.count {
+            cache = makeCache(subviews: subviews)
         }
     }
 
-    /// Return rows for `maxWidth`, recomputing from cached sizes only when the
-    /// width differs from the last computation (no re-measure of chips).
-    private func rows(for maxWidth: CGFloat, cache: inout Cache) -> [Row] {
+    /// Only oversized chips need remeasurement. Propose the whole available
+    /// row, including the chip's padding, so its label truncates inside its pill.
+    private func rows(for maxWidth: CGFloat, subviews: Subviews, cache: inout Cache) -> [Row] {
         if cache.rowsMaxWidth == maxWidth {
             return cache.rows
+        }
+        cache.sizes = cache.idealSizes.enumerated().map { index, ideal in
+            guard ideal.width > maxWidth else { return ideal }
+            let measured = subviews[index].sizeThatFits(ProposedViewSize(width: maxWidth, height: nil))
+            // Reserve the full constraint, not Text's smaller glyph-fitted
+            // width, so placement cannot truncate an already truncated label.
+            return CGSize(width: maxWidth, height: measured.height)
         }
         let computed = computeRows(maxWidth: maxWidth, sizes: cache.sizes)
         cache.rows = computed
@@ -96,9 +98,7 @@ struct FlowLayout: Layout {
         for index in sizes.indices {
             let size = sizes[index]
             let lead = current.indices.isEmpty ? 0 : horizontalSpacing
-            // Wrap when the chip would overflow — but never strand a chip on an
-            // empty line, so the first chip of a row always fits even if it is
-            // itself wider than the lane (it will clip, but that is degenerate).
+            // Oversized chips have already been measured against the row width.
             if !current.indices.isEmpty && current.width + lead + size.width > maxWidth {
                 rows.append(current)
                 current = Row()
