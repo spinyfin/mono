@@ -2944,20 +2944,24 @@ async fn handle_frontend_connection(
                 let batch = read_batch.clone();
                 let result = boss_task_scope::spawn_blocking_future(async move {
                     permits.started();
-                    let _permits = permits;
                     if let Some(batch) = &batch {
                         // From here identical reads start a new batch: this
                         // handler's snapshot predates them.
                         batch.start();
                     }
                     dispatch_fut.await;
+                    permits
                 })
                 .await;
                 match result {
-                    Ok(Some(())) => {
+                    Ok(Some(permits)) => {
+                        // Followers are answered before the read's admission
+                        // permits are released, so a later read cannot be
+                        // admitted ahead of the replies this one owes.
                         if let Some(batch) = &read_batch {
                             batch.finish(&sink);
                         }
+                        drop(permits);
                     }
                     // Cancelled by engine shutdown before the handler
                     // finished: the leader never replied, so its followers
