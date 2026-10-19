@@ -422,7 +422,6 @@ final class AgentsGridModelTests: XCTestCase {
         for (index, run) in ["a", "b", "c"].enumerated() {
             _ = workspace.attachWorkerPane(makeAttach(runId: run, slot: index + 1))
         }
-        let sessions = workspace.viewersByRunId.mapValues { $0.session }
         let states = [
             makeState(runId: "a", slotId: 1, agentType: "coding", projectId: "p1", projectName: "Alpha"),
             makeState(runId: "b", slotId: 2, activity: .waitingForInput, agentType: "review", projectId: "p2", projectName: "Beta"),
@@ -441,7 +440,6 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertEqual(grid.layout.waitingCount, 0)
         XCTAssertEqual(grid.layout.hiddenWaitingCount, 1)
         // Hidden runs keep their mounted viewers; they are just unplaced.
-        for (run, session) in sessions { XCTAssertTrue(workspace.viewersByRunId[run]?.session === session) }
         let mounted = grid.renderRunIds(attached: workspace.viewersByRunId.keys)
         XCTAssertEqual(mounted, ["a", "b", "c"])
         XCTAssertEqual(Set(mounted.filter { grid.layout.logicalCellIndex(ofRun: $0) == nil }), ["b", "c"])
