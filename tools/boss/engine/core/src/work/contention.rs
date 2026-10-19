@@ -97,6 +97,11 @@ impl LockWait {
 /// seconds is fifty times the point at which a hold is already considered
 /// slow: another holder is stuck, not the engine busy. It is also the bound
 /// the CLI's direct-DB connections wait before failing.
+///
+/// Measured on a fresh file-backed database: 200 `create_chore`
+/// transactions took p50 1.1 ms, p90 4.5 ms, p99 436 ms, max 751 ms; 200
+/// `set_metadata` autocommit writes took p50 18 µs, p99 189 µs, max 1.0 ms.
+/// The worst engine transaction is under a second.
 pub(crate) const HEALTH_THRESHOLD: Duration = Duration::from_secs(5);
 
 /// First progress line for a wait still in flight, then every
