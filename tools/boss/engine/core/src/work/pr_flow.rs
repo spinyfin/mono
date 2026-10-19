@@ -525,7 +525,7 @@ impl WorkDb {
         // the diagnostic is folded into `blocked_detail` when a reason
         // already exists (blocked_detail cannot outlive blocked_reason).
         // Kind-agnostic: a chore or followup parks on a question exactly like
-        // a task does. The question card is what lets the operator answer,
+        // a task does. The question card is what makes the decision answerable,
         // so folding the question into a `worker_failed` detail would leave
         // the row looking failed when it is waiting on a human.
         match query_task(&tx, &work_item_id)? {
@@ -2001,7 +2001,7 @@ pub(super) fn insert_question(
     // Every work-item kind that can run a worker gets a question row: a
     // chore or followup that stops on a human decision is waiting on that
     // decision exactly like a task is, and the kanban card is the only
-    // surface that lets the operator answer it. The row is `open` only when
+    // surface where this decision can be answered. The row is `open` only when
     // the item can actually park on it (see `record_worker_failure_or_question`).
     let Some(task) = query_task(conn, &execution.work_item_id)? else {
         return Ok(());

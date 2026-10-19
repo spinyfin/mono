@@ -1,6 +1,6 @@
 // Operator question cards for chore-like work items: a chore or followup
 // that stops blocked on a human decision parks on the same card route a task
-// does, instead of folding the question into a `worker_failed` detail.
+// does.
 use super::*;
 
 /// A chore or followup worker that stops blocked on a human decision parks
@@ -171,9 +171,8 @@ async fn question_on_chore_answers_like_a_task() {
     assert_eq!(state.work_db.list_executions(Some(&chore_id)).unwrap().len(), 1);
 }
 
-/// A task that cannot park (already `in_review`) still records the question
-/// as withdrawn rather than open, and keeps its status — unchanged by the
-/// chore change above.
+/// A task already `in_review` cannot park: its question is recorded as
+/// withdrawn (`task_not_parkable`) and its status remains `in_review`.
 #[tokio::test]
 async fn question_on_unparkable_task_withdraws() {
     let (state, _dir, execution_id, task_id) = live_chore_execution();
