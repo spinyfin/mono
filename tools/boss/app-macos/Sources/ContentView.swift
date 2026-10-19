@@ -328,23 +328,10 @@ struct ContentView: View {
                 model.workSearchText = ""
             }
         }
-        .alert(
-            "Work Error",
-            isPresented: Binding(
-                get: { model.workErrorMessage != nil },
-                set: { newValue in
-                    if !newValue {
-                        model.workErrorMessage = nil
-                    }
-                }
-            ),
-            actions: {
-                Button("OK", role: .cancel) {}
-            },
-            message: {
-                Text(model.workErrorMessage ?? "")
-            }
-        )
+        // `model.workErrorMessage` is deliberately NOT an `.alert` here: it
+        // renders as the passive `WorkNoticeBanner` in `chromeBanners`
+        // below. The two alerts that remain are decisions about an action
+        // the user just took (pause override, merge with open revisions).
         .alert(
             "Dispatch is paused",
             isPresented: Binding(
@@ -498,6 +485,7 @@ struct ContentView: View {
         )
             || (model.isConnected && !model.bannerHealthIssues.isEmpty)
             || model.disconnectedActionNotice != nil
+            || model.workErrorMessage != nil
             || updateModel.rollbackNotice != nil
     }
 
@@ -547,13 +535,26 @@ struct ContentView: View {
                 .padding(8)
                 .background(Color.orange.opacity(0.12))
             }
+            // Failure reports with no more specific surface (engine
+            // `work_error` replies, failed reveals, broken doc pointers).
+            // Formerly a "Work Error" modal alert that re-popped over
+            // whatever the user was typing for every repeat of a message
+            // they could not act on; now a passive, dismissable banner
+            // that never takes focus. See `WorkNoticeBanner`.
+            if let notice = model.workErrorMessage {
+                WorkNoticeBanner(
+                    message: notice,
+                    onDismiss: { model.dismissWorkErrorMessage() }
+                )
+                .transition(bannerTransition)
+            }
             // Persistent chrome-level signal that the engine socket is
             // down. Only shown after we've connected at least once so
             // the banner doesn't flash on launch during the normal
             // initial-connect window. Replaces the previous behavior
-            // where every reconnect attempt re-popped a "Work Error"
-            // modal (#698) — transport errors are now routed away from
-            // `workErrorMessage` in `ChatViewModel.handle`. Also gated on
+            // where every reconnect attempt re-popped the then-modal
+            // "Work Error" alert (#698) — transport errors are routed away
+            // from `workErrorMessage` in `ChatViewModel.handle`. Also gated on
             // `showConnectionLostBanner` rather than the raw `isConnected`
             // flag: a drop that self-heals within `connectionLostBannerDelay`
             // (reconnect backoff starts at 0.5s) never surfaces this at
@@ -589,6 +590,7 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.15), value: model.showConnectionLostBanner)
         .animation(.easeInOut(duration: 0.15), value: model.engineSupervisionState)
         .animation(.easeInOut(duration: 0.15), value: model.bannerHealthIssues)
+        .animation(.easeInOut(duration: 0.15), value: model.workErrorMessage)
         .animation(.easeInOut(duration: 0.15), value: updateModel.rollbackNotice)
     }
 

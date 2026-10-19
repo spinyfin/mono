@@ -1,7 +1,13 @@
 import Foundation
+import os.log
 #if canImport(AppKit)
 import AppKit
 #endif
+
+/// Every `workErrorMessage` is also written here, so a failure the user
+/// dismissed (or never noticed on the passive banner) stays recoverable
+/// from the unified log.
+private let workNoticeLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "work-notice")
 
 @MainActor
 final class ChatViewModel: ObservableObject {
@@ -333,7 +339,26 @@ final class ChatViewModel: ObservableObject {
     @Published var selectedWorkNodeID: WorkNodeID?
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
     @Published var pendingWorkEditRequest: WorkEditRequest?
-    @Published var workErrorMessage: String?
+    /// Failure report for the passive `WorkNoticeBanner` in the window's
+    /// titlebar chrome (`ContentView.chromeBanners`): engine `work_error`
+    /// replies, failed reveals, broken doc pointers, and so on. Setting a
+    /// non-nil value shows (or replaces) the banner; `nil` hides it. This
+    /// is never presented modally — a modal would steal focus from
+    /// whatever the user is doing and block the window for a message
+    /// they often cannot act on. Every value is also logged, so a
+    /// dismissed message is still recoverable from the unified log.
+    @Published var workErrorMessage: String? {
+        didSet {
+            guard let workErrorMessage, workErrorMessage != oldValue else { return }
+            workNoticeLog.error("\(workErrorMessage, privacy: .public)")
+        }
+    }
+
+    /// Explicit dismissal from the banner's close control; the same
+    /// clearing many flows already do before starting a fresh action.
+    func dismissWorkErrorMessage() {
+        workErrorMessage = nil
+    }
     @Published var disconnectedActionNotice: String?
     var uncertainActionNotice: String?
     /// One entry per drop that left actions unconfirmed; cleared only by
@@ -1295,8 +1320,8 @@ final class ChatViewModel: ObservableObject {
     /// (the generic reply carries no request id to disambiguate further —
     /// same limitation `mergeFeedbackNotice`'s doc comment describes for
     /// success). Read by the review-guide viewer header, which — unlike the
-    /// board card — has no other surface for `workErrorMessage`'s modal
-    /// alert. Cleared on a fresh `mergeWhenReady(for:)` attempt, on
+    /// board card — has no other surface for `workErrorMessage`'s chrome
+    /// banner. Cleared on a fresh `mergeWhenReady(for:)` attempt, on
     /// `.mergeWhenReadyAccepted`, and via `clearMergeError(for:)`.
     @Published var mergeErrorNoticesByTaskID: [String: String] = [:]
 
