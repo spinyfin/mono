@@ -397,20 +397,22 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
     });
     let (read, mut write) = client.into_split();
     let sender = tokio::spawn(async move {
-        let mut sent = 0;
-        let mut frames = Vec::new();
+        // Batch the frames into one write: Linux charges per-write socket
+        // bookkeeping against SO_SNDBUF, so 320 tiny writes can exhaust the
+        // buffer even though their payload fits. The reader is deliberately
+        // paused here; it cannot free that space until pipelining completes.
+        let mut frames = String::new();
         for index in 0..320 {
             let request = FrontendRequestEnvelope {
                 request_id: format!("saturated-{index}"),
                 payload: FrontendRequest::ListProducts,
             };
-            frames.extend_from_slice(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes());
-            sent += 1;
+            frames.push_str(&serde_json::to_string(&request).unwrap());
+            frames.push('\n');
         }
-        // Batch the frames so per-write kernel accounting cannot exhaust the
-        // socket buffer before reads begin, even though the payload fits.
-        write.write_all(&frames).await.unwrap();
-        (write, sent)
+        assert!(frames.len() < capacity as usize);
+        write.write_all(frames.as_bytes()).await.unwrap();
+        (write, 320)
     });
     let (write, sent) = tokio::time::timeout(Duration::from_secs(5), sender)
         .await
