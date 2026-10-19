@@ -79,8 +79,8 @@ pub enum RecordOutcome {
     CapExceeded,
 }
 
-/// Per-execution state. Two independent views over the same abandoned-command
-/// stream, because they answer two different questions with two different
+/// Per-execution state. Independent views over the same abandoned-command
+/// stream, because they answer different questions with different
 /// lifetimes:
 ///
 /// - `commands` is the permanent, capped **audit trail** — every distinct
@@ -92,11 +92,14 @@ pub enum RecordOutcome {
 ///   command been staged since the gate last consumed this flag?" It is
 ///   uncapped (setting it never fails) and self-clearing — see
 ///   [`UnobservedCommandTracker::consume_unresolved`].
+/// - `proposal_needs_observation` schedules recovery of an abandoned submission,
+///   even when its command text was already recorded or the audit trail is full.
 #[derive(Debug, Default)]
 struct ExecutionState {
     commands: Vec<String>,
     unresolved: bool,
     overflowed: bool,
+    proposal_needs_observation: bool,
 }
 
 /// In-memory `execution_id → abandoned commands` staging map. Populated by
@@ -163,6 +166,11 @@ impl UnobservedCommandTracker {
     pub fn record(&self, execution_id: &str, command: &str) -> RecordOutcome {
         let mut guard = self.inner.lock().expect("UnobservedCommandTracker mutex poisoned");
         let state = guard.entry(execution_id.to_owned()).or_default();
+        // Independent of audit deduplication: the same proposal retry can
+        // be abandoned again on a later turn.
+        if crate::proposal_channel_error::is_boss_propose_submit_command(&serde_json::json!({"command": command})) {
+            state.proposal_needs_observation = true;
+        }
         if state.commands.iter().any(|existing| existing == command) {
             return RecordOutcome::Duplicate;
         }
@@ -174,6 +182,15 @@ impl UnobservedCommandTracker {
         state.commands.push(command.to_owned());
         state.unresolved = true;
         RecordOutcome::Staged
+    }
+
+    /// Consume proposal recovery independently of the capped audit trail
+    /// and the no-op evidence gate.
+    pub fn take_unobserved_proposal(&self, execution_id: &str) -> bool {
+        let mut guard = self.inner.lock().expect("UnobservedCommandTracker mutex poisoned");
+        guard
+            .get_mut(execution_id)
+            .is_some_and(|state| std::mem::take(&mut state.proposal_needs_observation))
     }
 
     /// Every abandoned command staged for `execution_id`, oldest first,
@@ -265,6 +282,28 @@ pub fn register_metrics(registry: &crate::metrics::Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proposal_recovery_rearms_independently_of_audit_and_no_op_gate() {
+        let tracker = UnobservedCommandTracker::new();
+        let command = "\"$BOSS_BIN\" propose done --outcome delivered";
+        tracker.record("exec_1", command);
+        assert!(tracker.take_unobserved_proposal("exec_1"));
+        assert!(!tracker.take_unobserved_proposal("exec_1"));
+        assert!(tracker.consume_unresolved("exec_1"));
+        assert_eq!(tracker.record("exec_1", command), RecordOutcome::Duplicate);
+        assert!(tracker.take_unobserved_proposal("exec_1"));
+        assert!(!tracker.consume_unresolved("exec_1"));
+        for i in 0..MAX_COMMANDS_PER_EXECUTION {
+            tracker.record("exec_2", &format!("cmd-{i}"));
+        }
+        assert_eq!(tracker.record("exec_2", command), RecordOutcome::CapExceeded);
+        assert!(tracker.take_unobserved_proposal("exec_2"));
+        assert!(!tracker.take_unobserved_proposal("exec_other"));
+        tracker.record("exec_3", "echo 'boss propose done'");
+        tracker.record("exec_3", "bazel test //tools/boss/engine/...");
+        assert!(!tracker.take_unobserved_proposal("exec_3"));
+    }
 
     #[test]
     fn records_and_lists_distinct_commands() {

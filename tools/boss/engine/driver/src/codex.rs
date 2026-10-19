@@ -370,6 +370,16 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>`\n\
      before you end the turn.\n\
      \n\
+     Every `boss propose ...` command, including `boss propose pr-created ...`,\n\
+     `propose wait`, and terminal `propose done`, MUST run to completion.\n\
+     This also applies to any other boss command whose result determines the\n\
+     run's outcome, even when you expect it to take less than ten seconds.\n\
+     Use `yield_time_ms: 30000`; if it yields a session or cell, keep polling\n\
+     until the command exits. Inspect the exit code AND printed result. On\n\
+     failure, fix the reported cause and retry; never end the turn with an\n\
+     unobserved submission. Accepted terminal declarations may end the run\n\
+     before a response arrives; if still running, keep observing the call.\n\
+     \n\
      **Do not invent a budget.** Nothing in this session meters your runtime,\n\
      your turns, or your tokens, and you are not the accountant for any of\n\
      them. Never infer a budget from your own context usage or from how long\n\
