@@ -1,0 +1,12 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+# Exercises the per-host heavy-Bazel lock that ci-env.sh takes on Mac CI
+# hosts: acquire/release, waiting behind a live holder, reclaiming stale
+# locks, and the EXIT-trap release. Forces the lock on so it runs the same
+# on Linux and macOS.
+sh_test(
+    name = "host_bazel_lock_test",
+    size = "small",
+    srcs = ["host_bazel_lock_test.sh"],
+    data = ["//.buildkite/steps:host-bazel-lock.sh"],
+)

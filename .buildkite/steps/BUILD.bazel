@@ -1,0 +1,6 @@
+# The CI step scripts are run by the Buildkite agent, not built by Bazel. The
+# host lock library is exported only so its test package can exercise it.
+exports_files(
+    ["host-bazel-lock.sh"],
+    visibility = ["//.buildkite/steps/tests:__pkg__"],
+)

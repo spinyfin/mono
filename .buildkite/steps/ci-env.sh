@@ -2,6 +2,14 @@
 
 OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
 
+# One heavy Bazel job per Mac host at a time. Every step that runs Bazel
+# sources this file, so taking the host lock here — before the repobin
+# install below starts the first Bazel server — covers every such step
+# without per-step wiring. Held until the step exits (EXIT trap). No-op on
+# Linux. See host-bazel-lock.sh and ../mac-agents-runbook.md.
+source "$(dirname "${BASH_SOURCE[0]}")/host-bazel-lock.sh"
+host_bazel_lock_acquire
+
 export REPOBIN_BAZEL_FLAGS="--config=ci-${OS_TYPE}"
 
 # Bazel daemon idle TTL for every CI pipeline and OS: 30 minutes, so idle

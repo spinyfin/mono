@@ -23,11 +23,14 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     checkleft-release.sh   # checkleft prebuilt-binary release (prepare/linux/musl/darwin phases)
     release-release.sh     # shared release tool prebuilt-binary release
     ci-env.sh              # shared env/toolchain setup sourced by other steps
+    host-bazel-lock.sh     # one heavy Bazel job per Mac host at a time (taken by ci-env.sh)
+    tests/                 # bazel sh_tests for the step scripts (host_bazel_lock_test)
     integrity-commit-delta.sh # mono-integrity: commit-delta check
     integrity-bazel.sh        # mono-integrity: full bazel build + test
     integrity-checkleft.sh    # mono-integrity: checkleft check
   README.md               # this file
   linux-agents-runbook.md # Linux bazel-any host config + maintenance runbook
+  mac-agents-runbook.md   # Mac host layout, the one-heavy-job-per-host rule, host config
   gce-agent-runbook.md    # Standing up a new Linux CI agent on GCE
 ```
 
@@ -47,7 +50,11 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
 
 ### `ci-env.sh`
 
-Sourced by other steps to set up the shared bazel wrapper and CI config rather than run standalone. Sets `CI_BAZEL_STARTUP_FLAGS` (which carries `--max_idle_secs=1800` for every pipeline and OS, CI only, so idle Bazel servers release memory after 30 minutes; the single source of truth for bazel startup options in CI — every code path that shells out to bazel must read from here or the workspace ends up running two daemons at once), detects and recovers from stale-Xcode-cache failures on macOS, and installs `repobin` tools into `bin/`.
+Sourced by other steps to set up the shared bazel wrapper and CI config rather than run standalone. Takes the per-host heavy-Bazel lock on macOS before anything else (see `host-bazel-lock.sh` below), sets `CI_BAZEL_STARTUP_FLAGS` (which carries `--max_idle_secs=1800` for every pipeline and OS, CI only, so idle Bazel servers release memory after 30 minutes; the single source of truth for bazel startup options in CI — every code path that shells out to bazel must read from here or the workspace ends up running two daemons at once), detects and recovers from stale-Xcode-cache failures on macOS, and installs `repobin` tools into `bin/`.
+
+### `host-bazel-lock.sh`
+
+Enforces **one heavy Bazel job per Mac host at a time**. "Heavy" is any step that runs Bazel — a build, a test, or a checkleft run (whose `lint/rust` check builds the clippy aspect through Bazel) — which in this repo is exactly the set of steps that source `ci-env.sh`. On Darwin, `ci-env.sh` takes a host-wide `mkdir` lock under `${HOME}/.cache/buildkite-host-bazel-lock/` before the first Bazel invocation and holds it until the step exits; a second heavy job scheduled onto the same host parks with a visible `--- [host-bazel-lock] waiting` group in its log until the first finishes. Linux hosts are not throttled. Stale locks (dead pid, pre-reboot, over 3 h) are reclaimed automatically. The library is self-contained so sibling repos sharing the Mac hosts (appoint, flunge) can copy it verbatim; the lock directory is the cross-pipeline contract. Background, measurements, host configuration and the adoption checklist are in [`mac-agents-runbook.md`](mac-agents-runbook.md).
 
 ### `bazel-build-test.sh`
 
@@ -62,6 +69,8 @@ Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped
 Most steps run on the `bazel-any` queue (`${BUILDKITE_ANY_QUEUE:-bazel-any}` in `pipeline.yml`), a heterogeneous fleet mixing personal Macs and Linux cloud agents — see "Pushing from CI" below for why that matters. `mac-app-build` and `boss-release` pin to `macos-arm64` (`${BUILDKITE_MACOS_QUEUE:-macos-arm64}`) since they need a real Mac toolchain. Each step's `ci-env.sh` / inline setup handles hermetic Rust and Bazel provisioning; see [`gce-agent-runbook.md`](gce-agent-runbook.md) for the real Linux host requirements.
 
 For the Linux `bazel-any` hosts specifically — host inventory, the unprivileged-user-namespace requirement `linux-sandbox` depends on, the Bazel-server-restart procedure, and safe maintenance steps — see [`linux-agents-runbook.md`](linux-agents-runbook.md).
+
+The Mac hosts (`anaplian`, `skaffen`) each run two `macos-arm64` agents and two `bazel-any` agents, so up to four jobs can land on one 16 GB machine; a commit that invalidates `engine_lib` then has every one of them compile it at once, which has exhausted memory and timed out jobs repeatedly. Heavy jobs on a Mac host are therefore serialised by `host-bazel-lock.sh` (above). Host inventory, the agent process layout, the recommended one-spawn-per-queue host configuration and the measurements are in [`mac-agents-runbook.md`](mac-agents-runbook.md).
 
 ## Pushing from CI (queue heterogeneity and push identity)
 

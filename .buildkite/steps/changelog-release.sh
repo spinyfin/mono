@@ -627,7 +627,9 @@ phase_publish() {
 
 main() {
   local phase="${1:-}"
-  trap cleanup EXIT
+  # Replacing the EXIT trap would drop the host lock release that ci-env.sh
+  # installed; chain it so the darwin phase frees the host promptly.
+  trap 'cleanup; host_bazel_lock_release' EXIT
   case "${phase}" in
     prepare) phase_prepare ;;
     linux)   phase_linux ;;
