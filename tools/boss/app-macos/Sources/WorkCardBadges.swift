@@ -16,7 +16,7 @@ struct RepoChipView: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .fixedSize(horizontal: false, vertical: true)
         .foregroundStyle(Color(nsColor: .labelColor))
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
@@ -69,7 +69,7 @@ struct ExternalRefLinkView: View {
                 ? "Upstream issue (stale): \(presentation.label)"
                 : "Open upstream issue: \(presentation.label)")
             .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -90,7 +90,7 @@ struct ConflictClearedBadge: View {
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .fixedSize(horizontal: false, vertical: true)
         .foregroundStyle(Color.green)
         .help("The engine cleared a merge conflict on this PR within the last 24 hours.")
         .accessibilityLabel("Conflict cleared by the engine")
@@ -111,7 +111,7 @@ struct CIAutoFixedBadge: View {
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .fixedSize(horizontal: false, vertical: true)
         .foregroundStyle(Color.green)
         .help("The engine auto-fixed a CI failure on this PR within the last 24 hours.")
         .accessibilityLabel("CI auto-fixed by the engine")
@@ -171,7 +171,7 @@ struct CIFailureChip: View {
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .fixedSize(horizontal: false, vertical: true)
         .foregroundStyle(color)
         .help(tooltip)
         .accessibilityLabel(tooltip)
@@ -629,7 +629,7 @@ struct PrInRevisionIndicator: View {
         .padding(.vertical, 3)
         .background(isBlocked ? Color.red : Color.orange)
         .clipShape(Capsule())
-        .fixedSize()
+        .fixedSize(horizontal: false, vertical: true)
 
         Group {
             if let onTap {
@@ -819,6 +819,8 @@ struct AIReviewStateBadge: View {
         let label = Label(presentation.label, systemImage: presentation.systemImage)
             .font(.caption2.weight(.semibold))
             .foregroundStyle(tint)
+            .lineLimit(1)
+            .truncationMode(.tail)
 
         Group {
             if state == "reviewed_with_findings", let onRevealFindings {
