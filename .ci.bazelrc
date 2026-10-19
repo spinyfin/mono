@@ -17,8 +17,9 @@ build:ci --announce_rc
 # only take effect if something passed `--config=ci` as a startup flag (i.e.
 # before the subcommand) -- nothing does; `--config=ci-<os>` is always passed
 # as a build/test flag after the subcommand, which only reaches `build:ci`/
-# `test:ci` lines. Per-pipeline idle TTL is set directly on the command line
-# instead -- see CI_BAZEL_STARTUP_FLAGS in .buildkite/steps/ci-env.sh.
+# `test:ci` lines. The idle TTL (--max_idle_secs=1800, the same for every CI
+# pipeline and OS) is set on the command line instead -- see
+# CI_BAZEL_STARTUP_FLAGS in .buildkite/steps/ci-env.sh.
 
 # Linux cache configuration
 build:ci-linux --config=ci
