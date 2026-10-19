@@ -225,3 +225,34 @@ fn sixty_one_concurrent_resolvers_allow_writes_and_release_before_workspace_look
         improved_start.elapsed().as_millis()
     );
 }
+
+#[test]
+fn open_kind_probe_uses_partial_index_over_large_resolved_history() {
+    let (_dir, path) = disk_db_path("attention-open-kind-plan");
+    let db = WorkDb::open(path).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch(
+        "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<20000)
+         INSERT INTO work_attention_items(id,work_item_id,kind,status,title,body_markdown,created_at)
+         SELECT 'a-'||i,'item-'||i,'k'||(i%5),'resolved','t','b',CAST(i AS TEXT) FROM n",
+    )
+    .unwrap();
+    let plan: Vec<String> = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM work_attention_items WHERE status = 'open' AND kind = ?1)",
+        )
+        .unwrap()
+        .query_map(["k1"], |row| row.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("work_attention_items_open_kind_idx")),
+        "{plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.contains("SCAN work_attention_items")),
+        "{plan:?}"
+    );
+}

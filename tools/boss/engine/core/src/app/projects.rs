@@ -165,8 +165,10 @@ pub(super) async fn handle_resolve_project_design_doc(ctx: Dispatch, req: Fronte
         let leased_repo_paths = match work_db.list_in_flight_repo_workspaces() {
             Ok(paths) => paths,
             Err(err) => {
-                send_work_error(&sink, &request_id, &err);
-                return;
+                // The workspace map is only a fast path; resolved/broken state
+                // and the web URL do not depend on it.
+                tracing::warn!(error = %err, "design doc resolve: in-flight workspace lookup failed; resolving without it");
+                Default::default()
             }
         };
         match work_db.resolve_project_design_doc(&project_id, |repo| leased_repo_paths.get(repo).cloned()) {

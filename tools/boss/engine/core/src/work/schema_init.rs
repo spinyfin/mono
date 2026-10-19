@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 47;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 48;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -43,10 +43,15 @@ const TASKS_CRITICAL_PROVENANCE_46: &str = "ALTER TABLE tasks ADD COLUMN critica
 const TASKS_PR_URL_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS tasks_pr_url_idx ON tasks(pr_url) WHERE pr_url IS NOT NULL";
 
-const IN_FLIGHT_WORKSPACES_INDEX_SQL: &str = "CREATE INDEX work_executions_in_flight_idx
+const IN_FLIGHT_WORKSPACES_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS work_executions_in_flight_idx
      ON work_executions(created_at, id, repo_remote_url, workspace_path)
      WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
        AND cube_lease_id IS NOT NULL";
+
+/// Lets attention reconcile prove a kind has no open rows without scanning
+/// the resolved history.
+const ATTENTION_OPEN_KIND_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS work_attention_items_open_kind_idx ON work_attention_items(kind) WHERE status = 'open'";
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -152,6 +157,9 @@ impl WorkDb {
         }
         if version < 47 {
             tx.execute_batch(IN_FLIGHT_WORKSPACES_INDEX_SQL)?;
+        }
+        if version < 48 {
+            tx.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -716,6 +724,9 @@ mod floor_tests {
             if version >= 47 {
                 conn.execute_batch(IN_FLIGHT_WORKSPACES_INDEX_SQL).unwrap();
             }
+            if version >= 48 {
+                conn.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -750,6 +761,7 @@ mod floor_tests {
             expected.execute_batch(TASKS_PR_UPDATED_AT_45).unwrap();
             expected.execute_batch(TASKS_CRITICAL_PROVENANCE_46).unwrap();
             expected.execute_batch(IN_FLIGHT_WORKSPACES_INDEX_SQL).unwrap();
+            expected.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {
