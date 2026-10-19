@@ -141,15 +141,10 @@ struct WorkersDetailView: View, @MainActor Equatable {
     private func idleCells(area: CGSize) -> some View {
         if !grid.layout.isEmpty, let page = grid.layout.pages.first(where: { $0.index == grid.layout.selectedPage }) {
             ForEach(grid.idleCells(for: page), id: \.localIndex) { idle in
+                let frame = cellFrame(page: page, localIndex: idle.localIndex, area: area)
                 IdleCrewView(persona: idle.persona, title: idle.persona, flavorCycle: idle.flavorCycle, compact: true)
-                    .frame(
-                        width: cellFrame(page: page, localIndex: idle.localIndex, area: area).width,
-                        height: cellFrame(page: page, localIndex: idle.localIndex, area: area).height
-                    )
-                    .offset(
-                        x: cellFrame(page: page, localIndex: idle.localIndex, area: area).minX,
-                        y: cellFrame(page: page, localIndex: idle.localIndex, area: area).minY
-                    )
+                    .frame(width: frame.width, height: frame.height)
+                    .offset(x: frame.minX, y: frame.minY)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
