@@ -4,19 +4,11 @@ OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
 
 export REPOBIN_BAZEL_FLAGS="--config=ci-${OS_TYPE}"
 
-# Per-pipeline bazel daemon idle TTL. Low-immediacy pipelines (checkleft-release,
-# integrity) run on a cron/manual cadence where a cold start doesn't matter;
-# give them a short TTL so their daemon frees its memory ~15min after the last
-# invocation instead of lingering for bazel's multi-hour default. The hot `mono`
-# PR pipeline keeps a long TTL so back-to-back PR builds stay warm.
-case "${BUILDKITE_PIPELINE_SLUG:-}" in
-  mono-checkleft-release | mono-changelog-release | mono-repobin-release | mono-integrity | mono-release)
-    BAZEL_MAX_IDLE_SECS=900
-    ;;
-  *)
-    BAZEL_MAX_IDLE_SECS=7200
-    ;;
-esac
+# Bazel daemon idle TTL for every CI pipeline and OS: 30 minutes, so idle
+# servers on shared CI hosts (e.g. 16 GB Macs) release their memory. This is a
+# startup option set only here (CI), never in an rc file a developer's plain
+# `bazel` reads; startup options can't be selected via --config.
+BAZEL_MAX_IDLE_SECS=1800
 
 BAZEL_STARTUP_FLAGS="--max_idle_secs=${BAZEL_MAX_IDLE_SECS}"
 
