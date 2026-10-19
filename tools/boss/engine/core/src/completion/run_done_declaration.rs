@@ -141,7 +141,51 @@ impl WorkerCompletionHandler {
     /// transaction, so a replayed call (the same idempotency key resubmitted
     /// after a crash between apply and this call) safely no-ops instead of
     /// double-tearing-down.
+    ///
+    /// Holds the same per-execution lock as the Stop boundary, so a worker
+    /// turn-end arriving while this finalize is in flight waits for it and
+    /// then runs against the resolved state instead of racing it.
     pub async fn finalize_declared_run_done(
+        &self,
+        execution_id: &str,
+        outcome: boss_protocol::RunDoneOutcome,
+    ) -> StopOutcome {
+        let lock = self.boundary_lock(execution_id);
+        let _boundary = lock.lock().await;
+        self.finalize_declared_run_done_locked(execution_id, outcome).await
+    }
+
+    /// [`Self::finalize_declared_run_done`], repeated while the finalize's
+    /// own DB write fails ([`StopOutcome::DbError`]). The declaration stamp
+    /// is the durable pending-finalize record; the run must still reach a
+    /// terminal state without the worker doing anything. Every failure is
+    /// logged at error level. There is deliberately no attempt cap (none has
+    /// been measured); only the delay between attempts is bounded.
+    pub async fn finalize_declared_run_done_until_resolved(
+        &self,
+        execution_id: &str,
+        outcome: boss_protocol::RunDoneOutcome,
+    ) -> StopOutcome {
+        let mut delay = std::time::Duration::from_millis(500);
+        let mut attempt = 0u64;
+        loop {
+            let result = self.finalize_declared_run_done(execution_id, outcome).await;
+            if result != StopOutcome::DbError {
+                return result;
+            }
+            attempt += 1;
+            tracing::error!(
+                execution_id,
+                attempt,
+                retry_in_ms = delay.as_millis() as u64,
+                "run_done finalize failed on a DB error; the declaration is still stamped, retrying",
+            );
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(30));
+        }
+    }
+
+    async fn finalize_declared_run_done_locked(
         &self,
         execution_id: &str,
         outcome: boss_protocol::RunDoneOutcome,

@@ -718,6 +718,20 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                                 .finalize_declared_run_done(&caller.execution_id, run_done_payload.outcome),
                         )
                         .await;
+                        if stop_outcome == crate::completion::StopOutcome::DbError {
+                            // The stamp is durable but the finalize write failed:
+                            // keep retrying in the background so the run never
+                            // strands open waiting on the worker.
+                            let handler = Arc::clone(&server_state.completion_handler);
+                            let execution_id = caller.execution_id.clone();
+                            let outcome = run_done_payload.outcome;
+                            tokio::spawn(async move {
+                                let resolved = handler
+                                    .finalize_declared_run_done_until_resolved(&execution_id, outcome)
+                                    .await;
+                                tracing::info!(%execution_id, ?resolved, "run_done finalize resolved after retry");
+                            });
+                        }
                         tracing::info!(
                             execution_id = %caller.execution_id,
                             outcome = %run_done_payload.outcome,
