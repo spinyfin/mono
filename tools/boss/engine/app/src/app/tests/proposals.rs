@@ -1424,6 +1424,9 @@ mod no_op_declarations;
 #[path = "run_done_finalize_retry.rs"]
 mod run_done_finalize_retry;
 
+#[path = "unobserved_proposals.rs"]
+mod unobserved_proposals;
+
 #[path = "spoke_projection.rs"]
 mod spoke_projection;
 

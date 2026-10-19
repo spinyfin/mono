@@ -70,10 +70,15 @@ fn rollout_fixture_tool_heavy() -> Vec<Value> {
     lines
 }
 
-/// A code-mode cell written in JavaScript object shorthand (so the command
-/// cannot be recovered from it and the whole script stands in for the
-/// command) that batches ten reads and runs past the redactor's per-value
-/// ceiling.
+fn shorthand_cell_command_heads() -> Vec<String> {
+    (0..10)
+        .map(|i| format!("sed -n '{a},{b}p'", a = i * 100 + 1, b = (i + 1) * 100))
+        .collect()
+}
+
+/// A code-mode cell written in JavaScript object shorthand. Static argument
+/// objects expose their actual shell commands, including unquoted keys; ten
+/// reads in one cell become one joined command list for the summarizer.
 fn big_shorthand_cell(call_id: &str) -> Vec<Value> {
     let mut script = String::new();
     for i in 0..10 {
@@ -87,6 +92,26 @@ fn big_shorthand_cell(call_id: &str) -> Vec<Value> {
     assert!(
         script.len() > live_status_redact::MAX_VALUE_BYTES,
         "fixture must exceed the per-value ceiling: {}",
+        script.len()
+    );
+    completed_cell(call_id, &script, &"// rust\n".repeat(400))
+}
+
+/// A cell whose `cmd` is a dynamic expression, so the parser yields nothing
+/// and the whole script stands in for the command. Sized past the redactor's
+/// per-value ceiling so the truncated preview still has to keep a command head.
+fn big_dynamic_cell(call_id: &str) -> Vec<Value> {
+    let mut script = String::new();
+    for i in 0..10 {
+        script.push_str(&format!(
+            "const r{i} = await tools.exec_command({{cmd: command{i}, workdir: \"/Users/operator/.local/share/cube/workspaces/mono-agent-677\", yield_time_ms: 30000, max_output_tokens: 2000}});\n"
+        ));
+    }
+    script.push_str("text([r0,r1,r2,r3,r4,r5,r6,r7,r8,r9].map(r => r.output).join('\\n'));");
+    script.push_str(&format!("/* {} */", "pad".repeat(200)));
+    assert!(
+        script.len() > live_status_redact::MAX_VALUE_BYTES,
+        "dynamic fixture must exceed the per-value ceiling: {}",
         script.len()
     );
     completed_cell(call_id, &script, &"// rust\n".repeat(400))
@@ -138,17 +163,33 @@ fn codex_oversize_cell_scripts_keep_their_tool_calls_in_the_prompt() {
     for i in 0..4 {
         raw.extend(big_shorthand_cell(&format!("call_{i}")));
     }
+    raw.extend(big_dynamic_cell("call_dynamic"));
     let normalized = normalize_like_slot_loop(raw);
     let prompt = redact_and_assemble(&normalized);
-    // Each oversize cell still contributes its call line and its result line.
-    assert_eq!(tool_call_lines(&prompt).len(), 4, "{prompt}");
-    assert_eq!(tool_result_lines(&prompt).len(), 4, "{prompt}");
+    // Four decoded shorthand cells plus one dynamic-fallback cell. The
+    // renderer clips a multi-command cell to a preview, so the load-bearing
+    // check is that each call line keeps a command head.
+    assert_eq!(tool_call_lines(&prompt).len(), 5, "{prompt}");
+    assert_eq!(tool_result_lines(&prompt).len(), 5, "{prompt}");
+    let mut decoded = 0;
+    let mut dynamic = 0;
     for line in tool_call_lines(&prompt) {
-        assert!(line.contains("exec_command"), "call line lost its command head: {line}");
-        assert!(line.contains("sed -n"), "call line lost its command head: {line}");
+        if line.contains("sed -n '1,100p'") {
+            decoded += 1;
+            continue;
+        }
+        assert!(
+            line.contains("exec_command"),
+            "dynamic fallback lost its command head: {line}"
+        );
+        dynamic += 1;
     }
-    // The ceiling still holds: the script body never reaches the prompt.
-    assert!(!prompt.contains("yield_time_ms: 30000, max_output_tokens"), "{prompt}");
+    assert_eq!(decoded, 4, "{prompt}");
+    assert_eq!(dynamic, 1, "{prompt}");
+    assert!(
+        prompt.contains(&shorthand_cell_command_heads()[0]),
+        "first decoded command missing from {prompt}"
+    );
 }
 
 #[tokio::test]
