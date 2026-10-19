@@ -644,6 +644,23 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
+        // Concrete unfinished work must not wait through the generic silence
+        // horizon, which live descendants can extend indefinitely. A durable
+        // declaration still belongs to the submit finalizer/recovery paths.
+        if !defer_finalization
+            && self.staged_unobserved_commands.take_unobserved_proposal(execution_id)
+            && matches!(self.work_db.execution_run_done_outcome(execution_id), Ok(None))
+        {
+            self.detect_and_file_unobserved_command_signal(&execution).await;
+            return self.nudge_or_park(
+                &execution,
+                "Your turn ended with an unobserved boss propose command. Poll its existing session or cell until it exits and inspect the printed result. If it failed or the session is gone, check the proposal status and retry the submission if needed. Do not infer acceptance from your final summary. Run boss propose commands to completion, including pr-created, wait, and done; if your work is finished, submit the appropriate done outcome as your last action.",
+                "codex-unobserved-proposal",
+                None,
+                StopOutcome::AwaitingInput,
+            ).await;
+        }
+
         // Maint task 6: an `automation_triage` execution never opens a PR.
         // Its Stop is resolved by the marker-protocol outcome detector
         // (`automation: task <id>` / `automation: skip — …`), not by PR
