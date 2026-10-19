@@ -3,9 +3,14 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{ImplItem, ItemImpl, ReturnType, Type, parse_macro_input};
 
+mod read_transactions;
+
 #[proc_macro_attribute]
 pub fn instrument(_args: TokenStream, input: TokenStream) -> TokenStream {
     let mut implementation = parse_macro_input!(input as ItemImpl);
+    if let Err(error) = read_transactions::validate(&implementation) {
+        return error.into_compile_error().into();
+    }
     for item in &mut implementation.items {
         let ImplItem::Fn(method) = item else { continue };
         let ReturnType::Type(_, ty) = &method.sig.output else {

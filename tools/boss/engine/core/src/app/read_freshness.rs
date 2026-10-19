@@ -88,6 +88,17 @@ mod tests {
     }
 
     #[test]
+    fn newer_failure_does_not_replace_older_success() {
+        let mut reads = ReadFreshness::default();
+        reads.begin("old", "document".into());
+        reads.begin("new", "document".into());
+        reads.cancel("new");
+        assert_eq!(reads.finish("old", "loaded"), "loaded");
+        assert!(reads.views.is_empty());
+        assert!(reads.requests.is_empty());
+    }
+
+    #[test]
     fn newer_completion_can_advance_an_older_completed_snapshot() {
         let mut reads = ReadFreshness::default();
         reads.begin("old", "products".into());

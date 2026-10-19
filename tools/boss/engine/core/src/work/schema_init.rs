@@ -291,6 +291,8 @@ impl WorkDb {
     /// Give an admitted frontend query its own connection, preserving the
     /// shared WorkDb write semantics and event bus. Board reads use reader();
     /// read-only snapshots on any connection must explicitly use Deferred.
+    /// The WorkDb boundary macro rejects implicit transactions in get_/list_/
+    /// query_ helpers at compile time so they cannot inherit the writer default.
     pub(crate) fn query_connection(&self) -> Result<Self> {
         if self.memory.is_some() {
             return Ok(self.clone());

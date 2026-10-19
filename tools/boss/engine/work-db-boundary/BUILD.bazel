@@ -1,11 +1,27 @@
-load("@rules_rust//rust:defs.bzl", "rust_proc_macro")
+load("@rules_rust//rust:defs.bzl", "rust_proc_macro", "rust_test")
 
 rust_proc_macro(
     name = "work_db_boundary",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/lib.rs",
+        "src/read_transactions.rs",
+    ],
     edition = "2024",
     visibility = ["//tools/boss/engine/core:__pkg__"],
     deps = [
+        "@@rules_rust++crate+mono_crates__proc-macro2-1.0.106//:proc_macro2",
+        "@@rules_rust++crate+mono_crates__quote-1.0.45//:quote",
+        "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
+    ],
+)
+
+rust_test(
+    name = "read_transactions_test",
+    size = "small",
+    srcs = ["src/read_transactions.rs"],
+    edition = "2024",
+    deps = [
+        "@@rules_rust++crate+mono_crates__proc-macro2-1.0.106//:proc_macro2",
         "@@rules_rust++crate+mono_crates__quote-1.0.45//:quote",
         "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
     ],
