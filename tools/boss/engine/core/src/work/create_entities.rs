@@ -227,28 +227,56 @@ impl WorkDb {
         Ok(project)
     }
 
+    /// Engine-internal create (sweeps, automations, follow-up minting):
+    /// resolves to the `'engine'` actor, so a `critical` priority is
+    /// refused — see [`super::critical_priority`]. RPC handlers that have
+    /// resolved the caller tier use [`Self::create_task_as_actor`].
     pub fn create_task(&self, input: CreateTaskInput) -> Result<Task> {
+        self.create_task_as_actor(input, boss_protocol::LAST_STATUS_ACTOR_ENGINE)
+    }
+
+    /// Like [`Self::create_task`] with the resolved caller tier; only
+    /// `'human'` may create the row at `critical`.
+    pub fn create_task_as_actor(&self, input: CreateTaskInput, actor: &str) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let task = insert_task_in_tx(&tx, input)?;
+        let task = insert_task_in_tx_as_actor(&tx, input, actor)?;
         tx.commit()?;
         Ok(task)
     }
 
+    /// Engine-internal create — see [`Self::create_task`] for the actor rule.
     pub fn create_chore(&self, input: CreateChoreInput) -> Result<Task> {
+        self.create_chore_as_actor(input, boss_protocol::LAST_STATUS_ACTOR_ENGINE)
+    }
+
+    /// Like [`Self::create_chore`] with the resolved caller tier; only
+    /// `'human'` may create the row at `critical`.
+    pub fn create_chore_as_actor(&self, input: CreateChoreInput, actor: &str) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let chore = insert_chore_in_tx(&tx, input)?;
+        let chore = insert_chore_in_tx_as_actor(&tx, input, actor)?;
         tx.commit()?;
         Ok(chore)
     }
 
     /// Create a `kind = 'investigation'` task. Parallel to `create_chore`
     /// but uses the `investigation` kind and supports an optional `project_id`.
+    /// Engine-internal — see [`Self::create_task`] for the actor rule.
     pub fn create_investigation(&self, input: boss_protocol::CreateInvestigationInput) -> Result<Task> {
+        self.create_investigation_as_actor(input, boss_protocol::LAST_STATUS_ACTOR_ENGINE)
+    }
+
+    /// Like [`Self::create_investigation`] with the resolved caller tier;
+    /// only `'human'` may create the row at `critical`.
+    pub fn create_investigation_as_actor(
+        &self,
+        input: boss_protocol::CreateInvestigationInput,
+        actor: &str,
+    ) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let task = insert_investigation_in_tx(&tx, input)?;
+        let task = insert_investigation_in_tx_as_actor(&tx, input, actor)?;
         tx.commit()?;
         Ok(task)
     }
@@ -334,6 +362,10 @@ impl WorkDb {
     /// rolls back the entire batch (no partial state). Errors are
     /// annotated with the offending item index so the CLI can map
     /// them back to the input file.
+    ///
+    /// Batch creates are the planner / import path and carry no caller
+    /// tier, so an item at priority `critical` is refused (with the
+    /// `'engine'` tier named); a human raises such a row afterwards.
     pub fn create_many_tasks(&self, input: CreateManyTasksInput) -> Result<Vec<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;

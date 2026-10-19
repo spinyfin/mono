@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 45;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 46;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -31,6 +31,12 @@ pub(in crate::work) const EXECUTION_BOOKMARK_COLUMNS_43: &str =
 /// Schema 45: GitHub's `updatedAt` for the task's PR, written by the merge
 /// poller. The Review column orders its Pending section by it.
 const TASKS_PR_UPDATED_AT_45: &str = "ALTER TABLE tasks ADD COLUMN pr_updated_at TEXT";
+
+/// Schema 46: provenance of a raise to the human-only `critical`
+/// priority — the resolved caller tier and the timestamp. Both NULL
+/// unless `priority = 'critical'`; see `work/critical_priority.rs`.
+const TASKS_CRITICAL_PROVENANCE_46: &str = "ALTER TABLE tasks ADD COLUMN critical_set_by TEXT;
+     ALTER TABLE tasks ADD COLUMN critical_set_at TEXT";
 
 /// Serves the shared-PR probes (`o.pr_url = t.pr_url`, `pr_url = ?`) so they
 /// are index lookups instead of full `tasks` scans.
@@ -132,6 +138,12 @@ impl WorkDb {
         }
         if version < 45 {
             tx.execute_batch(TASKS_PR_UPDATED_AT_45)?;
+        }
+        // Guarded so a replay against a database that already carries the
+        // columns (the downgrade-and-reopen test fixtures reset only
+        // `schema_version`) is a no-op rather than a duplicate-column error.
+        if version < 46 && !table_has_column(&tx, "tasks", "critical_set_by")? {
+            tx.execute_batch(TASKS_CRITICAL_PROVENANCE_46)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -514,7 +526,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+/// Whether `table` currently has a column named `column`. Used by the
+/// idempotent schema-46 migration in `init` and by migration tests.
 pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -676,6 +689,9 @@ mod floor_tests {
             if version >= 45 {
                 conn.execute_batch(TASKS_PR_UPDATED_AT_45).unwrap();
             }
+            if version >= 46 {
+                conn.execute_batch(TASKS_CRITICAL_PROVENANCE_46).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -708,6 +724,7 @@ mod floor_tests {
             expected.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap();
             expected.execute_batch(TASKS_PR_URL_INDEX_SQL).unwrap();
             expected.execute_batch(TASKS_PR_UPDATED_AT_45).unwrap();
+            expected.execute_batch(TASKS_CRITICAL_PROVENANCE_46).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

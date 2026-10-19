@@ -529,7 +529,8 @@ pub(crate) fn resolve_revision_on_parent_close(
             .maybe_description(Some(description))
             .maybe_effort_level(rev.effort_level)
             .maybe_model_override(rev.model_override.clone())
-            .maybe_priority(Some(rev.priority.clone()))
+            // Never `critical`: the escape hatch is human-granted per row.
+            .maybe_priority(Some(super::critical_priority::inherited_priority(&rev.priority)))
             .maybe_repo_remote_url(rev.repo_remote_url.clone())
             .build(),
     )?;

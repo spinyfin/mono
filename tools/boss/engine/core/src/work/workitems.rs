@@ -773,7 +773,10 @@ impl WorkDb {
                 .maybe_description(Some(description))
                 .created_via(CREATED_VIA_ATTENTION)
                 .force_duplicate(true)
-                .maybe_priority(Some(source_task.priority.clone()))
+                // Never `critical`: the escape hatch is human-granted per row.
+                .maybe_priority(Some(super::critical_priority::inherited_priority(
+                    &source_task.priority,
+                )))
                 .maybe_repo_remote_url(source_task.repo_remote_url.clone())
                 .maybe_kind_override(kind_override)
                 .maybe_origin_task_short_id(source_task.short_id)

@@ -826,6 +826,23 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertNotEqual(lowSnap, highSnap)
     }
 
+    /// `critical` gets its own marker, distinct from the `H` chip: a
+    /// critical card must never read as merely high, and a high card must
+    /// never read as critical.
+    func testPriorityCriticalShowsDistinctChip() {
+        let high = Self.makeTask(id: "task_1", priority: "high")
+        let critical = Self.makeTask(id: "task_1", priority: "critical")
+        let ctx = WorkCardSnapshotContext(column: .backlog)
+        let highSnap = WorkCardSnapshot.build(task: high, context: ctx)
+        let criticalSnap = WorkCardSnapshot.build(task: critical, context: ctx)
+        XCTAssertTrue(criticalSnap.showsCriticalPriorityChip)
+        XCTAssertFalse(criticalSnap.showsHighPriorityChip)
+        XCTAssertFalse(highSnap.showsCriticalPriorityChip)
+        XCTAssertNotEqual(highSnap, criticalSnap)
+        XCTAssertEqual(WorkPriority.parse("CRITICAL"), .critical)
+        XCTAssertEqual(WorkPriority.critical.label, "Critical")
+    }
+
     func testTagsChangeProducesHasTagChips() {
         var a = Self.makeTask(id: "task_1")
         a.tags = ["alpha"]

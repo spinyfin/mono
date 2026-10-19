@@ -161,7 +161,15 @@ fn seed_reasoning(explicit: Option<ReasoningMode>, kind: &TaskKind, effort_level
         .to_owned()
 }
 
+/// Engine-internal create: resolves to the `'engine'` actor, so it can
+/// never mint a `critical` row (see [`super::critical_priority`]). RPC
+/// handlers that have resolved the caller tier use
+/// [`insert_task_in_tx_as_actor`].
 pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> {
+    insert_task_in_tx_as_actor(conn, input, boss_protocol::LAST_STATUS_ACTOR_ENGINE)
+}
+
+pub(crate) fn insert_task_in_tx_as_actor(conn: &Connection, input: CreateTaskInput, actor: &str) -> Result<Task> {
     ensure_product_exists(conn, &input.product_id)?;
     ensure_project_belongs_to_product(conn, &input.project_id, &input.product_id)?;
 
@@ -188,6 +196,7 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
     let deferred_value: i64 = if input.deferred { 1 } else { 0 };
     let human_driven_value: i64 = if input.human_driven { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
+    super::critical_priority::authorize_priority_write(&priority, None, actor)?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "task");
     let repo_remote_url = enforce_task_repo_invariant(&product, input.repo_remote_url)?;
     let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
@@ -201,6 +210,9 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
          VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred_value, human_driven_value, effort_matched_rule, effort_reasons],
     )?;
+    if super::critical_priority::is_critical(&priority) {
+        super::critical_priority::stamp_create_provenance(conn, &id, actor, &now)?;
+    }
 
     apply_create_time_dependencies(conn, &id, &input.depends_on, &now)?;
     query_task(conn, &id)?.with_context(|| format!("missing task after insert: {id}"))
@@ -249,8 +261,13 @@ pub(crate) fn apply_create_time_dependencies(
     Ok(())
 }
 
+/// Engine-internal create — see [`insert_task_in_tx`] for the actor rule.
 pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task> {
     insert_chore_with_project_in_tx(conn, input, None)
+}
+
+pub(crate) fn insert_chore_in_tx_as_actor(conn: &Connection, input: CreateChoreInput, actor: &str) -> Result<Task> {
+    insert_chore_with_project_in_tx_as_actor(conn, input, None, actor)
 }
 
 /// Review follow-ups may inherit project membership at creation time.
@@ -258,6 +275,15 @@ pub(crate) fn insert_chore_with_project_in_tx(
     conn: &Connection,
     input: CreateChoreInput,
     project_id: Option<&str>,
+) -> Result<Task> {
+    insert_chore_with_project_in_tx_as_actor(conn, input, project_id, boss_protocol::LAST_STATUS_ACTOR_ENGINE)
+}
+
+fn insert_chore_with_project_in_tx_as_actor(
+    conn: &Connection,
+    input: CreateChoreInput,
+    project_id: Option<&str>,
+    actor: &str,
 ) -> Result<Task> {
     let ordinal = project_id
         .map(|project_id| {
@@ -287,6 +313,7 @@ pub(crate) fn insert_chore_with_project_in_tx(
     let deferred_value: i64 = if input.deferred { 1 } else { 0 };
     let human_driven_value: i64 = if input.human_driven { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
+    super::critical_priority::authorize_priority_write(&priority, None, actor)?;
     let kind_str = input.kind_override.as_ref().map(|k| k.as_str()).unwrap_or("chore");
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, kind_str);
     let repo_remote_url = enforce_task_repo_invariant(&product, input.repo_remote_url)?;
@@ -305,6 +332,9 @@ pub(crate) fn insert_chore_with_project_in_tx(
          VALUES (?1, ?2, ?22, ?3, ?4, ?5, 'todo', ?23, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, input.origin_task_short_id, input.origin_pr_number, deferred_value, human_driven_value, effort_matched_rule, effort_reasons, project_id, ordinal],
     )?;
+    if super::critical_priority::is_critical(&priority) {
+        super::critical_priority::stamp_create_provenance(conn, &id, actor, &now)?;
+    }
 
     apply_create_time_dependencies(conn, &id, &input.depends_on, &now)?;
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
@@ -320,6 +350,14 @@ pub(crate) fn insert_chore_with_project_in_tx(
 pub(crate) fn insert_investigation_in_tx(
     conn: &Connection,
     input: boss_protocol::CreateInvestigationInput,
+) -> Result<Task> {
+    insert_investigation_in_tx_as_actor(conn, input, boss_protocol::LAST_STATUS_ACTOR_ENGINE)
+}
+
+pub(crate) fn insert_investigation_in_tx_as_actor(
+    conn: &Connection,
+    input: boss_protocol::CreateInvestigationInput,
+    actor: &str,
 ) -> Result<Task> {
     ensure_product_exists(conn, &input.product_id)?;
     if let Some(ref pid) = input.project_id {
@@ -342,6 +380,7 @@ pub(crate) fn insert_investigation_in_tx(
     let deferred_value: i64 = if input.deferred { 1 } else { 0 };
     let human_driven_value: i64 = if input.human_driven { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
+    super::critical_priority::authorize_priority_write(&priority, None, actor)?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "investigation");
     let repo_remote_url = input.repo_remote_url.filter(|s| !s.is_empty());
     let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
@@ -359,6 +398,9 @@ pub(crate) fn insert_investigation_in_tx(
             human_driven_value, effort_matched_rule, effort_reasons
         ],
     )?;
+    if super::critical_priority::is_critical(&priority) {
+        super::critical_priority::stamp_create_provenance(conn, &id, actor, &now)?;
+    }
     query_task(conn, &id)?.with_context(|| format!("missing investigation after insert: {id}"))
 }
 

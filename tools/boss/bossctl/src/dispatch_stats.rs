@@ -148,14 +148,20 @@ pub(crate) fn dispatch_stats(json: bool, state_root: Option<PathBuf>, since: Opt
         println!("top blocked now:");
         for entry in report.blocked_now.iter().take(top) {
             let work_item = entry.work_item_id.as_deref().unwrap_or("-");
+            // A critical row is exempt from the cap and an operator pause,
+            // so one still listed here is waiting on pool capacity itself
+            // — worth a loud marker, since it is the row the operator
+            // declared must not wait.
+            let critical = if entry.critical { "  CRITICAL" } else { "" };
             println!(
-                "  {}  work_item={}  pool={}  kind={}  reason={}  waiting={}",
+                "  {}  work_item={}  pool={}  kind={}  reason={}  waiting={}{}",
                 entry.execution_id,
                 work_item,
                 entry.pool,
                 entry.execution_kind,
                 entry.reason,
                 format_ms(entry.wait_so_far_ms),
+                critical,
             );
         }
     }

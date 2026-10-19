@@ -674,9 +674,11 @@ struct WorkEditSheet: View {
                         Text(status.replacingOccurrences(of: "_", with: " ").capitalized).tag(status)
                     }
                 }
+                // `critical` is human-only on the engine side; the app is a
+                // human surface, so it is offered here. See `WorkPriority`.
                 Picker("Priority", selection: $priority) {
-                    ForEach(["low", "medium", "high"], id: \.self) { priority in
-                        Text(priority.capitalized).tag(priority)
+                    ForEach(WorkPriority.allCases) { priority in
+                        Text(priority.label).tag(priority.rawValue)
                     }
                 }
                 TextField("PR URL", text: $prURL)

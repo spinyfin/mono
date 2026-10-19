@@ -1003,7 +1003,9 @@ struct ProjectTaskCountChip: View {
 /// priority (medium included) rather than hiding the default so the
 /// field is always visible — invisible defaults are exactly what
 /// pushed authors to stuff `[MEDIUM]` into the name in the first
-/// place.
+/// place. `critical` is deliberately not another letter: it is the
+/// one level that changes dispatch behaviour, so it reads as a solid
+/// red `CRIT` capsule that cannot be mistaken for the tinted `H`.
 
 struct PriorityChip: View {
     let priority: WorkPriority
@@ -1023,6 +1025,7 @@ struct PriorityChip: View {
 
     private var letter: String {
         switch priority {
+        case .critical: return "CRIT"
         case .high: return "H"
         case .medium: return "M"
         case .low: return "L"
@@ -1031,6 +1034,7 @@ struct PriorityChip: View {
 
     private var backgroundColor: Color {
         switch priority {
+        case .critical: return Color.red
         case .high: return Color.red.opacity(0.18)
         case .medium: return Color.gray.opacity(0.18)
         case .low: return Color.blue.opacity(0.14)
@@ -1039,6 +1043,7 @@ struct PriorityChip: View {
 
     private var foregroundColor: Color {
         switch priority {
+        case .critical: return .white
         case .high: return .red
         case .medium: return Color(nsColor: .secondaryLabelColor)
         case .low: return .blue

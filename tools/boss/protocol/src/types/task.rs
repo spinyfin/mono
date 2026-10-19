@@ -188,8 +188,9 @@ pub struct CreateChoreInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
 
-    /// One of `low` / `medium` / `high`. Omitted → engine default
-    /// (`medium`).
+    /// One of `low` / `medium` / `high` / `critical`. Omitted → engine
+    /// default (`medium`). `critical` is accepted only from the human
+    /// caller tier — see [`Task::priority`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
 
@@ -277,6 +278,9 @@ pub struct CreateInvestigationInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
 
+    /// One of `low` / `medium` / `high` / `critical`. Omitted → engine
+    /// default (`medium`). `critical` is accepted only from the human
+    /// caller tier — see [`Task::priority`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
 
@@ -392,9 +396,10 @@ pub struct CreateTaskInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
 
-    /// One of `low` / `medium` / `high`. Omitted → engine default
-    /// (`medium`), which is the right answer for the vast majority
-    /// of tasks; only callers who care should set this.
+    /// One of `low` / `medium` / `high` / `critical`. Omitted → engine
+    /// default (`medium`), which is the right answer for the vast majority
+    /// of tasks; only callers who care should set this. `critical` is
+    /// accepted only from the human caller tier — see [`Task::priority`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
 
@@ -699,13 +704,34 @@ pub struct Task {
     pub last_status_actor: String,
 
     pub name: String,
-    /// One of `low` / `medium` / `high`. Mirrors `Project.priority`
-    /// exactly so kanban surfaces can render every work-item kind with
-    /// the same vocabulary. Existing rows from before this column was
-    /// introduced default to `medium`.
+    /// One of `low` / `medium` / `high` / `critical`. The first three
+    /// mirror `Project.priority` exactly so kanban surfaces can render
+    /// every work-item kind with the same vocabulary. Existing rows from
+    /// before this column was introduced default to `medium`.
+    ///
+    /// `critical` is the human owner's escape hatch above `high`: the
+    /// engine accepts a raise to `critical` only from the human caller
+    /// tier (never from the coordinator session, a worker, an engine
+    /// sweep, an automation, or Boothby), and a critical item is
+    /// dispatched ahead of every non-critical item, is not held by the
+    /// interactive concurrency cap, and still dispatches under an
+    /// operator dispatch pause. Lowering from `critical` is an ordinary
+    /// priority change. Provenance of the raise is in
+    /// [`Self::critical_set_by`] / [`Self::critical_set_at`].
     #[serde(default = "default_priority")]
     #[builder(default = default_priority())]
     pub priority: String,
+
+    /// Who raised this row to `critical` — the resolved caller tier
+    /// (`"human"`). `None` unless [`Self::priority`] is currently
+    /// `critical`; cleared when the row is lowered again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_set_by: Option<String>,
+
+    /// When this row was raised to `critical`. Same lifetime as
+    /// [`Self::critical_set_by`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_set_at: Option<String>,
 
     pub status: TaskStatus,
     pub updated_at: String,

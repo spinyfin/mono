@@ -11,6 +11,30 @@ use boss_engine_board_gesture::{BoardRow, DropResolution, resolve_drop};
 use super::*;
 use crate::protocol::WorkItemPatch;
 
+/// Resolve the caller tier for a work-item write that may carry a
+/// priority. Two gates compose here, both engine-side:
+///
+/// 1. A socket peer the worker registry classifies as a worker pane is
+///    refused a raise to `critical` outright — `resolve_status_actor`
+///    cannot see that classification (worker panes are not descendants
+///    of the coordinator pid, so it would report them as `'human'`).
+/// 2. The returned actor string is what `WorkDb` then judges: a raise to
+///    `critical` is accepted only for `'human'` (see
+///    `work/critical_priority.rs`), which excludes the coordinator
+///    session's CLI tier (`'boss'`).
+///
+/// `current_priority` is `None` for a create.
+fn resolve_write_actor(
+    server_state: &ServerState,
+    peer_pid: Option<libc::pid_t>,
+    requested_priority: Option<&str>,
+    current_priority: Option<&str>,
+) -> anyhow::Result<&'static str> {
+    let peer_is_worker = server_state.classify_peer(peer_pid).is_worker();
+    crate::work::refuse_worker_critical_raise(requested_priority, current_priority, peer_is_worker)?;
+    Ok(resolve_status_actor(server_state, peer_pid))
+}
+
 pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -328,6 +352,7 @@ pub(super) async fn handle_create_task(ctx: Dispatch, req: FrontendRequest) {
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::CreateTask { mut input } = req else {
@@ -341,12 +366,15 @@ pub(super) async fn handle_create_task(ctx: Dispatch, req: FrontendRequest) {
     // canonical origin now so the durable row is dispatchable
     // and `cube repo ensure` never sees a bare slug (#861).
     repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
+    let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
+        .and_then(|actor| work_db.create_task_as_actor(input, actor))
+        .map(WorkItem::Task);
     finish_create_work_item(
         &server_state,
         &sink,
         &session_id,
         &request_id,
-        work_db.create_task(input).map(WorkItem::Task),
+        created,
         "task_created",
         duplicate_or_work_error,
     )
@@ -360,6 +388,7 @@ pub(super) async fn handle_create_chore(ctx: Dispatch, req: FrontendRequest) {
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::CreateChore { mut input } = req else {
@@ -371,12 +400,15 @@ pub(super) async fn handle_create_chore(ctx: Dispatch, req: FrontendRequest) {
     // Resolve a `--repo <slug>` override to its canonical cube
     // origin before persisting (#861); see the CreateTask arm.
     repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
+    let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
+        .and_then(|actor| work_db.create_chore_as_actor(input, actor))
+        .map(WorkItem::Chore);
     finish_create_work_item(
         &server_state,
         &sink,
         &session_id,
         &request_id,
-        work_db.create_chore(input).map(WorkItem::Chore),
+        created,
         "chore_created",
         duplicate_or_work_error,
     )
@@ -731,7 +763,29 @@ pub(super) async fn apply_work_item_patch(
             send_work_error(&sink, &request_id, &err);
             return;
         }
-        let actor = resolve_status_actor(&server_state, peer_pid);
+        // Only a patch that carries a priority needs the row's current
+        // level (to tell a raise from a re-assertion); skip the read
+        // otherwise so status-only patches pay nothing extra.
+        let current_priority = if patch.priority.is_some() {
+            work_db.get_work_item(&id).ok().and_then(|item| match item {
+                WorkItem::Task(t) | WorkItem::Chore(t) => Some(t.priority),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let actor = match resolve_write_actor(
+            &server_state,
+            peer_pid,
+            patch.priority.as_deref(),
+            current_priority.as_deref(),
+        ) {
+            Ok(actor) => actor,
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        };
         match work_db.update_work_item_as_actor(&id, patch, actor) {
             Ok(mut item) => {
                 // Dispatch refusals roll back the move and return the engine reason.
@@ -1435,17 +1489,21 @@ pub(super) async fn handle_create_investigation(ctx: Dispatch, req: FrontendRequ
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::CreateInvestigation { input } = req else {
         unreachable!()
     };
+    let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
+        .and_then(|actor| work_db.create_investigation_as_actor(input, actor))
+        .map(WorkItem::Task);
     finish_create_work_item(
         &server_state,
         &sink,
         &session_id,
         &request_id,
-        work_db.create_investigation(input).map(WorkItem::Task),
+        created,
         "investigation_created",
         |err| FrontendEvent::WorkError {
             message: err.to_string(),

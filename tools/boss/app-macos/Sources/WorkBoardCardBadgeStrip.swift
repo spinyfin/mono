@@ -13,6 +13,7 @@ import SwiftUI
 /// each chip needs; closures are on the view, not the slice.
 struct WorkBoardCardBadgeStripSlice: Equatable {
     let showsHighPriorityChip: Bool
+    let showsCriticalPriorityChip: Bool
     let showsEffortChip: Bool
     let effortLevel: String?
     let showsReasoningChip: Bool
@@ -54,6 +55,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
 
     init(snapshot: WorkCardSnapshot) {
         self.showsHighPriorityChip = snapshot.showsHighPriorityChip
+        self.showsCriticalPriorityChip = snapshot.showsCriticalPriorityChip
         self.showsEffortChip = snapshot.showsEffortChip
         self.effortLevel = snapshot.effortLevel
         self.showsReasoningChip = snapshot.showsReasoningChip
@@ -134,7 +136,9 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
         // additional lines within the lane width instead of overflowing
         // past the card's right edge and clipping (#1172).
         FlowLayout(horizontalSpacing: 6, verticalSpacing: 4) {
-            if slice.showsHighPriorityChip {
+            if slice.showsCriticalPriorityChip {
+                PriorityChip(priority: .critical)
+            } else if slice.showsHighPriorityChip {
                 PriorityChip(priority: .high)
             }
             if slice.showsEffortChip, let effortLevel = slice.effortLevel {

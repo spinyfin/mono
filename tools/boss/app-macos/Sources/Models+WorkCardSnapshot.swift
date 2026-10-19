@@ -182,6 +182,10 @@ struct WorkCardSnapshot: Equatable {
     /// conflict/CI remediation.
     let showsBlockedLock: Bool
     let showsHighPriorityChip: Bool
+    /// Solid red `CRIT` capsule for the human-only `critical` priority —
+    /// distinct from the tinted `H` chip because this is the one level
+    /// that changes dispatch behaviour (see `WorkPriority.critical`).
+    let showsCriticalPriorityChip: Bool
     let showsEffortChip: Bool
     let showsReasoningChip: Bool
     let showsDeferredBadge: Bool
@@ -432,6 +436,7 @@ struct WorkCardSnapshot: Equatable {
                 && !isResolvingConflicts
                 && !isRemediatingCI,
             showsHighPriorityChip: WorkPriority.parse(task.priority) == .high,
+            showsCriticalPriorityChip: WorkPriority.parse(task.priority) == .critical,
             showsEffortChip: effortNonEmpty,
             showsReasoningChip: task.reasoning == "investigation",
             showsDeferredBadge: task.deferred,

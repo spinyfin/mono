@@ -635,6 +635,7 @@ mod coordinator_guidance_cache;
 mod coordinator_tmux;
 mod cost_report_db;
 mod create_entities;
+mod critical_priority;
 mod decisions;
 mod dep_helpers;
 mod design_postmortem;
@@ -801,6 +802,10 @@ pub use mappers::SpeculativeConflictInsertInput;
 // the same as every other row type in this module.
 pub use boss_metrics::MetricsCounterRow;
 pub use boss_metrics::MetricsGaugeRow;
+pub use critical_priority::{
+    PRIORITY_CRITICAL, authorize_priority_write, critical_refusal, inherited_priority, is_critical,
+    refuse_worker_critical_raise,
+};
 pub use output_types::AutomationDedupSuppression;
 pub use output_types::AutomationSiblingTask;
 pub use output_types::HostBoundExecution;
