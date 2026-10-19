@@ -23,6 +23,13 @@ struct WorkerSlotLiveSlice: Equatable {
     let agentType: String?
     let projectName: String?
     let pool: String?
+    /// Read by the viewer-missing card only: `false` means the engine can
+    /// never attach a pane (no durable tmux identity), so the card must not
+    /// promise "Connecting…".
+    let tmuxHosted: Bool?
+    /// Engine-reported reason the last viewer attach failed; `nil` while
+    /// nothing has failed. Read by the viewer-missing card only.
+    let viewerAttachError: String?
 
     init(_ live: WorkerLiveState) {
         self.name = live.name
@@ -33,6 +40,8 @@ struct WorkerSlotLiveSlice: Equatable {
         self.agentType = live.agentType
         self.projectName = live.projectName
         self.pool = live.pool
+        self.tmuxHosted = live.tmuxHosted
+        self.viewerAttachError = live.viewerAttachError
     }
 
     var badgeType: AgentType { AgentType.fromWire(agentType) }
@@ -60,6 +69,12 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     let isPlaceholder: Bool
     /// Cached persona for placeholders after live state is gone.
     let cachedPersona: String?
+    /// Why this app refused the engine's last `AttachWorkerPane` for the
+    /// run (slot busy, unknown slot, bad socket path), recorded by
+    /// `WorkersWorkspaceModel`. `nil` when the app never rejected one.
+    /// The app-side reason wins over the engine's: it is the more specific
+    /// half of the same failed exchange.
+    let viewerAttachFailure: String?
 
     var displayName: String {
         if let cachedPersona, !cachedPersona.isEmpty { return cachedPersona }
@@ -71,6 +86,32 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     var isExited: Bool { live?.isExited == true }
     var isViewerMissing: Bool { runId != nil && session == nil && !isPlaceholder }
 
+    /// Caption for the viewer-missing card. A live member legitimately has
+    /// no viewer only while the engine's `AttachWorkerPane` is still on its
+    /// way (spawn, app or engine restart re-attach, the app's own
+    /// re-attach request); that reads "Connecting…". Anything the app or
+    /// the engine knows went wrong is shown instead, most specific first,
+    /// so a failed attach is never dressed up as still connecting.
+    var viewerMissingMessage: String {
+        if let viewerAttachFailure, !viewerAttachFailure.isEmpty {
+            return "Couldn't attach the terminal: \(viewerAttachFailure)"
+        }
+        if let error = live?.viewerAttachError, !error.isEmpty {
+            return "Couldn't attach the terminal: \(error)"
+        }
+        if live?.tmuxHosted == false {
+            return AgentActivityState.identityUnavailableReason
+        }
+        return "Connecting…"
+    }
+
+    /// True while the card's only honest caption is "Connecting…" — no
+    /// failure is known on either side. The view asks the engine for the
+    /// viewer in this state when the pane comes into view.
+    var isViewerConnecting: Bool {
+        isViewerMissing && viewerAttachFailure == nil && live?.viewerAttachError == nil && live?.tmuxHosted != false
+    }
+
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slotId == rhs.slotId
             && lhs.runId == rhs.runId
@@ -81,6 +122,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             && lhs.live == rhs.live
             && lhs.isPlaceholder == rhs.isPlaceholder
             && lhs.cachedPersona == rhs.cachedPersona
+            && lhs.viewerAttachFailure == rhs.viewerAttachFailure
     }
 
     static func build(
@@ -88,7 +130,8 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
         liveState: WorkerLiveState?,
         liveStatusEnabled: Bool,
         isPlaceholder: Bool = false,
-        cachedPersona: String? = nil
+        cachedPersona: String? = nil,
+        viewerAttachFailure: String? = nil
     ) -> WorkerSlotSnapshot {
         WorkerSlotSnapshot(
             slotId: slot.slotId,
@@ -99,7 +142,8 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
             liveStatusEnabled: liveStatusEnabled,
             live: liveState.map(WorkerSlotLiveSlice.init),
             isPlaceholder: isPlaceholder,
-            cachedPersona: cachedPersona
+            cachedPersona: cachedPersona,
+            viewerAttachFailure: viewerAttachFailure
         )
     }
 }

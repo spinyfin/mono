@@ -409,6 +409,102 @@ final class WorkersWorkspaceModelAttachSlotRoutingTests: XCTestCase {
     }
 }
 
+/// Attach outcomes the Agents card renders, and the visibility-driven
+/// re-attach request. A live member with no viewer reads "Connecting…"
+/// only while nothing has failed; a refusal by this app is recorded with
+/// its reason until a later attach succeeds or the run is detached.
+@MainActor
+final class WorkersWorkspaceModelViewerAttachTests: XCTestCase {
+    func testRefusedAttachRecordsTheReasonAndALaterSuccessClearsIt() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "run-old"))
+        XCTAssertTrue(model.viewerAttachFailuresByRunId.isEmpty)
+
+        guard case .failure(.slotBusy) = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "run-new")) else {
+            return XCTFail("slot 3 is occupied; the attach must be refused")
+        }
+        XCTAssertEqual(
+            model.viewerAttachFailuresByRunId["run-new"],
+            "its slot is still hosting run run-old",
+            "the card needs to name the squatting run"
+        )
+
+        // The engine evicts the stale occupant and retries: success clears.
+        _ = model.detachWorkerPane(runId: "run-old")
+        guard case .success = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "run-new")) else {
+            return XCTFail("the retry into the freed slot must succeed")
+        }
+        XCTAssertNil(model.viewerAttachFailuresByRunId["run-new"])
+        XCTAssertNotNil(model.viewersByRunId["run-new"]?.session)
+    }
+
+    func testOutOfRangeSlotAndBadSocketRecordReasons() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 99, runId: "run-range"))
+        XCTAssertEqual(model.viewerAttachFailuresByRunId["run-range"], "engine requested unknown slot 99")
+
+        _ = model.attachWorkerPane(EngineAttachRequest(
+            runId: "run-socket", slotId: 1, sessionName: "boss-1-run-socket",
+            tmuxSocketPath: "relative/tmux.sock", summary: nil, taskTitle: nil
+        ))
+        XCTAssertEqual(
+            model.viewerAttachFailuresByRunId["run-socket"],
+            "the engine supplied an invalid tmux socket path"
+        )
+    }
+
+    func testDetachClearsARecordedFailure() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "run-old"))
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "run-new"))
+        XCTAssertNotNil(model.viewerAttachFailuresByRunId["run-new"])
+        // A detach for a run with no viewer reports unknownSlot but still
+        // retires the stale reason: the engine has given up on that attach.
+        guard case .failure(.unknownSlot) = model.detachWorkerPane(runId: "run-new") else {
+            return XCTFail("run-new never had a viewer")
+        }
+        XCTAssertNil(model.viewerAttachFailuresByRunId["run-new"])
+    }
+
+    /// One request per run per visibility episode: the engine answers
+    /// with an attach or a failure reason, so repeating adds nothing.
+    /// Hiding and re-showing the view asks again; an attached run is never
+    /// asked for.
+    func testRequestViewerAttachAsksOncePerVisibilityEpisode() {
+        let model = WorkersWorkspaceModel()
+        var requested: [String] = []
+        model.onViewerAttachRequested = { requested.append($0) }
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 1, runId: "run-attached"))
+
+        model.requestViewerAttach(forRuns: ["run-a", "run-attached", "run-b"])
+        XCTAssertEqual(requested, ["run-a", "run-b"])
+        model.requestViewerAttach(forRuns: ["run-a", "run-b"])
+        XCTAssertEqual(requested, ["run-a", "run-b"], "a second request in the same episode is a no-op")
+
+        model.resetViewerAttachRequests()
+        model.requestViewerAttach(forRuns: ["run-a"])
+        XCTAssertEqual(requested, ["run-a", "run-b", "run-a"], "re-showing the view asks again")
+
+        // A viewer that arrives retires the dedupe entry, so a later detach
+        // followed by a fresh viewer-less sighting can ask again too.
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 2, runId: "run-b"))
+        _ = model.detachWorkerPane(runId: "run-b")
+        model.requestViewerAttach(forRuns: ["run-b"])
+        XCTAssertEqual(requested.last, "run-b")
+    }
+
+    private func makeAttachRequest(slot: Int, runId: String) -> EngineAttachRequest {
+        EngineAttachRequest(
+            runId: runId,
+            slotId: slot,
+            sessionName: "boss-\(slot)-\(runId)",
+            tmuxSocketPath: "/state/boss/tmux.sock",
+            summary: nil,
+            taskTitle: nil
+        )
+    }
+}
+
 @MainActor
 final class GhosttyRuntimeCloseDetectionTests: XCTestCase {
     func testCloseCallbackRequiresActualCurrentChildExit() {

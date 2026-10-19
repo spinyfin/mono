@@ -335,6 +335,14 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         self.broadcast_live_worker_states().await;
     }
 
+    async fn note_worker_viewer_attach_failed(&self, run_id: &str) {
+        tracing::info!(
+            run_id,
+            "spawn-time viewer attach failed; scheduling the bounded worker pane re-attach"
+        );
+        self.schedule_worker_viewer_reattach_retry().await;
+    }
+
     fn start_live_status_slot(&self, slot_id: u8, run_id: &str, driver: Arc<dyn AgentDriver>) {
         let Some(arc_self) = self._self_weak.upgrade() else {
             tracing::debug!(slot_id, "start_live_status_slot: ServerState already dropped",);

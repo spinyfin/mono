@@ -989,20 +989,71 @@ impl ServerState {
                 }
             }
         };
-        if outcome.had_failures {
-            self.schedule_worker_viewer_reattach_retry().await;
-        } else {
-            self.viewer_reattach_retry_attempt.store(0, Ordering::Relaxed);
-        }
+        let mut any_attach_failed = false;
         for state in candidates {
             if outcome.live.contains(&state.run_id) || outcome.blocked_slots.contains(&state.slot_id) {
                 continue;
             }
-            self.reattach_one_worker_pane(&state).await;
+            if !self.reattach_one_worker_pane(&state).await {
+                any_attach_failed = true;
+            }
+        }
+        // A failed attach is retried on the same bounded backoff as a failed
+        // inventory: the worker is live and visible in the Agents grid, and
+        // without a retry its card stays viewer-less until the app relaunches.
+        // The attempt counter resets only on a fully clean pass, so a
+        // persistent failure runs out of attempts instead of looping; from
+        // then on the app's own `RequestWorkerPaneAttach` (sent when the
+        // user brings the pane into view) is what triggers another try.
+        if outcome.had_failures || any_attach_failed {
+            self.schedule_worker_viewer_reattach_retry().await;
+        } else {
+            self.viewer_reattach_retry_attempt.store(0, Ordering::Relaxed);
         }
     }
 
-    async fn schedule_worker_viewer_reattach_retry(&self) {
+    /// App-requested re-attach for one run: the Agents view is showing a
+    /// live local worker it has no viewer for. Goes through the same
+    /// inventory-free single-run path as the registration pass (the app
+    /// has just said it hosts nothing for this run, and a stale occupant
+    /// of the slot is evicted by `attach_worker_viewer`'s `SlotBusy`
+    /// recovery). Runs the engine does not consider live, local and
+    /// tmux-hosted are ignored: there is no pane to attach for them, and
+    /// their cards already explain themselves (`tmux_hosted == false` renders
+    /// as identity unavailable; a terminal activity renders as exited).
+    pub(crate) async fn reattach_worker_pane_for_run(&self, run_id: &str) -> bool {
+        let Some(state) = self
+            .live_worker_states
+            .snapshot()
+            .into_iter()
+            .find(|state| state.run_id == run_id)
+        else {
+            tracing::info!(
+                run_id,
+                "worker pane attach requested for a run with no live state; ignoring"
+            );
+            return false;
+        };
+        if state.activity.is_terminal() || state.tmux_hosted != Some(true) {
+            tracing::info!(
+                run_id,
+                activity = state.activity.as_str(),
+                tmux_hosted = ?state.tmux_hosted,
+                "worker pane attach requested for a run that has no attachable local pane; ignoring",
+            );
+            return false;
+        }
+        if self.app_session.lock().await.is_none() {
+            tracing::info!(
+                run_id,
+                "worker pane attach requested with no app session registered; ignoring"
+            );
+            return false;
+        }
+        self.reattach_one_worker_pane(&state).await
+    }
+
+    pub(super) async fn schedule_worker_viewer_reattach_retry(&self) {
         let session_id = {
             let guard = self.app_session.lock().await;
             match guard.as_ref() {
@@ -1051,11 +1102,35 @@ impl ServerState {
         });
     }
 
-    async fn reattach_one_worker_pane(&self, state: &LiveWorkerState) {
+    /// Re-send `AttachWorkerPane` for one live worker. Returns `true` when
+    /// the app confirmed a viewer. Every failure is written to the run's
+    /// [`LiveWorkerState::viewer_attach_error`] (and a success clears it)
+    /// so the Agents card can show the reason rather than a generic
+    /// "connecting" forever; the caller decides whether to broadcast and
+    /// whether to retry. A run whose execution row is already terminal is
+    /// skipped silently — its live state is about to be released and no
+    /// card will outlive it.
+    async fn reattach_one_worker_pane(&self, state: &LiveWorkerState) -> bool {
         let run_id = state.run_id.as_str();
         if !matches!(self.work_db.find_execution(run_id), Ok(Some(run)) if !run.status.is_terminal()) {
-            return;
+            return false;
         }
+        let outcome = self.try_reattach_one_worker_pane(state).await;
+        let changed = self
+            .live_worker_states
+            .set_viewer_attach_error(run_id, outcome.as_ref().err().cloned());
+        if changed {
+            // The registration/adoption passes publish a snapshot of their
+            // own once membership settles; a per-run transition still needs
+            // its own push so a card that was "connecting" flips to the
+            // reason (or to a terminal) without waiting for the next hook.
+            self.broadcast_live_worker_states().await;
+        }
+        outcome.is_ok()
+    }
+
+    async fn try_reattach_one_worker_pane(&self, state: &LiveWorkerState) -> Result<(), String> {
+        let run_id = state.run_id.as_str();
         let identity = match self.work_db.tmux_identity_for_execution(run_id) {
             Ok(Some(identity)) => identity,
             Ok(None) => {
@@ -1063,7 +1138,7 @@ impl ServerState {
                     run_id,
                     "worker pane reattach: no durable tmux identity; cannot re-attach a viewer",
                 );
-                return;
+                return Err("no durable tmux identity is recorded for this worker".to_owned());
             }
             Err(err) => {
                 tracing::warn!(
@@ -1071,7 +1146,7 @@ impl ServerState {
                     error = %format!("{err:#}"),
                     "worker pane reattach: failed reading durable tmux identity",
                 );
-                return;
+                return Err(format!("could not read the worker's tmux identity: {err:#}"));
             }
         };
         // Same durable-socket / legacy-label resolution `pane_delivery` and
@@ -1087,12 +1162,15 @@ impl ServerState {
                     error = %format!("{err:#}"),
                     "worker pane reattach: could not resolve a tmux handle for the recorded server",
                 );
-                return;
+                return Err(format!(
+                    "could not resolve tmux for server {}: {err:#}",
+                    identity.server_label
+                ));
             }
         };
         let Some(tmux_socket_path) = tmux.socket_path().map(|path| path.display().to_string()) else {
             tracing::error!(run_id, "worker pane reattach: resolved tmux handle has no socket path",);
-            return;
+            return Err("the resolved tmux server has no socket path".to_owned());
         };
         match self
             .attach_worker_viewer(
@@ -1115,6 +1193,7 @@ impl ServerState {
                     session_name = %identity.session_name,
                     "worker pane reattach: attached tmux-hosted worker pane to the registered app session",
                 );
+                Ok(())
             }
             Ok(response) => {
                 tracing::warn!(
@@ -1123,6 +1202,7 @@ impl ServerState {
                     ?response,
                     "worker pane reattach: app did not attach its viewer surface",
                 );
+                Err(crate::spawn_flow::viewer_attach_failure_reason(&response))
             }
             Err(err) => {
                 tracing::warn!(
@@ -1131,6 +1211,7 @@ impl ServerState {
                     error = %format!("{err:#}"),
                     "worker pane reattach: request to the app failed",
                 );
+                Err(format!("request to the app failed: {err}"))
             }
         }
     }

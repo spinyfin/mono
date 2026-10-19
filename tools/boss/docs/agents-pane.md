@@ -8,9 +8,20 @@ Membership is the engine's live worker snapshot, restricted to local workers (`h
 
 Position (page, cell, order) is local presentation state. It is never identity and never sent to the engine. Agents are ordered by execution start time, then run id, oldest first.
 
-## "Viewer not attached" cards
+## "Connecting…" and "Couldn't attach the terminal" cards
 
-A viewer (the terminal) is separate from membership. If a run is in the engine's snapshot but its terminal is not attached (attach failed, surface lost, or detached), the run keeps its cell and shows a status card instead of a terminal. It still uses capacity, is filtered and counted like any other agent, and fills the same cell once a viewer attaches. An attach that arrives before the engine reports the run does not create a cell. A late detach after release does not bring a run back.
+A viewer (the terminal) is separate from membership. If a run is in the engine's snapshot but its terminal is not attached, the run keeps its cell and shows a status card instead of a terminal. It still uses capacity, is filtered and counted like any other agent, and fills the same cell once a viewer attaches. An attach that arrives before the engine reports the run does not create a cell. A late detach after release does not bring a run back.
+
+The card's caption says which of two situations you are looking at:
+
+- **Connecting…** — nothing is known to have failed. The engine's `AttachWorkerPane` is still on its way: the worker was just spawned, the app or engine restarted and the engine is re-attaching every live worker, or the app has just asked for the viewer again (below). This should resolve within seconds.
+- **Couldn't attach the terminal: <reason>** — the last attach attempt failed and the reason is shown. The app's own refusal (for example "its slot is still hosting run exec\_…", meaning a stale pane still occupies the slot) wins over the engine's reason (for example "request to the app failed: timed out", "no durable tmux identity is recorded for this worker"). A local worker whose durable tmux stamp is missing shows "Worker pane identity unavailable"; the engine can never attach that one.
+
+What drives recovery, so that neither caption is permanent:
+
+- The engine retries a failed attach on its own bounded backoff (the same schedule it uses for a failed viewer inventory) while the same app session stays registered, and re-attaches every live worker when an app session registers or when it readopts workers after its own restart.
+- When the Agents tab, or the page holding the worker, comes into view, the app asks the engine once per viewer-less worker (`request_worker_pane_attach`) for that worker's `AttachWorkerPane` again. Hiding and re-showing the tab asks again. There is no timer: a card that stays on "Connecting…" while you are looking at it means the engine has nothing to attach for that run and `bossctl logs spawn` / the engine log are the next place to look.
+- A successful attach clears any recorded reason on both sides; a detach for the run clears the app-side reason too.
 
 ## Filters
 

@@ -385,3 +385,202 @@ async fn repeated_periodic_adoption_sends_no_app_requests_for_existing_worker() 
             .is_err()
     );
 }
+
+/// Drain one `AttachWorkerPane` for `expected_run` off the app sink and answer
+/// it with `result`.
+async fn answer_attach_worker_pane(
+    server_state: &ServerState,
+    sink: &SessionSink,
+    expected_run: &str,
+    result: Result<crate::protocol::AttachWorkerPaneResult, EngineToAppError>,
+) {
+    let envelope = tokio::time::timeout(Duration::from_secs(10), sink.next())
+        .await
+        .expect("AttachWorkerPane request timed out")
+        .expect("AttachWorkerPane request");
+    let request_id = match &envelope.payload {
+        FrontendEvent::EngineRequest {
+            request_id,
+            request: EngineToAppRequest::AttachWorkerPane(input),
+        } => {
+            assert_eq!(input.run_id, expected_run);
+            request_id.clone()
+        }
+        other => panic!("expected AttachWorkerPane EngineRequest, got {other:?}"),
+    };
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::AttachWorkerPane { result },
+        )
+        .await;
+}
+
+fn viewer_attach_error(server_state: &ServerState, run_id: &str) -> Option<String> {
+    server_state
+        .live_worker_states
+        .snapshot()
+        .into_iter()
+        .find(|state| state.run_id == run_id)
+        .expect("live state for the seeded run")
+        .viewer_attach_error
+}
+
+/// A refused re-attach must leave evidence where the app renders it — the
+/// run's `viewer_attach_error` — and schedule the bounded retry, so the
+/// worker's Agents card says why there is no terminal instead of
+/// "connecting" forever. A later successful attach clears the reason.
+#[tokio::test]
+async fn refused_reattach_stamps_the_reason_schedules_a_retry_and_a_later_success_clears_it() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = seed_tmux_hosted_live_run(&server_state, 5, "boss-5-reattach", "reattach-token-5");
+    install_tmux_override(&server_state);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    assert_eq!(viewer_attach_error(&server_state, &run_id), None);
+
+    let state = server_state.clone();
+    let pass = tokio::spawn(async move {
+        state.reattach_worker_panes_to_registered_app().await;
+    });
+    answer_list_hosted_panes(&server_state, &sink, vec![]).await;
+    answer_attach_worker_pane(
+        &server_state,
+        &sink,
+        &run_id,
+        Err(EngineToAppError::Internal {
+            message: "engine requested unknown slot 5".into(),
+        }),
+    )
+    .await;
+    pass.await.expect("reattach pass task panicked");
+
+    assert_eq!(
+        viewer_attach_error(&server_state, &run_id).as_deref(),
+        Some("the app refused the viewer: app internal error: engine requested unknown slot 5"),
+    );
+    assert!(
+        server_state.viewer_reattach_retry_scheduled.load(Ordering::Relaxed),
+        "a failed attach must schedule the bounded re-attach, not wait for an app relaunch",
+    );
+    // Retire the scheduled retry so it cannot race the explicit re-attach
+    // below for the sink.
+    server_state.viewer_reattach_epoch.fetch_add(1, Ordering::Relaxed);
+
+    let state = server_state.clone();
+    let run = run_id.clone();
+    let requested = tokio::spawn(async move { state.reattach_worker_pane_for_run(&run).await });
+    answer_attach_worker_pane(
+        &server_state,
+        &sink,
+        &run_id,
+        Ok(crate::protocol::AttachWorkerPaneResult {}),
+    )
+    .await;
+    assert!(
+        requested.await.expect("re-attach task panicked"),
+        "the app confirmed a viewer"
+    );
+    assert_eq!(
+        viewer_attach_error(&server_state, &run_id),
+        None,
+        "a successful attach clears the recorded failure"
+    );
+}
+
+/// The app's `request_worker_pane_attach` is the user-driven re-attach: the
+/// handler authorises, resolves the run's live state, and sends exactly one
+/// `AttachWorkerPane` built from durable identity.
+#[tokio::test]
+async fn app_requested_attach_sends_attach_worker_pane_for_a_live_run() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = seed_tmux_hosted_live_run(&server_state, 6, "boss-6-reattach", "reattach-token-6");
+    install_tmux_override(&server_state);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let ctx = Dispatch::builder()
+        .server_state(server_state.clone())
+        .work_db(server_state.work_db.clone())
+        .sink(sink.clone())
+        .session_id("session-app")
+        .request_id("req-attach-1")
+        .recv_instant(std::time::Instant::now())
+        .decode_ms(0.0)
+        .build();
+    let handled = tokio::spawn(super::super::panes::handle_request_worker_pane_attach(
+        ctx,
+        FrontendRequest::RequestWorkerPaneAttach { run_id: run_id.clone() },
+    ));
+
+    let envelope = tokio::time::timeout(Duration::from_secs(10), sink.next())
+        .await
+        .expect("AttachWorkerPane request timed out")
+        .expect("AttachWorkerPane request");
+    let (request_id, input) = match &envelope.payload {
+        FrontendEvent::EngineRequest {
+            request_id,
+            request: EngineToAppRequest::AttachWorkerPane(input),
+        } => (request_id.clone(), input.clone()),
+        other => panic!("expected AttachWorkerPane EngineRequest, got {other:?}"),
+    };
+    assert_eq!(input.run_id, run_id);
+    assert_eq!(input.slot_id, 6);
+    assert_eq!(input.session_name, "boss-6-reattach");
+    assert_eq!(input.tmux_socket_path, boss_tmux::TEST_SOCKET_PATH);
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::AttachWorkerPane {
+                result: Ok(crate::protocol::AttachWorkerPaneResult {}),
+            },
+        )
+        .await;
+    handled.await.expect("handler task panicked");
+
+    // Fire-and-forget: no response envelope follows the attach.
+    let next = tokio::time::timeout(Duration::from_millis(200), sink.next()).await;
+    assert!(
+        next.is_err(),
+        "request_worker_pane_attach must not send a further event, got {next:?}"
+    );
+}
+
+/// Runs with nothing to attach are ignored without touching the app: an
+/// unknown run, and a local run whose durable tmux stamp is missing (its
+/// card already reads as identity unavailable).
+#[tokio::test]
+async fn app_requested_attach_ignores_runs_without_an_attachable_pane() {
+    let (server_state, _dir) = test_server_state();
+    install_tmux_override(&server_state);
+    server_state.live_worker_states.register_spawn_with_capabilities(
+        7,
+        "exec-no-identity".to_owned(),
+        "claude-opus-4-7",
+        0,
+        None,
+        true,
+        LiveSpawnRouting::new_with_hosting(Some("main".to_owned()), "task_implementation", false),
+    );
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    assert!(!server_state.reattach_worker_pane_for_run("exec-unknown").await);
+    assert!(!server_state.reattach_worker_pane_for_run("exec-no-identity").await);
+    let next = tokio::time::timeout(Duration::from_millis(200), sink.next()).await;
+    assert!(
+        next.is_err(),
+        "no attach may be sent for an unattachable run, got {next:?}"
+    );
+}

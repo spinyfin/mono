@@ -152,6 +152,22 @@ final class AgentsGridModel: ObservableObject {
         replaceLayout { $0.setFocusedRun(runId) }
     }
 
+    /// Live members placed on the selected page that have no viewer yet, in
+    /// cell order. These are the runs whose cards read "Connecting…" when
+    /// the page is shown, and the ones the view asks the engine to attach.
+    /// Off-page members are left to the engine's own retry: their surfaces
+    /// would be mounted invisibly, and asking for them when their page is
+    /// selected keeps each request tied to something the user can see.
+    var viewerlessRunIdsOnSelectedPage: [String] {
+        guard let page = layout.currentPage else { return [] }
+        return page.cells.compactMap { cell in
+            if case .occupied(let member) = cell.content, !member.hasViewer {
+                return member.runId
+            }
+            return nil
+        }
+    }
+
     /// Authoritative membership + current viewer map. Callers must pass
     /// only an accepted live-state snapshot: duplicates and a disconnected
     /// feed are handled by `LiveWorkerStateStore` before they reach here.

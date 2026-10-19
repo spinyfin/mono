@@ -35,9 +35,60 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// Authoritative viewer identity, keyed by run id. Layout cells are
     /// a separate presentation concern in `AgentsGridModel`.
     @Published private(set) var viewersByRunId: [String: WorkerSlot] = [:]
+    /// Why this app refused the engine's most recent `AttachWorkerPane` for
+    /// a run, keyed by run id. Written on every rejection in
+    /// `attachWorkerPane`, cleared by a later successful attach or a detach
+    /// for the same run. The Agents card renders it so a live worker whose
+    /// viewer this app turned away shows the reason instead of
+    /// "Connecting…".
+    @Published private(set) var viewerAttachFailuresByRunId: [String: String] = [:]
+    /// Asks the engine to send `AttachWorkerPane` for a run again. Wired by
+    /// `ContentView` to `ChatViewModel.requestWorkerPaneAttach(runId:)`;
+    /// `nil` in builds without an engine connection (tests).
+    var onViewerAttachRequested: ((String) -> Void)?
+    /// Runs a re-attach has already been requested for since the Agents
+    /// view last became visible. One request per run per visibility
+    /// episode: the engine answers with an attach (which clears the entry)
+    /// or with a failure reason on the live-state topic — either way a
+    /// repeat request would add nothing. Cleared when the view is hidden so
+    /// bringing it back asks again.
+    private var requestedViewerRunIds: Set<String> = []
 
     init() {
         self.runtime = GhosttyRuntime.shared
+    }
+
+    /// Request the engine re-attach viewers for live members the Agents
+    /// view is showing without a terminal. Call when a page or the view
+    /// itself comes into sight, never from a timer: the engine retries a
+    /// failed attach on its own bounded schedule, and this is the
+    /// user-driven path for anything that schedule gave up on. Runs that
+    /// already have a viewer, or that were asked for in this visibility
+    /// episode, are skipped.
+    func requestViewerAttach(forRuns runIds: [String]) {
+        for runId in runIds {
+            guard viewersByRunId[runId]?.session == nil else { continue }
+            guard !requestedViewerRunIds.contains(runId) else { continue }
+            requestedViewerRunIds.insert(runId)
+            onViewerAttachRequested?(runId)
+        }
+    }
+
+    /// The Agents view went out of sight: the next time it shows, every
+    /// still-viewerless member may be asked for again.
+    func resetViewerAttachRequests() {
+        requestedViewerRunIds.removeAll()
+    }
+
+    private func recordViewerAttachFailure(runId: String, reason: String) {
+        if viewerAttachFailuresByRunId[runId] != reason {
+            viewerAttachFailuresByRunId[runId] = reason
+        }
+    }
+
+    private func clearViewerAttachFailure(runId: String) {
+        guard viewerAttachFailuresByRunId[runId] != nil else { return }
+        viewerAttachFailuresByRunId.removeValue(forKey: runId)
     }
 
     /// Update pool capacities from the engine's EnginePoolConfig push.
@@ -65,14 +116,35 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// honors the requested slot or fails — it never picks a different slot.
     func attachWorkerPane(_ request: EngineAttachRequest) -> EngineAttachResult {
         guard !request.tmuxSocketPath.isEmpty, request.tmuxSocketPath.hasPrefix("/") else {
+            recordViewerAttachFailure(runId: request.runId, reason: "the engine supplied an invalid tmux socket path")
             return .failure(.internalFailure("engine supplied an invalid tmux socket path"))
         }
         let launch = WorkerViewerLaunch(attaching: request)
         switch hostAttachedPane(launch) {
         case .success:
+            clearViewerAttachFailure(runId: request.runId)
+            requestedViewerRunIds.remove(request.runId)
             return .success
         case .failure(let error):
+            recordViewerAttachFailure(runId: request.runId, reason: Self.viewerAttachFailureReason(error))
             return .failure(error)
+        }
+    }
+
+    /// Card-ready wording for an attach this app refused. Names the
+    /// occupying run on `slotBusy` because that is the one fact a reader
+    /// needs to recognise a stale pane squatting on the slot.
+    static func viewerAttachFailureReason(_ error: EngineSpawnError) -> String {
+        switch error {
+        case .slotBusy(let occupyingRunId):
+            if let occupyingRunId, !occupyingRunId.isEmpty {
+                return "its slot is still hosting run \(occupyingRunId)"
+            }
+            return "its slot is still hosting another pane"
+        case .noAvailableSlot:
+            return "no viewer slot was available"
+        case .internalFailure(let message):
+            return message
         }
     }
 
@@ -138,6 +210,11 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// signal any foreground process — it only tears down the app's own
     /// viewer bookkeeping.
     func detachWorkerPane(runId: String) -> EngineReleaseResult {
+        // A detach means the engine has given up on this run's viewer, so a
+        // refusal recorded for it is stale whether or not a viewer exists —
+        // a viewer-less run's reason must not outlive the engine's intent.
+        clearViewerAttachFailure(runId: runId)
+        requestedViewerRunIds.remove(runId)
         guard let viewer = viewersByRunId[runId], let session = viewer.session else {
             return .failure(.unknownSlot)
         }

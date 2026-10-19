@@ -605,7 +605,8 @@ extension EngineClient {
             projectName: payload["project_name"] as? String,
             hostId: payload["host_id"] as? String,
             startedAt: payload["started_at"] as? String,
-            pool: payload["pool"] as? String
+            pool: payload["pool"] as? String,
+            viewerAttachError: payload["viewer_attach_error"] as? String
         )
     }
 

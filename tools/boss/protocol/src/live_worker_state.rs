@@ -292,6 +292,17 @@ pub struct LiveWorkerState {
     /// the original execution start, not the adoption time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
+    /// Why the engine's most recent attempt to attach this worker's viewer
+    /// (the app's terminal pane) failed, e.g. the app refused the slot or
+    /// the request to the app timed out. `None` while no attempt has been
+    /// made yet or the last attempt succeeded, so a client can tell
+    /// "connecting" (no viewer yet, nothing failed) from "attach failed".
+    /// The engine clears it the moment a later attach succeeds. Only
+    /// meaningful for local tmux-hosted workers; remote workers have no
+    /// viewer to attach. `serde(default)` keeps decode tolerant of payloads
+    /// from an older engine that omits the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_attach_error: Option<String>,
 }
 
 /// Host id of workers that run on this machine.
@@ -470,6 +481,7 @@ impl LiveWorkerState {
             project_name: None,
             host_id: None,
             started_at: None,
+            viewer_attach_error: None,
         }
     }
 }
@@ -637,6 +649,7 @@ mod tests {
             project_name: Some("Dynamic Agents pane layout".into()),
             host_id: Some("local".into()),
             started_at: Some("2026-05-06T11:58:00Z".into()),
+            viewer_attach_error: Some("app refused slot 1: busy".into()),
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();
@@ -698,6 +711,7 @@ mod tests {
             project_name: None,
             host_id: None,
             started_at: None,
+            viewer_attach_error: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();

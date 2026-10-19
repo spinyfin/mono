@@ -53,10 +53,16 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .background(Color(nsColor: .separatorColor))
         .onAppear(perform: bindAndSync)
         .onChange(of: grid.layout) { _, _ in if isVisible { refreshSnapshots() } }
-        .onChange(of: isVisible) { _, _ in syncGrid() }
+        .onChange(of: grid.layout.selectedPage) { _, _ in requestViewersForVisiblePage() }
+        .onChange(of: isVisible) { _, visible in
+            if !visible { workspace.resetViewerAttachRequests() }
+            syncGrid()
+            if visible { requestViewersForVisiblePage() }
+        }
         .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
         .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
         .onChange(of: workspace.viewersByRunId) { _, _ in syncGrid() }
+        .onChange(of: workspace.viewerAttachFailuresByRunId) { _, _ in syncGrid() }
         .onChange(of: workspace.interactivePoolSize) { _, _ in syncGrid() }
         .onChange(of: workspace.automationPoolSize) { _, _ in syncGrid() }
         .onChange(of: workspace.reviewSlotCount) { _, _ in syncGrid() }
@@ -272,6 +278,17 @@ struct WorkersDetailView: View, @MainActor Equatable {
         }
         Self.bindAgentReveal(grid: grid, workspace: workspace, liveStates: liveStates)
         syncGrid()
+        requestViewersForVisiblePage()
+    }
+
+    /// A page of live members just came into sight (the Agents tab was
+    /// shown, or the page selector changed). Any member on it still waiting
+    /// for a terminal is asked for once; see
+    /// `WorkersWorkspaceModel.requestViewerAttach(forRuns:)` for the dedupe
+    /// and why this is never driven by a timer.
+    private func requestViewersForVisiblePage() {
+        guard isVisible else { return }
+        workspace.requestViewerAttach(forRuns: grid.viewerlessRunIdsOnSelectedPage)
     }
 
     static func bindAgentReveal(
@@ -347,7 +364,8 @@ struct WorkersDetailView: View, @MainActor Equatable {
             liveState: live,
             liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slotId),
             isPlaceholder: isPlaceholder,
-            cachedPersona: grid.personaName(for: runId)
+            cachedPersona: grid.personaName(for: runId),
+            viewerAttachFailure: workspace.viewerAttachFailuresByRunId[runId]
         )
     }
 }
@@ -486,9 +504,16 @@ struct WorkerSlotView: View, @MainActor Equatable {
             if let live = snapshot.live {
                 statusPill(live.activity.agentsPaneLabel, color: liveActivityColor(live.activity))
             }
-            Text("Viewer not attached")
+            // "Connecting…" only while nothing is known to have failed; a
+            // refused or failed attach shows its reason (see
+            // `WorkerSlotSnapshot.viewerMissingMessage`).
+            Text(snapshot.viewerMissingMessage)
                 .font(.callout)
-                .foregroundStyle(Color.white.opacity(0.6))
+                .foregroundStyle(snapshot.isViewerConnecting ? Color.white.opacity(0.6) : Color.orange.opacity(0.9))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16)
+                .lineLimit(4)
+                .accessibilityLabel(snapshot.isViewerConnecting ? "Connecting to the worker's terminal" : "Terminal not attached: \(snapshot.viewerMissingMessage)")
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
