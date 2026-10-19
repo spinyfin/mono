@@ -270,14 +270,23 @@ struct WorkersDetailView: View, @MainActor Equatable {
         workspace.runtime.onWorkerFocus = { [grid] sessionId in
             grid.setFocusedRun(String(sessionId.dropFirst("run-".count)))
         }
-        workspace.agentsRevealHandler = { [grid, workspace, liveStates] runId in
+        Self.bindAgentReveal(grid: grid, workspace: workspace, liveStates: liveStates)
+        syncGrid()
+    }
+
+    static func bindAgentReveal(
+        grid: AgentsGridModel,
+        workspace: WorkersWorkspaceModel,
+        liveStates: LiveWorkerStateStore
+    ) {
+        workspace.agentsRevealHandler = { [grid, weak workspace, liveStates] runId in
+            guard let workspace else { return .notMember }
             // Make membership current before validating the request; the
             // successful reveal will then switch navigation to Agents.
             grid.setVisible(true)
             Self.applyMembership(grid: grid, workspace: workspace, liveStates: liveStates)
             return grid.reveal(runId: runId)
         }
-        syncGrid()
     }
 
     private func syncGrid() {

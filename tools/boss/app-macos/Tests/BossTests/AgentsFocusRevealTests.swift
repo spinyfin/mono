@@ -79,16 +79,21 @@ final class AgentsFocusRevealTests: XCTestCase {
     func testWorkspaceRevealReportsUnknownRunAndSucceedsForViewerlessMember() {
         let workspace = WorkersWorkspaceModel()
         let grid = makeGrid(runs: 2, visible: false)
-        workspace.agentsRevealHandler = { runId in
-            // Mirrors the view: a request from another mode forces visibility.
-            grid.setVisible(true)
-            return grid.reveal(runId: runId)
-        }
+        let liveStates = LiveWorkerStateStore()
+        WorkersDetailView.bindAgentReveal(grid: grid, workspace: workspace, liveStates: liveStates)
+        // Membership arriving after binding must be used by the production handler.
+        liveStates.update(states: [makeState(
+            runId: "run-1", slotId: 2, name: "Persona 1", agentType: "coding",
+            startedAt: "2026-10-09T00:00:01Z"
+        )])
         guard case .success = workspace.revealAgent(runId: "run-1") else {
             return XCTFail("a viewer-less member is revealed as its card")
         }
         XCTAssertTrue(grid.layout.isVisible)
         XCTAssertEqual(grid.layout.focusedRunId, "run-1")
+        guard case .failure(.unknownSlot) = workspace.revealAgent(runId: "run-0") else {
+            return XCTFail("stale grid membership must be replaced before reveal")
+        }
         guard case .failure(.unknownSlot) = workspace.revealAgent(runId: "ghost") else {
             return XCTFail("a run unknown to membership and viewers must fail")
         }
