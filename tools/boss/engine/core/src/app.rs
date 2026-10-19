@@ -2608,20 +2608,24 @@ async fn handle_frontend_connection(
                 let batch = read_batch.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     permits.started();
-                    let _permits = permits;
                     if let Some(batch) = &batch {
                         // From here identical reads start a new batch: this
                         // handler's snapshot predates them.
                         batch.start();
                     }
                     runtime.block_on(dispatch_fut);
+                    permits
                 })
                 .await;
                 match result {
-                    Ok(()) => {
+                    Ok(permits) => {
+                        // Followers are answered before the read's admission
+                        // permits are released, so a later read cannot be
+                        // admitted ahead of the replies this one owes.
                         if let Some(batch) = &read_batch {
                             batch.finish(&sink);
                         }
+                        drop(permits);
                     }
                     Err(err) => {
                         tracing::error!(?err, %session_id, "read RPC handler failed");
