@@ -27,7 +27,8 @@ extension ChatViewModel {
 
     func focusAgentFromWorkCard(_ runId: String) {
         switch focusAgentRun(runId) {
-        case .success: break
+        case .success:
+            workErrorMessage = nil
         case .failure(.unknownSlot):
             workErrorMessage = "This agent is no longer available in this window."
         case .failure(.internalFailure(let reason)):

@@ -25,6 +25,7 @@ final class AgentFocusRequestTests: XCTestCase {
         model.navigationMode = .work
         var received: String?
         model.paneFocusHandler = { received = $0; return .success }
+        model.workErrorMessage = "This agent is no longer available in this window."
         model.focusAgentFromWorkCard("run-a")
         XCTAssertEqual(model.navigationMode, .agents)
         XCTAssertEqual(received, "run-a")
