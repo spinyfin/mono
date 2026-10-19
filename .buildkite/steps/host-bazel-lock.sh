@@ -17,11 +17,21 @@
 #
 # Mechanism: an atomic `mkdir` of $CI_HOST_BAZEL_LOCK_DIR/lock, with an
 # `owner` file naming the holder (pid, boot id, acquire time, Buildkite job).
-# Waiters poll. A lock whose holder pid is gone, whose boot id does not match
-# the running kernel, or whose age exceeds the safety ceiling is stale and is
-# reclaimed by renaming it aside (rename is atomic, so two waiters cannot both
-# reclaim the same lock, and nobody can delete a lock that was freshly
-# re-acquired by someone else between the check and the removal).
+# Waiters poll (so admission is not FIFO: whichever poll lands first after a
+# release wins). A lock whose holder pid is gone, whose boot id does not match
+# the running kernel, or which never got an owner file is stale and is
+# reclaimed. A live holder is never evicted, however long it has run: reclaim
+# only removes the directory, it cannot stop the holder's Bazel work, so
+# evicting a slow job would let a successor run beside it. Long holds are
+# reported in the waiting message instead.
+#
+# Reclaim is serialised by a short-lived guard directory ($root/reclaim-guard).
+# Under the guard the staleness check is redone against whatever occupies the
+# lock path right now, then the lock is renamed aside and deleted. A waiter
+# that judged an old lock stale but was delayed therefore re-checks and finds
+# the fresh live lock someone else acquired meanwhile, and leaves it alone.
+# Nothing else removes a lock that has a living holder: its own release is the
+# only other writer, and a stale lock's holder is by definition not releasing.
 #
 # Enablement:
 #   CI_HOST_BAZEL_LOCK=1     always take the lock
@@ -32,7 +42,13 @@
 #   CI_HOST_BAZEL_LOCK_DIR           default ${HOME}/.cache/buildkite-host-bazel-lock
 #   CI_HOST_BAZEL_LOCK_POLL_SECS     default 5
 #   CI_HOST_BAZEL_LOCK_REPORT_SECS   default 60  (progress line while waiting)
-#   CI_HOST_BAZEL_LOCK_MAX_AGE_SECS  default 10800 (3h safety ceiling)
+#   CI_HOST_BAZEL_LOCK_LONG_HOLD_SECS  default 10800 (3h; a live holder older
+#                                    than this is called out while waiting,
+#                                    never reclaimed)
+#   CI_HOST_BAZEL_LOCK_OWNERLESS_GRACE_SECS  default 30 (how long a lock may
+#                                    exist with no owner file before it is
+#                                    treated as abandoned)
+#   CI_HOST_BAZEL_LOCK_BOOT_ID       override the detected boot id (tests)
 
 host_bazel_lock_enabled() {
   case "${CI_HOST_BAZEL_LOCK:-auto}" in
@@ -54,6 +70,10 @@ host_bazel_lock_path() {
 # no longer exists cannot be mistaken for live because the pid got reused
 # after a restart. Empty when unknown (the check is then skipped).
 host_bazel_lock_boot_id() {
+  if [[ -n "${CI_HOST_BAZEL_LOCK_BOOT_ID:-}" ]]; then
+    printf '%s\n' "$CI_HOST_BAZEL_LOCK_BOOT_ID"
+    return 0
+  fi
   case "$(uname -s)" in
     # /usr/sbin is not on every PATH (Bazel's test sandbox, for one).
     Darwin) "$(command -v sysctl || printf '/usr/sbin/sysctl')" -n kern.boottime 2>/dev/null | sed -E 's/.*sec = ([0-9]+).*/\1/' ;;
@@ -73,8 +93,15 @@ host_bazel_lock_owner_field() {
   grep -m1 "^${key}=" "${lock}/owner" 2>/dev/null | cut -d= -f2-
 }
 
+# Prints the mtime in epoch seconds. Prints the current time when it cannot be
+# read, so an unreadable mtime never makes a lock look ancient.
 host_bazel_lock_mtime() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || printf '0'
+  # Bazel's test sandbox PATH has perl but no stat.
+  local m
+  m=$(perl -e 'print((stat $ARGV[0])[9])' "$1" 2>/dev/null) && [[ "$m" =~ ^[0-9]+$ ]] && { printf '%s\n' "$m"; return 0; }
+  m=$(stat -f %m "$1" 2>/dev/null) && [[ "$m" =~ ^[0-9]+$ ]] && { printf '%s\n' "$m"; return 0; }
+  m=$(stat -c %Y "$1" 2>/dev/null) && [[ "$m" =~ ^[0-9]+$ ]] && { printf '%s\n' "$m"; return 0; }
+  date +%s
 }
 
 host_bazel_lock_pid_alive() {
@@ -90,17 +117,18 @@ host_bazel_lock_pid_alive() {
   ps -p "$pid" >/dev/null 2>&1
 }
 
-# Returns 0 and prints a reason when the lock at $1 is stale.
+# Returns 0 and prints a reason when the lock at $1 is stale. Age is never a
+# reason: a live holder stays exclusive however long it runs.
 host_bazel_lock_stale_reason() {
-  local lock="$1" now pid boot acquired max_age
+  local lock="$1" now pid boot grace
   now=$(date +%s)
-  max_age="${CI_HOST_BAZEL_LOCK_MAX_AGE_SECS:-10800}"
+  grace="${CI_HOST_BAZEL_LOCK_OWNERLESS_GRACE_SECS:-30}"
   pid=$(host_bazel_lock_owner_field "$lock" pid)
   if [[ -z "$pid" ]]; then
     # mkdir happened but the owner file is not written yet (a few ms window),
     # or the holder died in that window. Give it a grace period.
-    if (( now - $(host_bazel_lock_mtime "$lock") > 30 )); then
-      printf 'no owner file after 30s\n'
+    if (( now - $(host_bazel_lock_mtime "$lock") > grace )); then
+      printf 'no owner file after %ss\n' "$grace"
       return 0
     fi
     return 1
@@ -116,23 +144,39 @@ host_bazel_lock_stale_reason() {
     printf 'taken before the last reboot (boot %s, now %s)\n' "$boot" "$current_boot"
     return 0
   fi
-  acquired=$(host_bazel_lock_owner_field "$lock" acquired)
-  if [[ -n "$acquired" ]] && (( now - acquired > max_age )); then
-    printf 'older than the %ss ceiling (held %ss)\n' "$max_age" "$((now - acquired))"
-    return 0
-  fi
   return 1
 }
 
-# Move a stale lock aside atomically and delete it. Only one of several
-# concurrent waiters can win the rename; the others simply retry mkdir.
+# Reclaim a lock that a waiter judged stale. The judgement is not trusted:
+# the lock path is reusable, so by the time this runs the directory there may
+# be a different, live lock. Under the reclaim guard the check is redone on
+# the current occupant and only a lock that is stale right now is removed.
 host_bazel_lock_reclaim() {
-  local lock="$1" reason="$2" aside
-  aside="$(host_bazel_lock_root)/stale.$$.${RANDOM}"
-  if mv "$lock" "$aside" 2>/dev/null; then
-    host_bazel_lock_log "reclaimed stale lock (${reason}); previous owner: $(tr '\n' ' ' < "${aside}/owner" 2>/dev/null)"
-    rm -rf "$aside"
+  local lock="$1" root guard aside reason
+  root=$(host_bazel_lock_root)
+  guard="${root}/reclaim-guard"
+  if ! mkdir "$guard" 2>/dev/null; then
+    # Another waiter is reclaiming (the guard is held for milliseconds). If
+    # its process died holding the guard, clear it so the next poll can
+    # proceed; otherwise just retry on the next poll.
+    local gpid
+    gpid=$(cat "${guard}/pid" 2>/dev/null || true)
+    if [[ -n "$gpid" ]] && ! host_bazel_lock_pid_alive "$gpid"; then
+      rm -rf "$guard"
+    elif [[ -z "$gpid" ]] && (( $(date +%s) - $(host_bazel_lock_mtime "$guard") > 30 )); then
+      rm -rf "$guard"
+    fi
+    return 0
   fi
+  printf '%s\n' "$$" > "${guard}/pid"
+  if [[ -d "$lock" ]] && reason=$(host_bazel_lock_stale_reason "$lock"); then
+    aside="${root}/stale.$$.${RANDOM}"
+    if mv "$lock" "$aside" 2>/dev/null; then
+      host_bazel_lock_log "reclaimed stale lock (${reason}); previous owner: $(tr '\n' ' ' < "${aside}/owner" 2>/dev/null)"
+      rm -rf "$aside"
+    fi
+  fi
+  rm -rf "$guard"
 }
 
 host_bazel_lock_describe_holder() {
@@ -142,6 +186,19 @@ host_bazel_lock_describe_holder() {
     "$(host_bazel_lock_owner_field "$lock" pid)" \
     "$(host_bazel_lock_owner_field "$lock" job)" \
     "$(host_bazel_lock_owner_field "$lock" acquired_at)"
+}
+
+# Echoes a note when the live holder has run longer than the long-hold
+# threshold. Diagnostic only; the holder keeps the lock.
+host_bazel_lock_long_hold_note() {
+  local lock="$1" acquired held limit
+  limit="${CI_HOST_BAZEL_LOCK_LONG_HOLD_SECS:-10800}"
+  acquired=$(host_bazel_lock_owner_field "$lock" acquired)
+  [[ -n "$acquired" ]] || return 0
+  held=$(( $(date +%s) - acquired ))
+  if (( held > limit )); then
+    printf ' — held %ss, over the %ss long-hold mark; not reclaimed while its process lives, cancel the job in Buildkite if it is wedged' "$held" "$limit"
+  fi
 }
 
 host_bazel_lock_acquire() {
@@ -192,20 +249,20 @@ host_bazel_lock_acquire() {
       return 0
     fi
 
-    local reason
-    if reason=$(host_bazel_lock_stale_reason "$lock"); then
-      host_bazel_lock_reclaim "$lock" "$reason"
+    if [[ -d "$lock" ]] && host_bazel_lock_stale_reason "$lock" >/dev/null; then
+      host_bazel_lock_reclaim "$lock"
+      sleep 0.2
       continue
     fi
 
     now=$(date +%s)
     if (( announced == 0 )); then
       echo "--- [host-bazel-lock] waiting: another heavy Bazel job holds this host"
-      host_bazel_lock_log "held by $(host_bazel_lock_describe_holder "$lock")"
+      host_bazel_lock_log "held by $(host_bazel_lock_describe_holder "$lock")$(host_bazel_lock_long_hold_note "$lock")"
       host_bazel_lock_log "one heavy Bazel job per Mac host at a time — see .buildkite/mac-agents-runbook.md"
       announced=1
     elif (( now - last_report >= report )); then
-      host_bazel_lock_log "still waiting ($((now - start))s), held by $(host_bazel_lock_describe_holder "$lock")"
+      host_bazel_lock_log "still waiting ($((now - start))s), held by $(host_bazel_lock_describe_holder "$lock")$(host_bazel_lock_long_hold_note "$lock")"
       last_report=$now
     fi
     sleep "$poll"

@@ -141,24 +141,76 @@ out=$(CI_HOST_BAZEL_LOCK_DIR="$dir" run_with_deadline 20 bash -c "source '$LIB';
   && pass "dead-pid lock reclaimed" || fail "dead-pid lock not reclaimed: $out"
 
 # --- a lock from before a reboot is reclaimed even if the pid is live ------
+# The boot id is injected so this runs inside the Bazel sandbox, where the
+# kernel boot time is unreadable.
 dir=$(fresh_dir stale-boot)
-if [[ -n "$(bash -c "source '$LIB'; host_bazel_lock_boot_id")" ]]; then
-  mkdir -p "$dir/lock"
-  { echo "pid=$$"; echo "boot=1"; echo "acquired=$(date +%s)"; echo "label=pre-reboot-job"; } > "$dir/lock/owner"
-  out=$(CI_HOST_BAZEL_LOCK_DIR="$dir" run_with_deadline 20 bash -c "source '$LIB'; host_bazel_lock_acquire; host_bazel_lock_release" 2>&1) \
-    && printf '%s\n' "$out" | grep -q 'reclaimed stale lock (taken before the last reboot' \
-    && pass "pre-reboot lock reclaimed" || fail "pre-reboot lock not reclaimed: $out"
-else
-  echo "skip: no boot id on this platform"
-fi
-
-# --- a lock older than the ceiling is reclaimed even if the pid is live ----
-dir=$(fresh_dir stale-age)
 mkdir -p "$dir/lock"
-{ echo "pid=$$"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(( $(date +%s) - 100 ))"; echo "label=wedged-job"; } > "$dir/lock/owner"
-out=$(CI_HOST_BAZEL_LOCK_DIR="$dir" CI_HOST_BAZEL_LOCK_MAX_AGE_SECS=10 run_with_deadline 20 bash -c "source '$LIB'; host_bazel_lock_acquire; host_bazel_lock_release" 2>&1) \
-  && printf '%s\n' "$out" | grep -q 'reclaimed stale lock (older than the 10s ceiling' \
-  && pass "over-age lock reclaimed" || fail "over-age lock not reclaimed: $out"
+{ echo "pid=$$"; echo "boot=1000"; echo "acquired=$(date +%s)"; echo "label=pre-reboot-job"; } > "$dir/lock/owner"
+out=$(CI_HOST_BAZEL_LOCK_DIR="$dir" CI_HOST_BAZEL_LOCK_BOOT_ID=2000 run_with_deadline 20 bash -c "source '$LIB'; host_bazel_lock_acquire; host_bazel_lock_release" 2>&1) \
+  && printf '%s\n' "$out" | grep -q 'reclaimed stale lock (taken before the last reboot' \
+  && pass "pre-reboot lock reclaimed" || fail "pre-reboot lock not reclaimed: $out"
+
+# --- a lock with no owner file is reclaimed after the grace period ---------
+dir=$(fresh_dir ownerless)
+mkdir -p "$dir/lock"
+out=$(CI_HOST_BAZEL_LOCK_DIR="$dir" CI_HOST_BAZEL_LOCK_OWNERLESS_GRACE_SECS=0 run_with_deadline 20 bash -c "sleep 1.1; source '$LIB'; host_bazel_lock_acquire; host_bazel_lock_release" 2>&1) \
+  && printf '%s\n' "$out" | grep -q 'reclaimed stale lock (no owner file after 0s' \
+  && pass "ownerless lock reclaimed after the grace period" || fail "ownerless lock not reclaimed: $out"
+
+# --- an ownerless lock inside the grace period is respected ----------------
+dir=$(fresh_dir ownerless-fresh)
+mkdir -p "$dir/lock"
+if CI_HOST_BAZEL_LOCK_DIR="$dir" run_with_deadline 3 bash -c "source '$LIB'; host_bazel_lock_acquire" >/dev/null 2>&1; then
+  fail "a fresh ownerless lock was reclaimed inside the grace period"
+else
+  pass "a fresh ownerless lock is respected"
+fi
+rm -rf "$dir/lock"
+
+# --- a live holder is never evicted for age; the wait names the long hold --
+dir=$(fresh_dir long-hold)
+mkdir -p "$dir/lock"
+{ echo "pid=$$"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(( $(date +%s) - 100 ))"; echo "label=slow-job"; } > "$dir/lock/owner"
+out_file="$dir/waiter.out"
+if CI_HOST_BAZEL_LOCK_DIR="$dir" CI_HOST_BAZEL_LOCK_LONG_HOLD_SECS=10 run_with_deadline 3 bash -c "source '$LIB'; host_bazel_lock_acquire" >"$out_file" 2>&1; then
+  fail "a live holder was evicted for age"
+else
+  pass "a live holder stays exclusive past the long-hold mark"
+fi
+grep -q 'over the 10s long-hold mark' "$out_file" \
+  && pass "waiter named the long-held lock" || fail "no long-hold note: $(cat "$out_file")"
+rm -rf "$dir/lock"
+
+# --- a delayed reclaim cannot delete a freshly re-acquired live lock -------
+# Waiter B judged the old lock stale, then stalled. Meanwhile waiter A
+# reclaimed it and a new job took the lock. B's reclaim, run now, must
+# re-check the current occupant and leave the live lock alone.
+dir=$(fresh_dir reclaim-race)
+mkdir -p "$dir/lock"
+sleep 0 & dead_pid=$!; wait "$dead_pid"
+{ echo "pid=$dead_pid"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(date +%s)"; echo "label=old-job"; } > "$dir/lock/owner"
+CI_HOST_BAZEL_LOCK_DIR="$dir" bash -c "source '$LIB'; host_bazel_lock_stale_reason '$dir/lock' >/dev/null" \
+  || fail "setup: old lock should read as stale"
+# A takes over: old lock gone, new live lock owned by this (live) process.
+rm -rf "$dir/lock"
+mkdir -p "$dir/lock"
+{ echo "pid=$$"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(date +%s)"; echo "label=new-job"; } > "$dir/lock/owner"
+CI_HOST_BAZEL_LOCK_DIR="$dir" bash -c "source '$LIB'; host_bazel_lock_reclaim '$dir/lock'" >/dev/null 2>&1
+if [[ -d "$dir/lock" ]] && grep -q '^label=new-job$' "$dir/lock/owner" && [[ ! -e "$dir/reclaim-guard" ]]; then
+  pass "delayed reclaim left the freshly acquired lock alone"
+else
+  fail "delayed reclaim removed or damaged the new live lock"
+fi
+rm -rf "$dir/lock"
+
+# --- a guard abandoned by a dead process is cleared ------------------------
+dir=$(fresh_dir dead-guard)
+mkdir -p "$dir/reclaim-guard" "$dir/lock"
+sleep 0 & dead_pid=$!; wait "$dead_pid"
+echo "$dead_pid" > "$dir/reclaim-guard/pid"
+{ echo "pid=$dead_pid"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(date +%s)"; echo "label=dead-job"; } > "$dir/lock/owner"
+CI_HOST_BAZEL_LOCK_DIR="$dir" run_with_deadline 20 bash -c "source '$LIB'; host_bazel_lock_acquire; host_bazel_lock_release" >/dev/null 2>&1 \
+  && pass "a dead process's reclaim guard does not wedge the lock" || fail "dead reclaim guard wedged acquisition"
 
 # --- a live, in-date lock held by this very process is NOT reclaimed -------
 dir=$(fresh_dir live)
