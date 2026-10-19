@@ -194,6 +194,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn allows_read_only_pipelines_and_multi_range_sed() {
+        let pinned = "a".repeat(40);
+        let approved = [
+            "nl -ba /repo/src/a.rs | sed -n '1,76p'".to_owned(),
+            "nl -ba /repo/src/a.rs | sed -n '105,164p;245,335p'".to_owned(),
+            "cat -n /repo/src/a.rs | head -n 40".to_owned(),
+            format!("git show {pinned}:src/a.rs | sed -n '10,20p'"),
+            "sed -n '1,5p;9p' /repo/src/a.rs".to_owned(),
+        ];
+        let blocked = [
+            "nl -ba /repo/src/a.rs | sed -i 's/a/b/'".to_owned(),
+            "nl -ba /repo/src/a.rs | sed -n '1p' /repo/src/b.rs".to_owned(),
+            "cat /repo/src/a.rs | sh".to_owned(),
+            "nl -ba /repo/src/a.rs > out".to_owned(),
+            "nl -ba /etc/passwd | sed -n '1p'".to_owned(),
+            "nl -ba | sed -n '1p'".to_owned(),
+            "sed -n '1p'".to_owned(),
+            "cat /repo/src/a.rs | head -n 3 ; touch x".to_owned(),
+            "cat /repo/src/a.rs | head -n 3 || touch x".to_owned(),
+            "cat /repo/src/a.rs | rg foo".to_owned(),
+            "cat /repo/src/a.rs | sed -n '1p;w out'".to_owned(),
+        ];
+        for (commands, expected) in [(&approved[..], "approve"), (&blocked[..], "block")] {
+            for command in commands {
+                assert_eq!(
+                    decide_with_source(
+                        serde_json::json!({"tool_name":"Bash","cwd":"/repo","tool_input":{"command":command}}),
+                        true
+                    )
+                    .0,
+                    expected,
+                    "{command}"
+                );
+            }
+        }
+    }
+
     fn decide(payload: serde_json::Value) -> (String, String) {
         decide_with_source(payload, false)
     }
@@ -346,7 +384,7 @@ mod tests {
                 ("$FILE", "block"),
                 ("$(cat src/a.rs)", "block"),
                 ("src/*", "block"),
-                ("src/a.rs | cat", "block"),
+                ("src/a.rs | sh", "block"),
                 ("src/a.rs > src/b.rs", "block"),
                 ("", "block"),
                 ("-", "block"),

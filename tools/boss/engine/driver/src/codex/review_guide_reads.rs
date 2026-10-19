@@ -46,23 +46,39 @@ def guide_shell_read(payload):
     # Literals are masked before grouping so punctuation inside a search query
     # cannot be mistaken for shell syntax by the shared tokenizer.
     literal = r"'(?:[^']*)'"
-    atom = '(?:[A-Za-z0-9_./:@+,-]+|'+literal+')'
+    atom = '(?:[A-Za-z0-9_./:@+,-]+|\\||'+literal+')'
     if not re.fullmatch(atom+'(?:[ \t]+'+atom+')*[ \t]*', command):
         return False
     values = []
     def mask(match):
         values.append(match.group(0)[1:-1])
         return 'GUIDE_LITERAL_'+str(len(values)-1)
-    groups = command_groups(re.sub(literal, mask, command))
-    if len(groups) != 1:
-        return False
-    tokens = groups[0]
-    tokens = [values[int(t[14:])] if t.startswith('GUIDE_LITERAL_') and t[14:].isdigit() and int(t[14:]) < len(values) else t for t in tokens]
+    masked = re.sub(literal, mask, command)
+    # Pipelines joined only by '|'; every stage is itself a single allowed read.
+    stages = masked.split('|')
+    for index, stage in enumerate(stages):
+        groups = command_groups(stage)
+        if len(groups) != 1:
+            return False
+        tokens = [values[int(t[14:])] if t.startswith('GUIDE_LITERAL_') and t[14:].isdigit() and int(t[14:]) < len(values) else t for t in groups[0]]
+        if not guide_read_stage(tokens, payload, index > 0):
+            return False
+    return True
+
+def guide_read_stage(tokens, payload, piped):
     if not tokens:
         return False
     prog, args = tokens[0], tokens[1:]
     cwd = payload.get('cwd') or os.environ.get('BOSS_REVIEW_GUIDE_WORKSPACE', '')
+    # A first stage must name its files; a piped stage reads stdin and names none.
+    def files_ok(paths):
+        if piped:
+            return not paths
+        return bool(paths) and all(guide_path(p, cwd) for p in paths)
+    ranges = '[0-9]+(?:,[0-9]+)?p(?:;[0-9]+(?:,[0-9]+)?p)*'
     if prog == 'git':
+        if piped:
+            return False
         if args and args[0] == '--no-pager':
             args = args[1:]
         revisions = {os.environ.get('BOSS_REVIEW_GUIDE_HEAD_SHA'), os.environ.get('BOSS_REVIEW_GUIDE_BASE_SHA'), os.environ.get('BOSS_REVIEW_GUIDE_PREVIOUS_HEAD_SHA')}
@@ -78,7 +94,7 @@ def guide_shell_read(payload):
     if prog == 'cat':
         if args and args[0] == '-n':
             args = args[1:]
-        return bool(args) and all(guide_path(p, cwd) for p in args)
+        return files_ok(args)
     if prog == 'nl':
         # Only explicit numbering options; never treat unknown options as paths.
         options = {'-b': '[atn]', '-h': '[atn]', '-f': '[atn]', '-n': '(?:ln|rn|rz)', '-i': '[0-9]+', '-v': '[0-9]+', '-w': '[0-9]+'}
@@ -93,16 +109,18 @@ def guide_shell_read(payload):
                 value, args = args[0], args[1:]
             if pattern is None or not re.fullmatch(pattern, value):
                 return False
-        return bool(args) and all(guide_path(p, cwd) for p in args)
+        return files_ok(args)
     if prog == 'wc':
-        return len(args) >= 2 and args[0] == '-l' and all(guide_path(p, cwd) for p in args[1:])
+        return len(args) >= 1 and args[0] == '-l' and files_ok(args[1:])
     if prog in ('head', 'tail'):
         if len(args) >= 2 and args[0] == '-n' and args[1].isdigit():
             args = args[2:]
-        return bool(args) and all(guide_path(p, cwd) for p in args)
+        return files_ok(args)
     if prog == 'sed':
-        return len(args) == 3 and args[0] == '-n' and bool(re.fullmatch('[0-9]+(?:,[0-9]+)?p', args[1])) and guide_path(args[2], cwd)
+        return len(args) >= 2 and args[0] == '-n' and bool(re.fullmatch(ranges, args[1])) and files_ok(args[2:]) and (piped or len(args) == 3)
     if prog == 'rg':
+        if piped:
+            return False
         flags = {'-n', '--line-number', '-l', '--files-with-matches', '-i', '--ignore-case', '-F', '--fixed-strings', '--files'}
         files = '--files' in args
         while args and args[0] in flags:
