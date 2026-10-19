@@ -2,12 +2,10 @@ import SwiftUI
 import XCTest
 @testable import Boss
 
-/// The former "Work Error" modal path. `workErrorMessage` now feeds the
-/// passive `WorkNoticeBanner` in the titlebar chrome: a message shows up
-/// (and a newer one replaces it in place), an explicit dismiss clears it,
-/// and nothing about presenting it changes which window or control has
-/// focus. `ReportOnlyAlertScanTests` is the source-level half of this
-/// guarantee (no `.alert` is bound to `workErrorMessage` anywhere).
+/// `workErrorMessage` feeds the passive `WorkNoticeBanner` in the titlebar
+/// chrome: a message shows up (and a newer one replaces it in place) and an
+/// explicit dismiss clears it. `ReportOnlyAlertScanTests` is the source-level
+/// guarantee that no `.alert` is bound to `workErrorMessage`.
 @MainActor
 final class WorkNoticeBannerTests: XCTestCase {
     private func makeModel() -> ChatViewModel {
@@ -40,11 +38,10 @@ final class WorkNoticeBannerTests: XCTestCase {
         XCTAssertNil(model.workErrorMessage)
     }
 
-    /// The banner is an ordinary view in the window chrome: evaluating it
-    /// headlessly must not require, create, or key a window. Presenting an
-    /// `NSAlert` or a SwiftUI `.alert` would have needed a key window to
-    /// attach to (and would have become key itself).
-    func testBannerRendersWithoutTakingAWindowOrFocus() {
+    /// Layout check only: the banner lays out headlessly and its dismiss
+    /// action fires. Focus behavior is covered by the titlebar-accessory
+    /// tests below.
+    func testBannerLaysOutAndDismisses() {
         let keyWindowBefore = NSApp?.keyWindow
         var dismissed = false
         let banner = WorkNoticeBanner(message: "database is locked", onDismiss: { dismissed = true })
@@ -57,5 +54,80 @@ final class WorkNoticeBannerTests: XCTestCase {
         XCTAssertFalse(dismissed)
         banner.onDismiss()
         XCTAssertTrue(dismissed)
+    }
+
+    func testWorkErrorAloneCountsAsAChromeBanner() {
+        func present(workError: Bool) -> Bool {
+            chromeBannersPresent(
+                isConnected: true,
+                showConnectionLostBanner: false,
+                supervisionState: .running,
+                hasHealthIssues: false,
+                hasDisconnectedActionNotice: false,
+                hasWorkErrorMessage: workError,
+                hasRollbackNotice: false
+            )
+        }
+        XCTAssertFalse(present(workError: false))
+        XCTAssertTrue(present(workError: true), "a work error must install the titlebar accessory")
+    }
+
+    /// Drives the production accessory path from a real `.workError` event:
+    /// the banner is installed and visible, focus stays on the text field,
+    /// and no sheet is attached through presentation, replacement, and
+    /// dismissal.
+    func testWorkErrorBannerInstallsWithoutMovingFocusOrAttachingSheets() throws {
+        let model = makeModel()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        let field = NSTextField(frame: NSRect(x: 20, y: 20, width: 200, height: 24))
+        window.contentView?.addSubview(field)
+        XCTAssertTrue(window.makeFirstResponder(field))
+        let responderBefore = window.firstResponder
+        let host = TitlebarAccessoryHost()
+
+        func refresh() {
+            let message = model.workErrorMessage
+            let present = chromeBannersPresent(
+                isConnected: true,
+                showConnectionLostBanner: false,
+                supervisionState: .running,
+                hasHealthIssues: false,
+                hasDisconnectedActionNotice: false,
+                hasWorkErrorMessage: message != nil,
+                hasRollbackNotice: false
+            )
+            let content = AnyView(Group {
+                if let message {
+                    WorkNoticeBanner(message: message, onDismiss: { model.dismissWorkErrorMessage() })
+                }
+            })
+            host.update(window: window, content: content, isPresented: present, contentHeight: present ? 40 : 0)
+        }
+        func assertQuiet(_ step: String) {
+            XCTAssertTrue(window.firstResponder === responderBefore, "focus moved during \(step)")
+            XCTAssertNil(window.attachedSheet, "sheet attached during \(step)")
+            XCTAssertTrue(window.sheets.isEmpty, "sheet attached during \(step)")
+        }
+
+        model.applyEventForTest(.error(message: "database is locked"))
+        refresh()
+        let controller = try XCTUnwrap(host.installedController, "banner must be installed")
+        XCTAssertFalse(controller.isHidden)
+        assertQuiet("initial presentation")
+
+        model.applyEventForTest(.error(message: "engine busy, retry"))
+        refresh()
+        XCTAssertFalse(try XCTUnwrap(host.installedController).isHidden)
+        assertQuiet("replacement")
+
+        model.dismissWorkErrorMessage()
+        refresh()
+        XCTAssertTrue(try XCTUnwrap(host.installedController).isHidden, "dismiss hides the banner")
+        assertQuiet("dismissal")
     }
 }

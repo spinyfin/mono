@@ -4,12 +4,9 @@ import XCTest
 /// Guard for the "no modal for a non-actionable status or error message"
 /// rule (tools/boss/app-macos/AGENTS.md).
 ///
-/// The original incident: a "Work Error" `.alert` bound to
-/// `ChatViewModel.workErrorMessage` re-popped over whatever the user was
-/// typing for every engine busy / database-locked reply — messages the
-/// user could do nothing about — stealing keyboard focus each time. The
-/// fix moved that report to the passive `WorkNoticeBanner`; this scan keeps
-/// the alert from coming back in any file.
+/// Failure reports the user cannot act on surface passively (for example
+/// `workErrorMessage` on `WorkNoticeBanner`); this scan guarantees no
+/// production source presents one as an alert.
 ///
 /// `scan_for_report_only_alerts.sh` scans every production `*.swift`
 /// under `Sources/` and reports:

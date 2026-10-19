@@ -129,6 +129,38 @@ final class UpdateModelBlocklistTests: XCTestCase {
         XCTAssertNotNil(model.lastCheckResult, "retry ran a check when none had happened yet")
     }
 
+    func testRetryRecheckNetworkErrorReportsViaToastNotSheet() async throws {
+        let installer = makeInstaller()
+        installer.blockVersion(mockVersion)
+        let model = makeModel(stager: .noop, installer: installer, fetcher: failingFetcher(status: 500))
+
+        model.retryBlockedUpdate(mockVersion)
+        XCTAssertFalse(model.showUpdateSheet, "no sheet while the re-check is in flight")
+        XCTAssertEqual(model.manualCheckFeedback, .checking)
+        try await waitForFeedback(model) { if case .networkError = $0 { return true } else { return false } }
+        XCTAssertFalse(model.showUpdateSheet)
+    }
+
+    func testRetryRecheckRateLimitedReportsViaToastNotSheet() async throws {
+        let installer = makeInstaller()
+        installer.blockVersion(mockVersion)
+        let model = makeModel(stager: .noop, installer: installer, fetcher: failingFetcher(status: 429))
+
+        model.retryBlockedUpdate(mockVersion)
+        try await waitForFeedback(model) { if case .rateLimited = $0 { return true } else { return false } }
+        XCTAssertFalse(model.showUpdateSheet)
+    }
+
+    func testRetryRecheckUpToDateReportsViaToastNotSheet() async throws {
+        let installer = makeInstaller()
+        installer.blockVersion(mockVersion)
+        let model = makeModel(stager: .noop, installer: installer, fetcher: emptyFeedFetcher())
+
+        model.retryBlockedUpdate(mockVersion)
+        try await waitForFeedback(model) { $0 == .upToDate }
+        XCTAssertFalse(model.showUpdateSheet)
+    }
+
     func testRollbackNoticeSurfacesUntilDismissed() throws {
         let installer = makeInstaller()
         try plantRollback(installer: installer, version: "1.0.99", reason: "handshake-timeout")
@@ -184,8 +216,38 @@ final class UpdateModelBlocklistTests: XCTestCase {
             log: log)
     }
 
-    private func makeModel(stager: UpdateStager, installer: UpdateInstaller) -> UpdateModel {
-        let fetcher = HTTPFetcher { _ in
+    private func failingFetcher(status: Int) -> HTTPFetcher {
+        HTTPFetcher { _ in
+            let response = HTTPURLResponse(
+                url: UpdateChecker.releasesURL, statusCode: status, httpVersion: nil,
+                headerFields: status == 429 ? ["Retry-After": "60"] : nil)!
+            return (Data(), response)
+        }
+    }
+
+    private func emptyFeedFetcher() -> HTTPFetcher {
+        HTTPFetcher { _ in
+            let data = try JSONSerialization.data(withJSONObject: [Any]())
+            let response = HTTPURLResponse(
+                url: UpdateChecker.releasesURL, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (data, response)
+        }
+    }
+
+    private func waitForFeedback(
+        _ model: UpdateModel, _ matches: (ManualUpdateFeedback) -> Bool
+    ) async throws {
+        for _ in 0..<300 {
+            if let feedback = model.manualCheckFeedback, matches(feedback) { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("expected feedback not reached; got \(String(describing: model.manualCheckFeedback))")
+    }
+
+    private func makeModel(
+        stager: UpdateStager, installer: UpdateInstaller, fetcher customFetcher: HTTPFetcher? = nil
+    ) -> UpdateModel {
+        let fetcher = customFetcher ?? HTTPFetcher { _ in
             let asset: [String: Any] = [
                 "name": "Boss-1.0.99.zip", "size": 34_000_000,
                 "browser_download_url": "https://github.com/spinyfin/mono/releases/download/boss-v1.0.99/Boss-1.0.99.zip",

@@ -11,6 +11,28 @@ func shouldShowEngineUnreachableBanner(
     !isConnected && (showConnectionLostBanner || supervisionState != .running)
 }
 
+/// Whether any titlebar chrome banner has something to show. The accessory is
+/// installed and visible exactly when this is true.
+func chromeBannersPresent(
+    isConnected: Bool,
+    showConnectionLostBanner: Bool,
+    supervisionState: EngineSupervisionState,
+    hasHealthIssues: Bool,
+    hasDisconnectedActionNotice: Bool,
+    hasWorkErrorMessage: Bool,
+    hasRollbackNotice: Bool
+) -> Bool {
+    shouldShowEngineUnreachableBanner(
+        isConnected: isConnected,
+        showConnectionLostBanner: showConnectionLostBanner,
+        supervisionState: supervisionState
+    )
+        || (isConnected && hasHealthIssues)
+        || hasDisconnectedActionNotice
+        || hasWorkErrorMessage
+        || hasRollbackNotice
+}
+
 struct ResizeDivider: NSViewRepresentable {
     let currentWidth: CGFloat
     let minWidth: CGFloat

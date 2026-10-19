@@ -478,15 +478,15 @@ struct ContentView: View {
     /// healthy window's titlebar is untouched. The coordinator-update
     /// banner is not chrome: it lives in the coordinator pane column.
     private var hasChromeBanners: Bool {
-        shouldShowEngineUnreachableBanner(
+        chromeBannersPresent(
             isConnected: model.isConnected,
             showConnectionLostBanner: model.showConnectionLostBanner,
-            supervisionState: model.engineSupervisionState
+            supervisionState: model.engineSupervisionState,
+            hasHealthIssues: !model.bannerHealthIssues.isEmpty,
+            hasDisconnectedActionNotice: model.disconnectedActionNotice != nil,
+            hasWorkErrorMessage: model.workErrorMessage != nil,
+            hasRollbackNotice: updateModel.rollbackNotice != nil
         )
-            || (model.isConnected && !model.bannerHealthIssues.isEmpty)
-            || model.disconnectedActionNotice != nil
-            || model.workErrorMessage != nil
-            || updateModel.rollbackNotice != nil
     }
 
     /// Insertion-only: a banner slides down into the gap AppKit has just
@@ -537,10 +537,8 @@ struct ContentView: View {
             }
             // Failure reports with no more specific surface (engine
             // `work_error` replies, failed reveals, broken doc pointers).
-            // Formerly a "Work Error" modal alert that re-popped over
-            // whatever the user was typing for every repeat of a message
-            // they could not act on; now a passive, dismissable banner
-            // that never takes focus. See `WorkNoticeBanner`.
+            // Passive, dismissable banner that never takes focus.
+            // See `WorkNoticeBanner`.
             if let notice = model.workErrorMessage {
                 WorkNoticeBanner(
                     message: notice,
@@ -551,9 +549,7 @@ struct ContentView: View {
             // Persistent chrome-level signal that the engine socket is
             // down. Only shown after we've connected at least once so
             // the banner doesn't flash on launch during the normal
-            // initial-connect window. Replaces the previous behavior
-            // where every reconnect attempt re-popped the then-modal
-            // "Work Error" alert (#698) — transport errors are routed away
+            // initial-connect window. Transport errors are routed away
             // from `workErrorMessage` in `ChatViewModel.handle`. Also gated on
             // `showConnectionLostBanner` rather than the raw `isConnected`
             // flag: a drop that self-heals within `connectionLostBannerDelay`
