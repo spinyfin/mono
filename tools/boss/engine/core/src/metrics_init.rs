@@ -179,6 +179,7 @@ mod tests {
                 "review_pool.batch_reaped",
                 "run_done.backstop_asked",
                 "run_done.backstop_parked",
+                "run_done.finalize_retry",
                 "run_done.gate_held",
                 "speculative_conflict.clean",
                 "speculative_conflict.predicted",

@@ -36,7 +36,7 @@ impl WorkerCompletionHandler {
         }
         let attention = Self::revision_no_op_attention_input(bound_pr_url, contribution);
         Some(
-            self.finalize_no_op_completion(execution, Some(contribution), Some(attention))
+            self.finalize_no_op_completion_retaining(execution, Some(contribution), Some(attention))
                 .await,
         )
     }

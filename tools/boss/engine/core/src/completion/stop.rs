@@ -640,7 +640,7 @@ impl WorkerCompletionHandler {
             }
             let (contribution, attention) = self.declared_run_done_no_op_inputs(&execution);
             return self
-                .finalize_no_op_completion(&execution, contribution, attention)
+                .finalize_no_op_completion_retaining(&execution, contribution, attention)
                 .await;
         }
 
@@ -1571,7 +1571,7 @@ must not be asked to open one",
                             "stop event: worker declared no-changes-needed with no PR produced — \
                              work already done; closing task as a no-op (no PR, no nudge)"
                         );
-                        return self.finalize_no_op_completion(&execution, None, None).await;
+                        return self.finalize_no_op_completion_retaining(&execution, None, None).await;
                     }
                 }
                 tracing::info!(

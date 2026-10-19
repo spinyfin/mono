@@ -718,10 +718,31 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                                 .finalize_declared_run_done(&caller.execution_id, run_done_payload.outcome),
                         )
                         .await;
-                        if stop_outcome == crate::completion::StopOutcome::DbError {
-                            // The stamp is durable but the finalize write failed:
-                            // keep retrying in the background so the run never
-                            // strands open waiting on the worker.
+                        if crate::completion::finalize_resolved(&stop_outcome)
+                            || run_done_payload.outcome == boss_protocol::RunDoneOutcome::NoChangesNeeded
+                        {
+                            tracing::info!(
+                                execution_id = %caller.execution_id,
+                                outcome = %run_done_payload.outcome,
+                                delivered = matches!(delivery_outcome, Ok(Ok(true))),
+                                ?stop_outcome,
+                                "run_done proposal accepted: delivered/blocked finalized synchronously at submit \
+                                 (no-changes-needed waits for Stop)",
+                            );
+                        } else {
+                            // The proposal is `applied` and the ack above already went out
+                            // (it must precede teardown), but the finalize did NOT commit:
+                            // the durable stamp is the pending-finalize record, the
+                            // execution is still live, and the retry below plus the
+                            // `run_done_finalize_sweep` own it until a terminal write.
+                            tracing::warn!(
+                                execution_id = %caller.execution_id,
+                                outcome = %run_done_payload.outcome,
+                                delivered = matches!(delivery_outcome, Ok(Ok(true))),
+                                ?stop_outcome,
+                                "run_done proposal accepted but its finalize is PENDING (not committed): \
+                                 background retry started; the execution stays live until it commits",
+                            );
                             let handler = Arc::clone(&server_state.completion_handler);
                             let execution_id = caller.execution_id.clone();
                             let outcome = run_done_payload.outcome;
@@ -732,13 +753,6 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                                 tracing::info!(%execution_id, ?resolved, "run_done finalize resolved after retry");
                             });
                         }
-                        tracing::info!(
-                            execution_id = %caller.execution_id,
-                            outcome = %run_done_payload.outcome,
-                            delivered = matches!(delivery_outcome, Ok(Ok(true))),
-                            ?stop_outcome,
-                            "run_done proposal accepted: delivered/blocked finalized synchronously at submit (no-changes-needed waits for Stop)",
-                        );
                     }
                     Err(err) => tracing::error!(
                         execution_id = %caller.execution_id,
