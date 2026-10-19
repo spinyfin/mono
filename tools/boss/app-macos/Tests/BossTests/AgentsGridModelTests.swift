@@ -304,7 +304,10 @@ final class AgentsGridModelTests: XCTestCase {
     }
 
     func testQuietTaskAndCellCallbackWaitForResizeBoundary() async throws {
-        let grid = AgentsGridModel()
+        let grid = AgentsGridModel(geometry: PaneGeometry(
+            area: PaneSize(width: 800, height: 600),
+            cell: PaneSize(width: 6, height: 13)
+        ))
         let before = grid.layout.geometry
         grid.noteArea(width: 1200, height: 900, inLiveResize: false)
         grid.noteArea(width: 1400, height: 1000, inLiveResize: true)

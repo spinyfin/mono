@@ -23,9 +23,10 @@ public struct PaneGeometry: Equatable, Sendable {
         self.cell = cell
     }
 
-    /// Whether the cell size is a real measurement: finite and positive.
+    /// Whether both the available area and cell size are finite and positive.
     public var isMeasured: Bool {
-        cell.width.isFinite && cell.width > 0 && cell.height.isFinite && cell.height > 0
+        area.width.isFinite && area.width > 0 && area.height.isFinite && area.height > 0
+            && cell.width.isFinite && cell.width > 0 && cell.height.isFinite && cell.height > 0
     }
 }
 
