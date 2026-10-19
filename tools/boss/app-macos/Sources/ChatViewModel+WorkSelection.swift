@@ -13,15 +13,26 @@ extension ChatViewModel {
     }
 
     /// Run-keyed focus shared by `bossctl agents focus` and Doing-card clicks:
-    /// switch to Agents, then let the pane handler clear a hiding filter,
-    /// select the run's page, focus its terminal, and outline it.
+    /// validate and reveal the run, then switch to Agents so the pending
+    /// responder request can focus the mounted terminal or card.
     @discardableResult
     func focusAgentRun(_ runId: String) -> EngineFocusResult {
         guard let handler = paneFocusHandler else {
             return .failure(.internalFailure(Self.noPaneAllocatorReason))
         }
-        setNavigationMode(.agents)
-        return handler(runId)
+        let result = handler(runId)
+        if case .success = result { setNavigationMode(.agents) }
+        return result
+    }
+
+    func focusAgentFromWorkCard(_ runId: String) {
+        switch focusAgentRun(runId) {
+        case .success: break
+        case .failure(.unknownSlot):
+            workErrorMessage = "This agent is no longer available in this window."
+        case .failure(.internalFailure(let reason)):
+            workErrorMessage = "Could not show agent: \(reason)"
+        }
     }
 
     func setNavigationMode(_ mode: NavigationMode) {

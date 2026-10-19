@@ -191,6 +191,8 @@ struct WorkersDetailView: View, @MainActor Equatable {
                         runtime: workspace.runtime,
                         snapshot: snapshot,
                         isHighlighted: grid.highlightedRunId == runId,
+                        focusCoordinator: workspace.agentFocus,
+                        focusRunId: runId,
                         onToggleLiveStatus: { enabled in
                             onToggleLiveStatus(snapshot.slotId, enabled)
                         }
@@ -269,8 +271,8 @@ struct WorkersDetailView: View, @MainActor Equatable {
             grid.setFocusedRun(String(sessionId.dropFirst("run-".count)))
         }
         workspace.agentsRevealHandler = { [grid, workspace, liveStates] runId in
-            // The mode switch that precedes a focus request has not rendered
-            // yet, so make the grid visible and current before revealing.
+            // Make membership current before validating the request; the
+            // successful reveal will then switch navigation to Agents.
             grid.setVisible(true)
             Self.applyMembership(grid: grid, workspace: workspace, liveStates: liveStates)
             return grid.reveal(runId: runId)
@@ -401,12 +403,16 @@ struct WorkerSlotView: View, @MainActor Equatable {
     let snapshot: WorkerSlotSnapshot
     /// Outline shown on the cell a focus request just revealed.
     var isHighlighted = false
+    var focusCoordinator: AgentFocusCoordinator?
+    var focusRunId: String?
     let onToggleLiveStatus: (Bool) -> Void
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.runtime === rhs.runtime
             && lhs.snapshot == rhs.snapshot
             && lhs.isHighlighted == rhs.isHighlighted
+            && lhs.focusCoordinator === rhs.focusCoordinator
+            && lhs.focusRunId == rhs.focusRunId
     }
 
     var body: some View {
@@ -478,6 +484,11 @@ struct WorkerSlotView: View, @MainActor Equatable {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .black))
+        .background {
+            if let focusCoordinator, let focusRunId {
+                AgentCardFocusTarget(coordinator: focusCoordinator, runId: focusRunId)
+            }
+        }
     }
 
     @ViewBuilder

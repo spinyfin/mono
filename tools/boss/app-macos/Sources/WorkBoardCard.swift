@@ -176,7 +176,7 @@ struct WorkBoardCardItem: View {
             guard column == .doing,
                   let runId = model.taskRuntime(for: task.id)?.executionID
             else { return nil }
-            return { model.focusAgentRun(runId) }
+            return { model.focusAgentFromWorkCard(runId) }
         }()
 
         VStack(alignment: .leading, spacing: 6) {

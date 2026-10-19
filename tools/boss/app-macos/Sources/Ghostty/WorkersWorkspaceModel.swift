@@ -164,6 +164,8 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
     }
 
+    let agentFocus = AgentFocusCoordinator()
+
     /// Installed by the Agents view. Applies the run-keyed reveal (filter
     /// clear, page select, outline) on the view's grid model, forcing the
     /// grid visible and current first so a request that arrives while another
@@ -172,7 +174,9 @@ final class WorkersWorkspaceModel: ObservableObject {
 
     /// Run-keyed focus used by `bossctl agents focus` and Doing-card clicks.
     /// Reveals the run's cell in the Agents view, then focuses its terminal
-    /// once layout has placed it; a run without a viewer is revealed as its
+    /// once layout has placed it. Success acknowledges reveal; the bounded
+    /// asynchronous responder attempt logs its final outcome. New requests
+    /// cancel superseded focus attempts; a run without a viewer is revealed as its
     /// "Viewer not attached" card. A run unknown to both membership and the
     /// viewer map fails as `.unknownSlot`.
     func revealAgent(runId: String) -> EngineFocusResult {
@@ -181,11 +185,12 @@ final class WorkersWorkspaceModel: ObservableObject {
         guard outcome != .notMember || viewer != nil else {
             return .failure(.unknownSlot)
         }
-        if viewer?.session != nil {
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 100_000_000)
-                _ = self?.focusWorkerPane(runId: runId)
+        agentFocus.request(runId: runId) { [weak self] in
+            guard let self else { return .failure(.unknownSlot) }
+            if self.viewersByRunId[runId]?.session != nil {
+                return self.focusWorkerPane(runId: runId)
             }
+            return self.agentFocus.focusCard(runId: runId)
         }
         return .success
     }
@@ -215,7 +220,9 @@ final class WorkersWorkspaceModel: ObservableObject {
             window.deminiaturize(nil)
         }
         window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(host)
+        guard window.makeFirstResponder(host) else {
+            return .failure(.internalFailure("pane refused keyboard focus"))
+        }
         return .success
     }
 }
