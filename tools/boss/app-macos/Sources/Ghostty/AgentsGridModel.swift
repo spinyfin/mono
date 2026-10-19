@@ -34,6 +34,10 @@ final class AgentsGridModel: ObservableObject {
     }
 
     private var personaByRun: [String: String] = [:]
+    /// Base persona names held by every accepted live state, local or
+    /// remote. Remote workers draw from the same engine persona pool but
+    /// never get a cell here, so this is kept apart from `personaByRun`.
+    private var liveBusyPersonas: Set<String> = []
     private var pendingArea: PaneSize?
     private var lastCell = PaneSize(width: 0, height: 0)
     private var quietTask: Task<Void, Never>?
@@ -62,11 +66,13 @@ final class AgentsGridModel: ObservableObject {
     }
 
     /// Idle crew for the page's empty rectangles. Personas already assigned
-    /// to any agent (visible or not) are excluded.
+    /// to any agent (visible, retained as a placeholder, or running on a
+    /// remote host) are excluded.
     func idleCells(for page: PaneLayoutPage) -> [IdleGridCell] {
-        IdleGridCellPlanner.cells(
+        let retained = personaByRun.values.map { TrekPortraitGrid.name(forPersona: $0) ?? $0 }
+        return IdleGridCellPlanner.cells(
             for: page,
-            busyPersonas: Set(personaByRun.values),
+            busyPersonas: liveBusyPersonas.union(retained),
             seedRunIds: Array(placedRunIds(in: layout))
         )
     }
@@ -202,6 +208,8 @@ final class AgentsGridModel: ObservableObject {
         self.viewers = viewers
         let local = states.filter(\.isLocalMember)
         exitedRunIds = Set(local.filter { $0.activity == .terminated }.map(\.runId))
+        let busy = Set(states.compactMap { TrekPortraitGrid.name(forPersona: $0.name) })
+        if liveBusyPersonas != busy { liveBusyPersonas = busy }
         for state in local {
             if let name = state.name, !name.isEmpty {
                 personaByRun[state.runId] = name
