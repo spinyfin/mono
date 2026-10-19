@@ -196,6 +196,9 @@ async fn skips_a_run_the_app_already_hosts() {
     let (server_state, _dir) = test_server_state();
     let run_id = seed_tmux_hosted_live_run(&server_state, 4, "boss-4-reattach", "reattach-token-2");
     install_tmux_override(&server_state);
+    server_state
+        .live_worker_states
+        .set_viewer_attach_error(&run_id, Some("late timeout".into()));
 
     let sink = make_session_sink();
     server_state
@@ -218,6 +221,16 @@ async fn skips_a_run_the_app_already_hosts() {
     );
 
     pass.await.expect("reattach pass task panicked");
+    assert!(
+        server_state
+            .live_worker_states
+            .snapshot()
+            .iter()
+            .find(|s| s.run_id == run_id)
+            .unwrap()
+            .viewer_attach_error
+            .is_none()
+    );
 }
 
 /// Registration ordering: the app registers first (nothing in live-state yet,
@@ -583,4 +596,146 @@ async fn app_requested_attach_ignores_runs_without_an_attachable_pane() {
         next.is_err(),
         "no attach may be sent for an unattachable run, got {next:?}"
     );
+}
+
+#[tokio::test]
+async fn terminal_execution_does_not_schedule_a_retry() {
+    let (state, _dir) = test_server_state();
+    let run_id = seed_tmux_hosted_live_run(&state, 1, "terminal-session", "terminal-token");
+    state.work_db.mark_execution_orphaned(&run_id, "finished").unwrap();
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    let pass = tokio::spawn({
+        let state = state.clone();
+        async move { state.reattach_worker_panes_to_registered_app().await }
+    });
+    answer_list_hosted_panes(&state, &sink, vec![]).await;
+    pass.await.unwrap();
+    assert!(
+        !state
+            .viewer_reattach_retry_scheduled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert_eq!(
+        state
+            .viewer_reattach_retry_attempt
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn app_requested_attach_recovers_slot_busy_through_connection_reader() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (state, _dir) = test_server_state();
+    install_tmux_override(&state);
+    let (client, server) = tokio::net::UnixStream::pair().unwrap();
+    let handler = tokio::spawn(handle_frontend_connection(server, state.clone(), None));
+    let (read, mut write) = client.into_split();
+    let mut lines = BufReader::new(read).lines();
+    async fn send(write: &mut tokio::net::unix::OwnedWriteHalf, payload: FrontendRequest) {
+        let envelope = FrontendRequestEnvelope {
+            request_id: "client".into(),
+            payload,
+        };
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&envelope).unwrap()).as_bytes())
+            .await
+            .unwrap();
+    }
+    send(&mut write, FrontendRequest::RegisterAppSession).await;
+    // Registration inventory runs with no live members; answer it before
+    // seeding the worker so only the explicit request can attach this run.
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event: FrontendEventEnvelope = serde_json::from_str(&line).unwrap();
+        if let FrontendEvent::EngineRequest {
+            request_id,
+            request: EngineToAppRequest::ListHostedPanes(_),
+        } = event.payload
+        {
+            send(
+                &mut write,
+                FrontendRequest::EngineResponse {
+                    request_id,
+                    response: EngineToAppResponse::ListHostedPanes {
+                        result: Ok(crate::protocol::ListHostedPanesResult { panes: vec![] }),
+                    },
+                },
+            )
+            .await;
+            break;
+        }
+    }
+    let run_id = seed_tmux_hosted_live_run(&state, 6, "reader-session", "reader-token");
+    state
+        .live_worker_states
+        .set_viewer_attach_error(&run_id, Some("previous failure".into()));
+    send(
+        &mut write,
+        FrontendRequest::RequestWorkerPaneAttach { run_id: run_id.clone() },
+    )
+    .await;
+    for step in 0..3 {
+        let (request_id, request) = loop {
+            let line = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+                .await
+                .expect("reader stalled")
+                .unwrap()
+                .unwrap();
+            let event: FrontendEventEnvelope = serde_json::from_str(&line).unwrap();
+            if let FrontendEvent::EngineRequest { request_id, request } = event.payload {
+                break (request_id, request);
+            }
+        };
+        let response = match (step, request) {
+            (0, EngineToAppRequest::AttachWorkerPane(input)) => {
+                assert_eq!(input.run_id, run_id);
+                EngineToAppResponse::AttachWorkerPane {
+                    result: Err(crate::protocol::EngineToAppError::SlotBusy {
+                        occupying_run_id: Some("stale-run".into()),
+                    }),
+                }
+            }
+            (1, EngineToAppRequest::DetachWorkerPane(input)) => {
+                assert_eq!(input.run_id, "stale-run");
+                EngineToAppResponse::DetachWorkerPane {
+                    result: Ok(crate::protocol::DetachWorkerPaneResult {}),
+                }
+            }
+            (2, EngineToAppRequest::AttachWorkerPane(input)) => {
+                assert_eq!(input.run_id, run_id);
+                EngineToAppResponse::AttachWorkerPane {
+                    result: Ok(crate::protocol::AttachWorkerPaneResult {}),
+                }
+            }
+            (_, other) => panic!("unexpected recovery step {step}: {other:?}"),
+        };
+        send(&mut write, FrontendRequest::EngineResponse { request_id, response }).await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state
+                .live_worker_states
+                .snapshot()
+                .iter()
+                .find(|s| s.run_id == run_id)
+                .unwrap()
+                .viewer_attach_error
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successful reply must clear the attach error");
+    drop(lines);
+    drop(write);
+    handler.await.unwrap().unwrap();
 }

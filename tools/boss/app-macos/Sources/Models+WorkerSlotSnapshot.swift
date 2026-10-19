@@ -93,6 +93,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     /// the engine knows went wrong is shown instead, most specific first,
     /// so a failed attach is never dressed up as still connecting.
     var viewerMissingMessage: String {
+        if isExited { return "Worker exited" }
         if let viewerAttachFailure, !viewerAttachFailure.isEmpty {
             return "Couldn't attach the terminal: \(viewerAttachFailure)"
         }
@@ -109,7 +110,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     /// failure is known on either side. The view asks the engine for the
     /// viewer in this state when the pane comes into view.
     var isViewerConnecting: Bool {
-        isViewerMissing && viewerAttachFailure == nil && live?.viewerAttachError == nil && live?.tmuxHosted != false
+        isViewerMissing && !isExited && viewerAttachFailure == nil && live?.viewerAttachError == nil && live?.tmuxHosted != false
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool {

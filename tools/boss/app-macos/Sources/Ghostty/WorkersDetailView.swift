@@ -53,11 +53,9 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .background(Color(nsColor: .separatorColor))
         .onAppear(perform: bindAndSync)
         .onChange(of: grid.layout) { _, _ in if isVisible { refreshSnapshots() } }
-        .onChange(of: grid.layout.selectedPage) { _, _ in requestViewersForVisiblePage() }
         .onChange(of: isVisible) { _, visible in
             if !visible { workspace.resetViewerAttachRequests() }
             syncGrid()
-            if visible { requestViewersForVisiblePage() }
         }
         .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
         .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
@@ -277,18 +275,10 @@ struct WorkersDetailView: View, @MainActor Equatable {
             grid.setFocusedRun(String(sessionId.dropFirst("run-".count)))
         }
         Self.bindAgentReveal(grid: grid, workspace: workspace, liveStates: liveStates)
+        grid.onViewerAttachRequested = { [weak workspace] runs in
+            workspace?.requestViewerAttach(forRuns: runs)
+        }
         syncGrid()
-        requestViewersForVisiblePage()
-    }
-
-    /// A page of live members just came into sight (the Agents tab was
-    /// shown, or the page selector changed). Any member on it still waiting
-    /// for a terminal is asked for once; see
-    /// `WorkersWorkspaceModel.requestViewerAttach(forRuns:)` for the dedupe
-    /// and why this is never driven by a timer.
-    private func requestViewersForVisiblePage() {
-        guard isVisible else { return }
-        workspace.requestViewerAttach(forRuns: grid.viewerlessRunIdsOnSelectedPage)
     }
 
     static func bindAgentReveal(
@@ -307,9 +297,12 @@ struct WorkersDetailView: View, @MainActor Equatable {
     }
 
     private func syncGrid() {
-        grid.setVisible(isVisible)
-        guard isVisible else { return }
+        if !isVisible {
+            grid.setVisible(false)
+            return
+        }
         Self.applyMembership(grid: grid, workspace: workspace, liveStates: liveStates)
+        grid.setVisible(true)
         refreshSnapshots()
     }
 

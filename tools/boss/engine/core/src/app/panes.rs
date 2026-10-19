@@ -86,7 +86,9 @@ pub(super) async fn handle_request_worker_pane_attach(ctx: Dispatch, req: Fronte
         return;
     }
     tracing::info!(run_id = %run_id, "request_worker_pane_attach: app has no viewer for a live worker");
-    server_state.reattach_worker_pane_for_run(&run_id).await;
+    tokio::spawn(async move {
+        server_state.reattach_worker_pane_for_run(&run_id).await;
+    });
 }
 
 pub(super) async fn handle_send_input_to_worker(ctx: Dispatch, req: FrontendRequest) {

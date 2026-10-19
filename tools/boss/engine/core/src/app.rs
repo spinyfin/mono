@@ -340,6 +340,8 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
             run_id,
             "spawn-time viewer attach failed; scheduling the bounded worker pane re-attach"
         );
+        // Give a newly spawned worker a fresh retry budget.
+        self.viewer_reattach_retry_attempt.store(0, Ordering::Relaxed);
         self.schedule_worker_viewer_reattach_retry().await;
     }
 

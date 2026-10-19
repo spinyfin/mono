@@ -989,12 +989,19 @@ impl ServerState {
                 }
             }
         };
+        let mut cleared_error = false;
+        for run_id in &outcome.live {
+            cleared_error |= self.live_worker_states.set_viewer_attach_error(run_id, None);
+        }
+        if cleared_error {
+            self.broadcast_live_worker_states().await;
+        }
         let mut any_attach_failed = false;
         for state in candidates {
             if outcome.live.contains(&state.run_id) || outcome.blocked_slots.contains(&state.slot_id) {
                 continue;
             }
-            if !self.reattach_one_worker_pane(&state).await {
+            if self.reattach_one_worker_pane(&state).await == WorkerPaneAttachOutcome::Failed {
                 any_attach_failed = true;
             }
         }
@@ -1050,7 +1057,7 @@ impl ServerState {
             );
             return false;
         }
-        self.reattach_one_worker_pane(&state).await
+        self.reattach_one_worker_pane(&state).await == WorkerPaneAttachOutcome::Attached
     }
 
     pub(super) async fn schedule_worker_viewer_reattach_retry(&self) {
@@ -1102,7 +1109,7 @@ impl ServerState {
         });
     }
 
-    /// Re-send `AttachWorkerPane` for one live worker. Returns `true` when
+    /// Re-send `AttachWorkerPane` for one live worker. Returns `Attached` when
     /// the app confirmed a viewer. Every failure is written to the run's
     /// [`LiveWorkerState::viewer_attach_error`] (and a success clears it)
     /// so the Agents card can show the reason rather than a generic
@@ -1110,10 +1117,10 @@ impl ServerState {
     /// whether to retry. A run whose execution row is already terminal is
     /// skipped silently — its live state is about to be released and no
     /// card will outlive it.
-    async fn reattach_one_worker_pane(&self, state: &LiveWorkerState) -> bool {
+    async fn reattach_one_worker_pane(&self, state: &LiveWorkerState) -> WorkerPaneAttachOutcome {
         let run_id = state.run_id.as_str();
         if !matches!(self.work_db.find_execution(run_id), Ok(Some(run)) if !run.status.is_terminal()) {
-            return false;
+            return WorkerPaneAttachOutcome::Skipped;
         }
         let outcome = self.try_reattach_one_worker_pane(state).await;
         let changed = self
@@ -1126,7 +1133,11 @@ impl ServerState {
             // reason (or to a terminal) without waiting for the next hook.
             self.broadcast_live_worker_states().await;
         }
-        outcome.is_ok()
+        if outcome.is_ok() {
+            WorkerPaneAttachOutcome::Attached
+        } else {
+            WorkerPaneAttachOutcome::Failed
+        }
     }
 
     async fn try_reattach_one_worker_pane(&self, state: &LiveWorkerState) -> Result<(), String> {
@@ -1215,6 +1226,13 @@ impl ServerState {
             }
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerPaneAttachOutcome {
+    Attached,
+    Skipped,
+    Failed,
 }
 
 #[cfg(test)]

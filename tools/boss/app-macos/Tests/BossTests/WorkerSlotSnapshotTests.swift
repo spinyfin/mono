@@ -439,6 +439,17 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertNotEqual(a, b)
     }
 
+    func testExitedMemberDoesNotConnect() {
+        let snapshot = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "exec-1"),
+            liveState: Self.makeLiveState(activity: .terminated, tmuxHosted: true),
+            liveStatusEnabled: true
+        )
+        XCTAssertTrue(snapshot.isViewerMissing)
+        XCTAssertFalse(snapshot.isViewerConnecting)
+        XCTAssertEqual(snapshot.viewerMissingMessage, "Worker exited")
+    }
+
     // MARK: - Viewer-missing card
 
     /// A live member with no viewer and no known failure is still

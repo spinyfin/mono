@@ -25,6 +25,13 @@ final class AgentsGridModel: ObservableObject {
     /// Projects with at least one live local member, in display order.
     @Published private(set) var memberProjects: [AgentProject] = []
     private var inLiveResize = false
+    private var exitedRunIds: Set<String> = []
+    var onViewerAttachRequested: (([String]) -> Void)?
+
+    func requestViewersForVisiblePage() {
+        guard layout.isVisible else { return }
+        onViewerAttachRequested?(viewerlessRunIdsOnSelectedPage)
+    }
 
     private var personaByRun: [String: String] = [:]
     private var pendingArea: PaneSize?
@@ -161,7 +168,7 @@ final class AgentsGridModel: ObservableObject {
     var viewerlessRunIdsOnSelectedPage: [String] {
         guard let page = layout.currentPage else { return [] }
         return page.cells.compactMap { cell in
-            if case .occupied(let member) = cell.content, !member.hasViewer {
+            if case .occupied(let member) = cell.content, !member.hasViewer, !exitedRunIds.contains(member.runId) {
                 return member.runId
             }
             return nil
@@ -184,6 +191,7 @@ final class AgentsGridModel: ObservableObject {
         }
         self.viewers = viewers
         let local = states.filter(\.isLocalMember)
+        exitedRunIds = Set(local.filter { $0.activity == .terminated }.map(\.runId))
         for state in local {
             if let name = state.name, !name.isEmpty {
                 personaByRun[state.runId] = name
@@ -304,6 +312,7 @@ final class AgentsGridModel: ObservableObject {
         if next != layout {
             layout = next
         }
+        requestViewersForVisiblePage()
     }
 
     private func placedRunIds(in layout: PaneLayoutModel) -> Set<String> {
