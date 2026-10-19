@@ -53,12 +53,15 @@ final class BadgeFlowLayoutTests: XCTestCase {
             measured(AIReviewStateBadge(state: "reviewing", presentation: AIReviewBadgePresentation(
                 label: longLabel, systemImage: "checkmark", tooltip: longLabel
             )), id: 6)
+            measured(CIFailureChip(badge: CiFailureBadge(state: .inFlight, attemptsUsed: 1, budget: 3)), id: 7)
+            measured(PrInRevisionIndicator(isBlocked: true), id: 8)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .coordinateSpace(name: "flow")
         .onPreferenceChange(BadgeFrames.self) { frames = $0 }
         let host = NSHostingView(rootView: flow)
         var shortSize: CGSize?
+        var fixedWidths: [Int: CGFloat] = [:]
         // Lane widths minus 28pt lane padding and 24pt card padding.
         // Reuse the host to exercise cache invalidation in both directions.
         for width in [CGFloat(288), 228, 368, 228] {
@@ -66,7 +69,7 @@ final class BadgeFlowLayoutTests: XCTestCase {
             host.layoutSubtreeIfNeeded()
             let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
             host.cacheDisplay(in: host.bounds, to: rep)
-            XCTAssertEqual(frames.count, 7)
+            XCTAssertEqual(frames.count, 9)
             for frame in frames.values {
                 XCTAssertGreaterThan(frame.width, 0)
                 XCTAssertGreaterThanOrEqual(frame.minX, -0.5)
@@ -79,6 +82,14 @@ final class BadgeFlowLayoutTests: XCTestCase {
                 XCTAssertEqual(short.height, shortSize.height, accuracy: 0.5)
             } else {
                 shortSize = short.size
+            }
+            for id in 7...8 {
+                let frame = try XCTUnwrap(frames[id])
+                if let ideal = fixedWidths[id] {
+                    XCTAssertEqual(frame.width, ideal, accuracy: 0.5, "Short status chips keep their ideal width")
+                } else {
+                    fixedWidths[id] = frame.width
+                }
             }
             XCTAssertLessThan(short.width, 100, "Short chips must retain their natural width")
             for id in 1...3 {
