@@ -1483,3 +1483,135 @@ fn a_fresh_registration_forgets_the_previous_occupants_sequence() {
         ApplyEventOutcome::Applied { changed: true }
     );
 }
+
+fn applied(reg: &LiveWorkerStateRegistry, seq: u64, event: &WorkerEvent, from_subagent: bool) -> HookApplied {
+    reg.apply_hook_event(
+        1,
+        HookOrigin {
+            ingress_seq: Some(seq),
+            from_subagent,
+        },
+        event,
+    )
+}
+
+fn notification_event() -> WorkerEvent {
+    WorkerEvent::Notification {
+        session_id: "s".into(),
+        message: "needs permission".into(),
+    }
+}
+
+#[test]
+fn the_first_main_session_hook_after_a_stop_reports_the_resume() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    assert_eq!(applied(&reg, 1, &pre_tool("Bash"), false).resumed_after, None);
+    assert_eq!(applied(&reg, 2, &stop_event(), false).resumed_after, None);
+    assert_eq!(
+        applied(&reg, 3, &pre_tool("Read"), false).resumed_after,
+        Some(TurnBoundary { seq: Some(2) })
+    );
+    assert_eq!(
+        applied(&reg, 4, &post_tool("Read"), false).resumed_after,
+        None,
+        "the boundary is consumed by the first resume"
+    );
+}
+
+#[test]
+fn a_stop_overtaken_by_main_session_activity_reports_the_resume_itself() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 1, &pre_tool("Bash"), false);
+    assert_eq!(applied(&reg, 4, &pre_tool("Read"), false).resumed_after, None);
+    let late = applied(&reg, 3, &stop_event(), false);
+    assert_eq!(late.outcome, ApplyEventOutcome::Stale { last_applied_seq: 4 });
+    assert_eq!(late.resumed_after, Some(TurnBoundary { seq: Some(3) }));
+}
+
+#[test]
+fn subagent_hooks_are_not_evidence_the_main_session_resumed() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 1, &pre_tool("Task"), false);
+    applied(&reg, 2, &stop_event(), false);
+    assert_eq!(applied(&reg, 3, &pre_tool("Grep"), true).resumed_after, None);
+    assert_eq!(applied(&reg, 4, &post_tool("Grep"), true).resumed_after, None);
+    assert_eq!(
+        applied(&reg, 5, &pre_tool("Read"), false).resumed_after,
+        Some(TurnBoundary { seq: Some(2) })
+    );
+    // A late Stop behind nothing but subagent hooks reports no resume, and
+    // leaves the boundary open for the main session's next hook.
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 1, &pre_tool("Task"), false);
+    applied(&reg, 3, &pre_tool("Grep"), true);
+    assert_eq!(applied(&reg, 2, &stop_event(), false).resumed_after, None);
+    assert_eq!(
+        applied(&reg, 4, &pre_tool("Read"), false).resumed_after,
+        Some(TurnBoundary { seq: Some(2) })
+    );
+}
+
+#[test]
+fn a_mid_turn_notification_is_not_a_turn_boundary() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 1, &pre_tool("Bash"), false);
+    applied(&reg, 2, &notification_event(), false);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
+    assert_eq!(applied(&reg, 3, &post_tool("Bash"), false).resumed_after, None);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
+}
+
+#[test]
+fn a_notification_overtaken_by_its_stop_still_makes_the_stop_waiting_for_input() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 1, &pre_tool("Bash"), false);
+    assert_eq!(
+        applied(&reg, 3, &stop_event(), false).outcome,
+        ApplyEventOutcome::Applied { changed: true }
+    );
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+
+    let late = applied(&reg, 2, &notification_event(), false);
+    assert_eq!(late.outcome, ApplyEventOutcome::Stale { last_applied_seq: 3 });
+    assert!(late.repaired, "the slot changed even though the event was late");
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
+    // Same result as emission order: the flag was consumed by the Stop, so
+    // the next turn's Stop is a plain Idle.
+    applied(&reg, 4, &pre_tool("Bash"), false);
+    applied(&reg, 5, &stop_event(), false);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+}
+
+#[test]
+fn a_notification_overtaken_by_a_post_tool_use_stays_pending_for_the_next_stop() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 1, &pre_tool("Bash"), false);
+    applied(&reg, 3, &post_tool("Bash"), false);
+    let late = applied(&reg, 2, &notification_event(), false);
+    assert!(!late.repaired);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
+    applied(&reg, 4, &stop_event(), false);
+    assert_eq!(
+        reg.get(1).unwrap().activity,
+        WorkerActivity::WaitingForInput,
+        "emission order Notification, PostToolUse, Stop ends on the prompt"
+    );
+}
+
+#[test]
+fn a_notification_overtaken_by_a_pre_tool_use_is_moot() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 1, &pre_tool("Bash"), false);
+    applied(&reg, 3, &pre_tool("Read"), false);
+    assert!(!applied(&reg, 2, &notification_event(), false).repaired);
+    applied(&reg, 4, &stop_event(), false);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+}

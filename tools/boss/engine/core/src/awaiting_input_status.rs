@@ -42,7 +42,7 @@
 //!
 //! That signal was already arriving; it just stopped at the in-memory
 //! registry and never reached the durable row. [`mirror_awaiting_input`]
-//! runs on the same dispatch path, immediately after `apply_event`, and
+//! runs on the same dispatch path, immediately after the live-state transition (before any transcript I/O), and
 //! writes the transition through.
 //!
 //! # What is deliberately NOT mirrored
@@ -59,7 +59,7 @@
 
 use std::sync::Arc;
 
-use boss_protocol::{ExecutionKind, WorkerActivity};
+use boss_protocol::{ExecutionKind, WorkExecution, WorkerActivity};
 
 use crate::coordinator::ExecutionPublisher;
 use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -97,6 +97,13 @@ pub fn awaiting_input_transition(prior: Option<WorkerActivity>, new: Option<Work
     }
 }
 
+/// The activity a hook event moved a slot between, as that handler saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivityTransition {
+    pub prior: Option<WorkerActivity>,
+    pub new: Option<WorkerActivity>,
+}
+
 /// Mirror one activity transition onto `execution_id`'s stored status.
 ///
 /// A no-op unless the transition crosses the awaiting-input boundary
@@ -123,19 +130,50 @@ pub fn awaiting_input_transition(prior: Option<WorkerActivity>, new: Option<Work
 pub async fn mirror_awaiting_input(
     work_db: &Arc<WorkDb>,
     publisher: &Arc<dyn ExecutionPublisher>,
+    registry: &LiveWorkerStateRegistry,
+    slot_id: u8,
     execution_id: &str,
     is_pr_review: bool,
-    prior: Option<WorkerActivity>,
-    new: Option<WorkerActivity>,
+    transition: ActivityTransition,
 ) {
     if is_pr_review {
         return;
     }
-    let Some(awaiting) = awaiting_input_transition(prior, new) else {
+    // The before/after pair only decides whether this event is worth a look.
+    if awaiting_input_transition(transition.prior, transition.new).is_none() {
         return;
+    }
+    // What gets written is decided from the pane's activity *at write time*,
+    // inside a gate that serializes every hook's write. Two hooks for one
+    // worker run on separate tasks, so a `Notification` (-> waiting) and the
+    // `PreToolUse` that follows it (-> working) can reach this point in
+    // either order; deciding from the pair each saw would let the older one
+    // write last and leave the row disagreeing with the pane until the next
+    // transition. Deciding from the current activity makes the last write
+    // always agree with the latest pane state.
+    let updated = {
+        let _gate = MIRROR_WRITE_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(current) = registry.get(slot_id).map(|s| s.activity) else {
+            return;
+        };
+        // A pane that died belongs to the death sweeps; see the module docs.
+        if current.is_terminal() {
+            return;
+        }
+        let awaiting = current == WorkerActivity::WaitingForInput;
+        match store_awaiting_status(work_db, execution_id, awaiting) {
+            Some(updated) => (updated, awaiting),
+            None => return,
+        }
     };
-    write_awaiting_status(work_db, publisher, execution_id, awaiting).await;
+    publish_awaiting_status(publisher, execution_id, &updated.0, updated.1).await;
 }
+
+/// Serializes the decide-and-write step of [`mirror_awaiting_input`] across
+/// hook tasks. Held only across the synchronous status write, never an await.
+static MIRROR_WRITE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Mirror `LiveWorkerStateRegistry::mark_stalled_spawns`'s promotion onto
 /// the row.
@@ -215,8 +253,15 @@ async fn write_awaiting_status(
     execution_id: &str,
     awaiting: bool,
 ) {
-    let updated = match work_db.set_execution_awaiting_human(execution_id, awaiting) {
-        Ok(Some(execution)) => execution,
+    if let Some(updated) = store_awaiting_status(work_db, execution_id, awaiting) {
+        publish_awaiting_status(publisher, execution_id, &updated, awaiting).await;
+    }
+}
+
+/// The durable half: move the row, or report why nothing moved.
+fn store_awaiting_status(work_db: &Arc<WorkDb>, execution_id: &str, awaiting: bool) -> Option<WorkExecution> {
+    match work_db.set_execution_awaiting_human(execution_id, awaiting) {
+        Ok(Some(execution)) => Some(execution),
         Ok(None) => {
             tracing::debug!(
                 execution_id,
@@ -224,7 +269,7 @@ async fn write_awaiting_status(
                 "awaiting-input mirror: no row moved (already in the target state, or the row is \
                  no longer a live pane-hosted worker)",
             );
-            return;
+            None
         }
         Err(err) => {
             tracing::warn!(
@@ -234,9 +279,17 @@ async fn write_awaiting_status(
                 "awaiting-input mirror: failed to write the execution status; the stored row now \
                  disagrees with the pane until the next transition re-converges it",
             );
-            return;
+            None
         }
-    };
+    }
+}
+
+async fn publish_awaiting_status(
+    publisher: &Arc<dyn ExecutionPublisher>,
+    execution_id: &str,
+    updated: &WorkExecution,
+    awaiting: bool,
+) {
     let reason = if awaiting {
         REASON_AWAITING_INPUT
     } else {

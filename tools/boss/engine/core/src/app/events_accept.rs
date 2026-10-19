@@ -1,12 +1,43 @@
 //! The events-socket accept loop: one connection per hook event from a
 //! worker's `boss-event` shim, each dispatched on its own task.
 //!
-//! Split out of `server.rs` for size. The one piece of state the loop owns
-//! is the accept-order sequence it stamps on every event — see the comment
-//! on it, and `LiveWorkerStateRegistry::apply_sequenced_event` for why the
-//! live-state reducer needs it.
+//! The loop owns the accept-order sequence stamped on every event, before the
+//! connection is handed to its own task — see [`accept_stamped`], and
+//! `LiveWorkerStateRegistry::apply_sequenced_event` for why the live-state
+//! reducer needs it.
 
 use super::*;
+
+/// Accept-order sequence for the live-state reducer.
+///
+/// Every connection is handled on its own task, so two hooks the worker
+/// emitted in order can reach `apply_hook_event` in either order — and a turn
+/// boundary does strictly more work on the way there than the tool events
+/// that follow it. The shim connects synchronously from inside the driver's
+/// hook, so accept order *is* emission order; the number must therefore be
+/// assigned at accept time, before the task is spawned, which is what lets the
+/// reducer refuse to let a late `Stop` overwrite the `PreToolUse` the worker
+/// emitted after it.
+#[derive(Debug, Default)]
+struct IngressSequencer {
+    last: u64,
+}
+
+impl IngressSequencer {
+    fn next(&mut self) -> u64 {
+        self.last += 1;
+        self.last
+    }
+}
+
+/// Accept one connection and stamp it with the next ingress sequence.
+async fn accept_stamped(
+    listener: &UnixListener,
+    sequencer: &mut IngressSequencer,
+) -> std::io::Result<(UnixStream, u64)> {
+    let (stream, _) = listener.accept().await?;
+    Ok((stream, sequencer.next()))
+}
 
 pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<ServerState>) {
     let local_addr = listener.local_addr().ok();
@@ -31,20 +62,10 @@ pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state:
     // connection. The registry is still built once: it is stateless and
     // shared read-only across connections.
     let driver_registry = std::sync::Arc::new(crate::driver::DriverRegistry::default());
-    // Accept-order sequence for the live-state reducer. Every connection
-    // below is handled on its own task, so two hooks the worker emitted in
-    // order can reach `apply_event` in either order — and a turn boundary
-    // does strictly more work on the way there than the tool events that
-    // follow it. The shim connects synchronously from inside the driver's
-    // hook, so accept order *is* emission order; stamping it here, before
-    // the task is spawned, is what lets the reducer refuse to let a late
-    // `Stop` overwrite the `PreToolUse` the worker emitted after it.
-    let mut next_ingress_seq: u64 = 0;
+    let mut sequencer = IngressSequencer::default();
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                next_ingress_seq += 1;
-                let ingress_seq = next_ingress_seq;
+        match accept_stamped(&listener, &mut sequencer).await {
+            Ok((stream, ingress_seq)) => {
                 let server_state = server_state.clone();
                 let driver_registry = driver_registry.clone();
                 boss_task_scope::spawn(async move {
@@ -70,5 +91,27 @@ pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state:
                 tracing::error!(?err, "events socket accept failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connections_are_stamped_in_strictly_increasing_accept_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut sequencer = IngressSequencer::default();
+
+        let mut stamps = Vec::new();
+        let mut clients = Vec::new();
+        for _ in 0..4 {
+            clients.push(UnixStream::connect(&path).await.unwrap());
+            let (_stream, seq) = accept_stamped(&listener, &mut sequencer).await.unwrap();
+            stamps.push(seq);
+        }
+        assert_eq!(stamps, vec![1, 2, 3, 4]);
     }
 }

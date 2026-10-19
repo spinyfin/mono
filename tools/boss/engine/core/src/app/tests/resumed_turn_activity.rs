@@ -18,6 +18,7 @@ use super::*;
 
 use crate::protocol::WorkerEvent;
 use crate::test_support::*;
+use crate::work::ExecutionStatus;
 use boss_protocol::{RequestExecutionInput, WorkerActivity};
 
 const SLOT: u8 = 1;
@@ -93,9 +94,19 @@ fn snapshot(server_state: &ServerState) -> crate::protocol::LiveWorkerState {
 
 fn declare_wait(server_state: &ServerState, execution_id: &str) {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    // Ordered against the worker's hook stream exactly as the proposal
+    // handler does.
+    let declared_after_seq = server_state.live_worker_states.last_applied_ingress_seq(SLOT);
     server_state
         .wait_registry
-        .declare(execution_id, WAIT_REASON.to_owned(), None, 45 * 60, now)
+        .declare_after(
+            execution_id,
+            WAIT_REASON.to_owned(),
+            None,
+            45 * 60,
+            now,
+            declared_after_seq,
+        )
         .expect("wait is within budget");
 }
 
@@ -227,4 +238,202 @@ async fn a_user_prompt_after_stop_also_ends_the_declared_wait() {
     let resumed = snapshot(&server_state);
     assert_eq!(resumed.activity, WorkerActivity::Working);
     assert!(resumed.wait_reason.is_none());
+}
+
+fn notification(execution_id: &str, seq: u64) -> crate::events_socket::IncomingHookEvent {
+    hook(
+        WorkerEvent::Notification {
+            session_id: "claude-sess-1".into(),
+            message: "Claude needs your permission to use Bash".into(),
+        },
+        execution_id,
+        seq,
+    )
+}
+
+fn wait_is_held(server_state: &ServerState, execution_id: &str) -> bool {
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    server_state.wait_registry.active(execution_id, now).is_some()
+}
+
+#[tokio::test]
+async fn a_stop_overtaken_by_the_resumed_turn_still_ends_the_declared_wait() {
+    // The reordering the ingress sequence exists for, with a wait declared
+    // in the turn the late Stop ends: the resumed turn's PreToolUse (seq 4)
+    // reaches the reducer while the slot still reads Working, so no
+    // idle -> Working transition is ever observed. The late Stop (seq 3) is
+    // refused as stale but still proves the main session resumed.
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 2)).await;
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Read", 4)).await;
+    assert!(
+        wait_is_held(&server_state, &execution_id),
+        "nothing has said the turn ended yet"
+    );
+
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+    let state = snapshot(&server_state);
+    assert_eq!(state.activity, WorkerActivity::Working);
+    assert_eq!(state.current_tool.as_deref(), Some("Read"));
+    assert!(state.wait_reason.is_none(), "the stale wait reason clears");
+    assert!(state.wait_expires_at.is_none());
+    assert!(!wait_is_held(&server_state, &execution_id));
+    assert_eq!(
+        server_state.wait_registry.total_granted_secs(&execution_id),
+        45 * 60,
+        "ending a wait early does not refund the per-execution cap",
+    );
+}
+
+#[tokio::test]
+async fn a_late_stop_does_not_end_a_wait_declared_in_the_resumed_turn() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 2)).await;
+    // The resumed turn (seq 4) runs ahead of the Stop (seq 3) and declares
+    // its own wait before the Stop's ingress completes.
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 4)).await;
+    declare_wait(&server_state, &execution_id);
+
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+    assert!(
+        wait_is_held(&server_state, &execution_id),
+        "the late Stop ended the turn before the wait was declared, not the turn that declared it",
+    );
+    assert_eq!(snapshot(&server_state).wait_reason.as_deref(), Some(WAIT_REASON));
+}
+
+#[tokio::test]
+async fn a_subagents_tool_hooks_do_not_end_a_wait_the_main_session_is_still_in() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Task", 1)).await;
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Task", 2)).await;
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+
+    // The backgrounded subagent keeps using tools under the same run id.
+    dispatch_worker_event_fanout(
+        &server_state,
+        &pre_tool_use(&execution_id, "Grep", 4).with_subagent_origin(true),
+    )
+    .await;
+    dispatch_worker_event_fanout(
+        &server_state,
+        &post_tool_use(&execution_id, "Grep", 5).with_subagent_origin(true),
+    )
+    .await;
+    assert!(
+        wait_is_held(&server_state, &execution_id),
+        "the main session has not resumed; only a subagent is busy",
+    );
+
+    // The main session waking up is what ends it.
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Read", 6)).await;
+    assert!(!wait_is_held(&server_state, &execution_id));
+}
+
+#[tokio::test]
+async fn a_late_stop_after_only_subagent_hooks_leaves_the_wait_for_the_main_sessions_resume() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Task", 1)).await;
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Task", 2)).await;
+    dispatch_worker_event_fanout(
+        &server_state,
+        &pre_tool_use(&execution_id, "Grep", 4).with_subagent_origin(true),
+    )
+    .await;
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+    assert!(wait_is_held(&server_state, &execution_id));
+
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Read", 5)).await;
+    assert!(!wait_is_held(&server_state, &execution_id));
+}
+
+#[tokio::test]
+async fn a_permission_prompt_mid_turn_does_not_end_a_wait_declared_earlier_in_the_turn() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 2)).await;
+    // The permission prompt moves the slot off Working; the tool the human
+    // approved then completes (a non-Working -> Working transition) — but
+    // the turn never ended, so this is not the main session resuming.
+    dispatch_worker_event_fanout(&server_state, &notification(&execution_id, 3)).await;
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingForInput);
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 4)).await;
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::Working);
+    assert!(
+        wait_is_held(&server_state, &execution_id),
+        "a wait declared mid-turn survives the rest of that turn"
+    );
+
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 5)).await;
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Read", 6)).await;
+    assert!(!wait_is_held(&server_state, &execution_id));
+}
+
+#[tokio::test]
+async fn a_notification_overtaken_by_its_stop_still_parks_the_worker_on_the_human() {
+    // In emission order Notification (seq 2) then Stop (seq 3) is a turn
+    // that ended on a permission prompt: WaitingForInput, `waiting_human`.
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::Idle);
+
+    dispatch_worker_event_fanout(&server_state, &notification(&execution_id, 2)).await;
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingForInput);
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::WaitingHuman,
+        "the durable row follows the pane",
+    );
+
+    // Resuming clears both.
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 4)).await;
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::Working);
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Running,
+    );
+}
+
+#[tokio::test]
+async fn a_durable_status_write_decided_from_a_stale_transition_follows_the_pane_not_the_transition() {
+    // A Notification's handler observed Working -> WaitingForInput, then
+    // stalled; a later PreToolUse moved the pane back to Working before the
+    // handler's durable write ran. The older handler must not write
+    // `waiting_human` over the newer state.
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::Working);
+
+    crate::awaiting_input_status::mirror_awaiting_input(
+        &server_state.work_db,
+        &server_state.publisher,
+        &server_state.live_worker_states,
+        SLOT,
+        &execution_id,
+        false,
+        crate::awaiting_input_status::ActivityTransition {
+            prior: Some(WorkerActivity::Working),
+            new: Some(WorkerActivity::WaitingForInput),
+        },
+    )
+    .await;
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Running,
+        "the pane is Working, so the row stays running",
+    );
 }

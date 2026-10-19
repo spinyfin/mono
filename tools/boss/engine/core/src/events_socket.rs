@@ -97,8 +97,8 @@ pub struct IncomingHookEvent {
     driver_resolution: DriverHookResolution,
 }
 
-/// Connection-level provenance of a hook event: facts the accept loop
-/// learned from the socket, not from the payload.
+/// Provenance of a hook event: where it came from, as opposed to what it
+/// reported.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HookConnection {
     /// Best-effort peer pid of the connecting shim; see the note on
@@ -112,6 +112,10 @@ pub struct HookConnection {
     /// live-state reducer in any order. `None` for ingress that is already
     /// sequential (a stdout-JSONL reader) and for events built in tests.
     pub ingress_seq: Option<u64>,
+    /// The payload named a subagent (`agent_id`) as the hook's origin: it
+    /// fired inside a subagent the main session launched, not in the main
+    /// session. Read from the payload by [`handle_connection`]'s decode.
+    pub from_subagent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -157,12 +161,19 @@ impl IncomingHookEvent {
             connection: HookConnection {
                 peer_pid,
                 ingress_seq: None,
+                from_subagent: false,
             },
             run_id,
             transcript_path,
             event,
             driver_resolution,
         }
+    }
+
+    /// Mark this event as having fired inside a subagent.
+    pub fn with_subagent_origin(mut self, from_subagent: bool) -> Self {
+        self.connection.from_subagent = from_subagent;
+        self
     }
 
     /// Stamp the accept-order sequence for this event. See
@@ -485,13 +496,19 @@ fn decode_incoming_event(
     // dispatchers never have to re-derive that from the event's shape.
     let transcript_path = driver.transcript_path_for_session(&raw);
     let event = driver.normalize_progress_event(&raw)?;
-    Ok(IncomingHookEvent::resolve(
-        driver.as_ref(),
-        event,
-        run_id,
-        transcript_path,
-        peer_pid_value,
-    ))
+    Ok(
+        IncomingHookEvent::resolve(driver.as_ref(), event, run_id, transcript_path, peer_pid_value)
+            .with_subagent_origin(payload_is_from_subagent(&raw)),
+    )
+}
+
+/// Whether a hook payload names a subagent as its origin. Claude Code stamps
+/// `agent_id` on the hooks that fire inside a subagent and omits it for the
+/// main session.
+fn payload_is_from_subagent(raw: &serde_json::Value) -> bool {
+    raw.get("agent_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| !id.is_empty())
 }
 
 /// Write [`REJECTION_PREFIX`] plus `err`'s message back to `stream`
@@ -1873,5 +1890,13 @@ mod tests {
         bus.publish(Event::DispatchReady);
         let event = sub.recv().await.expect("the sentinel event should still arrive");
         assert_eq!(event, Event::DispatchReady);
+    }
+
+    #[test]
+    fn only_a_payload_naming_an_agent_id_is_from_a_subagent() {
+        assert!(payload_is_from_subagent(&serde_json::json!({"agent_id": "agent-7"})));
+        assert!(!payload_is_from_subagent(&serde_json::json!({"session_id": "s"})));
+        assert!(!payload_is_from_subagent(&serde_json::json!({"agent_id": ""})));
+        assert!(!payload_is_from_subagent(&serde_json::json!({"agent_id": null})));
     }
 }

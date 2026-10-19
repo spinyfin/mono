@@ -6,8 +6,7 @@
 use super::transcript_persist::persist_transcript_and_capture_cost;
 use super::*;
 use crate::driver::{AgentDriver, Capability, ClaudeDriver};
-use crate::live_worker_state::{ApplyEventOutcome, DriverSignalKind};
-use boss_protocol::WorkerActivity;
+use crate::live_worker_state::{ApplyEventOutcome, DriverSignalKind, HookOrigin};
 
 impl ServerState {
     /// Stamp a driver-originated signal and, if this run is the in-flight
@@ -687,44 +686,47 @@ pub(super) async fn dispatch_live_worker_state(
     // Applied in the worker's emission order (`ingress_seq`), so a `Stop`
     // whose ingress task was slower than the next turn's `PreToolUse`
     // cannot land second and rewind the slot to Idle mid-tool-call.
-    let outcome = server_state.live_worker_states.apply_sequenced_event(
+    let applied = server_state.live_worker_states.apply_hook_event(
         slot_id,
-        incoming.connection.ingress_seq,
+        HookOrigin {
+            ingress_seq: incoming.connection.ingress_seq,
+            from_subagent: incoming.connection.from_subagent,
+        },
         &incoming.event,
     );
-    let stale_event = matches!(outcome, ApplyEventOutcome::Stale { .. });
-    let changed = matches!(outcome, ApplyEventOutcome::Applied { changed: true });
+    let stale_event = matches!(applied.outcome, ApplyEventOutcome::Stale { .. });
+    let changed = applied.repaired || matches!(applied.outcome, ApplyEventOutcome::Applied { changed: true });
     let new_state = server_state.live_worker_states.get(slot_id);
     let new_activity = new_state.as_ref().map(|s| s.activity);
     // A declared wait (`boss propose wait`) describes the idle period that
-    // follows it. The moment the worker is back to Working — a prompt, or
-    // Claude Code waking the session on its own because a background
-    // command finished, which opens the turn with tool hooks and no
-    // `UserPromptSubmit` — that period is over: end the wait so the pane
-    // stops advertising a stale `wait_reason` and the nudge ladder is no
-    // longer held for an idle period that has ended. Only an idle →
-    // Working transition qualifies: a wait declared mid-turn (the worker
-    // runs `propose wait`, then a few more tools, then stops) must survive
-    // the rest of that turn, and the prior activity is already Working
-    // for every one of those tool calls.
-    if changed
-        && prior_activity.is_some_and(|prior| prior != WorkerActivity::Working)
-        && new_activity == Some(WorkerActivity::Working)
-        && let Some(ended) = server_state.wait_registry.end_active(run_id)
+    // follows it. The registry reports when the worker's main session
+    // started a new turn after a turn boundary — a prompt, or Claude Code
+    // waking the session on its own because a background command finished,
+    // which opens the turn with tool hooks and no `UserPromptSubmit`. That
+    // period is over: end the wait so the pane stops advertising a stale
+    // `wait_reason` and the nudge ladder is no longer held for an idle
+    // period that has ended. This is keyed on turn ordering, not on the
+    // activity the slot showed: it holds when the resumed turn's tool hook
+    // overtakes the `Stop` it follows (the late `Stop` reports the resume
+    // itself), and it ignores a wait declared mid-turn, a permission-prompt
+    // `Notification` and a subagent's tool hooks, none of which is the main
+    // session resuming after a boundary.
+    if let Some(boundary) = applied.resumed_after
+        && let Some(ended) = server_state.wait_registry.end_if_declared_before(run_id, boundary.seq)
     {
         tracing::info!(
             execution_id = run_id,
             slot_id,
-            ?prior_activity,
+            boundary_seq = ?boundary.seq,
             current_tool = new_state.as_ref().and_then(|s| s.current_tool.as_deref()).unwrap_or("-"),
             reason = %ended.reason,
             "live_status: worker resumed a turn; ended its declared wait",
         );
-    }
-    if changed {
+        // The pane advertises the wait; push the cleared caption.
+        server_state.broadcast_live_worker_states().await;
+    } else if changed {
         server_state.broadcast_live_worker_states().await;
     }
-    persist_transcript_and_capture_cost(server_state, incoming, run_id, resolved_path.as_deref(), from_cache).await;
     // Fan out the matching trigger to the per-slot live-status loop.
     // The manager drops the trigger if no slot task is running, so a
     // hook arriving before `register_spawn` or after `release_slot`
@@ -735,18 +737,24 @@ pub(super) async fn dispatch_live_worker_state(
     // Project the pane's awaiting-input state onto the durable row, so
     // `work_executions.status` and `bossctl agents`' `activity` cannot
     // disagree about whether this worker is blocked on a human. Runs
-    // immediately after `apply_event` — while the before/after activity
-    // pair is in hand — and is a cheap no-op for every event that doesn't
-    // cross the boundary. See `crate::awaiting_input_status`.
+    // immediately after the live-state transition — ahead of the transcript
+    // I/O below, which a later hook could otherwise overtake — and is a
+    // cheap no-op for every event that doesn't cross the boundary. See
+    // `crate::awaiting_input_status`.
     crate::awaiting_input_status::mirror_awaiting_input(
         &server_state.work_db,
         &server_state.publisher,
+        &server_state.live_worker_states,
+        slot_id,
         run_id,
         is_pr_review,
-        prior_activity,
-        new_activity,
+        crate::awaiting_input_status::ActivityTransition {
+            prior: prior_activity,
+            new: new_activity,
+        },
     )
     .await;
+    persist_transcript_and_capture_cost(server_state, incoming, run_id, resolved_path.as_deref(), from_cache).await;
     // The end-of-turn trigger comes from the run's driver
     // (`Capability::TurnBoundary`), resolved once at ingress — not from this
     // dispatcher recognising a Claude-shaped `Stop`. Checked ahead of the

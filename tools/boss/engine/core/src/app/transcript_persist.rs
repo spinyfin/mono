@@ -1,9 +1,9 @@
 //! The slow half of hook ingress: persisting the transcript path a hook
 //! taught us and folding the transcript into the run's cost snapshot.
 //!
-//! Split out of `worker_events.rs` for size. The ordering contract — this
-//! runs *after* the live-state transition, never before it — is stated on
-//! the function and in `tools/boss/docs/worker-liveness-contract.md`.
+//! The ordering contract — this runs *after* the live-state transition and
+//! its durable projection, never before them — is stated on the function and
+//! in `tools/boss/docs/worker-liveness-contract.md`.
 
 use super::*;
 use crate::live_worker_state::DriverSignalKind;
@@ -31,8 +31,9 @@ pub(super) async fn persist_transcript_and_capture_cost(
     if let Some(path) = resolved_path {
         // The second driver-originated signal named in the driver-start
         // contract: a resolved transcript path means the driver created
-        // its transcript. Redundant with the hook stamp above on this
-        // code path (both are reached from the same ingress), and
+        // its transcript. Redundant with the `HookEvent` stamp in
+        // `dispatch_live_worker_state` (both are reached from the same
+        // ingress), and
         // recorded anyway so the contract holds at every site that
         // learns a transcript path rather than depending on the two
         // staying adjacent.

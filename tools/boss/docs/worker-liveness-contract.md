@@ -142,50 +142,72 @@ stopped session **on its own** when a background command finishes, and
 that resumed turn opens with tool hooks and no prompt.
 
 What can go wrong is ordering. The events-socket accept loop
-(`engine/core/src/app/server.rs`) dispatches every connection on its own
-task, so two hooks the worker emitted in order can reach the reducer in
-either order — and the race is not symmetric. A turn boundary persists
-the transcript path and folds the transcript into the run's cost snapshot
-(a bounded settle loop with sleeps) on its way to the reducer; a
+(`engine/core/src/app/events_accept.rs`) dispatches every connection on its
+own task, so two hooks the worker emitted in order can reach the reducer in
+either order — and the race is not symmetric. A turn boundary persists the
+transcript path and folds the transcript into the run's cost snapshot (a
+bounded settle loop with sleeps, plus transcript reads and DB writes whose
+latency is not bounded by those sleeps) on its way to the reducer; a
 `PreToolUse` goes almost straight there. When a `Stop` is slow and the
 re-woken turn's first `PreToolUse` is fast, the `Stop` lands second and
 rewinds the slot to `Idle` with no tool — and it stays that way until the
-next hook, which for a multi-minute `checkleft run` is the whole run. That
-is the 2026-10-15 "Idle while visibly running `checkleft`" symptom, with
-the old `wait_reason` still painted on the pane.
+next hook, which for a multi-minute `checkleft run` is the whole run.
 
-Two things close it:
+The 2026-10-15 "Idle while visibly running `checkleft`" incident is
+**consistent with** that race but the race is not proven to be its cause:
+the engine log lines for the incident window (`hook event received`, `hook
+payload arrived at dispatcher`, `dropping hook fan-out`) were not available
+when the fix was written. The settle loop's sleeps alone (~200ms) are far
+shorter than the minutes the pane stayed Idle, so a delay that long would
+have to come from elsewhere in the `Stop`'s ingress (transcript read, DB
+lock contention). If the symptom recurs, check those lines first: a hook
+that never arrived, or one dropped on the slot-less path, is not fixed by
+ordering. Every `Stale` refusal logs `ingress_seq` and `last_applied_seq`,
+so a recurrence with a refusal in the log confirms the race.
+
+Three things close the ordering hole:
 
 - **Accept order is emission order, and the reducer honours it.** The
   `boss-event` shim connects synchronously from inside the driver's hook,
   so the order the accept loop sees connections is the order the worker
-  emitted them. The loop stamps that order as `ingress_seq` on the
-  `IncomingHookEvent` before spawning the task; the registry remembers the
-  newest sequence it applied per slot and refuses an older one
-  (`ApplyEventOutcome::Stale`). A refused event touches nothing — not
-  `activity`, not `current_tool`, not the display timestamps — and does not
-  trigger the live-status loop's `Stop`/`PostToolUse` refresh either.
-  Liveness bookkeeping (`record_driver_signal`) already happened at ingress,
-  so the stale event still counts as proof the driver is alive. Unsequenced
-  callers (the Codex stdout reader, engine-synthesized events, tests) keep
-  the always-apply `apply_event`.
-- **The live-state transition runs before the slow half of ingress.**
-  `dispatch_live_worker_state` (`engine/core/src/app/worker_events.rs`) now
-  applies the event and broadcasts first, then persists the transcript path
-  and captures cost. The persist still runs on the slot-less path too, so
-  orphaned and late-hook executions retain their cost as before.
-
-A declared wait (`boss propose wait`) is handled at the same seam. It
-describes the idle period that follows the declaration; the moment the
-slot goes from a non-`Working` activity back to `Working` — a prompt, or a
-background-command wake-up — the ingress calls `WaitRegistry::end_active`,
-so the pane stops advertising a stale `wait_reason` and the nudge ladder is
-no longer held for an idle period that is over. The per-execution wait
-budget stays charged. A wait declared _mid-turn_ (the worker runs `propose
-wait`, then a few more tools, then stops) survives the rest of that turn,
-because the prior activity is already `Working` for each of those tool
-calls. Workers are told, in their prompt, to re-declare before ending a
-resumed turn if they are still waiting.
+  emitted them. The loop stamps that order as `ingress_seq` before spawning
+  the task; the registry remembers the newest sequence it applied per slot
+  (`LiveWorkerStateRegistry::apply_hook_event`) and treats an older event as
+  late (`ApplyEventOutcome::Stale`). A late event does not touch `activity`,
+  `current_tool` or the display timestamps, and does not trigger the
+  live-status loop's `Stop`/`PostToolUse` refresh. Hook events are
+  incremental, though, so two late events still contribute: a late
+  `Notification` repairs the `Stop` that overtook it (`WaitingForInput`
+  rather than `Idle`, or the pending flag the events after it did not
+  clear), and a late `Stop` reports the turn boundary it opened (below).
+  Liveness bookkeeping (`record_driver_signal`) already happened at ingress.
+  Unsequenced callers (the Codex stdout reader, engine-synthesized events,
+  tests) keep the always-apply `apply_event`.
+- **The live-state transition and its durable projection run before the
+  slow half of ingress.** `dispatch_live_worker_state`
+  (`engine/core/src/app/worker_events.rs`) applies the event, broadcasts,
+  and mirrors the awaiting-input state onto the execution row, and only then
+  persists the transcript path and captures cost. The row write is decided
+  from the pane's activity at write time, inside a gate that serializes the
+  writes, so an older handler that stalls can never leave `waiting_human`
+  over a pane that has since moved on.
+- **A declared wait ends on turn ordering, not on the activity the slot
+  showed.** A wait (`boss propose wait`) describes the idle period that
+  follows the declaration. The registry tracks the turn boundary (`Stop`)
+  the main session is parked behind and reports when the main session
+  starts a new turn after it (`HookApplied::resumed_after`): the first
+  main-session `UserPromptSubmit`/`PreToolUse`/`PostToolUse` after the
+  `Stop`, or the late `Stop` itself once main-session activity numbered above
+  it has already been applied. The ingress then calls
+  `WaitRegistry::end_if_declared_before`, which ends the wait only if it was
+  declared before that boundary (the wait records the hook sequence it was
+  declared after), so a late `Stop` cannot end a wait declared in the turn
+  that overtook it. Hooks stamped with an `agent_id` (a backgrounded
+  subagent's tools) are not main-session activity, a permission-prompt
+  `Notification` is not a turn boundary, and a wait declared mid-turn
+  survives the rest of that turn. The per-execution wait budget stays
+  charged. Workers are told, in their prompt, to re-declare before ending a
+  resumed turn if they are still waiting.
 
 ## Rules of thumb for future work here
 

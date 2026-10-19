@@ -26,7 +26,8 @@ use boss_protocol::{WAIT_MAX_DURATION_SECS, WAIT_MAX_TOTAL_SECS_PER_EXECUTION};
 
 /// One execution's currently granted wait, plus the cumulative budget it
 /// has already consumed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WaitRecord {
     pub reason: String,
     pub waiting_on: Option<String>,
@@ -35,6 +36,12 @@ pub struct WaitRecord {
     /// Duration charged against the per-execution total for this
     /// declaration, in seconds.
     pub granted_secs: u64,
+    /// Ingress sequence of the newest hook the worker's slot had applied when
+    /// the wait was declared (`None` when the worker has no sequenced hooks
+    /// yet). A turn boundary numbered above it ended the turn the wait was
+    /// declared in; one numbered below it belongs to an earlier turn and says
+    /// nothing about this wait. See [`WaitRegistry::end_if_declared_before`].
+    pub declared_after_seq: Option<u64>,
 }
 
 /// Why [`WaitRegistry::declare`] refused a wait.
@@ -152,18 +159,33 @@ impl WaitRegistry {
         duration_secs: u64,
         now_epoch_secs: i64,
     ) -> Result<WaitRecord, WaitDeclareError> {
+        self.declare_after(execution_id, reason, waiting_on, duration_secs, now_epoch_secs, None)
+    }
+
+    /// [`Self::declare`], recording the hook sequence the declaring worker
+    /// had reached so a later turn boundary can be ordered against it.
+    pub fn declare_after(
+        &self,
+        execution_id: &str,
+        reason: String,
+        waiting_on: Option<String>,
+        duration_secs: u64,
+        now_epoch_secs: i64,
+        declared_after_seq: Option<u64>,
+    ) -> Result<WaitRecord, WaitDeclareError> {
         let mut guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
         let state = guard.entry(execution_id.to_owned()).or_default();
         Self::validate(duration_secs, state.total_granted_secs)?;
 
         let expires_at_epoch = now_epoch_secs.saturating_add(duration_secs as i64);
-        let record = WaitRecord {
-            reason,
-            waiting_on,
-            declared_at_epoch: now_epoch_secs,
-            expires_at_epoch,
-            granted_secs: duration_secs,
-        };
+        let record = WaitRecord::builder()
+            .reason(reason)
+            .maybe_waiting_on(waiting_on)
+            .declared_at_epoch(now_epoch_secs)
+            .expires_at_epoch(expires_at_epoch)
+            .granted_secs(duration_secs)
+            .maybe_declared_after_seq(declared_after_seq)
+            .build();
         state.total_granted_secs = state.total_granted_secs.saturating_add(duration_secs);
         state.active = Some(record.clone());
         state.expiry_logged = false;
@@ -211,24 +233,29 @@ impl WaitRegistry {
             .unwrap_or(0)
     }
 
-    /// End the active wait for `execution_id` without touching the budget
-    /// it has already been charged. Returns the record that was active, or
-    /// `None` when nothing was.
+    /// End the active wait for `execution_id` because the worker's main
+    /// session started a new turn after `boundary`, without touching the
+    /// budget the wait has already been charged. Returns the record that
+    /// was ended, or `None` when nothing was active or the wait was declared
+    /// after `boundary` (in a later turn, so that boundary does not end it).
     ///
-    /// Called by the hook ingress when the worker's live activity leaves an
-    /// idle state for `Working` again. A declared wait describes the idle
-    /// period that follows the declaration, and a resumed turn — a human or
-    /// coordinator prompt, or Claude Code waking the session on its own
-    /// because a background command finished — ends that period. Leaving
-    /// the record in place would advertise a stale `wait_reason` on a
-    /// worker that is demonstrably working, and keep holding the nudge
-    /// ladder for an idle period that is over. The budget stays charged so
-    /// a worker cannot reset its per-execution cap by starting turns; it
-    /// re-declares (and is charged again) if it is still waiting when the
-    /// resumed turn ends.
-    pub fn end_active(&self, execution_id: &str) -> Option<WaitRecord> {
+    /// A declared wait describes the idle period that follows the
+    /// declaration, and a resumed turn — a human or coordinator prompt, or
+    /// Claude Code waking the session on its own because a background
+    /// command finished — ends that period. Leaving the record in place
+    /// would advertise a stale `wait_reason` on a worker that is
+    /// demonstrably working, and keep holding the nudge ladder for an idle
+    /// period that is over. The budget stays charged so a worker cannot reset
+    /// its per-execution cap by starting turns; it re-declares (and is
+    /// charged again) if it is still waiting when the resumed turn ends.
+    pub fn end_if_declared_before(&self, execution_id: &str, boundary_seq: Option<u64>) -> Option<WaitRecord> {
         let mut guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
         let state = guard.get_mut(execution_id)?;
+        if let (Some(declared), Some(boundary)) = (state.active.as_ref()?.declared_after_seq, boundary_seq)
+            && declared >= boundary
+        {
+            return None;
+        }
         let ended = state.active.take()?;
         state.expiry_logged = false;
         tracing::info!(
@@ -344,10 +371,12 @@ mod tests {
     }
 
     #[test]
-    fn end_active_drops_the_wait_but_keeps_the_budget_charged() {
+    fn end_if_declared_before_drops_the_wait_but_keeps_the_budget_charged() {
         let registry = WaitRegistry::new();
         registry.declare("exec_a", "bazel".into(), None, 60, 0).unwrap();
-        let ended = registry.end_active("exec_a").expect("the active wait is returned");
+        let ended = registry
+            .end_if_declared_before("exec_a", Some(5))
+            .expect("the active wait is returned");
         assert_eq!(ended.reason, "bazel");
         assert!(registry.active("exec_a", 0).is_none());
         assert_eq!(
@@ -355,14 +384,33 @@ mod tests {
             60,
             "ending a wait early is not a refund against the per-execution cap"
         );
-        assert!(registry.end_active("exec_a").is_none(), "nothing is left to end");
-        assert!(registry.end_active("exec_unknown").is_none());
+        assert!(
+            registry.end_if_declared_before("exec_a", None).is_none(),
+            "nothing is left to end"
+        );
+        assert!(registry.end_if_declared_before("exec_unknown", None).is_none());
         // Re-declaring afterwards works and is charged on top.
         registry
             .declare("exec_a", "still waiting".into(), None, 30, 10)
             .unwrap();
         assert_eq!(registry.total_granted_secs("exec_a"), 90);
         assert!(registry.active("exec_a", 10).is_some());
+    }
+
+    #[test]
+    fn a_boundary_older_than_the_declaration_does_not_end_the_wait() {
+        let registry = WaitRegistry::new();
+        // Declared by a worker whose newest applied hook was seq 10.
+        registry
+            .declare_after("exec_a", "bazel".into(), None, 60, 0, Some(10))
+            .unwrap();
+        assert!(
+            registry.end_if_declared_before("exec_a", Some(7)).is_none(),
+            "a turn boundary from before the declaration belongs to an earlier turn"
+        );
+        assert!(registry.active("exec_a", 0).is_some());
+        assert!(registry.end_if_declared_before("exec_a", Some(11)).is_some());
+        assert!(registry.active("exec_a", 0).is_none());
     }
 
     #[test]
