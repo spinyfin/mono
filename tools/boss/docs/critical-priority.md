@@ -8,9 +8,11 @@ Because it bypasses capacity limits, only the human owner can set it. Everything
 
 A work item at `critical`:
 
-- **Dispatches ahead of every non-critical item**, regardless of dispatch class, execution-level priority, queue order or age. Multiple critical items dispatch oldest-first among themselves.
+- **Dispatches ahead of every non-critical item**, regardless of dispatch class, execution-level priority, queue order or age. Multiple critical items dispatch oldest-first by execution creation time, before dispatch class or execution-level priority.
 - **Is not held by the interactive concurrency cap** (`bossctl dispatch concurrency`). It takes any idle slot up to the worker pool's own capacity, the hard ceiling. If the pool is completely full it is next in line ahead of everything else. Running workers are never preempted or killed for it.
 - **Still dispatches under an operator dispatch pause** (`bossctl dispatch pause`). Everything else stays held, and the pause state and reason are unchanged. A _breaker_ pause (the spawn-capability circuit breaker) still holds it: the spawn path is broken, so an urgent row would only burn another attempt against it.
+
+The cap and operator-pause exemptions also apply before an execution exists: admission preview, confirmed drag-to-Doing, and force-start all admit eligible critical main-pool work. Orphan recovery uses the same pause evaluation. These paths still report a breaker pause.
 
 What it does not do: it does not clear unmet dependencies, chain holds, a blocked status, or any other eligibility rule. It changes only ordering and the two capacity gates above.
 
