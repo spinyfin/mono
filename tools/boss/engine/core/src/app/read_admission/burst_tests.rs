@@ -294,17 +294,32 @@ async fn socket_saturation_without_pushes_delivers_every_id_once() {
     socket_saturation_delivers_every_id_once(0).await;
 }
 
-/// 300 distinct-topic pushes overflow the bulk lane while 320 replies are
-/// pending. Pushes are evicted (with a resync marker) instead of replies or
-/// the session: every id still arrives exactly once and the socket stays open.
+/// 300 distinct-topic pushes overflow the bulk lane before 320 replies are
+/// queued behind them. Pushes are evicted (behind a resync marker) instead
+/// of replies or the session: every id still arrives exactly once and the
+/// socket stays open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socket_saturation_with_distinct_topic_pushes_keeps_replies_and_connection() {
     socket_saturation_delivers_every_id_once(300).await;
 }
 
 /// Exercise the socket reader's backpressure with more requests than the
-/// outbound queue can hold, while `push_topics` independent topic producers
-/// keep running.
+/// outbound queue can hold, after `push_topics` independent topic producers
+/// have already overflowed the lane.
+///
+/// The protocol is ordered so the outcome depends on the engine's
+/// accounting alone, never on scheduling:
+/// 1. The outbound socket buffer is tiny and the client does not read yet,
+///    so the writer blocks within a handful of pushes and every further
+///    push lands in the lane. All pushes are published (and awaited) before
+///    any request is sent, so no push can arrive once the lane holds only
+///    replies.
+/// 2. All 320 request frames go down in one write that the inbound buffer
+///    must absorb without blocking. The reader is already paused behind the
+///    push backlog and nothing drains the outbound side yet, so a write that
+///    had to wait for the reader here would deadlock against it.
+/// 3. Only then does the client drain. Replies may be delayed but are never
+///    evicted, and the connection stays open.
 async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
     let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
         crate::app::ServerStateOverrides::builder()
@@ -322,11 +337,19 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
         .await
         .unwrap();
     let (client, server) = UnixStream::pair().unwrap();
-    // Hold all 320 small request frames in the socket even when the reader
-    // pauses; this lets the test finish pipelining before it begins draining.
     use std::os::fd::AsRawFd;
-    let capacity: libc::c_int = 65_536;
-    for (socket, option) in [(&client, libc::SO_SNDBUF), (&server, libc::SO_RCVBUF)] {
+    // Inbound (requests): room for the whole pipelined batch, about 21 KB,
+    // while the reader is paused. Outbound (pushes and replies): small
+    // enough that the writer blocks after a few 2 KB pushes on every
+    // platform, which is what makes the lane overflow below a certainty.
+    let inbound: libc::c_int = 65_536;
+    let outbound: libc::c_int = 8_192;
+    for (socket, option, capacity) in [
+        (&client, libc::SO_SNDBUF, inbound),
+        (&server, libc::SO_RCVBUF, inbound),
+        (&server, libc::SO_SNDBUF, outbound),
+        (&client, libc::SO_RCVBUF, outbound),
+    ] {
         // SAFETY: both descriptors and the integer option buffer remain live.
         let result = unsafe {
             libc::setsockopt(
@@ -354,63 +377,64 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
         .map(|i| format!("saturation-{i}-{}", "x".repeat(2048)))
         .collect();
     state.topic_broker.subscribe(&session, &topics).await;
-    let publisher = tokio::spawn({
-        let state = state.clone();
-        async move {
-            for topic in topics {
-                state
-                    .topic_broker
-                    .publish(
-                        &topic,
-                        FrontendEventEnvelope::push(FrontendEvent::TopicEvent {
-                            topic: topic.clone(),
-                            revision: 1,
-                            origin_session_id: String::new(),
-                            origin_request_id: None,
-                            event: boss_protocol::TopicEventPayload::ResyncRequired,
-                        }),
-                    )
-                    .await;
-                tokio::task::yield_now().await;
-            }
-        }
-    });
-    let (read, mut write) = client.into_split();
-    let sender = tokio::spawn(async move {
-        let mut sent = 0;
-        let mut frames = Vec::new();
-        for index in 0..320 {
+    for topic in &topics {
+        state
+            .topic_broker
+            .publish(
+                topic,
+                FrontendEventEnvelope::push(FrontendEvent::TopicEvent {
+                    topic: topic.clone(),
+                    revision: 1,
+                    origin_session_id: String::new(),
+                    origin_request_id: None,
+                    event: boss_protocol::TopicEventPayload::ResyncRequired,
+                }),
+            )
+            .await;
+    }
+    let (read, write) = client.into_split();
+    let batch: String = (0..320)
+        .map(|index| {
             let request = FrontendRequestEnvelope {
                 request_id: format!("saturated-{index}"),
                 payload: FrontendRequest::ListProducts,
             };
-            frames.extend_from_slice(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes());
-            sent += 1;
-        }
-        // Batch the frames so per-write kernel accounting cannot exhaust the
-        // socket buffer before reads begin, even though the payload fits.
-        write.write_all(&frames).await.unwrap();
-        (write, sent)
-    });
-    let (write, sent) = tokio::time::timeout(Duration::from_secs(5), sender)
-        .await
-        .expect("pipelining must finish before reads begin")
-        .unwrap();
-    // Deliberately do not drain either Hello, pushes or BUSY responses yet.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+            format!("{}\n", serde_json::to_string(&request).unwrap())
+        })
+        .collect();
+    write.writable().await.unwrap();
+    let written = write.try_write(batch.as_bytes()).unwrap();
+    assert_eq!(
+        written,
+        batch.len(),
+        "the inbound socket buffer must absorb the whole pipelined batch without blocking"
+    );
     let mut lines = BufReader::new(read).lines();
     let mut replies = std::collections::HashSet::new();
+    let mut pushes = 0usize;
+    let mut resync_markers = 0usize;
     let closed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     let env: FrontendEventEnvelope = serde_json::from_str(&line).unwrap();
-                    if let Some(id) = env.request_id {
-                        assert!(id.starts_with("saturated-"));
-                        assert!(matches!(env.payload, FrontendEvent::Error { message } if message == DEADLINE || message == QUEUE_FULL));
-                        assert!(replies.insert(id), "duplicate correlated reply");
-                        if replies.len() == 320 {
-                            break false;
+                    match env.request_id {
+                        Some(id) => {
+                            assert!(id.starts_with("saturated-"));
+                            assert!(matches!(env.payload, FrontendEvent::Error { message } if message == DEADLINE || message == QUEUE_FULL));
+                            assert!(replies.insert(id), "duplicate correlated reply");
+                            if replies.len() == 320 {
+                                break false;
+                            }
+                        }
+                        None => {
+                            if let FrontendEvent::TopicEvent { topic, .. } = &env.payload {
+                                if topic == crate::app::session_queue::RESYNC_TOPIC {
+                                    resync_markers += 1;
+                                } else if topic.starts_with("saturation-") {
+                                    pushes += 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -423,13 +447,31 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
     .await
     .expect("missing replies without an explicit socket close");
     assert!(!closed, "the connection must stay open: replies are never evicted");
-    assert_eq!(sent, 320);
     let expected: std::collections::HashSet<_> = (0..320).map(|index| format!("saturated-{index}")).collect();
     assert_eq!(replies, expected);
-    publisher.await.unwrap();
+    if push_topics == 0 {
+        assert_eq!(
+            resync_markers, 0,
+            "nothing overflowed, so nothing should ask for a resync"
+        );
+    } else {
+        assert!(
+            pushes < push_topics,
+            "all {push_topics} pushes arrived: the lane never overflowed, so eviction was not exercised"
+        );
+        assert!(
+            resync_markers > 0,
+            "evicted pushes must be announced by a resync marker ({pushes} of {push_topics} pushes arrived)"
+        );
+    }
     drop(lines);
     drop(write);
     drop(held);
+    // The session ends cleanly however the close reaches the server. Every
+    // push was queued ahead of the replies, so nothing should be left unread
+    // here; but a peer that does close with unread frames surfaces to a
+    // Linux server as a connection reset, which is a clean end of session
+    // too (see `app::tests::peer_disconnect`), never an error.
     tokio::time::timeout(Duration::from_secs(5), handler)
         .await
         .unwrap()
