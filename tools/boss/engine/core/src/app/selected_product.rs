@@ -77,16 +77,23 @@ impl ServerState {
     /// (tools/boss/cli/src/data.rs) that globally-unique short ids resolve
     /// without `--product`.
     pub(super) async fn resolve_work_item_id(&self, id: &str) -> anyhow::Result<String> {
+        self.resolve_work_item_id_with_db(&self.work_db, id).await
+    }
+
+    pub(super) async fn resolve_work_item_id_with_db(
+        &self,
+        db: &crate::work::WorkDb,
+        id: &str,
+    ) -> anyhow::Result<String> {
         let selector = boss_protocol::parse_work_item_selector(id);
         let boss_protocol::WorkItemSelector::ShortId(short_id) = selector else {
-            return self.work_db.resolve_work_item_ref(id);
+            return db.resolve_work_item_ref(id);
         };
 
         let SelectedProductState::Selected { product_id, name, .. } = self.selected_product_state().await else {
-            return self.work_db.resolve_work_item_ref(id);
+            return db.resolve_work_item_ref(id);
         };
-        self.work_db
-            .resolve_work_item_ref(&format!("{product_id}/{short_id}"))
+        db.resolve_work_item_ref(&format!("{product_id}/{short_id}"))
             .map_err(|err| rewrite_not_found(err, id, &name))
     }
 

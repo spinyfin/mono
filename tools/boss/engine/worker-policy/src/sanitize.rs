@@ -147,6 +147,9 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
             task_runtimes,
             dependencies,
             ideas: _,
+            attention_items,
+            attention_groups,
+            attention_members,
         } => FrontendEvent::WorkTree {
             product,
             projects,
@@ -155,6 +158,9 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
             task_runtimes,
             dependencies,
             ideas: vec![],
+            attention_items,
+            attention_groups,
+            attention_members,
         },
         passthrough @ (FrontendEvent::Hello { .. }
         | FrontendEvent::Subscribed { .. }

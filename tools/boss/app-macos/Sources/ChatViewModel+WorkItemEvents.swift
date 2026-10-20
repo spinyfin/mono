@@ -18,7 +18,10 @@ extension ChatViewModel {
         chores: [WorkTask],
         taskRuntimes: [WorkTaskRuntime],
         dependencies: [WorkItemDependency],
-        ideas: [WorkIdea]
+        ideas: [WorkIdea],
+        attentionItems: [WorkAttentionItem],
+        attentionGroups: [AttentionGroup],
+        attentionMembers: [Attention]
     ) {
         // Fan-out regression counter (design entry 2): full work-tree applies.
         UIUpdateCounters.shared.recordApplyWorkTree()
@@ -81,6 +84,8 @@ extension ChatViewModel {
         mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
         dependenciesByProductID[product.id] = dependencies
         ideasByProductID[product.id] = ideas
+        attentionItemsByWorkItemID[product.id] = attentionItems
+        applyAttentionGroupsList(productID: product.id, groups: attentionGroups, members: attentionMembers)
         seedReviewTaskIDs(tasks: tasks, chores: chores, productID: product.id)
         // After tasksByProjectID reflects real engine state, clear optimistic
         // overrides for cards whose true column now matches the target.
@@ -90,8 +95,6 @@ extension ChatViewModel {
         reconcileWorkSelection()
         refreshWorkSubscriptions()
         refreshDesignDocStates(for: projects)
-        engine.sendListAttentionItemsForWorkItem(workItemID: product.id)
-        engine.sendListAttentionGroups(productId: product.id)
         workErrorMessage = nil
         if let pending = pendingRevealScrollID, revealProductID == product.id {
             pendingRevealScrollID = nil

@@ -6,6 +6,7 @@ use super::idea::Idea;
 use super::product::Product;
 use super::project::Project;
 use super::task::{Task, TaskRuntime};
+use crate::{Attention, AttentionGroup, WorkAttentionItem};
 use serde::{Deserialize, Serialize};
 
 /// Input to `LinkWorkItemExternalRef`: manually bind a work item to a
@@ -340,4 +341,17 @@ pub struct WorkTree {
     /// field existed.
     #[serde(default)]
     pub ideas: Vec<Idea>,
+    /// Product-scoped operational alerts, including resolved items, matching
+    /// `list_attention_items_for_work_item` for this product.
+    #[serde(default)]
+    #[builder(default)]
+    pub attention_items: Vec<WorkAttentionItem>,
+    /// Open and partially answered groups, matching `list_attention_groups`.
+    #[serde(default)]
+    #[builder(default)]
+    pub attention_groups: Vec<AttentionGroup>,
+    /// Members of the included groups, bucketed by `group_id` by clients.
+    #[serde(default)]
+    #[builder(default)]
+    pub attention_members: Vec<Attention>,
 }

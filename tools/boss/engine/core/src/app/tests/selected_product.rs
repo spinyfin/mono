@@ -128,6 +128,14 @@ async fn bare_short_ids_resolve_in_the_selected_product() {
         server_state.resolve_work_item_id(&selector).await.unwrap(),
         selected_task.id
     );
+    let reader = server_state.work_db.reader().unwrap();
+    assert_eq!(
+        server_state
+            .resolve_work_item_id_with_db(&reader, &selector)
+            .await
+            .unwrap(),
+        selected_task.id
+    );
 }
 
 #[tokio::test]

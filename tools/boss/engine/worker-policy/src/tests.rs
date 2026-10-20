@@ -635,6 +635,9 @@ fn work_tree_strips_ideas_for_workers() {
         .build();
     let before = FrontendEvent::WorkTree {
         product: product.clone(),
+        attention_items: vec![],
+        attention_groups: vec![],
+        attention_members: vec![],
         projects: vec![],
         tasks: vec![],
         chores: vec![],

@@ -187,14 +187,7 @@ impl WorkDb {
                 return Err(item_err);
             }
         }
-        let mut stmt = conn.prepare(
-            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
-             FROM work_attention_items
-             WHERE work_item_id = ?1
-             ORDER BY created_at ASC, id ASC",
-        )?;
-        let rows = stmt.query_map([work_item_id], map_attention_item)?;
-        collect_rows(rows)
+        super::attentions::reads::list_items(&conn, work_item_id)
     }
 
     pub fn get_attention_item(&self, id: &str) -> Result<WorkAttentionItem> {
@@ -1248,6 +1241,9 @@ impl WorkDb {
         trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
 
         let ideas = list_ideas_in_tx(&conn, product_id, None)?;
+        let attention_items = super::attentions::reads::list_items(&conn, product_id)?;
+        let (attention_groups, attention_members) =
+            super::attentions::reads::list_groups_with_members(&conn, product_id, None, None, None, None)?;
 
         Ok(WorkTree {
             product,
@@ -1257,6 +1253,9 @@ impl WorkDb {
             task_runtimes,
             dependencies,
             ideas,
+            attention_items,
+            attention_groups,
+            attention_members,
         })
     }
 
