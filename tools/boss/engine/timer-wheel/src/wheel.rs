@@ -49,7 +49,7 @@ impl TimerWheel {
             wake: Notify::new(),
         });
         let loop_shared = Arc::clone(&shared);
-        let loop_handle = tokio::spawn(async move { run_loop(loop_shared, bus).await });
+        let loop_handle = boss_task_scope::spawn(async move { run_loop(loop_shared, bus).await });
         Self { shared, loop_handle }
     }
 

@@ -94,7 +94,7 @@ impl ServerStateProbeQueuer {
     /// have marked the nudge `interrupt_owned`.
     fn spawn_interrupting_delivery(&self, server: Arc<ServerState>, run_id: String, probe_id: String) {
         let nudges = self.nudges.clone();
-        tokio::spawn(async move { deliver_owned_nudge(&nudges, &server, &run_id, &probe_id).await });
+        boss_task_scope::spawn(async move { deliver_owned_nudge(&nudges, &server, &run_id, &probe_id).await });
     }
 }
 
@@ -177,7 +177,7 @@ impl ProbeQueuer for ServerStateProbeQueuer {
         };
         let run_id = run_id.to_owned();
         let nudges = self.nudges.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             // Decide under one lock so exactly one task owns the nudge.
             let takeover = {
                 let mut guard = nudges.lock().expect("queuer nudges mutex poisoned");

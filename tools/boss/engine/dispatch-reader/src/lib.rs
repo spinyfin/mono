@@ -766,7 +766,7 @@ pub fn spawn_stage_stalled_detector(
     thresholds: StageThresholds,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         // Stagger startup so an engine bring-up isn't paying for this
         // sweep while the rest of init is still running.
         tokio::time::sleep(interval).await;

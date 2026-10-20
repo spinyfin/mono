@@ -1213,7 +1213,7 @@ impl ExecutionCoordinator {
         };
         let execution = execution.clone();
         let coordinator = Arc::clone(self);
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             coordinator
                 .run_execution(execution, run, work_item, worker_id, lease, None, adapter)
                 .await;

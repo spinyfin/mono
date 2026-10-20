@@ -236,7 +236,7 @@ fn spawn_writer(
     work_db: Arc<WorkDb>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GhCallSample>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let mut pending: Vec<GithubApiCallRow> = Vec::with_capacity(WRITE_BATCH_MAX);
         let mut flush_tick = tokio::time::interval(WRITE_BATCH_INTERVAL);
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

@@ -65,8 +65,8 @@ impl TestEngine {
                 None,
                 None,
                 ServeOverrides {
-                    merge_probe: None,
                     worker_registry: Some(registry_for_serve),
+                    ..Default::default()
                 },
             )
             .await

@@ -127,6 +127,7 @@ rust_library(
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/stdout-progress",
         "//tools/boss/engine/structured-output",
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/timer-wheel",
         "//tools/boss/engine/transcript-markdown:transcript_markdown",
         "//tools/boss/engine/transcript-tail",
@@ -256,6 +257,7 @@ rust_test(
     ),
     shard_count = 11,
     deps = [
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",
     ] + all_crate_deps(
         normal = True,
@@ -300,6 +302,7 @@ network_enabled_rust_test(
     ),
     tags = ["manual"],
     deps = [
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/test-git",
     ] + all_crate_deps(
         normal = True,
@@ -731,8 +734,12 @@ rust_test(
     name = "tmux_engine_restart_drill_integration_test",
     size = "medium",
     timeout = "moderate",
-    srcs = ["tests/tmux_engine_restart_drill_integration.rs"],
+    srcs = [
+        "tests/restart_shutdown_probe.rs",
+        "tests/tmux_engine_restart_drill_integration.rs",
+    ],
     compile_data = ["tests/fixtures/still-working.sh"],
+    crate_root = "tests/tmux_engine_restart_drill_integration.rs",
     # Same rationale as `tmux_recovery_integration_test`: test-local declared
     # tmux runfiles, not a shared host capability.
     data = ["@host_tmux//:tmux"],

@@ -814,7 +814,7 @@ pub(super) async fn apply_work_item_patch(
                 // task/chore) collapse inside force_release.
                 if let Some(execution_id) = terminal_chore_execution(&work_db, &item) {
                     let handler = server_state.completion_handler.clone();
-                    tokio::spawn(async move {
+                    boss_task_scope::spawn(async move {
                         handler.force_release(&execution_id).await;
                     });
                 }
@@ -829,7 +829,7 @@ pub(super) async fn apply_work_item_patch(
                 // Idempotent for the same reasons as above.
                 if let Some(execution_id) = in_review_chore_execution(&work_db, &item) {
                     let handler = server_state.completion_handler.clone();
-                    tokio::spawn(async move {
+                    boss_task_scope::spawn(async move {
                         handler.force_release(&execution_id).await;
                     });
                 }
@@ -844,7 +844,7 @@ pub(super) async fn apply_work_item_patch(
                 if let Some(execution_id) = active_to_todo_execution(&work_db, &previous_task_status, &item) {
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = id.clone();
-                    tokio::spawn(async move {
+                    boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(
                                 &id_for_cancel,
@@ -1142,7 +1142,7 @@ pub(super) async fn apply_work_item_patch(
                         build_chore_update_message(&old_name, &new_name, &old_description, &new_description)
                     {
                         let server_for_notify = server_state.clone();
-                        tokio::spawn(async move {
+                        boss_task_scope::spawn(async move {
                             match server_for_notify.send_input_to_worker(&run_id, msg.clone()).await {
                                 Ok(_) => {}
                                 Err(err)
@@ -1247,7 +1247,7 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                     };
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = tombstoned_id.clone();
-                    tokio::spawn(async move {
+                    boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(
                                 &id_for_cancel,

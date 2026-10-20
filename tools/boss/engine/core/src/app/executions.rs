@@ -602,7 +602,7 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         let server_for_now = server_state.clone();
         let run_id_for_now = run_id.clone();
         let probe_id_for_now = probe_id.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             let outcome = dispatch_probe_now(&server_for_now, &run_id_for_now).await;
             // This runs detached, after the response has already gone back to
             // the caller, so its verdict is otherwise invisible. Log it — and
@@ -815,7 +815,7 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
         tracing::info!(run_id = %run_id, "stop_run requested");
         let handler = server_state.completion_handler.clone();
         let run_id_for_release = run_id.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             // Use `force_stop_execution` instead of plain
             // `force_release`: this additionally cancels the
             // execution row and demotes the task from `active`
@@ -997,7 +997,7 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
                     .unwrap_or_default();
                 let handler = server_state.completion_handler.clone();
                 let exec_for_release = execution_id.clone();
-                tokio::spawn(async move {
+                boss_task_scope::spawn(async move {
                     for run_id in active_runs {
                         handler.force_release(&run_id).await;
                     }
@@ -1087,7 +1087,7 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
                 // round-trip and process-tree signal don't add latency
                 // to the RPC response.
                 let run_id_for_release = run_id.clone();
-                tokio::spawn(async move {
+                boss_task_scope::spawn(async move {
                     server_state.release_worker_pane(&run_id_for_release).await;
                 });
                 send_response(&sink, &request_id, FrontendEvent::RunReaped { run_id, execution });

@@ -67,7 +67,7 @@ pub fn spawn_loop(
     threshold: Duration,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         tokio::time::sleep(interval).await;
         loop {
             // The pass reads the dispatch stream and then hits SQLite once

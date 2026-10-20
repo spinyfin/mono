@@ -591,7 +591,7 @@ pub fn spawn_loop(
 ) -> tokio::task::JoinHandle<()> {
     let (cube_client, completion_handler, trunk_queue_api) = handlers;
     let (kick, mut pr_reconcile_requests) = kicks;
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let quiesce_window = Duration::from_secs(15);
         let mut schedule = PrPollSchedule::default();
         let mut pr_requests_closed = false;

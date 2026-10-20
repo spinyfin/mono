@@ -101,7 +101,7 @@ fn spawn_comment_classifier(
     let artifact_kind = comment.artifact_kind.clone();
     let artifact_id = comment.artifact_id.clone();
 
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let call = match server_state.utility_model.resolve(UtilityTask::CommentIntent) {
             Ok(call) => call,
             Err(err) => {
@@ -794,7 +794,7 @@ fn spawn_followup_classifier(
     let comment = comment.clone();
     let followup_body = followup_body.to_owned();
 
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let thread = work_db.list_comment_thread_entries(&comment.id).unwrap_or_default();
         let result = crate::comment_classifier::classify_followup(
             &call,
@@ -1441,7 +1441,7 @@ async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<
     let active_runs = work_db.active_run_ids_for_execution(&execution.id).unwrap_or_default();
     let handler = server_state.completion_handler.clone();
     let execution_id = execution.id.clone();
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         for run_id in active_runs {
             handler.force_release(&run_id).await;
         }

@@ -1970,7 +1970,7 @@ impl ExecutionCoordinator {
                 // pre-change behaviour.
                 self.execution_started_hook.on_execution_started(&execution.id).await;
                 let coordinator = self.clone();
-                tokio::spawn(async move {
+                boss_task_scope::spawn(async move {
                     coordinator
                         .run_execution(execution, run, work_item, worker_id_owned, lease, change, adapter)
                         .await;
@@ -2410,7 +2410,7 @@ impl ExecutionCoordinator {
                 // back into the ready queue and wake the scheduler. Until
                 // then `dispatch_not_before` keeps it invisible to
                 // `list_ready_executions`.
-                tokio::spawn(async move {
+                boss_task_scope::spawn(async move {
                     tokio::time::sleep(delay).await;
                     coordinator.kick();
                 });
@@ -2532,7 +2532,7 @@ impl ExecutionCoordinator {
                         None
                     }
                 };
-                tokio::spawn(async move {
+                boss_task_scope::spawn(async move {
                     publisher
                         .publish(&execution_id, &work_item_id, status_str, "execution_start_failed")
                         .await;
@@ -2557,7 +2557,7 @@ impl ExecutionCoordinator {
         let work_db = self.work_db.clone();
         let publisher = self.publisher.clone();
         let execution_id = execution.id.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution_id) else {
                 return;
             };
