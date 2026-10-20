@@ -1367,7 +1367,11 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         .lock()
         .expect("board reads poisoned")
         .begin(&request_id, product_id.clone());
-    match work_db.get_work_tree_instrumented(&product_id, &mut trace) {
+    // Concurrent refreshes of one product that are blocked on a SQLite lock
+    // share one load; each still encodes its own response below.
+    match server_state.work_tree_flights.load(&product_id, || {
+        work_db.get_work_tree_instrumented(&product_id, &mut trace)
+    }) {
         Ok(tree) => {
             let mut reads = sink.board_reads.lock().expect("board reads poisoned");
             let tree = reads.finish(&request_id, tree);

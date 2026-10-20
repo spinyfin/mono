@@ -380,3 +380,63 @@ async fn get_engine_version_response_matches_swift_app_parser() {
     drop(write_half);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), conn).await;
 }
+
+/// A SQLite lock wait past the contention threshold is an engine-health
+/// issue while it lasts — naming the waiting operation — and leaves the
+/// report once the lock is released. The operation itself still completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_health_report_flags_database_contention_while_a_lock_is_stuck() {
+    use crate::work::contention::HEALTH_THRESHOLD;
+    let (state, _dir) = test_server_state();
+    let contention = |report: &boss_protocol::EngineHealthReport| {
+        report
+            .issues
+            .iter()
+            .find(|issue| issue.kind == "database_contention")
+            .cloned()
+    };
+    assert!(contention(&build_engine_health_report(&state)).is_none());
+
+    let holder = state.work_db.connect_new().unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        holder
+            .execute_batch("BEGIN IMMEDIATE; UPDATE metadata SET value = value WHERE key = 'schema_version'")
+            .unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(HEALTH_THRESHOLD + Duration::from_millis(700));
+        holder.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv().unwrap();
+    let writer = std::thread::spawn({
+        let db = state.work_db.clone();
+        move || db.set_metadata("contended", "value")
+    });
+
+    let deadline = std::time::Instant::now() + HEALTH_THRESHOLD + Duration::from_millis(500);
+    let issue = loop {
+        if let Some(issue) = contention(&build_engine_health_report(&state)) {
+            break issue;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stuck lock never reached engine health"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(issue.severity, "error");
+    assert!(issue.title.contains("waiting"), "{}", issue.title);
+    assert!(
+        issue.body.contains("internal") && issue.body.contains("workitems.rs"),
+        "{}",
+        issue.body
+    );
+
+    writer.join().unwrap().unwrap();
+    holder.join().unwrap();
+    assert!(contention(&build_engine_health_report(&state)).is_none());
+    assert_eq!(
+        state.work_db.get_metadata("contended").unwrap().as_deref(),
+        Some("value")
+    );
+}

@@ -170,9 +170,9 @@ async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn saturated_reads_return_busy_over_the_wire_while_status_works() {
-    // An explicit small budget: the production defaults wait far longer
-    // than this test's two-second bound before answering busy.
+async fn saturated_reads_wait_over_the_wire_while_status_works() {
+    // An explicit small budget with a short slow-wait threshold: the wait
+    // past it is logged, never answered as an error.
     let (state, _dir) = crate::app::tests::test_server_state_with_overrides(
         crate::app::ServerStateOverrides::builder()
             .read_admission(Arc::new(ReadAdmission::new(32, 16, 128, Duration::from_millis(500))))
@@ -185,21 +185,17 @@ async fn saturated_reads_return_busy_over_the_wire_while_status_works() {
             state
                 .read_admission
                 .enqueue(&state.read_admission.connection())
-                .unwrap()
-                .acquire()
                 .await
-                .unwrap(),
+                .acquire()
+                .await,
         );
     }
-    let start = std::time::Instant::now();
-    let response = tokio::time::timeout(
-        Duration::from_secs(2),
-        call(state.clone(), FrontendRequest::ListProducts, None),
-    )
-    .await
-    .expect("over-limit read hung");
-    assert!(matches!(response, FrontendEvent::Error { message } if message == DEADLINE));
-    assert!(start.elapsed() < Duration::from_secs(2));
+    let mut over_limit = tokio::spawn(call(state.clone(), FrontendRequest::ListProducts, None));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        !over_limit.is_finished(),
+        "an over-limit read must wait, not be answered"
+    );
     assert!(matches!(
         call(state.clone(), FrontendRequest::ListWorkerLiveStates, None).await,
         FrontendEvent::WorkerLiveStatesList { .. }
@@ -225,6 +221,28 @@ async fn saturated_reads_return_busy_over_the_wire_while_status_works() {
     }
     let mut replies = Vec::new();
     tokio::time::timeout(Duration::from_secs(2), async {
+        while replies.is_empty() {
+            let event: FrontendEventEnvelope =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            if let Some(id) = event.request_id {
+                replies.push((id, event.payload));
+            }
+        }
+    })
+    .await
+    .expect("live read hung behind a waiting bulk read");
+    assert_eq!(replies[0].0, "live");
+    assert!(!over_limit.is_finished());
+    // Freeing the slots answers every waiting read with data.
+    drop(held);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), &mut over_limit)
+            .await
+            .expect("waiting read never answered")
+            .unwrap(),
+        FrontendEvent::ProductsList { .. }
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
         while replies.len() < 2 {
             let event: FrontendEventEnvelope =
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
@@ -234,13 +252,16 @@ async fn saturated_reads_return_busy_over_the_wire_while_status_works() {
         }
     })
     .await
-    .expect("pipelined reads hung");
-    assert_eq!(replies[0].0, "live");
-    assert!(matches!(&replies[1].1, FrontendEvent::Error { message } if message == DEADLINE));
+    .expect("bulk read never answered");
+    assert_eq!(replies[1].0, "bulk");
+    assert!(
+        matches!(&replies[1].1, FrontendEvent::ProductsList { .. }),
+        "{:?}",
+        replies[1].1
+    );
     drop(lines);
     drop(write);
     handler.await.unwrap().unwrap();
-    drop(held);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -288,7 +309,7 @@ async fn one_socket_pipelining_sixteen_bulk_reads_never_sees_busy() {
     handler.await.unwrap().unwrap();
 }
 
-/// No concurrent pushes: every pipelined id gets exactly one BUSY reply.
+/// No concurrent pushes: every pipelined id gets exactly one reply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socket_saturation_without_pushes_delivers_every_id_once() {
     socket_saturation_delivers_every_id_once(0).await;
@@ -317,10 +338,9 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
     let held = state
         .read_admission
         .enqueue(&state.read_admission.connection())
-        .unwrap()
-        .acquire()
         .await
-        .unwrap();
+        .acquire()
+        .await;
     let (client, server) = UnixStream::pair().unwrap();
     // Hold all 320 small request frames in the socket even when the reader
     // pauses; this lets the test finish pipelining before it begins draining.
@@ -377,27 +397,31 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
     });
     let (read, mut write) = client.into_split();
     let sender = tokio::spawn(async move {
-        let mut sent = 0;
-        let mut frames = Vec::new();
+        // Batch the frames into one write: Linux charges per-write socket
+        // bookkeeping against SO_SNDBUF, so 320 tiny writes can exhaust the
+        // buffer even though their payload fits. The reader is deliberately
+        // paused here; it cannot free that space until pipelining completes.
+        let mut frames = String::new();
         for index in 0..320 {
             let request = FrontendRequestEnvelope {
                 request_id: format!("saturated-{index}"),
                 payload: FrontendRequest::ListProducts,
             };
-            frames.extend_from_slice(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes());
-            sent += 1;
+            frames.push_str(&serde_json::to_string(&request).unwrap());
+            frames.push('\n');
         }
-        // Batch the frames so per-write kernel accounting cannot exhaust the
-        // socket buffer before reads begin, even though the payload fits.
-        write.write_all(&frames).await.unwrap();
-        (write, sent)
+        assert!(frames.len() < capacity as usize);
+        write.write_all(frames.as_bytes()).await.unwrap();
+        (write, 320)
     });
     let (write, sent) = tokio::time::timeout(Duration::from_secs(5), sender)
         .await
         .expect("pipelining must finish before reads begin")
         .unwrap();
-    // Deliberately do not drain either Hello, pushes or BUSY responses yet.
+    // Deliberately do not drain either Hello, pushes or responses yet; then
+    // free the slot so the waiting reads are answered.
     tokio::time::sleep(Duration::from_millis(250)).await;
+    drop(held);
     let mut lines = BufReader::new(read).lines();
     let mut replies = std::collections::HashSet::new();
     let closed = tokio::time::timeout(Duration::from_secs(10), async {
@@ -407,7 +431,11 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
                     let env: FrontendEventEnvelope = serde_json::from_str(&line).unwrap();
                     if let Some(id) = env.request_id {
                         assert!(id.starts_with("saturated-"));
-                        assert!(matches!(env.payload, FrontendEvent::Error { message } if message == DEADLINE || message == QUEUE_FULL));
+                        assert!(
+                            matches!(env.payload, FrontendEvent::ProductsList { .. }),
+                            "{id}: {:?}",
+                            env.payload
+                        );
                         assert!(replies.insert(id), "duplicate correlated reply");
                         if replies.len() == 320 {
                             break false;
@@ -429,7 +457,6 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
     publisher.await.unwrap();
     drop(lines);
     drop(write);
-    drop(held);
     tokio::time::timeout(Duration::from_secs(5), handler)
         .await
         .unwrap()

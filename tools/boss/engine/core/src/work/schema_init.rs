@@ -1,3 +1,4 @@
+use super::contention::{Health, Holder, HolderScope, LockWait};
 use super::*;
 
 // The baseline keeps tmux identity nullable for remote detached runs and
@@ -7,6 +8,13 @@ use super::*;
 // tmux_hosted is the durable stamp written before every local spawn attempt.
 #[path = "schema_baseline.rs"]
 mod baseline;
+
+/// How long a `bossctl` read-only inspection connection waits for a lock
+/// before failing.
+const CLI_READ_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long a `bossctl` direct-DB command waits for a lock before failing.
+const CLI_WRITE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Databases older than the schema shipped by this release are unsupported.
 /// Raise this pair together when squashing the next migration generation.
@@ -201,15 +209,15 @@ impl WorkDb {
     /// pragma added here reaches all of them. `set_wal` is true only for the
     /// connection that creates/initialises the database; attaching to an
     /// existing database must not change its journal mode.
-    fn configure_connection(conn: &mut Connection, set_wal: bool) -> Result<()> {
+    fn configure_connection(conn: &mut Connection, set_wal: bool, wait: LockWait) -> Result<()> {
         // WAL lets readers and writers coexist (read-side concurrency
-        // is unaffected by an in-flight write) and `busy_timeout`
-        // turns lock contention into latency rather than an error
-        // returned to the caller. `synchronous = NORMAL` is the
-        // recommended pairing for WAL — durable across application
-        // crashes, only loses commits on OS/power loss, which is fine
-        // for engine state we can rebuild.
-        conn.busy_timeout(super::SQLITE_BUSY_TIMEOUT)?;
+        // is unaffected by an in-flight write). The engine's connections
+        // absorb lock contention as latency rather than returning it to
+        // the caller (see `contention`); CLI connections wait a bounded time.
+        // `synchronous = NORMAL` is the recommended pairing for WAL —
+        // durable across application crashes, only loses commits on
+        // OS/power loss, which is fine for engine state we can rebuild.
+        wait.apply(conn)?;
         if set_wal {
             conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         }
@@ -221,9 +229,10 @@ impl WorkDb {
         // `BEGIN DEFERRED`, two concurrent writers could each open a
         // read-mode transaction, then both try to upgrade to write,
         // and the loser fails with `SQLITE_BUSY_SNAPSHOT` — which the
-        // busy-timeout handler does NOT retry. `IMMEDIATE` acquires
-        // the write lock up front so the second caller waits inside
-        // the busy handler instead of racing.
+        // busy handler is NOT invoked for. `IMMEDIATE` acquires the
+        // write lock up front, before any row is touched, so the
+        // second caller waits inside the busy handler instead of
+        // racing — and a retried write is applied exactly once.
         conn.set_transaction_behavior(TransactionBehavior::Immediate);
         super::db_diagnostics::install_update_observer(conn);
         Ok(())
@@ -233,6 +242,10 @@ impl WorkDb {
     /// ever use, with every per-connection PRAGMA/behavior setting applied
     /// once up front. `WorkDb::connect()` just locks this connection's
     /// mutex — see the docs on `WorkDb::conn`.
+    ///
+    /// Waits while configuring (WAL recovery, the journal-mode switch) are
+    /// attributed to the innermost `HolderScope` on the thread; callers enter
+    /// one so they are reported to the right database.
     pub(in crate::work) fn open_raw_connection(path: &Path, memory: Option<&InMemoryAnchor>) -> Result<Connection> {
         let mut conn = if let Some(mem) = memory {
             // For in-memory databases, connect via the named shared-cache URI.
@@ -246,30 +259,59 @@ impl WorkDb {
         } else {
             Connection::open(path).with_context(|| format!("failed to open work db {}", path.display()))?
         };
-        Self::configure_connection(&mut conn, true)?;
+        Self::configure_connection(&mut conn, true, LockWait::Absorb)?;
         Ok(conn)
     }
+}
 
-    /// Escape hatch: open a brand-new connection to this database instead of
-    /// borrowing the shared pooled one. For the rare caller that genuinely
+// Connection openers stay outside the instrumented block above: the
+// instrumentation wraps each method in a closure, which would attribute every
+// lock wait on the connection they open to this file instead of their caller
+// (the same reason `WorkDb::connect` lives in `connection_wait`).
+impl WorkDb {
+    /// Escape hatch: run `f` on a brand-new connection to this database
+    /// instead of the shared pooled one. For the rare caller that genuinely
     /// needs an independent connection — e.g. a long-running `VACUUM INTO`
     /// snapshot that must not hold up every other operation on this `WorkDb`
-    /// for its duration (see `database_backup::take_backup`). Most callers
-    /// want [`Self::connect`], not this.
+    /// for its duration (see `database_backup::take_backup`). Lock waits on
+    /// the connection are attributed to the caller and request kind and
+    /// reported to this database's contention health. Most callers want
+    /// [`Self::connect`], not this.
     #[track_caller]
-    pub(crate) fn connect_new(&self) -> Result<super::db_diagnostics::OwnedConnection> {
-        Ok(super::db_diagnostics::OwnedConnection::new(
+    pub(crate) fn with_independent_connection<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let _holder = HolderScope::enter(Holder::here(&self.contention_health));
+        let conn = super::db_diagnostics::OwnedConnection::new(
             Self::open_raw_connection(&self.path, self.memory.as_ref())?,
             self.persona_metrics.clone(),
-        ))
+        );
+        f(&conn)
+    }
+
+    /// A raw independent connection for tests, which move it between threads
+    /// and so cannot use the scoped form above.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn connect_new(&self) -> Result<Connection> {
+        let _holder = HolderScope::enter(Holder::here(&self.contention_health));
+        Self::open_raw_connection(&self.path, self.memory.as_ref())
     }
 
     /// Inspect an existing database without migrations, journal-mode changes,
-    /// or any ability to write. CLI inspection must never run engine startup.
+    /// or any ability to write. CLI inspection must never run engine startup,
+    /// and waits only briefly for a lock rather than hanging on a stuck one.
     pub fn open_read_only(path: PathBuf) -> Result<Self> {
+        Self::attach_read_only(path, Arc::default(), LockWait::Bounded(CLI_READ_LOCK_TIMEOUT))
+    }
+
+    /// Read-only attach reporting to `health`, waiting as `wait` says.
+    #[track_caller]
+    fn attach_read_only(path: PathBuf, health: Arc<Health>, wait: LockWait) -> Result<Self> {
+        let _holder = HolderScope::enter(Holder::here(&health));
         let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening existing database {} for inspection", path.display()))?;
-        conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        // A WAL reader only ever waits for recovery or a truncating
+        // checkpoint.
+        wait.apply(&conn)?;
         Ok(Self {
             path,
             memory: None,
@@ -277,24 +319,35 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             persona_metrics: super::personas::new_metrics_registry(),
+            contention_health: health,
         })
     }
 
     /// Independent WAL reader for bulk inspection. In-memory test databases
-    /// keep their anchor; production file databases never share the writer mutex.
+    /// keep their anchor; production file databases never share the writer
+    /// mutex. Its lock waits are absorbed and reported to this database's
+    /// contention health.
+    #[track_caller]
     pub(crate) fn reader(&self) -> Result<Self> {
         if self.memory.is_some() {
             return Ok(self.clone());
         }
-        Self::open_read_only(self.path.clone())
+        Self::attach_read_only(self.path.clone(), self.contention_health.clone(), LockWait::Absorb)
     }
 
     /// Attach a CLI command to initialized state. Only engine startup runs
     /// migrations; even a mutating CLI command must not replay them per call.
+    /// Waits a bounded time for a lock, then fails with SQLite's error.
     pub fn open_existing(path: PathBuf) -> Result<Self> {
+        Self::attach_existing(path, Arc::default(), LockWait::Bounded(CLI_WRITE_LOCK_TIMEOUT))
+    }
+
+    #[track_caller]
+    pub(in crate::work) fn attach_existing(path: PathBuf, health: Arc<Health>, wait: LockWait) -> Result<Self> {
+        let _holder = HolderScope::enter(Holder::here(&health));
         let mut conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .with_context(|| format!("opening existing database {}", path.display()))?;
-        Self::configure_connection(&mut conn, false)?;
+        Self::configure_connection(&mut conn, false, wait)?;
         Ok(Self {
             path,
             memory: None,
@@ -302,6 +355,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
             persona_metrics: super::personas::new_metrics_registry(),
+            contention_health: health,
         })
     }
 
@@ -310,11 +364,12 @@ impl WorkDb {
     /// read-only snapshots on any connection must explicitly use Deferred.
     /// The WorkDb boundary macro rejects implicit transactions in get_/list_/
     /// query_ helpers at compile time so they cannot inherit the writer default.
+    #[track_caller]
     pub(crate) fn query_connection(&self) -> Result<Self> {
         if self.memory.is_some() {
             return Ok(self.clone());
         }
-        let connection = Self::open_existing(self.path.clone())?;
+        let connection = Self::attach_existing(self.path.clone(), self.contention_health.clone(), LockWait::Absorb)?;
         let mut result = self.clone();
         result.conn = connection.conn;
         Ok(result)

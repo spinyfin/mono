@@ -168,7 +168,7 @@ async fn cached_read_burst() {
     );
     let registry = state.design_doc_revalidation.clone();
     let (client, server) = UnixStream::pair().unwrap();
-    let handler = tokio::spawn(handle_frontend_connection(server, state, None));
+    let handler = tokio::spawn(handle_frontend_connection(server, state.clone(), None));
     let (read, mut write) = client.into_split();
     let mut lines = BufReader::new(read).lines();
     for index in 0..32 {
@@ -191,22 +191,29 @@ async fn cached_read_burst() {
     .await
     .unwrap();
     wait_started(&source, 2).await;
+    // Identical reads pipelined on one session share a handler run
+    // (`read_coalesce`), so the burst registers with the ladder once per
+    // run, not once per request; every request is one or the other.
+    let runs = usize::try_from(state.read_coalescing.leaders()).unwrap();
+    let followers = usize::try_from(state.read_coalescing.followers()).unwrap();
+    assert_eq!(runs + followers, 32);
+    assert!(runs >= 1);
     // Responses are queued before handlers register with the revalidation
-    // ladder. Keep its fetch blocked until every request has joined; otherwise
+    // ladder. Keep its fetch blocked until every run has joined; otherwise
     // the last handler can start a second ladder after the first one finishes.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let registered = registry.in_flight.lock().unwrap()[&key(PATH)]
                 .registered_requests
                 .load(Ordering::SeqCst);
-            if registered == 32 {
+            if registered == runs {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("not all cached reads joined the revalidation ladder");
+    .expect("not all cached read handler runs joined the revalidation ladder");
     assert_eq!(
         source.started.load(Ordering::SeqCst),
         2,
@@ -316,7 +323,7 @@ async fn guidance_fetch_holds_connection_admission_and_identical_reply_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fetch_beyond_the_global_limit_gets_the_busy_error_and_frees_on_release() {
+async fn a_fetch_beyond_the_global_limit_waits_for_a_slot_and_is_answered() {
     let source = Arc::new(GatedSource {
         inner: FakeSource::new(),
         gate: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -354,32 +361,30 @@ async fn a_fetch_beyond_the_global_limit_gets_the_busy_error_and_frees_on_releas
     wait_started(&source, 4).await;
     assert_eq!(limiter.available_permits(), 0);
     send(&mut write, "excess", request(4)).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // The fifth fetch waits for a slot: no reply, no handler run, no error.
+    let early = tokio::time::timeout(Duration::from_millis(400), async {
         loop {
             let env: FrontendEventEnvelope = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
             if let Some(id) = env.request_id {
-                assert_eq!(id, "excess", "gated fetch replied before release");
-                match env.payload {
-                    FrontendEvent::WorkError { message } => {
-                        assert_eq!(message, crate::app::coordinator_guidance::FETCH_LIMIT)
-                    }
-                    other => panic!("expected busy WorkError, got {other:?}"),
-                }
-                break;
+                return (id, env.payload);
             }
         }
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        early.is_err(),
+        "an over-limit fetch must wait, not be answered: {early:?}"
+    );
     assert_eq!(source.started.load(Ordering::SeqCst), 4);
-    source.gate.add_permits(4);
+    source.gate.add_permits(5);
     let mut ids = std::collections::HashSet::new();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while ids.len() < 4 {
+        while ids.len() < 5 {
             let env: FrontendEventEnvelope = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
             if let Some(id) = env.request_id {
                 let index = (0..4)
                     .find(|index| id == format!("fetch-{index}"))
+                    .or_else(|| (id == "excess").then_some(4))
                     .expect("original request id");
                 match env.payload {
                     FrontendEvent::CoordinatorGuidanceList { guidance } => {
@@ -401,6 +406,7 @@ async fn a_fetch_beyond_the_global_limit_gets_the_busy_error_and_frees_on_releas
     })
     .await
     .unwrap();
+    assert_eq!(source.started.load(Ordering::SeqCst), 5);
     drop(lines);
     drop(write);
     handler.await.unwrap().unwrap();

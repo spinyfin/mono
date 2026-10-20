@@ -20,7 +20,7 @@
 //!
 //! Synchronous callers and current-thread runtimes lock normally.
 use super::{Connection, Mutex, PooledConnection, Result};
-use std::sync::TryLockError;
+use std::sync::{Arc, TryLockError};
 
 // Lock acquisition cannot return SQLite errors. Keep this outside the result
 // boundary so track_caller forwards the original call site without a closure.
@@ -34,7 +34,7 @@ impl super::WorkDb {
     /// itself.
     #[track_caller]
     pub(crate) fn connect(&self) -> Result<PooledConnection<'_>> {
-        super::connection_wait::acquire(&self.conn, &self.persona_metrics)
+        super::connection_wait::acquire(&self.conn, &self.persona_metrics, &self.contention_health)
     }
 }
 
@@ -47,6 +47,9 @@ pub(crate) struct ConnectionGuard<'a> {
     waited: std::time::Duration,
     observation: std::rc::Rc<super::db_diagnostics::Observation>,
     connection_id: usize,
+    /// Names this holder to the SQLite busy handler for the guard's life
+    /// (see `contention`); dropped after the connection is released.
+    _holder: super::contention::HolderScope,
 }
 
 impl<'a> ConnectionGuard<'a> {
@@ -55,8 +58,14 @@ impl<'a> ConnectionGuard<'a> {
         caller: &'static std::panic::Location<'static>,
         waited: std::time::Duration,
         metrics: std::sync::Arc<crate::metrics::Registry>,
+        health: &Arc<super::contention::Health>,
     ) -> Self {
         let (connection_id, observation) = super::db_diagnostics::start(&guard, caller, metrics);
+        let holder = super::contention::HolderScope::enter(super::contention::Holder {
+            caller,
+            request: super::contention::current_request_kind(),
+            health: health.clone(),
+        });
         Self::builder()
             .connection_id(connection_id)
             .observation(observation)
@@ -64,6 +73,7 @@ impl<'a> ConnectionGuard<'a> {
             .caller(caller)
             .acquired(std::time::Instant::now())
             .waited(waited)
+            .holder(holder)
             .build()
     }
 }
@@ -96,10 +106,13 @@ impl Drop for ConnectionGuard<'_> {
     }
 }
 
+/// `health` is the database's contention registry, named to the busy
+/// handler for the guard's life.
 #[track_caller]
 pub(super) fn acquire<'a>(
     connection: &'a Mutex<Connection>,
     metrics: &std::sync::Arc<crate::metrics::Registry>,
+    health: &Arc<super::contention::Health>,
 ) -> Result<PooledConnection<'a>> {
     let caller = std::panic::Location::caller();
     match connection.try_lock() {
@@ -109,6 +122,7 @@ pub(super) fn acquire<'a>(
                 caller,
                 std::time::Duration::ZERO,
                 metrics.clone(),
+                health,
             ));
         }
         Err(TryLockError::Poisoned(_)) => anyhow::bail!("work db connection lock poisoned"),
@@ -130,14 +144,13 @@ pub(super) fn acquire<'a>(
         _ => lock(),
     };
     let waited = start.elapsed();
-    guard.map(|guard| ConnectionGuard::new(guard, caller, waited, metrics.clone()))
+    guard.map(|guard| ConnectionGuard::new(guard, caller, waited, metrics.clone(), health))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::log_capture;
-    use std::sync::Arc;
     use std::time::Duration;
 
     fn mutex() -> Mutex<Connection> {
@@ -157,15 +170,16 @@ mod tests {
     fn slow_waits_and_holds_are_logged_with_caller_and_fast_ones_are_not() {
         let buffer = log_capture::install();
         let from = buffer.lock().len();
+        let health = Arc::default();
         let fast = mutex();
-        drop(acquire(&fast, &super::super::personas::new_metrics_registry()).unwrap());
+        drop(acquire(&fast, &super::super::personas::new_metrics_registry(), &health).unwrap());
         assert!(
             lines_since(&buffer, from).is_empty(),
             "fast uncontended lock must not log"
         );
 
         let from = buffer.lock().len();
-        let held = acquire(&fast, &super::super::personas::new_metrics_registry()).unwrap();
+        let held = acquire(&fast, &super::super::personas::new_metrics_registry(), &health).unwrap();
         std::thread::sleep(Duration::from_millis(120));
         drop(held);
         let lines = lines_since(&buffer, from);
@@ -186,7 +200,7 @@ mod tests {
             }
         });
         locked_rx.recv().unwrap();
-        drop(acquire(&contended, &super::super::personas::new_metrics_registry()).unwrap());
+        drop(acquire(&contended, &super::super::personas::new_metrics_registry(), &health).unwrap());
         holder.join().unwrap();
         let lines = lines_since(&buffer, from);
         assert_eq!(lines.len(), 1, "{lines:?}");

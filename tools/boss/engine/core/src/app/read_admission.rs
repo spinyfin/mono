@@ -1,6 +1,15 @@
 //! Bounded frontend read admission. Internal work and mutations never enter
 //! this lane. Acquire the connection permit before the engine permit so a
 //! single pipelined connection cannot occupy the engine's whole wait queue.
+//!
+//! Admission bounds concurrency; it never turns waiting into a client
+//! error. A read that finds its connection's queue full waits — the reader
+//! loop stops taking requests off that socket until a queue slot frees, which
+//! is the backpressure. The engine-wide queue and the active permits are
+//! waited for in the read's own task, so one session filling the engine-wide
+//! queue never stops another session's reader loop from serving its writes
+//! and live-lane reads. A wait longer than the lane's slow-wait threshold
+//! logs the reads holding it up so the cause stays visible to operators.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,8 +18,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Queued (not yet active) reads allowed per active permit on one connection.
 const PENDING_PER_ACTIVE: usize = 4;
 
-const QUEUE_FULL: &str = "engine busy, retry: read admission queue full";
-const DEADLINE: &str = "engine busy, retry: read admission deadline expired";
+const SLOW_QUEUE: &str = "read waiting: admission queue full";
+const SLOW_PERMIT: &str = "read waiting: admission permits taken";
 mod diagnostics;
 pub(super) use diagnostics::Identity;
 use diagnostics::{Diagnostics, TrackedRead, Wait};
@@ -19,7 +28,8 @@ pub(super) struct ReadAdmission {
     active: Arc<Semaphore>,
     pending: Arc<Semaphore>,
     per_connection: usize,
-    wait: Duration,
+    /// Waits longer than this log their holders; nothing is rejected.
+    slow_wait: Duration,
     diagnostics: Arc<Diagnostics>,
 }
 
@@ -31,8 +41,9 @@ pub(super) struct ConnectionReads {
 pub(super) struct WaitingRead {
     engine: Arc<ReadAdmission>,
     connection: Arc<ConnectionReads>,
-    _pending: (OwnedSemaphorePermit, OwnedSemaphorePermit),
-    deadline: tokio::time::Instant,
+    /// This connection's queue slot. The engine-wide slot is taken in
+    /// [`WaitingRead::acquire`].
+    _pending: OwnedSemaphorePermit,
     tracked: Option<TrackedRead>,
 }
 
@@ -40,7 +51,8 @@ pub(super) struct WaitingRead {
 // earlier defaults (32 active, 500 ms wait) rejected the macOS app's own
 // startup reads after a cold engine start. These match the overrides that
 // restored normal use. Lower them only from measured data, with a generous
-// buffer above the observed peak. The env overrides below still apply.
+// buffer above the observed peak. The env overrides below apply; the
+// `_WAIT_MS` ones set the slow-wait log threshold, never a deadline.
 impl Default for ReadAdmission {
     fn default() -> Self {
         Self::new(
@@ -76,6 +88,19 @@ pub(super) fn reply_headroom(bulk: &ReadAdmission, live: &ReadAdmission) -> usiz
 
 const MAX_REPLY_RESERVE: usize = super::session_queue::MAX_SESSION_QUEUE / 2;
 
+/// Await `wait`; if it takes longer than `slow`, run `report` once and keep
+/// waiting for it.
+async fn report_if_slow<F: Future>(wait: F, slow: Duration, report: impl FnOnce()) -> F::Output {
+    tokio::pin!(wait);
+    match tokio::time::timeout(slow, &mut wait).await {
+        Ok(output) => output,
+        Err(_) => {
+            report();
+            wait.await
+        }
+    }
+}
+
 impl ReadAdmission {
     pub(super) fn live() -> Self {
         Self::new(
@@ -87,12 +112,12 @@ impl ReadAdmission {
         )
     }
 
-    pub(super) fn new(global: usize, per_connection: usize, queue: usize, wait: Duration) -> Self {
+    pub(super) fn new(global: usize, per_connection: usize, queue: usize, slow_wait: Duration) -> Self {
         Self {
             active: Arc::new(Semaphore::new(global)),
             pending: Arc::new(Semaphore::new(queue)),
             per_connection,
-            wait,
+            slow_wait,
             diagnostics: Arc::default(),
         }
     }
@@ -108,42 +133,37 @@ impl ReadAdmission {
         })
     }
 
-    /// Bound task allocation as well as active handlers. Full queues reject
-    /// immediately; accepted waiters share one deadline across both limits.
+    /// Bound each connection's queued reads as well as active handlers. A
+    /// full connection queue makes the caller wait for a slot (the reader
+    /// loop stops reading that socket meanwhile); a slow wait logs the reads
+    /// filling the queue.
     #[cfg(test)]
-    pub(super) fn enqueue(self: &Arc<Self>, connection: &Arc<ConnectionReads>) -> Result<WaitingRead, &'static str> {
-        self.enqueue_as(connection, None)
+    pub(super) async fn enqueue(self: &Arc<Self>, connection: &Arc<ConnectionReads>) -> WaitingRead {
+        self.enqueue_as(connection, None).await
     }
 
-    /// Like [`Self::enqueue`], naming the request so a queue-full dump can
-    /// identify the rejected read, which is not yet tracked.
-    pub(super) fn enqueue_as(
+    /// Like [`Self::enqueue`], naming the request so a slow-queue dump can
+    /// identify the waiting read, which is not yet tracked.
+    pub(super) async fn enqueue_as(
         self: &Arc<Self>,
         connection: &Arc<ConnectionReads>,
         identity: Option<Identity<'_>>,
-    ) -> Result<WaitingRead, &'static str> {
-        let full = |wait: Wait| {
+    ) -> WaitingRead {
+        let slow = |wait: Wait| {
             self.diagnostics
-                .report(QUEUE_FULL, wait, None, identity, Arc::as_ptr(connection) as usize);
-            QUEUE_FULL
+                .report(SLOW_QUEUE, wait, None, identity, Arc::as_ptr(connection) as usize);
         };
-        let local = connection
-            .pending
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| full(Wait::ConnectionQueue))?;
-        let global = self
-            .pending
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| full(Wait::EngineQueue))?;
-        Ok(WaitingRead {
+        let local = report_if_slow(connection.pending.clone().acquire_owned(), self.slow_wait, || {
+            slow(Wait::ConnectionQueue)
+        })
+        .await
+        .expect("connection pending semaphore is never closed");
+        WaitingRead {
             engine: self.clone(),
             connection: connection.clone(),
-            _pending: (global, local),
-            deadline: tokio::time::Instant::now() + self.wait,
+            _pending: local,
             tracked: None,
-        })
+        }
     }
 }
 
@@ -162,46 +182,67 @@ impl WaitingRead {
         Arc::as_ptr(&self.connection) as usize
     }
 
-    pub(super) async fn acquire(self) -> Result<ReadPermits, &'static str> {
-        let result = tokio::time::timeout_at(self.deadline, async {
-            if let Some(read) = &self.tracked {
-                read.stage("connection permit");
-            }
-            let local = self
-                .connection
-                .active
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| DEADLINE)?;
-            if let Some(read) = &self.tracked {
-                read.stage("engine permit");
-            }
-            let global = self.engine.active.clone().acquire_owned().await.map_err(|_| DEADLINE)?;
-            Ok((local, global))
-        })
-        .await
-        .unwrap_or(Err(DEADLINE));
-        match result {
-            Ok(permits) => {
-                if let Some(read) = &self.tracked {
-                    read.stage("blocking queue");
-                }
-                Ok(ReadPermits {
-                    _permits: permits,
-                    tracked: self.tracked,
-                })
-            }
-            Err(message) => {
+    /// Wait for an engine-wide queue slot, then the connection permit, then
+    /// the engine permit. A wait past the lane's slow-wait threshold logs the
+    /// holders once.
+    pub(super) async fn acquire(self) -> ReadPermits {
+        let _engine_pending = report_if_slow(
+            self.engine.pending.clone().acquire_owned(),
+            self.engine.slow_wait,
+            || {
                 self.engine.diagnostics.report(
-                    message,
+                    SLOW_QUEUE,
+                    Wait::EngineQueue,
+                    self.tracked.as_ref(),
+                    None,
+                    self.connection_id(),
+                );
+            },
+        )
+        .await
+        .expect("engine pending semaphore is never closed");
+        let permits = report_if_slow(
+            async {
+                if let Some(read) = &self.tracked {
+                    read.stage("connection permit");
+                }
+                let local = self
+                    .connection
+                    .active
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("connection active semaphore is never closed");
+                if let Some(read) = &self.tracked {
+                    read.stage("engine permit");
+                }
+                let global = self
+                    .engine
+                    .active
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("engine active semaphore is never closed");
+                (local, global)
+            },
+            self.engine.slow_wait,
+            || {
+                self.engine.diagnostics.report(
+                    SLOW_PERMIT,
                     Wait::Permit,
                     self.tracked.as_ref(),
                     None,
                     self.connection_id(),
                 );
-                Err(message)
-            }
+            },
+        )
+        .await;
+        if let Some(read) = &self.tracked {
+            read.stage("blocking queue");
+        }
+        ReadPermits {
+            _permits: permits,
+            tracked: self.tracked,
         }
     }
 }

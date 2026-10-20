@@ -604,6 +604,14 @@ struct ServerState {
     read_admission: Arc<read_admission::ReadAdmission>,
     #[builder(default = Arc::new(read_admission::ReadAdmission::live()))]
     live_read_admission: Arc<read_admission::ReadAdmission>,
+    /// How many admitted reads ran a handler versus were answered from an
+    /// identical in-flight read (see `read_coalesce`).
+    #[builder(default)]
+    read_coalescing: Arc<read_coalesce::Stats>,
+    /// In-flight `GetWorkTree` database loads shared across sessions (see
+    /// `work_tree_flight`).
+    #[builder(default)]
+    work_tree_flights: Arc<work_tree_flight::WorkTreeFlights>,
 
     work_db: Arc<WorkDb>,
     /// Socket this engine's tmux handle must target. Resolved once from
@@ -2308,9 +2316,11 @@ impl crate::external_tracker::reconcile::WorkInvalidationPublisher for ServerSta
 
 mod dispatch;
 mod read_admission;
+mod read_coalesce;
 mod read_freshness;
 mod session_queue;
 mod session_write;
+mod work_tree_flight;
 use session_queue::*;
 
 async fn handle_frontend_connection(
@@ -2342,6 +2352,7 @@ async fn handle_frontend_connection(
         );
     }
     let peer_is_worker = peer_class.is_worker();
+    let mut read_coalescer = read_coalesce::ReadCoalescer::default();
     let connection_reads = server_state.read_admission.connection();
     let connection_live_reads = server_state.live_read_admission.connection();
 
@@ -2518,29 +2529,47 @@ async fn handle_frontend_connection(
             read_admission::ReadLane::Live => Some((&server_state.live_read_admission, &connection_live_reads)),
             read_admission::ReadLane::Ordered => None,
         };
+        let verb = variant_name(&request);
+        let mut read_batch = None;
         let waiting_read = if let Some((admission, connection)) = read_lane {
-            let verb = variant_name(&request);
-            match admission.enqueue_as(
-                connection,
-                Some(read_admission::Identity {
-                    session: &session_id,
-                    request: &request_id,
-                    verb: &verb,
-                }),
-            ) {
-                Ok(waiting) => Some(waiting.identify(&session_id, &request_id, verb, read_admission::key_id(&request))),
-                Err(message) => {
-                    tracing::warn!(%session_id, %request_id, ?lane, "read RPC rejected: queue full");
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: message.into(),
-                        },
-                    );
-                    continue;
+            // Waits for queue space rather than rejecting: while this
+            // connection's queue is full, no further request is read from
+            // its socket, which is the backpressure.
+            let waiting = admission
+                .enqueue_as(
+                    connection,
+                    Some(read_admission::Identity {
+                        session: &session_id,
+                        request: &request_id,
+                        verb: &verb,
+                    }),
+                )
+                .await;
+            let waiting = if read_coalesce::coalescable(&request) {
+                let register = || {
+                    // The follower's answer is delivered under the same
+                    // per-view ordering as a read of its own, from this
+                    // arrival onward.
+                    sink.view_reads
+                        .lock()
+                        .expect("view reads poisoned")
+                        .begin(&request_id, read_admission::key(&request));
+                };
+                match read_coalescer.join(&request, &request_id, waiting, &server_state.read_coalescing, register) {
+                    // Answered from the identical read already in flight,
+                    // once it runs; its snapshot is not taken yet, so it is
+                    // no older than this request.
+                    read_coalesce::Role::Follow => continue,
+                    read_coalesce::Role::Lead { batch, waiting } => {
+                        sink.tap_response(&request_id, batch.clone());
+                        read_batch = Some(batch);
+                        waiting
+                    }
                 }
-            }
+            } else {
+                waiting
+            };
+            Some(waiting.identify(&session_id, &request_id, verb.clone(), read_admission::key_id(&request)))
         } else {
             None
         };
@@ -2554,45 +2583,66 @@ async fn handle_frontend_connection(
             .recv_instant(recv_instant)
             .decode_ms(decode_ms)
             .build();
-        let dispatch_fut = dispatch::dispatch_request(ctx, request, bulk_read);
+        // Name the request kind to the DB layer so a SQLite lock wait under
+        // this handler is logged against it (see `work::contention`).
+        let dispatch_fut = crate::work::contention::REQUEST_KIND.scope(
+            Arc::from(verb.as_str()),
+            dispatch::dispatch_request(ctx, request, bulk_read),
+        );
+        // A coalescing leader reports to its batch whether it is blocked on a
+        // SQLite lock, which is what keeps the batch open to followers.
+        let dispatch_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match &read_batch {
+            Some(batch) => Box::pin(crate::work::contention::READ_WAIT.scope(batch.wait(), dispatch_fut)),
+            None => Box::pin(dispatch_fut),
+        };
         if let Some(waiting) = waiting_read {
             let sink = sink.clone();
             let session_id = session_id.clone();
             tokio::spawn(async move {
-                match waiting.acquire().await {
-                    Ok(permits) => {
-                        // Synchronous SQLite work must not occupy the async
-                        // runtime threads that serve writes and live status.
-                        // Keep permits inside the blocking job even if its
-                        // client disconnects; cancellation cannot inflate capacity.
-                        let runtime = tokio::runtime::Handle::current();
-                        let result = tokio::task::spawn_blocking(move || {
-                            permits.started();
-                            let _permits = permits;
-                            runtime.block_on(dispatch_fut);
-                        })
-                        .await;
-                        if let Err(err) = result {
-                            tracing::error!(?err, %session_id, "read RPC handler failed");
-                            send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::Error {
-                                    message: "read RPC handler failed".into(),
-                                },
-                            );
-                        }
+                let permits = waiting.acquire().await;
+                // Synchronous SQLite work must not occupy the async
+                // runtime threads that serve writes and live status.
+                // Keep permits inside the blocking job even if its
+                // client disconnects; cancellation cannot inflate capacity.
+                let runtime = tokio::runtime::Handle::current();
+                let batch = read_batch.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    permits.started();
+                    if let Some(batch) = &batch {
+                        // From here identical reads start a new batch: this
+                        // handler's snapshot predates them.
+                        batch.start();
                     }
-                    Err(message) => {
-                        tracing::warn!(%session_id, %request_id, ?lane, wait_ms = recv_instant.elapsed().as_millis() as u64, "read RPC rejected: admission deadline expired");
+                    runtime.block_on(dispatch_fut);
+                    permits
+                })
+                .await;
+                match result {
+                    Ok(permits) => {
+                        // Followers are answered before the read's admission
+                        // permits are released, so a later read cannot be
+                        // admitted ahead of the replies this one owes.
+                        if let Some(batch) = &read_batch {
+                            batch.finish(&sink);
+                        }
+                        drop(permits);
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, %session_id, "read RPC handler failed");
                         send_response(
                             &sink,
                             &request_id,
                             FrontendEvent::Error {
-                                message: message.into(),
+                                message: "read RPC handler failed".into(),
                             },
                         );
+                        if let Some(batch) = &read_batch {
+                            batch.fail(&sink, "read RPC handler failed");
+                        }
                     }
+                }
+                if let Some(batch) = &read_batch {
+                    sink.untap_response(batch.leader_request_id());
                 }
             });
         } else {

@@ -34,7 +34,11 @@ fn assert_busy_count(run_success: bool) {
     holder.execute_batch("CREATE TABLE t(x); BEGIN IMMEDIATE").unwrap();
     let connection = Mutex::new(Connection::open(&path).unwrap());
     let result: anyhow::Result<()> = (|| {
-        let conn = acquire(&connection, &crate::work::personas::new_metrics_registry())?;
+        let conn = acquire(
+            &connection,
+            &crate::work::personas::new_metrics_registry(),
+            &crate::work::contention::fallback_health(),
+        )?;
         conn.busy_handler(None)?;
         let result = conn.execute("INSERT INTO t VALUES (1)", []);
         // A successful statement overwrites connection state before guard drop.
@@ -50,7 +54,14 @@ fn assert_busy_count(run_success: bool) {
     let result: anyhow::Result<()> = Err(error.context("outer operation"));
     assert!(returned_with(&stats, result).is_err());
     for _ in 0..5 {
-        drop(acquire(&connection, &crate::work::personas::new_metrics_registry()).unwrap());
+        drop(
+            acquire(
+                &connection,
+                &crate::work::personas::new_metrics_registry(),
+                &crate::work::contention::fallback_health(),
+            )
+            .unwrap(),
+        );
     }
     assert_eq!(stats.take_summary().unwrap().busy, 1);
     assert!(stats.take_summary().is_none());
