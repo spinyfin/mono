@@ -36,7 +36,7 @@ extension ChatViewModel {
         }
     }
 
-    func setNavigationMode(_ mode: NavigationMode) {
+    func setNavigationMode(_ mode: NavigationMode, refreshWorkOnEntry: Bool = true) {
         // Instrument the tab switch so the pane-grid relayout it provokes
         // (how many panes rebuild, the settle wall-time, any unexpected
         // teardown) is measurable for the high-CPU investigation. See
@@ -49,7 +49,7 @@ extension ChatViewModel {
         }
         navigationMode = mode
         defaults.set(mode.rawValue, forKey: navigationModeDefaultsKey)
-        if mode == .work {
+        if mode == .work && refreshWorkOnEntry {
             refreshWork()
         }
         if mode == .automations {
@@ -287,15 +287,20 @@ extension ChatViewModel {
         revealHighlightID = nil
         revealCompletion = completion
         revealProductID = productID
-        setNavigationMode(.work)
+        // Reveal owns its refresh: entering Work must not fetch the old
+        // product before selection, or refetch the target a second time.
+        setNavigationMode(.work, refreshWorkOnEntry: false)
         clearWorkFiltersForReveal()
         let switching = currentSelectedProductID != productID
-        if switching { selectWorkProduct(productID) }
+        if switching {
+            selectWorkProduct(productID)
+        } else {
+            refreshWork()
+        }
         let outcome: RevealCardResult
         if switching || task(withID: taskID) == nil {
             pendingRevealScrollID = taskID
             armRevealDeadline(taskID: taskID, waitingForTree: true)
-            if !switching { engine.sendGetWorkTree(productId: productID, flow: .manualRefresh) }
             outcome = .deferred
         } else {
             outcome = prepareReveal(taskID)

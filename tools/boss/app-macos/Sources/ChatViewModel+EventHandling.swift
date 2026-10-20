@@ -31,44 +31,7 @@ extension ChatViewModel {
     private func handle(_ event: EngineEvent) {
         switch event {
         case .connected:
-            UpdateLifecycle.recordStartup("engine-connected")
-            markConnected()
-            resetConnectionLostBanner()
-            if refreshUnsentActions() { showDisconnectedActionNotice() }
-            // A quota request in flight when the socket dropped will never be
-            // answered, so clear the pending flag rather than leaving the
-            // pane's Refresh button disabled for the rest of the session.
-            isRefreshingDriverQuota = false
-            engine.sendRegisterAppSession()
-            refreshWorkSubscriptions()
-            // Re-subscribe any open markdown viewers' comment topics and reload
-            // them; the engine dropped every subscription on the disconnect.
-            commentBridge.handleReconnected()
-            engine.sendListProducts()
-            engine.sendListWorkerLiveStates()
-            engine.sendListLiveStatusDisabledSlots()
-            // Pull the engine's configuration health on every (re)connect
-            // so the top-of-window banner reflects the *current* engine,
-            // not the one we attached to before a restart (#699).
-            engine.sendGetEngineHealth()
-            // Pull the current per-installation settings snapshot so
-            // Settings reflects the engine immediately after connecting
-            // rather than waiting until Settings is opened.
-            engine.sendGetSettings()
-            refreshOffsiteBackup()
-            // Pull the current GitHub OAuth auth state so the "GitHub
-            // account" settings subsection reflects a token persisted by a
-            // prior session (the engine restores it from the keychain at
-            // boot) without waiting for a device-flow transition.
-            engine.sendGitHubAuthStatus()
-            if let productID = currentSelectedProductID {
-                // Cold-start population of the restored product. NOTE: the
-                // `.productsList` handler below fetches this same product a
-                // SECOND time (a confirmed cold-start double-fetch) — the
-                // per-product fetch counter makes both visible.
-                engine.sendGetWorkTree(productId: productID, flow: .coldStart)
-            }
-            startBackgroundWorkPolling()
+            handleConnected()
         case .resyncRequired:
             handleResyncRequired() // socket never went down; see ChatViewModel+Connection.swift
         case .appSessionRegistered:
@@ -169,13 +132,6 @@ extension ChatViewModel {
                 self.selectedWorkProductID = first.id
                 persistSelectedProductID(first.id)
                 engine.sendGetWorkTree(productId: first.id, flow: .coldStart)
-            } else if let productID = currentSelectedProductID {
-                // On cold start this is the redundant SECOND fetch of the
-                // already-restored product (see `.connected` above); it also
-                // fires on later `products_list` refreshes. Tagged cold_start
-                // because the double-fetch is the case worth spotting; the
-                // per-product fetch counter disambiguates either way.
-                engine.sendGetWorkTree(productId: productID, flow: .coldStart)
             }
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):

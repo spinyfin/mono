@@ -351,12 +351,13 @@ final class EngineClient: @unchecked Sendable {
         let kind = (payload["type"] as? String) ?? "unknown"
         if queueIfDisconnected {
             Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
-            // Held as sorted-key JSON so the queue is Sendable and an
-            // identical newer request supersedes the queued one.
+            // Tree reads supersede by product even when fetch_seq changes;
+            // other reads preserve their existing exact-payload identity.
             if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
+                let treeProductID = kind == "get_work_tree" ? payload["product_id"] as? String : nil
                 queuedReads.withLock { state in
-                    state.removeAll { $0.data == data }
-                    state.append((envelopeRequestId, data))
+                    state.removeAll { treeProductID != nil ? $0.treeProductID == treeProductID : $0.data == data }
+                    state.append((envelopeRequestId, data, treeProductID))
                     if state.count > Self.maxQueuedReads { state.removeFirst(state.count - Self.maxQueuedReads) }
                 }
             } else {
@@ -493,7 +494,7 @@ final class EngineClient: @unchecked Sendable {
     private static let log = Logger(subsystem: "Boss", category: "EngineClient")
     private static let maxQueuedReads = 64
     private let queuedReads = OSAllocatedUnfairLock(
-        initialState: [(id: String, data: Data)]()
+        initialState: [(id: String, data: Data, treeProductID: String?)]()
     )
 
     /// Number of reads waiting for a connection. Test hook.
@@ -505,7 +506,7 @@ final class EngineClient: @unchecked Sendable {
 
     private func flushQueuedReads() {
         let drained = queuedReads.withLock { state -> [(id: String, data: Data)] in
-            let copy = state
+            let copy = state.map { (id: $0.id, data: $0.data) }
             state.removeAll()
             return copy
         }
