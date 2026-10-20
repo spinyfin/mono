@@ -229,12 +229,9 @@ impl WorkDb {
     /// and so cannot use the scoped form above.
     #[cfg(any(test, feature = "test-support"))]
     #[track_caller]
-    pub fn connect_new(&self) -> Result<super::db_diagnostics::OwnedConnection> {
+    pub fn connect_new(&self) -> Result<Connection> {
         let _holder = HolderScope::enter(Holder::here(&self.contention_health));
-        Ok(super::db_diagnostics::OwnedConnection::new(
-            Self::open_raw_connection(&self.path, self.memory.as_ref())?,
-            self.persona_metrics.clone(),
-        ))
+        Self::open_raw_connection(&self.path, self.memory.as_ref())
     }
 
     /// Inspect an existing database without migrations, journal-mode changes,
