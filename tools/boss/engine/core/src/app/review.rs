@@ -895,7 +895,10 @@ mod trunk_queue_tests {
 
     fn make_session_sink() -> Arc<SessionSink> {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
-        Arc::new(SessionSink::new(shutdown_tx))
+        Arc::new(SessionSink::new(
+            shutdown_tx,
+            crate::app::frontend_metrics::test_registry(),
+        ))
     }
 
     fn trunk_client_for(base_url: String) -> TrunkClient {

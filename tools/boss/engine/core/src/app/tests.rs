@@ -1,4 +1,5 @@
 use super::*;
+mod frontend_metrics;
 mod read_freshness;
 mod work_tree_delta;
 use crate::protocol::TopicEventPayload;
@@ -256,7 +257,10 @@ pub(super) fn test_server_state_with_fakes_branch_verifier_and_pr_state(
 
 pub(super) fn make_session_sink() -> Arc<SessionSink> {
     let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
-    Arc::new(SessionSink::new(shutdown_tx))
+    Arc::new(SessionSink::new(
+        shutdown_tx,
+        crate::app::frontend_metrics::test_registry(),
+    ))
 }
 
 /// Register `run_id` → `slot_id` and seed live state at

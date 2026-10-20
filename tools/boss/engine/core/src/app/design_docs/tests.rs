@@ -106,7 +106,10 @@ fn zero_policy() -> RetryPolicy {
 
 fn make_sink() -> Arc<SessionSink> {
     let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
-    Arc::new(SessionSink::new(shutdown_tx))
+    Arc::new(SessionSink::new(
+        shutdown_tx,
+        crate::app::frontend_metrics::test_registry(),
+    ))
 }
 
 async fn drain(sink: &SessionSink) -> Vec<FrontendEventEnvelope> {

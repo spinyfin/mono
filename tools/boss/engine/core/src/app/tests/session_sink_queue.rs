@@ -279,7 +279,7 @@ fn queue_stats_reports_priority_depth_separately() {
 #[tokio::test]
 async fn sink_next_drains_queue_and_returns_none_when_closed() {
     let (tx, _rx) = oneshot::channel::<()>();
-    let sink = Arc::new(SessionSink::new(tx));
+    let sink = Arc::new(SessionSink::new(tx, crate::app::frontend_metrics::test_registry()));
     sink.enqueue(response_envelope("r-1"));
     sink.enqueue(response_envelope("r-2"));
     sink.close();
@@ -294,7 +294,7 @@ async fn sink_next_drains_queue_and_returns_none_when_closed() {
 #[tokio::test]
 async fn sink_close_wakes_pending_next_call() {
     let (tx, _rx) = oneshot::channel::<()>();
-    let sink = Arc::new(SessionSink::new(tx));
+    let sink = Arc::new(SessionSink::new(tx, crate::app::frontend_metrics::test_registry()));
     let waiter = sink.clone();
     let join = tokio::spawn(async move { waiter.next().await });
     // Give the spawned task time to enter notified().await.
@@ -309,7 +309,7 @@ async fn sink_close_wakes_pending_next_call() {
 #[tokio::test]
 async fn broker_publish_disconnects_slow_subscriber() {
     let (tx, mut rx) = oneshot::channel::<()>();
-    let sink = Arc::new(SessionSink::new(tx));
+    let sink = Arc::new(SessionSink::new(tx, crate::app::frontend_metrics::test_registry()));
 
     // Pre-fill the sink past capacity by injecting non-coalescing entries
     // (responses are not coalesced) without ever draining, then back-date
@@ -351,7 +351,7 @@ async fn broker_publish_disconnects_slow_subscriber() {
 #[tokio::test]
 async fn broker_publish_degrades_bursty_subscriber_without_disconnecting() {
     let (tx, mut rx) = oneshot::channel::<()>();
-    let sink = Arc::new(SessionSink::new(tx));
+    let sink = Arc::new(SessionSink::new(tx, crate::app::frontend_metrics::test_registry()));
 
     // Pre-fill the sink past capacity with fresh, back-to-back entries —
     // the "bursty but draining" case, deliberately not back-dated.
@@ -381,7 +381,7 @@ async fn broker_publish_degrades_bursty_subscriber_without_disconnecting() {
 #[tokio::test]
 async fn request_reader_stalls_until_outbound_lane_drains() {
     let (tx, _rx) = oneshot::channel();
-    let sink = Arc::new(SessionSink::new(tx));
+    let sink = Arc::new(SessionSink::new(tx, crate::app::frontend_metrics::test_registry()));
     // Nothing queued: no stall.
     tokio::time::timeout(
         Duration::from_millis(100),
@@ -420,7 +420,7 @@ async fn request_reader_stalls_until_outbound_lane_drains() {
 async fn reply_at_head_is_kept_and_pushes_are_evicted_instead() {
     for response_index in [0, 1] {
         let (tx, mut rx) = oneshot::channel();
-        let sink = SessionSink::new(tx);
+        let sink = SessionSink::new(tx, crate::app::frontend_metrics::test_registry());
         for index in 0..MAX_SESSION_QUEUE {
             let env = if index == response_index {
                 response_envelope("must-survive")
@@ -454,7 +454,7 @@ async fn reply_at_head_is_kept_and_pushes_are_evicted_instead() {
 #[tokio::test]
 async fn response_eviction_disconnects_even_when_producer_ignores_outcome() {
     let (tx, rx) = oneshot::channel();
-    let sink = SessionSink::new(tx);
+    let sink = SessionSink::new(tx, crate::app::frontend_metrics::test_registry());
     for index in 0..MAX_SESSION_QUEUE {
         assert_eq!(
             sink.enqueue(response_envelope(&format!("reply-{index}"))),

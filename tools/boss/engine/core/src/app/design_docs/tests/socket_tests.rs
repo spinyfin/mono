@@ -230,7 +230,10 @@ async fn cached_read_burst() {
 #[test]
 fn revalidation_capacity_is_global_and_released_on_drop() {
     let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
-    let sink = Arc::new(SessionSink::new(shutdown_tx));
+    let sink = Arc::new(SessionSink::new(
+        shutdown_tx,
+        crate::app::frontend_metrics::test_registry(),
+    ));
     let registry = Arc::new(RevalidationRegistry::default());
     let mut guards = Vec::new();
     for index in 0..4 {
