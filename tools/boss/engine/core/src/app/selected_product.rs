@@ -90,7 +90,8 @@ impl ServerState {
             return db.resolve_work_item_ref(id);
         };
 
-        let SelectedProductState::Selected { product_id, name, .. } = self.selected_product_state().await else {
+        let SelectedProductState::Selected { product_id, name, .. } = self.selected_product_state_with_db(db).await
+        else {
             return db.resolve_work_item_ref(id);
         };
         db.resolve_work_item_ref(&format!("{product_id}/{short_id}"))
@@ -157,6 +158,13 @@ impl ServerState {
     /// tell "unknown" from "product X" will report facts about the wrong
     /// work item, which is exactly the failure this verb was built for.
     pub(super) async fn selected_product_state(&self) -> SelectedProductState {
+        self.selected_product_state_with_db(&self.work_db).await
+    }
+
+    /// Same as [`Self::selected_product_state`] but looks the product up on
+    /// `db`, so read paths holding the read connection never touch the
+    /// writer.
+    pub(super) async fn selected_product_state_with_db(&self, db: &crate::work::WorkDb) -> SelectedProductState {
         let app_session_id = self
             .app_session
             .lock()
@@ -178,7 +186,7 @@ impl ServerState {
             return SelectedProductState::NoSelection;
         };
 
-        match self.work_db.get_product(&product_id) {
+        match db.get_product(&product_id) {
             Ok(Some(product)) => SelectedProductState::Selected {
                 product_id: product.id,
                 name: product.name,

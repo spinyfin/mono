@@ -59,6 +59,14 @@ async fn standalone_attention_reads_do_not_acquire_the_writer_connection() {
     let (state, _dir) = test_server_state();
     let product = crate::test_support::create_test_product_named(&state.work_db, "reader");
     let task = crate::test_support::create_test_chore(&state.work_db, &product.id, "read filter");
+    state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    assert!(
+        state
+            .record_selected_product("session-app", Some(product.id.clone()))
+            .await
+    );
     let reader = Arc::new(state.work_db.reader().unwrap());
     let worker_state = state.clone();
     let selector = boss_protocol::short_id_wire_form(task.short_id.unwrap());
