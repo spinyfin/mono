@@ -37,7 +37,7 @@ public struct PaneLayoutModel: Equatable, Sendable {
     public let policy: PaneCapacityPolicy
     public private(set) var geometry: PaneGeometry
     public private(set) var limits: GridLimits
-    /// Whether `limits` came from a real cell-size measurement. Hysteresis only
+    /// Whether `limits` came from usable area and cell dimensions. Hysteresis only
     /// applies against measured limits, never the 1x1 unmeasured fallback.
     private var limitsMeasured: Bool
     public private(set) var filter: PaneFilter = .all
@@ -131,7 +131,7 @@ public struct PaneLayoutModel: Equatable, Sendable {
     /// should invoke it at drag end or after the geometry has been quiet, not
     /// on every drag frame. Capacity only moves once the measurement clears the
     /// policy's dead band; an identical or unmeasured (zero, negative, or
-    /// non-finite cell size) measurement is a no-op.
+    /// non-finite area or cell size) measurement is a no-op.
     public mutating func updateGeometry(_ newGeometry: PaneGeometry) {
         guard newGeometry != geometry, newGeometry.isMeasured else { return }
         let anchor = automaticAnchor()

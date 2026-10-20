@@ -33,11 +33,16 @@ final class AgentsGridModel: ObservableObject {
 
     static let defaultPoolStrip = "Interactive 0/16 · Automation 0/8 · Review 0/16"
 
+    /// Provisional metrics for the fixed 10pt worker font. Membership can
+    /// arrive without any attached viewer, so pagination must not depend on
+    /// libghostty creating a surface. A real cell measurement replaces these.
+    static let fallbackCell = PaneSize(width: 6, height: 13)
+
     init(
         policy: PaneCapacityPolicy = .standard,
         geometry: PaneGeometry = PaneGeometry(
-            area: PaneSize(width: 800, height: 600),
-            cell: PaneSize(width: 0, height: 0)
+            area: PaneSize(width: 0, height: 0),
+            cell: AgentsGridModel.fallbackCell
         ),
         isVisible: Bool = true
     ) {
@@ -186,10 +191,15 @@ final class AgentsGridModel: ObservableObject {
             quietTask = nil
             return
         }
-        scheduleQuietApply()
+        if !layout.geometry.isMeasured {
+            applyPendingGeometry()
+        } else {
+            scheduleQuietApply()
+        }
     }
 
     func noteCellSize(width: Double, height: Double) {
+        guard width > 0, height > 0, width.isFinite, height.isFinite else { return }
         lastCell = PaneSize(width: width, height: height)
         applyPendingGeometry()
     }
