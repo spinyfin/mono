@@ -77,6 +77,12 @@ struct WorkerLiveState {
     /// Attributed pool: `"main"`, `"automation"`, or `"review"`. Independent
     /// of the physical slot — spilled automation still reports `"automation"`.
     let pool: String?
+    /// Mirrors the engine's `LiveWorkerState.viewer_attach_error`: why the
+    /// engine's most recent attempt to attach this worker's viewer failed.
+    /// `nil` while nothing has failed (no attempt yet, or the last attempt
+    /// succeeded), which is what lets the Agents card say "Connecting…"
+    /// rather than guessing. Cleared by the engine on a later success.
+    let viewerAttachError: String?
 
     /// Wire value the engine stamps on local workers. Keep in lock-step
     /// with `boss_protocol::LOCAL_HOST_ID`.
@@ -112,7 +118,8 @@ struct WorkerLiveState {
         projectName: String? = nil,
         hostId: String? = nil,
         startedAt: String? = nil,
-        pool: String? = nil
+        pool: String? = nil,
+        viewerAttachError: String? = nil
     ) {
         self.name = name
         self.slotId = slotId
@@ -135,6 +142,7 @@ struct WorkerLiveState {
         self.hostId = hostId
         self.startedAt = startedAt
         self.pool = pool
+        self.viewerAttachError = viewerAttachError
     }
 
     /// False when two entries share a `runId` or a `slotId`. A snapshot
@@ -185,6 +193,7 @@ extension WorkerLiveState: Hashable {
             && lhs.hostId == rhs.hostId
             && lhs.startedAt == rhs.startedAt
             && lhs.pool == rhs.pool
+            && lhs.viewerAttachError == rhs.viewerAttachError
     }
 
     func hash(into hasher: inout Hasher) {
@@ -207,6 +216,7 @@ extension WorkerLiveState: Hashable {
         hasher.combine(hostId)
         hasher.combine(startedAt)
         hasher.combine(pool)
+        hasher.combine(viewerAttachError)
     }
 }
 

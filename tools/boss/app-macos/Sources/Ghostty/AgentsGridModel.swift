@@ -25,6 +25,13 @@ final class AgentsGridModel: ObservableObject {
     /// Projects with at least one live local member, in display order.
     @Published private(set) var memberProjects: [AgentProject] = []
     private var inLiveResize = false
+    private var exitedRunIds: Set<String> = []
+    var onViewerAttachRequested: (([String]) -> Void)?
+
+    func requestViewersForVisiblePage() {
+        guard layout.isVisible else { return }
+        onViewerAttachRequested?(viewerlessRunIdsOnSelectedPage)
+    }
 
     private var personaByRun: [String: String] = [:]
     private var pendingArea: PaneSize?
@@ -152,6 +159,22 @@ final class AgentsGridModel: ObservableObject {
         replaceLayout { $0.setFocusedRun(runId) }
     }
 
+    /// Live members placed on the selected page that have no viewer yet, in
+    /// cell order. These are the runs whose cards read "Connecting…" when
+    /// the page is shown, and the ones the view asks the engine to attach.
+    /// Off-page members are left to the engine's own retry: their surfaces
+    /// would be mounted invisibly, and asking for them when their page is
+    /// selected keeps each request tied to something the user can see.
+    var viewerlessRunIdsOnSelectedPage: [String] {
+        guard let page = layout.currentPage else { return [] }
+        return page.cells.compactMap { cell in
+            if case .occupied(let member) = cell.content, !member.hasViewer, !exitedRunIds.contains(member.runId) {
+                return member.runId
+            }
+            return nil
+        }
+    }
+
     /// Authoritative membership + current viewer map. Callers must pass
     /// only an accepted live-state snapshot: duplicates and a disconnected
     /// feed are handled by `LiveWorkerStateStore` before they reach here.
@@ -168,6 +191,7 @@ final class AgentsGridModel: ObservableObject {
         }
         self.viewers = viewers
         let local = states.filter(\.isLocalMember)
+        exitedRunIds = Set(local.filter { $0.activity == .terminated }.map(\.runId))
         for state in local {
             if let name = state.name, !name.isEmpty {
                 personaByRun[state.runId] = name
@@ -288,6 +312,7 @@ final class AgentsGridModel: ObservableObject {
         if next != layout {
             layout = next
         }
+        requestViewersForVisiblePage()
     }
 
     private func placedRunIds(in layout: PaneLayoutModel) -> Set<String> {

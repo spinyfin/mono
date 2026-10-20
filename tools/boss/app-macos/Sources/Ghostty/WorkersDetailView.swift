@@ -53,10 +53,14 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .background(Color(nsColor: .separatorColor))
         .onAppear(perform: bindAndSync)
         .onChange(of: grid.layout) { _, _ in if isVisible { refreshSnapshots() } }
-        .onChange(of: isVisible) { _, _ in syncGrid() }
+        .onChange(of: isVisible) { _, visible in
+            if !visible { workspace.resetViewerAttachRequests() }
+            syncGrid()
+        }
         .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
         .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
         .onChange(of: workspace.viewersByRunId) { _, _ in syncGrid() }
+        .onChange(of: workspace.viewerAttachFailuresByRunId) { _, _ in syncGrid() }
         .onChange(of: workspace.interactivePoolSize) { _, _ in syncGrid() }
         .onChange(of: workspace.automationPoolSize) { _, _ in syncGrid() }
         .onChange(of: workspace.reviewSlotCount) { _, _ in syncGrid() }
@@ -259,6 +263,9 @@ struct WorkersDetailView: View, @MainActor Equatable {
             grid.setFocusedRun(String(sessionId.dropFirst("run-".count)))
         }
         Self.bindAgentReveal(grid: grid, workspace: workspace, liveStates: liveStates)
+        grid.onViewerAttachRequested = { [weak workspace] runs in
+            workspace?.requestViewerAttach(forRuns: runs)
+        }
         syncGrid()
     }
 
@@ -278,9 +285,12 @@ struct WorkersDetailView: View, @MainActor Equatable {
     }
 
     private func syncGrid() {
-        grid.setVisible(isVisible)
-        guard isVisible else { return }
+        if !isVisible {
+            grid.setVisible(false)
+            return
+        }
         Self.applyMembership(grid: grid, workspace: workspace, liveStates: liveStates)
+        grid.setVisible(true)
         refreshSnapshots()
     }
 
@@ -335,7 +345,8 @@ struct WorkersDetailView: View, @MainActor Equatable {
             liveState: live,
             liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slotId),
             isPlaceholder: isPlaceholder,
-            cachedPersona: grid.personaName(for: runId)
+            cachedPersona: grid.personaName(for: runId),
+            viewerAttachFailure: workspace.viewerAttachFailuresByRunId[runId]
         )
     }
 }
@@ -433,9 +444,16 @@ struct WorkerSlotView: View, @MainActor Equatable {
             if let live = snapshot.live {
                 statusPill(live.activity.agentsPaneLabel, color: liveActivityColor(live.activity))
             }
-            Text("Viewer not attached")
+            // "Connecting…" only while nothing is known to have failed; a
+            // refused or failed attach shows its reason (see
+            // `WorkerSlotSnapshot.viewerMissingMessage`).
+            Text(snapshot.viewerMissingMessage)
                 .font(.callout)
-                .foregroundStyle(Color.white.opacity(0.6))
+                .foregroundStyle(snapshot.isViewerConnecting ? Color.white.opacity(0.6) : Color.orange.opacity(0.9))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16)
+                .lineLimit(4)
+                .accessibilityLabel(snapshot.isViewerConnecting ? "Connecting to the worker's terminal" : "Terminal not attached: \(snapshot.viewerMissingMessage)")
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

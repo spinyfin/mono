@@ -29,6 +29,7 @@ fn live(slot: u8, run: &str) -> LiveWorkerState {
         project_name: None,
         host_id: None,
         started_at: None,
+        viewer_attach_error: None,
     }
 }
 

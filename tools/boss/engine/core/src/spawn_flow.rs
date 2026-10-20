@@ -632,6 +632,15 @@ pub trait WorkerSpawner: Send + Sync {
     /// topic. Default no-op for tests.
     async fn publish_live_worker_states(&self) {}
 
+    /// Hook called when the spawn-time `AttachWorkerPane` did not
+    /// produce a viewer even though the worker itself started (the app
+    /// answered with an error other than `SlotBusy`, or the request
+    /// failed outright). The worker keeps running headless; production
+    /// `ServerState` schedules its bounded viewer re-attach so the pane
+    /// is retried without waiting for an app relaunch. Default no-op
+    /// for tests.
+    async fn note_worker_viewer_attach_failed(&self, _run_id: &str) {}
+
     /// Hook called after a slot has been registered so the engine can
     /// spawn the per-slot live-status summarizer task. Default no-op
     /// for tests; production `ServerState` starts the task via its
@@ -961,7 +970,10 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     // SlotBusy rejection is different: reconciliation has already tried to
     // clear stale occupancy, so the failure is propagated and the spawned
     // worker is reaped.
-    match spawner
+    // Why the viewer is missing, stamped onto the live state below so the
+    // app's pane card can say "attach failed: <reason>" instead of
+    // reading as still connecting. `None` after a successful attach.
+    let viewer_attach_error: Option<String> = match spawner
         .send_to_app_request(
             EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
                 run_id: input.run_id.clone(),
@@ -982,6 +994,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
                 session_name = tmux_host.session_name(),
                 "attached tmux-hosted worker pane",
             );
+            None
         }
         Ok(EngineToAppResponse::AttachWorkerPane {
             result: Err(err @ EngineToAppError::SlotBusy { .. }),
@@ -1001,6 +1014,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
                 ?response,
                 "tmux worker started but app did not attach its viewer surface",
             );
+            Some(viewer_attach_failure_reason(&response))
         }
         Err(err) => {
             tracing::debug!(
@@ -1009,8 +1023,15 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
                 ?err,
                 "tmux worker started without an app viewer surface",
             );
+            // `NotRegistered` is the one expected case: the app is not
+            // running, so there is nobody to show a card. Registration
+            // re-attaches every live worker and no failure is recorded.
+            match err {
+                crate::app::SendToAppError::NotRegistered => None,
+                other => Some(format!("request to the app failed: {other}")),
+            }
         }
-    }
+    };
 
     spawner
         .worker_registry()
@@ -1045,6 +1066,9 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         // driver that is actually running, not an assumed Claude rhythm
         // (see `ProgressFidelity::stale_threshold_secs`).
         live_states.set_progress_fidelity(slot_id, input.driver.progress_fidelity());
+        if let Some(reason) = viewer_attach_error.clone() {
+            live_states.set_viewer_attach_error(&input.run_id, Some(reason));
+        }
         spawner.publish_live_worker_states().await;
         // 5. Spin up the live-status summarizer for this slot. The
         //    manager owns the task lifecycle and will be torn down
@@ -1052,12 +1076,29 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         spawner.start_live_status_slot(slot_id, &input.run_id, input.driver.clone());
     }
     spawner.activate_progress_ingress(&input.run_id);
+    if viewer_attach_error.is_some() {
+        spawner.note_worker_viewer_attach_failed(&input.run_id).await;
+    }
 
     Ok(StartedWorker {
         slot_id,
         shell_pid,
         written_files: written,
     })
+}
+
+/// Human-readable reason for an `AttachWorkerPane` response that is not a
+/// success, for [`boss_protocol::LiveWorkerState::viewer_attach_error`].
+/// The typed app error is spelled out (not `Debug`-formatted) because the
+/// text is rendered verbatim on the worker's pane card.
+pub(crate) fn viewer_attach_failure_reason(response: &EngineToAppResponse) -> String {
+    match response {
+        EngineToAppResponse::AttachWorkerPane { result: Err(err) } => format!("the app refused the viewer: {err}"),
+        EngineToAppResponse::AttachWorkerPane { result: Ok(_) } => {
+            unreachable!("a successful attach has no failure reason")
+        }
+        other => format!("the app answered the viewer attach with an unexpected response: {other:?}"),
+    }
 }
 
 #[cfg(test)]
@@ -1934,6 +1975,10 @@ mod tests {
         /// `activate_progress_ingress`, tagged with whether the slot's
         /// live-state entry was already registered when it fired.
         Activated { registered: bool },
+        /// `note_worker_viewer_attach_failed`: the worker started but the
+        /// app did not give it a viewer, so production schedules the
+        /// bounded re-attach.
+        ViewerAttachFailedNoted,
     }
 
     /// Spawner that wires the two production collaborators `StubSpawner`
@@ -1954,6 +1999,9 @@ mod tests {
         slot_id: u8,
         spawn_calls: Arc<AtomicUsize>,
         steps: std::sync::Mutex<Vec<SpawnStep>>,
+        /// When set, the fake app answers `AttachWorkerPane` with this
+        /// error instead of a viewer (the worker itself still starts).
+        viewer_refusal: Option<EngineToAppError>,
     }
 
     impl LiveStateSpawner {
@@ -1966,6 +2014,7 @@ mod tests {
                 slot_id,
                 spawn_calls: Arc::new(AtomicUsize::new(0)),
                 steps: std::sync::Mutex::new(Vec::new()),
+                viewer_refusal: None,
             }
         }
 
@@ -1989,7 +2038,10 @@ mod tests {
             self.spawn_calls.fetch_add(1, Ordering::SeqCst);
             self.record(SpawnStep::PaneRequested);
             Ok(EngineToAppResponse::AttachWorkerPane {
-                result: Ok(AttachWorkerPaneResult {}),
+                result: match &self.viewer_refusal {
+                    Some(err) => Err(err.clone()),
+                    None => Ok(AttachWorkerPaneResult {}),
+                },
             })
         }
 
@@ -1999,6 +2051,10 @@ mod tests {
 
         fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
             Some(&self.live_states)
+        }
+
+        async fn note_worker_viewer_attach_failed(&self, _run_id: &str) {
+            self.record(SpawnStep::ViewerAttachFailedNoted);
         }
 
         fn prepare_progress_ingress(
@@ -2158,6 +2214,44 @@ mod tests {
         assert_eq!(state.work_item_id.as_deref(), Some("task-codex-1"));
     }
 
+    /// A non-`SlotBusy` viewer refusal at spawn must not fail the worker
+    /// (the tmux session owns it), but it must not be silent either: the
+    /// reason is stamped on the live state the app renders, and the
+    /// spawner is told so production can schedule the bounded re-attach.
+    #[tokio::test]
+    async fn refused_spawn_time_viewer_attach_is_stamped_on_the_live_state_and_noted() {
+        let workspace = TempDir::new().unwrap();
+        let mut spawner = LiveStateSpawner::new(3);
+        spawner.viewer_refusal = Some(EngineToAppError::Internal {
+            message: "pane allocator not ready".into(),
+        });
+
+        let started = start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .expect("a refused viewer must not fail the spawn");
+        assert_eq!(started.slot_id, 3);
+
+        assert_eq!(
+            spawner.steps(),
+            vec![
+                SpawnStep::Prepared("HookCallback"),
+                SpawnStep::PaneRequested,
+                SpawnStep::Activated { registered: true },
+                SpawnStep::ViewerAttachFailedNoted,
+            ],
+            "the failure is noted only after the live state exists, so the retry can find the run",
+        );
+        let state = spawner.live_states.get(3).expect("the worker is registered headless");
+        assert_eq!(
+            state.viewer_attach_error.as_deref(),
+            Some("the app refused the viewer: app internal error: pane allocator not ready"),
+        );
+    }
+
     /// The same spawn against the Claude driver, so the assertion above is
     /// pinned as a *parity* claim rather than a Codex-only snapshot: if a
     /// future change makes registration conditional on the ingress kind,
@@ -2191,6 +2285,10 @@ mod tests {
             .get(3)
             .expect("a Claude spawn registers a LiveWorkerState");
         assert_eq!(state.run_id, "run-test");
+        assert_eq!(
+            state.viewer_attach_error, None,
+            "a spawn whose viewer attached must not carry a failure reason"
+        );
         assert_eq!(state.pool.as_deref(), Some("main"));
     }
 

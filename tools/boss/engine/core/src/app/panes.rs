@@ -64,6 +64,33 @@ pub(super) async fn handle_focus_worker_pane(ctx: Dispatch, req: FrontendRequest
     }
 }
 
+/// The Agents view is showing a live local worker it has no viewer for and
+/// asks for `AttachWorkerPane` again. Fire-and-forget like
+/// `spawn_capability_restored`: the outcome reaches the app as the attach
+/// request itself, or as `viewer_attach_error` on the live-state topic.
+/// Only the app (or Boss) may ask — a worker must not be able to drive
+/// surface allocation for another worker's pane.
+pub(super) async fn handle_request_worker_pane_attach(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state, peer_pid, ..
+    } = ctx;
+    let FrontendRequest::RequestWorkerPaneAttach { run_id } = req else {
+        unreachable!()
+    };
+    if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+        tracing::warn!(
+            peer_pid = ?peer_pid,
+            run_id = %run_id,
+            "request_worker_pane_attach rejected: caller not in app/Boss subtree",
+        );
+        return;
+    }
+    tracing::info!(run_id = %run_id, "request_worker_pane_attach: app has no viewer for a live worker");
+    tokio::spawn(async move {
+        server_state.reattach_worker_pane_for_run(&run_id).await;
+    });
+}
+
 pub(super) async fn handle_send_input_to_worker(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

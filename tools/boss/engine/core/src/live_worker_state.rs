@@ -1363,6 +1363,28 @@ impl LiveWorkerStateRegistry {
         None
     }
 
+    /// Record the outcome of the engine's latest attempt to attach
+    /// `run_id`'s viewer to the app: `Some(reason)` after a failed
+    /// attempt, `None` once an attach succeeds. Keyed by run id because
+    /// every attach site (spawn, registration re-attach, the app's own
+    /// `RequestWorkerPaneAttach`) addresses the worker by run, not slot.
+    /// Returns `true` iff the stored value changed, so callers broadcast
+    /// only on a real transition. A run the registry does not know is a
+    /// no-op: there is no live worker whose card could show the reason.
+    pub fn set_viewer_attach_error(&self, run_id: &str, error: Option<String>) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        for entry in guard.values_mut() {
+            if entry.state.run_id == run_id {
+                if entry.state.viewer_attach_error == error {
+                    return false;
+                }
+                entry.state.viewer_attach_error = error;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Keep a retained worker addressable without claiming a released roster name.
     pub fn forget_persona_name(&self, run_id: &str) {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");

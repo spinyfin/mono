@@ -120,6 +120,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "agentType",
         "projectName",
         "pool",
+        "tmuxHosted",
+        "viewerAttachError",
     ]
 
     /// `WorkerLiveState` fields the slot snapshot intentionally ignores.
@@ -132,7 +134,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "currentTool",
         "lastToolEndedAt",
         "liveStatusAt",
-        "tmuxHosted",
         "waitReason",
         "waitExpiresAt",
         "projectId",
@@ -202,7 +203,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             Self.makeLiveState(currentTool: "Bash"),
             Self.makeLiveState(lastToolEndedAt: "2026-09-01T00:00:00Z"),
             Self.makeLiveState(liveStatusAt: "2026-09-01T00:00:00Z"),
-            Self.makeLiveState(tmuxHosted: true),
             Self.makeLiveState(waitReason: "CI build"),
             Self.makeLiveState(waitExpiresAt: "2026-09-01T00:00:00Z"),
             Self.makeLiveState(projectId: "proj-other"),
@@ -274,6 +274,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             ("agentType", Self.makeLiveState(agentType: "review")),
             ("projectName", Self.makeLiveState(projectName: "Nine")),
             ("pool", Self.makeLiveState(pool: "automation")),
+            ("tmuxHosted", Self.makeLiveState(tmuxHosted: false)),
+            ("viewerAttachError", Self.makeLiveState(viewerAttachError: "the app refused the viewer")),
         ]
         for (field, other) in flips {
             let otherSnap = WorkerSlotSnapshot.build(
@@ -435,6 +437,122 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             onToggleLiveStatus: { _ in }
         )
         XCTAssertNotEqual(a, b)
+    }
+
+    func testExitedMemberDoesNotConnect() {
+        let snapshot = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(slotId: 1, runId: "exec-1"),
+            liveState: Self.makeLiveState(activity: .terminated, tmuxHosted: true),
+            liveStatusEnabled: true
+        )
+        XCTAssertTrue(snapshot.isViewerMissing)
+        XCTAssertFalse(snapshot.isViewerConnecting)
+        XCTAssertEqual(snapshot.viewerMissingMessage, "Worker exited")
+    }
+
+    // MARK: - Viewer-missing card
+
+    /// A live member with no viewer and no known failure is still
+    /// connecting; the card must say so rather than "not attached".
+    func testViewerMissingCardReadsConnectingWhileNothingHasFailed() {
+        let slot = WorkerSlot(slotId: 1, runId: "exec-1")
+        let connecting = WorkerSlotSnapshot.build(
+            slot: slot, liveState: Self.makeLiveState(tmuxHosted: true), liveStatusEnabled: true
+        )
+        XCTAssertTrue(connecting.isViewerMissing)
+        XCTAssertTrue(connecting.isViewerConnecting)
+        XCTAssertEqual(connecting.viewerMissingMessage, "Connecting…")
+
+        // Before any live state has arrived the card is equally honest.
+        let preLive = WorkerSlotSnapshot.build(slot: slot, liveState: nil, liveStatusEnabled: true)
+        XCTAssertTrue(preLive.isViewerConnecting)
+        XCTAssertEqual(preLive.viewerMissingMessage, "Connecting…")
+
+        // A placeholder (released run) is not connecting to anything.
+        let placeholder = WorkerSlotSnapshot.build(
+            slot: slot, liveState: Self.makeLiveState(tmuxHosted: true), liveStatusEnabled: true, isPlaceholder: true
+        )
+        XCTAssertFalse(placeholder.isViewerConnecting)
+
+        // Once a viewer exists there is nothing to connect.
+        let attached = WorkerSlotSnapshot.build(
+            slot: WorkerSlot(
+                slotId: 1,
+                session: TerminalPaneSession(
+                    id: "run-exec-1", role: .worker(slot: 1),
+                    launchSpec: TerminalLaunchSpec(fontSize: 10, workingDirectory: "/", initialInput: "")
+                ),
+                runId: "exec-1"
+            ),
+            liveState: Self.makeLiveState(tmuxHosted: true), liveStatusEnabled: true
+        )
+        XCTAssertFalse(attached.isViewerMissing)
+        XCTAssertFalse(attached.isViewerConnecting)
+    }
+
+    /// Failure reasons win over "Connecting…", most specific first: the
+    /// app's own refusal, then the engine-reported attach error, then a
+    /// worker the engine can never attach (no durable tmux identity).
+    func testViewerMissingCardShowsTheFailureReasonInsteadOfConnecting() {
+        let slot = WorkerSlot(slotId: 1, runId: "exec-1")
+
+        let engineFailed = WorkerSlotSnapshot.build(
+            slot: slot,
+            liveState: Self.makeLiveState(tmuxHosted: true, viewerAttachError: "request to the app failed: timed out"),
+            liveStatusEnabled: true
+        )
+        XCTAssertFalse(engineFailed.isViewerConnecting)
+        XCTAssertEqual(
+            engineFailed.viewerMissingMessage,
+            "Couldn't attach the terminal: request to the app failed: timed out"
+        )
+
+        let appRefused = WorkerSlotSnapshot.build(
+            slot: slot,
+            liveState: Self.makeLiveState(tmuxHosted: true, viewerAttachError: "request to the app failed: timed out"),
+            liveStatusEnabled: true,
+            viewerAttachFailure: "its slot is still hosting run exec-0"
+        )
+        XCTAssertFalse(appRefused.isViewerConnecting)
+        XCTAssertEqual(
+            appRefused.viewerMissingMessage,
+            "Couldn't attach the terminal: its slot is still hosting run exec-0",
+            "the app's own refusal is the more specific half of the same failed exchange"
+        )
+
+        let noIdentity = WorkerSlotSnapshot.build(
+            slot: slot, liveState: Self.makeLiveState(tmuxHosted: false), liveStatusEnabled: true
+        )
+        XCTAssertFalse(noIdentity.isViewerConnecting)
+        XCTAssertEqual(noIdentity.viewerMissingMessage, AgentActivityState.identityUnavailableReason)
+    }
+
+    func testViewerAttachFailureFlipsEquality() {
+        let slot = WorkerSlot(slotId: 1, runId: "exec-1")
+        let live = Self.makeLiveState(tmuxHosted: true)
+        let plain = WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true)
+        let failed = WorkerSlotSnapshot.build(
+            slot: slot, liveState: live, liveStatusEnabled: true, viewerAttachFailure: "its slot is busy"
+        )
+        XCTAssertNotEqual(plain, failed)
+        XCTAssertEqual(
+            failed,
+            WorkerSlotSnapshot.build(slot: slot, liveState: live, liveStatusEnabled: true, viewerAttachFailure: "its slot is busy")
+        )
+    }
+
+    func testParseWorkerLiveStateReadsViewerAttachError() throws {
+        let client = EngineClient(socketPath: "/tmp/viewer-error-test-\(UUID().uuidString).sock")
+        let failed = try XCTUnwrap(client.parseWorkerLiveState([
+            "slot_id": 3, "run_id": "run-v", "model": "opus", "activity": "working",
+            "tmux_hosted": true, "viewer_attach_error": "the app refused the viewer: unknown slot",
+        ]))
+        XCTAssertEqual(failed.viewerAttachError, "the app refused the viewer: unknown slot")
+        let clean = try XCTUnwrap(client.parseWorkerLiveState([
+            "slot_id": 3, "run_id": "run-v", "model": "opus", "activity": "working",
+        ]))
+        XCTAssertNil(clean.viewerAttachError)
+        XCTAssertNotEqual(failed, clean, "the attach error participates in live-state equality so a change republishes")
     }
 
     func testPlaceholderAndViewerMissingFlipEquality() {
@@ -600,7 +718,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         projectName: String? = nil,
         hostId: String? = nil,
         startedAt: String? = nil,
-        pool: String? = nil
+        pool: String? = nil,
+        viewerAttachError: String? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
             name: name,
@@ -623,7 +742,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             projectName: projectName,
             hostId: hostId,
             startedAt: startedAt,
-            pool: pool
+            pool: pool,
+            viewerAttachError: viewerAttachError
         )
     }
 }

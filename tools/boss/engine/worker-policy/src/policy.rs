@@ -455,6 +455,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::RegisterAppSession
         | FrontendRequest::RegisterCapabilities { .. }
         | FrontendRequest::ReportSelectedProduct { .. }
+        | FrontendRequest::RequestWorkerPaneAttach { .. }
         | FrontendRequest::SetCoordinatorHandoff { .. }
         | FrontendRequest::Shutdown { .. }
         | FrontendRequest::SpawnCapabilityRestored => coordinator(variant_name(request)),

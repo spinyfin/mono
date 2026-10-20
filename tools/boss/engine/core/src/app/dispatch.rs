@@ -287,6 +287,9 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::RemoveHostTag { .. } => Box::pin(hosts::handle_remove_host_tag(ctx, r)),
         r @ FrontendRequest::ReorderProjectTasks { .. } => Box::pin(projects::handle_reorder_project_tasks(ctx, r)),
         r @ FrontendRequest::RequestExecution { .. } => Box::pin(executions::handle_request_execution(ctx, r)),
+        r @ FrontendRequest::RequestWorkerPaneAttach { .. } => {
+            Box::pin(panes::handle_request_worker_pane_attach(ctx, r))
+        }
         r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
             Box::pin(projects::handle_resolve_project_design_doc(ctx, r))
         }

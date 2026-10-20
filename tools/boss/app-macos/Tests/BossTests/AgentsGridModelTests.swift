@@ -424,6 +424,100 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertNil(GhosttyRuntime.workerCellSize(role: .worker(slot: 1), host: one, pixels: .zero))
     }
 
+    /// A live member on a page that becomes
+    /// visible gets a viewer attached. The grid names the viewer-less
+    /// members on the selected page, the workspace asks the engine once per
+    /// run, the engine answers with `AttachWorkerPane`, and the next apply
+    /// places the terminal in the same cell.
+    func testLiveMemberOnVisiblePageGetsViewerAttached() {
+        let workspace = WorkersWorkspaceModel()
+        let grid = AgentsGridModel(isVisible: false)
+        let state = makeState(runId: "run-a")
+        grid.apply(
+            states: [state], viewers: workspace.viewersByRunId,
+            interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false
+        )
+        XCTAssertEqual(grid.viewerlessRunIdsOnSelectedPage, ["run-a"])
+        guard case .occupied(let before) = grid.layout.currentPage?.cells.first?.content else {
+            return XCTFail("the live member occupies the first cell")
+        }
+        XCTAssertFalse(before.hasViewer)
+
+        // Stand in for the engine: the request comes back as AttachWorkerPane.
+        var requests: [String] = []
+        workspace.onViewerAttachRequested = { [weak workspace] runId in
+            requests.append(runId)
+            _ = workspace?.attachWorkerPane(self.makeAttach(runId: runId, slot: 1))
+        }
+        grid.onViewerAttachRequested = { [weak workspace] runs in
+            workspace?.requestViewerAttach(forRuns: runs)
+        }
+        grid.requestViewersForVisiblePage()
+        XCTAssertTrue(requests.isEmpty)
+        grid.setVisible(true)
+        XCTAssertEqual(requests, ["run-a"])
+        XCTAssertNotNil(workspace.viewersByRunId["run-a"]?.session)
+
+        grid.apply(
+            states: [state], viewers: workspace.viewersByRunId,
+            interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false
+        )
+        XCTAssertTrue(grid.viewerlessRunIdsOnSelectedPage.isEmpty)
+        guard case .occupied(let after) = grid.layout.currentPage?.cells.first?.content else {
+            return XCTFail("the member keeps its cell once attached")
+        }
+        XCTAssertTrue(after.hasViewer)
+        XCTAssertEqual(grid.layout.logicalCellIndex(ofRun: "run-a"), 0)
+    }
+
+    /// Only the selected page's members are offered for a re-attach
+    /// request; switching pages offers the next page's.
+    func testViewerlessRunIdsFollowTheSelectedPage() {
+        let workspace = WorkersWorkspaceModel()
+        let grid = AgentsGridModel(
+            policy: PaneCapacityPolicy(minColumns: 1, minRows: 1, headerHeight: 0, maxPanesPerPage: 8, gap: 0, deadBand: 0),
+            geometry: PaneGeometry(area: PaneSize(width: 400, height: 200), cell: PaneSize(width: 100, height: 100))
+        )
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-0", slot: 1))
+        grid.apply(
+            states: (0..<9).map { makeState(runId: "run-\($0)", slotId: $0 + 1, startedAt: "2026-10-09T00:00:0\($0)Z") },
+            viewers: workspace.viewersByRunId,
+            interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false
+        )
+        XCTAssertEqual(grid.layout.pageCount, 2)
+        XCTAssertEqual(grid.viewerlessRunIdsOnSelectedPage, (1..<8).map { "run-\($0)" })
+        grid.selectPage(1)
+        XCTAssertEqual(grid.viewerlessRunIdsOnSelectedPage, ["run-8"])
+    }
+
+    func testClearingFilterRequestsNewlyVisibleRunOnSamePage() {
+        let workspace = WorkersWorkspaceModel()
+        let grid = AgentsGridModel(
+            policy: PaneCapacityPolicy(minColumns: 1, minRows: 1, headerHeight: 0, maxPanesPerPage: 8, gap: 0, deadBand: 0),
+            geometry: PaneGeometry(area: PaneSize(width: 400, height: 200), cell: PaneSize(width: 100, height: 100))
+        )
+        var requests: [String] = []
+        workspace.onViewerAttachRequested = { requests.append($0) }
+        grid.onViewerAttachRequested = { workspace.requestViewerAttach(forRuns: $0) }
+        grid.setFilter(PaneFilter(projects: [.project(id: "visible")]))
+        grid.apply(
+            states: [
+                makeState(runId: "shown", projectId: "visible"),
+                makeState(runId: "hidden", slotId: 2, projectId: "hidden"),
+                makeState(runId: "exited", slotId: 3, activity: .terminated)
+            ], viewers: [:],
+            interactivePoolSize: 16, automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false
+        )
+        XCTAssertEqual(requests, ["shown"])
+        let page = grid.layout.selectedPage
+        grid.clearFilter()
+        XCTAssertEqual(grid.layout.selectedPage, page)
+        XCTAssertEqual(requests, ["shown", "hidden"])
+        grid.requestViewersForVisiblePage()
+        XCTAssertEqual(requests, ["shown", "hidden"])
+        XCTAssertFalse(grid.viewerlessRunIdsOnSelectedPage.contains("exited"))
+    }
+
     private func makeAttach(runId: String, slot: Int) -> EngineAttachRequest {
         EngineAttachRequest(
             runId: runId,

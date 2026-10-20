@@ -191,6 +191,12 @@ struct ContentView: View {
             model.paneListHostedHandler = { [workspace = workersWorkspace] in
                 workspace.listHostedPanes()
             }
+            // Agents view → engine: a live worker on a visible page has no
+            // viewer; ask for `AttachWorkerPane` again (see
+            // `WorkersWorkspaceModel.requestViewerAttach(forRuns:)`).
+            workersWorkspace.onViewerAttachRequested = { [model] runId in
+                model.requestWorkerPaneAttach(runId: runId)
+            }
             // Forward pool-config pushes from the engine so WorkersWorkspaceModel
             // always uses the engine's live pool sizes rather than independently-
             // maintained constants that drift when pool sizes change.

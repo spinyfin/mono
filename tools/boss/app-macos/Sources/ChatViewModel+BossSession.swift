@@ -119,4 +119,13 @@ extension ChatViewModel {
         guard isAppSessionRegistered else { return }
         engine.sendSpawnCapabilityRestored()
     }
+
+    /// Called by the Agents view when a live local worker on a visible
+    /// page has no viewer. Asks the engine to send `AttachWorkerPane` for
+    /// that run again. Dropped while no app session is registered: the
+    /// engine re-attaches every live worker as part of registration.
+    func requestWorkerPaneAttach(runId: String) {
+        guard isAppSessionRegistered else { return }
+        engine.sendRequestWorkerPaneAttach(runId: runId)
+    }
 }

@@ -2164,6 +2164,19 @@ pub enum FrontendRequest {
         input: RequestExecutionInput,
     },
 
+    /// App → engine: the Agents view is showing a live local worker it has
+    /// no viewer (terminal pane) for, and asks the engine to send
+    /// `AttachWorkerPane` for that run again. Sent when the view (or the
+    /// page holding the worker) becomes visible, never on a timer — the
+    /// engine's own bounded retry covers a failed attach while the user is
+    /// not looking. Idempotent: an attach for a run the app already hosts
+    /// succeeds without creating a second viewer. Fire-and-forget; the
+    /// outcome arrives as `AttachWorkerPane` (or as
+    /// `LiveWorkerState::viewer_attach_error` on the live-state topic).
+    RequestWorkerPaneAttach {
+        run_id: String,
+    },
+
     /// Read-only: resolve a project's design-doc pointer into the
     /// structured [`ResolveProjectDesignDocOutput`] the UI consumes.
     /// Engine-side this is `WorkDb::resolve_project_design_doc`

@@ -210,6 +210,7 @@ pub(in crate::app) fn read_lane(request: &R) -> ReadLane {
         | R::ReorderProjectTasks { .. }
         | R::ReportSelectedProduct { .. }
         | R::RequestExecution { .. }
+        | R::RequestWorkerPaneAttach { .. }
         | R::RestoreWorkItem { .. }
         | R::RetirePane { .. }
         | R::RetryCiRemediation { .. }

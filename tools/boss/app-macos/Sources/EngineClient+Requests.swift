@@ -773,6 +773,18 @@ extension EngineClient {
         ])
     }
 
+    /// Ask the engine to send `AttachWorkerPane` for `runId` again: the
+    /// Agents view is showing that live worker without a terminal. Sent
+    /// when the pane comes into view, never on a timer. Fire-and-forget;
+    /// the outcome arrives as the attach request itself or as
+    /// `viewer_attach_error` on the worker live-state topic.
+    func sendRequestWorkerPaneAttach(runId: String) {
+        sendLine([
+            "type": "request_worker_pane_attach",
+            "run_id": runId,
+        ])
+    }
+
     /// Ask the engine for all historical executions of `taskId`, newest-first.
     /// The engine replies with `executions_list`. The wire field is
     /// `work_item_id` — the engine's `ListExecutions` request and
