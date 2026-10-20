@@ -938,6 +938,25 @@ impl ExecutionCoordinator {
                 return DrainOutcome::QueueEmpty;
             }
         };
+        // Rows whose work item is at the human-only `critical` priority.
+        // `list_ready_executions` already sorted them first; this set is
+        // what exempts them from the operator-pause gate and the
+        // interactive concurrency cap below (`work/critical_priority.rs`).
+        // Read once per pass, from the task's *current* level, so a raise
+        // on a row that was already queued takes effect on the next pass.
+        let critical_ids: HashSet<String> = match self.work_db.list_critical_ready_execution_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                // Fail closed to ordinary queue semantics: a critical row
+                // still sorts first, it just loses its cap/pause exemption
+                // for this one pass.
+                tracing::warn!(
+                    ?err,
+                    "failed to list critical ready executions — treating none as critical"
+                );
+                HashSet::new()
+            }
+        };
 
         // Queue-level depth/oldest-wait gauges, sampled here (before the
         // pause gate and any filtering below) so they reflect the true
@@ -1079,6 +1098,10 @@ impl ExecutionCoordinator {
             let is_review = self.execution_targets_review_pool(&execution);
             let is_automation = !is_review && self.execution_targets_automation_pool(&execution);
             let is_main = !is_review && !is_automation;
+            // The `critical` exemptions apply to interactive (main-pool)
+            // work only: review and automation rows are governed by their
+            // own pools and are never held by the cap this bypasses.
+            let is_critical = is_main && critical_ids.contains(&execution.id);
             let pool_label = if is_review {
                 "review"
             } else if is_automation {
@@ -1112,7 +1135,14 @@ impl ExecutionCoordinator {
             // row in this pass is completely unaffected: this consumes at
             // most one id, for the one execution the caller is
             // synchronously awaiting the outcome of.
-            if paused && !is_review {
+            //
+            // The OTHER exception is a `critical` row: the human owner's
+            // escape hatch dispatches through an operator pause by
+            // design, every pass, with no marker to consume — it carries
+            // `DispatchAdmission::Critical` to the chokepoint instead.
+            // (A breaker pause never reaches this loop, so a critical row
+            // is still held by one — see `dispatch_hold_for`.)
+            if paused && !is_review && !is_critical {
                 if self.take_dispatch_pause_bypass(&execution.id) {
                     pause_bypass_admitted.insert(execution.id.clone());
                 } else {
@@ -1180,13 +1210,21 @@ impl ExecutionCoordinator {
             // deferred here with the `interactive_concurrency_cap` reason
             // and never touches the pipeline below. See the constant's doc
             // for rationale.
+            //
+            // A `critical` row is never capped: it may take any idle slot
+            // up to the pool's own capacity (the hard ceiling), which is
+            // the whole point of the level — `high` could not get past
+            // this gate. If no slot is idle it falls through to
+            // `pool_exhausted` below and, being sorted first, is next in
+            // line on the following pass. Running workers are never
+            // preempted for it.
             let live_workers_at_cap_check = if is_main {
                 Some(self.worker_pool.busy_count().await)
             } else {
                 None
             };
-            let capped =
-                live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers());
+            let capped = !is_critical
+                && live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers());
 
             if capped {
                 let claimed = if preempted_this_pass {
@@ -1318,6 +1356,7 @@ impl ExecutionCoordinator {
                             "dispatch_class_label": dispatch_class.label(),
                             "pool_ready_count": pool_ready_count,
                             "beaten_candidates": pool_ready_count.saturating_sub(1),
+                            "critical": is_critical,
                         })),
                 )
                 .await;
@@ -1546,7 +1585,7 @@ impl ExecutionCoordinator {
             // mainline arrival to at most one preemption.
             let claimed = match claimed {
                 Some(worker_id) => Some(worker_id),
-                None if is_main && !preempted_this_pass => {
+                None if is_main && !is_critical && !preempted_this_pass => {
                     match self.try_preempt_automation_for(&execution).await {
                         // Latch on the teardown having happened, NOT on
                         // having won the slot — see `PreemptionAttempt`.
@@ -1623,6 +1662,7 @@ impl ExecutionCoordinator {
                                 "pool": pool_label,
                                 "execution_kind": execution.kind.as_str(),
                                 "pool_capacity": pool_capacity,
+                                "critical": is_critical,
                             })),
                     )
                     .await;
@@ -1636,7 +1676,9 @@ impl ExecutionCoordinator {
                 continue;
             };
 
-            let admission = if pause_bypass_admitted.contains(&execution.id) {
+            let admission = if is_critical {
+                DispatchAdmission::Critical
+            } else if pause_bypass_admitted.contains(&execution.id) {
                 DispatchAdmission::PauseBypassOverride
             } else {
                 DispatchAdmission::Queued

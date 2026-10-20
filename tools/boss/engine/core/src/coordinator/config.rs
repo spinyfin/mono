@@ -618,6 +618,12 @@ impl ExecutionCoordinator {
     ///   `dispatch_pause_bypass_execution_ids` marker, so this arm exists to
     ///   keep that confirmation honest at the chokepoint rather than to
     ///   re-derive it.
+    /// - [`DispatchAdmission::Critical`] — the human-only `critical`
+    ///   priority: admitted under an Operator-origin pause (that is the
+    ///   pause the owner controls and the one the escape hatch exists to
+    ///   get past), held by a Breaker-origin pause exactly like
+    ///   [`DispatchAdmission::Queued`] — the spawn path is broken, so the
+    ///   urgent row would only burn another attempt against it.
     pub fn dispatch_hold_for(&self, execution: &WorkExecution, admission: DispatchAdmission) -> Option<DispatchHold> {
         let pause = self.dispatch_pause()?;
         let targets_review_pool = self.execution_targets_review_pool(execution);
@@ -673,6 +679,16 @@ impl ExecutionCoordinator {
                 hold(format!(
                     "dispatch is breaker-paused ({reason}) — the pause-only forced-dispatch override \
                      applies only to an operator pause",
+                    reason = pause.reason,
+                ))
+            }
+            DispatchAdmission::Critical => {
+                if pause.origin == DispatchPauseOrigin::Operator {
+                    return None;
+                }
+                hold(format!(
+                    "dispatch is breaker-paused ({reason}) — a `critical` priority bypasses only an \
+                     operator pause, not a broken spawn path",
                     reason = pause.reason,
                 ))
             }

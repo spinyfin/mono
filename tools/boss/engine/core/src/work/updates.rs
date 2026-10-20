@@ -456,7 +456,23 @@ impl WorkDb {
         }
         apply_repo_remote_url_patch(&mut task.repo_remote_url, patch.repo_remote_url);
         if let Some(priority_patch) = patch.priority {
-            task.priority = normalize_priority(Some(&priority_patch))?;
+            let requested = normalize_priority(Some(&priority_patch))?;
+            // `critical` is the human owner's escape hatch: a raise to it
+            // is accepted only from the human caller tier — see
+            // `critical_priority`. Lowering is an ordinary change.
+            super::critical_priority::authorize_priority_write(&requested, Some(&task.priority), actor)?;
+            if super::critical_priority::is_critical(&requested)
+                && !super::critical_priority::is_critical(&task.priority)
+            {
+                task.critical_set_by = Some(actor.to_owned());
+                task.critical_set_at = Some(now_string());
+            }
+            task.priority = requested;
+        }
+        // Critical provenance documents the row's *current* level only.
+        if !super::critical_priority::is_critical(&task.priority) {
+            task.critical_set_by = None;
+            task.critical_set_at = None;
         }
         let effort_level_patched = patch.effort_level.is_some();
         let effort_provenance_patched = patch.effort_matched_rule.is_some() || patch.effort_reasons.is_some();
@@ -687,6 +703,7 @@ impl WorkDb {
                  reasoning = ?20, tags = ?21, human_driven = ?22, completion_summary = ?23,
                  effort_matched_rule = ?24, effort_reasons = ?25, project_id = ?26, kind = ?27,
                  archived_by = ?28, archived_at = ?29, design_reasoning_effort_xhigh = ?30,
+                 critical_set_by = ?31, critical_set_at = ?32,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived') THEN COALESCE(completed_at, ?7)
@@ -724,6 +741,8 @@ impl WorkDb {
                 task.archived_by,
                 task.archived_at,
                 task.design_reasoning_effort_xhigh as i64,
+                task.critical_set_by,
+                task.critical_set_at,
             ],
         )?;
 

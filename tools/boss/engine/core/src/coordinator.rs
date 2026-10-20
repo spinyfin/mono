@@ -1957,6 +1957,17 @@ pub enum DispatchAdmission {
     /// when [`DispatchPauseOrigin::Operator`] still holds; a breaker pause
     /// refuses it exactly as it would an ordinary [`Self::Queued`] row.
     PauseBypassOverride,
+    /// The row's work item is at the human-only `critical` priority
+    /// (`work/critical_priority.rs`). `drain_ready_queue` keyed the row
+    /// off `WorkDb::list_critical_ready_execution_ids` and skipped both
+    /// the operator-pause gate and the interactive concurrency cap for
+    /// it; at the chokepoint it is admitted under an operator pause and —
+    /// like [`Self::PauseBypassOverride`] — still held by a breaker pause,
+    /// since a broken spawn path cannot run urgent work either. Durable
+    /// (it is a property of the row, not a one-shot marker), so a
+    /// critical row that misses a slot this pass is admitted again next
+    /// pass without any re-arming.
+    Critical,
 }
 
 impl DispatchAdmission {
@@ -1967,6 +1978,7 @@ impl DispatchAdmission {
             DispatchAdmission::OperatorForced => "operator_forced",
             DispatchAdmission::BreakerRecoveryProbe => "breaker_recovery_probe",
             DispatchAdmission::PauseBypassOverride => "pause_bypass_override",
+            DispatchAdmission::Critical => "critical",
         }
     }
 }

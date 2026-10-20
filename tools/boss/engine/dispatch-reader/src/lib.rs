@@ -361,6 +361,14 @@ pub struct BlockedNow {
     /// lets `bossctl dispatch stats` distinguish queued answer agents from
     /// the broader `other_work` dispatch class.
     pub execution_kind: String,
+    /// `true` when the drain flagged this row's work item as being at the
+    /// human-only `critical` priority (`details.critical` on its
+    /// `request_recorded` or `worker_claimed`/`skipped` events). Such a
+    /// row is exempt from the interactive concurrency cap and an operator
+    /// pause, so a critical row that is still blocked here is waiting on
+    /// pool capacity itself, not on the ordinary gates.
+    #[builder(default)]
+    pub critical: bool,
 }
 
 /// count / p50 / p95 / max dispatch wait, bucketed by the defer
@@ -463,6 +471,12 @@ pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Opti
             .unwrap_or("unknown")
             .to_owned();
 
+        let critical = evs
+            .iter()
+            .rev()
+            .find_map(|e| e.details.get("critical").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+
         let last_defer_reason_upto = |upto_ts: Option<u128>| -> String {
             evs.iter()
                 .rev()
@@ -500,6 +514,7 @@ pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Opti
                     reason,
                     pool,
                     execution_kind,
+                    critical,
                 });
             }
             // A terminal error before ever claiming a slot means dispatch
@@ -1596,6 +1611,7 @@ mod tests {
             reason: "pool_exhausted".to_owned(),
             pool: pool.to_owned(),
             execution_kind: "other_work".to_owned(),
+            critical: false,
         }
     }
 

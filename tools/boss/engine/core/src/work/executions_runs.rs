@@ -667,6 +667,13 @@ impl WorkDb {
     /// that automation ranks below all mainline work for an *interactive*
     /// slot regardless of where it lands in this sort — see
     /// `crate::dispatch_spillover` and `DispatchClass`'s docs.
+    ///
+    /// Ahead of every key above: a row whose work item is at the human-only
+    /// `critical` priority (`work/critical_priority.rs`) sorts first,
+    /// regardless of dispatch class, execution priority, or age — oldest
+    /// critical first among themselves. The drain also exempts those rows
+    /// from the interactive concurrency cap and an operator pause; see
+    /// [`Self::list_critical_ready_execution_ids`].
     pub fn list_ready_executions(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let class_case = format!(
@@ -693,11 +700,32 @@ impl WorkDb {
              WHERE we.status = 'ready' \
                AND (we.dispatch_not_before IS NULL \
                     OR CAST(we.dispatch_not_before AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER)) \
-             ORDER BY {class_case} ASC, we.priority DESC, we.created_at ASC, we.id ASC"
+             ORDER BY CASE WHEN t.priority = '{critical}' THEN 0 ELSE 1 END ASC, \
+                      CASE WHEN t.priority = '{critical}' THEN we.created_at END ASC, \
+                      {class_case} ASC, we.priority DESC, we.created_at ASC, we.id ASC",
+            critical = super::critical_priority::PRIORITY_CRITICAL,
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], map_execution)?;
         collect_rows(rows)
+    }
+
+    /// Ids of the `ready` executions whose work item is at `critical`
+    /// priority right now. Read once per drain pass so the gates that
+    /// exempt critical rows (interactive cap, operator pause) key on the
+    /// task's *current* level — a row that was queued at `high` and raised
+    /// to `critical` while waiting is exempt on the very next pass.
+    pub fn list_critical_ready_execution_ids(&self) -> Result<HashSet<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT we.id FROM work_executions we
+             JOIN tasks t ON t.id = we.work_item_id
+             WHERE we.status = 'ready' AND t.priority = ?1",
+        )?;
+        let rows = stmt.query_map([super::critical_priority::PRIORITY_CRITICAL], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<HashSet<String>>>().map_err(Into::into)
     }
 
     /// Compare-and-swap `ready → claimed` so the product reconciler cannot

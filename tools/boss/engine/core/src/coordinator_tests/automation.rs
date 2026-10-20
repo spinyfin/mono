@@ -976,3 +976,87 @@ async fn preempted_automation_work_redispatches_once_capacity_frees() {
         "redispatch must be a fresh execution, not the cancelled victim"
     );
 }
+
+#[tokio::test]
+async fn critical_waits_without_preempting_spilled_automation() {
+    const MAIN_POOL: usize = WORKER_PAGE_SIZE + 1; // 8 Bridge Crew + 1 Lower Decks
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let auto_chores = create_automation_chores(&db, &product.id, 2);
+    for n in 0..WORKER_PAGE_SIZE {
+        create_test_chore(&db, product.id.clone(), format!("Bridge chore {n}"));
+    }
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let pool = WorkerPool::new(MAIN_POOL);
+    let preemptor = Arc::new(FakePreemptor::new(pool.clone(), PreemptOutcome::Released));
+    let cube = Arc::new(FakeCubeClient::default());
+    let mut coord = ExecutionCoordinator::new(
+        db.clone(),
+        pool,
+        cube.clone(),
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        }),
+    )
+    .with_max_concurrent_interactive_workers(MAIN_POOL);
+    coord.set_automation_pool(WorkerPool::new_automation(1));
+    coord.set_automation_preemptor(preemptor.clone());
+    let coordinator = Arc::new(coord);
+    coordinator.kick();
+    // 8 Bridge Crew mainline + 1 automation in-pool + 1 spilled = 10.
+    wait_for_running_count(&db, WORKER_PAGE_SIZE + 2).await;
+
+    // Precondition: the interactive pool is full, with the Lower Decks
+    // slot held by spilled automation.
+    assert_eq!(
+        coordinator.worker_pool().idle_count().await,
+        0,
+        "test precondition: every interactive slot must be busy"
+    );
+    let spilled_execution_id = coordinator
+        .worker_pool()
+        .claims()
+        .await
+        .into_iter()
+        .find(|c| c.worker_id == "worker-9")
+        .expect("test precondition: an automation run must hold the Lower Decks slot")
+        .execution_id;
+    let spilled_work_item = db.get_execution(&spilled_execution_id).unwrap().work_item_id;
+    assert!(
+        auto_chores.contains(&spilled_work_item),
+        "test precondition: worker-9 must hold automation work"
+    );
+    assert!(preemptor.calls().await.is_empty(), "nothing preempted yet");
+
+    // A mainline chore arrives with nowhere to go.
+    let late = create_test_chore(&db, product.id.clone(), "Late mainline chore");
+    db.request_execution(
+        boss_protocol::RequestExecutionInput::builder()
+            .work_item_id(late.id.clone())
+            .build(),
+    )
+    .unwrap();
+
+    db.update_work_item_as_actor(
+        &late.id,
+        boss_protocol::WorkItemPatch {
+            priority: Some("critical".into()),
+            ..Default::default()
+        },
+        boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+    )
+    .unwrap();
+    coordinator.drain_ready_queue().await;
+    assert!(preemptor.calls().await.is_empty());
+    assert_eq!(
+        db.get_execution(&spilled_execution_id).unwrap().status,
+        ExecutionStatus::Running
+    );
+    let queued = db.list_executions(Some(&late.id)).unwrap();
+    assert_eq!(queued[0].status, ExecutionStatus::Ready);
+    assert!(claimed_worker_ids_for(&coordinator, &db, &late.id).await.is_empty());
+}

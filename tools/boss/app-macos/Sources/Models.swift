@@ -448,6 +448,13 @@ enum WorkPriority: String, CaseIterable, Identifiable {
     case low
     case medium
     case high
+    /// The human owner's escape hatch above `high`. The engine accepts
+    /// it only from a human session (never from the coordinator's CLI
+    /// tier or a worker), so it is offered here, in the app, and
+    /// refused with a "Work Error" alert for anything else. A critical
+    /// item dispatches ahead of everything, past the interactive
+    /// concurrency cap, and through an operator dispatch pause.
+    case critical
 
     var id: String { rawValue }
 
@@ -467,6 +474,7 @@ enum WorkPriority: String, CaseIterable, Identifiable {
         case .low: return "Low"
         case .medium: return "Medium"
         case .high: return "High"
+        case .critical: return "Critical"
         }
     }
 }

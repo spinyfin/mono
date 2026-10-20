@@ -1175,6 +1175,16 @@ pub(crate) fn insert_revision_in_tx(
         bail!("revision description must be non-empty");
     }
     let priority = normalize_priority(input.priority.as_deref())?;
+    // A revision is minted by the engine (CI fix, merge conflict, PR
+    // review) or filed over RPC with no resolved caller tier, and it must
+    // never inherit its parent's `critical` either — so it is created at
+    // an ordinary level and a human raises it afterwards if they mean it.
+    if super::critical_priority::is_critical(&priority) {
+        bail!(
+            "a revision cannot be created at priority `critical`; create it at a lower level and \
+             have a human raise it with `boss task update <id> --priority critical`"
+        );
+    }
     let effort_level = Some(
         input
             .effort_level
@@ -1344,8 +1354,11 @@ pub(crate) fn canonicalize_created_via(raw: Option<&str>, id_for_log: &str, kind
 /// lower-case value. `None`, the empty string, and pure whitespace
 /// resolve to the schema default (`medium`) so callers never have
 /// to type `--priority medium` explicitly. Anything outside
-/// `low` / `medium` / `high` is rejected up-front so the engine
-/// stays the single source of truth for the vocabulary.
+/// `low` / `medium` / `high` / `critical` is rejected up-front so the
+/// engine stays the single source of truth for the vocabulary. This
+/// only validates the spelling: whether the caller may *write*
+/// `critical` is [`super::critical_priority::authorize_priority_write`]'s
+/// decision.
 pub fn normalize_priority(value: Option<&str>) -> Result<String> {
     let trimmed = value.unwrap_or("").trim();
     if trimmed.is_empty() {
@@ -1353,8 +1366,8 @@ pub fn normalize_priority(value: Option<&str>) -> Result<String> {
     }
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
-        "low" | "medium" | "high" => Ok(lower),
-        other => bail!("invalid priority `{other}`; expected one of low, medium, high"),
+        "low" | "medium" | "high" | super::critical_priority::PRIORITY_CRITICAL => Ok(lower),
+        other => bail!("invalid priority `{other}`; expected one of low, medium, high, critical"),
     }
 }
 
@@ -1517,6 +1530,11 @@ mod tests {
     fn normalize_priority_rejects_unknown_value() {
         let err = normalize_priority(Some("urgent")).unwrap_err();
         assert!(err.to_string().contains("invalid priority"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn normalize_priority_accepts_critical() {
+        assert_eq!(normalize_priority(Some(" Critical ")).unwrap(), "critical");
     }
 
     // ── normalize_model_override ────────────────────────────────────────────
