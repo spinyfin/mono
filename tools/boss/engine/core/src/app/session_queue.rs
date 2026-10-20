@@ -424,7 +424,18 @@ impl SessionSink {
         if let Some(id) = env.request_id.clone() {
             if matches!(
                 env.payload,
-                FrontendEvent::Error { .. } | FrontendEvent::WorkError { .. }
+                FrontendEvent::Error { .. }
+                    | FrontendEvent::WorkError { .. }
+                    | FrontendEvent::ExecutionTranscriptUnavailable { .. }
+                    | FrontendEvent::ProductDesignDocContent {
+                        content: boss_protocol::DesignDocContent::Failed { .. },
+                        ..
+                    }
+                    | FrontendEvent::ProductDesignDocsList {
+                        state: boss_protocol::DesignDocTreeState::Unreachable { .. }
+                            | boss_protocol::DesignDocTreeState::RateLimited { .. },
+                        ..
+                    }
             ) {
                 reads.cancel(&id);
             } else {

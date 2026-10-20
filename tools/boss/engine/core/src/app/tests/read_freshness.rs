@@ -1,5 +1,57 @@
 use super::*;
 
+#[tokio::test]
+async fn newer_domain_failures_do_not_replace_successful_snapshots() {
+    use boss_protocol::{DesignDocContent, DesignDocTreeState};
+    let failures = [
+        FrontendEvent::ProductDesignDocContent {
+            repo_remote_url: "repo".into(),
+            path: "doc.md".into(),
+            git_ref: "main".into(),
+            content: DesignDocContent::Failed {
+                reason: "offline".into(),
+                retryable: true,
+            },
+        },
+        FrontendEvent::ProductDesignDocsList {
+            product_id: "product".into(),
+            state: DesignDocTreeState::Unreachable {
+                repo_remote_url: "repo".into(),
+                reason: "offline".into(),
+            },
+        },
+        FrontendEvent::ProductDesignDocsList {
+            product_id: "product".into(),
+            state: DesignDocTreeState::RateLimited {
+                repo_remote_url: "repo".into(),
+                reason: "limited".into(),
+            },
+        },
+        FrontendEvent::ExecutionTranscriptUnavailable {
+            execution_id: "execution".into(),
+            reason: "missing".into(),
+        },
+    ];
+    for failure in failures {
+        let sink = make_session_sink();
+        {
+            let mut reads = sink.view_reads.lock().unwrap();
+            reads.begin("old", "view".into());
+            reads.begin("new", "view".into());
+        }
+        let expected_failure = serde_json::to_value(&failure).unwrap();
+        send_response(&sink, "new", failure);
+        let newer = sink.next().await.unwrap();
+        assert_eq!(newer.request_id.as_deref(), Some("new"));
+        assert_eq!(serde_json::to_value(newer.payload).unwrap(), expected_failure);
+        // Snapshot contents are opaque to the ledger; this sentinel must survive.
+        send_response(&sink, "old", FrontendEvent::ProductsList { products: vec![] });
+        let older = sink.next().await.unwrap();
+        assert_eq!(older.request_id.as_deref(), Some("old"));
+        assert!(matches!(older.payload, FrontendEvent::ProductsList { .. }));
+    }
+}
+
 fn context(state: &Arc<ServerState>, sink: &Arc<SessionSink>, id: &str) -> Dispatch {
     Dispatch::builder()
         .server_state(state.clone())

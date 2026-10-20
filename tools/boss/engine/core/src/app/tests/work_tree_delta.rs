@@ -52,7 +52,6 @@ fn slow_board_read_does_not_block_a_later_read_on_the_same_session() {
 fn repeated_overtaking(other_product: bool) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .start_paused(true)
         .build()
         .unwrap();
     let _entered = runtime.enter();
@@ -115,7 +114,6 @@ fn repeated_overtaking(other_product: bool) {
         ))
     });
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    runtime.block_on(tokio::time::advance(Duration::from_secs(61)));
     state
         .work_db
         .connect()
