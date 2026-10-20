@@ -39,9 +39,9 @@ Alongside the request/event protocol sit the types for observing a
 worker's life: the typed `WorkerEvent` form of the claude lifecycle
 hooks (delivered via the `boss-event` shim), the per-slot
 `LiveWorkerState` the engine derives from those hooks, the diagnostic
-snapshot returned by the live-status debug verb, and the deterministic
-slot-id → crew-name roster that the engine, `bossctl`, and the Swift app
-keep in lock-step.
+snapshot returned by the live-status debug verb, and the crew roster from
+which the engine leases durable worker personas (kept in step with the
+app's portrait grid by `worker_roster_parity_test`).
 
 ## The builder convention
 
