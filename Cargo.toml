@@ -31,6 +31,7 @@ members = [
   "tools/boss/engine/dispatch-events",
   "tools/boss/engine/dispatch-reader",
   "tools/boss/engine/event-bus",
+  "tools/boss/engine/single-flight",
   "tools/boss/engine/core",
   "tools/boss/engine/grok-home-retention",
   "tools/boss/engine/jsonl-append",

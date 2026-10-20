@@ -280,6 +280,11 @@ impl WorkDb {
         })
     }
 
+    /// Observe commits from any other connection without a writer lock.
+    pub(crate) fn read_data_version(&self) -> Result<i64> {
+        Ok(self.connect()?.query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
     /// Independent WAL reader for bulk inspection. In-memory test databases
     /// keep their anchor; production file databases never share the writer mutex.
     pub(crate) fn reader(&self) -> Result<Self> {

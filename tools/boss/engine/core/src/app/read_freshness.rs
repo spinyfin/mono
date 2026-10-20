@@ -50,16 +50,25 @@ impl<T: Clone> ReadFreshness<T> {
     }
 
     pub(super) fn finish(&mut self, request: &str, value: T) -> T {
-        let Some((key, generation)) = self.requests.get(request) else {
+        let Some((_, generation)) = self.requests.get(request) else {
+            return value;
+        };
+        self.finish_at(request, *generation, value)
+    }
+
+    /// Board reads share a load; order those snapshots by load start instead
+    /// of the order their individual waiters happened to register.
+    pub(super) fn finish_at(&mut self, request: &str, generation: u64, value: T) -> T {
+        let Some((key, _)) = self.requests.get(request) else {
             return value;
         };
         let view = self.views.get_mut(key).expect("active view");
-        let value = if *generation < view.completed {
+        let value = if generation < view.completed {
             view.latest.clone().expect("completed snapshot")
         } else {
             value
         };
-        view.completed = view.completed.max(*generation);
+        view.completed = view.completed.max(generation);
         if view.active > 1 {
             view.latest = Some(value.clone());
         }
@@ -71,6 +80,18 @@ impl<T: Clone> ReadFreshness<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_snapshot_start_overrides_request_registration_order() {
+        let mut reads = ReadFreshness::default();
+        reads.begin("registered first", "board".into());
+        reads.begin("registered second", "board".into());
+        // The first handler was delayed before joining a scan, then joined a
+        // fresher load. The second handler must not put the older tree back.
+        assert_eq!(reads.finish_at("registered first", 20, "new"), "new");
+        assert_eq!(reads.finish_at("registered second", 10, "old"), "new");
+        assert!(reads.views.is_empty());
+    }
 
     #[test]
     fn reverse_completion_preserves_latest_view_without_retaining_idle_views() {
