@@ -117,6 +117,37 @@ final class AgentsGridModel: ObservableObject {
         replaceLayout { $0.setFilter(filter) }
     }
 
+    /// Run outlined after an explicit focus request, so the reader can find
+    /// the cell. Cleared after `highlightDuration`.
+    @Published private(set) var highlightedRunId: String?
+    /// Transient notice that a focus request cleared a hiding filter.
+    @Published private(set) var filterClearedBanner: String?
+    static let highlightDuration: TimeInterval = 3
+    private var highlightTask: Task<Void, Never>?
+
+    /// Reveal path for `bossctl agents focus` and Doing-card clicks: clear a
+    /// hiding filter (with a banner), select the run's page, focus it, and
+    /// outline it. Viewer-less members are revealed too; their card is the
+    /// focus target.
+    @discardableResult
+    func reveal(runId: String) -> PaneRevealOutcome {
+        var outcome = PaneRevealOutcome.notMember
+        replaceLayout { outcome = $0.reveal(runId: runId) }
+        guard outcome != .notMember else { return outcome }
+        highlightedRunId = runId
+        filterClearedBanner = outcome == .revealedClearingFilter
+            ? "Filter cleared to show \(personaByRun[runId] ?? "this agent")."
+            : nil
+        highlightTask?.cancel()
+        highlightTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(AgentsGridModel.highlightDuration * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.highlightedRunId = nil
+            self?.filterClearedBanner = nil
+        }
+        return outcome
+    }
+
     func setFocusedRun(_ runId: String?) {
         replaceLayout { $0.setFocusedRun(runId) }
     }

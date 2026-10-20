@@ -2283,6 +2283,22 @@ mod tests {
     }
 
     #[test]
+    fn run_slot_and_persona_references_resolve_to_the_same_focus_target() {
+        // `agents focus` sends only the resolved run id to the engine, so the
+        // three reference forms must be interchangeable.
+        let states = [worker(1, "exec_abc", "Riker"), worker(7, "exec_def", "Yar")];
+        for reference in ["exec_def", "7", "yar"] {
+            assert_eq!(
+                resolve_agent_ref(reference, &states)
+                    .expect("reference should resolve")
+                    .run_id,
+                "exec_def",
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
     fn resolves_by_name_case_insensitive() {
         let states = [worker(1, "exec_abc", "Riker"), worker(2, "exec_def", "Data")];
         let resolved = resolve_agent_ref("dATa", &states).expect("crew name should resolve");

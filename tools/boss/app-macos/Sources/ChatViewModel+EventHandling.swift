@@ -767,7 +767,7 @@ extension ChatViewModel {
             let result = paneDetachHandler.map { $0(runId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendDetachWorkerPaneResponse(requestId: requestId, result: result)
         case .focusWorkerPane(let runId):
-            let result = paneFocusHandler.map { $0(runId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
+            let result = focusAgentRun(runId)
             engine.sendFocusWorkerPaneResponse(requestId: requestId, result: result)
         case .revealWorkItem(let workItemId, let productId):
             revealWorkCard(workItemId, productID: productId) { [weak self] result in
@@ -797,7 +797,7 @@ extension ChatViewModel {
         }
     }
 
-    private static let noPaneAllocatorReason = "no pane allocator wired into this build (Bazel without GhosttyKit)"
+    static let noPaneAllocatorReason = "no pane allocator wired into this build (Bazel without GhosttyKit)"
 
     // MARK: - Arm helpers
 

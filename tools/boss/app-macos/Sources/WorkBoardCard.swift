@@ -171,12 +171,21 @@ struct WorkBoardCardItem: View {
             ? { openWindow(id: "attachment-viewer", value: AttachmentViewerRef(taskId: task.id)) }
             : nil
 
+        // Doing cards with a live run can jump to that run's Agents cell.
+        let onFocusAgent: (() -> Void)? = {
+            guard column == .doing,
+                  let runId = model.taskRuntime(for: task.id)?.executionID
+            else { return nil }
+            return { model.focusAgentFromWorkCard(runId) }
+        }()
+
         VStack(alignment: .leading, spacing: 6) {
             Button {
                 model.selectWorkCard(snapshot.isSelected ? nil : task.id)
             } label: {
                 WorkBoardCardView(
                     snapshot: snapshot,
+                    onFocusAgent: onFocusAgent,
                     onRevealQueueBlocker: { blocker in
                         if case .unreachable(let reason) = model.revealWorkCard(blocker.workItemID, productID: blocker.productID) {
                             model.workErrorMessage = "Couldn't reveal \(blocker.label): \(reason)"
@@ -405,6 +414,8 @@ struct WorkBoardCardItem: View {
 /// every sub-region.
 struct WorkBoardCardView: View, @MainActor Equatable {
     let snapshot: WorkCardSnapshot
+    /// Shows the run in the Agents view; outside `==` like other handlers.
+    var onFocusAgent: (() -> Void)? = nil
     var onRevealQueueBlocker: ((DispatchWaitBlocker) -> Void)? = nil
     /// Keyed revision-hover input, kept outside the snapshot so changing it
     /// does not require rebuilding every card snapshot in the column.
@@ -480,7 +491,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
             WorkBoardCardTitleRow(slice: WorkBoardCardTitleRowSlice(snapshot: snap))
                 .equatable()
             if let liveStatus = WorkBoardCardLiveStatusRowSlice(snapshot: snap) {
-                WorkBoardCardLiveStatusRow(slice: liveStatus, onRevealBlocker: onRevealQueueBlocker)
+                WorkBoardCardLiveStatusRow(slice: liveStatus, onRevealBlocker: onRevealQueueBlocker, onFocusAgent: onFocusAgent)
                     .equatable()
             }
             if let operatorQuestion = WorkBoardCardOperatorQuestionSlice(snapshot: snap) {

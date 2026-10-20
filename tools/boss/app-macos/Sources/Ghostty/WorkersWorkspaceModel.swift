@@ -2,6 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 import GhosttyKit
+import PaneLayout
 
 @MainActor
 final class WorkersWorkspaceModel: ObservableObject {
@@ -163,6 +164,37 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
     }
 
+    let agentFocus = AgentFocusCoordinator()
+
+    /// Installed by the Agents view. Applies the run-keyed reveal (filter
+    /// clear, page select, outline) on the view's grid model, forcing the
+    /// grid visible and current first so a request that arrives while another
+    /// mode is showing still resolves against live membership.
+    var agentsRevealHandler: ((String) -> PaneRevealOutcome)?
+
+    /// Run-keyed focus used by `bossctl agents focus` and Doing-card clicks.
+    /// Reveals the run's cell in the Agents view, then focuses its terminal
+    /// once layout has placed it. Success acknowledges reveal; the bounded
+    /// asynchronous responder attempt logs its final outcome. New requests
+    /// cancel superseded focus attempts; a run without a viewer is revealed as its
+    /// "Viewer not attached" card. A run unknown to both membership and the
+    /// viewer map fails as `.unknownSlot`.
+    func revealAgent(runId: String) -> EngineFocusResult {
+        let outcome = agentsRevealHandler?(runId) ?? .notMember
+        let viewer = viewersByRunId[runId]
+        guard outcome != .notMember || viewer != nil else {
+            return .failure(.unknownSlot)
+        }
+        agentFocus.request(runId: runId) { [weak self] in
+            guard let self else { return .failure(.unknownSlot) }
+            if self.viewersByRunId[runId]?.session != nil {
+                return self.focusWorkerPane(runId: runId)
+            }
+            return self.agentFocus.focusCard(runId: runId)
+        }
+        return .success
+    }
+
     /// Bring the slot's libghostty surface to first responder and
     /// raise the host window. Mirrors the user-click path in
     /// `GhosttyTerminalHostView.mouseDown` (which also calls
@@ -188,7 +220,9 @@ final class WorkersWorkspaceModel: ObservableObject {
             window.deminiaturize(nil)
         }
         window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(host)
+        guard window.makeFirstResponder(host) else {
+            return .failure(.internalFailure("pane refused keyboard focus"))
+        }
         return .success
     }
 }

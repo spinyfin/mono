@@ -81,6 +81,12 @@ struct WorkersDetailView: View, @MainActor Equatable {
             if grid.layout.selectorsVisible {
                 pageSelectors
             }
+            if let banner = grid.filterClearedBanner {
+                Text(banner)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Color.accentColor)
+                    .transition(.opacity)
+            }
             Spacer(minLength: 8)
             if grid.layout.filter.isActive {
                 hiddenSummary
@@ -184,6 +190,9 @@ struct WorkersDetailView: View, @MainActor Equatable {
                     WorkerSlotView(
                         runtime: workspace.runtime,
                         snapshot: snapshot,
+                        isHighlighted: grid.highlightedRunId == runId,
+                        focusCoordinator: workspace.agentFocus,
+                        focusRunId: runId,
                         onToggleLiveStatus: { enabled in
                             onToggleLiveStatus(snapshot.slotId, enabled)
                         }
@@ -261,12 +270,37 @@ struct WorkersDetailView: View, @MainActor Equatable {
         workspace.runtime.onWorkerFocus = { [grid] sessionId in
             grid.setFocusedRun(String(sessionId.dropFirst("run-".count)))
         }
+        Self.bindAgentReveal(grid: grid, workspace: workspace, liveStates: liveStates)
         syncGrid()
+    }
+
+    static func bindAgentReveal(
+        grid: AgentsGridModel,
+        workspace: WorkersWorkspaceModel,
+        liveStates: LiveWorkerStateStore
+    ) {
+        workspace.agentsRevealHandler = { [grid, weak workspace, liveStates] runId in
+            guard let workspace else { return .notMember }
+            // Make membership current before validating the request; the
+            // successful reveal will then switch navigation to Agents.
+            grid.setVisible(true)
+            Self.applyMembership(grid: grid, workspace: workspace, liveStates: liveStates)
+            return grid.reveal(runId: runId)
+        }
     }
 
     private func syncGrid() {
         grid.setVisible(isVisible)
         guard isVisible else { return }
+        Self.applyMembership(grid: grid, workspace: workspace, liveStates: liveStates)
+        refreshSnapshots()
+    }
+
+    private static func applyMembership(
+        grid: AgentsGridModel,
+        workspace: WorkersWorkspaceModel,
+        liveStates: LiveWorkerStateStore
+    ) {
         grid.apply(
             states: Array(liveStates.byRunID.values),
             viewers: workspace.viewersByRunId,
@@ -275,7 +309,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
             reviewPoolSize: workspace.reviewSlotCount,
             feedUnavailable: liveStates.feedUnavailable
         )
-        refreshSnapshots()
     }
 
     private func refreshSnapshots() {
@@ -377,11 +410,18 @@ private struct AgentsPaneSizeKey: PreferenceKey {
 struct WorkerSlotView: View, @MainActor Equatable {
     let runtime: GhosttyRuntime
     let snapshot: WorkerSlotSnapshot
+    /// Outline shown on the cell a focus request just revealed.
+    var isHighlighted = false
+    var focusCoordinator: AgentFocusCoordinator?
+    var focusRunId: String?
     let onToggleLiveStatus: (Bool) -> Void
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.runtime === rhs.runtime
             && lhs.snapshot == rhs.snapshot
+            && lhs.isHighlighted == rhs.isHighlighted
+            && lhs.focusCoordinator === rhs.focusCoordinator
+            && lhs.focusRunId == rhs.focusRunId
     }
 
     var body: some View {
@@ -392,6 +432,13 @@ struct WorkerSlotView: View, @MainActor Equatable {
             slotBody
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .overlay {
+            if isHighlighted {
+                Rectangle()
+                    .strokeBorder(Color.accentColor, lineWidth: 3)
+                    .allowsHitTesting(false)
+            }
+        }
     }
 
     @ViewBuilder
@@ -446,6 +493,11 @@ struct WorkerSlotView: View, @MainActor Equatable {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .black))
+        .background {
+            if let focusCoordinator, let focusRunId {
+                AgentCardFocusTarget(coordinator: focusCoordinator, runId: focusRunId)
+            }
+        }
     }
 
     @ViewBuilder
