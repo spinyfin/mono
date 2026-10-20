@@ -17,6 +17,7 @@ rust_library(
         "src/initial_prompt.py",
         "src/agy/adapter.py",
         "src/checkleft_push_guard.py",
+        "src/signal_guard.py",
     ],
     crate_name = "boss_engine_driver",
     crate_root = "src/lib.rs",
@@ -68,6 +69,7 @@ rust_test(
         "src/initial_prompt.py",
         "src/agy/adapter.py",
         "src/checkleft_push_guard.py",
+        "src/signal_guard.py",
     ],
     crate = ":driver",
     data = [
