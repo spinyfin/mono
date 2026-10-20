@@ -18,6 +18,7 @@
 //! status below).
 
 pub mod render;
+pub mod slow;
 pub mod state;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -194,6 +195,13 @@ impl LiveProgress {
             shared: Arc::clone(&self.shared),
             render_findings,
         })
+    }
+
+    /// A sink that streams slow-check lines into the scrolling log area, so
+    /// they interleave with findings instead of tearing the pinned status block.
+    pub fn log_sink(&self) -> slow::SlowCheckSink {
+        let shared = Arc::clone(&self.shared);
+        Arc::new(move |lines| shared.lock().unwrap().push_log_lines(lines))
     }
 
     /// Stop the render loop and draw the final frame. Idempotent. Call once all
