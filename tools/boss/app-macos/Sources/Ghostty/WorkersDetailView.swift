@@ -165,19 +165,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
     }
 
     private var pageSelectors: some View {
-        HStack(spacing: 6) {
-            Text("Page:")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            ForEach(grid.layout.pageSelectors, id: \.index) { selector in
-                AgentPageSelectorChip(
-                    selector: selector,
-                    isSelected: selector.index == grid.layout.selectedPage
-                ) {
-                    grid.selectPage(selector.index)
-                }
-            }
-        }
+        AgentPageSelectors(layout: grid.layout, onSelect: grid.selectPage)
     }
 
     // A single flat collection owns surfaces for their entire attached lifetime.
@@ -349,47 +337,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
             isPlaceholder: isPlaceholder,
             cachedPersona: grid.personaName(for: runId)
         )
-    }
-}
-
-private struct AgentPageSelectorChip: View {
-    let selector: PageSelector
-    let isSelected: Bool
-    let onSelect: () -> Void
-
-    var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 4) {
-                Text(pageLabel)
-                    .font(.caption.weight(.semibold))
-                Text("·")
-                    .foregroundStyle(.secondary)
-                Text(occupiedLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if selector.hasWaiting {
-                    Circle()
-                        .fill(Color.orange)
-                        .frame(width: 6, height: 6)
-                        .accessibilityLabel("Waiting workers")
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(
-                isSelected
-                    ? Color.accentColor.opacity(0.18)
-                    : Color.secondary.opacity(0.08)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Page \(selector.index + 1), \(selector.occupiedCount) agents")
-    }
-
-    private var pageLabel: String { String(selector.index + 1) }
-    private var occupiedLabel: String {
-        "\(selector.occupiedCount) \(selector.occupiedCount == 1 ? "Agent" : "Agents")"
     }
 }
 
