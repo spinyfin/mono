@@ -160,10 +160,20 @@ payload arrived at dispatcher`, `dropping hook fan-out`) were not available
 when the fix was written. The settle loop's sleeps alone (~200ms) are far
 shorter than the minutes the pane stayed Idle, so a delay that long would
 have to come from elsewhere in the `Stop`'s ingress (transcript read, DB
-lock contention). If the symptom recurs, check those lines first: a hook
-that never arrived, or one dropped on the slot-less path, is not fixed by
-ordering. Every `Stale` refusal logs `ingress_seq` and `last_applied_seq`,
-so a recurrence with a refusal in the log confirms the race.
+lock contention). Another unruled-out cause is the shim's resilience path:
+after its roughly ten-second connection retry budget, it appends the hook
+to `.boss/events-pending.jsonl`, exits successfully, and retries delivery
+only when another hook fires. A buffered `PreToolUse` may therefore arrive
+with `PostToolUse` after the entire long command. Check shim stderr for
+`buffering event for later delivery` and the pending file for that payload.
+An engine `hook event received` followed by `dropping hook fan-out`
+distinguishes a slot-less drop from shim buffering; `hook payload arrived
+at dispatcher` confirms dispatch. Missing receipt alone cannot distinguish
+buffering from a hook that never fired. Every `Stale` refusal logs
+`ingress_seq` and `last_applied_seq`, proving reducer reordering, but not
+by itself proving the cause of the historical incident. The incident's
+engine logs and original pending buffer require coordinator investigation;
+neither delivery failure nor slot-less dropping is repaired by ordering.
 
 Three things close the ordering hole:
 
@@ -176,10 +186,12 @@ Three things close the ordering hole:
   late (`ApplyEventOutcome::Stale`). A late event does not touch `activity`,
   `current_tool` or the display timestamps, and does not trigger the
   live-status loop's `Stop`/`PostToolUse` refresh. Hook events are
-  incremental, though, so two late events still contribute: a late
-  `Notification` repairs the `Stop` that overtook it (`WaitingForInput`
-  rather than `Idle`, or the pending flag the events after it did not
-  clear), and a late `Stop` reports the turn boundary it opened (below).
+  incremental, though, so late events still contribute: a late
+  `Notification` repairs only an Idle slot whose newest `Stop` was its
+  first clearing event. An earlier `PreToolUse` or `Stop` consumes it;
+  Errored and Terminated slots are never repaired to waiting. A late
+  `Stop` reports the turn boundary it opened (below), and stale main-session
+  activity can consume an older boundary without changing the display.
   Liveness bookkeeping (`record_driver_signal`) already happened at ingress.
   Unsequenced callers (the Codex stdout reader, engine-synthesized events,
   tests) keep the always-apply `apply_event`.
@@ -200,8 +212,8 @@ Three things close the ordering hole:
   `Stop`, or the late `Stop` itself once main-session activity numbered above
   it has already been applied. The ingress then calls
   `WaitRegistry::end_if_declared_before`, which ends the wait only if it was
-  declared before that boundary (the wait records the hook sequence it was
-  declared after), so a late `Stop` cannot end a wait declared in the turn
+  declared before that boundary (the wait records the newest accepted hook
+  sequence, including hooks still outstanding), so a late `Stop` cannot end a wait declared in the turn
   that overtook it. Hooks stamped with an `agent_id` (a backgrounded
   subagent's tools) are not main-session activity, a permission-prompt
   `Notification` is not a turn boundary, and a wait declared mid-turn

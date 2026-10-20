@@ -1009,7 +1009,9 @@ fn worker_wait_protocol_directive() -> String {
      Optionally pass `--waiting-on <task-id|pid|file>`. Re-running renews the wait. A wait ends \
      the moment your next turn begins — including a turn Claude Code starts on its own when a \
      background command finishes — so if you are still waiting when that turn ends, run the \
-     command again before ending it. An unexpired \
+     command again before ending it. Each declaration charges its full duration against the \
+     cap even if a turn resumes early; choose the expected remaining wait rather than the \
+     maximum, since re-declaring charges it again. An unexpired \
      wait holds the produce-a-PR nudge ladder and the nudge circuit breaker; it does not pause \
      the stale-worker reap or other safety checks. After expiry, normal nudging resumes. Total \
      wait-extension per execution is also capped.\n"

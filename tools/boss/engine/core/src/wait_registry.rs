@@ -248,6 +248,9 @@ impl WaitRegistry {
     /// period that is over. The budget stays charged so a worker cannot reset
     /// its per-execution cap by starting turns; it re-declares (and is
     /// charged again) if it is still waiting when the resumed turn ends.
+    /// This caps granted nudge suppression, not elapsed idle time: early wakes
+    /// intentionally do not refund grants. Declare the expected remaining wait
+    /// rather than reserving the two-hour maximum on every turn.
     pub fn end_if_declared_before(&self, execution_id: &str, boundary_seq: Option<u64>) -> Option<WaitRecord> {
         let mut guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
         let state = guard.get_mut(execution_id)?;

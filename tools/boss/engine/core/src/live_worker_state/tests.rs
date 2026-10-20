@@ -1615,3 +1615,46 @@ fn a_notification_overtaken_by_a_pre_tool_use_is_moot() {
     applied(&reg, 4, &stop_event(), false);
     assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
 }
+
+#[test]
+fn late_notification_uses_first_consumer_across_stop_boundaries() {
+    for repeated_stop in [false, true] {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        if repeated_stop {
+            applied(&reg, 3, &stop_event(), false);
+        } else {
+            applied(&reg, 3, &pre_tool("Read"), false);
+            applied(&reg, 4, &post_tool("Read"), false);
+        }
+        applied(&reg, 5, &stop_event(), false);
+        assert!(!applied(&reg, 2, &notification_event(), false).repaired);
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    }
+}
+
+#[test]
+fn late_notification_cannot_resurrect_a_dead_or_errored_slot() {
+    for activity in [WorkerActivity::Errored, WorkerActivity::Terminated] {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        applied(&reg, 3, &stop_event(), false);
+        reg.inner.lock().unwrap().get_mut(&1).unwrap().state.activity = activity;
+        assert!(!applied(&reg, 2, &notification_event(), false).repaired);
+        assert_eq!(reg.get(1).unwrap().activity, activity);
+    }
+}
+
+#[test]
+fn stale_main_activity_preserves_a_newer_stop_boundary() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 2, &stop_event(), false);
+    applied(&reg, 5, &stop_event(), false);
+    applied(&reg, 6, &pre_tool("Grep"), true);
+    assert_eq!(applied(&reg, 3, &pre_tool("Read"), false).resumed_after, None);
+    assert_eq!(
+        applied(&reg, 7, &pre_tool("Bash"), false).resumed_after,
+        Some(TurnBoundary { seq: Some(5) }),
+    );
+}

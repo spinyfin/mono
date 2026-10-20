@@ -696,6 +696,9 @@ struct ServerState {
     /// [`crate::wait_registry`].
     #[builder(default)]
     wait_registry: Arc<crate::wait_registry::WaitRegistry>,
+    /// Newest accepted hook, including connections not yet dispatched.
+    #[builder(default)]
+    accepted_hook_seq: Arc<AtomicU64>,
     /// In-flight completion-teardown marks, shared with the completion
     /// handler so [`crate::terminal_work_sweep`] (wired in
     /// `app::server::serve`) never reclaims a pane whose own teardown is

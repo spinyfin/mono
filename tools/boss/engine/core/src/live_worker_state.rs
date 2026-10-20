@@ -368,10 +368,10 @@ struct SlotMeta {
     /// Sequence of the newest `Stop` applied (it consumed any pending
     /// `Notification`).
     last_stop_seq: Option<u64>,
-    /// Sequence of the newest event that cleared `notification_pending`
-    /// (`Stop`, `PreToolUse`, `SessionEnd`). A late `Notification` numbered
-    /// below it was consumed by that event in emission order.
-    last_pending_clear_seq: Option<u64>,
+    /// Ordered clearing events retained for this slot lifetime so a late
+    /// notification is attributed to its first consumer, not the newest one.
+    #[builder(default)]
+    pending_clear_seqs: std::collections::BTreeSet<u64>,
     /// Whether [`crate::spawn_ack_sweep::raise_liveness_undeterminable_attention`]
     /// has already fired for this slot's current run. Guards against raising
     /// the same attention item again on every subsequent pass once the
@@ -1604,8 +1604,8 @@ impl LiveWorkerStateRegistry {
     /// tool hooks, no `UserPromptSubmit`; if the preceding `Stop` is still
     /// on its way, it lands *after* the `PreToolUse` and rewinds the slot to
     /// `Idle` with no tool, for as long as the next hook takes to arrive —
-    /// the whole of a multi-minute `checkleft run`, in the 2026-10-15
-    /// incident this guards against.
+    /// potentially the whole of a long tool call. See worker-liveness-contract.md
+    /// for what this explains and leaves unproven about the 2026-10-15 incident.
     ///
     /// So the slot remembers the newest sequence it applied, and an event
     /// numbered below it is refused as [`ApplyEventOutcome::Stale`]: it
@@ -1668,6 +1668,12 @@ impl LiveWorkerStateRegistry {
             };
         };
         if let Some(ingress_seq) = ingress_seq {
+            if matches!(
+                event,
+                WorkerEvent::Stop { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::SessionEnd { .. }
+            ) {
+                meta.pending_clear_seqs.insert(ingress_seq);
+            }
             if let Some(last_applied_seq) = meta.last_applied_ingress_seq
                 && last_applied_seq > ingress_seq
             {
@@ -1682,7 +1688,7 @@ impl LiveWorkerStateRegistry {
                     "live-state registry: a hook event arrived behind a newer one; \
                      the slot already reflects what the worker did after it",
                 );
-                let (resumed_after, repaired) = reconcile_late_event(state, meta, ingress_seq, event);
+                let (resumed_after, repaired) = reconcile_late_event(state, meta, ingress_seq, event, origin);
                 return HookApplied {
                     outcome: ApplyEventOutcome::Stale { last_applied_seq },
                     resumed_after,
@@ -2241,18 +2247,11 @@ fn record_turn_progress(
     match event {
         WorkerEvent::Stop { .. } => {
             keep_newest(&mut meta.last_stop_seq);
-            keep_newest(&mut meta.last_pending_clear_seq);
             meta.open_turn_boundary = Some(TurnBoundary { seq });
             None
         }
-        WorkerEvent::SessionEnd { .. } => {
-            keep_newest(&mut meta.last_pending_clear_seq);
-            None
-        }
+        WorkerEvent::SessionEnd { .. } => None,
         WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. } => {
-            if matches!(event, WorkerEvent::PreToolUse { .. }) {
-                keep_newest(&mut meta.last_pending_clear_seq);
-            }
             if origin.from_subagent {
                 return None;
             }
@@ -2270,6 +2269,7 @@ fn reconcile_late_event(
     meta: &mut SlotMeta,
     seq: u64,
     event: &WorkerEvent,
+    origin: HookOrigin,
 ) -> (Option<TurnBoundary>, bool) {
     match event {
         WorkerEvent::Stop { .. } => {
@@ -2287,7 +2287,12 @@ fn reconcile_late_event(
             (None, false)
         }
         WorkerEvent::Notification { .. } if meta.awaiting_input_capable => {
-            match meta.last_pending_clear_seq {
+            match meta
+                .pending_clear_seqs
+                .range((std::ops::Bound::Excluded(seq), std::ops::Bound::Unbounded))
+                .next()
+                .copied()
+            {
                 // In emission order this `Notification` was consumed by the
                 // event at `clear`. If that was the newest `Stop` and nothing
                 // has applied since, the `Stop` produced `Idle` for want of
@@ -2295,7 +2300,7 @@ fn reconcile_late_event(
                 Some(clear) if clear > seq => {
                     let stop_is_newest =
                         meta.last_stop_seq == Some(clear) && meta.last_applied_ingress_seq == Some(clear);
-                    if stop_is_newest && state.activity != WorkerActivity::WaitingForInput {
+                    if stop_is_newest && state.activity == WorkerActivity::Idle {
                         state.activity = WorkerActivity::WaitingForInput;
                         state.current_tool = None;
                         return (None, true);
@@ -2309,6 +2314,18 @@ fn reconcile_late_event(
                     (None, false)
                 }
             }
+        }
+        WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. }
+            if !origin.from_subagent =>
+        {
+            meta.last_main_activity_seq = Some(meta.last_main_activity_seq.map_or(seq, |last| last.max(seq)));
+            let resumed = meta
+                .open_turn_boundary
+                .filter(|boundary| boundary.seq.is_none_or(|stop| seq > stop));
+            if resumed.is_some() {
+                meta.open_turn_boundary = None;
+            }
+            (resumed, false)
         }
         _ => (None, false),
     }

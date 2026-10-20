@@ -20,13 +20,12 @@ use super::*;
 /// emitted after it.
 #[derive(Debug, Default)]
 struct IngressSequencer {
-    last: u64,
+    last: Arc<AtomicU64>,
 }
 
 impl IngressSequencer {
     fn next(&mut self) -> u64 {
-        self.last += 1;
-        self.last
+        self.last.fetch_add(1, Ordering::SeqCst) + 1
     }
 }
 
@@ -62,7 +61,9 @@ pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state:
     // connection. The registry is still built once: it is stateless and
     // shared read-only across connections.
     let driver_registry = std::sync::Arc::new(crate::driver::DriverRegistry::default());
-    let mut sequencer = IngressSequencer::default();
+    let mut sequencer = IngressSequencer {
+        last: server_state.accepted_hook_seq.clone(),
+    };
     loop {
         match accept_stamped(&listener, &mut sequencer).await {
             Ok((stream, ingress_seq)) => {
@@ -110,6 +111,7 @@ mod tests {
         for _ in 0..4 {
             clients.push(UnixStream::connect(&path).await.unwrap());
             let (_stream, seq) = accept_stamped(&listener, &mut sequencer).await.unwrap();
+            assert_eq!(sequencer.last.load(Ordering::SeqCst), seq);
             stamps.push(seq);
         }
         assert_eq!(stamps, vec![1, 2, 3, 4]);

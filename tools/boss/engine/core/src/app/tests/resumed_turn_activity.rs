@@ -96,7 +96,16 @@ fn declare_wait(server_state: &ServerState, execution_id: &str) {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     // Ordered against the worker's hook stream exactly as the proposal
     // handler does.
-    let declared_after_seq = server_state.live_worker_states.last_applied_ingress_seq(SLOT);
+    // Direct dispatch in these tests bypasses the accept loop; include both
+    // dispatched hooks and any explicitly staged outstanding connections.
+    server_state.accepted_hook_seq.fetch_max(
+        server_state
+            .live_worker_states
+            .last_applied_ingress_seq(SLOT)
+            .unwrap_or(0),
+        Ordering::SeqCst,
+    );
+    let declared_after_seq = Some(server_state.accepted_hook_seq.load(Ordering::SeqCst));
     server_state
         .wait_registry
         .declare_after(
@@ -405,6 +414,75 @@ async fn a_notification_overtaken_by_its_stop_still_parks_the_worker_on_the_huma
         server_state.work_db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Running,
     );
+}
+
+#[tokio::test]
+async fn accepted_but_unapplied_resume_protects_its_new_wait() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 9)).await;
+    // Stop 10 and the next turn's PreToolUse 11 are accepted, but neither
+    // has reached dispatch when the propose-wait RPC arrives.
+    server_state.accepted_hook_seq.store(11, Ordering::SeqCst);
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 11)).await;
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 10)).await;
+    assert!(wait_is_held(&server_state, &execution_id));
+}
+
+#[tokio::test]
+async fn stale_main_hook_after_subagent_ends_the_wait_without_refund() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 2)).await;
+    dispatch_worker_event_fanout(
+        &server_state,
+        &pre_tool_use(&execution_id, "Grep", 4).with_subagent_origin(true),
+    )
+    .await;
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 3)).await;
+    assert!(!wait_is_held(&server_state, &execution_id));
+    assert_eq!(snapshot(&server_state).current_tool.as_deref(), Some("Grep"));
+    assert_eq!(server_state.wait_registry.total_granted_secs(&execution_id), 45 * 60);
+}
+
+#[tokio::test]
+async fn consumed_late_notifications_do_not_park_running_executions() {
+    for repeated_stop in [false, true] {
+        let (server_state, _dir) = test_server_state();
+        let execution_id = spawned_worker(&server_state);
+        if repeated_stop {
+            dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+        } else {
+            dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Read", 3)).await;
+            dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Read", 4)).await;
+        }
+        dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 5)).await;
+        dispatch_worker_event_fanout(&server_state, &notification(&execution_id, 2)).await;
+        assert_eq!(snapshot(&server_state).activity, WorkerActivity::Idle);
+        assert_eq!(
+            server_state.work_db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Running
+        );
+    }
+}
+
+#[tokio::test]
+async fn late_notifications_preserve_non_hook_terminal_states() {
+    for activity in [WorkerActivity::Errored, WorkerActivity::Terminated] {
+        let (server_state, _dir) = test_server_state();
+        let execution_id = spawned_worker(&server_state);
+        dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+        server_state.live_worker_states.set_activity_for_test(SLOT, activity);
+        dispatch_worker_event_fanout(&server_state, &notification(&execution_id, 2)).await;
+        assert_eq!(snapshot(&server_state).activity, activity);
+        assert_eq!(
+            server_state.work_db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Running
+        );
+    }
 }
 
 #[tokio::test]
