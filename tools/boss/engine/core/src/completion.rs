@@ -87,6 +87,8 @@ mod handler_build;
 mod metadata_gate;
 mod no_op;
 mod nudge;
+mod pending_finalize;
+pub use pending_finalize::{PendingFinalizeSweepOutcome, RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND, finalize_resolved};
 mod pr_binding_guard;
 mod pr_transition;
 mod queue_ci_audit;
@@ -261,6 +263,13 @@ crate::register_counter!(
      declared itself done (run_done_proposals_seam on).",
 );
 crate::register_counter!(
+    RUN_DONE_FINALIZE_RETRY,
+    "run_done.finalize_retry",
+    "A declared-`run_done` finalize attempt ended without a terminal commit (a DB error or an \
+     inconclusive GitHub answer) and will be retried. A persistently climbing value means a \
+     finalize is stuck holding a worker slot and cube lease.",
+);
+crate::register_counter!(
     RUN_DONE_BACKSTOP_ASKED,
     "run_done.backstop_asked",
     "The run-done backstop's silence horizon elapsed with no declaration and no sign of worker \
@@ -306,6 +315,7 @@ pub const RUN_DONE_BLOCKED_ATTENTION_KIND: &str = "run_done_declared_blocked";
 /// surface at boot rather than at the first counter increment.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&RUN_DONE_GATE_HELD);
+    registry.register_counter(&RUN_DONE_FINALIZE_RETRY);
     registry.register_counter(&RUN_DONE_BACKSTOP_ASKED);
     registry.register_counter(&RUN_DONE_BACKSTOP_PARKED);
     registry.register_counter(&PR_URL_CAPTURE_PRIMARY_HIT);
@@ -1441,6 +1451,11 @@ pub struct WorkerCompletionHandler {
     /// Per-execution serialization for Stop acceptance and refusal.
     #[builder(default)]
     stop_locks: std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Validated `no-changes-needed` completions whose terminal write failed
+    /// at the Stop boundary, keyed by execution id. Kept until a retry
+    /// reaches a terminal state; see [`pending_finalize`].
+    #[builder(skip)]
+    pending_no_op_completions: std::sync::Mutex<std::collections::HashMap<String, PendingNoOpCompletion>>,
     work_db: Arc<WorkDb>,
     pr_detector: Arc<dyn PrDetector>,
     cube_client: Arc<dyn CubeClient>,
@@ -2736,6 +2751,14 @@ pub(crate) use crate::work::should_enqueue_reviewer_for_primary;
 ///   branch detection for one could only ever bind somebody else's PR.
 pub(crate) fn worker_owns_turn_loop(execution: &crate::work::WorkExecution) -> bool {
     ExecutionStatus::is_live(&execution.status) && execution.kind != ExecutionKind::PrReview
+}
+
+/// The already-validated inputs of a `no-changes-needed` completion write
+/// that failed, retained so it can be retried without another worker event.
+#[derive(Debug, Clone)]
+struct PendingNoOpCompletion {
+    contribution: Option<ContributionEvidence>,
+    attention: Option<CreateAttentionItemInput>,
 }
 
 #[cfg(test)]

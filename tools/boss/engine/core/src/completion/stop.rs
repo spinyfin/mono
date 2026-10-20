@@ -24,6 +24,22 @@ impl WorkerCompletionHandler {
         self.on_stop_with_turn_end(execution_id, None).await
     }
 
+    /// The per-execution lock serializing Stop boundary decisions and
+    /// `run_done` declaration finalizes. Weak entries let the lock go away
+    /// after the last in-flight holder finishes.
+    pub(super) fn boundary_lock(&self, execution_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.stop_locks.lock().expect("stop locks poisoned");
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(execution_id).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(execution_id.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        }
+    }
+
     /// Same as [`Self::on_stop`], but additionally takes the driver-resolved
     /// [`crate::driver::TurnEnd`] for the Stop that triggered this call —
     /// the production call site
@@ -66,18 +82,7 @@ impl WorkerCompletionHandler {
         // Serialize boundary decisions for each execution, including refusal
         // (which consumes a declaration) and acceptance. Weak entries let the
         // lock go away after the last in-flight boundary finishes.
-        let lock = {
-            let mut locks = self.stop_locks.lock().expect("stop locks poisoned");
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(execution_id).and_then(std::sync::Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(execution_id.to_owned(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
-        };
+        let lock = self.boundary_lock(execution_id);
         let _boundary = lock.lock().await;
         let outcome = self.on_stop_inner(execution_id, turn_end, defer_finalization).await;
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
@@ -635,7 +640,7 @@ impl WorkerCompletionHandler {
             }
             let (contribution, attention) = self.declared_run_done_no_op_inputs(&execution);
             return self
-                .finalize_no_op_completion(&execution, contribution, attention)
+                .finalize_no_op_completion_retaining(&execution, contribution, attention)
                 .await;
         }
 
@@ -1566,7 +1571,7 @@ must not be asked to open one",
                             "stop event: worker declared no-changes-needed with no PR produced — \
                              work already done; closing task as a no-op (no PR, no nudge)"
                         );
-                        return self.finalize_no_op_completion(&execution, None, None).await;
+                        return self.finalize_no_op_completion_retaining(&execution, None, None).await;
                     }
                 }
                 tracing::info!(

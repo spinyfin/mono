@@ -76,6 +76,11 @@ impl StubPrDetector {
         *self.result.lock().await = Ok(status);
     }
 
+    /// Swap subsequent `detect_pr` calls to a tool failure.
+    async fn set_error(&self, message: &str) {
+        *self.result.lock().await = Err(message.to_owned());
+    }
+
     /// Make `detect_pr` report `Fresh { url }` for `expected_branch` only.
     fn set_fresh_for_branch(&self, expected_branch: &str, url: &str) {
         self.fresh_url_by_branch
@@ -1954,6 +1959,7 @@ mod t13;
 mod t14;
 mod t15;
 mod t16;
+mod t17;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -2072,6 +2072,15 @@ pub async fn serve_with_overrides(
         crate::proposal_expiry_sweep::DEFAULT_INTERVAL,
     );
 
+    // Durable recovery for accepted `run_done` declarations whose finalize
+    // never reached a terminal write (DB failure, inconclusive GitHub answer,
+    // engine restart mid-retry), plus retained `no-changes-needed` writes.
+    // See `crate::run_done_finalize_sweep`.
+    let _run_done_finalize_sweep_handle = crate::run_done_finalize_sweep::spawn_loop(
+        server_state.completion_handler.clone(),
+        crate::run_done_finalize_sweep::DEFAULT_INTERVAL,
+    );
+
     // Asynchronous review-verdict application: a supervisor submission
     // stays `proposed` so GitHub probes and remediation task creation do
     // not block the worker socket. This sweep is the crash-recovery path;

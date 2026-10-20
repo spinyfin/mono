@@ -671,6 +671,38 @@ impl WorkDb {
         }
     }
 
+    /// Live executions carrying a stamped `delivered` / `blocked` `run_done`
+    /// declaration made at or before `declared_at_or_before` (epoch seconds).
+    /// The stamp is the durable pending-finalize record: a live execution
+    /// that still has one has not yet reached its terminal write.
+    /// `no_changes_needed` is excluded — only the driver's terminal boundary
+    /// may accept it.
+    pub fn live_executions_with_pending_run_done(
+        &self,
+        declared_at_or_before: i64,
+    ) -> Result<Vec<(String, boss_protocol::RunDoneOutcome)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, run_done_outcome FROM work_executions
+             WHERE status IN ('running', 'waiting_human')
+               AND run_done_outcome IN ('delivered', 'blocked')
+               AND run_done_declared_at IS NOT NULL
+               AND CAST(run_done_declared_at AS INTEGER) <= ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([declared_at_or_before], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut pending = Vec::new();
+        for row in rows {
+            let (id, outcome) = row?;
+            if let Ok(outcome) = outcome.parse::<boss_protocol::RunDoneOutcome>() {
+                pending.push((id, outcome));
+            }
+        }
+        Ok(pending)
+    }
+
     /// Identify the applied declaration that currently authorizes a no-op.
     /// Callers must revalidate this id in the terminal write transaction.
     pub fn current_no_op_declaration_id(&self, execution_id: &str) -> Result<Option<String>> {

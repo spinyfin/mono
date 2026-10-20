@@ -141,7 +141,21 @@ impl WorkerCompletionHandler {
     /// transaction, so a replayed call (the same idempotency key resubmitted
     /// after a crash between apply and this call) safely no-ops instead of
     /// double-tearing-down.
+    ///
+    /// Holds the same per-execution lock as the Stop boundary, so a worker
+    /// turn-end arriving while this finalize is in flight waits for it and
+    /// then runs against the resolved state instead of racing it.
     pub async fn finalize_declared_run_done(
+        &self,
+        execution_id: &str,
+        outcome: boss_protocol::RunDoneOutcome,
+    ) -> StopOutcome {
+        let lock = self.boundary_lock(execution_id);
+        let _boundary = lock.lock().await;
+        self.finalize_declared_run_done_locked(execution_id, outcome).await
+    }
+
+    async fn finalize_declared_run_done_locked(
         &self,
         execution_id: &str,
         outcome: boss_protocol::RunDoneOutcome,

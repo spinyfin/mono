@@ -85,6 +85,7 @@ rust_library(
     ],
     deps = [
         "//lib/rust/git_utils",
+        "//tools/boss/backoff",
         "//tools/boss/build-provenance",
         "//tools/boss/claude_client",
         "//tools/boss/codex_auth",

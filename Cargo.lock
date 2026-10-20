@@ -434,6 +434,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-backoff",
  "boss-build-info",
  "boss-build-provenance",
  "boss-ci-log-reader",

@@ -22,6 +22,7 @@ impl WorkerCompletionHandler {
         crate::answer_agent_observability::register_metrics(&local_metrics);
         Self {
             stop_locks: Default::default(),
+            pending_no_op_completions: Default::default(),
             work_db,
             pr_detector,
             cube_client,
