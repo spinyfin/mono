@@ -196,21 +196,93 @@ rm -rf "$dir/lock"
 mkdir -p "$dir/lock"
 { echo "pid=$$"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(date +%s)"; echo "label=new-job"; } > "$dir/lock/owner"
 CI_HOST_BAZEL_LOCK_DIR="$dir" bash -c "source '$LIB'; host_bazel_lock_reclaim '$dir/lock'" >/dev/null 2>&1
-if [[ -d "$dir/lock" ]] && grep -q '^label=new-job$' "$dir/lock/owner" && [[ ! -e "$dir/reclaim-guard" ]]; then
+if [[ -d "$dir/lock" ]] && grep -q '^label=new-job$' "$dir/lock/owner"; then
   pass "delayed reclaim left the freshly acquired lock alone"
 else
   fail "delayed reclaim removed or damaged the new live lock"
 fi
 rm -rf "$dir/lock"
 
-# --- a guard abandoned by a dead process is cleared ------------------------
-dir=$(fresh_dir dead-guard)
-mkdir -p "$dir/reclaim-guard" "$dir/lock"
+# --- a reclaim defers while another reclaimer holds the flock --------------
+# The reclaim section is serialised by a kernel flock. While another process
+# holds it, a reclaim must not touch even a stale lock; once it is released
+# the reclaim proceeds.
+if command -v perl >/dev/null 2>&1; then
+  dir=$(fresh_dir reclaim-flock)
+  mkdir -p "$dir/lock"
+  sleep 0 & dead_pid=$!; wait "$dead_pid"
+  { echo "pid=$dead_pid"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(date +%s)"; echo "label=dead-job"; } > "$dir/lock/owner"
+  perl -e '$^F = 255; open(my $f, ">>", $ARGV[0]) or die; flock($f, 2) or die; print "locked\n"; STDOUT->flush; sleep 600' "$dir/reclaim.flock" > "$dir/holder.out" &
+  flock_holder=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do grep -q locked "$dir/holder.out" 2>/dev/null && break; sleep 0.3; done
+  CI_HOST_BAZEL_LOCK_DIR="$dir" bash -c "source '$LIB'; host_bazel_lock_reclaim '$dir/lock'" >/dev/null 2>&1
+  [[ -d "$dir/lock" ]] && pass "reclaim leaves a stale lock alone while the flock is held elsewhere" \
+    || fail "reclaim ran without the flock"
+  kill "$flock_holder" 2>/dev/null || true; wait "$flock_holder" 2>/dev/null || true
+  CI_HOST_BAZEL_LOCK_DIR="$dir" bash -c "source '$LIB'; host_bazel_lock_reclaim '$dir/lock'" >/dev/null 2>&1
+  [[ ! -e "$dir/lock" ]] && pass "reclaim proceeds once the flock holder is gone (kernel released it)" \
+    || fail "reclaim did not proceed after the flock was released"
+
+  # Concurrent reclaimers of one stale lock: exactly one reclaims it.
+  dir=$(fresh_dir reclaim-concurrent)
+  mkdir -p "$dir/lock"
+  { echo "pid=$dead_pid"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(date +%s)"; echo "label=dead-job"; } > "$dir/lock/owner"
+  for i in 1 2 3 4 5 6; do
+    CI_HOST_BAZEL_LOCK_DIR="$dir" bash -c "source '$LIB'; host_bazel_lock_reclaim '$dir/lock'" > "$dir/out.$i" 2>&1 &
+  done
+  wait
+  n=$(cat "$dir"/out.* | grep -c 'reclaimed stale lock' || true)
+  [[ "$n" == 1 && ! -e "$dir/lock" ]] && pass "concurrent reclaimers reclaim a stale lock exactly once" \
+    || fail "concurrent reclaim reported $n reclaims"
+fi
+
+# --- a leftover reclaim.flock file with no holder does not wedge the lock --
+dir=$(fresh_dir dead-flock-file)
+mkdir -p "$dir/lock"
+: > "$dir/reclaim.flock"
 sleep 0 & dead_pid=$!; wait "$dead_pid"
-echo "$dead_pid" > "$dir/reclaim-guard/pid"
 { echo "pid=$dead_pid"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(date +%s)"; echo "label=dead-job"; } > "$dir/lock/owner"
 CI_HOST_BAZEL_LOCK_DIR="$dir" run_with_deadline 20 bash -c "source '$LIB'; host_bazel_lock_acquire; host_bazel_lock_release" >/dev/null 2>&1 \
-  && pass "a dead process's reclaim guard does not wedge the lock" || fail "dead reclaim guard wedged acquisition"
+  && pass "a leftover reclaim.flock file does not wedge acquisition" || fail "leftover reclaim.flock wedged acquisition"
+
+# --- a live pid with a different start time is a recycled pid: stale -------
+# Skipped where the sandbox hides process start times.
+if [[ -n "$(bash -c "source '$LIB'; host_bazel_lock_pid_start $$")" ]]; then
+  dir=$(fresh_dir recycled-pid)
+  mkdir -p "$dir/lock"
+  { echo "pid=$$"; echo "start=Thu Jan  1 00:00:00 1970"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(date +%s)"; echo "label=recycled-job"; } > "$dir/lock/owner"
+  out=$(CI_HOST_BAZEL_LOCK_DIR="$dir" run_with_deadline 20 bash -c "source '$LIB'; host_bazel_lock_acquire; host_bazel_lock_release" 2>&1) \
+    && printf '%s\n' "$out" | grep -q 'was recycled' \
+    && pass "a recycled pid does not keep a dead holder's lock alive" || fail "recycled-pid lock not reclaimed: $out"
+
+  # ...and the real start time of a live holder keeps its lock.
+  dir=$(fresh_dir live-start)
+  mkdir -p "$dir/lock"
+  { echo "pid=$$"; echo "start=$(bash -c "source '$LIB'; host_bazel_lock_pid_start $$")"; echo "boot=$(bash -c "source '$LIB'; host_bazel_lock_boot_id")"; echo "acquired=$(date +%s)"; echo "label=live-job"; } > "$dir/lock/owner"
+  if CI_HOST_BAZEL_LOCK_DIR="$dir" run_with_deadline 3 bash -c "source '$LIB'; host_bazel_lock_acquire" >/dev/null 2>&1; then
+    fail "a live holder with a matching start time was reclaimed"
+  else
+    pass "a live holder with a matching start time keeps its lock"
+  fi
+  rm -rf "$dir/lock"
+fi
+
+# --- agent hooks: pre-command takes the lock for the job, pre-exit frees it
+HOOK_DIR="$TEST_SRCDIR/${TEST_WORKSPACE:-_main}/.buildkite/host-hooks"
+dir=$(fresh_dir hooks)
+# The hooks run as children of this bash -c, standing in for the job
+# bootstrap process, whose pid must own the lock.
+HOST_BAZEL_LOCK_LIB="$LIB" CI_HOST_BAZEL_LOCK_DIR="$dir" BUILDKITE_PIPELINE_SLUG=appoint bash -c "
+  bash '$HOOK_DIR/pre-command' || exit 30
+  [[ \"\$(grep -m1 '^pid=' '$dir/lock/owner' | cut -d= -f2)\" == \"\$\$\" ]] || exit 31
+  bash '$HOOK_DIR/pre-exit' || exit 32
+  [[ ! -e '$dir/lock' ]] || exit 33
+" && pass "agent hooks hold the lock for the bootstrap pid and release it" || fail "agent hooks (exit $?)"
+dir=$(fresh_dir hooks-skip)
+HOST_BAZEL_LOCK_LIB="$LIB" CI_HOST_BAZEL_LOCK_DIR="$dir" BUILDKITE_PIPELINE_SLUG=mono bash -c "
+  bash '$HOOK_DIR/pre-command' || exit 40
+  [[ ! -e '$dir/lock' ]] || exit 41
+" && pass "agent hooks ignore pipelines outside the list" || fail "agent hook took the lock for an unlisted pipeline (exit $?)"
 
 # --- a live, in-date lock held by this very process is NOT reclaimed -------
 dir=$(fresh_dir live)

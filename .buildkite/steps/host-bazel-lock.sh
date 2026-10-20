@@ -25,13 +25,23 @@
 # evicting a slow job would let a successor run beside it. Long holds are
 # reported in the waiting message instead.
 #
-# Reclaim is serialised by a short-lived guard directory ($root/reclaim-guard).
-# Under the guard the staleness check is redone against whatever occupies the
-# lock path right now, then the lock is renamed aside and deleted. A waiter
-# that judged an old lock stale but was delayed therefore re-checks and finds
-# the fresh live lock someone else acquired meanwhile, and leaves it alone.
-# Nothing else removes a lock that has a living holder: its own release is the
-# only other writer, and a stale lock's holder is by definition not releasing.
+# Reclaim is serialised by a kernel-held exclusive lock (flock on
+# $root/reclaim.flock, taken through perl, which every Mac host and the Bazel
+# test sandbox have). The staleness check is redone, and the lock renamed
+# aside and deleted, only while that flock is held, so a waiter that judged an
+# old lock stale but was delayed re-checks and finds the fresh live lock
+# someone else acquired meanwhile, and leaves it alone. Because the kernel
+# drops an flock when its holder exits, there is no guard file to go stale and
+# nothing that has to be deleted by pathname on the strength of an earlier
+# read; a reclaimer that dies mid-section cannot wedge anyone. Without perl
+# no lock is ever reclaimed (exclusivity is preserved; a stale lock then needs
+# the manual remedy in the runbook). Nothing else removes a lock that has a
+# living holder: its own release is the only other writer, and a stale lock's
+# holder is by definition not releasing.
+#
+# Pipelines that cannot source this file from their steps can take the lock
+# for a whole job from Buildkite agent hooks instead; see
+# .buildkite/host-hooks/ and the runbook.
 #
 # Enablement:
 #   CI_HOST_BAZEL_LOCK=1     always take the lock
@@ -49,6 +59,9 @@
 #                                    exist with no owner file before it is
 #                                    treated as abandoned)
 #   CI_HOST_BAZEL_LOCK_BOOT_ID       override the detected boot id (tests)
+
+# Absolute path of this file, so a reclaim can re-run it under the flock.
+HOST_BAZEL_LOCK_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 host_bazel_lock_enabled() {
   case "${CI_HOST_BAZEL_LOCK:-auto}" in
@@ -117,6 +130,12 @@ host_bazel_lock_pid_alive() {
   ps -p "$pid" >/dev/null 2>&1
 }
 
+# Prints the start time of process $1 (second resolution), or nothing when it
+# cannot be read. Recorded in the owner file so a recycled pid is recognised.
+host_bazel_lock_pid_start() {
+  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed -e 's/^ *//' -e 's/ *$//'
+}
+
 # Returns 0 and prints a reason when the lock at $1 is stale. Age is never a
 # reason: a live holder stays exclusive however long it runs.
 host_bazel_lock_stale_reason() {
@@ -137,6 +156,18 @@ host_bazel_lock_stale_reason() {
     printf 'holder pid %s is gone\n' "$pid"
     return 0
   fi
+  # The pid is live, but it may be an unrelated process that inherited the pid
+  # of a holder that died without releasing. The owner file records the
+  # holder's start time; a different start time means the holder is gone.
+  local start current_start
+  start=$(host_bazel_lock_owner_field "$lock" start)
+  if [[ -n "$start" ]]; then
+    current_start=$(host_bazel_lock_pid_start "$pid")
+    if [[ -n "$current_start" && "$current_start" != "$start" ]]; then
+      printf 'holder pid %s was recycled (started %s, now %s)\n' "$pid" "$start" "$current_start"
+      return 0
+    fi
+  fi
   boot=$(host_bazel_lock_owner_field "$lock" boot)
   local current_boot
   current_boot=$(host_bazel_lock_boot_id)
@@ -149,26 +180,26 @@ host_bazel_lock_stale_reason() {
 
 # Reclaim a lock that a waiter judged stale. The judgement is not trusted:
 # the lock path is reusable, so by the time this runs the directory there may
-# be a different, live lock. Under the reclaim guard the check is redone on
-# the current occupant and only a lock that is stale right now is removed.
+# be a different, live lock. The check is redone on the current occupant while
+# holding the reclaim flock, and only a lock that is stale right now is
+# removed. If another waiter holds the flock this returns at once and the
+# caller retries on its next poll.
 host_bazel_lock_reclaim() {
-  local lock="$1" root guard aside reason
+  local lock="$1" root
   root=$(host_bazel_lock_root)
-  guard="${root}/reclaim-guard"
-  if ! mkdir "$guard" 2>/dev/null; then
-    # Another waiter is reclaiming (the guard is held for milliseconds). If
-    # its process died holding the guard, clear it so the next poll can
-    # proceed; otherwise just retry on the next poll.
-    local gpid
-    gpid=$(cat "${guard}/pid" 2>/dev/null || true)
-    if [[ -n "$gpid" ]] && ! host_bazel_lock_pid_alive "$gpid"; then
-      rm -rf "$guard"
-    elif [[ -z "$gpid" ]] && (( $(date +%s) - $(host_bazel_lock_mtime "$guard") > 30 )); then
-      rm -rf "$guard"
-    fi
+  if ! command -v perl >/dev/null 2>&1; then
     return 0
   fi
-  printf '%s\n' "$$" > "${guard}/pid"
+  mkdir -p "$root"
+  # $^F=255 keeps the flock'd descriptor open across exec, so the re-run below
+  # holds the lock for exactly its own lifetime. Exit 1 means busy.
+  perl -e '$^F = 255; open(my $f, ">>", shift) or exit 2; flock($f, 6) or exit 1; exec @ARGV or exit 3'     "${root}/reclaim.flock" bash "$HOST_BAZEL_LOCK_LIB" --reclaim-locked "$lock" || true
+}
+
+# Runs with the reclaim flock held (see host_bazel_lock_reclaim).
+host_bazel_lock_reclaim_locked() {
+  local lock="$1" root aside reason
+  root=$(host_bazel_lock_root)
   if [[ -d "$lock" ]] && reason=$(host_bazel_lock_stale_reason "$lock"); then
     aside="${root}/stale.$$.${RANDOM}"
     if mv "$lock" "$aside" 2>/dev/null; then
@@ -176,7 +207,6 @@ host_bazel_lock_reclaim() {
       rm -rf "$aside"
     fi
   fi
-  rm -rf "$guard"
 }
 
 host_bazel_lock_describe_holder() {
@@ -202,6 +232,14 @@ host_bazel_lock_long_hold_note() {
 }
 
 host_bazel_lock_acquire() {
+  host_bazel_lock_take "$$" 1
+}
+
+# Takes the lock on behalf of process $1 (the pid whose death frees it). With
+# $2 = 1 an EXIT trap releases it; Buildkite agent hooks pass 0 and the
+# job-bootstrap pid, and release from a pre-exit hook instead.
+host_bazel_lock_take() {
+  local holder="$1" install_trap="$2"
   host_bazel_lock_enabled || return 0
   # Idempotent: a step that sources ci-env.sh twice, or a child script that
   # sources it while the parent already holds the lock, must not deadlock
@@ -227,7 +265,8 @@ host_bazel_lock_acquire() {
   while :; do
     if mkdir "$lock" 2>/dev/null; then
       {
-        printf 'pid=%s\n' "$$"
+        printf 'pid=%s\n' "$holder"
+        printf 'start=%s\n' "$(host_bazel_lock_pid_start "$holder")"
         printf 'boot=%s\n' "$(host_bazel_lock_boot_id)"
         printf 'acquired=%s\n' "$(date +%s)"
         printf 'acquired_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -239,7 +278,9 @@ host_bazel_lock_acquire() {
       # Any step that installs its own EXIT trap after this point must call
       # host_bazel_lock_release from it. If it forgets, the lock is reclaimed
       # by the next waiter as soon as this pid is gone — slower, not broken.
-      trap host_bazel_lock_release EXIT
+      if [[ "$install_trap" == 1 ]]; then
+        trap host_bazel_lock_release EXIT
+      fi
       waited=$(( $(date +%s) - start ))
       if (( waited > 0 )); then
         host_bazel_lock_log "acquired ${lock} after waiting ${waited}s"
@@ -271,13 +312,22 @@ host_bazel_lock_acquire() {
 
 host_bazel_lock_release() {
   [[ -n "${HOST_BAZEL_LOCK_HELD:-}" ]] || return 0
+  host_bazel_lock_release_pid "$$"
+  unset HOST_BAZEL_LOCK_HELD
+}
+
+# Removes the lock if process $1 owns it. Only the owning process may release;
+# a child that inherited HOST_BAZEL_LOCK_HELD through the environment must not.
+host_bazel_lock_release_pid() {
   local lock
   lock=$(host_bazel_lock_path)
-  # Only the acquiring process may release; a child that inherited
-  # HOST_BAZEL_LOCK_HELD through the environment must not.
-  if [[ "$(host_bazel_lock_owner_field "$lock" pid)" == "$$" ]]; then
+  if [[ "$(host_bazel_lock_owner_field "$lock" pid)" == "$1" ]]; then
     rm -rf "$lock"
     host_bazel_lock_log "released ${lock}"
   fi
-  unset HOST_BAZEL_LOCK_HELD
 }
+
+# Executed (not sourced) by host_bazel_lock_reclaim, under the reclaim flock.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == "--reclaim-locked" ]]; then
+  host_bazel_lock_reclaim_locked "$2"
+fi

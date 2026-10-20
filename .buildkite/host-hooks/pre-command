@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Buildkite agent pre-command hook: take the per-host heavy-Bazel lock for
+# the whole job, for pipelines whose step scripts do not take it themselves
+# (appoint, flunge-ci). Install on each Mac host as described in
+# .buildkite/mac-agents-runbook.md; mono's own steps take the lock in
+# ci-env.sh and are not in the default pipeline list.
+#
+# The lock's holder is this hook's parent, the job's bootstrap process, which
+# lives for the whole job; the pre-exit hook releases it, and if the bootstrap
+# is killed outright the next waiter reclaims the lock because that pid is gone.
+set -euo pipefail
+
+LIB="${HOST_BAZEL_LOCK_LIB:-$(dirname "${BASH_SOURCE[0]}")/host-bazel-lock.sh}"
+PIPELINES="${CI_HOST_BAZEL_LOCK_HOOK_PIPELINES:-appoint flunge-ci}"
+
+[[ " ${PIPELINES} " == *" ${BUILDKITE_PIPELINE_SLUG:-} "* ]] || exit 0
+# shellcheck source=../steps/host-bazel-lock.sh
+source "$LIB"
+host_bazel_lock_take "$PPID" 0
+# Exported to the job command so a step that also sources a copy of the
+# library does not wait on the lock this job already holds.
+export HOST_BAZEL_LOCK_HELD=1

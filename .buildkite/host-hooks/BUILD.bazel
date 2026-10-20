@@ -1,0 +1,9 @@
+# Buildkite agent hooks installed on the Mac hosts, not built by Bazel; they
+# are exported only so the host lock test can exercise them.
+exports_files(
+    [
+        "pre-command",
+        "pre-exit",
+    ],
+    visibility = ["//.buildkite/steps/tests:__pkg__"],
+)

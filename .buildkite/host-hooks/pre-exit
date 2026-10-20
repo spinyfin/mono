@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Buildkite agent pre-exit hook: release the lock taken by the pre-command
+# hook. Runs however the job ended (success, failure, cancellation).
+set -euo pipefail
+
+LIB="${HOST_BAZEL_LOCK_LIB:-$(dirname "${BASH_SOURCE[0]}")/host-bazel-lock.sh}"
+PIPELINES="${CI_HOST_BAZEL_LOCK_HOOK_PIPELINES:-appoint flunge-ci}"
+
+[[ " ${PIPELINES} " == *" ${BUILDKITE_PIPELINE_SLUG:-} "* ]] || exit 0
+# shellcheck source=../steps/host-bazel-lock.sh
+source "$LIB"
+host_bazel_lock_release_pid "$PPID"

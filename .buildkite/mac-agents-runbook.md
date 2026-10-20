@@ -61,10 +61,10 @@ To repeat the measurement after a change, list the jobs with `bk api "/pipelines
 - **Lock path:** `${CI_HOST_BAZEL_LOCK_DIR:-${HOME}/.cache/buildkite-host-bazel-lock}/lock`. A directory, created with an atomic `mkdir`, containing an `owner` file (`pid`, `boot`, `acquired`, `job`, `agent`, `label`). The default sits next to `${HOME}/.cache/bazelcache`, the host-state location `ci-env.sh` already uses. **This path is the cross-pipeline contract**: every pipeline on a host must use the same directory, or the serialisation is only per-repo.
 - **Waiting:** a job that finds the lock held polls every 5 s and prints a Buildkite group `--- [host-bazel-lock] waiting: another heavy Bazel job holds this host`, naming the holder (pipeline/build step, pid, job id, acquire time), with a progress line every 60 s. On acquiring it prints `[host-bazel-lock] acquired … after waiting <S>s`. A parked job is therefore visible in the Buildkite log at a glance, and its wait is not charged against checkleft's per-check wall clock (checkleft starts after the lock is held). No pipeline here sets a Buildkite job timeout, so the wait cannot time a job out either.
 - **Release:** an `EXIT` trap removes the lock when the step's process ends, however it ends. A step that installs its own `EXIT` trap after sourcing `ci-env.sh` must chain `host_bazel_lock_release` into it (see `changelog-release.sh`); if it forgets, the next waiter reclaims the lock as soon as the holder's pid is gone.
-- **Stale locks:** a lock is reclaimed when its holder pid no longer exists, when it was taken before the last reboot (the `boot` field is the kernel boot time), or when it has had no owner file for 30 s. Age alone never reclaims: a live holder stays exclusive however long it runs, because reclaiming only deletes the lock directory and cannot stop the holder's Bazel work, so a successor would run beside it. A holder older than `CI_HOST_BAZEL_LOCK_LONG_HOLD_SECS` (default 3 h) is called out in the waiters' log lines; cancel that job in Buildkite if it is wedged. Reclaim is serialised by a short-lived `reclaim-guard` directory and re-checks the lock under it, so a delayed waiter cannot delete a lock that someone else acquired after the stale one was removed.
+- **Stale locks:** a lock is reclaimed when its holder pid no longer exists, when it was taken before the last reboot (the `boot` field is the kernel boot time), or when it has had no owner file for 30 s. Age alone never reclaims: a live holder stays exclusive however long it runs, because reclaiming only deletes the lock directory and cannot stop the holder's Bazel work, so a successor would run beside it. A holder older than `CI_HOST_BAZEL_LOCK_LONG_HOLD_SECS` (default 3 h) is called out in the waiters' log lines; cancel that job in Buildkite if it is wedged. A live pid whose start time differs from the `start` recorded in the owner file is a recycled pid and counts as gone. Reclaim is serialised by a kernel `flock` on `reclaim.flock` (taken through `perl`) and re-checks the lock while holding it, so a delayed waiter cannot delete a lock that someone else acquired after the stale one was removed, and a reclaimer that dies cannot leave a guard behind. Without `perl` nothing is reclaimed; use the manual remedy under Troubleshooting.
 - **Fairness:** waiters poll, so admission is not FIFO; whichever poll lands first after a release wins. At current volume this is acceptable; if a job is ever seen starving, add arrival-ordered tickets.
 - **Knobs:** `CI_HOST_BAZEL_LOCK=1|0` forces the lock on or off (set it in a pipeline's env to disable it for a test build, or to enable it on a Linux host if evidence ever says Linux needs it too); `CI_HOST_BAZEL_LOCK_POLL_SECS`, `CI_HOST_BAZEL_LOCK_REPORT_SECS` tune the polling.
-- **Tests:** `bazel test //.buildkite/steps/tests:host_bazel_lock_test` covers acquire/release, waiting behind a live holder, the stale cases (dead pid, reboot, ownerless), that a live holder is never evicted for age, that a delayed reclaim leaves a freshly acquired lock alone, the EXIT-trap release, and that a child process with an inherited lock neither blocks nor releases.
+- **Tests:** `bazel test //.buildkite/steps/tests:host_bazel_lock_test` covers acquire/release, waiting behind a live holder, the stale cases (dead pid, reboot, ownerless), that a live holder is never evicted for age, that a delayed reclaim leaves a freshly acquired lock alone, that reclaim defers while another process holds the flock and runs exactly once under concurrency, recycled pids, the agent hooks, the EXIT-trap release, and that a child process with an inherited lock neither blocks nor releases.
 
 ### Invariant: every agent on a host runs as one user
 
@@ -102,21 +102,27 @@ The expected layout per host is two config files and two launchd plists — one 
 
 The lock ships entirely in this repo. Once this change is on `main`, every `mono*` pipeline job that lands on a Mac takes it. The default lock directory is created on first use. The only host precondition is the one-user invariant above, which the current layout already satisfies.
 
-### Required for the rule to hold fleet-wide: adopt the lock in the sibling repos
+### Required for the rule to hold fleet-wide: install the agent hooks (appoint, flunge-ci)
 
-`appoint` and `flunge-ci` run their own step scripts from their own repos, so until they take the same lock a Mac host can still run one `mono` heavy job plus one job from each of those pipelines concurrently. Adoption is mechanical:
+`appoint` and `flunge-ci` run step scripts from their own repos, which do not take the lock. Rather than depend on changes in those repos, each Mac host takes the lock for their jobs from Buildkite agent hooks, shipped here in [`host-hooks/`](host-hooks/). `pre-command` acquires the lock for the whole job when `BUILDKITE_PIPELINE_SLUG` is in `CI_HOST_BAZEL_LOCK_HOOK_PIPELINES` (default `appoint flunge-ci`; `mono*` pipelines take it themselves in `ci-env.sh` and are not listed). The holder is the job's bootstrap process, so the lock is freed when the job ends: `pre-exit` releases it, and if the bootstrap is killed outright the next waiter reclaims it because the pid is gone. The hook exports `HOST_BAZEL_LOCK_HELD=1`, so a step that later sources a copy of the library does not wait on its own job. Cost: every job of those pipelines that lands on a Mac, including a light step, queues behind the running heavy job; such steps mostly run on Linux agents, where the lock is off.
 
-1. Copy `.buildkite/steps/host-bazel-lock.sh` verbatim into the repo (`.buildkite/steps/` in appoint, `.buildkite/scripts/` in flunge). Do not change the default lock directory.
-2. At the top of every Bazel-running step script, after `set -euo pipefail` and before the first `bazel` call, add:
+On each Mac host, as the agent user (the hooks are read per job, so no agent restart is needed):
+
+1. Find the hooks directory the agents use: `grep -h hooks-path /opt/homebrew/etc/buildkite-agent/*.cfg` (the Homebrew default is `/opt/homebrew/etc/buildkite-agent/hooks`). All agent configs on a host must point at the same directory, or install into each.
+2. From a checkout of this repo at `main`, install the library and both hooks side by side (the hooks source `host-bazel-lock.sh` from their own directory):
 
    ```sh
-   source "$(dirname "${BASH_SOURCE[0]}")/host-bazel-lock.sh"
-   host_bazel_lock_acquire
+   HOOKS=/opt/homebrew/etc/buildkite-agent/hooks
+   install -m 0755 .buildkite/host-hooks/pre-command "$HOOKS/pre-command"
+   install -m 0755 .buildkite/host-hooks/pre-exit "$HOOKS/pre-exit"
+   install -m 0644 .buildkite/steps/host-bazel-lock.sh "$HOOKS/host-bazel-lock.sh"
    ```
 
-   appoint: `bazel-build-test.sh`, `checks.sh`. flunge: `run_ios_bazel_build.sh`, `run_backend_bazel_tests.sh`, `run_cli_bazel_tests.sh`, `run_frontend_bazel_tests.sh`, and `run_checks.sh` if it runs Bazel (it does when checkleft's `lint/rust` is enabled there); a shared `lib.sh` is the natural place in flunge.
+   If a `pre-command` or `pre-exit` hook already exists there, merge rather than overwrite. Re-run the `install` of `host-bazel-lock.sh` whenever it changes on `main`.
 
-3. Watch one build on each pipeline for the `[host-bazel-lock] acquired` line in a Mac job's log.
+3. Watch one `appoint` and one `flunge-ci` job on a Mac for `[host-bazel-lock] acquired` at the start of the log, and `released` in the exit hook output.
+
+Until the hooks are installed on a host, that host can still run one `mono` heavy job plus jobs from those pipelines concurrently. Installing them is a one-time human action on each host (`anaplian`, `skaffen`); nothing in CI can do it.
 
 ### Recommended: one spawn per queue per Mac host
 
@@ -150,6 +156,6 @@ Removing the `-any` agents would make the rule trivially true for `bazel-any` wo
 ## Troubleshooting
 
 - **A Mac job shows `--- [host-bazel-lock] waiting` for a long time.** Expected while another heavy job runs on that host; the log names the holder. Look up the holder's build to see what it is doing. If the holder is a wedged job, cancel it in Buildkite; the waiter reclaims the lock as soon as the holder's process is gone.
-- **The holder named in the log finished long ago.** The lock was left behind by a process that died without its EXIT trap (a hard kill, a step that replaced the trap without chaining the release). Waiters reclaim it automatically when the pid is gone, after a reboot, or when it has no owner file. To clear it by hand: `rm -rf ~/.cache/buildkite-host-bazel-lock/lock` on the host as the agent user — only after checking `ps -p <pid>` shows the owner is really gone.
-- **Two heavy jobs are running on one Mac at the same time.** Check the second job's pipeline: if it is `appoint` or `flunge-ci`, that repo has not adopted the lock yet (see above). If both are `mono*` jobs, confirm the lock directory is the same for both agent processes (`echo $HOME` in each agent's environment; `ls ~/.cache/buildkite-host-bazel-lock/`).
+- **The holder named in the log finished long ago.** The lock was left behind by a process that died without its EXIT trap (a hard kill, a step that replaced the trap without chaining the release). Waiters reclaim it automatically when the pid is gone, after a reboot, or when it has no owner file. To clear it by hand: `rm -rf ~/.cache/buildkite-host-bazel-lock/lock` on the host as the agent user — only after checking `ps -p <pid>` shows the owner is really gone (a recycled pid is detected automatically when the owner file has a `start` line, and a host without `perl` never reclaims).
+- **Two heavy jobs are running on one Mac at the same time.** Check the second job's pipeline: if it is `appoint` or `flunge-ci`, the agent hooks are not installed on that host (see above). If both are `mono*` jobs, confirm the lock directory is the same for both agent processes (`echo $HOME` in each agent's environment; `ls ~/.cache/buildkite-host-bazel-lock/`).
 - **Running a Bazel step locally outside CI.** The lock is taken on any Darwin machine that sources `ci-env.sh`, so two local runs of a step script on one laptop serialise too. Set `CI_HOST_BAZEL_LOCK=0` to opt out.
