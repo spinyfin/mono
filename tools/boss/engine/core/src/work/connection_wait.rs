@@ -73,7 +73,7 @@ impl<'a> ConnectionGuard<'a> {
             .caller(caller)
             .acquired(std::time::Instant::now())
             .waited(waited)
-            ._holder(holder)
+            .holder(holder)
             .build()
     }
 }
