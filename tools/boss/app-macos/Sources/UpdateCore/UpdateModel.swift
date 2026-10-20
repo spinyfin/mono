@@ -498,7 +498,10 @@ public final class UpdateModel: ObservableObject {
 
     /// Deliberate retry of a version the watchdog rolled back: clear its block, then
     /// stage it again (re-checking first when the last check is stale or missing) and
-    /// present the sheet so the user can press Install & Relaunch. This is the only
+    /// present the sheet so the user can press Install & Relaunch. The sheet is a
+    /// decision surface, so it is presented only once an update is available; a
+    /// re-check that finds nothing (up to date, network error, rate limited) reports
+    /// through the self-dismissing ``manualCheckFeedback`` toast instead. This is the only
     /// path that re-downloads a blocklisted version; background polling and the plain
     /// "Download" button refuse to. The watchdog re-blocklists it if it fails again.
     public func retryBlockedUpdate(_ version: VersionTuple) {
@@ -512,17 +515,33 @@ public final class UpdateModel: ObservableObject {
         blocklist.unblock(version)
         blocklist.acknowledgeRollbacks()
         rollbackNotice = nil
-        showUpdateSheet = true
         if case .available(var update) = lastCheckResult, update.version >= version {
             update.attemptID = attemptID(for: update.version)
+            showUpdateSheet = true
             beginStaging(update)
             return
         }
+        toastDismissTask?.cancel()
+        manualCheckFeedback = .checking
         Task { [weak self] in
             guard let self else { return }
             let result = await self.checkNow()
-            if case .available(let update) = result, update.version >= version {
-                self.beginStaging(update)
+            switch result {
+            case .available(let update):
+                self.manualCheckFeedback = nil
+                self.showUpdateSheet = true
+                if update.version >= version {
+                    self.beginStaging(update)
+                }
+            case .upToDate:
+                self.manualCheckFeedback = .upToDate
+                self.scheduleFeedbackDismissal()
+            case .networkError(let message):
+                self.manualCheckFeedback = .networkError(message)
+                self.scheduleFeedbackDismissal()
+            case .rateLimited(let retryAfter):
+                self.manualCheckFeedback = .rateLimited(retryAfter)
+                self.scheduleFeedbackDismissal()
             }
         }
     }

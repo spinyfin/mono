@@ -32,6 +32,9 @@ root-cause rule as the section below.
 
 ## Operational docs workers should know
 
+- Boss macOS app rules (no modal dialogs for non-actionable status or
+  error messages; which inline/banner/log surface to use instead):
+  [`tools/boss/app-macos/AGENTS.md`](tools/boss/app-macos/AGENTS.md)
 - Bazel / Xcode LaunchServices pin on macOS hosts:
   [`tools/boss/docs/mac-toolchain-xcode-pinning.md`](tools/boss/docs/mac-toolchain-xcode-pinning.md)
 - Boss forensic surfaces (`engine-audit.log`, per-task cost / transcripts):

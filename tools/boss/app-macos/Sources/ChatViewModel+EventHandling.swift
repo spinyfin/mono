@@ -280,9 +280,10 @@ extension ChatViewModel {
                 reviewTerminalVM.state = .idle
             }
             // Error is likely from an in-flight kanban move: bounce the
-            // card(s) back and show an inline non-blocking notice instead
-            // of interrupting with a modal dialog. Parked drags are not
-            // bounced, so with nothing eligible the error is still surfaced.
+            // card(s) back and show the notice inline on the card. Parked
+            // drags are not bounced, so with nothing eligible the error is
+            // still surfaced — on the passive `WorkNoticeBanner`, never a
+            // modal.
             if pendingMoveOriginByTaskID.isEmpty || !bounceBackOptimisticMoves(message: message) {
                 workErrorMessage = message
             }

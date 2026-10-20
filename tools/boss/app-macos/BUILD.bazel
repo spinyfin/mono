@@ -307,13 +307,33 @@ genrule(
     tools = ["Tests/BossTests/scan_for_real_openers.sh"],
 )
 
+# Same build-action pattern, pointed at the production sources: flags any
+# report-only modal (a SwiftUI `.alert(isPresented:)` or `NSAlert` with
+# fewer than two buttons, or any `.alert` driven by `workErrorMessage`) so
+# a non-actionable status/error message can never regain a modal dialog.
+# ReportOnlyAlertScanTests.swift asserts on the result; the rule is spelled
+# out in tools/boss/app-macos/AGENTS.md.
+genrule(
+    name = "generate_report_only_alert_scan",
+    srcs = glob(
+        ["Sources/**/*.swift"],
+        exclude = ["Sources/EngineBinaryName.swift"],
+    ),
+    outs = ["GeneratedReportOnlyAlertScanResult.swift"],
+    cmd = "bash $(location Tests/BossTests/scan_for_report_only_alerts.sh) $(SRCS) > $@",
+    tools = ["Tests/BossTests/scan_for_report_only_alerts.sh"],
+)
+
 swift_library(
     name = "boss_mac_app_tests_shard3_lib",
     testonly = True,
     srcs = glob(
         ["Tests/BossTests/**/*.swift"],
         exclude = _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS,
-    ) + [":generate_real_opener_scan"],
+    ) + [
+        ":generate_real_opener_scan",
+        ":generate_report_only_alert_scan",
+    ],
     copts = [
         "-DTEXTUAL_ENABLE_TEXT_SELECTION",
         "-DBOSS_BAZEL_TEST_BUILD",
