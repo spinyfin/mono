@@ -24,6 +24,7 @@ use boss_metrics::Registry;
 /// at the first increment (design §"Risks / open questions" item 6).
 pub fn init_all(registry: &Registry) {
     crate::work::personas::register_metrics(registry);
+    crate::work::db_diagnostics::register_metrics(registry);
     // Off-machine state.db backup copies: success/failure counters and the
     // last-success-age staleness gauge.
     crate::database_backup::register_metrics(registry);
@@ -196,6 +197,7 @@ mod tests {
                 "work_attachments.replayed",
                 "work_attachments.stored",
                 "work_attachments.validation_failed",
+                "work_database_busy",
                 "worker_proposals.channel_error",
                 "worker_proposals.fallback_hit.automation_outcome",
                 "worker_proposals.fallback_hit.blocked",
