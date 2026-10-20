@@ -587,7 +587,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             runId: "exec-1", viewer: attached, liveState: nil, liveStatusDisabledSlotIDs: [], cachedPersona: "Riker"
         )
         XCTAssertTrue(detachPending.isPlaceholder)
-        XCTAssertEqual(detachPending.bodyKind, .terminal)
+        XCTAssertEqual(detachPending.bodyKind, .placeholder)
         XCTAssertEqual(detachPending.headerTitle, "Riker finished")
         XCTAssertNil(detachPending.headerBadge)
         XCTAssertEqual(detachPending.statusPillLabel, "Finished")
