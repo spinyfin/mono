@@ -12,6 +12,15 @@ final class AgentsGridModel: ObservableObject {
 
     @Published private(set) var layout: PaneLayoutModel
     @Published private(set) var poolStrip = AgentsGridModel.defaultPoolStrip
+    @Published private(set) var feedUnavailable = false
+    /// Attached viewers whose run is not in any layout cell (engine
+    /// released and compacted, detach not yet arrived). Keep their
+    /// surfaces mounted until `DetachWorkerPane`.
+    private var viewers: [String: WorkerSlot] = [:]
+    var unplacedViewers: [WorkerSlot] {
+        viewers.values.filter { $0.session != nil && !placedRunIds(in: layout).contains($0.runId ?? "") }
+            .sorted { $0.slotId < $1.slotId }
+    }
     /// Display names for projects seen on live members, keyed by project id.
     @Published private(set) var projectNames: [String: String] = [:]
     /// Projects with at least one live local member, in display order.
@@ -181,7 +190,8 @@ final class AgentsGridModel: ObservableObject {
         viewers: [String: WorkerSlot],
         interactivePoolSize: Int,
         automationPoolSize: Int,
-        reviewPoolSize: Int
+        reviewPoolSize: Int,
+        feedUnavailable: Bool = false
     ) {
         if !isVisible { setVisible(false) }
         apply(
@@ -189,7 +199,8 @@ final class AgentsGridModel: ObservableObject {
             viewers: viewers,
             interactivePoolSize: interactivePoolSize,
             automationPoolSize: automationPoolSize,
-            reviewPoolSize: reviewPoolSize
+            reviewPoolSize: reviewPoolSize,
+            feedUnavailable: feedUnavailable
         )
         if isVisible { setVisible(true) }
     }
@@ -199,8 +210,13 @@ final class AgentsGridModel: ObservableObject {
         viewers: [String: WorkerSlot],
         interactivePoolSize: Int,
         automationPoolSize: Int,
-        reviewPoolSize: Int
+        reviewPoolSize: Int,
+        feedUnavailable: Bool = false
     ) {
+        if self.feedUnavailable != feedUnavailable {
+            self.feedUnavailable = feedUnavailable
+        }
+        self.viewers = viewers
         let local = states.filter(\.isLocalMember)
         exitedRunIds = Set(local.filter { $0.activity == .terminated }.map(\.runId))
         for state in local {
@@ -280,6 +296,11 @@ final class AgentsGridModel: ObservableObject {
         quietTask?.cancel()
         quietTask = nil
         applyPendingGeometry()
+    }
+
+    /// Test seam: skip the 300 ms quiet window.
+    func flushGeometryForTesting() {
+        liveResizeDidEnd()
     }
 
     /// Run ids whose surfaces must stay mounted: every placed run (occupied

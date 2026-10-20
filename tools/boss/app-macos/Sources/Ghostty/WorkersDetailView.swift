@@ -58,6 +58,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
             syncGrid()
         }
         .onChange(of: liveStates.byRunID) { _, _ in syncGrid() }
+        .onChange(of: liveStates.feedUnavailable) { _, _ in syncGrid() }
         .onChange(of: workspace.viewersByRunId) { _, _ in syncGrid() }
         .onChange(of: workspace.viewerAttachFailuresByRunId) { _, _ in syncGrid() }
         .onChange(of: workspace.interactivePoolSize) { _, _ in syncGrid() }
@@ -301,7 +302,8 @@ struct WorkersDetailView: View, @MainActor Equatable {
             viewers: workspace.viewersByRunId,
             interactivePoolSize: workspace.interactivePoolSize,
             automationPoolSize: workspace.automationPoolSize,
-            reviewPoolSize: workspace.reviewSlotCount
+            reviewPoolSize: workspace.reviewSlotCount,
+            feedUnavailable: liveStates.feedUnavailable
         )
     }
 
