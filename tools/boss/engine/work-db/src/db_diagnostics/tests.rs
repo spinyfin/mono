@@ -91,7 +91,9 @@ async fn busy_names_actual_writer_and_counts_rate_limited_failures() {
                 ..Attribution::default()
             }
             .scope(async {
-                let mut conn = writer.connect_new().unwrap();
+                // Observe the connection on this thread; `connect_new` itself
+                // returns a raw, movable connection that diagnostics ignore.
+                let mut conn = OwnedConnection::new(writer.connect_new().unwrap(), writer.persona_metrics.clone());
                 let tx = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .unwrap();
