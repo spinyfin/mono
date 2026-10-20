@@ -22,4 +22,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 rustls = { workspace = true }
 tempfile = { workspace = true }
+# test-util enables tokio's virtual-time controls for the auth-forwarder tests.
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }

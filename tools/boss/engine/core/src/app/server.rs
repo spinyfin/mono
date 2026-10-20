@@ -203,22 +203,6 @@ pub fn process_is_alive(pid: libc::pid_t) -> bool {
     errno == libc::EPERM
 }
 
-/// Spawn the GitHub OAuth auth-state forwarder.
-///
-/// At boot it restores any keychain-persisted token (so the status surface
-/// reflects a prior connection across engine restarts), then subscribes to the
-/// controller's state channel and, for every transition:
-/// - pushes the display-safe [`GitHubAuthStateDto`] on the `github.auth` topic
-///   so subscribed frontends re-render, and
-/// - when the state is freshly `Authorized` with an unresolved `org_state`,
-///   runs the org/SSO probe ([`probe_and_record_org_state`]) and records the
-///   result via `update_org_state` — which itself produces the next transition
-///   the loop then broadcasts.
-///
-/// The probe only fires while `org_state` is `Unknown`, so resolving it to
-/// `Ok`/`NeedsOrgApproval`/`NeedsSso` does not re-trigger a probe; a probe that
-/// returns `Unknown` (transient / no org binding) leaves the state unchanged,
-/// so the loop simply waits for the next real transition rather than spinning.
 // Lets `Arc<ServerState>` be coerced to `Arc<dyn WorkerReaper>` for the
 // terminal-work reconciler (wired in `run` below). Reaping a stranded worker
 // is exactly the completion path's pane teardown. What the reconciler relies
@@ -323,6 +307,22 @@ impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
     }
 }
 
+/// Spawn the GitHub OAuth auth-state forwarder.
+///
+/// At boot it restores any keychain-persisted token (so the status surface
+/// reflects a prior connection across engine restarts), then hands the
+/// controller's state channel to [`run_auth_forwarder`], which:
+/// - pushes the display-safe [`GitHubAuthStateDto`] on the `github.auth` topic
+///   whenever it differs from the last one pushed, so subscribed frontends
+///   re-render, and
+/// - runs the org/SSO probe ([`probe_and_record_org_state`]) once per
+///   authorization that lands as `Authorized { org_state: Unknown }`.
+///
+/// A probe that resolves to `Unknown` (no GitHub-tracked product, transient
+/// failure) is not retried by this loop: re-probing is the job of the
+/// on-demand recheck (`GitHubAuthStatus`, and a product's tracker config
+/// changing), both via [`github_auth::spawn_org_recheck`]. A newly connected
+/// session reads the current state with its connect-time `GitHubAuthStatus`.
 fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
     boss_task_scope::spawn(async move {
         let controller = server_state.github_auth.clone();
@@ -331,29 +331,22 @@ fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::J
         // runs the org probe.
         controller.restore_from_store();
 
-        let flow = controller.device_flow();
-        let work_db = server_state.work_db.clone();
-        let mut rx = controller.subscribe();
-        loop {
-            let state = rx.borrow_and_update().clone();
-            server_state.broadcast_github_auth_state(state.to_dto()).await;
-
-            if let GitHubAuthState::Authorized {
-                record,
-                org_state: OrgAuthState::Unknown,
-            } = &state
-            {
-                let token = record.token.clone();
-                let org_sink = WorkDbOrgStateSink::new(work_db.as_ref());
-                let resolved = probe_and_record_org_state(&org_sink, flow.as_ref(), &token).await;
-                controller.update_org_state(resolved);
-            }
-
-            if rx.changed().await.is_err() {
-                // Sender dropped — the engine is shutting down.
-                break;
-            }
-        }
+        let rx = controller.subscribe();
+        let probe_state = server_state.clone();
+        let broadcast_state = server_state.clone();
+        run_auth_forwarder(
+            &controller,
+            rx,
+            |token| {
+                let server_state = probe_state.clone();
+                async move { github_auth::probe_org_state(&server_state, &token).await }
+            },
+            |dto| {
+                let server_state = broadcast_state.clone();
+                async move { server_state.broadcast_github_auth_state(dto).await }
+            },
+        )
+        .await;
     })
 }
 
