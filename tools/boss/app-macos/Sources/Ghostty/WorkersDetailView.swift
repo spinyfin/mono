@@ -355,30 +355,13 @@ struct WorkerSlotView: View, @MainActor Equatable {
         }
     }
 
-    @ViewBuilder
     private var slotBody: some View {
-        switch snapshot.bodyKind {
-        case .placeholder:
-            // A released run with its viewer still attached keeps the
-            // surface mounted (surfaces live until the matching detach) but
-            // invisible and inert behind the finished card.
-            ZStack {
-                if let session = snapshot.session {
-                    terminal(session)
-                        .opacity(0)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
-                placeholderCard
-            }
-        case .terminal:
-            if let session = snapshot.session {
-                terminal(session)
-                    .opacity(snapshot.isExited ? 0.55 : 1)
-            }
-        case .viewerMissing:
-            viewerMissingCard
-        }
+        WorkerSlotBody(
+            snapshot: snapshot,
+            terminal: { terminal($0) },
+            placeholder: { placeholderCard },
+            viewerMissing: { viewerMissingCard }
+        )
     }
 
     private func terminal(_ session: TerminalPaneSession) -> some View {
@@ -387,7 +370,6 @@ struct WorkerSlotView: View, @MainActor Equatable {
             session: session,
             liveStatePresent: snapshot.live != nil
         )
-        .id(session.id)
         .onChange(of: snapshot.displayName, initial: true) { _, name in
             session.setWorkerName(name)
         }

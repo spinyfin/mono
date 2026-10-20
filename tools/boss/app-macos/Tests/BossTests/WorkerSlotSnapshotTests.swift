@@ -588,6 +588,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         )
         XCTAssertTrue(detachPending.isPlaceholder)
         XCTAssertEqual(detachPending.bodyKind, .placeholder)
+        XCTAssertNotNil(detachPending.session)
+        XCTAssertTrue(detachPending.session === session)
         XCTAssertEqual(detachPending.headerTitle, "Riker finished")
         XCTAssertNil(detachPending.headerBadge)
         XCTAssertEqual(detachPending.statusPillLabel, "Finished")
