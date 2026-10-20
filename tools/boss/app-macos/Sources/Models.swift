@@ -217,6 +217,14 @@ struct WorkTask: Identifiable, Hashable {
     /// Together with `updatedAt` it keys the Review column's Pending-section
     /// order. Mirrors `Task.pr_updated_at` on the wire.
     var prUpdatedAt: String? = nil
+    /// One engine-written sentence saying why this Review-lane card is
+    /// blocked or stalled, including any remediation the engine tried
+    /// ("CI retrying: HTTP 504 in checks (1/2)"). Mirrors
+    /// `Task.review_blocked_reason`; `nil` when nothing is blocking it.
+    var reviewBlockedReason: String? = nil
+    /// Machine key for `reviewBlockedReason`. Mirrors
+    /// `Task.review_blocked_category`.
+    var reviewBlockedCategory: String? = nil
     /// Resolved doc-link state for this work item. Independent of `kind`
     /// — any task may carry a per-task pointer. Mirrors `Task.doc_link_state`
     /// on the wire: the engine resolves the task's own `doc_*` columns

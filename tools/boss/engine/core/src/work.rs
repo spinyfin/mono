@@ -624,6 +624,7 @@ mod attention_reconcile;
 mod attentions;
 mod audit_misc;
 mod automations;
+mod blocked_pr;
 mod blocked_workspace;
 mod blocking;
 pub(crate) mod board_runtime_cache;
@@ -761,6 +762,7 @@ pub(crate) use review_guide_sources::{
 };
 // Only the unit-test suite (and the resolver itself) call this directly;
 // production attach sites go through `attach_task_doc_link_state`.
+pub use blocked_pr::*;
 pub use pr_binding::{BLOCKED_REASON_PR_BINDING_UNRESOLVED, PrBindingRepairCandidate, PrBindingSuspicion};
 pub use pr_flow::DeferredReviewAdmissionCandidate;
 pub use pr_flow::OperatorAnswerOutcome;

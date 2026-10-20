@@ -1023,6 +1023,13 @@ pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task
     if let Err(err) = attach_pr_updated_at(conn, &mut tasks, &mut chores) {
         tracing::warn!(?err, task_id = %task.id, "attach_task_derived_projections: pr_updated_at failed; ignoring");
     }
+    if let Err(err) = attach_review_blocked_reason(conn, &mut tasks, &mut chores) {
+        tracing::warn!(
+            ?err,
+            task_id = %task.id,
+            "attach_task_derived_projections: review_blocked_reason failed; ignoring"
+        );
+    }
     if let Err(err) = attach_has_attachments_flag_for_ids(conn, &mut tasks, &mut chores) {
         tracing::warn!(
             ?err,
@@ -1054,6 +1061,8 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.ai_review_findings_revision_id = src.ai_review_findings_revision_id.clone();
     dst.ready_for_review = src.ready_for_review;
     dst.review_section = src.review_section;
+    dst.review_blocked_reason = src.review_blocked_reason.clone();
+    dst.review_blocked_category = src.review_blocked_category.clone();
     dst.review_guide_lifecycle = src.review_guide_lifecycle.clone();
     dst.review_guide_readable_version_id = src.review_guide_readable_version_id.clone();
     dst.review_guide_selected_comparison_id = src.review_guide_selected_comparison_id.clone();

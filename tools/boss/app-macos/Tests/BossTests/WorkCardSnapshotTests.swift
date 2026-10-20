@@ -85,6 +85,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "reviewGuideReadableVersionId",
         "reviewGuideStaleSource",
         "reviewGuideError",
+        "reviewBlockedReason",
     ]
 
     /// `WorkTask` fields the snapshot intentionally ignores. Changing any of
@@ -109,6 +110,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "readyForReview",
         "reviewSection",
         "prUpdatedAt",
+        "reviewBlockedCategory",
         "docLinkState",
         "reviewGuideSelectedComparisonId",
         "originTaskShortId",
@@ -260,6 +262,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             ("readyForReview", { t in var t = t; t.readyForReview = true; return t }),
             ("reviewSection", { t in var t = t; t.reviewSection = .blocked; return t }),
             ("prUpdatedAt", { t in var t = t; t.prUpdatedAt = "2026-05-25T00:00:00Z"; return t }),
+            ("reviewBlockedCategory", { t in var t = t; t.reviewBlockedCategory = "ci_failing"; return t }),
             ("docLinkState", { t in
                 var t = t; t.docLinkState = .notSet; return t
             }),
@@ -790,6 +793,20 @@ final class WorkCardSnapshotTests: XCTestCase {
                 },
                 mutate: {
                     var t = $0; t.prMergeableState = "conflicting"; return t
+                }
+            ),
+            Case(
+                name: "reviewBlockedReason",
+                context: review,
+                base: {
+                    Self.makeTask(
+                        id: "task_1",
+                        status: "in_review",
+                        prURL: "https://github.com/x/y/pull/3"
+                    )
+                },
+                mutate: {
+                    var t = $0; t.reviewBlockedReason = "Needs you: merge conflict with main"; return t
                 }
             ),
         ]

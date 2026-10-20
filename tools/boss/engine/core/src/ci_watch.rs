@@ -348,6 +348,36 @@ pub async fn on_ci_failure_detected(
     probe: &PrLifecycleProbe,
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    on_ci_failure_detected_with(
+        work_db,
+        publisher,
+        pr_checker,
+        candidate,
+        probe,
+        failures,
+        &crate::ci_transient_retry::NoTransientRetry,
+    )
+    .await
+}
+
+/// [`on_ci_failure_detected`] with the transient-CI retry step enabled
+/// through `retrier` (`crate::ci_transient_retry`). When every failing
+/// check is a PR-branch Buildkite job that failed on positive
+/// infrastructure evidence, the failed jobs are retried in place and the
+/// card is neither flipped to `blocked: ci_failure` nor given a fix
+/// revision; the blocked-PR sweep renders "CI retrying: … (n/N)" from the
+/// ledger until the next probe sees the retried job running. Anything
+/// not positively transient — or a head whose retry budget is spent —
+/// continues into the ordinary fix path below unchanged.
+pub async fn on_ci_failure_detected_with(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    pr_checker: &dyn PrStateChecker,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+    failures: &[RequiredCheckFailure],
+    retrier: &dyn crate::ci_transient_retry::BuildkiteRetrier,
+) -> bool {
     if failures.is_empty() {
         // Defensive — the dispatch site already filtered on Failing,
         // but if a future caller hands us an empty set we should not
@@ -356,6 +386,17 @@ pub async fn on_ci_failure_detected(
     }
     if auto_pr_maintenance_disabled(work_db, candidate, &probe.labels) {
         return false;
+    }
+    if let crate::ci_transient_retry::TransientOutcome::Handled { retried_jobs } =
+        crate::ci_transient_retry::try_transient_retry(work_db, publisher, retrier, candidate, probe, failures).await
+    {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            retried_jobs = ?retried_jobs,
+            "ci_watch: failing checks were transient; jobs retried, no fix revision minted",
+        );
+        return true;
     }
     // §Q7 composed ordering: an active conflict-resolution attempt
     // (or auto-rebase escalation) for this PR owns the slot until

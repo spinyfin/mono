@@ -103,6 +103,13 @@ pub struct SweepOutcome {
     pub reserved_review_units: i64,
     /// Point-in-time count of PendingReview tasks waiting on admission.
     pub deferred_pre_merge_count: usize,
+    /// Review-lane cards the blocked-PR sweep stored a (new or changed)
+    /// diagnosis for this pass — the reason the card shows for being
+    /// blocked or stalled (`crate::blocked_pr_sweep`).
+    pub blocked_pr_diagnosed: usize,
+    /// Dead revisions (no live worker, last run terminal) the blocked-PR
+    /// sweep re-dispatched this pass, within its per-revision budget.
+    pub blocked_pr_redispatched: usize,
 }
 
 impl SweepOutcome {
@@ -124,6 +131,10 @@ impl SweepOutcome {
             + self.trunk_episodes_adopted
             + self.review_admission_recovered
             + self.review_batches_reaped
+            // `blocked_pr_diagnosed` is deliberately not a transition: a
+            // stored reason describes state the pass already wrote, and the
+            // sweep logs its own pass summary.
+            + self.blocked_pr_redispatched
     }
 }
 
@@ -634,6 +645,13 @@ pub async fn run_one_pass_observed(
         }
     }
     sample_review_pool_gauges(work_db, &mut outcome);
+
+    // Last, after every lifecycle transition above has written its state:
+    // say WHY each Review-lane card that is still blocked or stalled is so,
+    // and re-kick the one path that has no owner (a dead revision).
+    let blocked = crate::blocked_pr_sweep::run_one_pass(work_db, publisher).await;
+    outcome.blocked_pr_diagnosed = blocked.diagnosed;
+    outcome.blocked_pr_redispatched = blocked.redispatched;
 
     let observations = poll_observations(&probe_urls, &snapshot.results);
     (outcome, observations)
@@ -1917,7 +1935,16 @@ pub(crate) async fn reconcile_stranded(
                 },
                 _ => Vec::new(),
             };
-            if ci_watch::on_ci_failure_detected(work_db, publisher, &checker, candidate, probe_result, &failures).await
+            if ci_watch::on_ci_failure_detected_with(
+                work_db,
+                publisher,
+                &checker,
+                candidate,
+                probe_result,
+                &failures,
+                &crate::ci_transient_retry::BkCli::default(),
+            )
+            .await
             {
                 outcome.ci_flagged += 1;
             }
@@ -1938,13 +1965,14 @@ pub(crate) async fn dispatch_ci_axis(
     outcome: &mut SweepOutcome,
 ) {
     if let OpenPrCiStatus::Failing { failures } = ci
-        && ci_watch::on_ci_failure_detected(
+        && ci_watch::on_ci_failure_detected_with(
             work_db,
             publisher,
             &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
             candidate,
             probe_result,
             failures,
+            &crate::ci_transient_retry::BkCli::default(),
         )
         .await
     {
