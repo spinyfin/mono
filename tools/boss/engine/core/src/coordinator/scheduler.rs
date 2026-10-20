@@ -1585,7 +1585,7 @@ impl ExecutionCoordinator {
             // mainline arrival to at most one preemption.
             let claimed = match claimed {
                 Some(worker_id) => Some(worker_id),
-                None if is_main && !preempted_this_pass => {
+                None if is_main && !is_critical && !preempted_this_pass => {
                     match self.try_preempt_automation_for(&execution).await {
                         // Latch on the teardown having happened, NOT on
                         // having won the slot — see `PreemptionAttempt`.

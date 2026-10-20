@@ -1,10 +1,7 @@
 //! The `critical` urgency level: a human-only escape hatch above `high`.
 //!
-//! On 2026-10-15 a fix the repo owner had declared critical sat `ready`
-//! for ~12 minutes behind the interactive concurrency cap while
-//! lower-priority work that had queued later kept the slots; `high` does
-//! not get ahead of the cap. `critical` does, and because it bypasses
-//! capacity limits only the human owner may set it.
+//! Critical priority bypasses the interactive concurrency cap and an operator
+//! dispatch pause, so only the human caller tier may set it.
 //!
 //! This module is the single authority for the *write* rule. The read
 //! side — ordering critical rows first, skipping the interactive cap and
@@ -48,8 +45,8 @@ pub fn is_critical(priority: &str) -> bool {
 }
 
 /// The error every refused critical write surfaces. Names the caller
-/// tier the engine resolved so the operator can tell *which* automated
-/// path tried it, and says what a human can do instead.
+/// tier so the error identifies which automated caller attempted the write,
+/// and says what a human can do instead.
 pub fn critical_refusal(caller_tier: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "priority `critical` is reserved for the human owner: refused for caller tier `{caller_tier}`. \
@@ -171,6 +168,8 @@ mod tests {
             assert!(msg.contains("reserved for the human owner"), "{actor}: {msg}");
             assert!(msg.contains(&format!("`{actor}`")), "{actor}: {msg}");
         }
+        let err = db.update_work_item(&chore.id, priority_patch("CRITICAL")).unwrap_err();
+        assert!(err.to_string().contains("`engine`"), "{err}");
         let row = task_of(db.get_work_item(&chore.id).unwrap());
         assert_eq!(row.priority, "medium", "a refused raise must leave the row untouched");
         assert_eq!(row.critical_set_by, None);

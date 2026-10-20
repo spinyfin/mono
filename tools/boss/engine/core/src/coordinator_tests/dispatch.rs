@@ -1719,3 +1719,29 @@ async fn critical_item_is_still_held_by_a_breaker_pause() {
     assert_eq!(held.status, ExecutionStatus::Ready);
     assert_eq!(held.dispatch_wait_reason.as_deref(), Some("dispatch_paused"));
 }
+
+#[test]
+fn critical_rows_are_oldest_first_despite_execution_priority_and_class() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let product = create_test_product(&db);
+    let older = create_test_chore(&db, product.id.clone(), "Older critical");
+    let newer = create_test_chore(&db, product.id.clone(), "Newer critical");
+    db.reconcile_product_executions(&product.id).unwrap();
+    raise_to_critical(&db, &older.id);
+    raise_to_critical(&db, &newer.id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = '2026-01-01T00:00:00Z' WHERE work_item_id = ?1",
+            rusqlite::params![older.id],
+        )
+        .unwrap();
+    db.connect().unwrap().execute(
+        "UPDATE work_executions SET created_at = '2026-01-02T00:00:00Z', priority = 10, kind = 'revision_implementation' WHERE work_item_id = ?1",
+        rusqlite::params![newer.id],
+    ).unwrap();
+    let ready = db.list_ready_executions().unwrap();
+    assert_eq!(ready[0].work_item_id, older.id);
+    assert_eq!(ready[1].work_item_id, newer.id);
+}

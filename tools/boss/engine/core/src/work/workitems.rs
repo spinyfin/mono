@@ -835,7 +835,13 @@ impl WorkDb {
     }
 
     pub fn update_work_item(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
-        self.update_work_item_as_actor(id, patch, "human")
+        // Priority writes require explicit caller authority.
+        let actor = if patch.priority.is_some() {
+            boss_protocol::LAST_STATUS_ACTOR_ENGINE
+        } else {
+            boss_protocol::LAST_STATUS_ACTOR_HUMAN
+        };
+        self.update_work_item_as_actor(id, patch, actor)
     }
 
     /// Like `update_work_item` but stamps `last_status_actor` with `actor`

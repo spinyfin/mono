@@ -848,12 +848,9 @@ async fn run_one_pass_filtered(
         // the engine's one reason-producing admission evaluator, rather than
         // a second private notion of "is dispatch paused" — so this sweep
         // agrees by construction with what `bossctl dispatch pause` means
-        // everywhere else, including the one case where a paused engine
-        // legitimately still dispatches: an operator-originated pause
-        // exempts the review pool (`drain_ready_queue` holds only
-        // `paused && !is_review`), and the evaluator reports no pause in
-        // effect for such a row. That exemption is the *only* sanctioned
-        // bypass here, and it is the evaluator's decision, not this sweep's.
+        // everywhere else: an operator-originated pause exempts review
+        // executions and critical main-pool work. The evaluator reports no
+        // pause in effect for those rows; a breaker pause still holds them.
         //
         // Deliberately reads only `admission.pause`, not `would_dispatch`:
         // the other blockers it computes (the interactive concurrency cap

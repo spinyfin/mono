@@ -150,8 +150,7 @@ pub(crate) fn dispatch_stats(json: bool, state_root: Option<PathBuf>, since: Opt
             let work_item = entry.work_item_id.as_deref().unwrap_or("-");
             // A critical row is exempt from the cap and an operator pause,
             // so one still listed here is waiting on pool capacity itself
-            // — worth a loud marker, since it is the row the operator
-            // declared must not wait.
+            // — worth a loud marker.
             let critical = if entry.critical { "  CRITICAL" } else { "" };
             println!(
                 "  {}  work_item={}  pool={}  kind={}  reason={}  waiting={}{}",

@@ -701,6 +701,7 @@ impl WorkDb {
                AND (we.dispatch_not_before IS NULL \
                     OR CAST(we.dispatch_not_before AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER)) \
              ORDER BY CASE WHEN t.priority = '{critical}' THEN 0 ELSE 1 END ASC, \
+                      CASE WHEN t.priority = '{critical}' THEN we.created_at END ASC, \
                       {class_case} ASC, we.priority DESC, we.created_at ASC, we.id ASC",
             critical = super::critical_priority::PRIORITY_CRITICAL,
         );

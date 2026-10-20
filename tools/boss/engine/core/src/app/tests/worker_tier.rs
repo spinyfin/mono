@@ -393,3 +393,36 @@ async fn run_scope_denies_a_worker_reading_another_executions_runs() {
     let parsed = round_trip(server_state, Some(self_pid()), &own_request).await;
     assert_eq!(parsed["payload"]["type"], "runs_list");
 }
+
+#[tokio::test]
+async fn critical_update_handler_refuses_worker_and_accepts_human_peer() {
+    let (state, _dir) = test_server_state();
+    state.feature_flags.set("worker_rpc_tier", false).unwrap();
+    let product = crate::test_support::create_test_product(&state.work_db);
+    let chore = crate::test_support::create_test_chore(&state.work_db, product.id, "Priority");
+    let request = serde_json::json!({
+        "request_id": "critical-update",
+        "payload": {
+            "type": "update_work_item", "id": chore.id,
+            "patch": { "priority": "critical" }
+        }
+    })
+    .to_string();
+    state.worker_registry.register(self_pid(), "exec_worker".to_owned());
+    let refused = round_trip(state.clone(), Some(self_pid()), &request).await;
+    assert_eq!(refused["payload"]["type"], "work_error");
+    assert!(refused.to_string().contains("`worker`"), "{refused}");
+    let WorkItem::Chore(unchanged) = state.work_db.get_work_item(&chore.id).unwrap() else {
+        panic!("expected chore");
+    };
+    assert_eq!(unchanged.priority, "medium");
+
+    state.worker_registry.unregister(self_pid());
+    let accepted = round_trip(state.clone(), Some(self_pid()), &request).await;
+    assert_eq!(accepted["payload"]["type"], "work_item_updated", "{accepted}");
+    let WorkItem::Chore(updated) = state.work_db.get_work_item(&chore.id).unwrap() else {
+        panic!("expected chore");
+    };
+    assert_eq!(updated.priority, "critical");
+    assert_eq!(updated.critical_set_by.as_deref(), Some("human"));
+}

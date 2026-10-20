@@ -71,10 +71,11 @@ pub(crate) struct DispatchAdmissionFacts {
     /// automation-sourced) — the only pool the concurrency cap governs.
     #[builder(default)]
     pub targets_main_pool: bool,
+    /// Whether the task currently has critical priority.
+    #[builder(default)]
+    pub is_critical: bool,
     /// `true` when a fresh execution for this work item would route to
-    /// the dedicated review pool (i.e. `pr_review`) — the only pool an
-    /// operator-originated dispatch pause exempts (`drain_ready_queue`
-    /// holds only `paused && !is_review`). Used by
+    /// the dedicated review pool (i.e. `pr_review`). Used by
     /// `ExecutionCoordinator::evaluate_dispatch_admission` to report no
     /// pause in effect for such rows, rather than a bypassable one.
     #[builder(default)]
@@ -195,6 +196,7 @@ impl WorkDb {
             autostart_disabled: bool,
             deliberate_parked: bool,
             kind: Option<ExecutionKind>,
+            is_critical: bool,
         }
         let raw = {
             let conn = self.connect()?;
@@ -210,16 +212,17 @@ impl WorkDb {
                     autostart_disabled: false,
                     deliberate_parked: false,
                     kind: None,
+                    is_critical: false,
                 }
             } else {
-                let row: Option<(String, Option<String>, i64, i64)> = conn
+                let row: Option<(String, Option<String>, i64, i64, String)> = conn
                     .query_row(
-                        "SELECT status, archived_reason, autostart, deleted_at IS NOT NULL FROM tasks WHERE id = ?1",
+                        "SELECT status, archived_reason, autostart, deleted_at IS NOT NULL, priority FROM tasks WHERE id = ?1",
                         params![resolved_work_item_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                     )
                     .optional()?;
-                let Some((status_str, archived_reason, autostart, deleted)) = row else {
+                let Some((status_str, archived_reason, autostart, deleted, priority)) = row else {
                     return Ok(DispatchAdmissionFacts::builder()
                         .resolved_work_item_id(resolved_work_item_id.clone())
                         .ineligible_reason(format!("unknown work item: {resolved_work_item_id}"))
@@ -320,6 +323,7 @@ impl WorkDb {
                     autostart_disabled,
                     deliberate_parked,
                     kind: Some(kind),
+                    is_critical: critical_priority::is_critical(&priority),
                 }
             }
         };
@@ -349,6 +353,7 @@ impl WorkDb {
             .autostart_disabled(raw.autostart_disabled)
             .deliberate_parked(raw.deliberate_parked)
             .targets_main_pool(targets_main_pool)
+            .is_critical(raw.is_critical)
             .exempt_from_operator_pause(exempt_from_operator_pause)
             .build())
     }
