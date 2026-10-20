@@ -384,11 +384,17 @@ struct WorkerSlotView: View, @MainActor Equatable {
     init(
         runtime: GhosttyRuntime,
         snapshot: WorkerSlotSnapshot,
+        isHighlighted: Bool = false,
+        focusCoordinator: AgentFocusCoordinator? = nil,
+        focusRunId: String? = nil,
         onToggleLiveStatus: @escaping (Bool) -> Void,
         terminalContent: @escaping WorkerTerminalContent = WorkerSlotView.productionTerminalContent
     ) {
         self.runtime = runtime
         self.snapshot = snapshot
+        self.isHighlighted = isHighlighted
+        self.focusCoordinator = focusCoordinator
+        self.focusRunId = focusRunId
         self.onToggleLiveStatus = onToggleLiveStatus
         self.terminalContent = terminalContent
     }
