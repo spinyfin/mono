@@ -384,7 +384,7 @@ pub(super) struct SessionSink {
     #[builder(default)]
     pop_traces: StdMutex<HashMap<String, crate::population_timing::PopulationTrace>>,
     #[builder(default)]
-    pub(super) board_reads: StdMutex<super::read_freshness::ReadFreshness<boss_protocol::WorkTree>>,
+    pub(super) board_reads: StdMutex<super::read_freshness::ReadFreshness<(u64, boss_protocol::WorkTree)>>,
     #[builder(default)]
     pub(super) view_reads: StdMutex<super::read_freshness::ReadFreshness<FrontendEventEnvelope>>,
     #[builder(default)]

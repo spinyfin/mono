@@ -11,6 +11,19 @@ async fn fetch_with_db(
     delta: bool,
     db: Arc<crate::work::WorkDb>,
 ) -> FrontendEvent {
+    let id = send_fetch(state, sink, product, delta, db).await;
+    let reply = sink.next().await.unwrap();
+    assert_eq!(reply.request_id.as_deref(), Some(id.as_str()));
+    reply.payload
+}
+
+async fn send_fetch(
+    state: &Arc<ServerState>,
+    sink: &Arc<SessionSink>,
+    product: &str,
+    delta: bool,
+    db: Arc<crate::work::WorkDb>,
+) -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = format!("fetch-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let ctx = Dispatch::builder()
@@ -31,9 +44,7 @@ async fn fetch_with_db(
         },
     )
     .await;
-    let reply = sink.next().await.unwrap();
-    assert_eq!(reply.request_id.as_deref(), Some(id.as_str()));
-    reply.payload
+    id
 }
 
 fn update(event: FrontendEvent) -> boss_protocol::work_tree_delta::WorkTreeUpdate {
@@ -44,12 +55,16 @@ fn update(event: FrontendEvent) -> boss_protocol::work_tree_delta::WorkTreeUpdat
 }
 
 #[test]
-fn slow_board_read_does_not_block_a_later_read_on_the_same_session() {
-    repeated_overtaking(false);
-    repeated_overtaking(true);
+fn same_product_reads_preserve_freshness_and_delta_sequence() {
+    overlapping_reads(false);
 }
 
-fn repeated_overtaking(other_product: bool) {
+#[test]
+fn slow_board_read_does_not_block_a_different_product_on_the_same_session() {
+    overlapping_reads(true);
+}
+
+fn overlapping_reads(other_product: bool) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -70,7 +85,7 @@ fn repeated_overtaking(other_product: bool) {
     let sink = make_session_sink();
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = attempts.clone();
-    let slow_db = Arc::new(state.work_db.query_connection().unwrap());
+    let slow_db = Arc::new(state.work_db.reader().unwrap());
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let mut first = true;
@@ -105,7 +120,7 @@ fn repeated_overtaking(other_product: bool) {
     let reader_sink = sink.clone();
     let product_id = product.id.clone();
     let reader = std::thread::spawn(move || {
-        tokio::runtime::Runtime::new().unwrap().block_on(fetch_with_db(
+        tokio::runtime::Runtime::new().unwrap().block_on(send_fetch(
             &reader_state,
             &reader_sink,
             &product_id,
@@ -121,27 +136,67 @@ fn repeated_overtaking(other_product: bool) {
         .execute("UPDATE tasks SET name = 'after'", [])
         .unwrap();
     let fast_db = Arc::new(state.work_db.reader().unwrap());
-    let fast_product = if other_product { &other.id } else { &product.id };
-    let fast = update(runtime.block_on(fetch_with_db(&state, &sink, fast_product, true, fast_db)));
-    assert!(fast.base_sequence.is_none());
-    if !other_product {
-        assert_eq!(fast.changes["chores"][0]["name"], "after");
-    }
-    let mut last = fast.sequence;
-    for _ in 0..8 {
-        let id = if other_product { &other.id } else { &product.id };
-        last = update(runtime.block_on(fetch(&state, &sink, id, true))).sequence;
-    }
-    release_tx.send(()).unwrap();
-    let slow = update(reader.join().unwrap());
-    assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
     if other_product {
+        // Preserve the overtaking guarantee for independent keys, including
+        // repeated delta updates while the first product remains blocked.
+        let fast = update(runtime.block_on(fetch_with_db(&state, &sink, &other.id, true, fast_db)));
+        assert!(fast.base_sequence.is_none());
+        let mut last = fast.sequence;
+        for _ in 0..8 {
+            let next = update(runtime.block_on(fetch(&state, &sink, &other.id, true)));
+            assert_eq!(next.base_sequence, Some(last));
+            assert_eq!(next.changes, serde_json::json!({}));
+            last = next.sequence;
+        }
+        release_tx.send(()).unwrap();
+        let id = reader.join().unwrap();
+        let reply = runtime.block_on(sink.next()).unwrap();
+        assert_eq!(reply.request_id.as_deref(), Some(id.as_str()));
+        let slow = update(reply.payload);
         assert!(slow.base_sequence.is_none());
         assert_eq!(slow.changes["chores"][0]["name"], "before");
     } else {
-        assert_eq!(slow.base_sequence, Some(last));
-        assert_eq!(slow.changes, serde_json::json!({}));
+        let (fast_state, fast_sink, product_id) = (state.clone(), sink.clone(), product.id.clone());
+        let fast = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(send_fetch(
+                &fast_state,
+                &fast_sink,
+                &product_id,
+                true,
+                fast_db,
+            ))
+        });
+        release_tx.send(()).unwrap();
+        let old_id = reader.join().unwrap();
+        let new_id = fast.join().unwrap();
+        let first = runtime.block_on(sink.next()).unwrap();
+        let second = runtime.block_on(sink.next()).unwrap();
+        assert_ne!(first.request_id, second.request_id);
+        assert!([old_id.as_str(), new_id.as_str()].contains(&first.request_id.as_deref().unwrap()));
+        assert!([old_id.as_str(), new_id.as_str()].contains(&second.request_id.as_deref().unwrap()));
+        let first_update = update(first.payload);
+        let second_update = update(second.payload);
+        assert!(first_update.base_sequence.is_none());
+        assert_eq!(second_update.base_sequence, Some(first_update.sequence));
+        assert!(second_update.sequence > first_update.sequence);
+        if first.request_id.as_deref() == Some(new_id.as_str()) {
+            // Newer scan enqueued first: the delayed older reply must reuse
+            // that snapshot, never roll the board back.
+            assert_eq!(first_update.changes["chores"][0]["name"], "after");
+            assert_eq!(second_update.changes, serde_json::json!({}));
+        } else {
+            assert_eq!(first_update.changes["chores"][0]["name"], "before");
+            let changed = second_update.changes["chores"]["upserts"].as_array().unwrap();
+            assert_eq!(changed.len(), 64);
+            assert!(changed.iter().all(|row| row["name"] == "after"));
+        }
+        assert_eq!(
+            update(runtime.block_on(fetch(&state, &sink, &product.id, true))).changes,
+            serde_json::json!({}),
+            "the session must retain the fresh board"
+        );
     }
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

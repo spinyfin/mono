@@ -485,6 +485,7 @@ dependencies = [
  "boss-pr-template",
  "boss-protocol",
  "boss-review-guide",
+ "boss-single-flight",
  "boss-ssh-transport",
  "boss-timer-wheel",
  "boss-tmux",
@@ -1026,6 +1027,10 @@ dependencies = [
 
 [[package]]
 name = "boss-shell-quote"
+version = "0.1.0"
+
+[[package]]
+name = "boss-single-flight"
 version = "0.1.0"
 
 [[package]]

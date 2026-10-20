@@ -1367,10 +1367,23 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         .lock()
         .expect("board reads poisoned")
         .begin(&request_id, product_id.clone());
-    match work_db.get_work_tree_instrumented(&product_id, &mut trace) {
-        Ok(tree) => {
+    let started = Instant::now();
+    let loaded = server_state
+        .work_tree_loads
+        .load(&work_db, &server_state.work_revision, &product_id, &mut trace);
+    trace.record_plain("shared_load_wait", crate::population_timing::elapsed_ms(started));
+    let result = loaded.and_then(|loaded| {
+        loaded
+            .value
+            .as_ref()
+            .map(|tree| (loaded.sequence, tree.clone()))
+            .map_err(Clone::clone)
+    });
+    match result {
+        Ok((sequence, tree)) => {
             let mut reads = sink.board_reads.lock().expect("board reads poisoned");
-            let tree = reads.finish(&request_id, tree);
+            let (snapshot_revision, tree) = reads.finish_at(&request_id, sequence, tree);
+            trace.set_items(tree.tasks.len() + tree.chores.len());
             let mut cache = sink.work_tree_cache.lock().expect("work tree cache poisoned");
             if delta {
                 match cache.update(&tree) {
@@ -1380,7 +1393,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
                         send_response_with_revision(
                             &sink,
                             &request_id,
-                            server_state.current_work_revision(),
+                            snapshot_revision,
                             FrontendEvent::WorkTreeUpdate { update },
                         );
                     }
@@ -1399,7 +1412,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
             send_response_with_revision(
                 &sink,
                 &request_id,
-                server_state.current_work_revision(),
+                snapshot_revision,
                 FrontendEvent::WorkTree {
                     product: tree.product,
                     projects: tree.projects,
@@ -1423,7 +1436,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
             // the next occurrence is diagnosable from the trace rather than
             // from a screenshot of the resulting "Work Error" modal.
             tracing::error!(product_id = %product_id, error = %err, "get_work_tree failed: product board unavailable");
-            send_work_error(&sink, &request_id, &err);
+            send_work_error(&sink, &request_id, err);
         }
     }
 }

@@ -915,6 +915,8 @@ struct ServerState {
     boot_id: u64,
     next_session_id: AtomicU64,
     work_revision: Arc<AtomicU64>,
+    #[builder(default)]
+    work_tree_loads: work_tree_loads::WorkTreeLoads,
     /// Pid of the process the engine trusts as the macOS app — must
     /// match a session's `peer_pid` for `RegisterAppSession` to
     /// succeed. `None` only in tests; production seeds this from
@@ -2311,6 +2313,7 @@ mod read_admission;
 mod read_freshness;
 mod session_queue;
 mod session_write;
+mod work_tree_loads;
 use session_queue::*;
 
 async fn handle_frontend_connection(
