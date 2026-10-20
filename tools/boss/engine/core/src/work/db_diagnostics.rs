@@ -37,7 +37,7 @@ where
         background: format!("{} @ {caller}", std::any::type_name::<F>()),
         ..Attribution::default()
     });
-    tokio::spawn(attribution.scope(future))
+    boss_task_scope::spawn(attribution.scope(future))
 }
 
 /// Task-local values do not cross Tokio's blocking boundary automatically.

@@ -1075,7 +1075,7 @@ pub fn enqueue_from_merge(work_db: &WorkDb, ctx: PopulateContext) {
     let max_tasks = config.max_tasks;
     let publisher = config.publisher.clone();
     tracing::info!(project_id = %ctx.project_id, pr_url = %ctx.pr_url, "populator: enqueuing auto-populate");
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let outcome = Populator::run(&db, &steps, &ctx, max_tasks, publisher.as_ref()).await;
         tracing::info!(
             project_id = %ctx.project_id,

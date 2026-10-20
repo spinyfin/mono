@@ -155,7 +155,7 @@ pub(crate) fn flush(stats: &LockStats, registry: &Registry) {
 
 /// Spawn the timer task that flushes the global window every minute.
 pub fn spawn_summary_task(registry: Arc<Registry>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let mut ticker = tokio::time::interval(SUMMARY_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;

@@ -502,7 +502,7 @@ impl ServerState {
             match self._self_weak.upgrade() {
                 Some(arc_self) => {
                     let run_id = run_id.to_owned();
-                    tokio::spawn(async move {
+                    boss_task_scope::spawn(async move {
                         crate::interrupt_recovery::run_interrupt_recovery(driver, run_id, snapshot, arc_self).await;
                     });
                 }

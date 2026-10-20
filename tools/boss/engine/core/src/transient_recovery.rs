@@ -259,7 +259,7 @@ pub fn spawn_loop(
     mut transient_error_idle: boss_event_bus::Subscription,
 ) -> tokio::task::JoinHandle<()> {
     let policy = RecoveryPolicy::default();
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         // Execution IDs that received a runtime nudge this engine session.
         // On the next sweep pass, if the error is still present, we skip
         // the nudge and fall through to orphan+respawn. Keyed by the
@@ -632,7 +632,7 @@ async fn process_state(
             // window expires.
             coordinator.kick();
             let coordinator = coordinator.clone();
-            tokio::spawn(async move {
+            boss_task_scope::spawn(async move {
                 tokio::time::sleep(backoff).await;
                 coordinator.kick();
             });

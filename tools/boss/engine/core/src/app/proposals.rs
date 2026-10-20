@@ -746,7 +746,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                             let handler = Arc::clone(&server_state.completion_handler);
                             let execution_id = caller.execution_id.clone();
                             let outcome = run_done_payload.outcome;
-                            tokio::spawn(async move {
+                            crate::work::db_diagnostics::spawn(async move {
                                 let resolved = handler
                                     .finalize_declared_run_done_until_resolved(&execution_id, outcome)
                                     .await;

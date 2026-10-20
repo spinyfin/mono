@@ -375,7 +375,7 @@ impl WorkerCompletionHandler {
         let db = self.work_db.clone();
         let publisher = self.publisher.clone();
         let execution_id = execution_id.to_owned();
-        Some(tokio::spawn(async move {
+        Some(boss_task_scope::spawn(async move {
             if let Err(error) = capture.await {
                 tracing::warn!(?error, "review-guide capture task failed");
             }

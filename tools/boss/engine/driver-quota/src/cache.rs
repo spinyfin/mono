@@ -169,7 +169,7 @@ impl QuotaCache {
         for probe in &self.probes {
             let probe = Arc::clone(probe);
             let timeout = self.probe_timeout;
-            join_set.spawn(async move {
+            boss_task_scope::spawn_into(&mut join_set, async move {
                 let driver = probe.driver().to_owned();
                 let outcome = match tokio::time::timeout(timeout, probe.probe()).await {
                     Ok(outcome) => outcome,

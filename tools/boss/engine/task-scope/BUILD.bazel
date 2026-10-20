@@ -1,0 +1,36 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "task-scope",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_task_scope",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = [
+        "//tools/boss/engine/attachments:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/day-rotated-log:__pkg__",
+        "//tools/boss/engine/dispatch-reader:__pkg__",
+        "//tools/boss/engine/driver-quota:__pkg__",
+        "//tools/boss/engine/event-bus:__pkg__",
+        "//tools/boss/engine/metrics:__pkg__",
+        "//tools/boss/engine/pr-review-sources:__pkg__",
+        "//tools/boss/engine/timer-wheel:__pkg__",
+        "//tools/boss/github_tracker:__pkg__",
+    ],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "task-scope_test",
+    size = "small",
+    crate = ":task-scope",
+    edition = "2024",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

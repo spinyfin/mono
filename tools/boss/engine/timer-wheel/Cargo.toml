@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-task-scope = { path = "../task-scope" }
 boss-event-bus = { path = "../event-bus" }
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
 

@@ -623,7 +623,7 @@ pub(super) async fn handle_get_driver_quota_usage(ctx: Dispatch, req: FrontendRe
     if lookup.should_probe {
         let quota = Arc::clone(&server_state.driver_quota);
         let sink = Arc::clone(&sink);
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             let snapshot = quota.snapshot(refresh).await;
             send_push(&sink, FrontendEvent::DriverQuotaUsageResult { snapshot });
         });

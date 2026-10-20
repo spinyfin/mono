@@ -87,7 +87,7 @@ impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
         if slot.is_some() {
             let server = Arc::clone(self);
             let run_id = run_id.to_owned();
-            tokio::spawn(async move {
+            boss_task_scope::spawn(async move {
                 crate::spawn_health::maybe_resume_after_canary_driver_signal(
                     &server.spawn_health,
                     &server.work_db,
@@ -943,7 +943,7 @@ pub(super) async fn dispatch_live_worker_state(
                                 // needs no GitHub call of its own.
                                 let handler = Arc::clone(&server_state.completion_handler);
                                 let execution_id = run_id.to_owned();
-                                tokio::spawn(async move {
+                                boss_task_scope::spawn(async move {
                                     handler
                                         .verify_staged_pr_url_after_capture(&execution_id, finalization_armed)
                                         .await;

@@ -74,7 +74,7 @@ pub(crate) async fn load_product_guidance(
         let design_docs = design_docs.clone();
         let work_db = work_db.clone();
         let fetched_at = fetched_at.clone();
-        reads.spawn(async move {
+        boss_task_scope::spawn_into(&mut reads, async move {
             let view = load_one(&design_docs, &work_db, &product, budget, fetched_at, now_epoch_secs).await;
             (index, view)
         });

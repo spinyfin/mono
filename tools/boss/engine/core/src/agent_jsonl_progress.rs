@@ -720,7 +720,7 @@ impl AgentJsonlProgressManager {
         let (halt_tx, halt_rx) = watch::channel(StreamHalt::Running);
         let task_run_id = run_id.to_owned();
         let overdue_after = self.discovery_overdue_after;
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             run_prepared(
                 task_run_id,
                 RunPreparedConfig {
@@ -925,7 +925,7 @@ async fn run_prepared<S>(
     let tail_halt = halt.clone();
     let tail_source = prepared.clone();
     let tail_map = checkpointer.map.clone();
-    let tail = tokio::spawn(async move {
+    let tail = boss_task_scope::spawn(async move {
         if let Err(err) = stream_file_bytes(tail_source, candidate, start_offset, tail_map, writer, tail_halt).await {
             tracing::warn!(%err, "agent JSONL progress: file tail ended with error");
         }

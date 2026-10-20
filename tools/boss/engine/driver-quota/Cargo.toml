@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-task-scope = { path = "../task-scope" }
 async-trait = { workspace = true }
 boss-engine-codex-hook-trust = { path = "../codex-hook-trust" }
 boss-engine-utils = { path = "../utils" }

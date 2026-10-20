@@ -83,7 +83,7 @@ pub(super) async fn handle_sync_product_external_tracker(ctx: Dispatch, req: Fro
         let credential_resolver = server_state.tracker_credential_resolver.clone();
         let sink2 = sink.clone();
         let request_id2 = request_id.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             match crate::external_tracker::reconcile::run_one_pass_for_product(
                 work_db.as_ref(),
                 registry.as_ref(),

@@ -138,7 +138,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 let product_slug = product.slug.clone();
                 let publisher = server_state.publisher.clone();
                 let product_id2 = product_id.clone();
-                tokio::spawn(async move {
+                boss_task_scope::spawn(async move {
                     tracing::info!(
                         work_item_id = %work_item_id2,
                         pr_url = %pr_url2,
@@ -417,7 +417,7 @@ async fn handle_trunk_queue_merge(
         outcome = "submitting",
         "merge_when_ready: submitting PR to Trunk merge queue",
     );
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let request = boss_trunk_client::SubmitPullRequestRequest::builder()
             .repo(boss_trunk_client::TrunkRepoRef::new(
                 crate::trunk_merge::TRUNK_REPO_HOST,
@@ -717,7 +717,7 @@ pub(super) async fn handle_open_review_terminal(ctx: Dispatch, req: FrontendRequ
         let sink2 = sink.clone();
         let request_id2 = request_id.clone();
         let work_item_id2 = work_item_id.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             match open_review_terminal_async(&cube_client, &repo_remote_url, &pr_url, &work_item_id2).await {
                 Ok((workspace_path, lease_id)) => {
                     send_response(
@@ -822,7 +822,7 @@ pub(super) async fn handle_release_review_terminal(ctx: Dispatch, req: FrontendR
     };
     {
         let cube_client = server_state.cube_client.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             if let Err(err) = cube_client.release_workspace(&lease_id).await {
                 tracing::warn!(
                     %lease_id,

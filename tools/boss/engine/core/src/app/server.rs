@@ -324,7 +324,7 @@ impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
 }
 
 fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let controller = server_state.github_auth.clone();
         // Restore a persisted token (if any) before subscribing, so the first
         // loop iteration sees the restored `Authorized { Unknown }` state and
@@ -441,8 +441,12 @@ fn stamped_frontend_socket_path(_existing: Option<&Path>, bound: &Path) -> std::
 /// Optional `serve` collaborators tests inject instead of production ones.
 #[derive(Default)]
 pub struct ServeOverrides {
-    /// Fake live-CI probe. `None` uses `CommandMergeProbe`.
+    /// Fake live-CI probe for RPC validation. `None` uses `CommandMergeProbe`.
     pub merge_probe: Option<Arc<dyn crate::merge_poller::MergeProbe>>,
+    /// Background poller probe, separate from RPC fixtures so a sweep cannot
+    /// consume their responses or transition their records before a request.
+    /// `None` uses `CommandMergeProbe`.
+    pub merge_poll_probe: Option<Arc<dyn crate::merge_poller::MergeProbe>>,
     /// Shared worker pid map so a test can register its process as a
     /// worker shell before a subprocess `boss` call is attributed.
     pub worker_registry: Option<crate::worker_registry::WorkerRegistry>,
@@ -498,7 +502,7 @@ pub async fn serve_with_merge_probe(
         watched_parent_pid,
         ServeOverrides {
             merge_probe: merge_probe_override,
-            worker_registry: None,
+            ..Default::default()
         },
     )
     .await
@@ -507,6 +511,31 @@ pub async fn serve_with_merge_probe(
 /// Same as [`serve_with_merge_probe`], with a [`ServeOverrides`] bundle so
 /// callers can also inject a cloned [`crate::worker_registry::WorkerRegistry`].
 pub async fn serve_with_overrides(
+    cfg: Arc<RuntimeConfig>,
+    socket_path: std::path::PathBuf,
+    pid_file_path: Option<std::path::PathBuf>,
+    events_socket_path: Option<std::path::PathBuf>,
+    control_token_path: Option<std::path::PathBuf>,
+    watched_parent_pid: Option<libc::pid_t>,
+    overrides: ServeOverrides,
+) -> Result<()> {
+    let result = boss_task_scope::run(serve_scoped(
+        cfg,
+        socket_path,
+        pid_file_path,
+        events_socket_path,
+        control_token_path,
+        watched_parent_pid,
+        overrides,
+    ))
+    .await;
+    if result.is_ok() {
+        tracing::info!("engine shutdown complete");
+    }
+    result
+}
+
+async fn serve_scoped(
     cfg: Arc<RuntimeConfig>,
     socket_path: std::path::PathBuf,
     pid_file_path: Option<std::path::PathBuf>,
@@ -637,6 +666,7 @@ pub async fn serve_with_overrides(
         },
     )?;
     pre_bind.mark("server_state");
+    super::panic_hook::install(&server_state);
 
     // Local host capability discovery (`uname`, `gh auth status`, one login
     // shell per registered driver — seconds of subprocess time). It runs in
@@ -673,7 +703,7 @@ pub async fn serve_with_overrides(
     }
     {
         let state = server_state.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             // Drop covers return and panic-unwind only. The timeout below
             // fail-closes the database state and lifts the discovery hold;
             // a blocking discovery that outlives it is harmless because its
@@ -765,7 +795,7 @@ pub async fn serve_with_overrides(
     // helper never creates an absent singleton; first creation remains tied
     // to app registration, after that app has prepared the session files.
     let coordinator_supervisor_state = server_state.clone();
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let mut restart_failures = crate::coordinator_tmux::CoordinatorRestartFailures::new();
         // Short first delay so a registration-time attach miss is retried
         // promptly; later passes set delay from the pass outcome.
@@ -1017,7 +1047,7 @@ pub async fn serve_with_overrides(
         };
         tracing::info!(events_socket_path = %path.display(), "events socket is ready");
         let server_state_for_events = server_state.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             run_events_accept_loop(events_listener, server_state_for_events).await;
         });
     }
@@ -1571,7 +1601,7 @@ pub async fn serve_with_overrides(
     // never blocks startup; errors are logged and skipped per candidate.
     {
         let work_db_for_backfill = server_state.work_db.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             let candidates = match work_db_for_backfill.list_in_review_tasks_for_doc_branch_backfill() {
                 Ok(rows) => rows,
                 Err(err) => {
@@ -1662,7 +1692,9 @@ pub async fn serve_with_overrides(
     // cadence tiers — see `merge_poller::spawn_loop`. It stays idle (one
     // local-DB read, zero Trunk requests) until a `trunk_queue` product's
     // merge button records an active merge intent.
-    let merge_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
+    let merge_probe = overrides
+        .merge_poll_probe
+        .unwrap_or_else(|| Arc::new(CommandMergeProbe::new()));
     let trunk_queue_api: Arc<dyn crate::trunk_queue_poller::TrunkQueueApi> =
         Arc::new(server_state.trunk_client.clone());
     let pr_reconcile_requests = server_state
@@ -2175,7 +2207,7 @@ pub async fn serve_with_overrides(
         // The socket this engine bound, not a fresh `$BOSS_EVENTS_SOCKET`
         // read — a restored reverse forward must terminate at *this* engine.
         let engine_socket = crate::runner::bound_events_socket_path(&cfg).display().to_string();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             coordinator.reattach_remote_runs(&engine_socket).await;
         });
     }
@@ -2499,7 +2531,7 @@ pub async fn serve_with_overrides(
     {
         let live_worker_states = server_state.live_worker_states.clone();
         let server_clone = Arc::clone(&server_state);
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
@@ -2554,7 +2586,7 @@ pub async fn serve_with_overrides(
     // is shallow — only emits above a small depth threshold.
     {
         let server_clone = Arc::clone(&server_state);
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             const LOG_DEPTH_THRESHOLD: usize = 32;
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             loop {
@@ -2585,8 +2617,6 @@ pub async fn serve_with_overrides(
     coordinator.set_startup_recovery_pending(false);
     coordinator.kick();
 
-    install_panic_hook(&server_state);
-
     // Orphan watcher: poll the watched parent pid every second.  When it's
     // gone (the bazel test runner that spawned us exited), fire a notify so
     // the accept loop below can exit cleanly instead of becoming a
@@ -2595,7 +2625,7 @@ pub async fn serve_with_overrides(
     let orphan_trigger = Arc::new(Notify::new());
     if let Some(ppid) = watched_parent_pid {
         let trigger = orphan_trigger.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if !process_is_alive(ppid) {
@@ -2624,8 +2654,9 @@ pub async fn serve_with_overrides(
         tokio::select! {
             biased;
             signal = graceful_shutdown_signal() => {
-                tracing::info!(signal, "shutdown signal received; releasing worker panes");
+                tracing::info!(signal, "shutdown signal received; preserving workers");
                 crate::audit::record_shutdown(format!("signal:{signal}"));
+                boss_task_scope::shutdown().await;
                 crate::ladder_lease_registry::release_all_on_shutdown(server_state.cube_client.as_ref()).await;
                 server_state
                     .shutdown_workers()
@@ -2641,12 +2672,12 @@ pub async fn serve_with_overrides(
                 ) {
                     tracing::warn!(?err, "metrics: final flush on shutdown failed");
                 }
-                tracing::info!("engine shutdown complete");
                 return Ok(());
             }
             _ = shutdown_trigger_for_loop.notified() => {
-                tracing::info!("shutdown rpc accepted; releasing worker panes");
+                tracing::info!("shutdown rpc accepted; preserving workers");
                 crate::audit::record_shutdown("rpc");
+                boss_task_scope::shutdown().await;
                 crate::ladder_lease_registry::release_all_on_shutdown(server_state.cube_client.as_ref()).await;
                 server_state
                     .shutdown_workers()
@@ -2657,7 +2688,6 @@ pub async fn serve_with_overrides(
                 ) {
                     tracing::warn!(?err, "metrics: final flush on shutdown failed");
                 }
-                tracing::info!("engine shutdown complete");
                 return Ok(());
             }
             _ = orphan_trigger_for_loop.notified() => {
@@ -2672,7 +2702,7 @@ pub async fn serve_with_overrides(
                 // can't race us into ENOTCONN.
                 let peer_pid_value = peer_pid(&stream).ok();
                 let server_state = server_state.clone();
-                tokio::spawn(async move {
+                boss_task_scope::spawn(async move {
                     if let Err(err) =
                         handle_frontend_connection(stream, server_state, peer_pid_value).await
                     {
@@ -2881,46 +2911,6 @@ async fn raise_recovered_planner_run_attentions(
     }
 }
 
-/// Snapshot of the (slot_id, shell_pid) pairs currently registered as
-/// live workers, intended for the panic-hook path: pulls just enough
-/// state to fire `SIGTERM`/`SIGKILL` without touching the runtime,
-/// async, or Tokio internals (any of which could deadlock during
-/// unwind).
-fn snapshot_live_shell_pids(server_state: &ServerState) -> Vec<libc::pid_t> {
-    server_state
-        .live_worker_states
-        .snapshot()
-        .into_iter()
-        .filter_map(|s| (s.shell_pid > 0).then_some(s.shell_pid as libc::pid_t))
-        .collect()
-}
-
-/// Install a panic hook that emergency-kills every recorded worker
-/// shell pid before delegating to the previously-installed hook. The
-/// async `release_worker_pane` path is unsafe inside an unwinding
-/// runtime — we settle for the synchronous SIGTERM/SIGKILL fallback
-/// so the worker tree doesn't outlive the engine.
-///
-/// We hold a `Weak` so the hook never keeps `ServerState` alive past
-/// a normal shutdown.
-fn install_panic_hook(server_state: &Arc<ServerState>) {
-    let weak = Arc::downgrade(server_state);
-    let prior = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if let Some(server) = weak.upgrade() {
-            let pids = snapshot_live_shell_pids(&server);
-            if !pids.is_empty() {
-                tracing::error!(
-                    count = pids.len(),
-                    "engine panic: emergency-killing worker shells before unwind",
-                );
-                signal_shell_pids(&pids, Duration::from_millis(500));
-            }
-        }
-        prior(info);
-    }));
-}
-
 /// Future that resolves when a graceful-shutdown signal arrives
 /// (`SIGINT` or `SIGTERM`). Resolves to a static label naming which
 /// signal fired so the caller can log it.
@@ -2971,7 +2961,7 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
             Ok((stream, _)) => {
                 let server_state = server_state.clone();
                 let driver_registry = driver_registry.clone();
-                tokio::spawn(async move {
+                boss_task_scope::spawn(async move {
                     match handle_connection(stream, &driver_registry, &server_state.work_db).await {
                         Ok(incoming) => {
                             tracing::info!(

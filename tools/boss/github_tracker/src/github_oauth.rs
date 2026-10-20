@@ -648,7 +648,7 @@ impl GitHubAuthController {
         let state_tx = self.state_tx.clone();
         let store = self.store.clone();
 
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             // Step 1: request device + user code.
             let device_info = match flow.request_device_code().await {
                 Ok(info) => info,

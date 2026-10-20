@@ -15,6 +15,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = all_crate_deps(normal = True) + [
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ],
@@ -33,6 +34,7 @@ rust_test(
         normal = True,
         normal_dev = True,
     ) + [
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ],

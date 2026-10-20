@@ -23,7 +23,7 @@ pub fn spawn_notifications(
     let subscription = event_bus.subscribe(boss_event_bus::TopicFilter::kind(
         boss_event_bus::EventKind::ReviewVerdictApplied,
     ));
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         forward_notifications(subscription, publisher.as_ref()).await;
     })
 }

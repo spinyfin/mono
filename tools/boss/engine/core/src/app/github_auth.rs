@@ -109,7 +109,7 @@ pub(super) async fn handle_git_hub_auth_status(ctx: Dispatch, req: FrontendReque
             let Ok(permit) = server_state.org_recheck.clone().try_acquire_owned() else {
                 return;
             };
-            tokio::spawn(async move {
+            boss_task_scope::spawn(async move {
                 let _permit = permit;
                 let controller = server_state.github_auth.clone();
                 let flow = controller.device_flow();

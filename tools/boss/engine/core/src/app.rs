@@ -117,6 +117,7 @@ pub(crate) mod proposals;
 // `pub(crate)` so `crate::attention_lifecycle` can name
 // `PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND` in the lifecycle registry
 // (crate-internal only — nothing outside the engine sees this module).
+mod panic_hook;
 pub(crate) mod readoption;
 mod review;
 mod review_guide;
@@ -2369,7 +2370,7 @@ async fn handle_frontend_connection(
     // reconnected, which is not what a kill switch means.
     let writer_flags = server_state.feature_flags.clone();
     let writer_session_id = session_id.clone();
-    let writer_task = tokio::spawn(async move {
+    let writer_task = boss_task_scope::spawn(async move {
         while let Some(mut event) = writer_sink.next().await {
             // The exposure boundary's single write choke point. Every frame
             // leaving a worker-classified connection passes through here —
@@ -2561,18 +2562,17 @@ async fn handle_frontend_connection(
         if let Some(waiting) = waiting_read {
             let sink = sink.clone();
             let session_id = session_id.clone();
-            tokio::spawn(async move {
+            boss_task_scope::spawn(async move {
                 match waiting.acquire().await {
                     Ok(permits) => {
                         // Synchronous SQLite work must not occupy the async
                         // runtime threads that serve writes and live status.
                         // Keep permits inside the blocking job even if its
                         // client disconnects; cancellation cannot inflate capacity.
-                        let runtime = tokio::runtime::Handle::current();
-                        let result = tokio::task::spawn_blocking(move || {
+                        let result = boss_task_scope::spawn_blocking_future(async move {
                             permits.started();
                             let _permits = permits;
-                            runtime.block_on(dispatch_fut);
+                            dispatch_fut.await;
                         })
                         .await;
                         if let Err(err) = result {

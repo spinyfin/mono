@@ -1090,7 +1090,7 @@ impl ServerState {
         let epoch = self.viewer_reattach_epoch.load(Ordering::Relaxed);
         let delay = VIEWER_REATTACH_RETRY_BASE.saturating_mul(1u32 << attempt.min(3));
         tracing::info!(attempt, ?delay, "retrying worker pane reconciliation");
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             tokio::time::sleep(delay).await;
             if state.viewer_reattach_epoch.load(Ordering::Relaxed) != epoch {
                 return;
