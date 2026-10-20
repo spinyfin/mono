@@ -368,7 +368,7 @@ final class AgentsGridModelTests: XCTestCase {
         func snapshot(placeholder: Bool) -> WorkerSlotSnapshot {
             WorkerSlotSnapshot(
                 slotId: 1, runId: "run-a", summary: nil, taskTitle: nil, session: nil,
-                liveStatusEnabled: true, live: nil, isPlaceholder: placeholder, cachedPersona: nil
+                liveStatusEnabled: true, live: nil, isPlaceholder: placeholder, cachedPersona: nil, viewerAttachFailure: nil
             )
         }
         XCTAssertTrue(snapshot(placeholder: false).offersLiveStatusToggle)
