@@ -34,6 +34,44 @@ fn read_back_identity(db: &WorkDb, execution_id: &str) -> TmuxIdentity {
         .expect("seeded identity must round-trip")
 }
 
+/// A real probe failure must retain the slot; tmux 3.6a's missing-session
+/// response on the next attempt must finish the reap and restore capacity.
+#[tokio::test]
+async fn no_such_session_releases_the_pool_slot_after_a_refused_reap() {
+    let (state, _dir) = test_server_state();
+    let db = state.work_db.as_ref();
+    let product = create_product(db);
+    let item = create_active_chore(db, &product, "absent worker");
+    let exec = seed_tmux_run(db, &item, "boss-absent", "tok-absent", 999_999);
+    let identity = read_back_identity(db, &exec);
+    let pool = state.execution_coordinator.worker_pool();
+    assert_eq!(pool.claim_worker(&exec, None).await.unwrap(), "worker-1");
+    state.worker_registry.register_run_slot(&exec, 1);
+    state.live_worker_states.register_spawn(1, &exec, "test", 0, None);
+    let (tmux, runner) = fake_tmux([
+        failure("error connecting to /state/boss/tmux.sock (Permission denied)"),
+        failure("no such session: boss-absent"),
+    ]);
+    state.set_tmux_override_for_test(tmux);
+
+    assert_eq!(state.release_worker_pane(&exec).await, PaneReleaseOutcome::NoLiveWorker);
+    assert_eq!(db.tmux_identity_for_execution(&exec).unwrap(), Some(identity));
+    assert_eq!(pool.idle_count().await, 0);
+    assert_eq!(state.worker_registry.slot_for_run(&exec), Some(1));
+    assert!(state.live_worker_states.get(1).is_some());
+
+    assert_eq!(state.release_worker_pane(&exec).await, PaneReleaseOutcome::Reaped);
+    assert!(db.tmux_identity_for_execution(&exec).unwrap().is_none());
+    assert_eq!(pool.idle_count().await, 1);
+    assert!(state.worker_registry.slot_for_run(&exec).is_none());
+    assert!(state.live_worker_states.get(1).is_none());
+    let observation = db.tmux_pane_observation_for_execution(&exec).unwrap().unwrap();
+    assert_eq!(observation.kind, crate::work::TmuxPaneObservationKind::SessionMissing);
+    assert_eq!(pool.claim_worker("next-execution", None).await.unwrap(), "worker-1");
+    assert_eq!(runner.calls().len(), 2, "neither probe should signal or kill a session");
+    assert!(runner.calls().iter().all(|args| args[2] == "show-environment"));
+}
+
 /// The cardinal case: live token matches, so the pane pid's process group
 /// is signalled, the session is killed, and the identity columns clear.
 #[tokio::test]

@@ -5,7 +5,10 @@
 //! under `/tmp`. The process runner is injectable so callers can test command
 //! construction without a live tmux daemon.
 
+mod diagnostics;
 mod types;
+
+use diagnostics::{is_absent_server_stderr, is_absent_session_stderr, is_diagnostic};
 
 pub use boss_command_runner::{CommandOutput, CommandRunner, RealCommandRunner};
 pub use boss_shell_quote::shell_quote as quote_for_shell;
@@ -387,7 +390,7 @@ impl Tmux {
         ]);
         let output = self.run(&args).await?;
         if !output.success {
-            if is_absent_session_stderr(&output.stderr) {
+            if is_absent_server_stderr(&output.stderr) || output.stderr.trim_end() == "no sessions" {
                 return Ok(Vec::new());
             }
             return command_failed(&args, &output);
@@ -415,8 +418,7 @@ impl Tmux {
                 .map(|value| Some(value.to_owned()))
                 .ok_or_else(|| anyhow::anyhow!("unexpected tmux environment output for {name:?}: {value:?}"));
         }
-        if output.stderr.contains("unknown variable")
-            || output.stderr.contains("environment variable not found")
+        if is_diagnostic(&output.stderr, &["unknown variable", "environment variable not found"])
             || is_absent_session_stderr(&output.stderr)
         {
             return Ok(None);
@@ -486,7 +488,7 @@ impl Tmux {
         if output.success {
             return Ok(Some(output.stdout.trim_end().to_owned()));
         }
-        if output.stderr.contains("invalid option") || output.stderr.contains("unknown option") {
+        if is_diagnostic(&output.stderr, &["invalid option", "unknown option"]) {
             return Ok(None);
         }
         command_failed(&args, &output)
@@ -511,7 +513,7 @@ impl Tmux {
         if output.success {
             return Ok(Some(output.stdout.trim_end().to_owned()));
         }
-        if output.stderr.contains("invalid option") || output.stderr.contains("unknown option") {
+        if is_diagnostic(&output.stderr, &["invalid option", "unknown option"]) {
             return Ok(None);
         }
         command_failed(&args, &output)
@@ -686,7 +688,7 @@ impl Tmux {
         let mut args = self.server_args();
         args.push("kill-server".into());
         let output = self.run(&args).await?;
-        if output.success || is_absent_session_stderr(&output.stderr) {
+        if output.success || is_absent_server_stderr(&output.stderr) {
             return Ok(());
         }
         command_failed(&args, &output)
@@ -827,50 +829,6 @@ fn unparseable_session_row_error(line: &str) -> anyhow::Error {
         );
     }
     anyhow::anyhow!("unexpected tmux list-sessions row: {line:?}")
-}
-
-/// True when tmux's stderr indicates the target session (or the whole
-/// private server) simply does not exist, as opposed to a real command
-/// failure. tmux reports this a few different ways depending on whether the
-/// session is missing, the server exited leaving its socket behind, or the
-/// socket file cannot be connected:
-/// `"can't find session: <name>"`, `"session not found: <name>"`,
-/// `"no server running on <socket>"`, and
-/// `"error connecting to <socket> (No such file or directory|Connection refused)"`.
-///
-/// `ENOENT` is the shape a host reboot produces for the legacy `-L boss`
-/// server. macOS clears `/tmp` on boot, so `/tmp/tmux-<uid>/boss` is not just
-/// stale but absent, and tmux switches from "no server running" to a
-/// `connect(2)` error. Reading that as a hard failure strands the
-/// coordinator: every recovery path funnels through
-/// [`Tmux::list_sessions`], which would return `Err` instead of an empty
-/// inventory, so `coordinator_tmux` never reaches the branch that recreates
-/// the session and the pane stays blank until the socket reappears by some
-/// other means.
-///
-/// `Connection refused` is the matching shape for a leftover durable socket
-/// file (`<state-root>/tmux.sock`) with no listener. That path survives
-/// `/tmp` cleanup, so a dead server leaves a unix socket that `connect(2)`
-/// refuses rather than `ENOENT`. [`Tmux::unlink_stale_socket_file`] removes
-/// that file at startup; treating the stderr as absent keeps `list_sessions`
-/// empty if a command races ahead of the unlink.
-///
-/// Other `connect(2)` failures — `Permission denied` on a socket owned by
-/// another uid — describe a socket that exists and is not ours to assume is
-/// empty, and must keep surfacing as real errors.
-fn is_absent_session_stderr(stderr: &str) -> bool {
-    stderr.contains("can't find session")
-        || stderr.contains("session not found")
-        || stderr.contains("no server running")
-        || is_absent_socket_stderr(stderr)
-}
-
-/// True for tmux's `connect(2)` failure against a socket that is gone or has
-/// no listener. See [`is_absent_session_stderr`] for why these are "absent"
-/// rather than "failed".
-fn is_absent_socket_stderr(stderr: &str) -> bool {
-    stderr.contains("error connecting to")
-        && (stderr.contains("No such file or directory") || stderr.contains("Connection refused"))
 }
 
 /// Unlink `path` when it exists as a unix socket with no listener. A live
