@@ -1634,6 +1634,41 @@ fn late_notification_uses_first_consumer_across_stop_boundaries() {
 }
 
 #[test]
+fn a_consumer_arriving_after_a_repairing_notification_reverts_the_repair() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 5, &stop_event(), false);
+    assert!(applied(&reg, 2, &notification_event(), false).repaired);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
+    assert!(applied(&reg, 3, &pre_tool("Read"), false).repaired);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert!(!applied(&reg, 4, &post_tool("Read"), false).repaired);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+}
+
+#[test]
+fn a_consumer_arriving_after_a_pending_late_notification_clears_it() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 4, &post_tool("Read"), false);
+    assert!(!applied(&reg, 2, &notification_event(), false).repaired);
+    assert!(!applied(&reg, 3, &pre_tool("Read"), false).repaired);
+    applied(&reg, 5, &stop_event(), false);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+}
+
+#[test]
+fn a_newer_notification_survives_a_late_older_consumer() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    applied(&reg, 4, &post_tool("Read"), false);
+    applied(&reg, 3, &notification_event(), false);
+    applied(&reg, 2, &pre_tool("Read"), false);
+    applied(&reg, 5, &stop_event(), false);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
+}
+
+#[test]
 fn late_notification_cannot_resurrect_a_dead_or_errored_slot() {
     for activity in [WorkerActivity::Errored, WorkerActivity::Terminated] {
         let reg = LiveWorkerStateRegistry::new();

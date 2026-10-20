@@ -228,6 +228,12 @@ struct SlotEntry {
 /// the caller; the rest start at the one value a fresh entry can honestly
 /// hold (`bon` defaults `Option` fields to `None` on its own), so the
 /// construction site states exactly what it knows and nothing else.
+#[derive(Clone, Copy)]
+struct NotificationRepair {
+    notification_seq: u64,
+    stop_seq: u64,
+}
+
 #[derive(bon::Builder)]
 struct SlotMeta {
     /// Set when a `Notification` hook arrives, cleared on the next `Stop`.
@@ -235,6 +241,15 @@ struct SlotMeta {
     /// when claude is paused on a permission prompt.
     #[builder(default = false)]
     notification_pending: bool,
+    /// Ingress sequence of the `Notification` behind `notification_pending`,
+    /// so a clearing hook that arrives late but was emitted after it can
+    /// still consume it.
+    notification_pending_seq: Option<u64>,
+    /// A late `Notification` that repaired the slot from `Idle` to
+    /// `WaitingForInput` on the strength of the `Stop` at `stop_seq`. A
+    /// clearing hook emitted between the two proves that `Stop` did not
+    /// consume the notification, and undoes the repair.
+    notification_repair: Option<NotificationRepair>,
     /// Epoch-seconds timestamp recorded when `register_spawn` creates the
     /// entry. Used by `mark_stalled_spawns` to detect workers that have
     /// been stuck in `Spawning` without any hook event (the initial
@@ -1757,6 +1772,7 @@ impl LiveWorkerStateRegistry {
                 state.activity = WorkerActivity::Working;
                 state.current_tool = Some(tool_name.clone());
                 meta.notification_pending = false;
+                meta.notification_pending_seq = None;
             }
             WorkerEvent::PostToolUse { .. } => {
                 state.current_tool = None;
@@ -1778,9 +1794,11 @@ impl LiveWorkerStateRegistry {
                     state.activity = WorkerActivity::WaitingForInput;
                     state.current_tool = None;
                     meta.notification_pending = true;
+                    meta.notification_pending_seq = ingress_seq;
                 }
             }
             WorkerEvent::Stop { .. } => {
+                meta.notification_pending_seq = None;
                 let was_pending = std::mem::take(&mut meta.notification_pending);
                 state.current_tool = None;
                 state.activity = if was_pending {
@@ -1815,6 +1833,7 @@ impl LiveWorkerStateRegistry {
                 // work. Keeping `current_tool` is what lets the corroboration
                 // guard see through a `SessionEnd` the process did not honor.
                 meta.notification_pending = false;
+                meta.notification_pending_seq = None;
             }
         }
 
@@ -2273,9 +2292,10 @@ fn reconcile_late_event(
 ) -> (Option<TurnBoundary>, bool) {
     match event {
         WorkerEvent::Stop { .. } => {
+            let repaired = consume_late_notification(state, meta, seq);
             let boundary = TurnBoundary { seq: Some(seq) };
             if meta.last_main_activity_seq.is_some_and(|main| main > seq) {
-                return (Some(boundary), false);
+                return (Some(boundary), repaired);
             }
             // Only subagent hooks have been applied since: the main session
             // is still behind this boundary, and its next hook resumes it.
@@ -2284,8 +2304,9 @@ fn reconcile_late_event(
                 .and_then(|open| open.seq)
                 .map_or(seq, |open| open.max(seq));
             meta.open_turn_boundary = Some(TurnBoundary { seq: Some(newest) });
-            (None, false)
+            (None, repaired)
         }
+        WorkerEvent::SessionEnd { .. } => (None, consume_late_notification(state, meta, seq)),
         WorkerEvent::Notification { .. } if meta.awaiting_input_capable => {
             match meta
                 .pending_clear_seqs
@@ -2303,6 +2324,10 @@ fn reconcile_late_event(
                     if stop_is_newest && state.activity == WorkerActivity::Idle {
                         state.activity = WorkerActivity::WaitingForInput;
                         state.current_tool = None;
+                        meta.notification_repair = Some(NotificationRepair {
+                            notification_seq: seq,
+                            stop_seq: clear,
+                        });
                         return (None, true);
                     }
                     (None, false)
@@ -2311,6 +2336,7 @@ fn reconcile_late_event(
                 // for the `Stop` that ends this turn.
                 _ => {
                     meta.notification_pending = true;
+                    meta.notification_pending_seq = Some(seq);
                     (None, false)
                 }
             }
@@ -2318,6 +2344,8 @@ fn reconcile_late_event(
         WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. }
             if !origin.from_subagent =>
         {
+            let repaired =
+                matches!(event, WorkerEvent::PreToolUse { .. }) && consume_late_notification(state, meta, seq);
             meta.last_main_activity_seq = Some(meta.last_main_activity_seq.map_or(seq, |last| last.max(seq)));
             let resumed = meta
                 .open_turn_boundary
@@ -2325,10 +2353,40 @@ fn reconcile_late_event(
             if resumed.is_some() {
                 meta.open_turn_boundary = None;
             }
-            (resumed, false)
+            (resumed, repaired)
         }
         _ => (None, false),
     }
+}
+
+/// A clearing hook (`Stop`, `PreToolUse`, `SessionEnd`) that arrives late
+/// consumes every `Notification` emitted before it that is still waiting on
+/// a consumer, including one that was reduced earlier in its absence:
+///
+/// - a pending flag set by a notification numbered below `seq` is dropped;
+/// - a repair to `WaitingForInput` made on the strength of a later `Stop` is
+///   undone, provided that `Stop` is still the newest thing applied and the
+///   slot is still where the repair left it. Returns `true` in that case so
+///   the caller mirrors the durable status back.
+///
+/// A notification numbered above `seq` is untouched.
+fn consume_late_notification(state: &mut LiveWorkerState, meta: &mut SlotMeta, seq: u64) -> bool {
+    if meta.notification_pending && meta.notification_pending_seq.is_some_and(|pending| pending < seq) {
+        meta.notification_pending = false;
+        meta.notification_pending_seq = None;
+    }
+    let Some(repair) = meta.notification_repair else {
+        return false;
+    };
+    if repair.notification_seq >= seq || seq >= repair.stop_seq {
+        return false;
+    }
+    meta.notification_repair = None;
+    if state.activity == WorkerActivity::WaitingForInput && meta.last_applied_ingress_seq == Some(repair.stop_seq) {
+        state.activity = WorkerActivity::Idle;
+        return true;
+    }
+    false
 }
 
 /// Hook event name for log lines — the payload's `hook_event_name`, not

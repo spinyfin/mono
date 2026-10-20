@@ -470,6 +470,30 @@ async fn consumed_late_notifications_do_not_park_running_executions() {
 }
 
 #[tokio::test]
+async fn late_notification_consumers_arriving_afterwards_leave_executions_running() {
+    // Emission order: Notification(2), PreToolUse(3), PostToolUse(4), Stop(5).
+    for arrival in [[5u64, 2, 3, 4], [4, 2, 3, 5]] {
+        let (server_state, _dir) = test_server_state();
+        let execution_id = spawned_worker(&server_state);
+        for seq in arrival {
+            let event = match seq {
+                2 => notification(&execution_id, 2),
+                3 => pre_tool_use(&execution_id, "Read", 3),
+                4 => post_tool_use(&execution_id, "Read", 4),
+                _ => stop(&execution_id, 5),
+            };
+            dispatch_worker_event_fanout(&server_state, &event).await;
+        }
+        assert_eq!(snapshot(&server_state).activity, WorkerActivity::Idle, "{arrival:?}");
+        assert_eq!(
+            server_state.work_db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Running,
+            "{arrival:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn late_notifications_preserve_non_hook_terminal_states() {
     for activity in [WorkerActivity::Errored, WorkerActivity::Terminated] {
         let (server_state, _dir) = test_server_state();
