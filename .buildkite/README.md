@@ -47,7 +47,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
 
 ### `ci-env.sh`
 
-Sourced by other steps to set up the shared bazel wrapper and CI config rather than run standalone. Sets `CI_BAZEL_STARTUP_FLAGS` (the single source of truth for bazel startup options in CI — every code path that shells out to bazel must read from here or the workspace ends up running two daemons at once), detects and recovers from stale-Xcode-cache failures on macOS, and installs `repobin` tools into `bin/`.
+Sourced by other steps to set up the shared bazel wrapper and CI config rather than run standalone. Sets `CI_BAZEL_STARTUP_FLAGS` (which carries `--max_idle_secs=1800` for every pipeline and OS, CI only, so idle Bazel servers release memory after 30 minutes; the single source of truth for bazel startup options in CI — every code path that shells out to bazel must read from here or the workspace ends up running two daemons at once), detects and recovers from stale-Xcode-cache failures on macOS, and installs `repobin` tools into `bin/`.
 
 ### `bazel-build-test.sh`
 
