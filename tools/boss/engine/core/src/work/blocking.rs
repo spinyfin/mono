@@ -1322,6 +1322,10 @@ impl WorkDb {
         work_item_id: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<EngineAttemptListEntry>> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+
         let want_conflict = kinds.is_empty() || kinds.iter().any(|k| k == "conflict");
         let want_rebase = kinds.is_empty() || kinds.iter().any(|k| k == "rebase");
         let want_ci = kinds.is_empty() || kinds.iter().any(|k| k == "ci");
