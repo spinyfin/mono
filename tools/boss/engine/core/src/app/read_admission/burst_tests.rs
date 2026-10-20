@@ -378,20 +378,18 @@ async fn socket_saturation_delivers_every_id_once(push_topics: usize) {
     let (read, mut write) = client.into_split();
     let sender = tokio::spawn(async move {
         let mut sent = 0;
+        let mut frames = Vec::new();
         for index in 0..320 {
             let request = FrontendRequestEnvelope {
                 request_id: format!("saturated-{index}"),
                 payload: FrontendRequest::ListProducts,
             };
-            if write
-                .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
-                .await
-                .is_err()
-            {
-                break;
-            }
+            frames.extend_from_slice(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes());
             sent += 1;
         }
+        // Batch the frames so per-write kernel accounting cannot exhaust the
+        // socket buffer before reads begin, even though the payload fits.
+        write.write_all(&frames).await.unwrap();
         (write, sent)
     });
     let (write, sent) = tokio::time::timeout(Duration::from_secs(5), sender)
