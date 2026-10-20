@@ -2436,6 +2436,11 @@ async fn handle_frontend_connection(
         writer_sink.trigger_shutdown();
     });
 
+    // Every exit from the read loop — EOF, peer disconnect, or a genuine
+    // read failure — must reach the teardown below: skipping it would leave
+    // the session registered with the broker (and, for the app, as the live
+    // app session) with nobody left to drain it.
+    let mut read_failure: Option<anyhow::Error> = None;
     loop {
         let line_result = tokio::select! {
             _ = &mut shutdown_rx => {
@@ -2452,8 +2457,17 @@ async fn handle_frontend_connection(
                 reader.next_line().await
             } => line,
         };
-        let Some(line) = line_result.context("socket read failed")? else {
-            break;
+        let line = match line_result {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) if read_error_is_peer_disconnect(&error) => {
+                tracing::info!(session_id = %session_id, %error, "peer closed the socket with frames unread; ending session");
+                break;
+            }
+            Err(error) => {
+                read_failure = Some(anyhow::Error::new(error).context("socket read failed"));
+                break;
+            }
         };
         // Population-timing window opens at line receipt, before decode, so
         // engine-side segments sum to ~the app-observed request duration.
@@ -2586,15 +2600,18 @@ async fn handle_frontend_connection(
                             );
                         }
                     }
-                    Err(message) => {
+                    Err(rejected) => {
                         tracing::warn!(%session_id, %request_id, ?lane, wait_ms = recv_instant.elapsed().as_millis() as u64, "read RPC rejected: admission deadline expired");
                         send_response(
                             &sink,
                             &request_id,
                             FrontendEvent::Error {
-                                message: message.into(),
+                                message: rejected.message().into(),
                             },
                         );
+                        // Only now may the queue slot go back: the reader's
+                        // headroom gate counted this reply through it.
+                        drop(rejected);
                     }
                 }
             });
@@ -2609,5 +2626,18 @@ async fn handle_frontend_connection(
     server_state.drop_app_session_if_matches(&session_id).await;
     sink.close();
     let _ = writer_task.await;
-    Ok(())
+    read_failure.map_or(Ok(()), Err)
+}
+
+/// Whether a socket read error means the peer went away, as opposed to the
+/// engine failing. Linux reports `ECONNRESET` on a Unix stream whose peer
+/// closed while frames were still unread in its receive buffer: the normal
+/// end of a `boss` CLI invocation that exits on its reply without draining
+/// later pushes, or of the app quitting mid-burst. macOS reports the same
+/// close as plain EOF. Either way the session simply ends.
+fn read_error_is_peer_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+    )
 }

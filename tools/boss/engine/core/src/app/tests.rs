@@ -474,6 +474,7 @@ mod open_document;
 mod pause_broadcast;
 mod pause_bypass_held_ready;
 mod pause_bypass_recheck;
+mod peer_disconnect;
 mod pr_status;
 mod probe_delivery;
 mod probe_interrupt;
