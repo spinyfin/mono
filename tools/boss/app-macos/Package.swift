@@ -40,7 +40,9 @@ let package = Package(
                 "PaneLayout",
             ],
             path: "Sources",
-            exclude: ["DiagnosticIO", "UpdateCore", "CrashWatchdog", "PaneLayout"],
+            // RelaunchHelper holds a C source (exit-observer.c) built by Bazel; SwiftPM
+            // rejects mixed-language targets, so keep it out of the Boss target.
+            exclude: ["DiagnosticIO", "UpdateCore", "CrashWatchdog", "PaneLayout", "Resources/RelaunchHelper"],
             resources: [
                 .copy("Resources/TrekIcons"),
             ],
