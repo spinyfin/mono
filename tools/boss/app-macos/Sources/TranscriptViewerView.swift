@@ -177,6 +177,9 @@ struct TranscriptViewerView: View {
 
     @EnvironmentObject private var chatModel: ChatViewModel
     @State private var selectedExecutionId: String?
+    /// Identifies this window to `ChatViewModel` as a consumer of the task's
+    /// execution history; see `WorkCardPopoverView.executionsConsumerToken`.
+    @State private var executionsConsumerToken = UUID()
 
     private var executions: [ExecutionVM] {
         chatModel.executionsByTaskID[ref.taskId] ?? []
@@ -210,11 +213,14 @@ struct TranscriptViewerView: View {
             transcriptDetail
         }
         .onAppear {
-            chatModel.loadExecutions(taskId: ref.taskId)
+            chatModel.beginExecutionsConsumer(taskID: ref.taskId, token: executionsConsumerToken)
             if let preselect = ref.preselectExecutionId {
                 selectedExecutionId = preselect
                 chatModel.loadTranscript(executionId: preselect)
             }
+        }
+        .onDisappear {
+            chatModel.endExecutionsConsumer(taskID: ref.taskId, token: executionsConsumerToken)
         }
         .onChange(of: selectedExecutionId) { _, newValue in
             if let execId = newValue {

@@ -34,6 +34,11 @@ struct WorkCardPopoverView: View {
     /// being interesting to a human reviewing status.
     @State private var showAllAbandonedAttempts: Bool = false
 
+    /// Identifies this popover to `ChatViewModel` as a consumer of the
+    /// task's execution history, so the history is refetched on
+    /// invalidation while the popover is open and dropped when it closes.
+    @State private var executionsConsumerToken = UUID()
+
     var body: some View {
         // Content is only in-graph while the parent card is selected
         // (see type docs). Keep the body as one presented surface.
@@ -41,7 +46,10 @@ struct WorkCardPopoverView: View {
             .padding(20)
             .frame(width: 360, alignment: .leading)
             .onAppear {
-                model.loadExecutions(taskId: task.id)
+                model.beginExecutionsConsumer(taskID: task.id, token: executionsConsumerToken)
+            }
+            .onDisappear {
+                model.endExecutionsConsumer(taskID: task.id, token: executionsConsumerToken)
             }
             // Always-attached sheet: idle cost is one unpresented sheet on
             // the single selected popover; conditional insert broke the
