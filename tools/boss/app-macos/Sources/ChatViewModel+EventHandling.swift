@@ -13,8 +13,9 @@ import Foundation
 /// events may therefore invoke `handle` N times back-to-back inside one
 /// main-actor turn. Per-event routing stays correct; SwiftUI coalesces
 /// `@Published` writes until the end of that turn. Invalidation-driven
-/// *fetches* still go through [[scheduleWorkTreeRefetch]]'s 150 ms debounce
-/// — that is a different boundary (request coalescing), not delivery batching.
+/// *fetches* go through the per-product burst in
+/// `ChatViewModel+InvalidationRefetch.swift` — that is a different boundary
+/// (request coalescing), not delivery batching.
 extension ChatViewModel {
     /// Point the engine's event stream at `handle(_:)`. Called from
     /// `commonInit`; kept here so the dispatch itself stays private to this
@@ -135,22 +136,19 @@ extension ChatViewModel {
             if topic == "work.products" {
                 engine.sendListProducts()
             }
-            if let selectedProductID = currentSelectedProductID,
-               topic == workTopic(forProductID: selectedProductID)
-            {
-                refetchForInvalidation(productID: selectedProductID)
-            } else if let productId,
-                      productId == currentSelectedProductID {
-                refetchForInvalidation(productID: productId)
-            }
-            // Execution history is loaded lazily, outside the work-tree
-            // snapshot. Refresh only already-visible histories so a spawned
-            // worker's persisted launch tuple appears live in its card
-            // popover and transcript viewer without broad polling.
-            for itemID in itemIDs where executionsByTaskID[itemID] != nil {
-                engine.sendListExecutions(taskId: itemID)
-            }
-            requestBackgroundWorkRefresh()
+            // Nothing is fetched here: the push joins its product's pending
+            // burst, which re-reads the board, its side lists, the
+            // background-work snapshot and — outside the work-tree snapshot,
+            // so a spawned worker's persisted launch tuple appears live —
+            // the execution history of the invalidated items that a card
+            // popover or transcript viewer is showing.
+            let onBoard = currentSelectedProductID.map {
+                topic == workTopic(forProductID: $0) || productId == $0
+            } ?? false
+            scheduleInvalidationRefetch(
+                productID: onBoard ? currentSelectedProductID : productId,
+                itemIDs: itemIDs
+            )
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
             let activeIDs = Set(activeProducts.map(\.id))
@@ -663,7 +661,11 @@ extension ChatViewModel {
             // subsection observes `gitHubAuthState` and re-renders.
             gitHubAuthState = state
         case .executionsList(let taskId, let executions):
-            executionsByTaskID[taskId] = executions
+            // A reply that lands after its last consumer closed must not
+            // re-create the entry that closing evicted.
+            if hasOpenExecutionsConsumer(taskID: taskId) {
+                executionsByTaskID[taskId] = executions
+            }
             executionsInFlightTaskIDs.remove(taskId)
             executionsLoadFailureByTaskID.removeValue(forKey: taskId)
         case .attachmentsList(let taskId, let attachments):
@@ -804,14 +806,6 @@ extension ChatViewModel {
 
     // MARK: - Arm helpers
 
-    /// Refetch everything a dropped/observed invalidation for `productID`
-    /// could have covered. Shared by the topic-matched and payload-matched
-    /// arms of `.workInvalidated`, which want identical refreshes.
-    private func refetchForInvalidation(productID: String) {
-        scheduleWorkTreeRefetch(productID: productID, flow: .invalidationRefetch)
-        engine.sendListDeferredScopeAttentions(productId: productID)
-    }
-
     /// Clear the in-flight guard for a completed `release_project` /
     /// `unpopulate_project` request and pull the audit trail plus the
     /// board, both of which the action just rewrote.
@@ -820,26 +814,6 @@ extension ChatViewModel {
         engine.sendListPlannerRuns(projectId: projectID)
         if let productID = project(withID: projectID)?.productID {
             scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
-        }
-    }
-
-    /// Coalesce bursts of invalidation-style refetch triggers (repeated
-    /// `WorkInvalidated` pushes, bulk deletes/reorders, planner actions
-    /// touching many projects) into a single `GetWorkTree` request per
-    /// product, instead of one full-tree fetch — and one full,
-    /// synchronous `applyWorkTree` rebuild — per triggering event. A
-    /// later call for the same product within the debounce window
-    /// supersedes an earlier one rather than queuing a second request.
-    /// Not used for cold-start/product-switch/manual-refresh fetches,
-    /// which want to land immediately.
-    func scheduleWorkTreeRefetch(productID: String, flow: PopulationFlow) {
-        pendingWorkTreeRefetchTasks[productID]?.cancel()
-        pendingWorkTreeRefetchTasks[productID] = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 150_000_000)
-            guard !Task.isCancelled else { return }
-            guard let self else { return }
-            self.pendingWorkTreeRefetchTasks.removeValue(forKey: productID)
-            self.engine.sendGetWorkTree(productId: productID, flow: flow)
         }
     }
 

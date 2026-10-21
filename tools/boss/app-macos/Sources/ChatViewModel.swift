@@ -70,13 +70,23 @@ final class ChatViewModel: ObservableObject {
     /// product ever viewed this session, not just the product being
     /// refreshed (see `ChatViewModel+WorkItemEvents.applyWorkTree`).
     var trackedProjectIDsByProductID: [String: Set<String>] = [:]
-    /// Debounce handles for [[scheduleWorkTreeRefetch]], keyed by product
+    /// The one timer per product behind [[scheduleRefetch]], keyed by product
     /// id. A burst of invalidation-style events for the same product
-    /// (bulk deletes, reorders, planner actions) collapses into one
-    /// `GetWorkTree` request — and one full-tree apply — instead of one
-    /// per event; see the "refetch storm" evidence in
+    /// (bulk deletes, reorders, planner actions, `work_invalidated`)
+    /// collapses into one `GetWorkTree` request — and one full-tree apply —
+    /// plus one set of side-fetches, instead of one per event; see the
+    /// "refetch storm" evidence in
     /// docs/investigations/task-population-latency-on-start-and-product-switch.md §10.2.
     var pendingWorkTreeRefetchTasks: [String: Task<Void, Never>] = [:]
+    /// What each pending timer in [[pendingWorkTreeRefetchTasks]] will send
+    /// when it fires, keyed by the same product id.
+    var pendingRefetchBursts: [String: PendingRefetchBurst] = [:]
+    var refetchCoalescingPolicy = RefetchCoalescingPolicy.standard
+    /// Views currently showing a task's execution history (card popover,
+    /// transcript viewer), by task id, each identified by a per-view token.
+    /// A task with no entry has no consumer: its history is not cached and
+    /// is not refetched on invalidation.
+    var executionsConsumerTokensByTaskID: [String: Set<UUID>] = [:]
 
     /// Projects whose navigator "Archive" gesture has been sent to the
     /// engine and not yet answered. This is the gesture's immediate

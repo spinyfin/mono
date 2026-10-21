@@ -242,32 +242,34 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         model.applyEventForTest(.disconnected)
     }
 
-    func testWorkInvalidationTriggersAnEarlyBackgroundPoll() {
+    func testWorkInvalidationTriggersAnEarlyBackgroundPoll() async {
         let model = makeModel()
         let recorder = installRecorder(on: model)
         model.applyEventForTest(.connected)
         recorder.value.removeAll()
 
         model.applyEventForTest(.workInvalidated(topic: "work.product.prod_1", productId: "prod_1", itemIds: []))
+        await waitForRefetchBursts(model)
 
         XCTAssertEqual(backgroundPolls(in: recorder).count, 1)
         XCTAssertTrue(model.isBackgroundWorkPolling, "an early refresh must not cancel the timer")
         model.applyEventForTest(.disconnected)
     }
 
-    func testResyncRequiredTriggersAnEarlyBackgroundPoll() {
+    func testResyncRequiredTriggersAnEarlyBackgroundPoll() async {
         let model = makeModel()
         let recorder = installRecorder(on: model)
         model.applyEventForTest(.connected)
         recorder.value.removeAll()
 
         model.applyEventForTest(.resyncRequired)
+        await waitForRefetchBursts(model)
 
         XCTAssertEqual(backgroundPolls(in: recorder).count, 1)
         model.applyEventForTest(.disconnected)
     }
 
-    func testEventTriggeredRefreshCoalescesWhileBackgroundPollIsPending() {
+    func testEventTriggeredRefreshCoalescesWhileBackgroundPollIsPending() async {
         let model = makeModel()
         let recorder = installRecorder(on: model)
         model.applyEventForTest(.connected)
@@ -277,6 +279,7 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         model.applyEventForTest(.workInvalidated(topic: "work.product.prod_1", productId: "prod_1", itemIds: []))
         model.applyEventForTest(.workInvalidated(topic: "comments.artifact.x", productId: nil, itemIds: []))
         model.applyEventForTest(.resyncRequired)
+        await waitForRefetchBursts(model)
 
         XCTAssertEqual(
             backgroundPolls(in: recorder).count,
@@ -390,6 +393,14 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         let model = ChatViewModel(socketPath: "/tmp/boss-bgwork-\(UUID().uuidString).sock")
         model.backgroundWorkPollInterval = pollInterval
         return model
+    }
+
+    /// The event-triggered background poll is sent by the coalesced refetch
+    /// burst, not by the event handler, so an assertion about it must run
+    /// after the burst has fired.
+    private func waitForRefetchBursts(_ model: ChatViewModel) async {
+        let settled = await model.waitForRefetchBurstsForTest()
+        XCTAssertTrue(settled, "the refetch burst never fired")
     }
 
     private func installRecorder(on model: ChatViewModel) -> PayloadRecorder {

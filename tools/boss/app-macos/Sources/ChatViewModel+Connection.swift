@@ -86,17 +86,15 @@ extension ChatViewModel {
     /// `EngineEvent.resyncRequired`). The socket never went down, so
     /// there's no connection state to fix — just refetch whatever a
     /// dropped invalidation could have covered, the same data a
-    /// `.workInvalidated` refresh would have pulled.
+    /// `.workInvalidated` refresh would have pulled. That refetch joins the
+    /// product's coalesced burst; a dropped push can't name the items it
+    /// covered, so every open execution history is refreshed with it.
     func handleResyncRequired() {
         engine.sendListProducts()
         engine.sendListWorkerLiveStates()
         engine.sendListLiveStatusDisabledSlots()
         commentBridge.reloadOpenLayers()
-        if let productID = currentSelectedProductID {
-            engine.sendGetWorkTree(productId: productID, flow: .invalidationRefetch)
-            engine.sendListDeferredScopeAttentions(productId: productID)
-        }
-        requestBackgroundWorkRefresh()
+        scheduleInvalidationRefetch(productID: currentSelectedProductID, includesAllOpenConsumers: true)
     }
 
     /// Clears the banner and supersedes any pending delayed reveal on a
