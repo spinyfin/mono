@@ -429,7 +429,7 @@ impl WorkDb {
     /// reconcilers (task 3) layer content-dedup on top of this.
     pub fn create_attention(&self, input: CreateAttentionInput) -> Result<(Attention, AttentionGroup)> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let result = create_attention_in_tx(&tx, input)?;
         tx.commit()?;
         Ok(result)
@@ -462,7 +462,7 @@ impl WorkDb {
         };
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let group = resolve_or_create_group(&tx, first)?;
         // `resolve_or_create_group` always returns a non-terminal group (it
@@ -607,7 +607,7 @@ impl WorkDb {
         }
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let group = resolve_group(&tx, id).require("attention group", id)?;
         let before = group.clone();
         match group.state.as_str() {
@@ -657,7 +657,7 @@ impl WorkDb {
         actor: &str,
     ) -> Result<AttentionGroup> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let before = query_attention(&tx, member_id).require("attention", member_id)?;
         let group = query_attention_group(&tx, &before.group_id)?
             .with_context(|| format!("attention {member_id} references a missing group"))?;

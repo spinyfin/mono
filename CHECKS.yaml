@@ -4,6 +4,21 @@ check_definitions:
   allow_override_bundled: true
 
 checks:
+  - id: boss/explicit-work-transactions
+    check: text/forbidden-pattern
+    include:
+      - "tools/boss/engine/core/src/work/**/*.rs"
+    policy:
+      severity: error
+    config:
+      surfaces:
+        - files
+      patterns:
+        - name: implicit-transaction-behavior
+          pattern: '\.\s*(?:unchecked_)?transaction\s*\(\s*\)'
+          message: "Choose transaction behavior explicitly: Deferred for reads, Immediate for writes, including free helpers."
+          severity: error
+
   - id: md/link-integrity
     policy:
       severity: warning

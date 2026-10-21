@@ -368,7 +368,7 @@ impl WorkDb {
     /// run here for both paths, advancing the marker only after success.
     pub(crate) fn init(&self) -> Result<()> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let has_schema: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')",
             [],
@@ -649,8 +649,8 @@ impl WorkDb {
     /// Give an admitted frontend query its own connection, preserving the
     /// shared WorkDb write semantics and event bus. Board reads use reader();
     /// read-only snapshots on any connection must explicitly use Deferred.
-    /// The WorkDb boundary macro rejects implicit transactions in get_/list_/
-    /// query_ helpers at compile time so they cannot inherit the writer default.
+    /// The WorkDb boundary macro rejects implicit transactions in every instrumented method
+    /// at compile time so reads cannot silently inherit the writer default.
     pub(crate) fn query_connection(&self) -> Result<Self> {
         if self.memory.is_some() {
             return Ok(self.clone());

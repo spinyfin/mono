@@ -325,7 +325,7 @@ impl WorkDb {
     /// run degraded to clean dispatch cannot be treated as already recovered.
     pub(crate) fn delete_execution_bookmark_and_restore_report(&self, execution_id: &str) -> Result<()> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM execution_bookmarks WHERE execution_id = ?1",
             [execution_id],

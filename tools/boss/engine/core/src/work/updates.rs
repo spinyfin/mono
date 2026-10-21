@@ -216,7 +216,7 @@ pub(crate) fn apply_tag_patch(
 impl WorkDb {
     pub(crate) fn update_product(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut product = query_product(&tx, id).require("product", id)?;
         let previous_status = product.status.clone();
         let status_changed = patch.status.is_some();
@@ -286,7 +286,7 @@ impl WorkDb {
     pub(crate) fn update_project(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
         tracing::debug!(target: "work_write_timing", boundary = "transaction_begin");
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut project = query_project(&tx, id).require("project", id)?;
         // Pre-image for the Boothby audit trail. Cloned unconditionally
         // rather than behind the actor gate: `project` is mutated in place
@@ -397,7 +397,7 @@ impl WorkDb {
         let blocked_detail_patch_requests_set = patch.blocked_detail.as_deref().is_some_and(|s| !s.is_empty());
         let archived_reason_patch_requests_set = patch.archived_reason.as_deref().is_some_and(|s| !s.is_empty());
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
         let mut task = query_task(&tx, id).require("task", id)?;
         let previous_status = task.status.clone();

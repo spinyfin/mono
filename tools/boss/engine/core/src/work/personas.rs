@@ -131,7 +131,7 @@ impl WorkDb {
     /// first, then backfill older rows in the adoption query's created_at/id order.
     pub fn restore_tmux_personas(&self, runs: &[TmuxRunHandle]) -> Result<()> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut existing = Vec::new();
         let mut missing = Vec::new();
         for run in runs {
@@ -168,7 +168,7 @@ impl WorkDb {
         if held {
             return persona_display_name(&conn, execution_id)?.context("held persona missing");
         }
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let run_id: String = tx.query_row(
             "SELECT id FROM work_runs WHERE execution_id = ?1
              ORDER BY persona_lease_active DESC, (tmux_spawn_token IS NOT NULL) DESC,

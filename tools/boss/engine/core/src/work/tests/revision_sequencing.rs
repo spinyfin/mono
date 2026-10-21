@@ -355,7 +355,9 @@ fn demotion_and_wake_stage_status_events_published_only_on_commit() {
         .unwrap();
     // Rolled back: the staged wake-up must never reach subscribers.
     let mut conn = db.connect().unwrap();
-    let tx = conn.transaction().unwrap();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
     let mut pending = PendingEvents::new();
     super::super::revision_sequencing::promote_waiting_writers(&mut pending, &tx, None).unwrap();
     assert!(!pending.is_empty());

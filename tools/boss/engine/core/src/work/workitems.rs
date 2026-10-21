@@ -123,7 +123,7 @@ pub(crate) fn insert_attention_item_row(
 impl WorkDb {
     pub fn create_attention_item(&self, input: CreateAttentionItemInput) -> Result<WorkAttentionItem> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let item = insert_attention_item_row(&tx, &input)?;
         tx.commit()?;
         Ok(item)
@@ -236,7 +236,7 @@ impl WorkDb {
     ) -> Result<()> {
         warn_if_lifecycle_undeclared(kind);
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _ = product_id_for_work_item(&tx, work_item_id)?;
         if reraise_open_work_item_attention(&tx, work_item_id, kind)?.is_none() {
             let id = next_id("attn");
@@ -672,7 +672,7 @@ impl WorkDb {
     /// apply here) and any non-`open` item (no double-closing).
     pub fn resolve_deferred_scope_attention(&self, id: &str) -> Result<WorkAttentionItem> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let attention = query_attention_item(&tx, id)?.with_context(|| format!("unknown attention item: {id}"))?;
         if attention.kind != crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND {
             bail!(
@@ -705,7 +705,7 @@ impl WorkDb {
     /// uses for PR-review findings.
     pub fn create_task_from_deferred_scope_attention(&self, attention_id: &str) -> Result<(WorkAttentionItem, Task)> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let attention = query_attention_item(&tx, attention_id)?
             .with_context(|| format!("unknown attention item: {attention_id}"))?;
@@ -894,7 +894,7 @@ impl WorkDb {
         match classify_id(id)? {
             ItemKind::Task => {
                 let mut conn = self.connect()?;
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let now = now_string();
                 // Pre-image, before the tombstone lands. Only read when the
                 // actor is Boothby — every other caller pays nothing.
@@ -1008,7 +1008,7 @@ impl WorkDb {
                     .flatten();
                 let now = now_string();
                 {
-                    let tx = conn.transaction()?;
+                    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     // Pre-image, while the tombstone is still on the row.
                     // Only read for Boothby; every other caller pays nothing.
                     let before = if boothby::is_boothby_actor(actor) {
@@ -1258,7 +1258,7 @@ impl WorkDb {
 
     pub fn reorder_project_tasks(&self, project_id: &str, task_ids: &[String]) -> Result<()> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure_project_exists(&tx, project_id)?;
 
         let mut existing = {
@@ -1986,7 +1986,7 @@ impl WorkDb {
         }
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let mut pending = PendingEvents::new();
         let (edge, reaped) =
@@ -2011,7 +2011,7 @@ impl WorkDb {
             bail!("dependent and prerequisite ids are required");
         }
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let removed = deps::delete_edge(&tx, dependent_id, prerequisite_id, relation)?;
         // Auto-unblock (Q4): when the only remaining gating reason is
         // gone and the engine itself put this row in `blocked` (identified
@@ -2068,7 +2068,7 @@ impl WorkDb {
     /// concurrent update, or engine was offline when the prereq landed).
     pub fn try_unblock_dependency_if_resolved(&self, work_item_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let mut pending = PendingEvents::new();
         let unblocked = maybe_engine_unblock_dependent(&mut pending, &tx, work_item_id, &now)?;
@@ -2089,7 +2089,7 @@ impl WorkDb {
     /// whose old execution is terminal; ordinary admission guards still apply.
     pub fn promote_todo_autostart_stuck_executions(&self) -> Result<Vec<String>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let candidates: Vec<String> = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM tasks

@@ -100,7 +100,7 @@ impl WorkDb {
         review_verdict: Option<ReviewVerdictInput>,
     ) -> Result<Option<WorkerPrCompletion>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution.status.is_terminal() {
             return Ok(None);
@@ -311,7 +311,7 @@ impl WorkDb {
         declaration_id: Option<&str>,
     ) -> Result<Option<WorkerPrCompletion>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(declaration_id) = declaration_id {
             let authorized: bool = tx.query_row(
                 "SELECT EXISTS(
@@ -501,7 +501,7 @@ impl WorkDb {
         question: Option<&boss_protocol::OperatorQuestion>,
     ) -> Result<Option<WorkerFailureCompletion>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution.status.is_terminal() {
             return Ok(None);
@@ -1294,7 +1294,7 @@ impl WorkDb {
     /// the single source of truth for what's mergeable.
     pub fn mark_chore_pr_merged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
         let Some(task) = query_task(&tx, work_item_id)? else {
             return Ok(None);
@@ -1417,7 +1417,7 @@ impl WorkDb {
     /// undo by re-resolving those same comments.
     pub fn mark_chore_pr_closed_unmerged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
         let Some(task) = query_task(&tx, work_item_id)? else {
             return Ok(None);
@@ -1497,7 +1497,7 @@ impl WorkDb {
     /// Returns the number of comment rows reopened (tests / logging).
     pub fn reopen_comments_for_closed_unmerged_pr(&self, work_item_id: &str) -> Result<usize> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         // The direct/plain-chore vehicle's own comments only ever resolve on
         // a genuine merge, so a late/duplicate close-unmerged sweep here
@@ -1561,7 +1561,7 @@ impl WorkDb {
     /// observation neither moves Review cards nor publishes an invalidation.
     pub fn update_task_pr_poll_state(&self, work_item_id: &str, input: PrPollStateInput) -> Result<PrPollStateOutcome> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let before = read_pr_observation_columns(&tx, work_item_id)?;
         let prior_ci_state = before.as_ref().and_then(|row| row.ci_required_state.clone());
@@ -1736,7 +1736,7 @@ impl WorkDb {
         observed_at: &str,
     ) -> Result<bool> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let before = read_pr_observation_columns(&tx, work_item_id)?;
         let mergeable_state = retain_known_poll_value(
             before.as_ref().and_then(|row| row.pr_mergeable_state.as_deref()),

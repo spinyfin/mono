@@ -50,7 +50,7 @@ pub struct BackfillDurableTranscriptPathsOutcome {
 impl WorkDb {
     pub fn create_run(&self, input: CreateRunInput) -> Result<WorkRun> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure_execution_exists(&tx, &input.execution_id)?;
 
         let id = next_id("run");

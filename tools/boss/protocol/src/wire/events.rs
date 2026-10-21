@@ -1750,3 +1750,25 @@ pub enum FrontendEvent {
         project: Option<Box<Project>>,
     },
 }
+
+impl FrontendEvent {
+    /// Failed read replies must not replace a successful overlapping snapshot.
+    pub fn is_failed_read_reply(&self) -> bool {
+        matches!(
+            self,
+            FrontendEvent::OperatorQuestionError { .. }
+                | FrontendEvent::Error { .. }
+                | FrontendEvent::WorkError { .. }
+                | FrontendEvent::ExecutionTranscriptUnavailable { .. }
+                | FrontendEvent::ProductDesignDocContent {
+                    content: crate::DesignDocContent::Failed { .. },
+                    ..
+                }
+                | FrontendEvent::ProductDesignDocsList {
+                    state: crate::DesignDocTreeState::Unreachable { .. }
+                        | crate::DesignDocTreeState::RateLimited { .. },
+                    ..
+                }
+        )
+    }
+}

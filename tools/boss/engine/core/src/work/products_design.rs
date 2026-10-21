@@ -31,7 +31,7 @@ impl WorkDb {
     /// an engine release blocking it (design §Q3).
     pub fn set_product_default_model(&self, product_id: &str, model: Option<&str>) -> Result<Product> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _ = query_product(&tx, product_id).require("product", product_id)?;
         let now = now_string();
         let stored = model.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
@@ -50,7 +50,7 @@ impl WorkDb {
     /// updated product.
     pub fn set_product_default_driver(&self, product_id: &str, driver: Option<&str>) -> Result<Product> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _ = query_product(&tx, product_id).require("product", product_id)?;
         let now = now_string();
         let stored = driver.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
@@ -72,7 +72,7 @@ impl WorkDb {
     /// surfacing later at every parse call site.
     pub fn set_product_merge_mechanism(&self, product_id: &str, mechanism: Option<&str>) -> Result<Product> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _ = query_product(&tx, product_id).require("product", product_id)?;
         let stored = mechanism.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
         crate::merge_mechanism::MergeMechanism::parse(stored.as_deref())?;
@@ -100,7 +100,7 @@ impl WorkDb {
         unset: bool,
     ) -> Result<Product> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _ = query_product(&tx, product_id).require("product", product_id)?;
         let now = now_string();
         if unset {
@@ -130,7 +130,7 @@ impl WorkDb {
         rules: Option<&boss_protocol::EditorialRules>,
     ) -> Result<Product> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _ = query_product(&tx, product_id).require("product", product_id)?;
         let now = now_string();
         let rules_json = rules
@@ -171,7 +171,7 @@ impl WorkDb {
     /// not status transitions (Q10).
     pub fn set_project_design_doc(&self, input: SetProjectDesignDocInput) -> Result<Project> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let before = query_project(&tx, &input.project_id).require("project", &input.project_id)?;
         let now = now_string();
 
@@ -346,7 +346,7 @@ impl WorkDb {
         let branch = normalize_optional_text(branch.map(str::to_owned));
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let before = query_project(&tx, project_id).require("project", project_id)?;
         if before.design_doc_path.is_some() {
             return Ok(false);
@@ -506,7 +506,7 @@ impl WorkDb {
         let branch = normalize_optional_text(branch.map(str::to_owned));
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing_path: Option<String> = tx
             .query_row("SELECT doc_path FROM tasks WHERE id = ?1", [task_id], |row| row.get(0))
             .optional()?
@@ -552,7 +552,7 @@ impl WorkDb {
         let now = now_string();
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         match path {
             Some(raw_path) => {
                 let validated = validate_design_doc_path(raw_path)?;
@@ -600,7 +600,7 @@ impl WorkDb {
         if input.unset {
             let now = now_string();
             let mut conn = self.connect()?;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute(
                 "UPDATE tasks
                  SET doc_repo_remote_url = NULL,

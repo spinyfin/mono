@@ -94,7 +94,7 @@ impl WorkDb {
         input: ConflictResolutionInsertInput,
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let id = next_id("crz");
         let now = now_string();
 
@@ -241,7 +241,7 @@ impl WorkDb {
         diagnosis_json: &str,
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let conflict_class = serde_json::from_str::<crate::conflict_diagnosis::ConflictDiagnosis>(diagnosis_json)
             .ok()
             .map(|diagnosis| {
@@ -275,7 +275,7 @@ impl WorkDb {
         revision_task_id: &str,
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = tx.execute(
             "UPDATE conflict_resolutions
                 SET revision_task_id = ?2
@@ -297,7 +297,7 @@ impl WorkDb {
         worker_id: &str,
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
@@ -336,7 +336,7 @@ impl WorkDb {
         reason: &str,
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
@@ -381,7 +381,7 @@ impl WorkDb {
         rung: i64,
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
@@ -451,7 +451,7 @@ impl WorkDb {
             return Ok(None);
         }
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(rev) = query_task(&tx, revision_task_id)? else {
             return Ok(None);
         };
@@ -532,7 +532,7 @@ impl WorkDb {
     /// rung stamp, matching rung 1's convention.
     pub fn stamp_conflict_resolution_rung(&self, attempt_id: &str, rung: i64) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = tx.execute(
             "UPDATE conflict_resolutions
                 SET resolved_by_rung = COALESCE(resolved_by_rung, ?2)
@@ -570,7 +570,7 @@ impl WorkDb {
         cube_workspace_id: &str,
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = tx.execute(
             "UPDATE conflict_resolutions
                 SET mechanical_rung_in_flight = ?2,
@@ -598,7 +598,7 @@ impl WorkDb {
     /// terminal. `Ok(None)` when the id is unknown.
     pub fn clear_conflict_resolution_mechanical_rung(&self, attempt_id: &str) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = tx.execute(
             "UPDATE conflict_resolutions
                 SET mechanical_rung_in_flight = NULL,
@@ -625,7 +625,7 @@ impl WorkDb {
         reason: &str,
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
@@ -669,7 +669,7 @@ impl WorkDb {
         reason: &str,
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
@@ -708,7 +708,7 @@ impl WorkDb {
         reason: &str,
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
@@ -849,7 +849,7 @@ impl WorkDb {
     /// `Ok(None)` when the id is unknown or the row is non-terminal.
     pub fn retry_conflict_resolution(&self, attempt_id: &str) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
@@ -960,7 +960,7 @@ impl WorkDb {
             serde_json::to_string(&diagnosis).context("failed to serialize producer-side conflict diagnosis")?;
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let id = next_id("crz");
         let now = now_string();
         tx.execute(
@@ -1036,7 +1036,7 @@ impl WorkDb {
             serde_json::to_string(&diagnosis).context("failed to serialize speculative conflict diagnosis")?;
 
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let id = next_id("crz");
         let now = now_string();
         tx.execute(
@@ -1114,7 +1114,7 @@ impl WorkDb {
     /// and the fall-through re-detect is self-healing.
     pub fn reconcile_orphaned_conflict_ladder_attempts(&self) -> Result<Vec<RecoveredConflictLadderAttempt>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let candidates: Vec<OrphanedLadderCandidate> = {
             let mut stmt = tx.prepare(
                 "SELECT t.id, t.product_id, t.pr_url, t.blocked_attempt_id,

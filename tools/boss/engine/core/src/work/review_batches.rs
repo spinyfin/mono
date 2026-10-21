@@ -907,7 +907,7 @@ fn file_reported_live_review_batch_member_attentions(conn: &mut Connection) -> R
             .collect::<rusqlite::Result<_>>()?
     };
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     // Auto-clear first: a cycle root with an open alarm that no longer
     // appears in the set just recomputed above has had its condition

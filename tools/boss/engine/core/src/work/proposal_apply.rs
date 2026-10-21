@@ -1441,7 +1441,9 @@ mod tests {
     fn flipping_a_gated_kind_to_autoapply_without_an_applier_errors_instead_of_panicking() {
         let (_dir, db) = crate::test_support::open_db();
         let mut conn = db.connect().unwrap();
-        let tx = conn.transaction().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
 
         let err = apply_in_transaction(
             &tx,

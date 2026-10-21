@@ -295,7 +295,7 @@ impl WorkDb {
             bail!("'local' is a reserved host id; use `bossctl hosts list` to see it");
         }
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         if tx.query_row("SELECT COUNT(*) FROM hosts WHERE id = ?1", params![id], |r| {
             r.get::<_, i64>(0)

@@ -63,7 +63,7 @@ impl WorkDb {
         merge_queue_detail: &str,
     ) -> Result<GithubMergeIntentRecordOutcome> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let id = next_id("gmi");
         let now = now_string();
         let inserted = tx.execute(
@@ -145,7 +145,7 @@ impl WorkDb {
         event_created_at: i64,
     ) -> Result<Option<Option<String>>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let retired = tx.execute(
             "UPDATE github_merge_intents
              SET status = 'dequeued'

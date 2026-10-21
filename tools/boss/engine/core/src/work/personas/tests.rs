@@ -205,7 +205,9 @@ fn allocation_rolls_back_and_database_rejects_duplicate_live_leases() {
     db.release_persona(&first.id).unwrap();
     let mut conn = db.connect().unwrap();
     {
-        let tx = conn.transaction().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         allocate(&tx, &first_run.id).unwrap();
         // Intentionally roll back the whole spawn/restore transaction.
     }

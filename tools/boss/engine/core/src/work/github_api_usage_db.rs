@@ -66,7 +66,7 @@ impl WorkDb {
             return Ok(());
         }
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO github_api_calls
