@@ -1736,6 +1736,9 @@ impl ServerState {
 
             ServerState::builder()
                 .work_db(work_db)
+                .agent_jsonl_progress_manager(Arc::new(
+                    AgentJsonlProgressManager::new().with_metrics(metrics_registry.clone()),
+                ))
                 .maybe_coordinator_handoff_timeout(coordinator_handoff_timeout_override)
                 .maybe_coordinator_handoff_delivery(coordinator_handoff_delivery_override)
                 .maybe_coordinator_tmux_override(coordinator_tmux_override)

@@ -198,6 +198,7 @@ pub mod stranded_answering_sweep;
 pub use boss_engine_structured_output as structured_output;
 pub mod supersession_scan;
 pub(crate) mod sweep_loop;
+pub mod sweep_metrics;
 pub mod syspolicyd_monitor;
 pub mod teardown_registry;
 pub mod terminal_work_sweep;

@@ -217,7 +217,7 @@ pub async fn run_one_pass(
     // clears), and hand the fact to the existing two-way policy. A bounded
     // probe is mandatory because convergence may signal the recorded process
     // group; an old recycled pid is not evidence.
-    let terminal_candidates = match work_db.list_recent_terminal_executions_with_local_shell_pid(
+    let terminal_candidates = match work_db.list_recent_terminal_execution_refs_with_local_shell_pid(
         crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
         now_epoch_secs,
     ) {
