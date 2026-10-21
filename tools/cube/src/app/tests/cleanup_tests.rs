@@ -788,6 +788,33 @@ fn a_command_that_partly_runs_then_cannot_find_a_helper_withholds_the_workspace(
     assert!(!pool.claim(0));
 }
 
+/// A helper that exists but cannot execute can also follow partial cleanup.
+#[test]
+fn a_nonexecutable_helper_after_partial_cleanup_withholds_the_workspace() {
+    use crate::command_runner::RealCommandRunner;
+    use std::os::unix::fs::PermissionsExt;
+
+    let _env = super::support::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (low, _) = marks();
+    let pool = Pool::seed(1);
+    let helper = pool.workspaces[0].join("cleanup-helper");
+    std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o600)).unwrap();
+    write_setup_yaml(
+        &pool.workspaces[0],
+        "version: 1\ncleanup:\n  command: 'touch partial.marker; ./cleanup-helper'\n",
+    );
+    let _volume = testing::with_reading(volume_with_free(low - GIB));
+
+    let report = pool.pass(&RealCommandRunner, false);
+
+    assert_eq!(report.failed.len(), 1);
+    assert!(report.failed[0].error.contains("exit 126"));
+    assert!(pool.workspaces[0].join("partial.marker").exists());
+    assert_eq!(pool.cleanup_status(0), Some(CleanupStatus::Failed));
+    assert!(!pool.claim(0), "partial cleanup must stay withheld");
+}
+
 /// A real spawn failure during retry must not lift an existing failed mark.
 #[test]
 fn failed_cleanup_stays_withheld_when_retry_cannot_spawn() {
