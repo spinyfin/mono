@@ -6,8 +6,8 @@ import SwiftUI
 ///
 /// Hosts the production `MarkdownDocumentChrome` at the real
 /// `async-markdown-viewer` scene width with a "Goals" list whose bullets each
-/// wrap to two or three lines — the shape in which wrapped lines used to sit
-/// further apart than consecutive bullets. Captured through the same
+/// wrap to two or three lines — the shape that shows whether wrapped lines sit
+/// closer together than consecutive bullets. Captured through the same
 /// never-presented window path as the other fixtures.
 @MainActor
 enum BossMarkdownListCapture {
@@ -21,7 +21,7 @@ enum BossMarkdownListCapture {
         ## Goals
 
         - Line spacing within a list item matches body paragraph line spacing, so a bullet that wraps reads as one item rather than as lines drifting apart.
-        - The gap between consecutive list items is at least the in-item line gap, and a little more, so the list reads as separate items instead of one block of staggered text.
+        - The gap between consecutive list items is at least the in-item line gap, and a little more, so the list reads as separate items instead of one block of text.
         - Holds for single-line items too.
         - Holds for items with `inline code` and [links](https://example.com) whose decorations must not change the rhythm of the lines around them.
         - Nested lists share the same item gap as their parent:
