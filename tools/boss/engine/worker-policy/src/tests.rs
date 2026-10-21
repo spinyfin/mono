@@ -638,6 +638,7 @@ fn work_tree_strips_ideas_for_workers() {
         attention_items: vec![],
         attention_groups: vec![],
         attention_members: vec![],
+        planner_runs: vec![],
         projects: vec![],
         tasks: vec![],
         chores: vec![],
