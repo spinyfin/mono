@@ -616,6 +616,17 @@ impl Clone for WorkDb {
     }
 }
 
+impl WorkDb {
+    /// The engine-wide metrics [`Registry`](crate::metrics::Registry) this
+    /// handle (and every clone of it) publishes into — the same registry
+    /// `ServerState` flushes and `bossctl metrics` reads. Sweeps that only
+    /// hold a `&WorkDb` record their per-pass telemetry through this rather
+    /// than threading a second `Arc<Registry>` through every spawn signature.
+    pub(crate) fn metrics_registry(&self) -> &crate::metrics::Registry {
+        &self.persona_metrics
+    }
+}
+
 // ---- module tree (see PR description for the split rationale) ----
 mod answer_agent_runs;
 mod attachments;
@@ -706,6 +717,7 @@ pub(crate) use schema_init::table_exists;
 #[cfg(test)]
 use schema_init::table_has_column;
 mod semantic_progress;
+mod sweep_reads;
 mod task_targets;
 #[cfg(test)]
 mod tests;
@@ -738,6 +750,7 @@ pub(crate) use exec_status_helpers::*;
 pub(crate) use exec_tail::content_checksum;
 use ideas::list_ideas_in_tx;
 pub(crate) use insert_helpers::*;
+pub use sweep_reads::{TaskWaitLabel, TerminalExecutionRef};
 // Private on purpose: only the list-read submodules under `work` build
 // these queries, so it stays visible to `work` and its children only.
 use list_filter::ListFilterQuery;

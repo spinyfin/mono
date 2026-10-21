@@ -762,13 +762,23 @@ impl ExecutionCoordinator {
     }
 
     fn chain_serialized_wait_reason(&self, sibling: &WorkExecution, review_held: bool, queue_len: usize) -> String {
-        let sibling_task = self
-            .resolve_execution_work_item(sibling)
-            .ok()
-            .and_then(|item| match item {
-                WorkItem::Task(task) | WorkItem::Chore(task) => Some(task),
-                _ => None,
-            });
+        // A narrow label read, not the full `get_work_item` projection: this
+        // runs for every chain-serialized execution on every drain pass and
+        // needs three columns (see `work/sweep_reads.rs`). A chain sibling
+        // always binds a task/chore row — the synthetic automation / answer-
+        // agent / review-guide kinds never share a PR chain.
+        let sibling_task = match self.work_db.task_wait_label(&sibling.work_item_id) {
+            Ok(label) => label,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %sibling.id,
+                    work_item_id = %sibling.work_item_id,
+                    ?err,
+                    "chain-serialized wait reason: sibling label lookup failed; naming the id instead"
+                );
+                None
+            }
+        };
         let sibling_label = sibling_task
             .as_ref()
             .map(|task| format!("{} '{}'", task.short_label(), task.name))

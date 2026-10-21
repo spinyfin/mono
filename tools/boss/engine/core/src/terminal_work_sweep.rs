@@ -240,13 +240,29 @@ pub fn spawn_loop(
         let seen_terminal = Arc::clone(&seen_terminal);
         async move {
             let mut seen_terminal = seen_terminal.lock().await;
-            run_one_pass(
+            // The candidate-gathering phase is synchronous SQLite work (one
+            // execution point-read per live slot plus one batched status
+            // read); keep it off the async worker threads so a slow pass
+            // cannot stall the runtime's other tasks. The reap phase that
+            // follows awaits the reaper / cube client and stays async.
+            let gather_db = Arc::clone(&work_db);
+            let gathered = crate::work::db_diagnostics::spawn_blocking(move || {
+                gather_reap_candidates(gather_db.as_ref(), live_states.as_ref(), teardown_registry.as_ref())
+            })
+            .await;
+            let gathered = match gathered {
+                Ok(gathered) => gathered,
+                Err(err) => {
+                    tracing::error!(?err, "terminal-work sweep: candidate gathering did not complete");
+                    return TerminalWorkSweepOutcome::default();
+                }
+            };
+            reap_confirmed_candidates(
+                gathered,
                 work_db.as_ref(),
-                live_states.as_ref(),
                 reaper.as_ref(),
                 cube_client.as_ref(),
                 dispatch_events.as_ref(),
-                teardown_registry.as_ref(),
                 &mut seen_terminal,
             )
             .await
@@ -268,6 +284,31 @@ pub async fn run_one_pass(
     teardown_registry: &TeardownRegistry,
     seen_terminal: &mut HashSet<String>,
 ) -> TerminalWorkSweepOutcome {
+    let gathered = gather_reap_candidates(work_db, live_states, teardown_registry);
+    reap_confirmed_candidates(gathered, work_db, reaper, cube_client, dispatch_events, seen_terminal).await
+}
+
+/// Everything the synchronous half of a pass produces: the per-slot
+/// counters so far and this pass's reap candidates, keyed on `run_id` for
+/// the two-pass confirmation helper.
+struct GatheredCandidates {
+    outcome: TerminalWorkSweepOutcome,
+    candidates: Vec<(String, ReapCandidate)>,
+}
+
+/// The synchronous half of a pass: inspect every live slot, decide whether
+/// it is a reap candidate, and collect the candidates. All DB work happens
+/// here — one execution point-read per slot plus ONE batched status read
+/// for every bound task (see `work/sweep_reads.rs`), instead of the full
+/// work-item projection the per-slot closedness check used to build. No
+/// awaits, so [`spawn_loop`] can run it on the blocking pool.
+fn gather_reap_candidates(
+    work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
+    teardown_registry: &TeardownRegistry,
+) -> GatheredCandidates {
+    let registry = work_db.metrics_registry();
+    let timer = crate::sweep_metrics::TERMINAL_WORK_SWEEP.begin(registry);
     let mut outcome = TerminalWorkSweepOutcome::default();
     if let Err(err) = work_db.reconcile_pr_review_guide_attempts() {
         tracing::warn!(?err, "terminal-work sweep: review-guide attempt reconcile failed",);
@@ -281,16 +322,19 @@ pub async fn run_one_pass(
     // these into the confirmed/pending partitions below.
     let mut candidates: Vec<(String, ReapCandidate)> = Vec::new();
 
-    for state in live_states.snapshot() {
+    let states = live_states.snapshot();
+    let items = states.len();
+    let mut slots = Vec::with_capacity(states.len());
+    for state in states {
         // `run_id` on a live-state entry IS the execution id (see
         // dead_pid_sweep / pool_claim_sweep).
-        let run_id = state.run_id;
+        let run_id = state.run_id.clone();
 
         // Look up the execution: it gives us both the execution's own
         // terminality and the bound work-item id. A DB error is not proof
         // of anything — skip conservatively and retry next pass.
-        let execution = match work_db.get_execution(&run_id) {
-            Ok(execution) => execution,
+        match work_db.get_execution(&run_id) {
+            Ok(execution) => slots.push((state, execution)),
             Err(err) => {
                 tracing::warn!(
                     run_id = %run_id,
@@ -299,10 +343,39 @@ pub async fn run_one_pass(
                     "terminal-work sweep: failed to look up execution; skipping this pass",
                 );
                 outcome.lookup_failed_skipped += 1;
-                continue;
             }
-        };
+        }
+    }
 
+    // One batched status read for every task/chore bound by a live slot.
+    // A slot whose id is absent from the map (a comment binding, a row that
+    // vanished, or a failed batch) falls back to the per-id read below,
+    // whose error path is what distinguishes "gone" from "DB hiccup".
+    let bound_task_ids: Vec<String> = {
+        let mut ids: Vec<String> = slots
+            .iter()
+            .filter(|(_, execution)| {
+                !never_binds_work_item(&execution.kind) && execution.work_item_id.starts_with("task_")
+            })
+            .map(|(_, execution)| execution.work_item_id.clone())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let closed_states = match work_db.task_closed_states(&bound_task_ids) {
+        Ok(closed) => closed,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "terminal-work sweep: batched work-item status read failed; falling back to per-slot reads",
+            );
+            std::collections::HashMap::new()
+        }
+    };
+
+    for (state, execution) in slots {
+        let run_id = state.run_id;
         let execution_terminal = execution.status.is_terminal();
 
         // `AutomationTriage`'s `work_item_id` is an automation id, and
@@ -313,12 +386,7 @@ pub async fn run_one_pass(
         // recovery so it can finalize through the answer-agent path and
         // file its lost-signal attention item. Skip all three here and fall
         // back to execution status.
-        let never_bound_work_item = matches!(
-            execution.kind,
-            boss_protocol::ExecutionKind::AutomationTriage
-                | boss_protocol::ExecutionKind::AnswerAgent
-                | boss_protocol::ExecutionKind::PrReviewGuide
-        );
+        let never_bound_work_item = never_binds_work_item(&execution.kind);
 
         // The O'Brien signal: the bound work item is terminal (done /
         // archived / comment resolved|dismissed|answered) even though the
@@ -346,7 +414,11 @@ pub async fn run_one_pass(
         let work_item_terminal = if never_bound_work_item {
             false
         } else {
-            match work_db.is_bound_work_item_closed(&execution.work_item_id) {
+            let closed = match closed_states.get(&execution.work_item_id) {
+                Some(&closed) => Ok(closed),
+                None => work_db.is_bound_work_item_closed(&execution.work_item_id),
+            };
+            match closed {
                 Ok(closed) => {
                     if !closed {
                         false
@@ -472,6 +544,36 @@ pub async fn run_one_pass(
         ));
     }
 
+    timer.finish(registry, items);
+    GatheredCandidates { outcome, candidates }
+}
+
+/// Whether an execution kind's `work_item_id` is something other than a
+/// product/project/task/comment, so bound-item closedness can never be
+/// established for it (see the comment at the use site).
+fn never_binds_work_item(kind: &boss_protocol::ExecutionKind) -> bool {
+    matches!(
+        kind,
+        boss_protocol::ExecutionKind::AutomationTriage
+            | boss_protocol::ExecutionKind::AnswerAgent
+            | boss_protocol::ExecutionKind::PrReviewGuide
+    )
+}
+
+/// The async half of a pass: confirm this pass's candidates against the
+/// previous pass's and reap the confirmed ones.
+async fn reap_confirmed_candidates(
+    gathered: GatheredCandidates,
+    work_db: &WorkDb,
+    reaper: &dyn WorkerReaper,
+    cube_client: &dyn CubeClient,
+    dispatch_events: &dyn DispatchEventSink,
+    seen_terminal: &mut HashSet<String>,
+) -> TerminalWorkSweepOutcome {
+    let GatheredCandidates {
+        mut outcome,
+        candidates,
+    } = gathered;
     // Two-pass confirmation (shared with `husk_pane_sweep`): only reap a run
     // that was ALSO a terminal+live candidate on the previous pass. A
     // teardown still in flight would have completed within the interval, so

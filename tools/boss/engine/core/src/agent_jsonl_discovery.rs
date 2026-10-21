@@ -128,6 +128,16 @@ pub(crate) fn descriptor_is_unlinked(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
+/// Process-wide count of [`VerifiedRoot::revalidate`] calls. Each one is
+/// an `lstat` plus a `canonicalize` of the sessions directory; the tail
+/// loop's telemetry reads the delta per poll iteration so the per-poll
+/// pathname-walk cost is visible as `agent_jsonl_stream.items_per_pass`.
+static ROOT_REVALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn root_revalidation_count() -> u64 {
+    ROOT_REVALIDATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedRoot {
     pub(crate) path: PathBuf,
@@ -150,6 +160,7 @@ impl VerifiedRoot {
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), String> {
+        ROOT_REVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let metadata =
             fs::symlink_metadata(&self.path).map_err(|err| format!("stat {}: {err}", self.path.display()))?;
         if metadata.file_type().is_symlink()
