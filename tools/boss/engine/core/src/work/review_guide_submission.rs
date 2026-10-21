@@ -201,7 +201,7 @@ mod tests {
                 }))
             });
             let payload =
-                serde_json::json!({"body_markdown": "# Guide\n## Problem\n## Implementation\n## Example\n## Review"})
+                serde_json::json!({"body_markdown": "# Guide\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation results reported; no screenshots registered."})
                     .to_string();
             let start = std::time::Instant::now();
             let outcome = db

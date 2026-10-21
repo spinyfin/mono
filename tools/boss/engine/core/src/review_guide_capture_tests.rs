@@ -723,7 +723,7 @@ fn updated_guide_links_validate_at_the_new_head_and_reject_stale_head_links() {
     // The previous head is an inspection endpoint, not a valid current-guide link.
     packet.merge_base_sha = "a".repeat(40);
     let markdown = format!(
-        "# Guide\n## Changed since the previous version\nThe caller now uses the fix.\n## Problem\n## Fix\n## Walkthrough\n[code](https://github.com/{}/blob/{head}/new.rs#L1)\n## Tests",
+        "# Guide\n## Changed since the previous version\nThe caller now uses the fix.\n## Problem\n## Fix\n## Walkthrough\n[code](https://github.com/{}/blob/{head}/new.rs#L1)\n## Tests\n## Evidence\nNo validation results reported; no screenshots registered.",
         packet.head_repository
     );
     assert!(boss_review_guide::validate_update_section(&markdown).is_ok());
