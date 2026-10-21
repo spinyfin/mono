@@ -488,10 +488,10 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 WorkBoardCardRevisionHeader(slice: revision)
                     .equatable()
             }
-            WorkBoardCardTitleRow(slice: WorkBoardCardTitleRowSlice(snapshot: snap))
+            WorkBoardCardTitleRow(slice: WorkBoardCardTitleRowSlice(snapshot: snap), onFocusAgent: onFocusAgent)
                 .equatable()
             if let liveStatus = WorkBoardCardLiveStatusRowSlice(snapshot: snap) {
-                WorkBoardCardLiveStatusRow(slice: liveStatus, onRevealBlocker: onRevealQueueBlocker, onFocusAgent: onFocusAgent)
+                WorkBoardCardLiveStatusRow(slice: liveStatus, onRevealBlocker: onRevealQueueBlocker)
                     .equatable()
             }
             if let operatorQuestion = WorkBoardCardOperatorQuestionSlice(snapshot: snap) {
