@@ -21,7 +21,8 @@ extension ChatViewModel {
         ideas: [WorkIdea],
         attentionItems: [WorkAttentionItem],
         attentionGroups: [AttentionGroup],
-        attentionMembers: [Attention]
+        attentionMembers: [Attention],
+        plannerRuns: [PlannerRunSummary] = []
     ) {
         // Fan-out regression counter (design entry 2): full work-tree applies.
         UIUpdateCounters.shared.recordApplyWorkTree()
@@ -34,6 +35,7 @@ extension ChatViewModel {
         if currentSelectedProductID == nil {
             selectedWorkProductID = product.id
         }
+        applyPlannerRunSummaries(plannerRuns, forProductID: product.id, projects: projects)
         projectsByProductID[product.id] = projects.sorted(by: projectSort)
         let popBucketStartNanos = PopulationTiming.now()
         // Evict exactly this product's previous buckets (tracked
@@ -176,32 +178,24 @@ extension ChatViewModel {
     /// push (e.g. the auto-populate Populator staging a project's task
     /// breakdown while the operator is looking at something else). Unlike
     /// the single-item path, this must never hijack the operator's current
-    /// selection/filters — it only refreshes the affected product's board
-    /// and, for any touched projects, their planner-run audit trail so a
-    /// [[PlannerRunAffordance]] icon that hasn't appeared yet surfaces
-    /// without a view remount.
+    /// selection/filters — it only refreshes the affected product's board.
+    /// The refreshed tree also carries each project's latest planner run, so
+    /// a [[PlannerRunAffordance]] icon surfaces without a separate
+    /// `list_planner_runs` round trip or a view remount.
     func handleCreatedWorkItemsBatch(_ items: [WorkItemPayload]) {
         var productIDs: Set<String> = []
-        var projectIDs: Set<String> = []
         for item in items {
             switch item {
             case .product(let product):
                 productIDs.insert(product.id)
             case .project(let project):
                 productIDs.insert(project.productID)
-                projectIDs.insert(project.id)
             case .task(let task), .chore(let task):
                 productIDs.insert(task.productID)
-                if let projectID = task.projectID {
-                    projectIDs.insert(projectID)
-                }
             }
         }
         for productID in productIDs where productID == currentSelectedProductID {
             engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
-        }
-        for projectID in projectIDs {
-            refreshPlannerRuns(projectID: projectID)
         }
     }
 

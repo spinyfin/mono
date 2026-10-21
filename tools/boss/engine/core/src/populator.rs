@@ -1605,10 +1605,7 @@ mod tests {
         )
         .await;
         let events = publisher.events.lock().await.clone();
-        assert_eq!(
-            events,
-            vec![(product_id, project_id, "planner_run_changed".to_owned())]
-        );
+        assert_eq!(events, vec![(product_id, project_id, "planner_run_changed".to_owned())]);
     }
 
     #[tokio::test]

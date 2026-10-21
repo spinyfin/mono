@@ -817,7 +817,9 @@ final class EngineClient: @unchecked Sendable {
                 ideas: ideas,
                 attentionItems: (payload["attention_items"] as? [[String: Any]] ?? []).compactMap(parseAttentionItem),
                 attentionGroups: (payload["attention_groups"] as? [[String: Any]] ?? []).compactMap(parseAttentionGroup),
-                attentionMembers: (payload["attention_members"] as? [[String: Any]] ?? []).compactMap(parseAttention)
+                attentionMembers: (payload["attention_members"] as? [[String: Any]] ?? []).compactMap(parseAttention),
+                plannerRuns: (payload["planner_runs"] as? [[String: Any]] ?? [])
+                    .compactMap { decodeWire(PlannerRunSummary.self, from: $0) }
             ))
         case "work_item_created":
             guard let itemPayload = payload["item"] as? [String: Any],

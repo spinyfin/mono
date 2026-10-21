@@ -19,6 +19,31 @@ final class WorkTreeDeltaCacheTests: XCTestCase {
         }
     }
 
+    func testPlannerRunDeltasMergeOnProjectIDAndTombstoneUndoneRuns() throws {
+        var cache = WorkTreeDeltaCache()
+        func summary(_ project: String, _ outcome: String) -> [String: Any] {
+            ["run_id": "run_\(project)", "project_id": project, "outcome": outcome]
+        }
+        XCTAssertNotNil(cache.apply([
+            "product_id": "product", "sequence": UInt64(1),
+            "changes": ["product": ["id": "product"], "planner_runs": [summary("a", "staged"), summary("b", "staged")]]
+        ]))
+        let released = try XCTUnwrap(cache.apply([
+            "product_id": "product", "sequence": UInt64(2), "base_sequence": UInt64(1),
+            "changes": ["planner_runs": ["upserts": [summary("a", "applied")]]]
+        ]))
+        let rows = try XCTUnwrap(released["planner_runs"] as? [[String: Any]])
+        XCTAssertEqual(rows.compactMap { $0["project_id"] as? String }, ["a", "b"])
+        XCTAssertEqual(rows.first?["outcome"] as? String, "applied")
+        XCTAssertEqual(rows.last?["outcome"] as? String, "staged", "an untouched project's row is retained")
+
+        let undone = try XCTUnwrap(cache.apply([
+            "product_id": "product", "sequence": UInt64(3), "base_sequence": UInt64(2),
+            "changes": ["planner_runs": ["upserts": [], "order": ["b"]]]
+        ]))
+        XCTAssertEqual((undone["planner_runs"] as? [[String: Any]])?.compactMap { $0["project_id"] as? String }, ["b"])
+    }
+
     func testSnapshotPatchDeletionReorderAndGapRecovery() throws {
         var cache = WorkTreeDeltaCache()
         cache.startConnection(1)
