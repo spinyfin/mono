@@ -1283,6 +1283,31 @@ impl DispatchEvent {
     }
 }
 
+/// The `execution_cancelled` timeline event for one cancel. `prior_status` is
+/// the status that was terminalized (read before the cancel; the row says
+/// `cancelled` afterwards) and `actor` is who decided it, in the
+/// `tasks.last_status_actor` vocabulary. `work_item_moved` records whether
+/// the cancel also moved the owning row (demoted it from Doing and/or stopped
+/// it in Backlog), so a reader can tell a stop that changed the board from one
+/// that only retired a shadowed duplicate.
+pub fn execution_cancelled_event(
+    execution_id: &str,
+    work_item_id: &str,
+    prior_status: &str,
+    actor: &str,
+    reason: &str,
+    work_item_moved: bool,
+) -> DispatchEvent {
+    DispatchEvent::new(Stage::ExecutionCancelled, Outcome::Ok, execution_id)
+        .with_work_item(work_item_id)
+        .with_details(serde_json::json!({
+            "actor": actor,
+            "reason": reason,
+            "prior_status": prior_status,
+            "work_item_moved": work_item_moved,
+        }))
+}
+
 #[async_trait]
 pub trait DispatchEventSink: Send + Sync {
     async fn emit(&self, event: DispatchEvent);
@@ -1863,6 +1888,19 @@ mod tests {
     /// `Stage::as_str` is the on-disk stage identifier ledger consumers
     /// pin against; a silent rename would break them. Pin every variant
     /// to its exact snake_case string.
+    #[test]
+    fn execution_cancelled_event_carries_actor_reason_prior_status_and_board_effect() {
+        let event = execution_cancelled_event("exec_1", "task_1", "ready", "human", "cancel requested", true);
+        assert_eq!(event.stage, Stage::ExecutionCancelled.as_str());
+        assert_eq!(event.outcome, Outcome::Ok.as_str());
+        assert_eq!(event.execution_id, "exec_1");
+        assert_eq!(event.work_item_id.as_deref(), Some("task_1"));
+        assert_eq!(event.details["actor"], "human");
+        assert_eq!(event.details["reason"], "cancel requested");
+        assert_eq!(event.details["prior_status"], "ready");
+        assert_eq!(event.details["work_item_moved"], true);
+    }
+
     #[test]
     fn stage_as_str_pins_exact_snake_case_identifiers() {
         assert_eq!(Stage::StatusTransition.as_str(), "status_transition");
