@@ -175,6 +175,45 @@ final class AgentsGridModel: ObservableObject {
         }
     }
 
+    /// Authoritative membership + current viewer map, ordered around tab
+    /// visibility. Going hidden hides first and coming back shows last, so
+    /// a snapshot that arrives while Agents is hidden applies at once (the
+    /// layout's hidden rule: released runs compact away, no placeholder)
+    /// and re-entering Agents repacks current membership, never stale
+    /// membership. Callers must call this on every input change, hidden or
+    /// not — visibility is a rendering concern, not a reason to stop
+    /// ingesting state.
+    func apply(
+        isVisible: Bool,
+        states: [WorkerLiveState],
+        viewers: [String: WorkerSlot],
+        interactivePoolSize: Int,
+        automationPoolSize: Int,
+        reviewPoolSize: Int,
+        feedUnavailable: Bool
+    ) {
+        if !isVisible { setVisible(false) }
+        apply(
+            states: states,
+            viewers: viewers,
+            interactivePoolSize: interactivePoolSize,
+            automationPoolSize: automationPoolSize,
+            reviewPoolSize: reviewPoolSize,
+            feedUnavailable: feedUnavailable
+        )
+        if isVisible { setVisible(true) }
+    }
+
+    /// Run ids whose surfaces must be mounted: every placed run (occupied or
+    /// placeholder) plus every attached viewer. A released run that the
+    /// layout compacted away stays mounted, hidden, until `DetachWorkerPane`
+    /// removes its viewer; a run that is neither placed nor attached is not
+    /// rendered at all. This set is derived from current inputs only, so no
+    /// earlier render can keep a finished run on screen.
+    func renderRunIds(attached: some Collection<String>) -> [String] {
+        placedRunIds(in: layout).union(attached).sorted()
+    }
+
     /// Authoritative membership + current viewer map. Callers must pass
     /// only an accepted live-state snapshot: duplicates and a disconnected
     /// feed are handled by `LiveWorkerStateStore` before they reach here.
@@ -330,5 +369,40 @@ final class AgentsGridModel: ObservableObject {
             }
         }
         return ids
+    }
+}
+
+/// The single assembly point for the grid's inputs, shared by
+/// `WorkersDetailView` and the tests so neither can drift from the other.
+extension AgentsGridModel {
+    /// Feeds the current workspace and live-state inputs to the grid.
+    func sync(isVisible: Bool, workspace: WorkersWorkspaceModel, liveStates: LiveWorkerStateStore) {
+        apply(
+            isVisible: isVisible,
+            states: Array(liveStates.byRunID.values),
+            viewers: workspace.viewersByRunId,
+            interactivePoolSize: workspace.interactivePoolSize,
+            automationPoolSize: workspace.automationPoolSize,
+            reviewPoolSize: workspace.reviewSlotCount,
+            feedUnavailable: liveStates.feedUnavailable
+        )
+    }
+
+    /// Current render state for one mounted surface, from the current
+    /// workspace and live-state inputs.
+    func renderSnapshot(
+        runId: String,
+        workspace: WorkersWorkspaceModel,
+        liveStates: LiveWorkerStateStore,
+        liveStatusDisabledSlotIDs: Set<Int>
+    ) -> WorkerSlotSnapshot {
+        WorkerSlotSnapshot.render(
+            runId: runId,
+            viewer: workspace.viewersByRunId[runId],
+            liveState: liveStates.byRunID[runId],
+            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs,
+            cachedPersona: personaName(for: runId),
+            viewerAttachFailure: workspace.viewerAttachFailuresByRunId[runId]
+        )
     }
 }

@@ -6,6 +6,56 @@ import XCTest
 
 @MainActor
 final class AgentSurfaceCollectionTests: XCTestCase {
+    func testSlotMembershipChangesKeepNativeTerminalUntilDetach() throws {
+        let recorder = MountRecorder()
+        let session = TerminalPaneSession(
+            id: "run-one", role: .worker(slot: 1),
+            launchSpec: TerminalLaunchSpec(fontSize: 10, workingDirectory: "/tmp", initialInput: "")
+        )
+        let viewer = WorkerSlot(slotId: 1, session: session, runId: "one")
+        let live = WorkerLiveState(
+            name: "Riker", slotId: 1, runId: "one", model: "opus", shellPid: 1,
+            lastEventAt: nil, currentTool: nil, lastToolEndedAt: nil,
+            activity: .working, liveStatus: nil, liveStatusAt: nil,
+            recoveryStatus: nil, tmuxHosted: true, hostId: WorkerLiveState.localHostId
+        )
+        func view(attached: Bool, listed: Bool) -> some View {
+            let snapshot = WorkerSlotSnapshot.render(
+                runId: "one", viewer: attached ? viewer : nil, liveState: listed ? live : nil,
+                liveStatusDisabledSlotIDs: [], cachedPersona: "Riker"
+            )
+            return WorkerSlotBody(
+                snapshot: snapshot,
+                terminal: { MountProbe(runId: $0.id, recorder: recorder) },
+                placeholder: { Color.black },
+                viewerMissing: { Color.gray }
+            )
+        }
+        // Viewer attaches before the first membership snapshot.
+        let host = NSHostingView(rootView: view(attached: true, listed: false))
+        host.frame = CGRect(x: 0, y: 0, width: 400, height: 300)
+        host.layoutSubtreeIfNeeded()
+        let original = try XCTUnwrap(recorder.views[session.id])
+        XCTAssertEqual(recorder.created, 1)
+        // First membership and release both cross the placeholder/terminal boundary.
+        for listed in [true, false] {
+            host.rootView = view(attached: true, listed: listed)
+            host.layoutSubtreeIfNeeded()
+            XCTAssertEqual(recorder.created, 1)
+            XCTAssertEqual(recorder.dismantled, 0)
+            XCTAssertTrue(recorder.views[session.id] === original)
+        }
+        host.rootView = view(attached: false, listed: false)
+        host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(recorder.created, 1)
+        XCTAssertEqual(recorder.dismantled, 1)
+        // A subsequent viewer-missing card must not remount the detached terminal.
+        host.rootView = view(attached: false, listed: true)
+        host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(recorder.created, 1)
+        XCTAssertEqual(recorder.dismantled, 1)
+    }
+
     func testPageSelectionUpdatesRenderedAgentsWithoutNavigation() throws {
         let grid = AgentsGridModel()
         let states = ["a", "b", "c", "d"].map { run in
