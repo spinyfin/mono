@@ -24,7 +24,7 @@ use super::*;
 /// changing), both via [`spawn_org_recheck`]. A newly connected session reads
 /// the current state with its connect-time `GitHubAuthStatus`.
 pub(super) fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let controller = server_state.github_auth.clone();
         // Restore a persisted token (if any) before subscribing, so the first
         // loop iteration sees the restored `Authorized { Unknown }` state and
