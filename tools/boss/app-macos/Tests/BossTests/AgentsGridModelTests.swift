@@ -850,13 +850,6 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertFalse(grid.viewerlessRunIdsOnSelectedPage.contains("errored"))
     }
 
-    private func roomyGrid() -> AgentsGridModel {
-        AgentsGridModel(
-            policy: PaneCapacityPolicy(minColumns: 1, minRows: 1, headerHeight: 0, maxPanesPerPage: 8, gap: 0, deadBand: 0),
-            geometry: PaneGeometry(area: PaneSize(width: 400, height: 200), cell: PaneSize(width: 100, height: 100))
-        )
-    }
-
     private func makeAttach(runId: String, slot: Int) -> EngineAttachRequest {
         EngineAttachRequest(
             runId: runId,

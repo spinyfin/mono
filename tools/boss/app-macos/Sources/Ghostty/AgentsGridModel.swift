@@ -192,7 +192,7 @@ final class AgentsGridModel: ObservableObject {
         interactivePoolSize: Int,
         automationPoolSize: Int,
         reviewPoolSize: Int,
-        feedUnavailable: Bool
+        feedUnavailable: Bool = false
     ) {
         if !isVisible { setVisible(false) }
         apply(
@@ -214,35 +214,6 @@ final class AgentsGridModel: ObservableObject {
     /// earlier render can keep a finished run on screen.
     func renderRunIds(attached: some Collection<String>) -> [String] {
         placedRunIds(in: layout).union(attached).sorted()
-    }
-
-    /// Authoritative membership + current viewer map. Callers must pass
-    /// only an accepted live-state snapshot: duplicates and a disconnected
-    /// feed are handled by `LiveWorkerStateStore` before they reach here.
-    ///
-    /// `isVisible` orders the visibility change around the membership
-    /// update. Going hidden hides first, and coming back shows last, so
-    /// the snapshot lands while the model is hidden and applies at once;
-    /// entering Agents then repacks current membership, not stale membership.
-    func apply(
-        isVisible: Bool,
-        states: [WorkerLiveState],
-        viewers: [String: WorkerSlot],
-        interactivePoolSize: Int,
-        automationPoolSize: Int,
-        reviewPoolSize: Int,
-        feedUnavailable: Bool = false
-    ) {
-        if !isVisible { setVisible(false) }
-        apply(
-            states: states,
-            viewers: viewers,
-            interactivePoolSize: interactivePoolSize,
-            automationPoolSize: automationPoolSize,
-            reviewPoolSize: reviewPoolSize,
-            feedUnavailable: feedUnavailable
-        )
-        if isVisible { setVisible(true) }
     }
 
     func apply(
@@ -342,14 +313,6 @@ final class AgentsGridModel: ObservableObject {
     /// Test seam: skip the 300 ms quiet window.
     func flushGeometryForTesting() {
         liveResizeDidEnd()
-    }
-
-    /// Run ids whose surfaces must stay mounted: every placed run (occupied
-    /// or placeholder) plus every attached viewer, so an engine release that
-    /// compacts the run out of the layout never tears down its surface before
-    /// `DetachWorkerPane` arrives.
-    func renderRunIds(attached: some Collection<String>) -> [String] {
-        placedRunIds(in: layout).union(attached).sorted()
     }
 
     /// Frame and visibility for a run's surface within `area`. Pane
