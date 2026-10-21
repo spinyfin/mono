@@ -2,8 +2,9 @@
 //!
 //! Normal runs print nothing from this module. Only when a single check has
 //! been running longer than a threshold does it emit one line naming the
-//! check, repeating at a doubling interval while the check keeps running, and
-//! one closing line with the total duration when a reported check finishes.
+//! check (and the file it is on, when known), repeating at a doubling interval
+//! while the check keeps running, and one closing line with the total duration
+//! when a reported check finishes.
 //!
 //! This is reporting only: it never times out, kills, or otherwise affects a
 //! check, so findings and exit codes are unchanged.
@@ -15,8 +16,7 @@
 //! the monitor on the real clock.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -27,8 +27,8 @@ use super::ProgressReporter;
 /// How long a single check must run before it is reported as slow.
 ///
 /// Chosen from measurement: see `tools/checkleft/docs/slow-check-threshold.md`
-/// for the observed per-check peaks and the margin applied.
-pub const DEFAULT_SLOW_CHECK_THRESHOLD: Duration = Duration::from_secs(180);
+/// for the observed peaks and the margin applied.
+pub const DEFAULT_SLOW_CHECK_THRESHOLD: Duration = Duration::from_secs(300);
 
 /// How often the watcher thread polls the monitor.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -40,7 +40,11 @@ pub type SlowCheckSink = Arc<dyn Fn(Vec<String>) + Send + Sync>;
 struct Slot {
     started_at: Instant,
     total_files: usize,
-    processed_files: usize,
+    /// `Some` once the check has reported per-file progress; until then the
+    /// count is unknown, not zero.
+    processed_files: Option<usize>,
+    /// The file/surface the check last said it was working on.
+    active: Option<String>,
     /// How many "still running" lines have been emitted for this run.
     reports: u32,
 }
@@ -73,7 +77,8 @@ impl SlowCheckMonitor {
             Slot {
                 started_at: now,
                 total_files,
-                processed_files: 0,
+                processed_files: None,
+                active: None,
                 reports: 0,
             },
         );
@@ -81,7 +86,14 @@ impl SlowCheckMonitor {
 
     pub fn record_progress(&mut self, check_id: &str, processed: usize) {
         if let Some(slot) = self.running.get_mut(check_id) {
-            slot.processed_files = processed;
+            slot.processed_files = Some(processed);
+        }
+    }
+
+    /// The check is working on `label` (a file path or other surface).
+    pub fn note_active(&mut self, check_id: &str, label: &str) {
+        if let Some(slot) = self.running.get_mut(check_id) {
+            slot.active = Some(label.to_owned());
         }
     }
 
@@ -111,17 +123,30 @@ impl SlowCheckMonitor {
                 continue;
             }
             slot.reports += 1;
-            let files = if slot.total_files > 0 {
-                format!(" on {}/{} files", slot.processed_files, slot.total_files)
-            } else {
-                String::new()
-            };
             lines.push(format!(
-                "checks: still running {check_id}{files} ({})",
+                "checks: still running {check_id}{} ({})",
+                describe_position(slot),
                 format_elapsed(elapsed)
             ));
         }
         lines
+    }
+}
+
+/// Where the check is, as precisely as is actually known: the active file when
+/// reported, else a processed/total count once progress has been reported,
+/// else just how many files it was given (never a misleading `0/N`).
+fn describe_position(slot: &Slot) -> String {
+    let counts = match (slot.processed_files, slot.total_files) {
+        (Some(done), total) if total > 0 => Some(format!("{done}/{total} files")),
+        (None, total) if total > 0 => Some(format!("{total} files")),
+        _ => None,
+    };
+    match (&slot.active, counts) {
+        (Some(active), Some(counts)) if slot.processed_files.is_some() => format!(" on {active} ({counts})"),
+        (Some(active), _) => format!(" on {active}"),
+        (None, Some(counts)) => format!(" on {counts}"),
+        (None, None) => String::new(),
     }
 }
 
@@ -133,24 +158,48 @@ fn format_elapsed(elapsed: Duration) -> String {
 /// forwarded to the inner reporter unchanged.
 pub struct SlowCheckReporter {
     inner: Arc<dyn ProgressReporter>,
+    /// Held across both a state transition and delivery of the line it
+    /// produced, so a "finished" line can never overtake a "still running"
+    /// line computed just before it.
     monitor: Arc<Mutex<SlowCheckMonitor>>,
     sink: SlowCheckSink,
-    stop: Arc<AtomicBool>,
+    /// Stop flag + wakeup, so dropping the reporter ends the watcher at once
+    /// rather than after the rest of a poll interval.
+    stop: Arc<(Mutex<bool>, Condvar)>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SlowCheckReporter {
     pub fn new(inner: Arc<dyn ProgressReporter>, threshold: Duration, sink: SlowCheckSink) -> Self {
+        Self::with_poll_interval(inner, threshold, POLL_INTERVAL, sink)
+    }
+
+    fn with_poll_interval(
+        inner: Arc<dyn ProgressReporter>,
+        threshold: Duration,
+        poll_interval: Duration,
+        sink: SlowCheckSink,
+    ) -> Self {
         let monitor = Arc::new(Mutex::new(SlowCheckMonitor::new(threshold)));
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let handle = {
             let monitor = Arc::clone(&monitor);
             let sink = Arc::clone(&sink);
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
-                while !stop.load(Ordering::SeqCst) {
-                    std::thread::sleep(POLL_INTERVAL);
-                    let lines = monitor.lock().unwrap().poll(Instant::now());
+                let (flag, wake) = &*stop;
+                loop {
+                    let stopped = flag.lock().unwrap();
+                    if *stopped {
+                        return;
+                    }
+                    let (stopped, _) = wake.wait_timeout(stopped, poll_interval).unwrap();
+                    if *stopped {
+                        return;
+                    }
+                    drop(stopped);
+                    let mut monitor = monitor.lock().unwrap();
+                    let lines = monitor.poll(Instant::now());
                     if !lines.is_empty() {
                         sink(lines);
                     }
@@ -169,7 +218,9 @@ impl SlowCheckReporter {
 
 impl Drop for SlowCheckReporter {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        let (flag, wake) = &*self.stop;
+        *flag.lock().unwrap() = true;
+        wake.notify_all();
         if let Some(handle) = self.handle.lock().unwrap().take() {
             let _ = handle.join();
         }
@@ -197,10 +248,17 @@ impl ProgressReporter for SlowCheckReporter {
         self.inner.record_progress(check_id, processed);
     }
 
+    fn note_active(&self, check_id: &str, label: &str) {
+        self.monitor.lock().unwrap().note_active(check_id, label);
+        self.inner.note_active(check_id, label);
+    }
+
     fn finish(&self, check_id: &str, files_failed: usize, elapsed: Duration) {
-        let line = self.monitor.lock().unwrap().finish(check_id, Instant::now());
-        if let Some(line) = line {
-            (self.sink)(vec![line]);
+        {
+            let mut monitor = self.monitor.lock().unwrap();
+            if let Some(line) = monitor.finish(check_id, Instant::now()) {
+                (self.sink)(vec![line]);
+            }
         }
         self.inner.finish(check_id, files_failed, elapsed);
     }
@@ -281,6 +339,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn names_active_file_and_never_claims_zero_progress_when_untracked() {
+        let base = Instant::now();
+        let mut monitor = SlowCheckMonitor::new(T);
+        monitor.register("lint", 7);
+        monitor.start("lint", base);
+        // No progress and no active file: only the number of files is known.
+        assert_eq!(
+            monitor.poll(secs(base, 30)),
+            vec!["checks: still running lint on 7 files (30s)".to_owned()]
+        );
+        monitor.note_active("lint", "src/a.rs");
+        assert_eq!(
+            monitor.poll(secs(base, 60)),
+            vec!["checks: still running lint on src/a.rs (60s)".to_owned()]
+        );
+        monitor.record_progress("lint", 2);
+        monitor.note_active("lint", "src/b.rs");
+        assert_eq!(
+            monitor.poll(secs(base, 120)),
+            vec!["checks: still running lint on src/b.rs (2/7 files) (120s)".to_owned()]
+        );
+    }
+
     #[derive(Default)]
     struct RecordingReporter {
         events: Mutex<Vec<String>>,
@@ -338,5 +420,97 @@ mod tests {
                 "finish typo 0"
             ]
         );
+    }
+
+    fn collecting_sink() -> (SlowCheckSink, Arc<Mutex<Vec<String>>>) {
+        let printed: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink: SlowCheckSink = {
+            let printed = Arc::clone(&printed);
+            Arc::new(move |lines| printed.lock().unwrap().extend(lines))
+        };
+        (sink, printed)
+    }
+
+    fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn slow_check_delivers_still_running_then_finished_to_the_sink() {
+        let inner = Arc::new(RecordingReporter::default());
+        let (sink, printed) = collecting_sink();
+        let reporter = SlowCheckReporter::with_poll_interval(
+            inner.clone(),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            sink,
+        );
+        reporter.register("lint", 3);
+        reporter.start("lint");
+        reporter.note_active("lint", "src/a.rs");
+        wait_for("slow line", || !printed.lock().unwrap().is_empty());
+        reporter.finish("lint", 0, Duration::from_millis(30));
+        drop(reporter);
+
+        let lines = printed.lock().unwrap().clone();
+        assert!(
+            lines[0].starts_with("checks: still running lint on src/a.rs ("),
+            "{lines:?}"
+        );
+        assert!(
+            lines.last().unwrap().starts_with("checks: lint finished after "),
+            "{lines:?}"
+        );
+        assert!(inner.events.lock().unwrap().contains(&"finish lint 0".to_owned()));
+    }
+
+    #[test]
+    fn finish_cannot_overtake_a_still_running_line_already_being_delivered() {
+        let inner = Arc::new(RecordingReporter::default());
+        let printed: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let tx = Mutex::new(tx);
+        // The first delivery announces itself, then lingers; a finish() issued
+        // meanwhile must wait for it instead of printing first.
+        let sink: SlowCheckSink = {
+            let printed = Arc::clone(&printed);
+            Arc::new(move |lines| {
+                let first = printed.lock().unwrap().is_empty();
+                if first {
+                    let _ = tx.lock().unwrap().send(());
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                printed.lock().unwrap().extend(lines);
+            })
+        };
+        let reporter =
+            SlowCheckReporter::with_poll_interval(inner, Duration::from_millis(10), Duration::from_millis(5), sink);
+        reporter.start("lint");
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("slow line delivery began");
+        reporter.finish("lint", 0, Duration::from_millis(1));
+        drop(reporter);
+
+        let lines = printed.lock().unwrap().clone();
+        assert!(lines[0].starts_with("checks: still running lint"), "{lines:?}");
+        assert!(lines.last().unwrap().starts_with("checks: lint finished"), "{lines:?}");
+    }
+
+    #[test]
+    fn drop_does_not_wait_out_the_poll_interval() {
+        let (sink, _) = collecting_sink();
+        let reporter = SlowCheckReporter::with_poll_interval(
+            Arc::new(RecordingReporter::default()),
+            DEFAULT_SLOW_CHECK_THRESHOLD,
+            Duration::from_secs(60),
+            sink,
+        );
+        let started = Instant::now();
+        drop(reporter);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

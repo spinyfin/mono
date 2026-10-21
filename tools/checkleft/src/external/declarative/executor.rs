@@ -442,6 +442,7 @@ fn run_tool_invocation(
             let mut findings = Vec::new();
             let mut processed = 0usize;
             for file in files {
+                crate::progress::note_active(file);
                 let args = with_prefix(expand_per_file_args(
                     context.repo_root,
                     &tool.args,
@@ -1380,6 +1381,7 @@ fn execute_fix_per_file(
     let mut per_file_errors: Vec<(PathBuf, String)> = Vec::new();
 
     for file in files {
+        crate::progress::note_active(file);
         let mut args = prefix_args.to_vec();
         args.extend(expand_per_file_args(context.repo_root, &fix.args, file, config_values)?);
         let sandbox_context = CheckExecutionContext {

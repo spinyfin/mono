@@ -398,16 +398,22 @@ impl Runner {
                             let on_file_processed: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(move |n| {
                                 progress_reporter.record_progress(&progress_check_id, n);
                             });
-                            match external_executor.execute_with_progress(
-                                &package,
-                                &run_changeset,
-                                source_tree.as_ref(),
-                                &run_config,
-                                &run_config_dir,
-                                run_policy.severity_override,
-                                &path_scope,
-                                on_file_processed,
-                            ) {
+                            let activity_reporter = Arc::clone(&task_reporter);
+                            let activity_check_id = configured_check_id.clone();
+                            let activity: Arc<dyn Fn(&str) + Send + Sync> =
+                                Arc::new(move |label| activity_reporter.note_active(&activity_check_id, label));
+                            match crate::progress::with_activity(activity, || {
+                                external_executor.execute_with_progress(
+                                    &package,
+                                    &run_changeset,
+                                    source_tree.as_ref(),
+                                    &run_config,
+                                    &run_config_dir,
+                                    run_policy.severity_override,
+                                    &path_scope,
+                                    on_file_processed,
+                                )
+                            }) {
                                 Ok(mut result) => {
                                     let elapsed = check_start.elapsed();
                                     result.check_id = configured_check_id.clone();
@@ -842,15 +848,23 @@ impl Runner {
                         let reporter_clone = Arc::clone(&reporter);
                         let check_id_for_progress = check_id.clone();
                         let invocation_outcomes = match declarative_info.get(check_id) {
-                            Some(Some((package, config, path_scope))) => crate::external::run_declarative_fix(
-                                crate::external::DeclarativeFixContext { repo_root, check_id },
-                                package,
-                                &fix_plan[check_id],
-                                source_tree.as_ref(),
-                                config,
-                                path_scope,
-                                move |n| reporter_clone.record_progress(&check_id_for_progress, n),
-                            ),
+                            Some(Some((package, config, path_scope))) => {
+                                let activity_reporter = Arc::clone(&reporter);
+                                let activity_check_id = check_id.clone();
+                                let activity: Arc<dyn Fn(&str) + Send + Sync> =
+                                    Arc::new(move |label| activity_reporter.note_active(&activity_check_id, label));
+                                crate::progress::with_activity(activity, || {
+                                    crate::external::run_declarative_fix(
+                                        crate::external::DeclarativeFixContext { repo_root, check_id },
+                                        package,
+                                        &fix_plan[check_id],
+                                        source_tree.as_ref(),
+                                        config,
+                                        path_scope,
+                                        move |n| reporter_clone.record_progress(&check_id_for_progress, n),
+                                    )
+                                })
+                            }
                             _ => Vec::new(), // non-declarative or missing → no fix
                         };
                         let error_count: usize = invocation_outcomes

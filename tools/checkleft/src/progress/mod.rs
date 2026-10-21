@@ -66,6 +66,11 @@ pub trait ProgressReporter: Send + Sync {
     /// progress.
     fn record_progress(&self, check_id: &str, processed: usize);
 
+    /// The check is about to work on `label` (a file path or other surface).
+    /// Only consumed by slow-check reporting, which names the last-reported
+    /// label so a stuck check says what it is stuck on; the default ignores it.
+    fn note_active(&self, _check_id: &str, _label: &str) {}
+
     /// The check finished. `files_failed` is the number of files with
     /// error/warning findings (0 ⇒ clean). Updates the status line only; stream
     /// the findings themselves with [`Self::stream_findings`].
@@ -74,6 +79,36 @@ pub trait ProgressReporter: Send + Sync {
     /// Stream a result's findings into the scrolling log area in their normal
     /// rendered form. A no-op when the result has no findings.
     fn stream_findings(&self, result: &CheckResult);
+}
+
+type ActivitySink = Arc<dyn Fn(&str) + Send + Sync>;
+
+thread_local! {
+    static ACTIVITY: std::cell::RefCell<Option<ActivitySink>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `sink` receiving every [`note_active`] call made on this
+/// thread. Declarative checks run synchronously on one thread, so this carries
+/// the active file from the executor to the reporter without threading another
+/// callback through every executor signature.
+pub fn with_activity<R>(sink: ActivitySink, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<ActivitySink>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVITY.with(|a| *a.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(ACTIVITY.with(|a| a.borrow_mut().replace(sink)));
+    f()
+}
+
+/// Report the file/surface the current check is about to work on. A no-op
+/// outside [`with_activity`].
+pub fn note_active(label: &str) {
+    let sink = ACTIVITY.with(|a| a.borrow().clone());
+    if let Some(sink) = sink {
+        sink(label);
+    }
 }
 
 /// Number of distinct files with error/warning findings in a result — the
@@ -309,6 +344,44 @@ mod tests {
             split_block("a\n\nb\n"),
             vec!["a".to_owned(), "".to_owned(), "b".to_owned()]
         );
+    }
+
+    #[test]
+    fn note_active_reaches_scoped_sink_only() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        note_active("ignored.rs");
+        let sink: ActivitySink = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |l| seen.lock().unwrap().push(l.to_owned()))
+        };
+        with_activity(sink, || note_active("a.rs"));
+        note_active("after.rs");
+        assert_eq!(*seen.lock().unwrap(), vec!["a.rs"]);
+    }
+
+    #[test]
+    fn log_sink_routes_lines_to_the_renderer_log_area() {
+        struct LogCapture(Arc<Mutex<Vec<String>>>);
+        impl Renderer for LogCapture {
+            fn render(
+                &mut self,
+                new_log_lines: &[String],
+                _status: &[state::StatusLine],
+                _tick: usize,
+            ) -> std::io::Result<()> {
+                self.0.lock().unwrap().extend(new_log_lines.iter().cloned());
+                Ok(())
+            }
+            fn finalize(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::default();
+        let mut live = LiveProgress::new(Box::new(LogCapture(Arc::clone(&captured))), DEFAULT_DEBOUNCE, true);
+        live.log_sink()(vec!["checks: still running x (3s)".to_owned()]);
+        live.finalize();
+        assert_eq!(*captured.lock().unwrap(), vec!["checks: still running x (3s)"]);
     }
 
     #[test]
