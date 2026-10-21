@@ -8,6 +8,7 @@
 mod bazel_output_base;
 mod change;
 mod checkleft_gate;
+mod cleanup;
 mod disk;
 mod dispatch;
 mod display;

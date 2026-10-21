@@ -563,6 +563,49 @@ holding anything no remote has is skipped and left to the retention pass, which
 salvages before it resets. A repo whose surplus is entirely unpushed work will
 therefore not reach its mark, which is correct.
 
+**Repo-declared cleanup is the relief valve for state cube cannot see.** Some
+of a workspace's build state lives outside its checkout (a build tool's output
+tree under a shared cache directory), where compaction never looks and nothing
+else gives it back. Cube does not know what any of that is. A repo declares a
+`cleanup:` command in `.cube/setup.yaml`, next to its setup steps:
+
+```yaml
+version: 1
+cleanup:
+  command: bash .cube/cleanup-bazel-output-base.sh
+```
+
+Cube decides **when** and **whether** a workspace may be cleaned; the command
+decides **what cleaning means**. It runs through `sh -c` with cwd and
+`CUBE_WORKSPACE` set to the workspace (`CUBE_BASE_REPO` too, when the repo has a
+canonical source). Exit 0 is cleaned, exit 75 is "busy, nothing done", anything
+else is a failure. The command must be idempotent.
+
+- _When_: free space only. Below the low-water mark — the same floor the lease
+  path uses (`min-free-bytes` / `min-free-percent`) — cube cleans free
+  workspaces **least recently leased first**, one at a time, re-reading free
+  space after each, and stops as soon as free space is back above the
+  high-water mark (the floor plus `cleanup-headroom-bytes`, default 16 GiB —
+  about one fully built workspace). Above the floor nothing is cleaned, however
+  idle: warm workspaces are what the pool is for, so there is no retention
+  clock. A workspace is not cleaned again until it has been leased again.
+- _Safety_: only free workspaces. The cleaning workspace is marked in the
+  registry, and every lease claim query skips marked rows, so a lease that
+  arrives mid-cleanup takes a different workspace (or mints one) and never
+  sees a half-cleaned tree. Dirty, conflicted and quarantined workspaces are
+  skipped, because a recovery lease (`--allow-dirty`) must be able to claim
+  them. A busy workspace (exit 75) is released and skipped. A failed cleanup,
+  or one whose process died, leaves the mark in place — the workspace is not
+  leased in a broken state — and is retried (at most every ten minutes, without
+  waiting for disk pressure) until it succeeds.
+- _Where it runs_: in the periodic pool-GC pass right after compaction, and
+  from `cube workspace gc` (`--dry-run` lists the workspaces it would clean, in
+  order, and why). Low free space also shortens the GC throttle from a day to
+  five minutes, but only while the previous pass managed to clean something.
+- _Accounting_: bytes freed is the change in the volume's free space across the
+  command. Every cleanup is logged and audited (`workspace.cleanup`: workspace,
+  outcome, reason, trigger, bytes freed, duration, the command's output).
+
 Configure under `[pool]` in `cube.toml`:
 
 ```toml
@@ -572,6 +615,7 @@ build-artifact-dirs = ["target", ".build"]
 compact-idle-hours = 6
 min-free-bytes = 21474836480   # 20 GiB
 min-free-percent = 2           # floor = max(bytes, percent-of-total)
+cleanup-headroom-bytes = 17179869184   # 16 GiB: how far above the floor cleanup stops
 
 [pool.repos.flunge]
 max-free-workspaces = 6

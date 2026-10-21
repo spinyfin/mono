@@ -407,7 +407,7 @@ impl Store {
                     r#"
                     SELECT workspace_id, workspace_path
                     FROM workspaces
-                    WHERE repo = ?1 AND workspace_id = ?2 AND state = ?3
+                    WHERE repo = ?1 AND workspace_id = ?2 AND state = ?3 AND cleanup_status IS NULL
                     "#,
                     params![repo, preferred_id, WorkspaceState::Free.as_str()],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -422,7 +422,7 @@ impl Store {
                         r#"
                         SELECT workspace_id, workspace_path
                         FROM workspaces
-                        WHERE repo = ?1 AND state = ?2
+                        WHERE repo = ?1 AND state = ?2 AND cleanup_status IS NULL
                         ORDER BY workspace_id
                         LIMIT 1
                         "#,
@@ -438,7 +438,7 @@ impl Store {
                     r#"
                     SELECT workspace_id, workspace_path
                     FROM workspaces
-                    WHERE repo = ?1 AND state = ?2
+                    WHERE repo = ?1 AND state = ?2 AND cleanup_status IS NULL
                     ORDER BY workspace_id
                     LIMIT 1
                     "#,
@@ -470,7 +470,7 @@ impl Store {
                     health_status = NULL,
                     unhealthy_since_epoch_s = NULL,
                     last_activity_at_epoch_s = ?5
-                WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9
+                WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9 AND cleanup_status IS NULL
                 "#,
                 params![
                     WorkspaceState::Leased.as_str(),
@@ -585,6 +585,20 @@ impl Store {
         Ok(())
     }
 
+    /// Directly override a workspace's `last_activity_at_epoch_s` timestamp.
+    /// Only used in tests to order free workspaces by idle time without
+    /// waiting.
+    #[cfg(test)]
+    pub fn set_workspace_last_activity(&self, repo: &str, workspace_id: &str, epoch_s: i64) -> Result<(), CubeError> {
+        self.connection
+            .execute(
+                "UPDATE workspaces SET last_activity_at_epoch_s = ?3 WHERE repo = ?1 AND workspace_id = ?2",
+                params![repo, workspace_id, epoch_s],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(())
+    }
+
     /// Mark a workspace's health as clean after pool GC has reset it.
     /// Clears both `health_status` and `unhealthy_since_epoch_s`, but only
     /// if the workspace is still free — if it was claimed mid-pass, this
@@ -643,7 +657,7 @@ impl Store {
                     health_status = NULL,
                     unhealthy_since_epoch_s = NULL,
                     last_activity_at_epoch_s = ?5
-                WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9
+                WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9 AND cleanup_status IS NULL
                 "#,
                 params![
                     WorkspaceState::Leased.as_str(),
@@ -979,6 +993,145 @@ impl Store {
             .map_err(CubeError::Storage)
     }
 
+    /// Atomically mark a free workspace as being cleaned, which is also what
+    /// keeps it from being leased: every claim query filters on
+    /// `cleanup_status IS NULL`, so a lease that arrives mid-cleanup takes a
+    /// different workspace (or mints one) and never sees a half-cleaned tree.
+    ///
+    /// Returns `false` — and changes nothing — when the workspace is not
+    /// claimable for cleanup: it is leased, it is unhealthy (a dirty,
+    /// conflicted or quarantined workspace holds work a recovery lease must be
+    /// able to reclaim), or another cleanup is already running on it. A `failed`
+    /// mark is retryable. A `running` mark is only taken over once it is older
+    /// than `stale_before_epoch_s`, which is how a cleanup whose process died
+    /// is eventually retried rather than withholding the workspace forever.
+    pub fn begin_workspace_cleanup(
+        &self,
+        repo: &str,
+        workspace_id: &str,
+        now_epoch_s: i64,
+        stale_before_epoch_s: i64,
+    ) -> Result<bool, CubeError> {
+        let updated = self
+            .connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    cleanup_status = ?3,
+                    cleanup_started_at_epoch_s = ?4
+                WHERE repo = ?1 AND workspace_id = ?2
+                  AND state = ?5
+                  AND (health_status IS NULL OR health_status = 'clean')
+                  AND (
+                      cleanup_status IS NULL
+                      OR cleanup_status = ?6
+                      OR cleanup_started_at_epoch_s <= ?7
+                  )
+                "#,
+                params![
+                    repo,
+                    workspace_id,
+                    CleanupStatus::Running.as_str(),
+                    now_epoch_s,
+                    WorkspaceState::Free.as_str(),
+                    CleanupStatus::Failed.as_str(),
+                    stale_before_epoch_s,
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(updated > 0)
+    }
+
+    /// Record how a cleanup begun with [`Store::begin_workspace_cleanup`]
+    /// ended. Only a row still marked `running` is touched.
+    ///
+    /// - [`CleanupResult::Cleaned`] lifts the mark and stamps
+    ///   `last_cleaned_at_epoch_s`, so the same untouched workspace is not
+    ///   picked again.
+    /// - [`CleanupResult::Skipped`] lifts the mark without stamping it: the
+    ///   step declined (the workspace was in use), so nothing was cleaned.
+    /// - [`CleanupResult::Failed`] leaves the mark in place as `failed`, which
+    ///   keeps the workspace out of the pool until a retry succeeds.
+    pub fn finish_workspace_cleanup(
+        &self,
+        repo: &str,
+        workspace_id: &str,
+        result: CleanupResult,
+        now_epoch_s: i64,
+    ) -> Result<(), CubeError> {
+        let (status, cleaned_at): (Option<&str>, Option<i64>) = match result {
+            CleanupResult::Cleaned => (None, Some(now_epoch_s)),
+            CleanupResult::Skipped => (None, None),
+            CleanupResult::Failed => (Some(CleanupStatus::Failed.as_str()), None),
+        };
+        self.connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    cleanup_status = ?3,
+                    last_cleaned_at_epoch_s = COALESCE(?4, last_cleaned_at_epoch_s)
+                WHERE repo = ?1 AND workspace_id = ?2 AND cleanup_status = ?5
+                "#,
+                params![repo, workspace_id, status, cleaned_at, CleanupStatus::Running.as_str(),],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(())
+    }
+
+    /// The cleanup mark on one workspace, `None` when it carries none (or does
+    /// not exist).
+    pub fn get_workspace_cleanup_status(
+        &self,
+        repo: &str,
+        workspace_id: &str,
+    ) -> Result<Option<CleanupStatus>, CubeError> {
+        let raw: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT cleanup_status FROM workspaces WHERE repo = ?1 AND workspace_id = ?2",
+                params![repo, workspace_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(CubeError::Storage)?;
+        Ok(raw.flatten().and_then(|status| status.parse().ok()))
+    }
+
+    /// Cleanup bookkeeping for every workspace of `repo` (or of every repo).
+    pub fn list_workspace_cleanup_states(&self, repo: Option<&str>) -> Result<Vec<WorkspaceCleanupState>, CubeError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                r#"
+                SELECT
+                    repo,
+                    workspace_id,
+                    cleanup_status,
+                    cleanup_started_at_epoch_s,
+                    last_cleaned_at_epoch_s
+                FROM workspaces
+                WHERE (?1 IS NULL OR repo = ?1)
+                ORDER BY repo, workspace_id
+                "#,
+            )
+            .map_err(CubeError::Storage)?;
+        let rows = statement
+            .query_map(params![repo], |row| {
+                let status: Option<String> = row.get(2)?;
+                Ok(WorkspaceCleanupState {
+                    repo: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    status: status.and_then(|raw| raw.parse().ok()),
+                    started_at_epoch_s: row.get(3)?,
+                    last_cleaned_at_epoch_s: row.get(4)?,
+                })
+            })
+            .map_err(CubeError::Storage)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(CubeError::Storage)
+    }
+
     pub fn get_pool_metadata_i(&self, key: &str) -> Result<Option<i64>, CubeError> {
         self.connection
             .query_row(
@@ -1254,6 +1407,9 @@ impl Store {
                     last_holder TEXT,
                     last_task TEXT,
                     last_activity_at_epoch_s INTEGER,
+                    cleanup_status TEXT,
+                    cleanup_started_at_epoch_s INTEGER,
+                    last_cleaned_at_epoch_s INTEGER,
                     PRIMARY KEY(repo, workspace_id),
                     FOREIGN KEY(repo) REFERENCES repos(repo) ON DELETE CASCADE
                 );
@@ -1323,6 +1479,21 @@ impl Store {
             &self.connection,
             "ALTER TABLE workspaces ADD COLUMN last_activity_at_epoch_s INTEGER",
         )?;
+        // Workspace cleanup bookkeeping (see `Store::begin_workspace_cleanup`).
+        // `cleanup_status` doubles as the lease-exclusion mark: every claim
+        // query filters on `cleanup_status IS NULL`.
+        try_add_column(
+            &self.connection,
+            "ALTER TABLE workspaces ADD COLUMN cleanup_status TEXT",
+        )?;
+        try_add_column(
+            &self.connection,
+            "ALTER TABLE workspaces ADD COLUMN cleanup_started_at_epoch_s INTEGER",
+        )?;
+        try_add_column(
+            &self.connection,
+            "ALTER TABLE workspaces ADD COLUMN last_cleaned_at_epoch_s INTEGER",
+        )?;
 
         // Created after the ALTERs above so it also lands on a database whose
         // `workspaces` table pre-dates the `health_status` column.
@@ -1351,6 +1522,54 @@ fn try_add_column(connection: &Connection, sql: &str) -> Result<(), CubeError> {
         Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => Ok(()),
         Err(e) => Err(CubeError::Storage(e)),
     }
+}
+
+/// Whether a repo-declared cleanup is in flight on a workspace, or failed and
+/// is awaiting retry. A workspace with either mark is not leasable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupStatus {
+    Running,
+    Failed,
+}
+
+impl CleanupStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::str::FromStr for CleanupStatus {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "running" => Ok(Self::Running),
+            "failed" => Ok(Self::Failed),
+            _ => Err(()),
+        }
+    }
+}
+
+/// How a cleanup ended, as reported to [`Store::finish_workspace_cleanup`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupResult {
+    Cleaned,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorkspaceCleanupState {
+    pub repo: String,
+    pub workspace_id: String,
+    pub status: Option<CleanupStatus>,
+    /// When the most recent cleanup attempt began.
+    pub started_at_epoch_s: Option<i64>,
+    pub last_cleaned_at_epoch_s: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1938,5 +2157,201 @@ mod tests {
         let (_tempdir, store) = open_store();
         let removed = store.delete_repo("does-not-exist").expect("delete");
         assert!(!removed, "delete_repo should return false for unknown repo");
+    }
+
+    fn seed_two_workspaces(tempdir: &TempDir, store: &mut Store) {
+        let workspace_root = tempdir.path().join("workspaces");
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            })
+            .expect("repo");
+        let candidates: Vec<WorkspaceCandidate> = ["mono-agent-001", "mono-agent-002"]
+            .iter()
+            .map(|id| WorkspaceCandidate {
+                workspace_id: id.to_string(),
+                workspace_path: workspace_root.join(id),
+            })
+            .collect();
+        store.sync_workspaces("mono", &candidates).expect("sync");
+    }
+
+    /// The mark is what keeps a lease off a workspace mid-cleanup, on every
+    /// path that can claim one: the unconstrained claim skips it for the next
+    /// free workspace, and the named claims refuse it outright.
+    #[test]
+    fn a_workspace_being_cleaned_cannot_be_claimed() {
+        let (tempdir, mut store) = open_store();
+        seed_two_workspaces(&tempdir, &mut store);
+
+        assert!(
+            store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 100, 0)
+                .expect("begin")
+        );
+
+        let claimed = store
+            .claim_workspace("mono", "boss", "task", "lease-1", 200, None, None)
+            .expect("claim")
+            .expect("another workspace is free");
+        assert_eq!(claimed.workspace_id, "mono-agent-002");
+
+        // Nothing else is free: the only candidate left is the one being cleaned.
+        assert!(
+            store
+                .claim_workspace("mono", "boss", "task", "lease-2", 200, None, None)
+                .expect("claim")
+                .is_none()
+        );
+        assert!(
+            store
+                .claim_workspace("mono", "boss", "task", "lease-3", 200, None, Some("mono-agent-001"))
+                .expect("claim")
+                .is_none(),
+            "--prefer must not reach through the mark either"
+        );
+        assert!(
+            store
+                .claim_specific_workspace("mono", "mono-agent-001", "boss", "task", "lease-4", 200, None)
+                .expect("claim")
+                .is_none()
+        );
+
+        // Finishing lifts the mark and the workspace is claimable again.
+        store
+            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Cleaned, 300)
+            .expect("finish");
+        assert!(
+            store
+                .claim_specific_workspace("mono", "mono-agent-001", "boss", "task", "lease-5", 400, None)
+                .expect("claim")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cleanup_cannot_begin_on_a_leased_or_unhealthy_workspace() {
+        let (tempdir, mut store) = open_store();
+        seed_two_workspaces(&tempdir, &mut store);
+
+        store
+            .claim_specific_workspace("mono", "mono-agent-001", "boss", "task", "lease-1", 100, None)
+            .expect("claim")
+            .expect("claimed");
+        assert!(
+            !store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 200, 0)
+                .expect("begin"),
+            "a leased workspace is never cleaned"
+        );
+
+        store
+            .update_workspace_health("mono", "mono-agent-002", crate::metadata::WorkspaceHealth::Dirty)
+            .expect("health");
+        assert!(
+            !store
+                .begin_workspace_cleanup("mono", "mono-agent-002", 200, 0)
+                .expect("begin"),
+            "a dirty workspace holds recoverable work and must stay claimable"
+        );
+        let states = store.list_workspace_cleanup_states(Some("mono")).expect("states");
+        assert!(states.iter().all(|state| state.status.is_none()));
+    }
+
+    #[test]
+    fn a_failed_cleanup_keeps_its_mark_and_can_be_retried() {
+        let (tempdir, mut store) = open_store();
+        seed_two_workspaces(&tempdir, &mut store);
+
+        assert!(
+            store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 100, 0)
+                .expect("begin")
+        );
+        assert!(
+            !store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 101, 0)
+                .expect("begin"),
+            "a fresh running cleanup is not taken over"
+        );
+        store
+            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Failed, 110)
+            .expect("finish");
+
+        let state = store
+            .list_workspace_cleanup_states(Some("mono"))
+            .expect("states")
+            .into_iter()
+            .find(|state| state.workspace_id == "mono-agent-001")
+            .expect("row");
+        assert_eq!(state.status, Some(super::CleanupStatus::Failed));
+        assert_eq!(state.last_cleaned_at_epoch_s, None, "a failure is not a cleaning");
+        assert!(
+            store
+                .claim_specific_workspace("mono", "mono-agent-001", "boss", "task", "lease-1", 120, None)
+                .expect("claim")
+                .is_none(),
+            "a failed cleanup is not leased in a broken state"
+        );
+
+        assert!(
+            store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 200, 0)
+                .expect("retry"),
+            "a failed mark is retryable"
+        );
+    }
+
+    #[test]
+    fn a_crashed_running_cleanup_is_taken_over_once_stale() {
+        let (tempdir, mut store) = open_store();
+        seed_two_workspaces(&tempdir, &mut store);
+
+        assert!(
+            store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 100, 0)
+                .expect("begin")
+        );
+        // Not yet stale: it began at 100 and staleness is "started at or before 50".
+        assert!(
+            !store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 200, 50)
+                .expect("begin")
+        );
+        assert!(
+            store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 200, 150)
+                .expect("begin")
+        );
+    }
+
+    #[test]
+    fn a_skipped_cleanup_lifts_the_mark_without_recording_a_cleaning() {
+        let (tempdir, mut store) = open_store();
+        seed_two_workspaces(&tempdir, &mut store);
+
+        assert!(
+            store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 100, 0)
+                .expect("begin")
+        );
+        store
+            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Skipped, 110)
+            .expect("finish");
+
+        let state = store
+            .list_workspace_cleanup_states(Some("mono"))
+            .expect("states")
+            .into_iter()
+            .find(|state| state.workspace_id == "mono-agent-001")
+            .expect("row");
+        assert_eq!(state.status, None);
+        assert_eq!(state.last_cleaned_at_epoch_s, None);
     }
 }

@@ -3,6 +3,7 @@
 mod bazel_output_base_tests;
 mod change_tests;
 mod checkleft_tests;
+mod cleanup_tests;
 mod dispatch_tests;
 mod excludes_tests;
 mod gc_tests;

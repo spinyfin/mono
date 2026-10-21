@@ -18,6 +18,31 @@ pub struct SetupConfig {
     pub version: u32,
     #[serde(default)]
     pub steps: Vec<SetupStep>,
+    /// How to give back the disk a free workspace of this repo is holding
+    /// (build output, caches kept outside the checkout). cube decides when and
+    /// whether a workspace may be cleaned; the repo decides what cleaning means.
+    #[serde(default)]
+    pub cleanup: Option<CleanupStep>,
+}
+
+/// Exit status a cleanup command uses to say "this workspace is in use right
+/// now, I did nothing" (`EX_TEMPFAIL`). cube treats it as a skip — not a
+/// failure — and tries a different workspace.
+pub const CLEANUP_BUSY_EXIT_CODE: i32 = 75;
+
+/// A repo's cleanup command, declared under `cleanup:` in
+/// `.cube/setup.yaml`.
+///
+/// Run through `sh -c` with cwd and `CUBE_WORKSPACE` set to the workspace
+/// being cleaned (and `CUBE_BASE_REPO` set when the repo has a canonical
+/// source), exactly like a setup step. Exit 0 means cleaned,
+/// [`CLEANUP_BUSY_EXIT_CODE`] means the workspace was busy and nothing was
+/// done, and any other exit is a failure that cube logs and retries. The
+/// command must be idempotent: a cleanup that was interrupted is re-run from
+/// the top.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CleanupStep {
+    pub command: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -230,7 +255,41 @@ pub fn read_setup_config(workspace_path: &Path) -> Result<Option<SetupConfig>, C
             )));
         }
     }
+    if let Some(cleanup) = &config.cleanup
+        && cleanup.command.trim().is_empty()
+    {
+        return Err(CubeError::InvalidArgument(format!(
+            "cleanup step has an empty command in `{}`",
+            path.display()
+        )));
+    }
     Ok(Some(config))
+}
+
+/// The cleanup step to run for a workspace of a repo, if the repo declares one.
+///
+/// Read from the workspace's own checkout first, like setup steps. A free
+/// workspace can be sitting on a commit that predates the declaration, so the
+/// repo's canonical source checkout (`fallback`) is consulted when the
+/// workspace declares none — otherwise a workspace left on an old revision
+/// could never be cleaned.
+pub fn read_cleanup_step(workspace_path: &Path, fallback: Option<&Path>) -> Result<Option<CleanupStep>, CubeError> {
+    for root in std::iter::once(workspace_path).chain(fallback) {
+        if let Some(cleanup) = read_setup_config(root)?.and_then(|config| config.cleanup) {
+            return Ok(Some(cleanup));
+        }
+    }
+    Ok(None)
+}
+
+/// The environment cube gives every repo-declared command it runs against a
+/// workspace (setup steps and the cleanup step alike).
+pub fn workspace_step_env(workspace_path: &Path, source: Option<&Path>) -> Vec<(String, String)> {
+    let mut env = vec![("CUBE_WORKSPACE".to_string(), workspace_path.display().to_string())];
+    if let Some(source) = source {
+        env.push(("CUBE_BASE_REPO".to_string(), source.display().to_string()));
+    }
+    env
 }
 
 pub fn compute_fingerprint(workspace_path: &Path, step: &SetupStep) -> Result<String, CubeError> {
@@ -280,13 +339,7 @@ pub fn run_setup_engine(
     now_epoch_s: i64,
 ) -> Result<SetupReport, CubeError> {
     let source_path = store.get_repo(&workspace.repo)?.and_then(|r| r.source);
-    let mut step_env = vec![(
-        "CUBE_WORKSPACE".to_string(),
-        workspace.workspace_path.display().to_string(),
-    )];
-    if let Some(ref source) = source_path {
-        step_env.push(("CUBE_BASE_REPO".to_string(), source.display().to_string()));
-    }
+    let step_env = workspace_step_env(&workspace.workspace_path, source_path.as_deref());
 
     let mut report = SetupReport::empty();
     for step in &config.steps {
@@ -388,8 +441,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        FingerprintInput, RunPolicy, SetupConfig, SetupStep, compute_fingerprint, decide_action, read_setup_config,
-        setup_config_path,
+        FingerprintInput, RunPolicy, SetupConfig, SetupStep, compute_fingerprint, decide_action, read_cleanup_step,
+        read_setup_config, setup_config_path,
     };
     use crate::store::WorkspaceSetupState;
 
@@ -440,6 +493,67 @@ steps:
                     value: "v3".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn cleanup_step_is_optional_and_parsed_when_declared() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(setup_config_path(temp.path()).parent().unwrap()).unwrap();
+        fs::write(setup_config_path(temp.path()), "version: 1\nsteps: []\n").unwrap();
+        assert!(read_setup_config(temp.path()).unwrap().unwrap().cleanup.is_none());
+
+        fs::write(
+            setup_config_path(temp.path()),
+            "version: 1\ncleanup:\n  command: sh .cube/clean.sh\n",
+        )
+        .unwrap();
+        let cleanup = read_setup_config(temp.path()).unwrap().unwrap().cleanup.unwrap();
+        assert_eq!(cleanup.command, "sh .cube/clean.sh");
+    }
+
+    #[test]
+    fn cleanup_step_rejects_an_empty_command() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(setup_config_path(temp.path()).parent().unwrap()).unwrap();
+        fs::write(
+            setup_config_path(temp.path()),
+            "version: 1\ncleanup:\n  command: '  '\n",
+        )
+        .unwrap();
+        let err = read_setup_config(temp.path()).unwrap_err();
+        assert!(err.to_string().contains("cleanup step has an empty command"));
+    }
+
+    #[test]
+    fn cleanup_step_falls_back_to_the_source_checkout() {
+        let workspace = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        fs::create_dir_all(setup_config_path(source.path()).parent().unwrap()).unwrap();
+        fs::write(
+            setup_config_path(source.path()),
+            "version: 1\ncleanup:\n  command: from-source\n",
+        )
+        .unwrap();
+
+        // The workspace declares nothing (e.g. it sits on an older commit).
+        let found = read_cleanup_step(workspace.path(), Some(source.path())).unwrap();
+        assert_eq!(found.unwrap().command, "from-source");
+
+        // Its own declaration wins when it has one.
+        fs::create_dir_all(setup_config_path(workspace.path()).parent().unwrap()).unwrap();
+        fs::write(
+            setup_config_path(workspace.path()),
+            "version: 1\ncleanup:\n  command: from-workspace\n",
+        )
+        .unwrap();
+        let found = read_cleanup_step(workspace.path(), Some(source.path())).unwrap();
+        assert_eq!(found.unwrap().command, "from-workspace");
+
+        assert!(
+            read_cleanup_step(source.path().join("missing").as_path(), None)
+                .unwrap()
+                .is_none()
         );
     }
 

@@ -20,6 +20,7 @@ use crate::app::bazel_output_base::{
     BazelUserRootCache, CleanupOutcome, cleanup_output_base_for_workspace, discover_bazel_user_root,
     sweep_orphaned_output_bases,
 };
+use crate::app::cleanup::{CleanupOptions, CleanupTrigger, run_cleanup_pass};
 use crate::app::display::{
     effective_state_display, format_age, format_retention_summary, format_workspace_list, human_workspace_detail,
     retention_summary,
@@ -2077,24 +2078,48 @@ pub(super) fn run_workspace(
                 0
             };
 
+            // Repo-declared workspace cleanup: the same disk-pressure-driven
+            // pass the periodic GC runs, unbounded. With `--dry-run` it lists
+            // the workspaces it would clean, least recently used first, and
+            // changes nothing.
+            let cleanup = run_cleanup_pass(
+                runner,
+                &store,
+                database_path,
+                &CleanupOptions {
+                    repo: None,
+                    workspace: workspace.as_deref(),
+                    trigger: CleanupTrigger::Manual,
+                    dry_run,
+                    deadline: None,
+                },
+            );
+
             let total_forgotten: usize = results.iter().map(|r| r.bookmarks_forgotten.len()).sum();
             let message = if dry_run {
                 format!(
-                    "{} workspace(s): {} bookmark(s) would be forgotten (dry-run).",
+                    "{} workspace(s): {} bookmark(s) would be forgotten (dry-run). {}",
                     results.len(),
-                    total_forgotten
+                    total_forgotten,
+                    cleanup.summary(),
                 )
             } else {
                 format!(
-                    "{} workspace(s): {} bookmark(s) forgotten, {} unhealthy workspace(s) recycled.",
+                    "{} workspace(s): {} bookmark(s) forgotten, {} unhealthy workspace(s) recycled; workspace \
+                     cleanup: {}.",
                     results.len(),
                     total_forgotten,
-                    unhealthy_recycled
+                    unhealthy_recycled,
+                    cleanup.summary(),
                 )
             };
             RunResult::new(
                 message,
-                json!({ "results": results, "unhealthy_recycled": unhealthy_recycled }),
+                json!({
+                    "results": results,
+                    "unhealthy_recycled": unhealthy_recycled,
+                    "workspace_cleanup": cleanup,
+                }),
             )
         }
         WorkspaceCommand::Goto {
