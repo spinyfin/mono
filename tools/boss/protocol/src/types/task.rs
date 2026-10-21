@@ -1334,6 +1334,18 @@ pub struct TaskRuntime {
     /// Currently gating work item, resolved by the engine's dispatch rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_wait_blocker: Option<DispatchWaitBlocker>,
+
+    /// Why a `todo` work item flagged `autostart` has **nothing queued**,
+    /// stated by the engine from its own decline-to-mint gates
+    /// (`human_driven`, `deferred`, `pr_awaits_review`,
+    /// `deliberately_parked`, `repo_unresolved`) or `awaiting_reconcile`
+    /// when the reconciler will mint or park it on its next pass. `None`
+    /// whenever a non-terminal execution exists (`execution_status` and
+    /// `dispatch_wait_reason` describe it then) or the row is not
+    /// dispatch-pending. Lets the kanban card say what is holding a
+    /// "Queued" row instead of "reason unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_hold_reason: Option<String>,
 }
 
 /// A prerequisite selected by the same gating rules used for dispatch.

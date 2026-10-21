@@ -79,6 +79,7 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
         publisher,
         pane,
         probes,
+        ..
     } = TestHarness::new(db.clone(), detector.clone());
 
     struct NoOpProbe;
@@ -753,6 +754,7 @@ async fn genuine_no_pr_chore_still_nudges_then_breaker_parks() {
         publisher,
         pane,
         probes,
+        ..
     } = TestHarness::new(db.clone(), detector);
     let handler = handler.with_max_unproductive_nudges(2);
 
@@ -864,6 +866,7 @@ async fn no_op_declaration_closes_task_as_done_without_nudge() {
         publisher,
         pane,
         probes,
+        ..
     } = TestHarness::new(db.clone(), detector);
 
     let outcome = handler.on_stop(&execution_id).await;

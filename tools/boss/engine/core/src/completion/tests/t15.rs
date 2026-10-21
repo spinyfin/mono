@@ -102,6 +102,7 @@ async fn revision_no_op_survives_unavailable_github_for_every_driver() {
             pane,
             probes,
             publisher,
+            ..
         } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
         let handler = handler.with_branch_verifier(verifier);
 

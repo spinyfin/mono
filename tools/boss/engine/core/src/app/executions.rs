@@ -947,30 +947,35 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
             );
             return;
         }
-        // Snapshot from_status before the write so the audit event can
-        // record what the operator cancelled (the returned row is already
-        // `cancelled`).
-        let from_status = server_state
-            .work_db
-            .get_execution(&execution_id)
-            .ok()
-            .map(|e| e.status.as_str().to_owned());
+        // Snapshot from_status before the write so the audit event and the
+        // dispatch-timeline event can record what the operator cancelled
+        // (the returned row is already `cancelled`).
+        let prior_status = server_state.work_db.get_execution(&execution_id).ok().map(|e| e.status);
+        let actor = crate::work::CancelActor::Human;
+        let reason_text = reason.clone().unwrap_or_else(|| "explicit cancel".to_owned());
         let opts = crate::work::CancelExecutionOpts {
             reason: reason.clone(),
             queued_only,
             record_failure_reason: false,
+            keep_work_item_schedulable: false,
+            actor,
         };
-        match server_state.work_db.cancel_execution_with(&execution_id, opts) {
-            Ok(execution) => {
+        match server_state.work_db.cancel_execution_with_outcome(&execution_id, opts) {
+            Ok(crate::work::CancelledExecution {
+                execution,
+                work_item_parked,
+            }) => {
                 tracing::info!(
                     execution_id = %execution_id,
                     queued_only,
-                    reason = reason.as_deref().unwrap_or("explicit cancel"),
+                    actor = %actor,
+                    reason = %reason_text,
+                    work_item_parked,
                     "cancel_execution: marked cancelled",
                 );
                 // Durable operator-facing audit trail: status `cancelled`
                 // already distinguishes deliberate cancel from `orphaned`
-                // / `abandoned`; the reason + from_status make the
+                // / `abandoned`; the actor + reason + from_status make the
                 // decision reconstructible months later from
                 // engine-audit.log alone.
                 crate::audit::record_event(
@@ -978,12 +983,27 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
                     &serde_json::json!({
                         "execution_id": &execution.id,
                         "work_item_id": &execution.work_item_id,
-                        "from_status": from_status,
-                        "reason": reason.as_deref().unwrap_or("explicit cancel"),
+                        "from_status": prior_status.as_ref().map(|s| s.as_str()),
+                        "actor": actor.as_str(),
+                        "reason": &reason_text,
                         "queued_only": queued_only,
+                        "work_item_parked": work_item_parked,
                         "peer_pid": peer_pid,
                     }),
                 );
+                // Per-execution dispatch timeline: the same provenance,
+                // where `bossctl dispatch diagnose` reads it.
+                server_state
+                    .completion_handler
+                    .record_execution_cancelled(
+                        &execution.id,
+                        &execution.work_item_id,
+                        prior_status,
+                        actor,
+                        &reason_text,
+                        work_item_parked,
+                    )
+                    .await;
                 // Pane releases are keyed by run_id (the slot
                 // registry's key), not by execution_id — so
                 // walk the execution's still-active runs and

@@ -26,6 +26,19 @@ pub struct ClearedExecutionWorkspace {
     pub workspace_path: Option<String>,
 }
 
+/// What a `cancel_running_execution*` call does to the owning task besides
+/// terminalizing the execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelTaskEffect {
+    /// Park the row on the halt surface when this was its governing
+    /// execution (`park_work_item_after_cancel`).
+    Park,
+    /// Demote an `active` row to `todo` first, then park as above.
+    DemoteAndPark,
+    /// Touch nothing on the task: the caller replaces the execution itself.
+    LeaveSchedulable,
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
@@ -67,32 +80,75 @@ impl WorkDb {
     /// has already been moved to `todo` by `update_work_item_as_actor`,
     /// so we only need to mark the execution as cancelled before releasing
     /// the pane and workspace.
+    /// Cancel a non-terminal execution without demoting its task. Returns
+    /// `false` (no error) when the row was already terminal, so teardown
+    /// cascades stay idempotent. When this was the row's governing
+    /// execution the row is parked on the halt surface
+    /// (`park_work_item_after_cancel`) so the board shows the stop instead
+    /// of a phantom "Queued" card.
     pub fn cancel_running_execution(&self, execution_id: &str) -> Result<bool> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let now = now_string();
-        let cancelled = if !execution.status.is_terminal() {
-            let affected = tx.execute(
-                "UPDATE work_executions
-                 SET status      = 'cancelled',
-                     finished_at = COALESCE(finished_at, ?2)
-                 WHERE id = ?1",
-                params![execution_id, now],
-            )?;
-            affected > 0
-        } else {
-            false
-        };
-        let mut pending = PendingEvents::new();
-        if cancelled {
-            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
-        }
-        commit_and_publish(tx, pending, &self.event_bus)?;
-        Ok(cancelled)
+        self.cancel_running_execution_with_reason(execution_id, CancelActor::Engine, "cancelled by an engine teardown")
+            .map(|(cancelled, _)| cancelled)
     }
 
+    /// [`Self::cancel_running_execution`] with the caller's own actor and
+    /// reason, which the park stamp renders on the card and in `boss task
+    /// show`. Returns `(execution_cancelled, work_item_parked)` so the
+    /// caller can put the same facts on the dispatch timeline.
+    pub fn cancel_running_execution_with_reason(
+        &self,
+        execution_id: &str,
+        actor: CancelActor,
+        reason: &str,
+    ) -> Result<(bool, bool)> {
+        self.cancel_running_execution_inner(execution_id, actor, reason, CancelTaskEffect::Park)
+    }
+
+    /// Cancel an execution the caller is about to replace in the same
+    /// breath (scheduler preemption re-queues the victim as a fresh
+    /// execution). The row's dispatch state is left untouched: parking it
+    /// would flip `autostart` off and stamp a "Stopped" banner on a card
+    /// that is, from the operator's point of view, merely being requeued.
+    pub fn cancel_running_execution_for_requeue(&self, execution_id: &str) -> Result<bool> {
+        self.cancel_running_execution_inner(
+            execution_id,
+            CancelActor::Engine,
+            "preempted; requeued as a fresh execution",
+            CancelTaskEffect::LeaveSchedulable,
+        )
+        .map(|(cancelled, _)| cancelled)
+    }
+
+    /// Explicit stop (`bossctl agents stop`, the app's stop action, the
+    /// merge poller's stop-on-review): cancel the execution and demote an
+    /// `active` task to `todo`, parking it on the halt surface when this was
+    /// its governing execution (an `in_review` task is left alone — a stop
+    /// does not retract a PR). Recorded as an operator's explicit stop;
+    /// [`Self::cancel_running_execution_and_demote_task_as`] takes the
+    /// caller's own actor and reason. Returns `(execution_cancelled,
+    /// task_moved)`, where `task_moved` covers both the demote and the park.
     pub fn cancel_running_execution_and_demote_task(&self, execution_id: &str) -> Result<(bool, bool)> {
+        self.cancel_running_execution_and_demote_task_as(execution_id, CancelActor::Human, "explicit stop")
+    }
+
+    /// [`Self::cancel_running_execution_and_demote_task`] with the caller's
+    /// own actor and reason, rendered verbatim in the park text.
+    pub fn cancel_running_execution_and_demote_task_as(
+        &self,
+        execution_id: &str,
+        actor: CancelActor,
+        reason: &str,
+    ) -> Result<(bool, bool)> {
+        self.cancel_running_execution_inner(execution_id, actor, reason, CancelTaskEffect::DemoteAndPark)
+    }
+
+    fn cancel_running_execution_inner(
+        &self,
+        execution_id: &str,
+        actor: CancelActor,
+        reason: &str,
+        effect: CancelTaskEffect,
+    ) -> Result<(bool, bool)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -129,14 +185,37 @@ impl WorkDb {
         // row (and the live replacement) untouched.
         //
         // Shared with `cancel_execution_with`'s live path so the guard
-        // and `last_status_actor = 'engine'` stamp cannot drift.
-        let task_demoted = demote_active_if_latest_execution(&tx, &execution.work_item_id, execution_id, &now)?;
+        // and `last_status_actor = 'engine'` stamp cannot drift. The park
+        // below carries the same latest-execution guard plus a
+        // no-other-live-execution guard.
+        let task_demoted = if effect == CancelTaskEffect::DemoteAndPark {
+            demote_active_if_latest_execution(&tx, &execution.work_item_id, execution_id, &now)?
+        } else {
+            false
+        };
         let mut pending = PendingEvents::new();
+        let mut work_item_parked = false;
         if exec_cancelled {
+            if effect != CancelTaskEffect::LeaveSchedulable {
+                work_item_parked =
+                    park_work_item_after_cancel(&tx, &execution.work_item_id, execution_id, actor, reason, &now)?;
+            }
             stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
         commit_and_publish(tx, pending, &self.event_bus)?;
-        Ok((exec_cancelled, task_demoted))
+        if exec_cancelled {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                from_status = %execution.status,
+                to_status = "cancelled",
+                actor = %actor,
+                reason = %reason,
+                work_item_parked,
+                "execution terminalized: cancel",
+            );
+        }
+        Ok((exec_cancelled, task_demoted || work_item_parked))
     }
 
     pub fn clear_execution_workspace(&self, execution_id: &str) -> Result<Option<ClearedExecutionWorkspace>> {
