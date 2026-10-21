@@ -9,7 +9,7 @@ struct ProjectDesignDocAffordance: View {
 
     var body: some View {
         if let presentation = ProjectDesignDocAffordancePresentation.from(
-            state: model.designDocStateByProjectID[project.id] ?? .notSet
+            project: project
         ) {
             Button {
                 model.openProjectDesignDoc(project)
@@ -48,6 +48,17 @@ struct ProjectDesignDocAffordancePresentation: Equatable {
         case .broken:
             return .orange
         }
+    }
+
+    /// Project icons reflect the pointer in the work tree, without resolving it.
+    static func from(project: WorkProject) -> ProjectDesignDocAffordancePresentation? {
+        guard let path = project.designDocPath else { return nil }
+        return ProjectDesignDocAffordancePresentation(
+            systemImage: "doc.text",
+            tooltip: path,
+            accessibilityLabel: "Open design doc",
+            kind: .resolved
+        )
     }
 
     /// Map a `ProjectDesignDocState` to its kanban presentation. Returns

@@ -613,3 +613,5 @@ mod work_item_tags_tests;
 mod work_item_write_tests;
 
 mod work_tree_scale_tests;
+
+mod design_doc_contention_tests;

@@ -10,7 +10,7 @@ extension ChatViewModel {
     /// Reception of a full `WorkTree` snapshot for one product: replaces that
     /// product's slice of every bucket, re-sorts it, and re-runs the
     /// reconciliations a fresh snapshot invalidates (optimistic overrides,
-    /// selection, subscriptions, design-doc state).
+    /// selection, subscriptions).
     func applyWorkTree(
         product: WorkProduct,
         projects: [WorkProject],
@@ -96,7 +96,6 @@ extension ChatViewModel {
         reconcileOptimisticOverrides(from: tasks + chores)
         reconcileWorkSelection()
         refreshWorkSubscriptions()
-        refreshDesignDocStates(for: projects)
         workErrorMessage = nil
         if let pending = pendingRevealScrollID, revealProductID == product.id {
             pendingRevealScrollID = nil

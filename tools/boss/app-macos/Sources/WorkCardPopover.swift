@@ -450,8 +450,7 @@ struct WorkCardPopoverView: View {
     /// for design cards, per-task otherwise) shows the same row.
     @ViewBuilder
     private var docRow: some View {
-        if let state = model.workItemDocState(for: task),
-           let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
+        if let presentation = model.workItemDocPresentation(for: task) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Doc")
                     .font(.caption)

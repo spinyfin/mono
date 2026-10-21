@@ -83,6 +83,7 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            pendingProjectDesignDocOpen = nil
             disconnectOffsiteBackupEdit()
             if engine.hasUnsentAction(kind: "recreate_coordinator") {
                 coordinatorResetWaiting = false
@@ -419,8 +420,6 @@ extension ChatViewModel {
         case .metricsListLiveResult(let entries):
             engineMetrics = entries
         case .projectDesignDocResolved(let output):
-            // Batch bookkeeping and its timing log are private to
-            // ChatViewModel.swift, alongside `refreshDesignDocStates`.
             applyResolvedProjectDesignDoc(output)
         case .dispatchAdmissionEvaluated(let admission):
             handleDispatchAdmissionEvaluated(admission)

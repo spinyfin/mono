@@ -43,7 +43,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
     let showsExternalRefLink: Bool
     let externalRefLink: ExternalRefLinkPresentation?
     let showsDesignDocAffordance: Bool
-    let designDocState: ProjectDesignDocState?
+    let designDocPresentation: ProjectDesignDocAffordancePresentation?
     let reviewGuidePresentation: ReviewGuideCardPresentation?
     let showsAttachmentsAffordance: Bool
     let showsTerminalButton: Bool
@@ -85,7 +85,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
         self.showsExternalRefLink = snapshot.showsExternalRefLink
         self.externalRefLink = snapshot.externalRefLink
         self.showsDesignDocAffordance = snapshot.showsDesignDocAffordance
-        self.designDocState = snapshot.designDocState
+        self.designDocPresentation = snapshot.designDocPresentation
         self.reviewGuidePresentation = snapshot.reviewGuidePresentation
         self.showsAttachmentsAffordance = snapshot.showsAttachmentsAffordance
         self.showsTerminalButton = snapshot.showsTerminalButton
@@ -221,10 +221,9 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 ExternalRefLinkView(presentation: extRef)
             }
             // Doc-link icon. Eligibility is already encoded in
-            // `showsDesignDocAffordance` + `designDocState`.
+            // `showsDesignDocAffordance` + `designDocPresentation`.
             if slice.showsDesignDocAffordance,
-               let state = slice.designDocState,
-               let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
+               let presentation = slice.designDocPresentation {
                 Button {
                     onOpenDesignDoc?()
                 } label: {
