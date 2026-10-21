@@ -1,6 +1,7 @@
 //! Occupants that no live run owns, and old owners whose shell PID was reused.
 
 use super::*;
+use crate::test_support::test_cancel_provenance;
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
 use std::io::BufRead;
 
@@ -134,7 +135,7 @@ async fn reused_shell_pid_does_not_protect_an_old_owners_orphans() {
         db.set_run_shell_pid_for_execution(&old.id, i64::from(reused.id()))
             .unwrap()
     );
-    db.cancel_running_execution(&old.id).unwrap();
+    db.cancel_running_execution(&old.id, test_cancel_provenance()).unwrap();
     let mut orphan = spawn_detached(workspace.path(), Some(&old.id));
 
     let outcome = release_with_host_occupancy(&db, &current).await;

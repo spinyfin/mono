@@ -331,15 +331,18 @@ fn abandon_pending_executions_filtered(
     // canonical terminalization trace (see `WorkDb::mark_execution_orphaned`
     // in executions_runs.rs) can name each one individually, rather than
     // leaving this bulk transition untraced.
-    let mut stmt = conn.prepare(&format!(
-        "SELECT id, status FROM work_executions
-         WHERE work_item_id = ?1
-           AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed'){kind_filter}"
-    ))?;
-    let doomed: Vec<(String, String)> = stmt
-        .query_map(params![work_item_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    drop(stmt);
+    let doomed = capture_doomed(
+        conn,
+        &format!(
+            "work_item_id = ?1 AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed'){kind_filter}"
+        ),
+        params![work_item_id],
+    )?;
+    let provenance = boss_protocol::CancelProvenance::engine(
+        cause.cancel_source(),
+        "abandon_pending_executions",
+        format!("work item {work_item_id}: {}", cause.detail),
+    );
 
     let abandoned = crate::task_status_audit::abandon(
         conn,
@@ -347,20 +350,37 @@ fn abandon_pending_executions_filtered(
         &format!(
             "UPDATE work_executions
              SET status = 'abandoned',
-                 finished_at = COALESCE(finished_at, ?2)
+                 finished_at = COALESCE(finished_at, ?2),
+                 cancel_source = ?3,
+                 cancel_actor = ?4,
+                 cancel_reason = ?5
              WHERE work_item_id = ?1
                AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed'){kind_filter}"
         ),
-        params![work_item_id, now],
+        params![
+            work_item_id,
+            now,
+            provenance.source.as_str(),
+            provenance.actor,
+            provenance.reason
+        ],
     )?;
-    for (execution_id, from_status) in &doomed {
-        stage_execution_terminal(pending, conn, execution_id, work_item_id)?;
+    stage_doomed(
+        pending,
+        conn,
+        &doomed,
+        &boss_protocol::ExecutionStatus::Abandoned,
+        &provenance,
+    )?;
+    for row in &doomed {
         tracing::warn!(
-            execution_id = %execution_id,
+            execution_id = %row.id,
             work_item_id = %work_item_id,
-            from_status = %from_status,
+            from_status = %row.from_status,
             to_status = "abandoned",
-            reason = "pending execution abandoned (work item archived/settled)",
+            source = %provenance.source,
+            actor = %provenance.actor,
+            reason = %provenance.reason,
             "execution terminalized: abandon pending",
         );
     }

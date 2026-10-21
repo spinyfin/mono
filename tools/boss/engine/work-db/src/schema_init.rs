@@ -588,6 +588,26 @@ mod tests {
     }
 }
 
+/// Add the cancel-provenance columns unless they are already there. Recovery
+/// re-arm (v039 / v043 / v059) cancels executions while migrating an older
+/// database, before the named `20261118_1800_cancel_provenance` migration
+/// would add them, so those steps call this first; the named migration
+/// calls it again and finds nothing left to do.
+pub(crate) fn ensure_cancel_provenance_columns(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_executions", "cancel_source")? {
+        conn.execute_batch(EXECUTIONS_CANCEL_PROVENANCE_SQL)?;
+    }
+    Ok(())
+}
+
+pub(crate) const CANCEL_PROVENANCE_MIGRATION_ID: &str = "20261118_1800_cancel_provenance";
+
+pub(crate) fn migrate_cancel_provenance(conn: &Connection) -> Result<()> {
+    ensure_cancel_provenance_columns(conn)?;
+    conn.execute_batch(EXECUTIONS_CANCEL_PROVENANCE_TRIGGER_SQL)?;
+    Ok(())
+}
+
 /// Whether `table` currently has a column named `column`. Used by the
 /// idempotent schema-46 migration in `init` and by migration tests.
 pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -767,6 +787,10 @@ mod floor_tests {
                 }),
             ),
             (
+                "00000000_0000_v039_ancestry_rearm",
+                Box::new(|c| ensure_cancel_provenance_columns(c).unwrap()),
+            ),
+            (
                 "00000000_0000_v040_queue_base",
                 Box::new(|c| {
                     c.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")
@@ -786,7 +810,10 @@ mod floor_tests {
             ),
             (
                 "00000000_0000_v043_recovery_bookmarks",
-                Box::new(|c| c.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap()),
+                Box::new(|c| {
+                    c.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43).unwrap();
+                    ensure_cancel_provenance_columns(c).unwrap();
+                }),
             ),
             (
                 "00000000_0000_v044_pr_url_index",
@@ -1071,6 +1098,10 @@ mod floor_tests {
                 "20261118_0918_board_runtime_epoch_run_finished",
                 Box::new(|c| super::super::queued_display::migrate(c).unwrap()),
             ),
+            (
+                CANCEL_PROVENANCE_MIGRATION_ID,
+                Box::new(|c| migrate_cancel_provenance(c).unwrap()),
+            ),
         ];
         steps.sort_by_key(|(id, _)| *id);
         for (_, apply) in steps {
@@ -1112,6 +1143,12 @@ mod floor_tests {
             if version >= 38 {
                 conn.execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")
                     .unwrap();
+            }
+            if version >= 39 {
+                // v039 recovery re-arm stamps cancel provenance; columns must
+                // already exist on a database whose integer version skipped
+                // that step.
+                conn.execute_batch(EXECUTIONS_CANCEL_PROVENANCE_SQL).unwrap();
             }
             if version >= 40 {
                 conn.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")

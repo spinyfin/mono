@@ -377,7 +377,7 @@ pub fn make_abandoned_chore_with_workspace(db: &WorkDb, name: &str) -> (String, 
     )
     .unwrap();
     // Simulate orphan sweep abandoning exec_A.
-    db.mark_execution_redundant(&exec.id).unwrap();
+    db.mark_execution_redundant(&exec.id, test_cancel_provenance()).unwrap();
     (product.id, chore.id, exec.id)
 }
 

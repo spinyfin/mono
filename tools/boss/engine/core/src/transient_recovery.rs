@@ -1843,7 +1843,7 @@ mod tests {
         crate::stub_cube_client! { CancelOnRelease {
             async fn force_release_lease(&self, _lease_id: &str, _reason: Option<&str>) -> Result<()> {
                 let id = self.0.list_executions(None).unwrap()[0].id.clone();
-                self.0.cancel_running_execution(&id).unwrap();
+                self.0.cancel_running_execution(&id, test_cancel_provenance()).unwrap();
                 Ok(())
             }
             async fn list_workspaces(&self) -> Result<Vec<boss_host_execution::types::CubeWorkspaceStatus>> {

@@ -726,7 +726,7 @@ pub(crate) fn query_latest_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
          FROM work_executions
          WHERE work_item_id = ?1 AND kind <> 'progression'
          ORDER BY created_at DESC, id DESC
@@ -755,7 +755,7 @@ pub(crate) fn query_live_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
          FROM work_executions
          WHERE work_item_id = ?1
            AND kind != 'progression'
@@ -785,7 +785,7 @@ pub(crate) fn query_last_non_abandoned_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
          FROM work_executions
          WHERE work_item_id = ?1
            AND status != 'abandoned'
@@ -2268,27 +2268,13 @@ fn request_execution_in_tx_body<F: FnOnce(&str) -> bool>(
                 );
                 return query_execution(conn, &existing.id).require("execution", &existing.id);
             } else {
-                tracing::info!(
-                    work_item_id = %work_item_id,
-                    governing_execution_id = %existing.id,
-                    governing_status = %existing.status,
-                    latest_execution_id = ?latest_id,
-                    live_execution_id = ?live_id,
-                    decision = "abandon_stale_and_redispatch",
-                    "dispatch_decision: governing execution not live (worker gone) — \
-                     abandoning it and creating a fresh ready execution",
-                );
-                let now = now_string();
-                crate::task_status_audit::abandon(
+                crate::decision_terminal::abandon_stale_governing(
+                    pending,
                     conn,
-                    crate::task_status_audit::abandon_cause::STALE_GOVERNING_REDISPATCH.by(actor),
-                    "UPDATE work_executions
-                     SET status = 'abandoned',
-                         finished_at = COALESCE(finished_at, ?2)
-                     WHERE id = ?1",
-                    params![existing.id, now],
+                    &existing,
+                    &work_item_id,
+                    actor,
                 )?;
-                stage_execution_terminal(pending, conn, &existing.id, &work_item_id)?;
             }
         } else {
             tracing::info!(

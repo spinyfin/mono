@@ -41,6 +41,28 @@ impl<'a> AbandonCause<'a> {
     pub(crate) const fn by(self, actor: &'a str) -> Self {
         Self { actor, ..self }
     }
+
+    /// The cancel-provenance source recorded on the execution row for this cause.
+    pub(crate) fn cancel_source(self) -> boss_protocol::CancelSource {
+        use boss_protocol::CancelSource;
+        match self.code {
+            "ghost_active_demoted" => CancelSource::GhostActiveHeal,
+            "closed_item_stranded" => CancelSource::StrandedExecutionSweep,
+            "redundant_duplicate" => CancelSource::DoubleSpawnGuard,
+            "stale_revision_retired" => CancelSource::StaleRevisionRetirement,
+            "stale_governing_redispatch" => CancelSource::StaleGoverningExecution,
+            "parent_closed_revision" | "parent_close_sweep" | "retired_spawning_attempt" | "deferred" => {
+                CancelSource::WorkItemSettled
+            }
+            "review_reservation_released" | "review_batch_reaped" => CancelSource::ReviewBatch,
+            "run_finished_abandoned" => CancelSource::WorkItemSettled,
+            other => panic!("unmapped abandon cause `{other}`"),
+        }
+    }
+
+    pub(crate) fn cancel_provenance(self) -> boss_protocol::CancelProvenance {
+        boss_protocol::CancelProvenance::engine(self.cancel_source(), self.path, self.detail)
+    }
 }
 
 /// Every abandonment cause, one per writer. Shared helpers take the cause of

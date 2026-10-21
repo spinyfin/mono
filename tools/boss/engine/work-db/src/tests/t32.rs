@@ -22,6 +22,7 @@
 //!   8. a ghost-active heal of a never-started autostart item is reminted
 //!      once the item is runnable again.
 
+use crate::test_support::test_cancel_provenance;
 use super::*;
 
 /// Read the raw `deferred` column for a task id.
@@ -569,7 +570,7 @@ fn an_abandoned_execution_that_started_is_not_reminted() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = 'abandoned', started_at = '1', finished_at = '2' WHERE id = ?1",
+            "UPDATE work_executions SET status = 'abandoned', started_at = '1', finished_at = '2', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = ?1",
             params![first.id],
         )
         .unwrap();
@@ -604,7 +605,7 @@ fn an_abandoned_execution_with_a_run_is_not_reminted() {
     {
         let conn = db.connect().unwrap();
         conn.execute(
-            "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+            "UPDATE work_executions SET status = 'abandoned', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = ?1",
             params![first.id],
         )
         .unwrap();
@@ -651,7 +652,7 @@ fn reconcile_does_not_remint_beside_a_live_or_claimed_execution() {
         {
             let conn = db.connect().unwrap();
             conn.execute(
-                "UPDATE work_executions SET status = ?2, started_at = ?3 WHERE id = ?1",
+                "UPDATE work_executions SET status = ?2, started_at = ?3, cancel_source = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?1",
                 params![live.id, status, started_at],
             )
             .unwrap();
@@ -672,7 +673,7 @@ fn reconcile_does_not_remint_beside_a_live_or_claimed_execution() {
                 params![duplicate.id],
             )
             .unwrap();
-        db.mark_execution_redundant(&duplicate.id).unwrap();
+        db.mark_execution_redundant(&duplicate.id, test_cancel_provenance()).unwrap();
 
         for _ in 0..3 {
             db.reconcile_product_executions(&product.id).unwrap();

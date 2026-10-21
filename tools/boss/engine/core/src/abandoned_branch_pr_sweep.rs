@@ -803,7 +803,9 @@ mod tests {
 
     use super::*;
     use crate::dispatch_events::{NoopDispatchEventSink, RecordingDispatchEventSink};
-    use crate::test_support::{create_test_chore_manual, create_test_product_with_repo, open_db};
+    use crate::test_support::{
+        create_test_chore_manual, create_test_product_with_repo, open_db, test_cancel_provenance,
+    };
     use crate::work::WorkItemPatch;
 
     const GRACE_SECS: i64 = TERMINATION_GRACE_SECS;
@@ -836,7 +838,7 @@ mod tests {
                 .build(),
         )
         .unwrap();
-        db.mark_execution_redundant(&exec.id).unwrap();
+        db.mark_execution_redundant(&exec.id, test_cancel_provenance()).unwrap();
         {
             let conn = db.connect().unwrap();
             let backdated = (boss_engine_utils::epoch_time::now_epoch_secs() - GRACE_SECS - 60).to_string();
@@ -887,7 +889,7 @@ mod tests {
                 .build(),
         )
         .unwrap();
-        db.mark_execution_redundant(&exec.id).unwrap();
+        db.mark_execution_redundant(&exec.id, test_cancel_provenance()).unwrap();
         {
             let conn = db.connect().unwrap();
             let backdated =

@@ -188,7 +188,9 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: execution_id.clone(),
-            reason: None,
+            reason: Some("operator cancelled from control-verbs test".to_owned()),
+            source: Some(boss_protocol::CancelSource::Bossctl),
+            actor: Some("control_verbs_test".to_owned()),
             queued_only: false,
         })
         .await?;
@@ -199,6 +201,12 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
     assert_eq!(cancelled.id, execution_id);
     assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
     assert!(cancelled.finished_at.is_some(), "cancel must stamp finished_at");
+    let provenance = cancelled
+        .cancel_provenance
+        .expect("cancel RPC must stamp provenance on the execution");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::Bossctl);
+    assert_eq!(provenance.actor, "control_verbs_test");
+    assert_eq!(provenance.reason, "operator cancelled from control-verbs test");
 
     // Live cancel of the current execution: active → todo so the kanban
     // card returns to Backlog (stop/abandon semantics).
@@ -210,7 +218,9 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
             execution_id,
-            reason: None,
+            reason: Some("operator cancelled from control-verbs test".to_owned()),
+            source: Some(boss_protocol::CancelSource::Bossctl),
+            actor: Some("control_verbs_test".to_owned()),
             queued_only: false,
         })
         .await?;
@@ -227,6 +237,43 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
 }
 
 #[tokio::test]
+async fn work_cancel_without_source_is_refused() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
+
+    let response = client
+        .send_request(&FrontendRequest::CancelExecution {
+            execution_id: execution_id.clone(),
+            reason: Some("stopping this run".to_owned()),
+            source: None,
+            actor: Some("control_verbs_test".to_owned()),
+            queued_only: false,
+        })
+        .await?;
+    match response {
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("no `source`"),
+                "expected a refusal that names the missing source, got: {message}"
+            );
+        }
+        other => return Err(anyhow!("expected Error refusing a sourceless cancel, got: {other:?}")),
+    }
+    let still = WorkDb::open(engine.db_path.clone())?.get_execution(&execution_id)?;
+    assert_ne!(
+        still.status,
+        ExecutionStatus::Cancelled,
+        "a refused cancel must leave the execution non-cancelled"
+    );
+    assert!(
+        still.cancel_provenance.is_none(),
+        "a refused cancel must not stamp provenance"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn work_cancel_unknown_execution_returns_clear_error() -> Result<()> {
     let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
@@ -234,7 +281,9 @@ async fn work_cancel_unknown_execution_returns_clear_error() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: "exec_does_not_exist".to_owned(),
-            reason: None,
+            reason: Some("does not exist".to_owned()),
+            source: Some(boss_protocol::CancelSource::Bossctl),
+            actor: Some("control_verbs_test".to_owned()),
             queued_only: false,
         })
         .await?;
@@ -266,6 +315,8 @@ async fn executions_cancel_queued_only_accepts_ready_refuses_running() -> Result
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: ready_id.clone(),
             reason: Some("moot after work completed elsewhere".to_owned()),
+            source: Some(boss_protocol::CancelSource::Bossctl),
+            actor: Some("control_verbs_test".to_owned()),
             queued_only: true,
         })
         .await?;
@@ -296,6 +347,8 @@ async fn executions_cancel_queued_only_accepts_ready_refuses_running() -> Result
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: running_id.clone(),
             reason: Some("should refuse".to_owned()),
+            source: Some(boss_protocol::CancelSource::Bossctl),
+            actor: Some("control_verbs_test".to_owned()),
             queued_only: true,
         })
         .await?;
@@ -643,6 +696,9 @@ async fn agents_stop_does_not_reject_local_caller_as_boss_only() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::StopRun {
             run_id: "run-does-not-exist".to_owned(),
+            reason: Some("control-verbs stop of a missing run".to_owned()),
+            source: Some(boss_protocol::CancelSource::Bossctl),
+            actor: Some("control_verbs_test".to_owned()),
         })
         .await?;
     match response {

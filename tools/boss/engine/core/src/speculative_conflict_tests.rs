@@ -337,7 +337,7 @@ async fn live_writer_on_the_chain_skips_the_candidate_without_marking_it_checked
     );
 
     // Once the writer is gone the very next pass checks it.
-    db.mark_execution_redundant(&execution.id).unwrap();
+    db.mark_execution_redundant(&execution.id, test_cancel_provenance()).unwrap();
     run_speculative_pass(&db, &cube, &registry, &mut schedule, &[candidate]).await;
     assert_eq!(*cube.rebases.lock().await, vec![42]);
 }

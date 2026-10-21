@@ -425,6 +425,7 @@ fn recover(work_db: &WorkDb, comment: &WorkComment) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_cancel_provenance;
     use boss_protocol::{
         ANSWER_AGENT_RUN_STATUS_FAILED, CommentAnchor, CreateCommentInput, INTENT_QUESTION, INTENT_REVISION,
         THREAD_ENTRY_KIND_ANSWER,
@@ -546,7 +547,7 @@ mod tests {
         let execution = db
             .create_answer_agent_execution(&comment_id, "git@github.com:o/r.git")
             .unwrap();
-        db.cancel_execution(&execution.id).unwrap();
+        db.cancel_execution(&execution.id, test_cancel_provenance()).unwrap();
         let mut seen = HashSet::new();
 
         run_one_pass(&db, &mut seen).await;
@@ -765,7 +766,8 @@ mod tests {
         let stale_execution = db
             .create_answer_agent_execution(&comment_id, "git@github.com:o/r.git")
             .unwrap();
-        db.cancel_execution(&stale_execution.id).unwrap();
+        db.cancel_execution(&stale_execution.id, test_cancel_provenance())
+            .unwrap();
         let fresh_execution = db
             .create_answer_agent_execution(&comment_id, "git@github.com:o/r.git")
             .unwrap();

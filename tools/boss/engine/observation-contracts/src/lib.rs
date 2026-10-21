@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::Result;
 use async_trait::async_trait;
 use boss_github::RequiredCheckFailure;
-use boss_protocol::{Attention, AttentionGroup, ExecutionStatus, WorkExecution};
+use boss_protocol::{Attention, AttentionGroup, CancelProvenance, ExecutionStatus, WorkExecution};
 use boss_work_db::{LatePrCandidate, PendingMergeCheck, ReviewBatchDispatch, WorkDb};
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -709,8 +709,9 @@ pub trait CompletionRequests: Send + Sync {
         execution: &WorkExecution,
         prior_status: ExecutionStatus,
         chain_root_id: &str,
+        provenance: &CancelProvenance,
     );
-    async fn force_stop_execution(&self, execution_id: &str);
+    async fn force_stop_execution(&self, execution_id: &str, provenance: CancelProvenance);
     async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome;
     async fn recheck_for_pr_late(&self, candidate: &LatePrCandidate) -> StopOutcome;
     fn reconcile_review_guide_source_from_probe(
@@ -819,12 +820,13 @@ impl<T: CompletionRequests + ?Sized> CompletionRequests for std::sync::Arc<T> {
         execution: &WorkExecution,
         prior_status: ExecutionStatus,
         chain_root_id: &str,
+        provenance: &CancelProvenance,
     ) {
-        T::record_parent_pr_merge_cancellation(self.as_ref(), execution, prior_status, chain_root_id).await;
+        T::record_parent_pr_merge_cancellation(self.as_ref(), execution, prior_status, chain_root_id, provenance).await;
     }
 
-    async fn force_stop_execution(&self, execution_id: &str) {
-        T::force_stop_execution(self.as_ref(), execution_id).await;
+    async fn force_stop_execution(&self, execution_id: &str, provenance: CancelProvenance) {
+        T::force_stop_execution(self.as_ref(), execution_id, provenance).await;
     }
 
     async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {

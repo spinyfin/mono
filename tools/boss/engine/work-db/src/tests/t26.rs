@@ -115,7 +115,8 @@ fn retire_stale_revision_before_dispatch_abandons_execution_and_advances_task() 
     let (revision, exec_id) = seed_ready_revision(&db, "retire-happy");
 
     assert!(
-        db.retire_stale_revision_before_dispatch(&exec_id, &revision).unwrap(),
+        db.retire_stale_revision_before_dispatch(&exec_id, &revision, test_cancel_provenance())
+            .unwrap(),
         "a todo revision must be retired and report the transition"
     );
     assert_eq!(
@@ -147,7 +148,8 @@ fn retire_stale_revision_before_dispatch_accepts_an_active_revision() {
     .unwrap();
 
     assert!(
-        db.retire_stale_revision_before_dispatch(&exec_id, &revision).unwrap(),
+        db.retire_stale_revision_before_dispatch(&exec_id, &revision, test_cancel_provenance())
+            .unwrap(),
         "the guard accepts an active revision, not just a todo one"
     );
     assert_eq!(task_status(&db, &revision), "in_review");
@@ -170,7 +172,8 @@ fn retire_stale_revision_before_dispatch_leaves_a_non_stale_revision_alone() {
     .unwrap();
 
     assert!(
-        !db.retire_stale_revision_before_dispatch(&exec_id, &revision).unwrap(),
+        !db.retire_stale_revision_before_dispatch(&exec_id, &revision, test_cancel_provenance())
+            .unwrap(),
         "a revision already out of todo/active must not be re-transitioned"
     );
     assert_eq!(
@@ -187,9 +190,13 @@ fn retire_stale_revision_before_dispatch_is_idempotent() {
     let db = WorkDb::open(temp_db_path("retire-idem")).unwrap();
     let (revision, exec_id) = seed_ready_revision(&db, "retire-idem");
 
-    assert!(db.retire_stale_revision_before_dispatch(&exec_id, &revision).unwrap());
     assert!(
-        !db.retire_stale_revision_before_dispatch(&exec_id, &revision).unwrap(),
+        db.retire_stale_revision_before_dispatch(&exec_id, &revision, test_cancel_provenance())
+            .unwrap()
+    );
+    assert!(
+        !db.retire_stale_revision_before_dispatch(&exec_id, &revision, test_cancel_provenance())
+            .unwrap(),
         "a repeat retire is a no-op reporting false"
     );
     assert_eq!(task_status(&db, &revision), "in_review");

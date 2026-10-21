@@ -182,7 +182,7 @@ fn read_only_reviews_never_inherit_a_recovery_predecessor() {
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE work_executions SET status = 'cancelled', finished_at = '2' WHERE id = ?1",
+                "UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture', finished_at = '2' WHERE id = ?1",
                 params![next.id],
             )
             .unwrap();

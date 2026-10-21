@@ -1025,9 +1025,13 @@ pub(crate) fn cancel_pending_executions(
             pending,
             execution_id,
             CancelExecutionOpts {
-                reason: Some(CANCEL_REASON_PARKED.to_owned()),
                 queued_only: true,
                 record_failure_reason: false,
+                ..CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                    boss_protocol::CancelSource::WorkItemSettled,
+                    "parking",
+                    CANCEL_REASON_PARKED,
+                ))
             },
         )?;
     }

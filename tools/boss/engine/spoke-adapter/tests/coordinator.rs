@@ -394,9 +394,13 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
         .cancel_execution_with(
             &execution.id,
             CancelExecutionOpts {
-                reason: Some("operator cancel".into()),
                 queued_only: false,
                 record_failure_reason: false,
+                ..CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                    boss_protocol::CancelSource::Bossctl,
+                    "test",
+                    "operator cancel",
+                ))
             },
         )
         .unwrap();
@@ -715,9 +719,13 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
         .cancel_execution_with(
             &execution.id,
             CancelExecutionOpts {
-                reason: Some("operator cancel".into()),
                 queued_only: false,
                 record_failure_reason: false,
+                ..CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                    boss_protocol::CancelSource::Bossctl,
+                    "test",
+                    "operator cancel",
+                ))
             },
         )
         .unwrap();
@@ -1005,9 +1013,13 @@ async fn a_cancelled_unanswered_lease_stays_open_until_a_late_grant_is_released(
         .cancel_execution_with(
             &execution.id,
             CancelExecutionOpts {
-                reason: Some("operator cancel".into()),
                 queued_only: false,
                 record_failure_reason: false,
+                ..CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                    boss_protocol::CancelSource::Bossctl,
+                    "test",
+                    "operator cancel",
+                ))
             },
         )
         .unwrap();
@@ -1101,9 +1113,13 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
         .cancel_execution_with(
             &first.id,
             CancelExecutionOpts {
-                reason: Some("operator cancel".into()),
                 queued_only: false,
                 record_failure_reason: false,
+                ..CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                    boss_protocol::CancelSource::Bossctl,
+                    "test",
+                    "operator cancel",
+                ))
             },
         )
         .unwrap();

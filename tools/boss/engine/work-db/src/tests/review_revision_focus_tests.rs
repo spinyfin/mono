@@ -6,6 +6,7 @@
 //! has pushed to that PR and is held `active` for review. The followup is
 //! never launched and never in the focus set.
 
+use crate::test_support::test_cancel_provenance;
 use boss_protocol::{DispatchFocus, DispatchFocusTargetKind, ExecutionStatus, RequestExecutionInput, ReviewBatchPhase};
 
 use super::*;
@@ -201,7 +202,7 @@ impl Cycle {
 
 fn created(dispatch: ReviewBatchDispatch) -> (ReviewBatch, Vec<WorkExecution>) {
     match dispatch {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a new batch, got {other:?}"),
     }
 }
@@ -318,7 +319,7 @@ fn a_reminted_generation_keeps_the_launched_revision_it_reviews_for() {
     let db = &cycle.db;
     let (failed, executions) = created(cycle.admit_for_revision("head-a"));
     for execution in &executions {
-        db.mark_execution_redundant(&execution.id).unwrap();
+        db.mark_execution_redundant(&execution.id, test_cancel_provenance()).unwrap();
     }
     sql(
         db,

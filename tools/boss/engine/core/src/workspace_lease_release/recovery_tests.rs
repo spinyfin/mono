@@ -606,7 +606,7 @@ async fn sweep_retries_a_cancelled_row_after_a_transient_cube_failure() {
     child.wait().unwrap();
     db.set_run_shell_pid_for_execution(&execution.id, i64::from(pid))
         .unwrap();
-    db.cancel_execution(&execution.id).unwrap();
+    db.cancel_execution(&execution.id, test_cancel_provenance()).unwrap();
     assert_eq!(
         db.get_execution(&execution.id).unwrap().status,
         ExecutionStatus::Cancelled

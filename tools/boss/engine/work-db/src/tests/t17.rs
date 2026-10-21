@@ -213,7 +213,7 @@ fn queued_wait_payload_exposes_backoff_without_a_prior_failure_and_hides_stale_h
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                "UPDATE work_executions SET status = ?2, cancel_source = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?1",
                 params![execution.id, state],
             )
             .unwrap();
@@ -281,7 +281,7 @@ fn queued_wait_chain_hold_survives_claimed_blocker_and_clears_when_terminal() {
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                "UPDATE work_executions SET status = ?2, cancel_source = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?1",
                 params![blocker_execution.id, status],
             )
             .unwrap();

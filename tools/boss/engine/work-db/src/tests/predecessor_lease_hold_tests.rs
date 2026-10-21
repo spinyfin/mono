@@ -1,3 +1,4 @@
+use crate::test_support::test_cancel_provenance;
 use super::*;
 use boss_engine_recovery::execution_bookmark::PreservedTip;
 
@@ -213,7 +214,7 @@ fn resume_does_not_adopt_a_sibling_of_a_read_only_kind() {
 fn resume_inserts_nothing_for_a_predecessor_cancelled_during_preservation() {
     let db = WorkDb::open(temp_db_path("resume-cancelled")).unwrap();
     let (_, task, id) = make_waiting_human_chore(&db, "cancelled");
-    db.cancel_running_execution(&id).unwrap();
+    db.cancel_running_execution(&id, test_cancel_provenance()).unwrap();
     assert_eq!(db.get_execution(&id).unwrap().status, ExecutionStatus::Cancelled);
 
     let resumed = db.request_resume_execution(&id, 1, 0, "retry").unwrap();

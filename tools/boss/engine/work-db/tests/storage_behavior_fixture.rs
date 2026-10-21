@@ -7,8 +7,15 @@
 
 use tempfile::TempDir;
 
-use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, Product, Task, WorkExecution};
+use boss_protocol::{
+    CancelProvenance, CancelSource, CreateExecutionInput, ExecutionKind, ExecutionStatus, Product, Task, WorkExecution,
+};
 use boss_work_db::{CreateChoreInput, CreateProductInput, WorkDb};
+
+/// Fixture provenance for tests that cancel or abandon an execution.
+pub fn test_cancel_provenance() -> CancelProvenance {
+    CancelProvenance::engine(CancelSource::Bossctl, "test", "test cancel")
+}
 
 /// Repo remote used by [`create_test_product`].
 pub const TEST_REPO_REMOTE_URL: &str = "git@github.com:spinyfin/mono.git";

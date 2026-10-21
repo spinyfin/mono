@@ -554,7 +554,7 @@ async fn db_preservation_errors_for_a_started_execution_without_a_record() {
         "/tmp/ws-started",
     )
     .unwrap();
-    db.cancel_execution(&execution.id).unwrap();
+    db.cancel_execution(&execution.id, test_cancel_provenance()).unwrap();
     let execution = db.get_execution(&execution.id).unwrap();
     assert!(execution.started_at.is_some());
     assert!(
@@ -811,7 +811,7 @@ async fn sweep_holds_cancelled_spawn_and_failed_abort() {
             )
             .unwrap();
         if status == ExecutionStatus::Cancelled {
-            db.cancel_execution(&execution.id).unwrap();
+            db.cancel_execution(&execution.id, test_cancel_provenance()).unwrap();
         } else {
             db.finish_execution_run(
                 boss_protocol::FinishExecutionRunInput::builder()

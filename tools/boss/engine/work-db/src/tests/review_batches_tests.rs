@@ -1207,7 +1207,7 @@ fn leaf_dispatch_creates_two_atomic_role_pinned_executions() {
         .create_pre_merge_review_batch(input.clone(), "https://github.com/example/repo")
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
     assert_eq!(executions.len(), 2);
@@ -1269,7 +1269,7 @@ fn admissible_concurrent_review_batch_pair_admits_supervisor_leaf_pairs() {
         )
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
 
@@ -1536,7 +1536,7 @@ fn create_pre_merge_review_batch_prefers_existing_batch_over_a_partial_verdict()
         .create_pre_merge_review_batch(input.clone(), "https://github.com/example/repo")
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, .. } => batch,
+        ReviewBatchDispatch::Created { batch, .. } => *batch,
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
 
@@ -1624,7 +1624,7 @@ fn dead_leaf_retries_only_its_own_role_once() {
         )
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
     let dead = executions[0].clone();
@@ -1682,7 +1682,7 @@ fn stamp_execution_status(db: &WorkDb, execution_id: &str, status: &str) {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+            "UPDATE work_executions SET status = ?2, cancel_source = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?1",
             rusqlite::params![execution_id, status],
         )
         .unwrap();
@@ -2268,6 +2268,16 @@ async fn reap_inert_review_batches_terminalizes_running_members_of_a_deleted_cyc
         "a leaf still running when its cycle root disappears must be terminalized so its \
          review-pool slot is actually freed"
     );
+    let provenance = terminalized
+        .cancel_provenance
+        .expect("reaping an inert batch must stamp cancel provenance");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::ReviewBatch);
+    assert_eq!(provenance.actor, "reap_inert_review_batches");
+    assert!(
+        provenance.reason.contains(&batch.id),
+        "reason must name the reaped batch, got {}",
+        provenance.reason
+    );
     let members = db.review_batch_members(&batch.id).unwrap();
     assert_eq!(
         members[0].status,
@@ -2448,7 +2458,7 @@ fn create_post_merge_review_batch_dispatches_the_sole_member_and_is_idempotent()
         .create_post_merge_review_batch(input.clone(), "https://github.com/example/repo")
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
     assert_eq!(batch.phase, ReviewBatchPhase::PostMerge);

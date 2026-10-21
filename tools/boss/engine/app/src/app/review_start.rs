@@ -122,10 +122,10 @@ async fn handle_trigger_pr_review_with<F, Fut>(
             match admission {
                 ReviewAdmission::Legacy(execution) => Ok(ReviewStartOutcome::Legacy(execution)),
                 ReviewAdmission::Batch(boss_work_db::ReviewBatchDispatch::Created { batch, executions }) => {
-                    BatchOutcome::new(batch, executions, false).map(ReviewStartOutcome::Batch)
+                    BatchOutcome::new(*batch, executions, false).map(ReviewStartOutcome::Batch)
                 }
                 ReviewAdmission::Batch(boss_work_db::ReviewBatchDispatch::ExistingBatch { batch, executions }) => {
-                    BatchOutcome::new(batch, executions, true).map(ReviewStartOutcome::Batch)
+                    BatchOutcome::new(*batch, executions, true).map(ReviewStartOutcome::Batch)
                 }
                 ReviewAdmission::Batch(other) => {
                     anyhow::bail!("cannot start review batch: unexpected admission outcome {other:?}")

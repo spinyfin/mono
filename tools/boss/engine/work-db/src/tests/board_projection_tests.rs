@@ -143,7 +143,7 @@ fn board_projection_runtime_and_structural_sequence_matches_every_field() {
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                "UPDATE work_executions SET status = ?2, cancel_source = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?1",
                 params![execution.id, status],
             )
             .unwrap();
@@ -284,7 +284,7 @@ fn board_projection_cross_product_dependencies_and_chain_holds_follow_their_inpu
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                "UPDATE work_executions SET status = ?2, cancel_source = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?1",
                 params![blocker.id, status],
             )
             .unwrap();
@@ -690,7 +690,7 @@ fn wait_inputs_refresh_the_board_after_attention_pause_parking_and_batch_writes(
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = 'abandoned', run_done_outcome = 'blocked' WHERE id = ?1",
+            "UPDATE work_executions SET status = 'abandoned', run_done_outcome = 'blocked', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = ?1",
             [&execution.id],
         )
         .unwrap();

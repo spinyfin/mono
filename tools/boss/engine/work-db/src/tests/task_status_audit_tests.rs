@@ -1,3 +1,4 @@
+use crate::test_support::test_cancel_provenance;
 use super::*;
 use crate::task_status_audit;
 
@@ -1055,7 +1056,7 @@ fn redundant_duplicate_records_code_previous_status_and_never_ran_snapshots() {
     let product = create_test_product_named(&db, "Abandon redundant");
     let chore = create_test_chore_manual(&db, &product.id, "Duplicate");
     let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
-    db.mark_execution_redundant(&execution.id).unwrap();
+    db.mark_execution_redundant(&execution.id, test_cancel_provenance()).unwrap();
 
     let row = the_abandonment(&db, &chore.id, "redundant_duplicate");
     assert_eq!(row.old_value.as_deref(), Some("ready"));
@@ -1126,7 +1127,7 @@ fn stale_revision_retirement_abandons_and_moves_to_review_together() {
     let chore = create_test_chore_manual(&db, &product.id, "Stale");
     let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
     assert!(
-        db.retire_stale_revision_before_dispatch(&execution.id, &chore.id)
+        db.retire_stale_revision_before_dispatch(&execution.id, &chore.id, test_cancel_provenance())
             .unwrap()
     );
     let row = the_abandonment(&db, &chore.id, "stale_revision_retired");
@@ -1301,7 +1302,7 @@ fn dispatch_failure_history_keeps_the_error_text_after_the_stamp_is_cleared() {
         .into_iter()
         .next()
         .unwrap_or_else(|| execution_with_status(&db, &chore.id, ExecutionStatus::Ready));
-    db.mark_execution_redundant(&execution.id).unwrap();
+    db.mark_execution_redundant(&execution.id, test_cancel_provenance()).unwrap();
     let abandonment = the_abandonment(&db, &chore.id, "redundant_duplicate");
     assert_eq!(abandonment.failure_error.as_deref(), Some("cube refused the lease"));
     assert_eq!(abandonment.failure_stamp.as_deref(), Some(stamp.as_str()));
@@ -1344,7 +1345,7 @@ fn item_ever_ran_matches_execution_ever_ran_when_started_without_a_run_row() {
             [&execution.id],
         )
         .unwrap();
-    db.mark_execution_redundant(&execution.id).unwrap();
+    db.mark_execution_redundant(&execution.id, test_cancel_provenance()).unwrap();
     let row = the_abandonment(&db, &chore.id, "redundant_duplicate");
     assert_eq!((row.execution_ever_ran, row.item_ever_ran), (Some(true), Some(true)));
 }
@@ -1364,7 +1365,12 @@ fn dropping_an_operation_without_end_does_not_correlate_later_writes() {
         task_status_audit::abandon(
             &tx,
             task_status_audit::abandon_cause::REDUNDANT_DUPLICATE,
-            "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+            "UPDATE work_executions
+             SET status = 'abandoned',
+                 cancel_source = 'double_spawn_guard',
+                 cancel_actor = 'engine',
+                 cancel_reason = 'test abandon'
+             WHERE id = ?1",
             [&execution.id],
         )
         .unwrap();
@@ -1431,7 +1437,12 @@ fn a_write_that_bypasses_the_helper_is_recorded_as_an_unattributed_abandonment()
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+            "UPDATE work_executions
+             SET status = 'abandoned',
+                 cancel_source = 'double_spawn_guard',
+                 cancel_actor = 'engine',
+                 cancel_reason = 'test abandon'
+             WHERE id = ?1",
             [&execution.id],
         )
         .unwrap();
@@ -1457,7 +1468,12 @@ fn abandon_history_rolls_back_with_its_transaction_and_leaves_no_context_behind(
         task_status_audit::abandon(
             &tx,
             task_status_audit::abandon_cause::REDUNDANT_DUPLICATE,
-            "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+            "UPDATE work_executions
+             SET status = 'abandoned',
+                 cancel_source = 'double_spawn_guard',
+                 cancel_actor = 'engine',
+                 cancel_reason = 'test abandon'
+             WHERE id = ?1",
             [&execution.id],
         )
         .unwrap();
@@ -1492,7 +1508,7 @@ fn abandon_history_survives_later_status_changes_and_pruning_of_the_execution() 
     let product = create_test_product_named(&db, "Abandon retained");
     let chore = create_test_chore_manual(&db, &product.id, "Retained");
     let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
-    db.mark_execution_redundant(&execution.id).unwrap();
+    db.mark_execution_redundant(&execution.id, test_cancel_provenance()).unwrap();
     let before = the_abandonment(&db, &chore.id, "redundant_duplicate");
 
     // A later status change, and the execution row disappearing as retention
@@ -1597,6 +1613,6 @@ fn upgrading_keeps_old_ledger_rows_unattributed_and_records_new_abandonments() {
     }
     let db = WorkDb::open(path).unwrap();
     let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
-    db.mark_execution_redundant(&execution.id).unwrap();
+    db.mark_execution_redundant(&execution.id, test_cancel_provenance()).unwrap();
     the_abandonment(&db, &chore.id, "redundant_duplicate");
 }

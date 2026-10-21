@@ -8,7 +8,9 @@ use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, Review
 use super::{PR_URL, batch_input, bind_open_pr, insert_revision_row, raw};
 use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::execution_publisher::NoopExecutionPublisher;
-use crate::test_support::{create_test_chore_manual, create_test_product_with_repo, make_coordinator, open_db};
+use crate::test_support::{
+    create_test_chore_manual, create_test_product_with_repo, make_coordinator, open_db, test_cancel_provenance,
+};
 use crate::work::{FakePrStateChecker, PrOpenState, ReviewBatchDispatch, WorkDb};
 
 const REPO: &str = "https://github.com/example/repo";
@@ -173,7 +175,7 @@ async fn memberless_failed_review_does_not_preempt_stale_batch_readmission() {
         panic!("expected new batch");
     };
     for execution in &executions {
-        db.mark_execution_redundant(&execution.id).unwrap();
+        db.mark_execution_redundant(&execution.id, test_cancel_provenance()).unwrap();
     }
     raw(&db)
         .execute(

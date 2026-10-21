@@ -423,7 +423,7 @@ fn clause_4_root_recovery_limits_do_not_redirect_progression_to_dependents() {
     f.assert_candidate(&prerequisite, false);
     f.assert_candidate(&dependent, false);
     f.sql(&format!(
-        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{run}'"
+        "UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = '{run}'"
     ));
     f.assert_candidate(&dependent, false);
 

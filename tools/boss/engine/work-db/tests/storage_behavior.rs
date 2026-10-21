@@ -24,7 +24,7 @@ mod work {
 
             use boss_work_db::{WorkItem, WorkItemPatch};
             use storage_behavior_fixture::{
-                create_ready_chore_execution, create_test_chore, create_test_product, open_db,
+                create_ready_chore_execution, create_test_chore, create_test_product, open_db, test_cancel_provenance,
             };
 
             use crate::content_checksum;
@@ -217,7 +217,7 @@ mod work {
                         .event_bus()
                         .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
 
-                    let cancelled = db.cancel_running_execution(&execution.id).unwrap();
+                    let cancelled = db.cancel_running_execution(&execution.id, test_cancel_provenance()).unwrap();
                     assert!(cancelled, "a non-terminal execution must be cancelled");
 
                     let event = sub
@@ -264,7 +264,7 @@ mod work {
                         .event_bus()
                         .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
 
-                    let (cancelled, demoted) = db.cancel_running_execution_and_demote_task(&execution.id).unwrap();
+                    let (cancelled, demoted) = db.cancel_running_execution_and_demote_task(&execution.id, test_cancel_provenance()).unwrap();
                     assert!(cancelled, "a non-terminal execution must be cancelled");
                     assert!(demoted, "the active task must be demoted to todo");
 

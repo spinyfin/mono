@@ -69,6 +69,9 @@ pub(super) fn all() -> Vec<Migration> {
             id: "00000000_0000_v039_ancestry_rearm".into(),
             legacy_version: Some(39),
             apply: |conn| {
+                // Rearm cancels shadowed executions; columns land in the named
+                // cancel-provenance migration, which sorts after this frozen id.
+                ensure_cancel_provenance_columns(conn)?;
                 // Data only: restart items blocked by the false ancestry failure.
                 execution_recovery_rearm::migrate(conn, execution_recovery_rearm::is_false_not_descended_blocker)?;
                 Ok(())
@@ -103,6 +106,7 @@ pub(super) fn all() -> Vec<Migration> {
             legacy_version: Some(43),
             apply: |conn| {
                 conn.execute_batch(EXECUTION_BOOKMARK_COLUMNS_43)?;
+                ensure_cancel_provenance_columns(conn)?;
                 // Restart items wedged by baseline loss or diverged pointers.
                 execution_recovery_rearm::migrate(
                     conn,
@@ -241,6 +245,7 @@ pub(super) fn all() -> Vec<Migration> {
             id: "00000000_0000_v059_pr_anchor_rearm".into(),
             legacy_version: Some(59),
             apply: |conn| {
+                ensure_cancel_provenance_columns(conn)?;
                 execution_recovery_rearm::migrate(
                     conn,
                     execution_recovery_rearm::is_legacy_pr_anchor_blocker,
@@ -262,6 +267,11 @@ pub(super) fn all() -> Vec<Migration> {
             id: "20261118_0918_board_runtime_epoch_run_finished".into(),
             legacy_version: None,
             apply: queued_display::migrate,
+        },
+        Migration {
+            id: CANCEL_PROVENANCE_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: migrate_cancel_provenance,
         },
         Migration {
             id: conflict_mismatch::MIGRATION_ID.into(),

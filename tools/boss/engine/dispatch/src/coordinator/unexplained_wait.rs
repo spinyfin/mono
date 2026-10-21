@@ -208,7 +208,7 @@ impl ExecutionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::test_support::{create_active_chore, create_product, open_db};
+    use crate::work::test_support::{create_active_chore, create_product, open_db, test_cancel_provenance};
     use boss_engine_storage_values::dispatch_wait::{
         DISPATCH_WAIT_REASON_POOL_EXHAUSTED, DISPATCH_WAIT_REASON_UNCLASSIFIED,
     };
@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(open_attentions(&db), vec![chore.clone()]);
 
         // The row leaves the waiting state, so the signal comes down.
-        db.cancel_execution(&execution.id).unwrap();
+        db.cancel_execution(&execution.id, test_cancel_provenance()).unwrap();
         sweep_unexplained_waits(&db, &mut watch, start + GRACE * 3, GRACE, &|_| false);
         assert!(open_attentions(&db).is_empty());
     }

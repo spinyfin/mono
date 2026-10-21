@@ -42,7 +42,7 @@ async fn stale_head_sha_supersedes_pending_crz() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = 'abandoned' WHERE work_item_id = ?1",
+            "UPDATE work_executions SET status = 'abandoned', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE work_item_id = ?1",
             rusqlite::params![original_crz.revision_task_id],
         )
         .unwrap();
@@ -133,7 +133,7 @@ async fn terminal_revision_supersedes_pending_crz_even_without_head_move() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = 'abandoned' WHERE work_item_id = ?1",
+            "UPDATE work_executions SET status = 'abandoned', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE work_item_id = ?1",
             rusqlite::params![original_crz.revision_task_id],
         )
         .unwrap();
@@ -246,7 +246,7 @@ async fn stale_head_sha_and_base_advance_supersedes_pending_crz() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = 'abandoned' WHERE work_item_id = ?1",
+            "UPDATE work_executions SET status = 'abandoned', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE work_item_id = ?1",
             rusqlite::params![original_crz.revision_task_id],
         )
         .unwrap();
@@ -353,7 +353,7 @@ async fn stale_head_sha_supersede_tombstones_the_superseded_revision() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = 'abandoned' WHERE work_item_id = ?1",
+            "UPDATE work_executions SET status = 'abandoned', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE work_item_id = ?1",
             rusqlite::params![original_revision_id],
         )
         .unwrap();

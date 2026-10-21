@@ -868,6 +868,7 @@ mod cost_report_db;
 mod create_entities;
 mod critical_priority;
 mod critical_requests;
+mod decision_terminal;
 mod decisions;
 pub mod deferred_scope;
 mod dep_helpers;
@@ -1020,6 +1021,7 @@ use board_notifications::stage_task_board_change;
 use cached_task_runtimes::*;
 pub use chain_helpers::*;
 use create_entities::create_project_in_tx;
+pub use decision_terminal::*;
 pub use dep_helpers::*;
 pub use dispatch_class::DispatchClass;
 pub use dispatch_helpers::*;
@@ -1090,11 +1092,13 @@ pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
 pub use board_patch::WorkRuntimePatch;
 pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
+pub use decision_terminal::DecisionAuditContext;
 pub use exec_tail::ClearedExecutionWorkspace;
 pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
     ExecutionRetentionPolicy,
 };
+pub use event_publish::set_engine_audit_sink;
 pub use executions_runs::CancelExecutionOpts;
 pub use github_api_usage_db::{GithubApiCallRow, GithubApiUsageBucket};
 pub use github_merge_intents::{GithubMergeIntent, GithubMergeIntentInsertInput, GithubMergeIntentRecordOutcome};

@@ -1171,7 +1171,8 @@ pub fn abandoned_execution_fixture() -> (TempDir, Arc<WorkDb>, String, String, S
     // Mirror the waiting_human state.
     finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned pane"));
     // Simulate orphan sweep abandoning exec_A.
-    db.mark_execution_redundant(&execution.id).unwrap();
+    db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+        .unwrap();
     (dir, db, product.id, chore.id, execution.id)
 }
 
