@@ -233,6 +233,12 @@ fn descent_follows_parent_links_and_ignores_unrelated_processes() {
     assert!(descends_from(10, 10, parent_of));
     assert!(!descends_from(21, 10, parent_of));
     assert!(!descends_from(99, 10, parent_of));
+    assert!(!descends_from(13, 10, |pid| match pid {
+        13 => Some(12),
+        12 => Some(11),
+        11 => Some(10),
+        _ => None,
+    }));
 }
 
 /// The registration lookup must work through the same relay command the
@@ -248,8 +254,21 @@ async fn registration_resolves_through_the_coordinator_launcher_command() {
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\necho \"{{\\\"pid\\\":$$}}\" > '{}'/$$.json\nsleep 60\n",
-            sessions.display()
+            r#"#!/usr/bin/env python3
+import os, time
+from pathlib import Path
+sessions = Path({sessions:?})
+if os.fork() == 0:
+    (sessions / (str(os.getpid()) + ".json")).write_text("{{}}")
+    time.sleep(60)
+    os._exit(0)
+while not list(sessions.iterdir()):
+    time.sleep(0.01)
+(sessions.parent / "expected").write_text(str(os.getpid()))
+(sessions / (str(os.getpid()) + ".json")).write_text("{{}}")
+time.sleep(60)
+"#,
+            sessions = sessions.to_str().unwrap(),
         ),
     )
     .unwrap();
@@ -274,15 +293,10 @@ async fn registration_resolves_through_the_coordinator_launcher_command() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let registered = std::fs::read_dir(&sessions).unwrap().next().map(|entry| {
-        entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .trim_end_matches(".json")
-            .parse::<libc::pid_t>()
-            .unwrap()
-    });
+    let registered = std::fs::read_to_string(sessions.parent().unwrap().join("expected"))
+        .ok()
+        .and_then(|pid| pid.parse::<libc::pid_t>().ok());
+    let registration_count = std::fs::read_dir(&sessions).unwrap().count();
     pane.kill().unwrap();
     let relay = pane.wait_with_output().unwrap();
     let resolved = resolved.unwrap_or_else(|| {
@@ -292,5 +306,6 @@ async fn registration_resolves_through_the_coordinator_launcher_command() {
         )
     });
     assert_ne!(resolved, pane_pid);
+    assert_eq!(registration_count, 2, "nested session must be registered too");
     assert_eq!(Some(resolved), registered);
 }

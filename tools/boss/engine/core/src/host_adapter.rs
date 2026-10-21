@@ -242,7 +242,12 @@ pub trait HostAdapter: Send + Sync {
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
 
-    /// Reclaim only this dead run's staged input, before releasing its lease.
+    /// Missing attempt PID evidence is inconclusive, never proof of death.
+    async fn probe_initial_input_alive(&self, _workspace: &str, _run_id: &str) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// Reclaim only input whose launch never started or whose reader is dead.
     async fn cleanup_initial_input(&self, _workspace: &str, _run_id: &str) -> Result<()> {
         Ok(())
     }
@@ -1200,6 +1205,10 @@ impl HostAdapter for SshHostAdapter {
         Ok(())
     }
 
+    async fn probe_initial_input_alive(&self, workspace: &str, run_id: &str) -> Result<Option<bool>> {
+        crate::remote_input_lifecycle::probe_input_alive(&self.transport, workspace, run_id).await
+    }
+
     async fn cleanup_initial_input(&self, workspace: &str, run_id: &str) -> Result<()> {
         crate::remote_input_lifecycle::remove_run_input(&self.transport, workspace, run_id).await
     }
@@ -1433,7 +1442,8 @@ impl HostAdapter for SshHostAdapter {
         //    command rather than teaching the wrapper a second argv dialect.
         let (remote_config_dir, remote_prompt_gitignore_path) =
             remote_driver_config_paths(&workspace, driver.descriptor());
-        let remote_prompt_dir = format!("{remote_config_dir}/runs/{run_id}");
+        let input_id = crate::work::next_id("input");
+        let remote_prompt_dir = format!("{remote_config_dir}/runs/{input_id}");
         let remote_home = remote_home_dir(&self.transport).await?;
         let remote_settings_dir = format!("{remote_home}/{REMOTE_SETTINGS_DIR}");
         let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
@@ -1531,6 +1541,7 @@ impl HostAdapter for SshHostAdapter {
             &self.transport,
             &self.work_db,
             &workspace,
+            &input_id,
             &run_id,
             stage,
             launch,
@@ -1552,13 +1563,9 @@ impl HostAdapter for SshHostAdapter {
         // the pid is informational, not a spawn precondition.
         if let Some(pid) = outcome.remote_pid {
             match self.work_db.set_run_remote_pid_for_execution(&run_id, pid) {
-                // The recorded pid now gates the existing teardown and
-                // reconcile cleanup, which supersedes the pending marker.
-                Ok(true) => {
-                    if let Err(err) = self.work_db.clear_remote_input_cleanup(&host, &run_id) {
-                        tracing::warn!(?err, run_id = %run_id, "remote spawn: clearing input cleanup marker failed");
-                    }
-                }
+                // The attempt-scoped marker remains responsible for input;
+                // the run row independently gates lease and persona teardown.
+                Ok(true) => {}
                 Ok(false) => tracing::warn!(
                     host_id = %host,
                     run_id = %run_id,

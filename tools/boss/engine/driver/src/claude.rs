@@ -788,7 +788,6 @@ impl AgentDriver for ClaudeDriver {
             "Choose the text style",
             "Sign in with",
             "Sign in to",
-            "Waiting for approval",
         ]
         .map(String::from)
         .to_vec()
@@ -925,7 +924,7 @@ impl AgentDriver for ClaudeDriver {
         // Record the private input home for the existing restart-safe home
         // retention sweep; the workspace link does not own these bytes.
         Ok(Some(super::DriverRuntimeState::new(serde_json::json!({
-            "initial_prompt_home": prompt_home,
+            (crate::initial_prompt::INITIAL_PROMPT_HOME_KEY): prompt_home,
         }))))
     }
 

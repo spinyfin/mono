@@ -98,8 +98,8 @@ pub(crate) const WORKER_EXIT_STATUS_PREFIX: &str = "boss-remote-run: worker exit
 pub enum WrapperLaunch {
     /// Wrapper backgrounded the worker successfully (`exit 0`).
     Launched,
-    /// Wrapper refused to launch; the `&'static str` is the
-    /// failure-reason taxonomy string.
+    /// Wrapper or SSH reported failure; this alone does not prove no worker
+    /// exists. The string classifies the diagnostic, not cleanup safety.
     Failed(&'static str),
 }
 
@@ -289,10 +289,21 @@ impl SshExec for SshTransport {
 
 // ── Orchestration ─────────────────────────────────────────────────────────────
 
+/// Evidence about whether staged input may still have a reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCleanup {
+    NoProcess,
+    ConfirmedDead,
+    MayBeLive,
+}
+
 /// Result of [`perform_remote_launch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteLaunchOutcome {
-    /// True iff the wrapper backgrounded the worker (exit 0).
+    /// Only pre-process failures and confirmed worker death permit immediate cleanup.
+    pub input_cleanup: InputCleanup,
+    /// True when launch was acknowledged and no immediate death was confirmed.
+    /// False does not prove that no remote worker exists.
     pub launched: bool,
     /// Failure-reason taxonomy string when `launched` is false.
     pub failure_reason: Option<&'static str>,
@@ -332,6 +343,7 @@ pub async fn perform_remote_launch(
         .await?;
     if !fwd.success() {
         return Ok(RemoteLaunchOutcome {
+            input_cleanup: InputCleanup::NoProcess,
             launched: false,
             failure_reason: Some(REASON_WORKER_LAUNCH_FAILED),
             remote_pid: None,
@@ -380,6 +392,7 @@ pub async fn perform_remote_launch(
                             .cancel_reverse_unix_forward(&plan.events_socket_path, engine_events_socket)
                             .await;
                         return Ok(RemoteLaunchOutcome {
+                            input_cleanup: InputCleanup::ConfirmedDead,
                             launched: false,
                             failure_reason: Some(REASON_WORKER_DIED_IMMEDIATELY),
                             remote_pid: Some(pid),
@@ -405,6 +418,7 @@ pub async fn perform_remote_launch(
                 }
             }
             Ok(RemoteLaunchOutcome {
+                input_cleanup: InputCleanup::MayBeLive,
                 launched: true,
                 failure_reason: None,
                 remote_pid,
@@ -417,6 +431,11 @@ pub async fn perform_remote_launch(
                 .cancel_reverse_unix_forward(&plan.events_socket_path, engine_events_socket)
                 .await;
             Ok(RemoteLaunchOutcome {
+                input_cleanup: if (78..=82).contains(&out.status) {
+                    InputCleanup::NoProcess
+                } else {
+                    InputCleanup::MayBeLive
+                },
                 launched: false,
                 failure_reason: Some(reason),
                 remote_pid: None,
@@ -481,7 +500,11 @@ async fn resolve_failed_remote_worker_pids(exec: &dyn SshExec, run_id: &str, wor
 
 async fn read_published_worker_pid(exec: &dyn SshExec, workspace_path: &str) -> Option<i64> {
     let path = remote_worker_pid_path(workspace_path);
-    let out = exec.run(&["cat", "--", &path]).await.ok()?;
+    read_worker_pid_path(exec, &path).await
+}
+
+pub(crate) async fn read_worker_pid_path(exec: &dyn SshExec, path: &str) -> Option<i64> {
+    let out = exec.run(&["cat", "--", path]).await.ok()?;
     if !out.success() {
         return None;
     }
@@ -580,6 +603,7 @@ pub(crate) async fn probe_worker_liveness(exec: &dyn SshExec, worker_pid: i64, s
          else echo {LIVENESS_DEAD_SENTINEL}; fi"
     );
     let out = exec.run_shell(&script).await?;
+    anyhow::ensure!(out.success(), "worker liveness probe failed with status {}", out.status);
     if out.stdout.contains(LIVENESS_ALIVE_SENTINEL) {
         Ok(true)
     } else if out.stdout.contains(LIVENESS_DEAD_SENTINEL) {
@@ -628,6 +652,7 @@ pub async fn reestablish_events_forward(
         .await?;
     if fwd.success() {
         Ok(RemoteLaunchOutcome {
+            input_cleanup: InputCleanup::MayBeLive,
             launched: true,
             failure_reason: None,
             remote_pid: None,
@@ -635,6 +660,7 @@ pub async fn reestablish_events_forward(
         })
     } else {
         Ok(RemoteLaunchOutcome {
+            input_cleanup: InputCleanup::MayBeLive,
             launched: false,
             failure_reason: Some(REASON_WORKER_LAUNCH_FAILED),
             remote_pid: None,
@@ -714,7 +740,7 @@ mod tests {
             events_socket_path: "/tmp/boss-events-run-1.sock".into(),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "codex".into(),
-            driver_command: "codex -m gpt-6-astra \"$(cat .codex/initial-prompt.txt)\"".into(),
+            driver_command: "python3 .codex/initial-prompt.py codex -m gpt-6-astra".into(),
             driver_env: "export CODEX_HOME='/tmp/codex'; ".into(),
             structured_output_kind: Some("review-result".into()),
             pr_url_output: true,
@@ -748,7 +774,7 @@ mod tests {
             events_socket_path: "/tmp/s.sock".into(),
             wrapper_path: "wrapper".into(),
             driver_binary: "claude".into(),
-            driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
+            driver_command: "python3 .claude/initial-prompt.py claude --model opus".into(),
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
             structured_output_kind: None,
             pr_url_output: false,
@@ -1057,7 +1083,7 @@ mod tests {
             events_socket_path: remote_events_socket_path("run-1"),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "claude".into(),
-            driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
+            driver_command: "python3 .claude/initial-prompt.py claude --model opus".into(),
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
             structured_output_kind: Some("review-result".into()),
             pr_url_output: false,
@@ -1178,6 +1204,7 @@ mod tests {
             &db,
             "/ws",
             "run-1",
+            "execution-1",
             lifecycle_stage(&exec, true),
             |_command: String| async { unreachable!("launch must not run after a staging failure") },
         )
@@ -1197,6 +1224,7 @@ mod tests {
             &db,
             "/ws",
             "run-1",
+            "execution-1",
             lifecycle_stage(&exec, false),
             |command: String| {
                 let mut plan = sample_plan();
@@ -1222,6 +1250,7 @@ mod tests {
             &db,
             "/ws",
             "run-1",
+            "execution-1",
             lifecycle_stage(&exec, true),
             |_command: String| async { unreachable!() },
         )
@@ -1236,6 +1265,7 @@ mod tests {
             &db,
             "/ws",
             "run-2",
+            "execution-1",
             async { Ok(()) },
             |()| async { Err::<RemoteLaunchOutcome, _>(anyhow!("ssh connection dropped")) },
         )
@@ -1248,6 +1278,61 @@ mod tests {
                 .iter()
                 .any(|item| item.run_id == "run-2" && item.workspace == "/ws")
         );
+    }
+
+    #[tokio::test]
+    async fn uncertain_wrapper_exits_keep_input_and_marker() {
+        for status in [255, -1, 83, 123] {
+            let db = crate::work::WorkDb::open_in_memory().unwrap();
+            let exec = FakeExec::new(status, "");
+            let outcome = crate::remote_input_lifecycle::with_input_lifecycle(
+                &exec,
+                &db,
+                "/ws",
+                "run-1",
+                "execution-1",
+                lifecycle_stage(&exec, false),
+                |command| {
+                    let mut plan = sample_plan();
+                    plan.driver_command = command;
+                    let exec = &exec;
+                    async move { perform_remote_launch(exec, &plan, "/tmp/engine.sock").await }
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!outcome.launched);
+            assert_eq!(outcome.input_cleanup, InputCleanup::MayBeLive);
+            assert!(removed_run_dirs(&exec).is_empty(), "status {status}");
+            assert_eq!(db.pending_remote_input_cleanups().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn input_probe_requires_the_attempt_pid_and_conclusive_liveness() {
+        use crate::remote_input_lifecycle::probe_input_alive;
+        let absent = FakeExec::new(0, "").with_liveness(LivenessStub::Dead);
+        assert_eq!(probe_input_alive(&absent, "/ws", "attempt").await.unwrap(), None);
+        for (probe, expected) in [(LivenessStub::Alive, true), (LivenessStub::Dead, false)] {
+            let exec = FakeExec::new(0, "")
+                .with_published_worker_pid(4242)
+                .with_liveness(probe);
+            assert_eq!(
+                probe_input_alive(&exec, "/ws", "attempt").await.unwrap(),
+                Some(expected)
+            );
+            assert!(exec.calls().contains(&Call::Run(vec![
+                "cat".into(),
+                "--".into(),
+                "/ws/.claude/runs/attempt/worker.pid".into(),
+            ])));
+        }
+        for probe in [LivenessStub::NoSentinel, LivenessStub::TransportError] {
+            let exec = FakeExec::new(0, "")
+                .with_published_worker_pid(4242)
+                .with_liveness(probe);
+            assert!(probe_input_alive(&exec, "/ws", "attempt").await.is_err());
+        }
     }
 
     #[tokio::test]

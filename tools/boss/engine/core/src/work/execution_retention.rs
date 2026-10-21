@@ -116,7 +116,7 @@ pub struct ExecutionPruneOutcome {
     /// Boss-owned Codex homes reclaimed because the last DB pointer was
     /// on a just-pruned row. Zero on `dry_run`. Best-effort; reclaim
     /// failures are logged and do not fail the prune.
-    pub codex_homes_reclaimed: u64,
+    pub driver_homes_reclaimed: u64,
 }
 
 #[work_db_boundary::instrument]
@@ -184,7 +184,7 @@ fn prune_terminal_executions_on(
         )?;
         return Ok(ExecutionPruneOutcome {
             deleted: count as u64,
-            codex_homes_reclaimed: 0,
+            driver_homes_reclaimed: 0,
         });
     }
 
@@ -211,7 +211,7 @@ fn prune_terminal_executions_on(
                 reclaimed = reclaimed.saturating_add(1);
                 tracing::info!(
                     codex_home = %path.display(),
-                    "execution-retention prune: reclaimed Codex home that lost its last DB pointer"
+                    "execution-retention prune: reclaimed driver home that lost its last DB pointer"
                 );
             }
             Err(err) => {
@@ -229,7 +229,7 @@ fn prune_terminal_executions_on(
 
     Ok(ExecutionPruneOutcome {
         deleted: deleted as u64,
-        codex_homes_reclaimed: reclaimed,
+        driver_homes_reclaimed: reclaimed,
     })
 }
 
@@ -284,7 +284,7 @@ fn remaining_codex_home_paths(conn: &Connection) -> Result<HashSet<PathBuf>> {
 
 fn owned_home_from_runtime_state_json(raw: &str) -> Option<PathBuf> {
     let state: boss_protocol::DriverRuntimeState = serde_json::from_str(raw).ok()?;
-    boss_engine_driver::codex::owned_home_from_runtime_state(&state)
+    boss_engine_driver::initial_prompt::owned_home_from_runtime_state(&state)
 }
 
 #[cfg(test)]
@@ -749,7 +749,7 @@ mod tests {
         let outcome = db.prune_terminal_executions(policy, now, false).unwrap();
         assert_eq!(outcome.deleted, 1);
         assert_eq!(
-            outcome.codex_homes_reclaimed, 1,
+            outcome.driver_homes_reclaimed, 1,
             "last DB pointer gone → home must be reclaimed: {outcome:?}"
         );
         assert!(!home.exists(), "orphaned CODEX_HOME must not remain on disk");
@@ -796,7 +796,7 @@ mod tests {
         let outcome = db.prune_terminal_executions(policy, now, false).unwrap();
         assert_eq!(outcome.deleted, 1, "only the abandoned row is pruned");
         assert_eq!(
-            outcome.codex_homes_reclaimed, 0,
+            outcome.driver_homes_reclaimed, 0,
             "shared path still referenced by live row must not be reclaimed"
         );
         assert!(home.join("marker").is_file(), "live owner's home must survive");
@@ -828,7 +828,7 @@ mod tests {
         };
         let outcome = db.prune_terminal_executions(policy, now, false).unwrap();
         assert_eq!(outcome.deleted, 1);
-        assert_eq!(outcome.codex_homes_reclaimed, 1, "{outcome:?}");
+        assert_eq!(outcome.driver_homes_reclaimed, 1, "{outcome:?}");
         assert!(!home.exists(), "pruned Claude execution must not orphan its brief");
     }
 }

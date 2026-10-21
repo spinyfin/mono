@@ -10,6 +10,19 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+pub const INITIAL_PROMPT_HOME_KEY: &str = "initial_prompt_home";
+
+/// The retained per-run home a driver's runtime state owns: a Codex
+/// `codex_home`, or the private input home Claude records as
+/// `initial_prompt_home`. `None` when the state records neither.
+pub fn owned_home_from_runtime_state(state: &boss_protocol::DriverRuntimeState) -> Option<std::path::PathBuf> {
+    let home = match crate::codex::CodexRuntimeState::from_driver_runtime_state(state) {
+        Ok(runtime) => runtime.codex_home,
+        Err(_) => std::path::PathBuf::from(state.as_value().get(INITIAL_PROMPT_HOME_KEY)?.as_str()?),
+    };
+    (!home.as_os_str().is_empty()).then_some(home)
+}
+
 pub const LAUNCHER: &str = include_str!("initial_prompt.py");
 
 /// Shared by local provisioning and SSH staging.
@@ -130,6 +143,8 @@ launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
 configs = json.loads((root / "configs.json").read_text())
 for fixture in json.loads(r'''[
+{"driver": "grok", "version": "1.0.62", "phase": "composer --no-alt-screen, isolated home", "ready": true, "height": 30, "width": 100, "capture": "\u001b]0;grok\u0007\u001b[?1000h\u001b[?1002h\u001b[?1003h\u001b[?1015h\u001b[?1006h\u001b[?1004h\u001b[?2004h\u001b[?25l\u001b[?u\u001b[c\u001b[6n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u001b[2;3H~\u001b[5;4H\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\u001b[6;4H\u2502\u001b[6;97H\u2502\u001b[7;4H\u2502\u001b[7;7H\u2800\u2800\u2800\u2800\u2800\u2800\u28c0\u28c0\u2840\u2800\u2800\u2800\u2880\u2804\u001b[7;24H\u001b[1mGrok Build  \u001b[22m1.0.62\u001b[7;97H\u2502\u001b[8;4H\u2502\u001b[8;7H\u2800\u2800\u2800\u28e0\u28fe\u283f\u281b\u281b\u281b\u281b\u2880\u2874\u2801\u2800\u001b[8;97H\u2502\u001b[9;4H\u2502\u001b[9;7H\u2800\u2800\u28fc\u285f\u2801\u2800\u2800\u2800\u2880\u2874\u283b\u28ff\u2840\u2800\u001b[9;24H\u001b[1mNew /learn skill!\u001b[9;97H\u001b[22m\u2502\u001b[10;4H\u2502\u001b[10;7H\u2800\u2800\u28ff\u2847\u2800\u2800\u2800\u2814\u2801\u2800\u2800\u28ff\u2847\u2800\u001b[10;24HAsk\u001b[10;28HGrok\u001b[10;33Hto\u001b[10;36H/learn\u001b[10;43Hfrom\u001b[10;48Hyour\u001b[10;53Hpast\u001b[10;58Htraces\u001b[10;65Hand\u001b[10;69Htune\u001b[10;74HGrok\u001b[10;79HBuild\u001b[10;85Hto\u001b[10;88Hhow\u001b[10;92Hyou\u001b[10;97H\u2502\u001b[11;4H\u2502\u001b[11;7H\u2800\u2800\u28b9\u28f7\u2800\u2800\u2800\u2800\u2800\u2880\u28f4\u287f\u2800\u2800\u001b[11;24Hwork.\u001b[11;97H\u2502\u001b[12;4H\u2502\u001b[12;7H\u2800\u2880\u281e\u2801\u2820\u28b6\u28f6\u28f6\u28f6\u283f\u280b\u2800\u2800\u2800\u001b[12;97H\u2502\u001b[13;4H\u2502\u001b[13;7H\u2810\u2801\u2800\u2800\u2800\u2800\u2800\u2800\u2800\u2800\u2800\u2800\u2800\u2800\u001b[13;24H\u001b[1mNew worktree\u001b[13;89H\u001b[22mctrl+w\u001b[13;97H\u2502\u001b[14;4H\u2502\u001b[14;24H\u001b[1mResume session\u001b[14;89H\u001b[22mctrl+r\u001b[14;97H\u2502\u001b[15;4H\u2502\u001b[15;24H\u001b[1mChangelog\u001b[15;97H\u001b[22m\u2502\u001b[16;4H\u2502\u001b[16;24H\u001b[1mQuit\u001b[16;89H\u001b[22mctrl+q\u001b[16;97H\u2502\u001b[17;4H\u2502\u001b[17;97H\u2502\u001b[18;4H\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\u001b[23;4H\u001b[1mTip: \u001b[22mUse\u001b[23;13H@\u001b[23;15Hto\u001b[23;18Hattach\u001b[23;25Hfiles\u001b[23;31Hlike\u001b[23;36H@src/main.rs.\u001b[25;3H\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\u001b[26;3H\u2502\u001b[26;5H\u276f\u001b[26;98H\u2502\u001b[27;3H\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[27;81H\u001b[2mGrok 4.7 (high)\u001b[27;97H\u001b[22m\u2500\u256f\u001b[m\u001b[m\u001b[m\u001b[0m\u001b[26;7H\u001b[?25h\u001b[23;14H! for hidden or ignored files: @!.github/workflows.\u001b[m\u001b[m\u001b[m\u001b[0m\u001b]0;grok\u0007\u001b[26;7H\u001b[23;9HPr\u001b[23;12Hss Ctrl+O to toggle auto-approve\u001b[23;45Hmode.               \u001b[m\u001b[m\u001b[m\u001b[0m\u001b[26;7H"},
+{"driver": "codex", "version": "0.161.0", "phase": "sign-in picker", "ready": false, "height": 30, "width": 100, "capture": "\u001b[?2004h\u001b[>4;0m\u001b[>5u\u001b[?1004h\u001b[6n\u001b]10;?\u001b\\\u001b]11;?\u001b\\\u001b[?u\u001b[c\u001b[?2026h\u001b[?2026l\u001b[?2026h\u001b[1;1H\u001b[J\u001b[?25l\u001b[1;3HWelcome\u001b[1;11Hto\u001b[1;14H\u001b[1mCodex\u001b[22m,\u001b[1;21HOpenAI's\u001b[1;30Hcommand-line\u001b[1;43Hcoding\u001b[1;50Hagent\u001b[3;3HSign\u001b[3;8Hin\u001b[3;11Hwith\u001b[3;16HChatGPT\u001b[3;24Hto\u001b[3;27Huse\u001b[3;31HCodex\u001b[3;37Has\u001b[3;40Hpart\u001b[3;45Hof\u001b[3;48Hyour\u001b[3;53Hpaid\u001b[3;58Hplan\u001b[4;3Hor\u001b[4;6Hconnect\u001b[4;14Han\u001b[4;17HAPI\u001b[4;21Hkey\u001b[4;25Hfor\u001b[4;29Husage-based\u001b[4;41Hbilling\u001b[6;1H\u001b[2m> 1. \u001b[22mSign in with ChatGPT\u001b[7;1H\u001b[2m     Usage included with Plus, Pro, Business, and Enterprise plans\u001b[9;3H\u001b[22m2.\u001b[9;6HSign\u001b[9;11Hin\u001b[9;14Hwith\u001b[9;19HDevice\u001b[9;26HCode\u001b[10;1H\u001b[2m     Sign in from another device with a one-time code\u001b[12;3H\u001b[22m3.\u001b[12;6HProvide\u001b[12;14Hyour\u001b[12;19Hown\u001b[12;23HAPI\u001b[12;27Hkey\u001b[13;1H\u001b[2m     Pay for what you use\u001b[15;1H  Press \u001b[22m\u001b[1menter\u001b[22m\u001b[2m\u001b[2m to continue\u001b[m\u001b[m\u001b[0m\u001b[?2026l"},
   {
     "driver": "claude",
     "version": "2.1.306",
@@ -197,6 +212,19 @@ for fixture in json.loads(r'''[
             [s.encode() for s in config["agent_markers"]],
             [s.encode() for s in config["starting_markers"]])
         assert ready == fixture["ready"], (fixture["driver"], view.tail())
+
+# A login picker may retain agent chrome or a composer-style cursor. Its
+# onboarding hold must win even when the positive marker is also present.
+for driver, text in [("codex", "› Sign in with ChatGPT"),
+                     ("codex", "› Sign in with Device Code"),
+                     ("codex", "› Provide your own API key"),
+                     ("grok", "Grok 4 Waiting for approval...")]:
+    config = configs[driver]
+    view = launcher.TerminalTail()
+    view.feed(text.encode())
+    assert not launcher.ready_for_prompt(view, True, True,
+        [s.encode() for s in config["agent_markers"]],
+        [s.encode() for s in config["starting_markers"]])
 
 view = launcher.TerminalTail()
 view.feed(b"Claude Code\r\nQuick safety check:")
@@ -407,11 +435,19 @@ assert_processes_exited(lifetime_reader)
     fn early_driver_exit_is_a_launch_failure() {
         let temp = tempfile::tempdir().unwrap();
         provision(temp.path(), temp.path(), "private sentinel", &crate::ClaudeDriver).unwrap();
-        let output = std::process::Command::new("python3")
+        let child = std::process::Command::new("python3")
             .arg(temp.path().join("initial-prompt.py"))
             .args(["python3", "-c", "print('before readiness')"])
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        let pid = child.id();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join("worker.pid")).unwrap(),
+            pid.to_string()
+        );
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("before receiving the initial brief"));
     }

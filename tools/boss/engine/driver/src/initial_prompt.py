@@ -336,6 +336,8 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
 
 
 def main():
+    # Attempt-scoped evidence for remote cleanup; absent means inconclusive.
+    Path(__file__).with_name("worker.pid").write_text(str(os.getpid()))
     argv = sys.argv[1:]
     if not argv:
         raise ValueError("missing worker driver")

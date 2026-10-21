@@ -34,18 +34,18 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ExecutionRetentionSweepOutcome {
     pub deleted: u64,
-    pub codex_homes_reclaimed: u64,
+    pub driver_homes_reclaimed: u64,
 }
 
 impl crate::sweep_loop::SweepOutcome for ExecutionRetentionSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.deleted > 0 || self.codex_homes_reclaimed > 0
+        self.deleted > 0 || self.driver_homes_reclaimed > 0
     }
 
     fn log(&self) {
         tracing::info!(
             deleted = self.deleted,
-            codex_homes_reclaimed = self.codex_homes_reclaimed,
+            driver_homes_reclaimed = self.driver_homes_reclaimed,
             "execution-retention sweep: pruned terminal work_executions rows past the retention bound",
         );
     }
@@ -81,7 +81,7 @@ pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
     match work_db.prune_terminal_executions(ExecutionRetentionPolicy::default(), now_epoch, false) {
         Ok(outcome) => ExecutionRetentionSweepOutcome {
             deleted: outcome.deleted,
-            codex_homes_reclaimed: outcome.codex_homes_reclaimed,
+            driver_homes_reclaimed: outcome.driver_homes_reclaimed,
         },
         Err(err) => {
             tracing::warn!(?err, "execution-retention sweep: prune failed; skipping this pass");

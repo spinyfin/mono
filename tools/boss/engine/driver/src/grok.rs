@@ -343,7 +343,11 @@ impl AgentDriver for GrokDriver {
     }
 
     fn launcher_starting_markers(&self) -> Vec<String> {
-        vec!["Connecting...".into()]
+        vec![
+            "Connecting...".into(),
+            "Waiting for approval".into(),
+            "Approve in your browser".into(),
+        ]
     }
 
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {

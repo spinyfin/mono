@@ -104,7 +104,7 @@ pub async fn run_one_pass_with_policy(
         let Some(state) = execution.driver_runtime_state.as_ref() else {
             continue;
         };
-        let Some(home) = boss_engine_driver::codex::owned_home_from_runtime_state(state) else {
+        let Some(home) = boss_engine_driver::initial_prompt::owned_home_from_runtime_state(state) else {
             continue;
         };
         let age_anchor_epoch = execution

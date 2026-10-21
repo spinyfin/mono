@@ -94,24 +94,13 @@ struct Registration {
     cwd: PathBuf,
 }
 
-/// Whether `pid` is `ancestor` or runs somewhere below it, following parent links.
+/// Accept only the relay's direct grandchild, or a legacy direct pane process.
 fn descends_from(
     pid: libc::pid_t,
     ancestor: libc::pid_t,
     parent_of: impl Fn(libc::pid_t) -> Option<libc::pid_t>,
 ) -> bool {
-    let mut current = pid;
-    // Bounded: the relay places Claude two forks below the pane process.
-    for _ in 0..32 {
-        if current == ancestor {
-            return true;
-        }
-        match parent_of(current) {
-            Some(parent) if parent > 1 => current = parent,
-            _ => return false,
-        }
-    }
-    false
+    pid == ancestor || parent_of(pid).and_then(parent_of) == Some(ancestor)
 }
 
 /// The coordinator pane runs the terminal relay, which supervises Claude two

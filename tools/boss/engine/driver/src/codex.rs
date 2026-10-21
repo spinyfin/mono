@@ -649,17 +649,6 @@ pub struct CodexRuntimeState {
     pub auth_policy: String,
 }
 
-/// The retained per-run home a driver's runtime state owns: a Codex
-/// `codex_home`, or the private input home Claude records as
-/// `initial_prompt_home`. `None` when the state records neither.
-pub fn owned_home_from_runtime_state(state: &DriverRuntimeState) -> Option<PathBuf> {
-    let home = match CodexRuntimeState::from_driver_runtime_state(state) {
-        Ok(runtime) => runtime.codex_home,
-        Err(_) => PathBuf::from(state.as_value().get("initial_prompt_home")?.as_str()?),
-    };
-    (!home.as_os_str().is_empty()).then_some(home)
-}
-
 impl CodexRuntimeState {
     pub fn from_snapshot(codex_home: PathBuf, snapshot: &AuthSnapshot) -> Self {
         Self {
@@ -1600,6 +1589,19 @@ impl AgentDriver for CodexDriver {
             // record that means it — an interactive approval request, say —
             // at which point that record is the measured mapping.
         ])
+    }
+
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        // Recorded from the isolated Codex 0.161.0 onboarding picker.
+        [
+            "Sign in with ChatGPT",
+            "Sign in with Device Code",
+            "Provide your own API key",
+            "Sign in from another device",
+            "Complete sign-in in your browser",
+        ]
+        .map(String::from)
+        .to_vec()
     }
 
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {

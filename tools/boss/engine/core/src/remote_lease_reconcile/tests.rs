@@ -44,6 +44,9 @@ crate::stub_host_adapter! { StubAdapter {
     fn host_id(&self) -> &str {
         &self.host_id
     }
+    async fn probe_initial_input_alive(&self, _workspace: &str, _run_id: &str) -> Result<Option<bool>> {
+        self.probe_remote_worker_alive(4242).await
+    }
     async fn cleanup_initial_input(&self, workspace: &str, run_id: &str) -> Result<()> {
         self.cleaned_inputs.lock().unwrap().push((workspace.to_owned(), run_id.to_owned()));
         Ok(())
@@ -579,51 +582,79 @@ async fn mismatched_host_adapter_cannot_prove_death_or_release_resources() {
 }
 
 #[tokio::test]
-async fn pending_staged_input_is_removed_once_the_failed_execution_is_not_live() {
-    let (_d, db) = open_db_arc();
-    let chore = create_chore(&db);
-    db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
-    // A launch failed after staging and never recorded a remote pid.
-    let failed = start_remote_run(&db, &chore, "anaplian", "lease-1", None);
-    db.cancel_running_execution(&failed).unwrap();
-    db.mark_remote_input_cleanup_pending("anaplian", &failed, "/remote/mono-agent-004")
-        .unwrap();
-    // Another run is still starting; its input must not be touched.
-    let chore_two = create_chore(&db);
-    let starting = start_remote_run(&db, &chore_two, "anaplian", "lease-2", None);
-    db.mark_remote_input_cleanup_pending("anaplian", &starting, "/remote/mono-agent-005")
-        .unwrap();
-
-    let (adapter, provider) = provider("anaplian", Probe::Alive);
-    let sink = RecordingDispatchEventSink::default();
-    reconcile_remote_leases(&db, &provider, &sink, None).await;
-
+async fn pending_input_restart_requires_confirmed_death_and_preserves_new_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("work.db");
+    let execution;
+    {
+        let db = WorkDb::open(path.clone()).unwrap();
+        let chore = create_chore(&db);
+        db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+        execution = start_remote_run(&db, &chore, "anaplian", "lease-1", None);
+        db.cancel_running_execution(&execution).unwrap();
+        db.mark_remote_input_cleanup_pending("anaplian", "attempt-old", "/remote/ws", &execution)
+            .unwrap();
+    }
+    let db = WorkDb::open(path).unwrap();
+    for probe in [Probe::Alive, Probe::Error] {
+        let (adapter, provider) = provider("anaplian", probe);
+        crate::remote_input_lifecycle::retry_pending(&db, &provider).await;
+        assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());
+        assert_eq!(db.pending_remote_input_cleanups().unwrap().len(), 1);
+    }
+    let old = db.pending_remote_input_cleanups().unwrap().remove(0);
+    let (adapter, provider) = provider("anaplian", Probe::Dead);
+    crate::remote_input_lifecycle::retry_pending(&db, &provider).await;
     assert_eq!(
         *adapter.cleaned_inputs.lock().unwrap(),
-        vec![("/remote/mono-agent-004".to_owned(), failed.clone())]
+        vec![("/remote/ws".into(), "attempt-old".into())]
     );
-    let pending = db.pending_remote_input_cleanups().unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].run_id, starting);
+    assert!(db.pending_remote_input_cleanups().unwrap().is_empty());
+    // A later attempt for the same execution has a different directory and
+    // marker. An old cleanup completion cannot clear its obligation.
+    let fresh = db
+        .mark_remote_input_cleanup_pending("anaplian", "attempt-new", "/remote/ws", &execution)
+        .unwrap();
+    db.clear_remote_input_cleanup(&old).unwrap();
+    assert_eq!(db.pending_remote_input_cleanups().unwrap(), vec![fresh]);
 }
 
 #[tokio::test]
-async fn pending_staged_input_survives_an_engine_restart_until_removal_succeeds() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("work.db");
-    {
-        let db = WorkDb::open(path.clone()).unwrap();
-        db.mark_remote_input_cleanup_pending("anaplian", "exec_gone", "/remote/ws")
-            .unwrap();
-    }
-    let db = WorkDb::open(path.clone()).unwrap();
+async fn missing_execution_keeps_even_known_safe_input() {
+    let (_d, db) = open_db_arc();
     db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+    let mut item = db
+        .mark_remote_input_cleanup_pending("anaplian", "attempt", "/remote/ws", "missing")
+        .unwrap();
+    db.mark_remote_input_safe(&mut item).unwrap();
+    let (adapter, provider) = provider("anaplian", Probe::Dead);
+    crate::remote_input_lifecycle::retry_pending(&db, &provider).await;
+    assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());
+    assert_eq!(db.pending_remote_input_cleanups().unwrap(), vec![item]);
+}
+
+#[tokio::test]
+async fn known_safe_input_retries_without_a_pid_and_stale_clear_preserves_marker() {
+    let (_d, db) = open_db_arc();
+    let chore = create_chore(&db);
+    db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+    let execution = start_remote_run(&db, &chore, "anaplian", "lease-1", None);
+    db.cancel_running_execution(&execution).unwrap();
+    let stale = db
+        .mark_remote_input_cleanup_pending("anaplian", "old", "/remote/ws", &execution)
+        .unwrap();
+    let mut safe = stale.clone();
+    db.mark_remote_input_safe(&mut safe).unwrap();
+    db.clear_remote_input_cleanup(&stale).unwrap();
+    assert_eq!(db.pending_remote_input_cleanups().unwrap(), vec![safe]);
+    let fresh = db
+        .mark_remote_input_cleanup_pending("anaplian", "new", "/remote/ws", &execution)
+        .unwrap();
     let (adapter, provider) = provider("anaplian", Probe::Alive);
-    let sink = RecordingDispatchEventSink::default();
-    reconcile_remote_leases(&db, &provider, &sink, None).await;
+    crate::remote_input_lifecycle::retry_pending(&db, &provider).await;
     assert_eq!(
         *adapter.cleaned_inputs.lock().unwrap(),
-        vec![("/remote/ws".to_owned(), "exec_gone".to_owned())]
+        vec![("/remote/ws".into(), "old".into())]
     );
-    assert!(db.pending_remote_input_cleanups().unwrap().is_empty());
+    assert_eq!(db.pending_remote_input_cleanups().unwrap(), vec![fresh]);
 }
