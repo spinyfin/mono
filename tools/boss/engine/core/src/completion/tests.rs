@@ -490,6 +490,32 @@ impl TestHarness {
     /// `PaneReleaseOutcome::NoLiveWorker` pane to exercise the
     /// lease-release gate.
     fn with_pane(db: Arc<WorkDb>, detector: Arc<dyn PrDetector>, pane: Arc<RecordingPaneReleaser>) -> Self {
+        Self::with_pane_and_sink(
+            db,
+            detector,
+            pane,
+            Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new()),
+        )
+    }
+
+    /// [`TestHarness::new`] that also hands back the handler's structured
+    /// dispatch-event sink, for tests asserting the per-execution timeline
+    /// (e.g. `execution_cancelled` provenance).
+    fn with_recording_dispatch_events(
+        db: Arc<WorkDb>,
+        detector: Arc<dyn PrDetector>,
+    ) -> (Self, Arc<crate::dispatch_events::RecordingDispatchEventSink>) {
+        let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let harness = Self::with_pane_and_sink(db, detector, Arc::new(RecordingPaneReleaser::default()), sink.clone());
+        (harness, sink)
+    }
+
+    fn with_pane_and_sink(
+        db: Arc<WorkDb>,
+        detector: Arc<dyn PrDetector>,
+        pane: Arc<RecordingPaneReleaser>,
+        dispatch_events: Arc<crate::dispatch_events::RecordingDispatchEventSink>,
+    ) -> Self {
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let probes = Arc::new(RecordingProbeQueuer::default());
@@ -501,6 +527,7 @@ impl TestHarness {
             pane.clone(),
             probes.clone(),
         )
+        .with_dispatch_events(dispatch_events)
         // PR-completion terminalization records a fresh head. Keep the shared
         // harness hermetic; tests that exercise branch-specific behaviour
         // replace this with their own verifier.
@@ -1917,6 +1944,7 @@ mod review_guide_submission {
         );
     }
 }
+mod cancel_provenance_tests;
 mod t01;
 mod t02;
 mod t03;

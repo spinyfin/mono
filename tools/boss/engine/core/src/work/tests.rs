@@ -552,6 +552,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
 mod claimed_dispatch_tests;
 mod latest_local_execution_tests;
 mod list_runs_filters;
+mod stranded_autostart_tests;
 mod t01;
 mod t02;
 mod t03;

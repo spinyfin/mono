@@ -21,7 +21,7 @@ use boss_protocol::{
 };
 
 use super::*;
-use crate::work::CancelExecutionOpts;
+use crate::work::{CancelActor, CancelExecutionOpts};
 
 /// Blocker codes that a plain (non-forced) `RequestExecution` has
 /// always bypassed regardless of `force` — see
@@ -417,14 +417,23 @@ impl ExecutionCoordinator {
             .clone()
             .unwrap_or_else(|| "blocked after the pause was set aside (reason not recorded)".to_string());
         if was_new {
-            let _ = self.work_db.cancel_execution_with(
+            let cancel_reason = format!("pause-only forced dispatch refused: {reason}");
+            if let Ok(cancelled) = self.work_db.cancel_execution_with_outcome(
                 &refreshed.id,
                 CancelExecutionOpts {
-                    reason: Some(format!("pause-only forced dispatch refused: {reason}")),
+                    reason: Some(cancel_reason.clone()),
                     queued_only: true,
                     record_failure_reason: false,
+                    // "Leave no residue": the row was not schedulable before
+                    // this request minted its execution, and must not come
+                    // out of it parked under a cancel stamp either.
+                    keep_work_item_schedulable: true,
+                    actor: CancelActor::Engine,
                 },
-            );
+            ) {
+                self.record_engine_cancel(&cancelled, refreshed.status.clone(), &cancel_reason)
+                    .await;
+            }
             // This row can carry a `--host` routing constraint set by
             // `request_execution_via_db` just above; it will never drain
             // now, so drop the constraint rather than leaking it.
@@ -505,14 +514,20 @@ impl ExecutionCoordinator {
                 // execution message. The transaction above already
                 // committed a created/refreshed row for this status, so
                 // clean it up rather than leaving residue behind an error.
-                let _ = self.work_db.cancel_execution_with(
+                let cancel_reason = "--host only applies to a queued execution";
+                if let Ok(cancelled) = self.work_db.cancel_execution_with_outcome(
                     &execution.id,
                     CancelExecutionOpts {
-                        reason: Some("--host only applies to a queued execution".to_string()),
+                        reason: Some(cancel_reason.to_string()),
                         queued_only: true,
                         record_failure_reason: false,
+                        // Same residue rule as the pause-refusal cleanup above.
+                        keep_work_item_schedulable: true,
+                        actor: CancelActor::Engine,
                     },
-                );
+                ) {
+                    self.record_engine_cancel_detached(&cancelled, execution.status.clone(), cancel_reason);
+                }
                 bail!(
                     "{} resolved to execution {} in status `{}`; --host only applies to a queued execution",
                     execution.work_item_id,

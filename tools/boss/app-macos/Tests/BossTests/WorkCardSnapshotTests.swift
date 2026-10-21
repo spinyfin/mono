@@ -1944,7 +1944,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         ))
     }
 
-    func testLiveStatusDispatchPendingWithoutReasonIsUnknown() {
+    func testLiveStatusDispatchPendingWithoutReasonWaitsForScheduler() {
         let task = Self.makeTask(status: "todo", autostart: true)
         let runtime = WorkTaskRuntime(
             workItemID: task.id,
@@ -1959,7 +1959,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            "Queued — reason unknown"
+            WorkCardLiveStatus.pendingWithoutReasonLabel
         )
     }
 
@@ -1997,7 +1997,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            "Queued — reason unknown"
+            WorkCardLiveStatus.pendingWithoutReasonLabel
         )
     }
 

@@ -934,6 +934,12 @@ pub(crate) async fn stop_active_revision_executions(
                 reason: Some("parent PR merged".to_owned()),
                 queued_only: false,
                 record_failure_reason: false,
+                actor: crate::work::CancelActor::Engine,
+                // The parent-close transaction above already settled the
+                // revision's status (or converted it to a chore the
+                // reconcile below re-mints); parking it here would undo
+                // that conversion.
+                keep_work_item_schedulable: true,
             },
         );
         match &cancel_result {
@@ -1038,7 +1044,13 @@ pub(crate) async fn stop_worker_on_review_transition(
         work_item_id,
         "merge poller: stopping worker — task auto-transitioned to in_review (CI green)",
     );
-    handler.force_stop_execution(&execution.id).await;
+    handler
+        .force_stop_execution_as(
+            &execution.id,
+            crate::work::CancelActor::Engine,
+            "task auto-transitioned to in_review (CI green); worker stopped",
+        )
+        .await;
     outcome.worker_stopped_on_review += 1;
 }
 

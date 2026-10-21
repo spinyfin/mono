@@ -373,6 +373,7 @@ pub(crate) fn compute_task_runtime(
         }
     };
     let wait = super::queued_wait::for_execution(conn, execution.as_ref(), now)?;
+    let dispatch_hold_reason = dispatch_hold_reason_for(conn, work_item_id, execution.as_ref(), queries)?;
     let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at, dispatch_wait_since) =
         if let Some(execution) = execution {
             *queries += 1;
@@ -418,6 +419,7 @@ pub(crate) fn compute_task_runtime(
         .maybe_dispatch_wait_since(dispatch_wait_since)
         .maybe_dispatch_not_before(wait.not_before)
         .maybe_dispatch_wait_blocker(wait.blocker)
+        .maybe_dispatch_hold_reason(dispatch_hold_reason)
         .build();
     Ok(ComputedRuntime {
         runtime,
@@ -677,6 +679,13 @@ pub(crate) fn reconcile_work_item_execution(
                 // scoped to the `Cancelled` case only — a completed or
                 // failed revision has no uncommitted edits worth reclaiming.
                 insert_fresh(result, Some(&execution))?;
+            } else if execution.status.is_terminal()
+                && query_live_execution_for_work_item(conn, work_item_id)?.is_none()
+                && let Some(task) = query_task(conn, work_item_id)?
+                && task.status == TaskStatus::Todo
+                && task.autostart
+            {
+                converge_stranded_autostart_row(conn, result, &task, &execution, &insert_fresh)?;
             }
         }
         None => insert_fresh(result, None)?,

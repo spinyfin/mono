@@ -155,16 +155,42 @@ pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 /// is folded into the body text instead so the card names both.
 pub const DELIBERATE_PARK_DISPATCH_FAILED_REASON: &str = "deliberate_park";
 
+/// `tasks.dispatch_failed_reason` value stamped when the execution that
+/// governed a work item was **cancelled** — by an operator (`bossctl
+/// executions cancel`, `bossctl agents stop`, a kanban drag back to Backlog,
+/// the app's cancel action) or by an engine lifecycle transition that
+/// deliberately stopped it. A cancel means "stop until asked", so the row is
+/// moved to Backlog with `autostart = 0` in the same transaction and will not
+/// restart on its own; `dispatch_failed_error` records who cancelled it
+/// ([`CancelActor`]) and why, and
+/// `dispatch_failed_at` when. The same cancel also lands on the execution's
+/// dispatch timeline as an `execution_cancelled` event with the same
+/// provenance. Like
+/// [`DELIBERATE_PARK_DISPATCH_FAILED_REASON`] this is not a dispatch
+/// failure: [`crate::dispatch_failure_recovery_sweep`] must never retry it.
+/// Only an explicit `bossctl work start` (or kanban drag-to-Doing) resumes
+/// the row, which also clears the stamp when the fresh run starts.
+///
+/// Before this reason existed a cancelled never-started execution left its
+/// row `todo` with `autostart = 1` and nothing queued — the kanban rendered
+/// it in Doing as "Queued — reason unknown" indefinitely, because the
+/// reconciler never mints a replacement behind a terminal same-kind
+/// execution (see `reconcile_work_item_execution`).
+pub const EXECUTION_CANCELLED_DISPATCH_FAILED_REASON: &str = "execution_cancelled";
+
 /// One-line CLI headline for a `tasks.dispatch_failed_reason` value.
-/// A deliberate park is a wait, not a failure, so it must not share the
-/// "Dispatch failed" prefix every other reason uses. `print_task_details`
-/// (`cli/src/output.rs`) and `bossctl agents status` (`bossctl/src/agents.rs`)
-/// both print this, so a third reason added later cannot regress the same
-/// "failed" mislabel. Mirrors `WorkDispatchFailureBanner.headline` on the
-/// kanban card (colon here, em dash there).
+/// A deliberate park is a wait, not a failure, and a cancel is a stop, so
+/// neither may share the "Dispatch failed" prefix every other reason uses.
+/// `print_task_details` (`cli/src/output.rs`) and `bossctl agents status`
+/// (`bossctl/src/agents.rs`) both print this, so a further reason added
+/// later cannot regress the same "failed" mislabel. Mirrors
+/// `WorkDispatchFailureBanner.headline` on the kanban card (colon here, em
+/// dash there).
 pub fn dispatch_halt_headline(reason: &str) -> String {
     if reason == DELIBERATE_PARK_DISPATCH_FAILED_REASON {
         "Waiting on you: deliberate park".to_owned()
+    } else if reason == EXECUTION_CANCELLED_DISPATCH_FAILED_REASON {
+        "Stopped: execution cancelled".to_owned()
     } else {
         format!("Dispatch failed: {reason}")
     }
@@ -213,6 +239,10 @@ mod dispatch_halt_headline_tests {
         assert_eq!(
             super::dispatch_halt_headline(super::DELIBERATE_PARK_DISPATCH_FAILED_REASON),
             "Waiting on you: deliberate park",
+        );
+        assert_eq!(
+            super::dispatch_halt_headline(super::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON),
+            "Stopped: execution cancelled",
         );
         assert_eq!(
             super::dispatch_halt_headline(super::CHURN_GUARD_DISPATCH_FAILED_REASON),
@@ -794,7 +824,7 @@ pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
     ExecutionRetentionPolicy,
 };
-pub use executions_runs::CancelExecutionOpts;
+pub use executions_runs::{CancelActor, CancelExecutionOpts, CancelledExecution, execution_cancelled_event};
 pub use github_api_usage_db::{GithubApiCallRow, GithubApiUsageBucket};
 pub use github_merge_intents::{GithubMergeIntent, GithubMergeIntentInsertInput, GithubMergeIntentRecordOutcome};
 pub use mappers::CiInFlightObservation;
