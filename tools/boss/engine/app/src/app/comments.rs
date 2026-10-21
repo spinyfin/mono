@@ -8,8 +8,9 @@
 use super::*;
 
 use boss_protocol::{
-    AnswerAgentRun, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERING, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_RESOLVED,
-    CommentThreadEntry, INTENT_REVISION, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
+    AnswerAgentRun, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERING, COMMENT_STATUS_DISMISSED,
+    COMMENT_STATUS_IN_REVISION, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CommentThreadEntry, INTENT_REVISION,
+    THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
 };
 
 use boss_engine_utility_model::UtilityTask;
@@ -65,9 +66,14 @@ pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) 
                 // magic-wand dispatch pattern. The comment starts with
                 // `intent` NULL — the transient `classifying` state — until
                 // this completes and publishes on `comment_topic`.
-                if comment.guide_context.is_none() {
-                    spawn_comment_classifier(&server_state, &work_db, &session_id, &request_id, &comment);
-                }
+                //
+                // Review-guide comments are classified too
+                // (automatic-pr-review-guides.md § "Comments target the implementation"):
+                // the kind is what `revisable_comment_predicate` gates the
+                // Revise PR batch on and what routes a question to the
+                // answer agent, so a guide comment left unclassified can
+                // never reach either path.
+                spawn_comment_classifier(&server_state, &work_db, &session_id, &request_id, &comment);
 
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
             }
@@ -1257,21 +1263,24 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
 /// intent badge is what the sidebar surfaces the classification with — so
 /// both have to move together.
 ///
-/// The eight directed transitions, by the comment's status *before* the
-/// override:
+/// The directed transitions, by the comment's status *before* the override:
 ///
 /// | before | new intent | what happens |
 /// |---|---|---|
 /// | `answering` | `revision` | stand the live run down (`superseded`) and cancel + release its execution *before* the override write, then `→ active` |
-/// | `answered`/`awaiting_followup` | `revision` | `→ active` |
+/// | `answered`/`answer_failed`/`awaiting_followup` | `revision` | `→ active`; the posted answer stays in the thread and rides into the revise directive as context |
 /// | `active` | `revision` | no status change needed |
 /// | `active` | `question` | spawn the answer agent → `answering` |
-/// | any | same track as before | no-op beyond the label |
-/// | `in_revision` | anything | label only — see below |
+/// | any | same kind as before | label only — a live run keeps running, an answered thread stays answered |
+/// | `in_revision` / `resolved` / `dismissed` / `orphaned` | anything | **refused** before any write — see [`refuse_comment_reclassification`] |
 ///
-/// `in_revision` is the one status this deliberately does not re-home; see
-/// [`WorkDb::override_comment_intent`] for why (immutable directive, live
-/// claiming task, `revise_task_id` provenance) and how the operator is told.
+/// A refusal is never a silent no-op: the reply is a `WorkError` carrying
+/// the reason, correlated to the request so the picker that sent it can
+/// revert and show the reason inline. `in_revision` in particular used to be
+/// accepted as a label-only write (see [`WorkDb::override_comment_intent`]
+/// for why the claim itself must not move); that read as "nothing happened"
+/// because nothing routed, so it is now refused with the claiming task
+/// named instead.
 ///
 /// The `answering`-run stand-down runs *before* the `override_comment_intent`
 /// write (see `stand_down_answer_agent`'s doc for why); everything else is
@@ -1292,10 +1301,10 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
         unreachable!()
     };
 
-    // The pre-override status decides the routing; read it before the write
-    // (which may itself move `status` to `active`).
-    let status_before = match work_db.get_comment(&comment_id) {
-        Ok(Some(comment)) => comment.status,
+    // The pre-override row decides both admission and routing; read it
+    // before the write (which may itself move `status` to `active`).
+    let before = match work_db.get_comment(&comment_id) {
+        Ok(Some(comment)) => comment,
         Ok(None) => {
             send_response(
                 &sink,
@@ -1312,12 +1321,24 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
         }
     };
 
+    if let Some(reason) = refuse_comment_reclassification(&before, &intent) {
+        tracing::info!(
+            comment_id,
+            status = %before.status,
+            requested_intent = %intent,
+            %reason,
+            "comment reclassification refused",
+        );
+        send_response(&sink, &request_id, FrontendEvent::WorkError { message: reason });
+        return;
+    }
+
     // Stand the live run down *before* the override write: if this happened
     // after, a `CommentsPostAnswer` landing in between would still see a
     // `running` run, complete it `replied`, and feed the retracted question's
     // answer into the revise directive. Standing it down first means the
     // reply can only win this race if it genuinely beat the reclassification.
-    if status_before == COMMENT_STATUS_ANSWERING && intent.as_str() == INTENT_REVISION {
+    if before.status == COMMENT_STATUS_ANSWERING && intent.as_str() == INTENT_REVISION {
         stand_down_answer_agent(&server_state, &work_db, &comment_id).await;
     }
 
@@ -1344,6 +1365,47 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
         "comment_intent_overridden",
     )
     .await;
+}
+
+/// Why a manual reclassification cannot be honoured, or `None` when it can.
+///
+/// Decided before any write, so a refused gesture leaves the row exactly as
+/// it was — label included — and the reply can say why instead of echoing an
+/// unchanged comment. The reasons are operator-facing: the picker shows them
+/// inline next to the kind it reverted to.
+///
+/// - `in_revision`: the kind of a claimed comment is owned by the revision
+///   addressing it. Its directive was assembled once, at claim time, and is
+///   immutable, so neither track can take the comment over until that task
+///   finishes (the comment resolves) or is abandoned (reconciliation reopens
+///   it `active`, at which point the picker works again).
+/// - `resolved` / `dismissed`: terminal threads route nowhere; the operator
+///   reopens first.
+/// - `orphaned`: a question needs an anchor to be answered against and a
+///   revision needs one to be addressed; neither can start until the
+///   comment re-anchors.
+fn refuse_comment_reclassification(comment: &WorkComment, intent: &str) -> Option<String> {
+    if intent != INTENT_REVISION && intent != INTENT_QUESTION {
+        return Some(format!("invalid comment intent: {intent}"));
+    }
+    match comment.status.as_str() {
+        COMMENT_STATUS_IN_REVISION => Some(match comment.revise_task_id.as_deref() {
+            Some(task_id) => format!(
+                "Already being addressed by revision {task_id}. Its kind can change once that revision finishes or is abandoned."
+            ),
+            None => {
+                "Already being addressed by a revision. Its kind can change once that revision finishes or is abandoned."
+                    .to_owned()
+            }
+        }),
+        COMMENT_STATUS_RESOLVED => Some("This comment is resolved. Reopen it before changing its kind.".to_owned()),
+        COMMENT_STATUS_DISMISSED => Some("This comment was dismissed; its kind can no longer be changed.".to_owned()),
+        COMMENT_STATUS_ORPHANED => Some(
+            "This comment's anchor was lost in the current document. It can't be routed until it re-anchors."
+                .to_owned(),
+        ),
+        _ => None,
+    }
 }
 
 /// Run the routing side effects for a manual reclassification that don't have
@@ -2331,6 +2393,127 @@ mod tests {
         );
     }
 
+    /// A review-guide question mid-answer — the reported surface. Returns
+    /// `(series, comment_id, execution_id)`; the guide's PR is open, so the
+    /// Revise PR path is live for the series.
+    fn seed_answering_guide_question(work_db: &Arc<WorkDb>) -> (String, String, String) {
+        let (_root, series, comment) = boss_engine_runtime::test_support::seed_published_guide_comment(
+            work_db,
+            9,
+            "Why does this retry three times?",
+        );
+        work_db.set_comment_intent(&comment.id, INTENT_QUESTION, 0.9).unwrap();
+        work_db.transition_comment_to_answering(&comment.id).unwrap();
+        let run = work_db
+            .create_answer_agent_run(
+                &comment.id,
+                &comment.artifact_kind,
+                &comment.artifact_id,
+                &comment.doc_version,
+                0,
+            )
+            .unwrap();
+        let execution = work_db
+            .create_answer_agent_execution(&comment.id, "git@github.com:acme/widget.git")
+            .unwrap();
+        work_db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
+        (series, comment.id, execution.id)
+    }
+
+    /// Switching a guide question to Revision while its answer is thinking
+    /// must stop the answer and hand the comment to the ordinary Revise PR
+    /// path — not relabel, not wait for the run, not drop the gesture.
+    #[tokio::test]
+    async fn reclassifying_a_thinking_guide_question_to_revision_stops_the_answer_and_hands_it_to_revise_pr() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (series, comment_id, execution_id) = seed_answering_guide_question(&work_db);
+        let listed = |work_db: &WorkDb| {
+            work_db
+                .list_comments_with_thread("pr_review_guide", &series, false)
+                .unwrap()
+                .into_iter()
+                .find(|c| c.comment.id == comment_id)
+                .expect("the guide comment is listed")
+        };
+        assert!(
+            listed(&work_db).answer_agent_running,
+            "precondition: the sidebar shows Thinking…"
+        );
+
+        set_intent(&server_state, &work_db, &sink, &comment_id, INTENT_REVISION).await;
+
+        let envelope = sink.next().await.expect("the reclassification replies");
+        match envelope.payload {
+            FrontendEvent::CommentResult { comment } => {
+                assert_eq!(comment.status, COMMENT_STATUS_ACTIVE);
+                assert_eq!(comment.intent.as_deref(), Some(INTENT_REVISION));
+                assert_eq!(comment.intent_overridden_by.as_deref(), Some("user"));
+            }
+            other => panic!("expected CommentResult, got {other:?}"),
+        }
+
+        let run = work_db
+            .latest_answer_agent_run_for_comment(&comment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ANSWER_AGENT_RUN_STATUS_SUPERSEDED);
+        assert!(work_db.get_execution(&execution_id).unwrap().status.is_terminal());
+        let after = listed(&work_db);
+        assert!(!after.answer_agent_running);
+        assert!(!after.answer_agent_failed, "a retracted answer is not a failure");
+
+        let banner = work_db.comments_banner_state("pr_review_guide", &series).unwrap();
+        assert!(banner.revisable, "{banner:?}");
+        assert_eq!(banner.unresolved_count, 1);
+        let outcome = work_db
+            .revise_doc(
+                boss_work_db::ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .build(),
+                &boss_work_db::FakePrStateChecker::always(boss_work_db::PrOpenState::Open),
+            )
+            .unwrap();
+        match outcome {
+            boss_work_db::ReviseDocOutcome::Created {
+                addressed_comment_ids, ..
+            } => assert_eq!(addressed_comment_ids, vec![comment_id.clone()]),
+            other => panic!("expected the batch to claim the reclassified comment, got {other:?}"),
+        }
+        assert_eq!(
+            work_db.get_comment(&comment_id).unwrap().unwrap().status,
+            COMMENT_STATUS_IN_REVISION
+        );
+    }
+
+    /// Re-affirming the kind a comment already has is not a retraction: the
+    /// live answer keeps running and the reply echoes the unchanged state.
+    #[tokio::test]
+    async fn reaffirming_question_while_the_answer_is_thinking_keeps_the_run_alive() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, execution_id) = seed_answering_comment(&work_db);
+
+        set_intent(&server_state, &work_db, &sink, &comment_id, INTENT_QUESTION).await;
+
+        let envelope = sink.next().await.expect("the reclassification replies");
+        match envelope.payload {
+            FrontendEvent::CommentResult { comment } => assert_eq!(comment.status, COMMENT_STATUS_ANSWERING),
+            other => panic!("expected CommentResult, got {other:?}"),
+        }
+        assert!(
+            work_db
+                .running_answer_agent_run_for_comment(&comment_id)
+                .unwrap()
+                .is_some(),
+            "re-affirming 'question' must not stand the live run down",
+        );
+        assert!(!work_db.get_execution(&execution_id).unwrap().status.is_terminal());
+    }
+
     #[tokio::test]
     async fn a_late_reply_from_a_stood_down_run_does_not_resurrect_answering() {
         let (server_state, _dir) = test_server_state();
@@ -2477,7 +2660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_intent_leaves_a_claimed_comment_in_revision() {
+    async fn reclassifying_a_claimed_comment_is_refused_naming_the_revision() {
         let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
@@ -2496,11 +2679,24 @@ mod tests {
 
         // The claiming task's directive was assembled once and is immutable;
         // pulling the comment out would leave it addressing a comment it no
-        // longer owns. The label changes, the claim does not.
+        // longer owns. The engine refuses — naming the task — rather than
+        // relabelling a comment that cannot route anywhere, and writes nothing.
+        let envelope = sink.next().await.expect("the refusal replies");
+        let FrontendEvent::WorkError { message } = envelope.payload else {
+            panic!("expected a WorkError refusal, got {:?}", envelope.payload);
+        };
+        assert!(
+            message.contains("task_1"),
+            "the reason names the claiming revision: {message}"
+        );
         let reloaded = work_db.get_comment(&comment.id).unwrap().unwrap();
         assert_eq!(reloaded.status, COMMENT_STATUS_IN_REVISION);
         assert_eq!(reloaded.revise_task_id.as_deref(), Some("task_1"));
-        assert_eq!(reloaded.intent.as_deref(), Some(INTENT_QUESTION));
+        assert_eq!(
+            reloaded.intent.as_deref(),
+            Some(INTENT_REVISION),
+            "a refusal leaves the label alone"
+        );
         assert!(
             work_db
                 .running_answer_agent_run_for_comment(&comment.id)
@@ -2508,6 +2704,38 @@ mod tests {
                 .is_none(),
             "a claimed comment must not spawn an answer agent behind the revision's back",
         );
+    }
+
+    /// A terminal thread routes nowhere, so the engine says so rather than
+    /// relabelling a comment the operator can no longer act on.
+    #[tokio::test]
+    async fn reclassifying_a_resolved_comment_is_refused_with_a_reason() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let comment = seed_investigation_question_comment(&work_db, Some(DOC_REPO), None);
+        work_db
+            .set_comment_status(&comment.id, COMMENT_STATUS_RESOLVED, Some("user:me"))
+            .unwrap();
+
+        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_REVISION).await;
+
+        let envelope = sink.next().await.expect("the refusal replies");
+        let FrontendEvent::WorkError { message } = envelope.payload else {
+            panic!("expected a WorkError refusal, got {:?}", envelope.payload);
+        };
+        assert!(
+            message.contains("resolved"),
+            "the reason names the refusing state: {message}"
+        );
+        let reloaded = work_db.get_comment(&comment.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, COMMENT_STATUS_RESOLVED);
+        assert_eq!(
+            reloaded.intent.as_deref(),
+            Some(INTENT_QUESTION),
+            "a refusal writes nothing"
+        );
+        assert!(reloaded.intent_overridden_by.is_none());
     }
 
     #[tokio::test]
