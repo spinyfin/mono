@@ -48,13 +48,87 @@ mod resolve_engine_paths_tests {
         let cfg = cfg_with_events_socket(isolation.derived.events_socket.clone().unwrap());
 
         let resolved =
-            resolve_engine_paths(&isolation, &cfg, None, None).expect("a fully isolated fixture must resolve");
+            resolve_engine_paths(&isolation, &cfg, None, None, None).expect("a fully isolated fixture must resolve");
 
         assert_eq!(resolved.db, Some(PathBuf::from("/tmp/boss-test-resolve-abc.db")));
         assert_eq!(resolved.events_socket, isolation.derived.events_socket);
         assert_eq!(resolved.pid, isolation.derived.pid);
         assert_eq!(resolved.control_token, isolation.derived.control_token);
         assert_eq!(resolved.tmux_socket, isolation.derived.tmux_socket);
+        assert_eq!(
+            resolved.diagnostics_dir,
+            Some(PathBuf::from("/tmp/boss-test-resolve-abc.diagnostics")),
+            "a fixture's diagnostics land beside its other files, not under production's state root"
+        );
+    }
+
+    /// The diagnostics-directory resolution table the engine installs the
+    /// population-timing logger from.
+    #[test]
+    fn diagnostics_dir_resolution_cases() {
+        let prod = production();
+        let prod_diag = prod.diagnostics_dir.clone().unwrap();
+        let private = PathBuf::from("/tmp/my-private-diagnostics");
+        let scoped = PathBuf::from("/tmp/boss-test-resolve-abc.diagnostics");
+        let resolve = |socket: &str, env: Option<&PathBuf>| {
+            let isolation = IsolationPaths::derive_from(
+                socket,
+                &IsolationOverrides {
+                    diagnostics_dir: env.cloned(),
+                    ..IsolationOverrides::default()
+                },
+                &prod,
+            );
+            let events = isolation
+                .derived
+                .events_socket
+                .clone()
+                .unwrap_or_else(|| prod.events_socket.clone().unwrap());
+            let cfg = cfg_with_events_socket(events);
+            resolve_engine_paths(&isolation, &cfg, None, None, env.cloned()).map(|resolved| resolved.diagnostics_dir)
+        };
+
+        // Fixture, nothing set -> fixture-scoped.
+        assert_eq!(resolve(FIXTURE_SOCKET, None).unwrap(), Some(scoped.clone()));
+        // Fixture, override equal to production (inherited env) -> still scoped.
+        assert_eq!(resolve(FIXTURE_SOCKET, Some(&prod_diag)).unwrap(), Some(scoped));
+        // Fixture, private override -> the override wins.
+        assert_eq!(resolve(FIXTURE_SOCKET, Some(&private)).unwrap(), Some(private.clone()));
+        // Production, nothing set -> production's directory, unchanged.
+        let socket = production_socket();
+        let socket = socket.to_str().unwrap();
+        assert_eq!(resolve(socket, None).unwrap(), Some(prod_diag.clone()));
+        // Production, explicit override -> the override, unchanged.
+        assert_eq!(resolve(socket, Some(&private)).unwrap(), Some(private));
+    }
+
+    /// If the diagnostics directory resolves onto production's — here by the
+    /// env fallback disagreeing with what derivation saw — the wiring must
+    /// refuse the start rather than let the logger be installed there.
+    #[test]
+    fn diagnostics_dir_resolving_onto_production_is_refused_by_the_real_wiring() {
+        let prod = production();
+        let isolation = IsolationPaths::derive_from(
+            FIXTURE_SOCKET,
+            &IsolationOverrides {
+                diagnostics_dir: Some(PathBuf::from("/tmp/my-private-diagnostics")),
+                ..IsolationOverrides::default()
+            },
+            &prod,
+        );
+        let cfg = cfg_with_events_socket(isolation.derived.events_socket.clone().unwrap());
+
+        // Derivation honoured a private override (so it derived nothing), but
+        // the value the start resolves from is production's.
+        let err = resolve_engine_paths(&isolation, &cfg, None, None, prod.diagnostics_dir.clone())
+            .expect_err("a diagnostics directory on production must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("diagnostics directory"), "must name the field; got: {msg}");
+        assert!(
+            msg.contains("BOSS_ENGINE_DIAGNOSTICS_DIR"),
+            "must name the env var; got: {msg}"
+        );
+        assert!(msg.contains("refused to start"), "error must be a refusal; got: {msg}");
     }
 
     /// If the config's events socket resolves onto production — e.g. the
@@ -68,7 +142,7 @@ mod resolve_engine_paths_tests {
         let isolation = IsolationPaths::derive_from(FIXTURE_SOCKET, &IsolationOverrides::default(), &prod);
         let cfg = cfg_with_events_socket(prod.events_socket.clone().unwrap());
 
-        let err = resolve_engine_paths(&isolation, &cfg, None, None)
+        let err = resolve_engine_paths(&isolation, &cfg, None, None, None)
             .expect_err("a config resolving onto production must be refused");
         let msg = format!("{err}");
         assert!(
@@ -87,7 +161,7 @@ mod resolve_engine_paths_tests {
         let bound = PathBuf::from("/tmp/boss-test-resolve-abc.events.sock");
         let cfg = cfg_with_events_socket(bound.clone());
 
-        let resolved = resolve_engine_paths(&isolation, &cfg, None, None).unwrap();
+        let resolved = resolve_engine_paths(&isolation, &cfg, None, None, None).unwrap();
         assert_eq!(resolved.events_socket, Some(bound));
     }
 
@@ -104,7 +178,8 @@ mod resolve_engine_paths_tests {
             .build();
         let cfg = RuntimeConfig::from_parts(work, None);
 
-        let err = resolve_engine_paths(&isolation, &cfg, None, None).expect_err("no bound events socket must error");
+        let err =
+            resolve_engine_paths(&isolation, &cfg, None, None, None).expect_err("no bound events socket must error");
         assert!(format!("{err}").contains("HOME must be set"));
     }
 }

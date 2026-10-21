@@ -146,6 +146,7 @@ fn all_derived() -> EnginePaths {
         pid: Some(PathBuf::from("/tmp/boss-test-guard-1234.pid")),
         control_token: Some(PathBuf::from("/tmp/boss-test-guard-1234.control-token")),
         tmux_socket: Some(PathBuf::from("/tmp/boss-test-guard-1234.tmux.sock")),
+        diagnostics_dir: Some(PathBuf::from("/tmp/boss-test-guard-1234.diagnostics")),
     }
 }
 
@@ -160,7 +161,7 @@ fn derive_stands_down_entirely_for_the_production_socket() {
 }
 
 #[test]
-fn derive_isolates_all_five_paths_when_no_env_is_set() {
+fn derive_isolates_all_six_paths_when_no_env_is_set() {
     let paths = derive(IsolationOverrides::default());
     assert!(paths.is_test_fixture);
     assert_eq!(paths.derived, all_derived());
@@ -177,6 +178,7 @@ fn derive_ignores_env_that_merely_repeats_the_production_default() {
         events_socket: prod.events_socket,
         pid_path: prod.pid,
         control_token_path: prod.control_token,
+        diagnostics_dir: prod.diagnostics_dir,
     });
     assert_eq!(
         paths.derived,
@@ -229,6 +231,56 @@ fn fixture_refuses_to_start_when_a_resolved_path_is_production() {
         format!("{err}").contains("BOSS_ENGINE_CONTROL_TOKEN_PATH"),
         "must name the control-token env var; got: {err}"
     );
+
+    let stolen_diagnostics = EnginePaths {
+        diagnostics_dir: prod.diagnostics_dir,
+        ..all_derived()
+    };
+    let err = paths
+        .ensure_isolated(&stolen_diagnostics)
+        .expect_err("a fixture must never write into production's diagnostics directory");
+    assert!(
+        format!("{err}").contains("BOSS_ENGINE_DIAGNOSTICS_DIR"),
+        "must name the diagnostics env var; got: {err}"
+    );
+}
+
+/// The population-timing log used to resolve `<state root>/diagnostics` from
+/// `$HOME` regardless of isolation, so a fixture appended to production's
+/// `engine-population-timing-*.jsonl`. A fixture now resolves its own
+/// directory beside its other files — including over an inherited production
+/// `BOSS_ENGINE_DIAGNOSTICS_DIR` — while a deliberate private override and a
+/// production engine keep theirs.
+#[test]
+fn diagnostics_dir_is_fixture_scoped_unless_deliberately_overridden() {
+    let prod_diag = production().diagnostics_dir.unwrap();
+    let scoped = PathBuf::from("/tmp/boss-test-guard-1234.diagnostics");
+
+    assert_eq!(
+        derive(IsolationOverrides::default()).resolve_diagnostics_dir(None),
+        Some(scoped.clone())
+    );
+
+    let inherited = derive(IsolationOverrides {
+        diagnostics_dir: Some(prod_diag.clone()),
+        ..IsolationOverrides::default()
+    });
+    assert_eq!(inherited.resolve_diagnostics_dir(Some(prod_diag.clone())), Some(scoped));
+
+    let private = PathBuf::from("/tmp/my-private-diagnostics");
+    let deliberate = derive(IsolationOverrides {
+        diagnostics_dir: Some(private.clone()),
+        ..IsolationOverrides::default()
+    });
+    assert_eq!(deliberate.resolve_diagnostics_dir(Some(private.clone())), Some(private));
+
+    let production_socket = production_socket();
+    let production_engine = IsolationPaths::derive_from(
+        production_socket.to_str().unwrap(),
+        &IsolationOverrides::default(),
+        &production(),
+    );
+    assert_eq!(production_engine.resolve_diagnostics_dir(None), Some(prod_diag));
 }
 
 // ---------------------------------------------------------------------------
