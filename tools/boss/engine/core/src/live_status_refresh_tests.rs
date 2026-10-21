@@ -15,6 +15,72 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const RUN: &str = "summary-replay";
 
+struct DeathResolver {
+    path: PathBuf,
+    alive: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl TranscriptPathResolver for DeathResolver {
+    async fn transcript_path(&self, _: &str) -> Option<PathBuf> {
+        Some(self.path.clone())
+    }
+
+    async fn worker_can_refresh(&self, _: &str) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[tokio::test]
+async fn dead_session_stops_timer_refresh_of_cached_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("rollout.jsonl");
+    append_action(&transcript, "claude", "inspecting");
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "inspecting the module"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let utility = Arc::new(
+        crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".into()), |_| None)
+            .with_endpoint(format!("{}/v1/messages", server.uri())),
+    );
+    let registry = Arc::new(LiveWorkerStateRegistry::new());
+    registry.register_spawn(1, RUN, "claude", 0, None);
+    registry.set_activity_for_test(1, WorkerActivity::Working);
+    registry.set_last_event_at_for_test(1, "2026-10-20T19:42:42Z");
+    let resolver = Arc::new(DeathResolver {
+        path: transcript,
+        alive: std::sync::atomic::AtomicBool::new(true),
+    });
+    let manager = LiveStatusManager::new();
+    manager.start_slot(
+        1,
+        LiveStatusRun::new(RUN, Arc::new(ClaudeDriver)),
+        utility,
+        registry.clone(),
+        Arc::new(Broadcasts {
+            registry: registry.clone(),
+            summaries: StdMutex::new(Vec::new()),
+        }),
+        resolver.clone(),
+    );
+    await_summary(&registry, "inspecting the module").await;
+    let before = registry.get(1).unwrap();
+    resolver.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+    advance(61).await;
+    manager.notify(1, Trigger::Stop);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let after = registry.get(1).unwrap();
+    assert_eq!(after.live_status, before.live_status);
+    assert_eq!(after.live_status_at, before.live_status_at);
+    assert_eq!(after.last_event_at, before.last_event_at);
+    server.verify().await;
+}
+
 struct Resolver(PathBuf);
 
 #[async_trait]

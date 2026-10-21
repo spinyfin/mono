@@ -252,6 +252,9 @@ struct NotificationRepair {
 
 #[derive(bon::Builder)]
 struct SlotMeta {
+    /// Confirmed process/session death fences buffered transcript events until re-adoption.
+    #[builder(default)]
+    observed_dead: bool,
     /// Set when a `Notification` hook arrives, cleared on the next `Stop`.
     /// Lets us turn a `Stop` into `WaitingForInput` rather than `Idle`
     /// when claude is paused on a permission prompt.
@@ -1771,6 +1774,13 @@ impl LiveWorkerStateRegistry {
                 repaired: false,
             };
         };
+        if meta.observed_dead {
+            return HookApplied {
+                outcome: ApplyEventOutcome::ObservedDead,
+                resumed_after: None,
+                repaired: false,
+            };
+        }
         if let Some(ingress_seq) = ingress_seq {
             if matches!(
                 event,
@@ -1950,6 +1960,21 @@ impl LiveWorkerStateRegistry {
         }
     }
 
+    /// Record observed death without inventing a driver event or refreshing its summary.
+    pub fn mark_terminated(&self, run_id: &str) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(entry) = guard.values_mut().find(|entry| entry.state.run_id == run_id) else {
+            return false;
+        };
+        let state = &mut entry.state;
+        entry.meta.observed_dead = true;
+        let changed = state.activity != WorkerActivity::Terminated;
+        state.activity = WorkerActivity::Terminated;
+        state.current_tool = None;
+        state.recovery_status = None;
+        changed
+    }
+
     /// Replace the live-status string for `slot_id` and stamp
     /// `live_status_at` with the current ISO-8601 timestamp. Returns
     /// `true` iff the entry actually changed — callers gate the
@@ -1966,16 +1991,16 @@ impl LiveWorkerStateRegistry {
     /// arrived before spawn registered, or after release) — the
     /// caller treats that as a benign drop, mirroring `apply_event`.
     ///
-    /// The registry never decides on its own whether the update is
-    /// appropriate for the current activity. The trigger fan-in
-    /// owns that policy (e.g., don't refresh while `Spawning`,
-    /// suppress stale writes after `Idle`); the registry just stores
-    /// the value the caller passed.
+    /// Reject writes after termination, including an in-flight model response.
+    /// The trigger fan-in owns the remaining cadence policy.
     pub fn set_live_status(&self, slot_id: u8, status: Option<String>) -> bool {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let Some(state) = guard.get_mut(&slot_id).map(|entry| &mut entry.state) else {
             return false;
         };
+        if state.activity == WorkerActivity::Terminated {
+            return false;
+        }
         match (&status, &state.live_status) {
             (None, None) => {
                 // Already cleared; nothing to broadcast.
@@ -2310,6 +2335,8 @@ pub enum ApplyEventOutcome {
     /// No entry exists for the slot — the event arrived before spawn
     /// registered it or after release. A benign drop, as before.
     NoSlot,
+    /// Physical death was already confirmed; late transcript events are ignored.
+    ObservedDead,
     /// The event's ingress sequence is older than the newest event already
     /// applied to the slot: the worker emitted it *before* the state the
     /// slot currently shows. Not applied.

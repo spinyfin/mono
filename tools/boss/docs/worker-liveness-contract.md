@@ -146,6 +146,19 @@ being handled here.
 
 ### Retained worker exits
 
+Confirmed session loss is reconciled independently of the last transcript
+event and the activity it left behind: idle and waiting workers can die too.
+The engine marks the pane terminated before asynchronous teardown, preserving
+the final driver timestamp and summary. A surviving recorded PID still blocks
+destructive cleanup for an absent session or mismatched token; it does not
+make that missing pane display as working.
+
+The live-status timer checks the execution's process/session before using its
+cached transcript and again before publishing a model response. Confirmed
+death stops the loop, and the registry rejects summary writes after termination.
+The app renders that activity in the header and the exited body; it does not
+infer death from summary age or viewer attachment.
+
 Before Boss creates its first private-server window, it starts the server and
 sets the global `history-limit=2000` and `remain-on-exit=on` defaults. The
 former makes scrollback a bounded diagnostic convenience; driver JSONL remains

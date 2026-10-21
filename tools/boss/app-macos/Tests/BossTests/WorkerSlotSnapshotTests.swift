@@ -9,6 +9,18 @@ import XCTest
 /// closures so `.equatable()` can skip unchanged slot bodies.
 @MainActor
 final class WorkerSlotSnapshotTests: XCTestCase {
+    func testTerminatedHeaderOverridesStaleGerundAndWorkingFallback() {
+        for summary in [nil, "working", "running tests"] as [String?] {
+            let live = Self.makeLiveState(name: "Dax", activity: .terminated)
+            let snapshot = WorkerSlotSnapshot(
+                slotId: 1, runId: "exec-1", summary: summary, taskTitle: nil,
+                session: nil, liveStatusEnabled: true, live: WorkerSlotLiveSlice(live),
+                isPlaceholder: false, cachedPersona: nil, viewerAttachFailure: nil
+            )
+            XCTAssertEqual(snapshot.headerTitle, "Dax: Exited")
+            XCTAssertEqual(snapshot.viewerMissingMessage, "Worker exited")
+        }
+    }
 
     func testEnginePersonaNamesAndPortraits() throws {
         let client = EngineClient(socketPath: "/tmp/persona-test-\(UUID().uuidString).sock")

@@ -484,6 +484,11 @@ pub trait LiveStatusBroadcaster: Send + Sync {
 #[async_trait]
 pub trait TranscriptPathResolver: Send + Sync {
     async fn transcript_path(&self, run_id: &str) -> Option<PathBuf>;
+
+    /// Check process/session liveness before reading a cached transcript.
+    async fn worker_can_refresh(&self, _run_id: &str) -> bool {
+        true
+    }
 }
 
 /// Per-slot handle stored on the manager. Dropping the sender closes
@@ -877,6 +882,13 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             _ = tokio::time::sleep(timer_remaining) => (Trigger::PostToolUse, true),
         };
 
+        if !registry
+            .get(slot_id)
+            .is_some_and(|state| state.run_id == run_id && state.activity != WorkerActivity::Terminated)
+        {
+            return;
+        }
+
         let kind = trigger_kind(&trigger);
         tracing::debug!(
             slot_id,
@@ -959,6 +971,10 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                 "live_status: skip — quiet activity state",
             );
             continue;
+        }
+
+        if !resolver.worker_can_refresh(&run_id).await {
+            return;
         }
 
         last_refresh_attempt = Instant::now();
@@ -1132,7 +1148,10 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     snap.last_success_at_epoch_s = Some(now_epoch);
                     snap.last_success_text = Some(preview);
                 });
-                if registry.set_live_status(slot_id, Some(text)) {
+                if resolver.worker_can_refresh(&run_id).await
+                    && registry.get(slot_id).is_some_and(|state| state.run_id == run_id)
+                    && registry.set_live_status(slot_id, Some(text))
+                {
                     broadcaster.broadcast_live_worker_states().await;
                 }
                 last_success_at = Some(Instant::now());

@@ -155,6 +155,9 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
         if isPlaceholder {
             return "\(name) finished"
         }
+        if let activity = live?.activity, activity == .terminated || activity == .errored {
+            return "\(name): \(activity.agentsPaneLabel)"
+        }
         if let summary, !summary.isEmpty {
             // Success path: Claude-generated gerund phrase.
             // Preserved verbatim — do NOT change this branch.

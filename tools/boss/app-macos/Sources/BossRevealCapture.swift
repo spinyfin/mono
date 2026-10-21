@@ -50,6 +50,10 @@ enum BossRevealCapture {
             BossAgentsToolbarCapture.start(path: path)
             return
         }
+        if state == "exited-worker" {
+            BossExitedWorkerCapture.start(path: path)
+            return
+        }
         if state == "badge-width" {
             BossBadgeWidthCapture.start(path: path)
             return

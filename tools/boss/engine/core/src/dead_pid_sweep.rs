@@ -435,7 +435,7 @@ async fn reap_live_nonterminal_worker(
         return false;
     };
 
-    if state.activity.is_terminal() {
+    if state.activity.is_terminal() && !matches!(evidence, DeathEvidence::TmuxObservation) {
         // Already finalized via the normal completion path; nothing to do.
         return false;
     }
@@ -643,6 +643,9 @@ async fn reap_dead_execution(
         );
         return false;
     }
+
+    // Freeze status before slow teardown/backup work yields to the summarizer.
+    live_states.mark_terminated(execution_id);
 
     // Every dead-worker reap removes this slot from the live-state registry.
     // Resolve the work item's stale-worker attention before that happens so

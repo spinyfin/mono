@@ -831,11 +831,8 @@ pub async fn run_one_pass_with_terminal_and_grace(
             continue;
         }
 
-        // Only `working` slots are candidates. `Spawning` is still
-        // coming up (no event history expected); `Idle` and
-        // `WaitingForInput` are handled by the completion and
-        // transient-recovery paths; terminal states are done.
-        if state.activity != WorkerActivity::Working {
+        // A spawn may have persisted its session identity before creating it.
+        if state.activity == WorkerActivity::Spawning {
             outcome.not_working_skipped += 1;
             continue;
         }
@@ -853,6 +850,7 @@ pub async fn run_one_pass_with_terminal_and_grace(
             continue;
         };
         if execution.status.is_terminal() {
+            live_states.mark_terminated(&state.run_id);
             resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
             continue;
         }
@@ -862,6 +860,9 @@ pub async fn run_one_pass_with_terminal_and_grace(
         let identity = match terminal_inspector {
             Some(inspector) => match inspector.inspect(&state.run_id).await {
                 Ok(Some(TerminalLiveness::Dead { session_name, evidence })) => {
+                    // The pane is gone even if a surviving PID prevents destructive
+                    // cleanup. Stop presenting that pane as an active worker now.
+                    live_states.mark_terminated(&state.run_id);
                     // Tmux's death signal is authoritative on its own terms;
                     // it needs no cadence/semantic evidence.
                     if evidence.requires_pid_corroboration() {
@@ -927,6 +928,12 @@ pub async fn run_one_pass_with_terminal_and_grace(
             },
             None => None,
         };
+
+        // Death is independent of activity; semantic staleness requires Working.
+        if state.activity != WorkerActivity::Working {
+            outcome.not_working_skipped += 1;
+            continue;
+        }
 
         let Some(identity) = identity else {
             // No tmux identity for this run at all (no terminal inspector
