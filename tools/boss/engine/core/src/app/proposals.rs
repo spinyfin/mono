@@ -429,12 +429,16 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 && !already_submitted
             {
                 let now = boss_engine_utils::epoch_time::now_epoch_secs();
-                match server_state.wait_registry.declare(
+                // Order the wait against the worker's hook stream, so a turn
+                // boundary that predates the declaration cannot end it.
+                let declared_after_seq = Some(server_state.accepted_hook_seq.load(Ordering::SeqCst));
+                match server_state.wait_registry.declare_after(
                     &caller.execution_id,
                     payload.reason,
                     payload.waiting_on,
                     payload.duration_secs,
                     now,
+                    declared_after_seq,
                 ) {
                     Ok(record) => {
                         server_state.broadcast_live_worker_states().await;

@@ -82,6 +82,7 @@ mod dependencies;
 mod design_docs;
 mod effort;
 mod engine_meta;
+mod events_accept;
 mod executions;
 mod external_tracker;
 mod github_auth;
@@ -130,6 +131,7 @@ mod subscriptions;
 #[cfg(test)]
 mod tests;
 mod tmux_teardown;
+mod transcript_persist;
 mod trunk_auth;
 mod trust;
 mod viewer_reconcile;
@@ -694,6 +696,9 @@ struct ServerState {
     /// [`crate::wait_registry`].
     #[builder(default)]
     wait_registry: Arc<crate::wait_registry::WaitRegistry>,
+    /// Newest accepted hook, including connections not yet dispatched.
+    #[builder(default)]
+    accepted_hook_seq: Arc<AtomicU64>,
     /// In-flight completion-teardown marks, shared with the completion
     /// handler so [`crate::terminal_work_sweep`] (wired in
     /// `app::server::serve`) never reclaims a pane whose own teardown is

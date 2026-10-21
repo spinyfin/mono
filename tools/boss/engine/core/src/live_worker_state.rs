@@ -3,7 +3,10 @@
 //! The events socket consumer feeds this; bossctl reads from it via
 //! the frontend RPC; the topic broker re-publishes the full snapshot
 //! whenever any slot changes so UI subscribers can push to the kanban
-//! Doing icon and the pane titlebar pill in near-real-time.
+//! Doing icon and the pane titlebar pill in near-real-time. Hook events
+//! are applied in the worker's emission order, never in the order their
+//! per-connection ingress tasks happen to finish — see
+//! [`LiveWorkerStateRegistry::apply_sequenced_event`].
 //!
 //! Keyed by slot id (the interactive pool spans 1..=16 across two pages,
 //! with automation/review above it), not run id — run records finalise
@@ -225,6 +228,12 @@ struct SlotEntry {
 /// the caller; the rest start at the one value a fresh entry can honestly
 /// hold (`bon` defaults `Option` fields to `None` on its own), so the
 /// construction site states exactly what it knows and nothing else.
+#[derive(Clone, Copy)]
+struct NotificationRepair {
+    notification_seq: u64,
+    stop_seq: u64,
+}
+
 #[derive(bon::Builder)]
 struct SlotMeta {
     /// Set when a `Notification` hook arrives, cleared on the next `Stop`.
@@ -232,6 +241,15 @@ struct SlotMeta {
     /// when claude is paused on a permission prompt.
     #[builder(default = false)]
     notification_pending: bool,
+    /// Ingress sequence of the `Notification` behind `notification_pending`,
+    /// so a clearing hook that arrives late but was emitted after it can
+    /// still consume it.
+    notification_pending_seq: Option<u64>,
+    /// A late `Notification` that repaired the slot from `Idle` to
+    /// `WaitingForInput` on the strength of the `Stop` at `stop_seq`. A
+    /// clearing hook emitted between the two proves that `Stop` did not
+    /// consume the notification, and undoes the repair.
+    notification_repair: Option<NotificationRepair>,
     /// Epoch-seconds timestamp recorded when `register_spawn` creates the
     /// entry. Used by `mark_stalled_spawns` to detect workers that have
     /// been stuck in `Spawning` without any hook event (the initial
@@ -343,6 +361,32 @@ struct SlotMeta {
     /// this counter is ever consulted.
     #[builder(default)]
     undeterminable_liveness_passes: u32,
+    /// Accept-order sequence of the newest hook event applied to this slot
+    /// through [`LiveWorkerStateRegistry::apply_sequenced_event`]. `None`
+    /// until the first sequenced event lands, and for slots fed only by
+    /// unsequenced ingress (the Codex stdout reader, engine-synthesized
+    /// events). A sequenced event numbered below this value was emitted by
+    /// the worker *before* the state the slot already shows, so applying it
+    /// would rewind the slot — it is refused instead; see that method.
+    last_applied_ingress_seq: Option<u64>,
+    /// The turn boundary (`Stop`) the worker is currently parked behind and
+    /// has not yet resumed from. Set by a `Stop`, taken by the next
+    /// main-session `UserPromptSubmit`/`PreToolUse`/`PostToolUse` — see
+    /// [`TurnBoundary`]. Deliberately not derived from the slot's activity:
+    /// a permission-prompt `Notification` also leaves `Working`, but it is
+    /// not a turn boundary and the tool that follows it is not a resume.
+    open_turn_boundary: Option<TurnBoundary>,
+    /// Sequence of the newest main-session `UserPromptSubmit`/`PreToolUse`/
+    /// `PostToolUse` applied. A `Stop` numbered below it was followed by a
+    /// resumed turn even though the `Stop` itself arrives late.
+    last_main_activity_seq: Option<u64>,
+    /// Sequence of the newest `Stop` applied (it consumed any pending
+    /// `Notification`).
+    last_stop_seq: Option<u64>,
+    /// Ordered clearing events retained for this slot lifetime so a late
+    /// notification is attributed to its first consumer, not the newest one.
+    #[builder(default)]
+    pending_clear_seqs: std::collections::BTreeSet<u64>,
     /// Whether [`crate::spawn_ack_sweep::raise_liveness_undeterminable_attention`]
     /// has already fired for this slot's current run. Guards against raising
     /// the same attention item again on every subsequent pass once the
@@ -1549,15 +1593,126 @@ impl LiveWorkerStateRegistry {
     /// when present it is treated as authoritative and overwrites the
     /// launch default stamped at spawn. When absent (Codex stdout
     /// `thread.started`, older fixtures), the launch default is retained.
+    ///
+    /// Unsequenced form of [`Self::apply_sequenced_event`]: the event is
+    /// always applied, in arrival order. Callers whose ingress is already
+    /// sequential (the Codex stdout reader, engine-synthesized events,
+    /// tests) use this.
     pub fn apply_event(&self, slot_id: u8, event: &WorkerEvent) -> bool {
+        matches!(
+            self.apply_sequenced_event(slot_id, None, event),
+            ApplyEventOutcome::Applied { changed: true }
+        )
+    }
+
+    /// [`Self::apply_event`], applied in the worker's emission order.
+    ///
+    /// `ingress_seq` is the accept-order sequence the events-socket accept
+    /// loop stamped on the hook's connection
+    /// ([`crate::events_socket::HookConnection::ingress_seq`]). Each
+    /// connection is dispatched on its own task, so two hooks the worker
+    /// emitted in order can reach this method in either order — and the
+    /// race is not symmetric: a turn boundary persists the transcript path
+    /// and captures run cost before it gets here, while a `PreToolUse`
+    /// arrives almost directly. When Claude Code wakes a stopped session on
+    /// its own (a background command finished) the resumed turn opens with
+    /// tool hooks, no `UserPromptSubmit`; if the preceding `Stop` is still
+    /// on its way, it lands *after* the `PreToolUse` and rewinds the slot to
+    /// `Idle` with no tool, for as long as the next hook takes to arrive —
+    /// potentially the whole of a long tool call. See worker-liveness-contract.md
+    /// for what this explains and leaves unproven about the 2026-10-15 incident.
+    ///
+    /// So the slot remembers the newest sequence it applied, and an event
+    /// numbered below it is refused as [`ApplyEventOutcome::Stale`]: it
+    /// describes a state the worker has already moved past. Liveness
+    /// bookkeeping for a stale event is unaffected — the ingress recorded
+    /// the driver signal before calling here — and `None` always applies.
+    pub fn apply_sequenced_event(
+        &self,
+        slot_id: u8,
+        ingress_seq: Option<u64>,
+        event: &WorkerEvent,
+    ) -> ApplyEventOutcome {
+        self.apply_hook_event(
+            slot_id,
+            HookOrigin {
+                ingress_seq,
+                from_subagent: false,
+            },
+            event,
+        )
+        .outcome
+    }
+
+    /// Ingress sequence of the newest hook applied to `slot_id`, if any.
+    pub fn last_applied_ingress_seq(&self, slot_id: u8) -> Option<u64> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.get(&slot_id)?.meta.last_applied_ingress_seq
+    }
+
+    /// [`Self::apply_sequenced_event`] with the hook's full provenance, and
+    /// the turn-resume evidence the reduction produced.
+    ///
+    /// A *late* event is not simply discarded, because hook events are
+    /// incremental transitions rather than snapshots and two of them leave
+    /// state behind that later events read:
+    ///
+    /// - a `Notification` overtaken by the `Stop` that followed it still
+    ///   turns that `Stop` into `WaitingForInput` in emission order, so the
+    ///   late `Notification` repairs the slot (or sets the pending flag the
+    ///   events after it did not clear);
+    /// - a `Stop` overtaken by the resumed turn's tool hook still opened a
+    ///   turn boundary, which is reported through
+    ///   [`HookApplied::resumed_after`] so the caller can end the wait the
+    ///   worker declared before it.
+    ///
+    /// Every other late event describes a state the worker has already left
+    /// and is refused.
+    pub fn apply_hook_event(&self, slot_id: u8, origin: HookOrigin, event: &WorkerEvent) -> HookApplied {
+        let ingress_seq = origin.ingress_seq;
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let now = current_iso8601();
         // The wire state and the per-slot bookkeeping this arm reads and
         // writes now live in one entry, so a single lookup reaches both;
         // `SlotEntry`'s fields split-borrow without a second map access.
         let Some(SlotEntry { state, meta }) = guard.get_mut(&slot_id) else {
-            return false;
+            return HookApplied {
+                outcome: ApplyEventOutcome::NoSlot,
+                resumed_after: None,
+                repaired: false,
+            };
         };
+        if let Some(ingress_seq) = ingress_seq {
+            if matches!(
+                event,
+                WorkerEvent::Stop { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::SessionEnd { .. }
+            ) {
+                meta.pending_clear_seqs.insert(ingress_seq);
+            }
+            if let Some(last_applied_seq) = meta.last_applied_ingress_seq
+                && last_applied_seq > ingress_seq
+            {
+                tracing::info!(
+                    slot_id,
+                    run_id = %state.run_id,
+                    event = worker_event_name(event),
+                    ingress_seq,
+                    last_applied_seq,
+                    activity = state.activity.as_str(),
+                    current_tool = state.current_tool.as_deref().unwrap_or("-"),
+                    "live-state registry: a hook event arrived behind a newer one; \
+                     the slot already reflects what the worker did after it",
+                );
+                let (resumed_after, repaired) = reconcile_late_event(state, meta, ingress_seq, event, origin);
+                return HookApplied {
+                    outcome: ApplyEventOutcome::Stale { last_applied_seq },
+                    resumed_after,
+                    repaired,
+                };
+            }
+            meta.last_applied_ingress_seq = Some(ingress_seq);
+        }
+        let resumed_after = record_turn_progress(meta, ingress_seq, event, origin);
         let before = state.clone();
 
         state.last_event_at = Some(now.clone());
@@ -1617,6 +1772,7 @@ impl LiveWorkerStateRegistry {
                 state.activity = WorkerActivity::Working;
                 state.current_tool = Some(tool_name.clone());
                 meta.notification_pending = false;
+                meta.notification_pending_seq = None;
             }
             WorkerEvent::PostToolUse { .. } => {
                 state.current_tool = None;
@@ -1638,9 +1794,11 @@ impl LiveWorkerStateRegistry {
                     state.activity = WorkerActivity::WaitingForInput;
                     state.current_tool = None;
                     meta.notification_pending = true;
+                    meta.notification_pending_seq = ingress_seq;
                 }
             }
             WorkerEvent::Stop { .. } => {
+                meta.notification_pending_seq = None;
                 let was_pending = std::mem::take(&mut meta.notification_pending);
                 state.current_tool = None;
                 state.activity = if was_pending {
@@ -1675,6 +1833,7 @@ impl LiveWorkerStateRegistry {
                 // work. Keeping `current_tool` is what lets the corroboration
                 // guard see through a `SessionEnd` the process did not honor.
                 meta.notification_pending = false;
+                meta.notification_pending_seq = None;
             }
         }
 
@@ -1685,7 +1844,13 @@ impl LiveWorkerStateRegistry {
         let mut comparable_after = state.clone();
         comparable_after.last_event_at = before.last_event_at.clone();
         comparable_after.last_tool_ended_at = before.last_tool_ended_at.clone();
-        before != comparable_after
+        HookApplied {
+            outcome: ApplyEventOutcome::Applied {
+                changed: before != comparable_after,
+            },
+            resumed_after,
+            repaired: false,
+        }
     }
 
     /// Replace the live-status string for `slot_id` and stamp
@@ -2030,6 +2195,211 @@ impl LiveWorkerStateRegistry {
         if let Some(entry) = guard.get_mut(&slot_id) {
             entry.meta.semantic_tool_condition = tool_condition;
         }
+    }
+}
+
+/// What [`LiveWorkerStateRegistry::apply_sequenced_event`] did with an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyEventOutcome {
+    /// The event was applied. `changed` reports whether any observable
+    /// field moved, exactly as [`LiveWorkerStateRegistry::apply_event`]'s
+    /// boolean does, so callers can keep suppressing no-op broadcasts.
+    Applied { changed: bool },
+    /// No entry exists for the slot — the event arrived before spawn
+    /// registered it or after release. A benign drop, as before.
+    NoSlot,
+    /// The event's ingress sequence is older than the newest event already
+    /// applied to the slot: the worker emitted it *before* the state the
+    /// slot currently shows. Not applied.
+    Stale { last_applied_seq: u64 },
+}
+
+/// Where the hook came from, beyond the event itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HookOrigin {
+    /// Accept-order sequence; see [`LiveWorkerStateRegistry::apply_sequenced_event`].
+    pub ingress_seq: Option<u64>,
+    /// The hook fired inside a subagent the main session launched, not in
+    /// the main session itself. A subagent keeps working after the main
+    /// session's turn has ended, so its tool hooks are not evidence that the
+    /// main session started a new turn.
+    pub from_subagent: bool,
+}
+
+/// A turn boundary (`Stop`) the main session was parked behind. `seq` is
+/// the boundary's ingress sequence (`None` for unsequenced ingress).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnBoundary {
+    pub seq: Option<u64>,
+}
+
+/// Result of [`LiveWorkerStateRegistry::apply_hook_event`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HookApplied {
+    pub outcome: ApplyEventOutcome,
+    /// Set when this hook is proof the main session started a new turn
+    /// after `TurnBoundary` — either the first main-session activity
+    /// following a `Stop`, or the late `Stop` itself once main-session
+    /// activity numbered above it has already been applied. This is what
+    /// ends a wait declared before that boundary: it is keyed on turn
+    /// ordering, not on the activity the slot happened to show.
+    pub resumed_after: Option<TurnBoundary>,
+    /// A late event was refused as [`ApplyEventOutcome::Stale`] but still
+    /// repaired the slot's activity (a `Notification` overtaken by its
+    /// `Stop`), so the caller must treat the slot as changed.
+    pub repaired: bool,
+}
+
+/// Bookkeeping for the turn lifecycle, run for every event that is applied.
+/// Returns the boundary the main session just resumed from, if any.
+fn record_turn_progress(
+    meta: &mut SlotMeta,
+    seq: Option<u64>,
+    event: &WorkerEvent,
+    origin: HookOrigin,
+) -> Option<TurnBoundary> {
+    let keep_newest = |slot: &mut Option<u64>| {
+        if seq.is_some() {
+            *slot = seq;
+        }
+    };
+    match event {
+        WorkerEvent::Stop { .. } => {
+            keep_newest(&mut meta.last_stop_seq);
+            meta.open_turn_boundary = Some(TurnBoundary { seq });
+            None
+        }
+        WorkerEvent::SessionEnd { .. } => None,
+        WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. } => {
+            if origin.from_subagent {
+                return None;
+            }
+            keep_newest(&mut meta.last_main_activity_seq);
+            meta.open_turn_boundary.take()
+        }
+        WorkerEvent::SessionStart { .. } | WorkerEvent::Notification { .. } => None,
+    }
+}
+
+/// What a late (stale) event still contributes. Returns the boundary it
+/// proves the main session resumed from, and whether it repaired the slot.
+fn reconcile_late_event(
+    state: &mut LiveWorkerState,
+    meta: &mut SlotMeta,
+    seq: u64,
+    event: &WorkerEvent,
+    origin: HookOrigin,
+) -> (Option<TurnBoundary>, bool) {
+    match event {
+        WorkerEvent::Stop { .. } => {
+            let repaired = consume_late_notification(state, meta, seq);
+            let boundary = TurnBoundary { seq: Some(seq) };
+            if meta.last_main_activity_seq.is_some_and(|main| main > seq) {
+                return (Some(boundary), repaired);
+            }
+            // Only subagent hooks have been applied since: the main session
+            // is still behind this boundary, and its next hook resumes it.
+            let newest = meta
+                .open_turn_boundary
+                .and_then(|open| open.seq)
+                .map_or(seq, |open| open.max(seq));
+            meta.open_turn_boundary = Some(TurnBoundary { seq: Some(newest) });
+            (None, repaired)
+        }
+        WorkerEvent::SessionEnd { .. } => (None, consume_late_notification(state, meta, seq)),
+        WorkerEvent::Notification { .. } if meta.awaiting_input_capable => {
+            match meta
+                .pending_clear_seqs
+                .range((std::ops::Bound::Excluded(seq), std::ops::Bound::Unbounded))
+                .next()
+                .copied()
+            {
+                // In emission order this `Notification` was consumed by the
+                // event at `clear`. If that was the newest `Stop` and nothing
+                // has applied since, the `Stop` produced `Idle` for want of
+                // this `Notification`: it should have been `WaitingForInput`.
+                Some(clear) if clear > seq => {
+                    let stop_is_newest =
+                        meta.last_stop_seq == Some(clear) && meta.last_applied_ingress_seq == Some(clear);
+                    if stop_is_newest && state.activity == WorkerActivity::Idle {
+                        state.activity = WorkerActivity::WaitingForInput;
+                        state.current_tool = None;
+                        meta.notification_repair = Some(NotificationRepair {
+                            notification_seq: seq,
+                            stop_seq: clear,
+                        });
+                        return (None, true);
+                    }
+                    (None, false)
+                }
+                // Nothing applied since has cleared it: it is still pending
+                // for the `Stop` that ends this turn.
+                _ => {
+                    meta.notification_pending = true;
+                    meta.notification_pending_seq = Some(seq);
+                    (None, false)
+                }
+            }
+        }
+        WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. }
+            if !origin.from_subagent =>
+        {
+            let repaired =
+                matches!(event, WorkerEvent::PreToolUse { .. }) && consume_late_notification(state, meta, seq);
+            meta.last_main_activity_seq = Some(meta.last_main_activity_seq.map_or(seq, |last| last.max(seq)));
+            let resumed = meta
+                .open_turn_boundary
+                .filter(|boundary| boundary.seq.is_none_or(|stop| seq > stop));
+            if resumed.is_some() {
+                meta.open_turn_boundary = None;
+            }
+            (resumed, repaired)
+        }
+        _ => (None, false),
+    }
+}
+
+/// A clearing hook (`Stop`, `PreToolUse`, `SessionEnd`) that arrives late
+/// consumes every `Notification` emitted before it that is still waiting on
+/// a consumer, including one that was reduced earlier in its absence:
+///
+/// - a pending flag set by a notification numbered below `seq` is dropped;
+/// - a repair to `WaitingForInput` made on the strength of a later `Stop` is
+///   undone, provided that `Stop` is still the newest thing applied and the
+///   slot is still where the repair left it. Returns `true` in that case so
+///   the caller mirrors the durable status back.
+///
+/// A notification numbered above `seq` is untouched.
+fn consume_late_notification(state: &mut LiveWorkerState, meta: &mut SlotMeta, seq: u64) -> bool {
+    if meta.notification_pending && meta.notification_pending_seq.is_some_and(|pending| pending < seq) {
+        meta.notification_pending = false;
+        meta.notification_pending_seq = None;
+    }
+    let Some(repair) = meta.notification_repair else {
+        return false;
+    };
+    if repair.notification_seq >= seq || seq >= repair.stop_seq {
+        return false;
+    }
+    meta.notification_repair = None;
+    if state.activity == WorkerActivity::WaitingForInput && meta.last_applied_ingress_seq == Some(repair.stop_seq) {
+        state.activity = WorkerActivity::Idle;
+        return true;
+    }
+    false
+}
+
+/// Hook event name for log lines — the payload's `hook_event_name`, not
+/// the full event (a `PreToolUse` carries the whole tool input).
+fn worker_event_name(event: &WorkerEvent) -> &'static str {
+    match event {
+        WorkerEvent::SessionStart { .. } => "SessionStart",
+        WorkerEvent::UserPromptSubmit { .. } => "UserPromptSubmit",
+        WorkerEvent::PreToolUse { .. } => "PreToolUse",
+        WorkerEvent::PostToolUse { .. } => "PostToolUse",
+        WorkerEvent::Stop { .. } => "Stop",
+        WorkerEvent::Notification { .. } => "Notification",
+        WorkerEvent::SessionEnd { .. } => "SessionEnd",
     }
 }
 
