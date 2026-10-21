@@ -29,7 +29,7 @@ use crate::semantic_progress::{
 mod declared_wait;
 mod never_started_reap;
 pub use declared_wait::{DeclaredWait, DeclaredWaitSource};
-use declared_wait::{ParkedBy, SharedWaitSource, is_idle_prompt_message, reconcile_parked, settle_parked};
+use declared_wait::{SharedWaitSource, is_idle_prompt_message, reconcile_parked, settle_parked};
 pub use never_started_reap::NeverStartedReapCommit;
 
 /// Attributed worker-pool label for a live run (`"main"`, `"automation"`,
@@ -1264,7 +1264,14 @@ impl LiveWorkerStateRegistry {
     /// by the topic publisher.
     pub fn snapshot(&self) -> Vec<LiveWorkerState> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
-        let mut out: Vec<LiveWorkerState> = guard.values().map(|entry| entry.state.clone()).collect();
+        let mut out: Vec<LiveWorkerState> = guard
+            .values()
+            .map(|entry| {
+                let mut state = entry.state.clone();
+                state.live_status = crate::live_status::activity_subtitle(state.activity, state.live_status.as_deref());
+                state
+            })
+            .collect();
         out.sort_by_key(|s| s.slot_id);
         out
     }
@@ -1797,8 +1804,8 @@ impl LiveWorkerStateRegistry {
     ///   events after it did not clear);
     /// - a `Stop` overtaken by the resumed turn's tool hook still opened a
     ///   turn boundary, which is reported through
-    ///   [`HookApplied::resumed_after`] so the caller can end the wait the
-    ///   worker declared before it.
+    ///   [`HookApplied::resumed_after`] and consumes the wait declared before
+    ///   that boundary before another event can read it.
     ///
     /// Every other late event describes a state the worker has already left
     /// and is refused.
@@ -1848,6 +1855,19 @@ impl LiveWorkerStateRegistry {
                      the slot already reflects what the worker did after it",
                 );
                 let (resumed_after, repaired) = reconcile_late_event(state, meta, ingress_seq, event, origin);
+                if let Some(boundary) = resumed_after
+                    && let Some(source) = &wait_source
+                {
+                    source.resume(&state.run_id, boundary.seq);
+                }
+                if repaired && matches!(state.activity, WorkerActivity::Idle | WorkerActivity::WaitingForInput) {
+                    state.activity = settle_parked(
+                        state.activity,
+                        meta.blocking_prompt_pending,
+                        wait_state(&wait_source, &state.run_id),
+                    );
+                }
+
                 return HookApplied {
                     outcome: ApplyEventOutcome::Stale { last_applied_seq },
                     resumed_after,
@@ -1858,6 +1878,12 @@ impl LiveWorkerStateRegistry {
         }
         let resumed_after = record_turn_progress(meta, ingress_seq, event, origin);
         let before = state.clone();
+
+        if let Some(boundary) = resumed_after
+            && let Some(source) = &wait_source
+        {
+            source.resume(&state.run_id, boundary.seq);
+        }
 
         state.last_event_at = Some(now.clone());
         // Driver-originated only: this method is the hook/JSONL ingress.
@@ -1961,8 +1987,6 @@ impl LiveWorkerStateRegistry {
                     // idle prompt is a human's problem.
                     state.activity = settle_parked(
                         WorkerActivity::WaitingForInput,
-                        before.activity,
-                        ParkedBy::Notification,
                         meta.blocking_prompt_pending,
                         wait_state(&wait_source, &state.run_id),
                     );
@@ -1982,13 +2006,7 @@ impl LiveWorkerStateRegistry {
                 } else {
                     WorkerActivity::Idle
                 };
-                state.activity = settle_parked(
-                    raw,
-                    before.activity,
-                    ParkedBy::Stop,
-                    blocking,
-                    wait_state(&wait_source, &state.run_id),
-                );
+                state.activity = settle_parked(raw, blocking, wait_state(&wait_source, &state.run_id));
             }
             WorkerEvent::SessionEnd { .. } => {
                 state.activity = WorkerActivity::Terminated;
@@ -2610,7 +2628,7 @@ fn reconcile_late_event(
         }
         WorkerEvent::ToolPoll { .. } | WorkerEvent::ModelProgress { .. } => (None, false),
         WorkerEvent::SessionEnd { .. } => (None, consume_late_notification(state, meta, seq)),
-        WorkerEvent::Notification { .. } if meta.awaiting_input_capable => {
+        WorkerEvent::Notification { message, .. } if meta.awaiting_input_capable => {
             match meta
                 .pending_clear_seqs
                 .range((std::ops::Bound::Excluded(seq), std::ops::Bound::Unbounded))
@@ -2624,7 +2642,13 @@ fn reconcile_late_event(
                 Some(clear) if clear > seq => {
                     let stop_is_newest =
                         meta.last_stop_seq == Some(clear) && meta.last_applied_ingress_seq == Some(clear);
-                    if stop_is_newest && state.activity == WorkerActivity::Idle {
+                    if stop_is_newest
+                        && matches!(
+                            state.activity,
+                            WorkerActivity::Idle | WorkerActivity::WaitingOnWork | WorkerActivity::WaitOverdue
+                        )
+                    {
+                        meta.blocking_prompt_pending |= !is_idle_prompt_message(message);
                         state.activity = WorkerActivity::WaitingForInput;
                         state.current_tool = None;
                         meta.notification_repair = Some(NotificationRepair {
@@ -2640,6 +2664,7 @@ fn reconcile_late_event(
                 _ => {
                     meta.notification_pending = true;
                     meta.notification_pending_seq = Some(seq);
+                    meta.blocking_prompt_pending |= !is_idle_prompt_message(message);
                     (None, false)
                 }
             }
@@ -2677,6 +2702,7 @@ fn consume_late_notification(state: &mut LiveWorkerState, meta: &mut SlotMeta, s
     if meta.notification_pending && meta.notification_pending_seq.is_some_and(|pending| pending < seq) {
         meta.notification_pending = false;
         meta.notification_pending_seq = None;
+        meta.blocking_prompt_pending = false;
     }
     let Some(repair) = meta.notification_repair else {
         return false;
@@ -2685,6 +2711,7 @@ fn consume_late_notification(state: &mut LiveWorkerState, meta: &mut SlotMeta, s
         return false;
     }
     meta.notification_repair = None;
+    meta.blocking_prompt_pending = false;
     if state.activity == WorkerActivity::WaitingForInput && meta.last_applied_ingress_seq == Some(repair.stop_seq) {
         state.activity = WorkerActivity::Idle;
         return true;

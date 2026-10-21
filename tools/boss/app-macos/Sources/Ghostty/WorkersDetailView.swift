@@ -508,7 +508,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
                     .help(snapshot.runId ?? "")
                     .accessibilityLabel(wait)
             }
-        } else if let live = snapshot.live?.liveStatus,
+        } else if let live = snapshot.live?.activity.slotSubtitle(prior: snapshot.live?.liveStatus),
            !live.isEmpty
         {
             HStack(alignment: .firstTextBaseline, spacing: 4) {

@@ -530,3 +530,19 @@ enum AgentActivityState: Equatable {
         }
     }
 }
+
+extension WorkerActivity {
+    /// Keep a narrative summary, but project state literals from current activity.
+    func slotSubtitle(prior: String?) -> String? {
+        let literals = ["awaiting input", "waiting on its own work", "wait expired — check on it"]
+        if let prior, !prior.isEmpty, !literals.contains(prior) {
+            return prior
+        }
+        switch self {
+        case .waitingForInput: return literals[0]
+        case .waitingOnWork: return literals[1]
+        case .waitOverdue: return literals[2]
+        default: return nil
+        }
+    }
+}

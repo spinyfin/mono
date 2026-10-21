@@ -141,7 +141,8 @@ async fn a_background_wakeup_turn_reads_as_working_and_ends_the_declared_wait() 
 
     dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 5)).await;
     let idle = snapshot(&server_state);
-    assert_eq!(idle.activity, WorkerActivity::Idle);
+    assert_eq!(idle.activity, WorkerActivity::WaitingOnWork);
+    assert!(!idle.activity.needs_human());
     assert!(idle.current_tool.is_none());
     assert_eq!(
         idle.wait_reason.as_deref(),

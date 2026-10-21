@@ -269,6 +269,24 @@ final class AwaitingInputKanbanTests: XCTestCase {
         XCTAssertEqual(WorkerActivity.waitOverdue.agentsPaneLabel, "Wait overdue")
     }
 
+    func testSubtitleAndNeedsInputAgreeAcrossTransitions() {
+        let cases: [(WorkerActivity, String?, Bool)] = [
+            (.waitingOnWork, "waiting on its own work", false),
+            (.waitOverdue, "wait expired — check on it", false),
+            (.waitingForInput, "awaiting input", true),
+            (.working, nil, false),
+            (.idle, nil, false),
+        ]
+        for (activity, expected, needsHuman) in cases {
+            for prior in ["awaiting input", "waiting on its own work", "wait expired — check on it"] {
+                XCTAssertEqual(activity.slotSubtitle(prior: prior), expected)
+                XCTAssertEqual(activity.needsHuman, needsHuman)
+            }
+            XCTAssertEqual(activity.slotSubtitle(prior: "investigating the bug"), "investigating the bug")
+            XCTAssertEqual(activity.slotSubtitle(prior: nil), expected)
+        }
+    }
+
     // MARK: - Helpers
 
     private func makeLiveState(
