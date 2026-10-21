@@ -28,7 +28,7 @@ use super::ProgressReporter;
 ///
 /// Chosen from measurement: see `tools/checkleft/docs/slow-check-threshold.md`
 /// for the observed per-check peaks and the margin applied.
-pub const DEFAULT_SLOW_CHECK_THRESHOLD: Duration = Duration::from_secs(30);
+pub const DEFAULT_SLOW_CHECK_THRESHOLD: Duration = Duration::from_secs(180);
 
 /// How often the watcher thread polls the monitor.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -330,7 +330,13 @@ mod tests {
         assert!(printed.lock().unwrap().is_empty());
         assert_eq!(
             *inner.events.lock().unwrap(),
-            vec!["register typo 2", "start typo", "progress typo 2", "stream typo", "finish typo 0"]
+            vec![
+                "register typo 2",
+                "start typo",
+                "progress typo 2",
+                "stream typo",
+                "finish typo 0"
+            ]
         );
     }
 }

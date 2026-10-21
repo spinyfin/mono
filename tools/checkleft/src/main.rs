@@ -2310,7 +2310,10 @@ fn severity_sort_key(severity: Severity) -> u8 {
 /// the live UI's log area when it is active (so they do not tear the pinned
 /// status block); otherwise to stderr, which keeps `--format json` stdout
 /// parseable.
-fn with_slow_check_reporting(inner: Arc<dyn ProgressReporter>, live: Option<&LiveProgress>) -> Arc<dyn ProgressReporter> {
+fn with_slow_check_reporting(
+    inner: Arc<dyn ProgressReporter>,
+    live: Option<&LiveProgress>,
+) -> Arc<dyn ProgressReporter> {
     let sink: SlowCheckSink = match live {
         Some(progress) => progress.log_sink(),
         None => Arc::new(|lines| {
