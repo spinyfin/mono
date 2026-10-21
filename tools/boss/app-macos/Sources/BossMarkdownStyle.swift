@@ -170,6 +170,53 @@ enum MarkdownEditorialMetrics {
     /// editorial body size instead of falling back to the compact scale.
     static let codeBlockScale: CGFloat = 0.82 * bodyScale
 
+    /// Extra leading between a paragraph's wrapped lines, in ems of that
+    /// paragraph's own (already `bodyScale`d) font. SwiftUI `lineSpacing` is
+    /// additional to the font's natural line box: measured via NSFont at the
+    /// enlarged editorial body size (19.04pt), the system sans's natural box
+    /// is ~1.178em, so 0.47em of extra leading yields an effective line
+    /// height of ~1.65em — the top of the 1.6–1.65 reference range.
+    static let editorialBodyLeading: CGFloat = 0.47
+
+    /// The compact surfaces' leading, unchanged from Textual's GitHub
+    /// paragraph style.
+    static let compactBodyLeading: CGFloat = 0.25
+
+    /// How much further apart consecutive list items sit than the wrapped
+    /// lines inside one item, in ems of the body font. Small on purpose: a
+    /// markdown list is tight, so the gap must read as item separation
+    /// without approaching the 1em paragraph gap.
+    static let listItemSeparation: CGFloat = 0.25
+
+    /// The one leading value prose and lists share. Lines inside a list item
+    /// are laid out by the paragraph style, so they inherit this directly;
+    /// `listItemGap` derives the between-item gap from it so the two can never
+    /// drift apart again.
+    static func bodyLeading(editorial: Bool) -> CGFloat {
+        editorial ? editorialBodyLeading : compactBodyLeading
+    }
+
+    /// Spacing between consecutive list items, in ems of the body font:
+    /// never less than the in-item leading, plus `listItemSeparation`.
+    static func listItemGap(editorial: Bool) -> CGFloat {
+        bodyLeading(editorial: editorial) + listItemSeparation
+    }
+
+    /// `listItemGap` for Textual's `listItemSpacing` environment value as set
+    /// at the theme root. Textual resolves that value at the *list's* font,
+    /// which at the root is the environment body font before any block has
+    /// applied `bodyScale`; the editorial gap is pre-multiplied so it lands at
+    /// the same points as the leading inside a `bodyScale`d paragraph.
+    static func rootListItemSpacing(editorial: Bool) -> FontScaled<StructuredText.BlockSpacing> {
+        .fontScaled(top: listItemGap(editorial: editorial) * (editorial ? bodyScale : 1))
+    }
+
+    /// `listItemGap` for a list nested inside an editorial list item, where
+    /// the item row has already applied `bodyScale` to the environment font,
+    /// so the value is expressed in the scaled font's own ems.
+    static let nestedEditorialListItemSpacing: FontScaled<StructuredText.BlockSpacing> =
+        .fontScaled(top: listItemGap(editorial: true))
+
     /// Compact surfaces deliberately retain their fixed, pre-editorial
     /// heading rhythm even when their caller applies a smaller font scale.
     static let compactHeadingSpacing = StructuredText.BlockSpacing(top: 16, bottom: 8)
@@ -336,18 +383,14 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
                 .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
                 .font(.system(.body, design: .default))
                 .foregroundStyle(BossMarkdownPalette.ink)
-                // SwiftUI `lineSpacing` is extra leading on top of the font's
-                // own natural line box. Measured via NSFont at the enlarged
-                // editorial body size (19.04pt), the system sans's natural
-                // box is ~1.178em, so 0.47em of additional fontScaled leading
-                // yields an effective line height of ~1.65em — the top of
-                // the 1.6–1.65 reference range.
-                .textual.lineSpacing(.fontScaled(0.47))
+                // The leading shared with lists — see
+                // `MarkdownEditorialMetrics.bodyLeading` for the derivation.
+                .textual.lineSpacing(.fontScaled(MarkdownEditorialMetrics.bodyLeading(editorial: true)))
                 .textual.blockSpacing(.fontScaled(top: 0, bottom: 1))
                 .proseMeasureClamped()
         } else {
             configuration.label
-                .textual.lineSpacing(.fontScaled(0.25))
+                .textual.lineSpacing(.fontScaled(MarkdownEditorialMetrics.bodyLeading(editorial: false)))
                 .textual.blockSpacing(.init(top: 0, bottom: 16))
                 .proseMeasureClamped()
         }
@@ -384,10 +427,19 @@ struct BossListItemStyle: StructuredText.ListItemStyle {
     // does not clip the marker, so its glyph and its font-scaled horizontal
     // width remain unchanged, while the block is the sole source of line
     // height. This applies equally to unordered, ordered, and nested lists.
+    //
+    // The lines *inside* an item are laid out by `BossParagraphStyle`, so
+    // they already carry the body leading. The gap *between* items is
+    // Textual's `listItemSpacing`, which the list resolves at its own font
+    // and which `BossMarkdownTheme` sets at the root; a list nested inside
+    // this row sees the `bodyScale`d font instead, so the row re-states the
+    // gap in that font's ems and nested bullets land at the same points as
+    // top-level ones.
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
         if editorial {
             listRow(configuration: configuration)
+                .textual.listItemSpacing(MarkdownEditorialMetrics.nestedEditorialListItemSpacing)
                 // fontScale innermost, `.font` outside it — see the matching
                 // comment in BossParagraphStyle.makeBody.
                 .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
@@ -875,6 +927,11 @@ private struct BossMarkdownTheme<Content: View>: View {
         let styled = content
             .textual.structuredTextStyle(BossStructuredTextStyle(editorial: isEditorial))
             .textual.highlighterTheme(isEditorial ? BossMarkdownHighlighterTheme.editorial : .default)
+            // Textual's own default (0.25em at the list's font) is tighter
+            // than the leading inside an editorial bullet, which made wrapped
+            // bullets read as staggered. The gap is derived from the same
+            // leading the paragraph style uses, so the two cannot diverge.
+            .textual.listItemSpacing(MarkdownEditorialMetrics.rootListItemSpacing(editorial: isEditorial))
         if isEditorial {
             styled.modifier(EditorialInlineCodeBoxDecoration())
         } else {
