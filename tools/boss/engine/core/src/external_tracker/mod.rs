@@ -23,6 +23,6 @@ mod github_oauth_org_probe_tests;
 pub use boss_github_tracker::{
     CloseReason, ClosedReason, EchoTracker, ExternalTracker, RegistryError, Result, TrackerConfigError, TrackerContext,
     TrackerCredential, TrackerError, TrackerRegistry, UpstreamItem, UpstreamPrAssociation, UpstreamRef, UpstreamStatus,
-    credentials, github, github_oauth,
+    auth_forwarder, credentials, github, github_oauth,
 };
 pub use org_state_sink::WorkDbOrgStateSink;

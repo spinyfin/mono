@@ -744,10 +744,18 @@ impl GitHubAuthController {
     }
 
     /// Update the `org_state` sub-field of an `Authorized` state.
-    /// T-4 calls this after running [`DeviceFlow::probe_org_state`].
+    /// The engine calls this after running [`DeviceFlow::probe_org_state`].
+    ///
+    /// Receivers are woken only when the stored org state actually changes. A
+    /// probe that re-resolves to the value already held (an `Unknown` probe
+    /// over an `Unknown` state, say) must not look like a transition: a
+    /// watcher that probes on wake-up would otherwise be woken by its own
+    /// write and spin.
     pub fn update_org_state(&self, org_state: OrgAuthState) {
         self.state_tx.send_if_modified(|s| {
-            if let GitHubAuthState::Authorized { org_state: os, .. } = s {
+            if let GitHubAuthState::Authorized { org_state: os, .. } = s
+                && *os != org_state
+            {
                 *os = org_state;
                 true
             } else {
@@ -1726,6 +1734,45 @@ mod tests {
                 }
             ),
             "expected OrgAuthState::Ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_update_org_state_wakes_receivers_only_on_change() {
+        let server = MockServer::start().await;
+        let flow = DeviceFlow::new(config_for(&server), test_client());
+        let (ctrl, mut rx) = GitHubAuthController::new(flow);
+
+        // Not authorized: nothing to update, nothing to wake.
+        ctrl.update_org_state(OrgAuthState::Ok);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "update on a non-Authorized state woke receivers"
+        );
+
+        ctrl.state_tx.send_replace(GitHubAuthState::Authorized {
+            record: TokenRecord {
+                token: "tok".to_owned(),
+                login: "iris".to_owned(),
+                granted_scopes: vec![],
+                obtained_at: 0,
+            },
+            org_state: OrgAuthState::Unknown,
+        });
+        rx.borrow_and_update();
+
+        // Identical value: the stored state is unchanged, so no wake.
+        ctrl.update_org_state(OrgAuthState::Unknown);
+        assert!(!rx.has_changed().unwrap(), "identical org state woke receivers");
+
+        // A real change wakes exactly once, and repeating it does not wake again.
+        ctrl.update_org_state(OrgAuthState::Ok);
+        assert!(rx.has_changed().unwrap(), "changed org state did not wake receivers");
+        rx.borrow_and_update();
+        ctrl.update_org_state(OrgAuthState::Ok);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "repeating the same org state woke receivers"
         );
     }
 
