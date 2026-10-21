@@ -226,16 +226,43 @@ pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 /// is folded into the body text instead so the card names both.
 pub const DELIBERATE_PARK_DISPATCH_FAILED_REASON: &str = "deliberate_park";
 
+/// `tasks.dispatch_failed_reason` value stamped when the execution that
+/// governed a work item was **cancelled** — by a person (`bossctl executions
+/// cancel`, `bossctl agents stop`, a kanban drag back to Backlog, the app's
+/// cancel action), the coordinator, or an engine lifecycle transition that
+/// deliberately stopped it. A cancel means "stop until asked", so the row is
+/// moved to Backlog with `autostart = 0` in the same transaction and will not
+/// restart on its own; `dispatch_failed_error` records who cancelled it
+/// ([`StatusActor`]) and why, and `dispatch_failed_at` when. The same cancel
+/// is recorded durably (`cancel_records`), from where the engine writes it to
+/// `engine-audit.log` and the execution's dispatch timeline. Like
+/// [`DELIBERATE_PARK_DISPATCH_FAILED_REASON`] this is not a dispatch failure:
+/// the dispatch-failure recovery sweep must never retry it. Only an explicit
+/// `bossctl work start` (or kanban drag-to-Doing) resumes the row, which also
+/// clears the stamp when the fresh run starts.
+///
+/// This is a different mechanism from parking (`parking.rs`): a parked row
+/// leaves the default board until someone un-parks it, and a park's own
+/// cancels opt out of this stamp. A stopped row stays in Backlog, visibly.
+///
+/// Without it, cancelling a queued card's execution leaves the card `todo`
+/// with `autostart = 1` behind a run that ended, which the engine never
+/// replaces by itself: the card reads as queued while nothing will start.
+pub const EXECUTION_CANCELLED_DISPATCH_FAILED_REASON: &str = "execution_cancelled";
+
 /// One-line CLI headline for a `tasks.dispatch_failed_reason` value.
-/// A deliberate park is a wait, not a failure, so it must not share the
-/// "Dispatch failed" prefix every other reason uses. `print_task_details`
-/// (`cli/src/output.rs`) and `bossctl agents status` (`bossctl/src/agents.rs`)
-/// both print this, so a third reason added later cannot regress the same
-/// "failed" mislabel. Mirrors `WorkDispatchFailureBanner.headline` on the
-/// kanban card (colon here, em dash there).
+/// A deliberate park is a wait, not a failure, and a cancel is a stop, so
+/// neither may share the "Dispatch failed" prefix every other reason uses.
+/// `print_task_details` (`cli/src/output.rs`) and `bossctl agents status`
+/// (`bossctl/src/agents.rs`) both print this, so a further reason added
+/// later cannot regress the same "failed" mislabel. Mirrors
+/// `WorkDispatchFailureBanner.headline` on the kanban card (colon here, em
+/// dash there).
 pub fn dispatch_halt_headline(reason: &str) -> String {
     if reason == DELIBERATE_PARK_DISPATCH_FAILED_REASON {
         "Waiting on you: deliberate park".to_owned()
+    } else if reason == EXECUTION_CANCELLED_DISPATCH_FAILED_REASON {
+        "Stopped: execution cancelled".to_owned()
     } else {
         format!("Dispatch failed: {reason}")
     }
@@ -284,6 +311,10 @@ mod dispatch_halt_headline_tests {
         assert_eq!(
             super::dispatch_halt_headline(super::DELIBERATE_PARK_DISPATCH_FAILED_REASON),
             "Waiting on you: deliberate park",
+        );
+        assert_eq!(
+            super::dispatch_halt_headline(super::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON),
+            "Stopped: execution cancelled",
         );
         assert_eq!(
             super::dispatch_halt_headline(super::CHURN_GUARD_DISPATCH_FAILED_REASON),
@@ -855,6 +886,7 @@ pub mod board_review_cache;
 pub mod board_runtime_cache;
 mod boothby;
 mod cached_task_runtimes;
+mod cancel_records;
 mod chain_helpers;
 mod ci_failure_identity;
 mod comment_thread_entries;
@@ -1101,12 +1133,14 @@ pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
 pub use board_patch::WorkRuntimePatch;
 pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
+pub use cancel_records::ExecutionCancelRecord;
+use cancel_records::{CancelProvenance, stage_cancel_provenance};
 pub use exec_tail::ClearedExecutionWorkspace;
 pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
     ExecutionRetentionPolicy,
 };
-pub use executions_runs::CancelExecutionOpts;
+pub use executions_runs::{CancelExecutionOpts, CancelledExecution, describe_cancel_actor};
 pub use github_api_usage_db::{GithubApiCallRow, GithubApiUsageBucket};
 pub use github_merge_intents::{GithubMergeIntent, GithubMergeIntentInsertInput, GithubMergeIntentRecordOutcome};
 pub use mappers::CiInFlightObservation;
