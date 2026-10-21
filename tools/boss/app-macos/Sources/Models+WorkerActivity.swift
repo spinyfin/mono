@@ -255,6 +255,11 @@ enum WorkerActivity: String, Hashable {
     case spawning
     case working
     case waitingForInput = "waiting_for_input"
+    /// Parked on a wait the worker declared itself (`boss propose wait`).
+    /// Nobody needs to answer it; the worker re-wakes on its own.
+    case waitingOnWork = "waiting_on_work"
+    /// The declared wait expired and the worker was not re-woken.
+    case waitOverdue = "wait_overdue"
     case idle
     case errored
     case terminated
@@ -268,11 +273,20 @@ enum WorkerActivity: String, Hashable {
         case .spawning: "Spawning"
         case .working: "Working"
         case .waitingForInput: "Waiting"
+        case .waitingOnWork: "Waiting on work"
+        case .waitOverdue: "Wait overdue"
         case .idle: "Idle"
         case .errored: "Errored"
         case .terminated: "Terminated"
         }
     }
+
+    /// True iff a person is what the worker is blocked on. The single
+    /// definition behind the top-bar "Needs input" count and the
+    /// "awaiting input" affordances; the engine decides the activity, so the
+    /// count, pill and subtitle cannot disagree. A worker parked on its own
+    /// declared wait (`waitingOnWork`, `waitOverdue`) is deliberately not one.
+    var needsHuman: Bool { self == .waitingForInput }
 
     /// Agents-pane activity pill. Spawning is a neutral "Starting"; an
     /// engine terminal state is "Exited" until the snapshot releases the run.
@@ -364,6 +378,10 @@ enum AgentActivityState: Equatable {
                 self = .active
             case .waitingForInput:
                 self = .waiting(reason: "Waiting on user input")
+            case .waitingOnWork:
+                self = .waiting(reason: Self.waitCaption(liveState))
+            case .waitOverdue:
+                self = .waiting(reason: Self.overdueCaption(liveState))
             case .idle:
                 if liveState.isWaitingOnJob {
                     self = .waiting(reason: Self.waitCaption(liveState))
@@ -439,6 +457,12 @@ enum AgentActivityState: Equatable {
         if liveState?.activity == .waitingForInput {
             return .waiting(reason: "Waiting on user input")
         }
+        if let liveState, liveState.activity == .waitingOnWork {
+            return .waiting(reason: waitCaption(liveState))
+        }
+        if let liveState, liveState.activity == .waitOverdue {
+            return .waiting(reason: overdueCaption(liveState))
+        }
         if liveState?.activity == .spawning {
             return .unknown(reason: "Worker state not yet reported")
         }
@@ -470,6 +494,11 @@ enum AgentActivityState: Equatable {
         let parser = ISO8601DateFormatter()
         guard let date = parser.date(from: iso) else { return iso }
         return date.formatted(date: .omitted, time: .shortened)
+    }
+
+    static func overdueCaption(_ liveState: WorkerLiveState) -> String {
+        let reason = liveState.waitReason ?? "long-running job"
+        return "Wait expired without a wake-up: \(reason)"
     }
 
     static func waitCaption(_ liveState: WorkerLiveState) -> String {

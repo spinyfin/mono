@@ -85,6 +85,15 @@ pub const MAX_LIVE_STATUS_LEN: usize = 60;
 /// directly to `live_status` without a model call.
 pub const AWAITING_INPUT_LITERAL: &str = "awaiting input";
 
+/// Literal written when `activity` flips to `WaitingOnWork` and no useful
+/// prior summary exists: the worker is parked on a wait it declared itself,
+/// so it must never read as needing a person.
+pub const WAITING_ON_WORK_LITERAL: &str = "waiting on its own work";
+
+/// Literal written when `activity` flips to `WaitOverdue`: the declared wait
+/// expired and the worker was not re-woken.
+pub const WAIT_OVERDUE_LITERAL: &str = "wait expired — check on it";
+
 /// Literal string written when `activity` flips to `Errored`.
 pub const ERRORED_LITERAL: &str = "errored — check logs";
 

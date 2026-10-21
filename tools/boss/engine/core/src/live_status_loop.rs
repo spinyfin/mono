@@ -994,6 +994,30 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                         }
                         continue;
                     }
+                    WorkerActivity::WaitingOnWork | WorkerActivity::WaitOverdue => {
+                        // Parked on the worker's own declared wait. Keep a
+                        // useful prior sentence, but never leave the stale
+                        // "awaiting input" literal from before the wait was
+                        // declared: the header must agree with the state.
+                        let literal = if new_activity == WorkerActivity::WaitOverdue {
+                            live_status::WAIT_OVERDUE_LITERAL
+                        } else {
+                            live_status::WAITING_ON_WORK_LITERAL
+                        };
+                        let prior = registry.get(slot_id).and_then(|s| s.live_status);
+                        let replace = match prior.as_deref() {
+                            None => true,
+                            Some(text) => {
+                                text == live_status::AWAITING_INPUT_LITERAL
+                                    || text == live_status::WAITING_ON_WORK_LITERAL
+                                    || text == live_status::WAIT_OVERDUE_LITERAL
+                            }
+                        };
+                        if replace && registry.set_live_status(slot_id, Some(literal.to_owned())) {
+                            broadcaster.broadcast_live_worker_states().await;
+                        }
+                        continue;
+                    }
                     WorkerActivity::Spawning | WorkerActivity::Terminated => {
                         // No refresh, and (for Terminated) the manager
                         // will tear us down momentarily.

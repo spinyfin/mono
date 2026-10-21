@@ -773,7 +773,12 @@ fn worker_error_class_to_policy(class: WorkerErrorClass) -> ErrorClass {
 fn should_inspect(activity: WorkerActivity) -> bool {
     matches!(
         activity,
-        WorkerActivity::Idle | WorkerActivity::WaitingForInput | WorkerActivity::Errored | WorkerActivity::Terminated
+        WorkerActivity::Idle
+            | WorkerActivity::WaitingForInput
+            | WorkerActivity::WaitingOnWork
+            | WorkerActivity::WaitOverdue
+            | WorkerActivity::Errored
+            | WorkerActivity::Terminated
     )
 }
 
@@ -1727,6 +1732,8 @@ mod tests {
             WorkerActivity::Spawning,
             WorkerActivity::Working,
             WorkerActivity::WaitingForInput,
+            WorkerActivity::WaitingOnWork,
+            WorkerActivity::WaitOverdue,
             WorkerActivity::Idle,
             WorkerActivity::Errored,
             WorkerActivity::Terminated,
@@ -1734,6 +1741,8 @@ mod tests {
             let expected = match activity {
                 WorkerActivity::Idle
                 | WorkerActivity::WaitingForInput
+                | WorkerActivity::WaitingOnWork
+                | WorkerActivity::WaitOverdue
                 | WorkerActivity::Errored
                 | WorkerActivity::Terminated => true,
                 WorkerActivity::Spawning | WorkerActivity::Working => false,
