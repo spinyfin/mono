@@ -287,8 +287,8 @@ pub enum WorkspaceCommand {
         dry_run: bool,
         /// Lift the `failed` cleanup mark from workspaces (all, or just
         /// `--workspace`) before the cleanup pass, returning them to the pool.
-        /// For a workspace withheld by a cleanup that keeps failing and that
-        /// an operator has decided to leave alone. Ignored with `--dry-run`.
+        /// Use it for a workspace whose cleanup keeps failing and should go
+        /// back to the pool as it is. Ignored with `--dry-run`.
         #[arg(long)]
         clear_failed_cleanup: bool,
     },

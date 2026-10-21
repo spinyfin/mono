@@ -101,11 +101,6 @@ const CLEANUP_STALE_SECS: i64 = 60 * 60;
 /// polite to a command that is probably failing for a reason that persists.
 const CLEANUP_RETRY_SECS: i64 = 10 * 60;
 
-/// Shell exit statuses for "found but not executable" and "not found": the
-/// command did not run.
-const SHELL_NOT_EXECUTABLE: i32 = 126;
-const SHELL_NOT_FOUND: i32 = 127;
-
 /// Longest stretch of a command's output kept in the audit record.
 const AUDIT_OUTPUT_LIMIT: usize = 2048;
 
@@ -579,7 +574,7 @@ fn execute(
     };
 
     let started = Instant::now();
-    let outcome = runner.run_with_timeout(
+    let outcome = runner.run_cleanup(
         &CommandInvocation {
             cwd: record.workspace_path.clone(),
             program: "sh".to_string(),
@@ -639,28 +634,6 @@ fn execute(
             );
             audit_outcome(database_path, candidate, opts, "busy", 0, duration_ms, &stderr);
             report.busy.push(record.workspace_id.clone());
-        }
-        Err(CubeError::CommandFailed {
-            status: Some(status @ (SHELL_NOT_EXECUTABLE | SHELL_NOT_FOUND)),
-            stderr,
-            ..
-        }) => {
-            // The command never ran, so nothing was done to the workspace and
-            // withholding it would only block a lease for a condition that no
-            // retry changes.
-            finish(store, record, CleanupResult::Skipped, now, finished_at);
-            let error = format!("exit {status}: {stderr}");
-            eprintln!(
-                "cube: cleanup: {} could not run the cleanup command, leaving the workspace in the pool: {error}",
-                record.workspace_id,
-            );
-            audit_outcome(database_path, candidate, opts, "unrunnable", 0, duration_ms, &error);
-            report.failed.push(FailedCleanup {
-                repo: record.repo.clone(),
-                workspace_id: record.workspace_id.clone(),
-                reason: candidate.reason,
-                error,
-            });
         }
         Err(e) => {
             // Left marked: not leasable until a retry succeeds.

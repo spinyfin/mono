@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../.."
 
 [dependencies]
+process-runner = { path = "../../lib/rust/process_runner" }
 bon = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 console = { workspace = true }

@@ -18,7 +18,7 @@ rust_library(
         "//tools/boss/github:__pkg__",
         "//tools/boss/tmux:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = ["//lib/rust/process_runner"] + all_crate_deps(normal = True),
 )
 
 rust_test(

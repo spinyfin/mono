@@ -1,9 +1,11 @@
-use std::io::{IsTerminal, Read};
-use std::os::unix::process::CommandExt;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(test)]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use crate::app::CubeError;
 
@@ -19,6 +21,11 @@ pub struct CommandInvocation {
 
 pub trait CommandRunner {
     fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError>;
+
+    /// Cleanup runs in an isolated group and retains both output streams.
+    fn run_cleanup(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
+        self.run_with_timeout(invocation, timeout)
+    }
 
     /// Run a command with an upper bound on its wall-clock time. On expiry the
     /// child process is killed and reaped, and [`CubeError::CommandTimedOut`]
@@ -42,17 +49,6 @@ pub trait CommandRunner {
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct RealCommandRunner;
-
-/// SIGKILL every process in the group led by `pid`. Best effort: the group may
-/// already be gone.
-fn kill_process_group(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
 
 impl RealCommandRunner {
     pub fn invocation(cwd: &Path, program: &str, args: &[&str]) -> CommandInvocation {
@@ -117,6 +113,41 @@ impl CommandRunner for RealCommandRunner {
         }
     }
 
+    fn run_cleanup(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
+        let output = self
+            .run_with_timeout_capturing_output_and_heartbeat(
+                invocation,
+                &[],
+                timeout,
+                HEARTBEAT_INTERVAL,
+                true,
+                |elapsed, _| eprintln!("cube: cleanup still running ({}s elapsed)", elapsed.as_secs()),
+            )?
+            .ok_or_else(|| CubeError::CommandTimedOut {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                timeout_secs: timeout.as_secs(),
+            })?;
+        let combined = [
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+        if output.status.success() {
+            Ok(combined)
+        } else {
+            Err(CubeError::CommandFailed {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                status: output.status.code(),
+                stderr: combined,
+            })
+        }
+    }
+
     fn run_with_timeout(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
         let program = invocation.program.clone();
         let args = invocation.args.join(" ");
@@ -134,8 +165,8 @@ impl RealCommandRunner {
     /// Run a command with a wall-clock timeout, returning the raw
     /// [`std::process::Output`] regardless of exit status (`Ok(Some(_))`),
     /// or `Ok(None)` if the timeout elapsed (the child is killed and reaped
-    /// first). `Err` is reserved for a spawn/exec failure -- the command
-    /// never actually ran.
+    /// first). `Err` reports an I/O failure while spawning, waiting, or
+    /// reading the command's output.
     ///
     /// Unlike [`CommandRunner::run_with_timeout`], failure is not inferred
     /// from a non-zero exit code and stdout is never discarded, so callers
@@ -160,6 +191,7 @@ impl RealCommandRunner {
             env_remove,
             timeout,
             HEARTBEAT_INTERVAL,
+            false,
             move |elapsed, timeout| {
                 eprintln!(
                     "cube: still waiting on `{program} {args}` ({}s elapsed, {}s deadline)...",
@@ -180,17 +212,13 @@ impl RealCommandRunner {
         env_remove: &[&str],
         timeout: Duration,
         heartbeat_interval: Duration,
+        own_process_group: bool,
         mut on_heartbeat: impl FnMut(Duration, Duration),
     ) -> Result<Option<std::process::Output>, CubeError> {
         let mut cmd = Command::new(&invocation.program);
         cmd.args(&invocation.args)
             .current_dir(&invocation.cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Its own process group, so the timeout can take down the whole tree
-            // (a `sh -c` wrapper's children outlive a kill of the wrapper alone).
-            .process_group(0);
+            .stdin(Stdio::null());
         Self::configure_env(&mut cmd);
         for (k, v) in &invocation.env {
             cmd.env(k, v);
@@ -199,73 +227,23 @@ impl RealCommandRunner {
             cmd.env_remove(k);
         }
 
-        let mut child = cmd.spawn().map_err(CubeError::Io)?;
-
-        // Drain stdout/stderr on dedicated threads so a child that produces
-        // more output than the pipe buffer holds cannot deadlock against our
-        // timeout poll (matching `Command::output`'s full-drain semantics).
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-        let out_handle = thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = stdout_pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        });
-        let err_handle = thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = stderr_pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        });
-
-        let started = Instant::now();
-        let deadline = started + timeout;
-        // Adaptive backoff: fast commands return promptly, slow ones poll
-        // cheaply. Capped so a hung command is detected within ~50ms of the
-        // deadline.
-        let mut wait = Duration::from_millis(1);
-        let max_wait = Duration::from_millis(50);
-        let mut last_heartbeat = started;
-        let status = loop {
-            match child.try_wait().map_err(CubeError::Io)? {
-                Some(status) => break status,
-                None => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        // Kill the child so cube stops waiting and any lock it
-                        // holds is released; reap it to avoid a zombie, and
-                        // join the drain threads so the pipe fds close.
-                        kill_process_group(child.id());
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let _ = out_handle.join();
-                        let _ = err_handle.join();
-                        return Ok(None);
-                    }
-                    // Long-running commands (most importantly `jj git push`
-                    // queued behind a contended shared-store lock) must never
-                    // go silent: a caller with its own output-silence timeout
-                    // (e.g. a Bash tool's default) would otherwise read the
-                    // silence as a hang and kill/retry a command that was
-                    // actually making progress. Emit a heartbeat at a fixed
-                    // cadence for the whole wait.
-                    if now.duration_since(last_heartbeat) >= heartbeat_interval {
-                        on_heartbeat(now.duration_since(started), timeout);
-                        last_heartbeat = now;
-                    }
-                    thread::sleep(wait);
-                    wait = (wait * 2).min(max_wait);
+        let mut last_heartbeat = Duration::ZERO;
+        match process_runner::output_bounded(
+            &mut cmd,
+            timeout,
+            own_process_group,
+            |_| {},
+            |elapsed| {
+                if elapsed.saturating_sub(last_heartbeat) >= heartbeat_interval {
+                    on_heartbeat(elapsed, timeout);
+                    last_heartbeat = elapsed;
                 }
-            }
-        };
-
-        let stdout = out_handle.join().unwrap_or_default();
-        let stderr = err_handle.join().unwrap_or_default();
-
-        Ok(Some(std::process::Output { status, stdout, stderr }))
+            },
+        ) {
+            Ok(output) => Ok(Some(output)),
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Ok(None),
+            Err(error) => Err(CubeError::Io(error)),
+        }
     }
 
     /// Core of [`CommandRunner::run_with_timeout`], with the heartbeat
@@ -283,6 +261,7 @@ impl RealCommandRunner {
             &[],
             timeout,
             heartbeat_interval,
+            false,
             on_heartbeat,
         )? {
             None => Err(CubeError::CommandTimedOut {
@@ -332,7 +311,7 @@ mod tests {
         // the deadline; killing only the direct child would let it.
         let script = format!("(sleep 1; touch '{}') & wait", marker.display());
         let err = runner
-            .run_with_timeout(
+            .run_cleanup(
                 &RealCommandRunner::invocation(dir.path(), "sh", &["-c", &script]),
                 Duration::from_millis(200),
             )
@@ -340,6 +319,44 @@ mod tests {
         assert!(matches!(err, CubeError::CommandTimedOut { .. }), "got {err:?}");
         thread::sleep(Duration::from_millis(1800));
         assert!(!marker.exists(), "a descendant outlived the timeout");
+    }
+
+    #[test]
+    fn cleanup_drain_is_bounded_when_a_descendant_holds_the_pipe() {
+        let started = Instant::now();
+        let err = RealCommandRunner
+            .run_cleanup(
+                &RealCommandRunner::invocation(&std::env::temp_dir(), "sh", &["-c", "sleep 60 & exit 0"]),
+                Duration::from_millis(200),
+            )
+            .unwrap_err();
+        assert!(matches!(err, CubeError::CommandTimedOut { .. }));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn only_cleanup_commands_lead_their_own_process_group() {
+        // Use the shell builtin: process enumeration is denied by the test sandbox.
+        let invocation = RealCommandRunner::invocation(
+            &std::env::temp_dir(),
+            "sh",
+            &[
+                "-c",
+                "if kill -0 -$$ 2>/dev/null; then echo isolated; else echo inherited; fi",
+            ],
+        );
+        assert_eq!(
+            RealCommandRunner
+                .run_with_timeout(&invocation, Duration::from_secs(5))
+                .unwrap(),
+            "inherited"
+        );
+        assert_eq!(
+            RealCommandRunner
+                .run_cleanup(&invocation, Duration::from_secs(5))
+                .unwrap(),
+            "isolated"
+        );
     }
 
     #[test]

@@ -667,7 +667,7 @@ fn real_commands_run_in_the_workspace_and_exit_statuses_map_to_outcomes() {
     let pool = Pool::seed(3);
     write_setup_yaml(
         &pool.workspaces[0],
-        "version: 1\ncleanup:\n  command: 'echo \"cleaning $CUBE_WORKSPACE\" && touch cleaned.marker'\n",
+        "version: 1\ncleanup:\n  command: 'echo \"cleaning $CUBE_WORKSPACE\" >&2 && touch cleaned.marker'\n",
     );
     write_setup_yaml(
         &pool.workspaces[1],
@@ -675,7 +675,7 @@ fn real_commands_run_in_the_workspace_and_exit_statuses_map_to_outcomes() {
     );
     write_setup_yaml(
         &pool.workspaces[2],
-        "version: 1\ncleanup:\n  command: 'echo disk on fire >&2; exit 3'\n",
+        "version: 1\ncleanup:\n  command: 'echo disk on fire; exit 3'\n",
     );
     // Low enough that every command's (zero) effect leaves it low, so all
     // three are tried.
@@ -706,6 +706,11 @@ fn real_commands_run_in_the_workspace_and_exit_statuses_map_to_outcomes() {
         .find(|e| e["event"] == "workspace.cleanup" && e["workspace_id"] == "mono-agent-001")
         .expect("audit event");
     assert!(audited["output"].as_str().unwrap().starts_with("cleaning "));
+    let failure = audit_events(&pool.tempdir)
+        .into_iter()
+        .find(|e| e["event"] == "workspace.cleanup" && e["workspace_id"] == "mono-agent-003")
+        .unwrap();
+    assert!(failure["output"].as_str().unwrap().contains("disk on fire"));
 }
 
 /// The fallback case: only the repo's source checkout has the script, the
@@ -745,10 +750,9 @@ fn a_cleanup_script_only_the_source_checkout_has_is_found_through_cleanup_root()
     assert_eq!(pool.cleanup_status(0), None);
 }
 
-/// A command that could not run (127, 126) did nothing to the workspace, so
-/// it is not withheld from leases for it.
+/// Shell errors may follow partial cleanup and must keep the mark.
 #[test]
-fn a_command_that_cannot_run_does_not_withhold_the_workspace() {
+fn a_command_that_partly_runs_then_cannot_find_a_helper_withholds_the_workspace() {
     use crate::command_runner::RealCommandRunner;
 
     // Spawns real processes: keep PATH-mutating tests out while it does.
@@ -758,15 +762,60 @@ fn a_command_that_cannot_run_does_not_withhold_the_workspace() {
     let pool = Pool::seed(1);
     write_setup_yaml(
         &pool.workspaces[0],
-        "version: 1\ncleanup:\n  command: 'bash .cube/not-in-this-revision.sh'\n",
+        "version: 1\ncleanup:\n  command: 'touch partial.marker; missing-cleanup-helper'\n",
     );
     let _volume = testing::with_reading(volume_with_free(low - GIB));
 
     let report = pool.pass(&RealCommandRunner, false);
 
     assert_eq!(report.failed.len(), 1, "still reported");
-    assert_eq!(pool.cleanup_status(0), None, "but not marked: it stays leasable");
-    assert!(pool.claim(0), "a lease can take it");
+    assert!(pool.workspaces[0].join("partial.marker").exists());
+    assert_eq!(pool.cleanup_status(0), Some(CleanupStatus::Failed));
+    assert!(!pool.claim(0), "partial cleanup must stay withheld");
+    // Make the failed attempt old enough to retry, then remove its script.
+    pool.store.clear_failed_cleanup_marks(Some(&pool.id(0))).unwrap();
+    assert!(pool.store.begin_workspace_cleanup("mono", &pool.id(0), 1, 0).unwrap());
+    pool.store
+        .finish_workspace_cleanup("mono", &pool.id(0), CleanupResult::Failed, 1, 1)
+        .unwrap();
+    write_setup_yaml(
+        &pool.workspaces[0],
+        "version: 1\ncleanup:\n  command: 'sh missing-cleanup-script'\n",
+    );
+    let retry = pool.pass(&RealCommandRunner, false);
+    assert_eq!(retry.failed.len(), 1);
+    assert_eq!(pool.cleanup_status(0), Some(CleanupStatus::Failed));
+    assert!(!pool.claim(0));
+}
+
+/// A real spawn failure during retry must not lift an existing failed mark.
+#[test]
+fn failed_cleanup_stays_withheld_when_retry_cannot_spawn() {
+    struct MissingShell;
+    impl CommandRunner for MissingShell {
+        fn run(&self, _: &CommandInvocation) -> Result<String, CubeError> {
+            unreachable!("only cleanup is used")
+        }
+        fn run_cleanup(
+            &self,
+            invocation: &CommandInvocation,
+            timeout: std::time::Duration,
+        ) -> Result<String, CubeError> {
+            let mut invocation = invocation.clone();
+            invocation.program = "/missing-cleanup-shell".to_string();
+            crate::command_runner::RealCommandRunner.run_cleanup(&invocation, timeout)
+        }
+    }
+    let pool = Pool::seed(1);
+    assert!(pool.store.begin_workspace_cleanup("mono", &pool.id(0), 1, 0).unwrap());
+    pool.store
+        .finish_workspace_cleanup("mono", &pool.id(0), CleanupResult::Failed, 1, 1)
+        .unwrap();
+    let _volume = testing::with_reading(AMPLE_TEST_VOLUME);
+    let report = pool.pass(&MissingShell, false);
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(pool.cleanup_status(0), Some(CleanupStatus::Failed));
+    assert!(!pool.claim(0));
 }
 
 /// A pass that overlaps another does not start a second cleanup: the periodic
