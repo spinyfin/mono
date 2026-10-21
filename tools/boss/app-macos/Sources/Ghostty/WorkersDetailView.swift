@@ -508,6 +508,8 @@ struct WorkerSlotView: View, @MainActor Equatable {
         switch activity {
         case .working: .blue
         case .waitingForInput: .orange
+        case .waitingOnWork: .teal
+        case .waitOverdue: .yellow
         case .idle: .green
         case .spawning: .secondary
         case .errored: .red

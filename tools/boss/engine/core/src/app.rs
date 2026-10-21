@@ -1554,6 +1554,10 @@ impl ServerState {
         let hold_registry_for_state = hold_registry.clone();
         let wait_registry = Arc::new(crate::wait_registry::WaitRegistry::new());
         let wait_registry_for_state = wait_registry.clone();
+        // Parked workers' activity folds in their own declared wait, so the
+        // live-state registry reads the same registry `boss propose wait`
+        // writes to.
+        live_worker_states.set_wait_source(wait_registry.clone());
         // ONE teardown registry shared by the completion handler (which
         // marks a teardown in flight before it terminalizes an execution)
         // and `terminal_work_sweep` (which must not reclaim a marked pane).

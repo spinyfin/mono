@@ -247,6 +247,66 @@ pub async fn mirror_stalled_spawn_waits(
     }
 }
 
+/// One periodic declared-wait pass: reclassify parked workers against the wait
+/// registry, keep each header subtitle on the new state, and mirror departures
+/// from `WaitingForInput` onto the rows. Returns the slots that changed so the
+/// caller can broadcast.
+pub async fn sweep_declared_waits(
+    registry: &LiveWorkerStateRegistry,
+    work_db: &Arc<WorkDb>,
+    publisher: &Arc<dyn ExecutionPublisher>,
+    live_status_manager: &crate::live_status_loop::LiveStatusManager,
+    now_epoch_secs: i64,
+) -> Vec<u8> {
+    let changed = registry.reconcile_declared_waits(now_epoch_secs);
+    if changed.is_empty() {
+        return Vec::new();
+    }
+    let slots: Vec<u8> = changed.iter().map(|(slot, ..)| *slot).collect();
+    tracing::info!(
+        slots = ?slots,
+        "declared-wait sweep: reclassified parked workers \
+         (WaitingOnWork while a wait is live, WaitOverdue once it expired)",
+    );
+    for (slot_id, _, new) in &changed {
+        if *slot_id < crate::worker_registry::REMOTE_SLOT_BASE {
+            live_status_manager.notify(*slot_id, crate::live_status_loop::Trigger::ActivityChanged(*new));
+        }
+    }
+    mirror_declared_wait_reclassifications(registry, work_db, publisher, &changed).await;
+    slots
+}
+
+/// Mirror the periodic declared-wait pass's reclassifications onto the rows.
+///
+/// A worker parked as `WaitingForInput` (and mirrored to `waiting_human`)
+/// that then declares a wait is reclassified off the hook-dispatch path, so
+/// `mirror_awaiting_input` never sees the departure. Each `(slot, prior, new)`
+/// goes through the same [`awaiting_input_transition`] policy, so the row can
+/// only ever be cleared, never newly parked, by this pass.
+pub async fn mirror_declared_wait_reclassifications(
+    registry: &LiveWorkerStateRegistry,
+    work_db: &Arc<WorkDb>,
+    publisher: &Arc<dyn ExecutionPublisher>,
+    changed: &[(u8, WorkerActivity, WorkerActivity)],
+) {
+    for (slot_id, prior, new) in changed {
+        let Some(state) = registry.get(*slot_id) else {
+            continue;
+        };
+        let is_pr_review = state.kind.as_deref() == Some(ExecutionKind::PrReview.as_str());
+        mirror_awaiting_input(
+            work_db,
+            publisher,
+            &state.run_id,
+            is_pr_review,
+            Some(*prior),
+            Some(*new),
+        )
+        .await;
+    }
+}
+
 async fn write_awaiting_status(
     work_db: &Arc<WorkDb>,
     publisher: &Arc<dyn ExecutionPublisher>,

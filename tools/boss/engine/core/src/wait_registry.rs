@@ -223,6 +223,18 @@ impl WaitRegistry {
         None
     }
 
+    /// True iff `execution_id` declared a wait whose deadline has passed and
+    /// that has not been cleared. Read-only: unlike [`active`](Self::active)
+    /// it logs nothing.
+    pub fn lapsed(&self, execution_id: &str, now_epoch_secs: i64) -> bool {
+        self.inner
+            .lock()
+            .expect("WaitRegistry mutex poisoned")
+            .get(execution_id)
+            .and_then(|state| state.active.as_ref())
+            .is_some_and(|record| record.expires_at_epoch <= now_epoch_secs)
+    }
+
     /// Cumulative seconds already granted to `execution_id`.
     pub fn total_granted_secs(&self, execution_id: &str) -> u64 {
         self.inner

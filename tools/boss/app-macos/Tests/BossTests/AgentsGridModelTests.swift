@@ -650,6 +650,19 @@ final class AgentsGridModelTests: XCTestCase {
         )
     }
 
+    func testNeedsInputCountExcludesWorkersWaitingOnTheirOwnWork() {
+        let grid = AgentsGridModel()
+        let states = [
+            makeState(runId: "a", slotId: 1, activity: .waitingForInput),
+            makeState(runId: "b", slotId: 2, activity: .waitingOnWork),
+            makeState(runId: "c", slotId: 3, activity: .waitOverdue),
+            makeState(runId: "d", slotId: 4, activity: .idle),
+        ]
+        grid.apply(states: states, viewers: [:], interactivePoolSize: 16,
+                   automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false)
+        XCTAssertEqual(grid.layout.waitingCount, 1)
+    }
+
     func testWorkerCellMeasurementIgnoresBossAndNormalizesBackingScale() {
         let one = BackingScaleView(scale: 1)
         let two = BackingScaleView(scale: 2)
