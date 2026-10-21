@@ -100,6 +100,17 @@ pub struct BlockedPrRemediation {
 const REVIEW_PHASE_BLOCKED_REASONS_SQL: &str =
     "('merge_conflict', 'ci_failure', 'ci_failure_exhausted', 'review_feedback')";
 
+/// An `active` row (alias `t`) that is held in PendingReview: it has a bound
+/// PR and no live non-review execution of its own. Whether an automated
+/// reviewer is live, an admission is deferred or a batch died is for the
+/// diagnosis to say; a root that an implementation or fix run resumed is not
+/// held for review, so no review reason may sit on it.
+const PENDING_REVIEW_HELD_SQL: &str = "(t.status = 'active'
+        AND t.pr_url IS NOT NULL AND t.pr_url != ''
+        AND NOT EXISTS (SELECT 1 FROM work_executions we
+                        WHERE we.work_item_id = t.id AND we.kind != 'pr_review'
+                          AND we.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')))";
+
 /// The card's own `tasks` columns the diagnosis reads.
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
@@ -132,17 +143,40 @@ type RevisionRow = (String, String, String, String, Option<String>, Option<Strin
 impl WorkDb {
     /// Every Review-lane card with a bound PR: `in_review` rows,
     /// `blocked` rows parked on a review-phase reason, and roots held
-    /// `active` (PendingReview) while an automated reviewer is live, so a
-    /// reviewer stuck in dispatch still gets a reason.
+    /// `active` (PendingReview) whether or not a reviewer is live, so a
+    /// reviewer stuck in dispatch, an admission hold and a reaped batch all
+    /// get a reason.
     pub fn list_blocked_pr_sweep_candidates(&self) -> Result<Vec<PendingMergeCheck>> {
         self.query_pending_merge_checks(&format!(
             "(t.status = 'in_review'
                OR (t.status = 'blocked' AND t.blocked_reason IN {REVIEW_PHASE_BLOCKED_REASONS_SQL})
-               OR (t.status = 'active'
-                   AND EXISTS (SELECT 1 FROM work_executions we
-                               WHERE we.work_item_id = t.id AND we.kind = 'pr_review'
-                                 AND we.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned'))))"
+               OR {PENDING_REVIEW_HELD_SQL})"
         ))
+    }
+
+    /// Delete every stored diagnosis whose card is no longer a sweep
+    /// candidate (`current`), returning `(work_item_id, product_id)` for each
+    /// so the caller can publish a change. `product_id` is empty when the
+    /// card row is gone.
+    pub fn prune_pr_blocked_diagnoses(&self, current: &[String]) -> Result<Vec<(String, String)>> {
+        let conn = self.connect()?;
+        let stored: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT d.work_item_id, COALESCE(t.product_id, '')
+                 FROM pr_blocked_diagnoses d LEFT JOIN tasks t ON t.id = d.work_item_id",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            collect_rows(rows)?
+        };
+        let mut removed = Vec::new();
+        for (id, product_id) in stored {
+            if current.contains(&id) {
+                continue;
+            }
+            conn.execute("DELETE FROM pr_blocked_diagnoses WHERE work_item_id = ?1", [&id])?;
+            removed.push((id, product_id));
+        }
+        Ok(removed)
     }
 
     /// Replace the card's diagnosis. Returns `true` when the stored
@@ -505,10 +539,15 @@ impl WorkDb {
             .list_tasks_awaiting_pre_merge_review_admission()?
             .iter()
             .any(|c| c.task_id == work_item_id || c.cycle_root_id == work_item_id);
-        let (latest_pre_merge_batch, head_verdict, reviewers) = match head_sha.as_deref() {
-            Some(sha) => self.review_facts_for_head(work_item_id, sha, now)?,
-            None => (None, None, Vec::new()),
+        // Reviewer health does not wait for the poller to observe a head: with
+        // none, the newest batch's immutable target stands in, and with no
+        // batch either the card family's own live reviewers are read.
+        let review_sha = match head_sha.clone() {
+            Some(sha) => Some(sha),
+            None => self.latest_pre_merge_batch_target(work_item_id)?,
         };
+        let (latest_pre_merge_batch, head_verdict, reviewers) =
+            self.review_facts_for_head(work_item_id, review_sha.as_deref().unwrap_or(""), now)?;
         let facts = BlockedFacts {
             status,
             blocked_reason,
@@ -520,7 +559,7 @@ impl WorkDb {
             ci,
             conflict,
             review: ReviewFacts {
-                head_known: head_sha.is_some(),
+                head_known: review_sha.is_some() || !reviewers.is_empty(),
                 latest_pre_merge_batch,
                 head_verdict,
                 generation_cap: review_batches::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS,
@@ -531,6 +570,20 @@ impl WorkDb {
             },
         };
         Ok((facts, head_sha))
+    }
+
+    /// Target SHA of the card's newest pre-merge batch, if any.
+    fn latest_pre_merge_batch_target(&self, work_item_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        Ok(conn
+            .query_row(
+                "SELECT target_sha FROM pr_review_batches
+                 WHERE cycle_root_id = ?1 AND phase = 'pre_merge' AND target_sha IS NOT NULL
+                 ORDER BY generation DESC, created_at DESC, id DESC LIMIT 1",
+                [work_item_id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// The newest pre-merge batch and newest review verdict for the card's
@@ -669,6 +722,9 @@ pub fn transient_retry_signal(summary: &str, check_name: &str) -> String {
 /// sweep has a stored diagnosis for. One batched query; other rows keep
 /// `None`.
 pub(crate) fn attach_review_blocked_reason(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
+    // A stored diagnosis shows on an `active` card only while that card is
+    // still held in PendingReview; `blocked_pr_sweep` deletes the rest on
+    // its next pass.
     let ids: Vec<String> = tasks
         .iter()
         .chain(chores.iter())
@@ -680,7 +736,10 @@ pub(crate) fn attach_review_blocked_reason(conn: &Connection, tasks: &mut [Task]
     }
     let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT work_item_id, category, reason FROM pr_blocked_diagnoses WHERE work_item_id IN ({placeholders})"
+        "SELECT d.work_item_id, d.category, d.reason
+         FROM pr_blocked_diagnoses d JOIN tasks t ON t.id = d.work_item_id
+         WHERE d.work_item_id IN ({placeholders})
+           AND (t.status != 'active' OR {PENDING_REVIEW_HELD_SQL})"
     );
     let mut stmt = conn.prepare(&sql)?;
     let found: std::collections::HashMap<String, (String, String)> = stmt

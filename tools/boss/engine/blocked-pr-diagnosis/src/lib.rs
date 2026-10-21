@@ -244,7 +244,8 @@ pub struct HeadVerdictFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Default, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ReviewFacts {
-    /// The PR head is known (the poller has observed one).
+    /// There is a head to scope review facts to: the poller's observed head,
+    /// or the target of the card's newest batch when none was observed yet.
     pub head_known: bool,
     /// Newest batch whose target is the observed head; `None` means no batch
     /// has been admitted for it.

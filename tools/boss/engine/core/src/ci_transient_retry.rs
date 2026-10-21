@@ -174,6 +174,10 @@ pub enum TransientOutcome {
     /// Not every failure was positively transient, or the retry budget for
     /// this head is spent: the caller proceeds with the ordinary fix path.
     NotApplicable { reason: String },
+    /// The failure is positively transient but the retry ledger could not be
+    /// read, so the budget is unknown. The caller stops this pass: no flip,
+    /// no fix revision. The next poller pass looks again.
+    Deferred { reason: String },
 }
 
 /// Heads already judged not-retryable, keyed by work item, head and failing
@@ -280,7 +284,7 @@ pub async fn try_transient_retry(
             };
         }
         Err(err) => {
-            return not_applicable(candidate, format!("could not read the retry ledger: {err:#}"));
+            return deferred(candidate, format!("could not read the retry ledger: {err:#}"));
         }
     }
 
@@ -384,7 +388,7 @@ pub async fn try_transient_retry(
         // (a `budget_exhausted` row would pin the head permanently) and let
         // the next pass count again.
         Err(err) => {
-            return not_applicable(candidate, format!("could not count the retry ledger: {err:#}"));
+            return deferred(candidate, format!("could not count the retry ledger: {err:#}"));
         }
     };
     let budget = TRANSIENT_RETRY_BUDGET_PER_HEAD;
@@ -468,6 +472,16 @@ pub async fn try_transient_retry(
         .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "ci_transient_retry")
         .await;
     TransientOutcome::Handled { retried_jobs }
+}
+
+fn deferred(candidate: &PendingMergeCheck, reason: String) -> TransientOutcome {
+    tracing::warn!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        %reason,
+        "ci_transient_retry: ledger unreadable; skipping this pass without a fix revision",
+    );
+    TransientOutcome::Deferred { reason }
 }
 
 fn not_applicable(candidate: &PendingMergeCheck, reason: String) -> TransientOutcome {
@@ -1317,7 +1331,7 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
         )
         .await;
         assert!(
-            matches!(outcome, TransientOutcome::NotApplicable { ref reason } if reason.contains("could not count")),
+            matches!(outcome, TransientOutcome::Deferred { ref reason } if reason.contains("could not count")),
             "{outcome:?}"
         );
         assert!(bk.inner.retried.lock().unwrap().is_empty());
@@ -1329,5 +1343,40 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
             ledger(&db, &chore, "head-522").is_empty(),
             "no budget_exhausted row may be written from a failed count"
         );
+    }
+
+    #[tokio::test]
+    async fn a_ledger_read_error_stops_the_pass_with_no_fix_and_a_later_pass_retries() {
+        let (_dir, db) = open_db();
+        let pr = "https://github.com/foo/bar/pull/523";
+        let (product, chore) = make_in_review(&db, "C-defer", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let bk = HidesLedger {
+            inner: FakeBuildkite::new(BRANCH, failed_job(1), PR_DESCRIPTION_504_LOG),
+            db: &db,
+        };
+        let checker = fix_checker();
+        let cand = candidate(&product, &chore, pr);
+        let probe = pr_probe(pr, "head-523");
+        let failures = checks_failure();
+        macro_rules! detect {
+            ($retrier:expr) => {
+                on_ci_failure_detected_with(&db, pub_.as_ref(), &checker, &cand, &probe, &failures, $retrier)
+            };
+        }
+
+        assert!(!detect!(&bk).await, "a deferred pass transitions nothing");
+        assert!(bk.inner.retried.lock().unwrap().is_empty());
+        assert_eq!(chore_state(&db, &chore), (TaskStatus::InReview, None));
+        assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+        assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
+
+        db.connect()
+            .unwrap()
+            .execute_batch("ALTER TABLE pr_blocked_remediations_hidden RENAME TO pr_blocked_remediations")
+            .unwrap();
+        assert!(detect!(&bk.inner).await, "the next pass retries normally");
+        assert_eq!(*bk.inner.retried.lock().unwrap(), vec![JOB.to_owned()]);
+        assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
     }
 }

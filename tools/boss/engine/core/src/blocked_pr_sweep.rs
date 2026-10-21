@@ -65,6 +65,23 @@ pub async fn run_one_pass(
     for candidate in &candidates {
         diagnose_one(work_db, publisher, candidate, review_fanout_enabled, &mut outcome).await;
     }
+    // A diagnosis only describes a card the sweep still examines; one that
+    // left review ownership (a fix run resumed it, it merged, it was
+    // blocked elsewhere) must not keep its reason.
+    let current: Vec<String> = candidates.iter().map(|c| c.work_item_id.clone()).collect();
+    match work_db.prune_pr_blocked_diagnoses(&current) {
+        Ok(removed) => {
+            for (work_item_id, product_id) in removed {
+                outcome.cleared += 1;
+                if !product_id.is_empty() {
+                    publisher
+                        .publish_work_item_changed(&product_id, &work_item_id, "blocked_pr_cleared")
+                        .await;
+                }
+            }
+        }
+        Err(err) => tracing::warn!(?err, "blocked-pr sweep: failed to prune stale diagnoses"),
+    }
     if outcome.diagnosed + outcome.cleared + outcome.redispatched > 0 {
         tracing::info!(
             examined = outcome.examined,
@@ -772,5 +789,106 @@ mod tests {
                 "{status} {reason:?} {ci:?} {mergeable:?} {revision_status:?}"
             );
         }
+    }
+
+    fn hold_active(db: &WorkDb, id: &str) {
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [id])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_active_root_with_an_admission_hold_and_no_reviewer_gets_a_reason() {
+        let (_dir, db) = open_db();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let c = in_review_chore(&db, "held-admission");
+        hold_active(&db, &c.work_item_id);
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO work_attention_items (id, work_item_id, kind, status, title, body_markdown, created_at)
+                 VALUES ('att-held', ?1, 'pr_review_admission_deferred', 'open', 't', 'b', '1')",
+                [&c.work_item_id],
+            )
+            .unwrap();
+        run_one_pass(&db, publisher.as_ref(), true).await;
+        let t = task(&db, &c.work_item_id);
+        assert_eq!(t.review_blocked_category.as_deref(), Some("review_not_admitted"));
+        assert!(
+            t.review_blocked_reason
+                .unwrap()
+                .contains("no automated review has been admitted")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_active_root_whose_capped_batch_died_gets_a_reason_without_a_live_reviewer() {
+        let (_dir, db) = open_db();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let c = in_review_chore(&db, "held-reaped");
+        hold_active(&db, &c.work_item_id);
+        insert_batch(&db, "b-dead", &c.work_item_id, "head-1", "failed", 2);
+        run_one_pass(&db, publisher.as_ref(), true).await;
+        let t = task(&db, &c.work_item_id);
+        assert_eq!(
+            t.review_blocked_category.as_deref(),
+            Some("review_unreviewed_after_reap")
+        );
+        assert!(t.review_blocked_reason.unwrap().contains("failed 2 times"));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_reviewer_is_reported_before_any_pr_head_was_polled() {
+        let (_dir, db) = open_db();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let c = in_review_chore(&db, "no-head");
+        hold_active(&db, &c.work_item_id);
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET pr_head_sha = NULL WHERE id = ?1", [&c.work_item_id])
+            .unwrap();
+        insert_batch(&db, "b-first", &c.work_item_id, "head-1", "collecting", 1);
+        insert_execution(&db, "pr_review_first", &c.work_item_id, "pr_review", "claimed", 45 * 60);
+        insert_member(&db, "m_first", "b-first", "pr_review_first", 1);
+        run_one_pass(&db, publisher.as_ref(), true).await;
+        let t = task(&db, &c.work_item_id);
+        assert_eq!(t.review_blocked_category.as_deref(), Some("review_reviewer_stalled"));
+        assert!(t.review_blocked_reason.unwrap().contains("45m"));
+    }
+
+    #[tokio::test]
+    async fn a_diagnosis_is_dropped_when_the_card_leaves_review_ownership_and_kept_while_it_stalls() {
+        let (_dir, db) = open_db();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let c = in_review_chore(&db, "leaves-review");
+        hold_active(&db, &c.work_item_id);
+        insert_batch(&db, "b-live", &c.work_item_id, "head-1", "collecting", 1);
+        insert_execution(&db, "pr_review_stuck", &c.work_item_id, "pr_review", "claimed", 45 * 60);
+        insert_member(&db, "m_stuck", "b-live", "pr_review_stuck", 1);
+
+        run_one_pass(&db, publisher.as_ref(), true).await;
+        run_one_pass(&db, publisher.as_ref(), true).await;
+        assert_eq!(
+            task(&db, &c.work_item_id).review_blocked_category.as_deref(),
+            Some("review_reviewer_stalled"),
+            "a genuinely stalled reviewer keeps its reason across passes"
+        );
+
+        // A CI-fix / implementation run resumes the root: no longer held for review.
+        insert_execution(&db, "impl_resume", &c.work_item_id, "implementation", "running", 60);
+        assert!(
+            task(&db, &c.work_item_id).review_blocked_reason.is_none(),
+            "the Doing card stops showing the review reason immediately"
+        );
+        let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
+        assert_eq!(outcome.cleared, 1);
+        assert!(db.pr_blocked_diagnosis(&c.work_item_id).unwrap().is_none());
+        assert!(
+            publisher
+                .lifecycle_reasons()
+                .await
+                .contains(&"blocked_pr_cleared".to_owned())
+        );
     }
 }

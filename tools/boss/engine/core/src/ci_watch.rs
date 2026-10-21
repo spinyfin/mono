@@ -558,18 +558,25 @@ pub async fn on_ci_failure_detected_with(
     // A failure set pre-triage would `retrigger` (every check STARTUP_FAILURE
     // or CANCELLED) belongs to that path; the job-level retry never also
     // claims it.
-    if classify_pre_triage(failures) != "retrigger"
-        && let crate::ci_transient_retry::TransientOutcome::Handled { retried_jobs } =
-            crate::ci_transient_retry::try_transient_retry(work_db, publisher, retrier, candidate, probe, failures)
-                .await
-    {
-        tracing::info!(
-            work_item_id = %candidate.work_item_id,
-            pr_url = %candidate.pr_url,
-            retried_jobs = ?retried_jobs,
-            "ci_watch: failing checks were transient; jobs retried, no fix revision minted",
-        );
-        return true;
+    if classify_pre_triage(failures) != "retrigger" {
+        match crate::ci_transient_retry::try_transient_retry(work_db, publisher, retrier, candidate, probe, failures)
+            .await
+        {
+            crate::ci_transient_retry::TransientOutcome::Handled { retried_jobs } => {
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    retried_jobs = ?retried_jobs,
+                    "ci_watch: failing checks were transient; jobs retried, no fix revision minted",
+                );
+                return true;
+            }
+            // The failure is transient but the retry budget could not be
+            // read: stop this pass. Falling through would spend a CI-fix
+            // attempt on an infrastructure failure.
+            crate::ci_transient_retry::TransientOutcome::Deferred { .. } => return false,
+            crate::ci_transient_retry::TransientOutcome::NotApplicable { .. } => {}
+        }
     }
     // Budget check (design §Q3). A used >= budget here means we've
     // already burned the allotment for this PR — flip the parent to
