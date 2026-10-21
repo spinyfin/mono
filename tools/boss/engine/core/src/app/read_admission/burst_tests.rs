@@ -30,6 +30,48 @@ async fn call(state: Arc<ServerState>, request: FrontendRequest, pid: Option<lib
     response
 }
 
+/// One request on a fresh socket, timed against the two-second bound.
+async fn timed<F: std::future::Future>(work: F) -> (Result<F::Output, tokio::time::error::Elapsed>, u128) {
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(2), work).await;
+    (result, start.elapsed().as_millis())
+}
+
+async fn list_proposals(state: Arc<ServerState>, run_id: String, pid: libc::pid_t) -> FrontendEvent {
+    call(
+        state,
+        FrontendRequest::ListProposals {
+            run_id,
+            kind: None,
+            state: None,
+        },
+        Some(pid),
+    )
+    .await
+}
+
+/// Eight, then 32, simultaneous CLI readers must not delay a worker's
+/// proposal write, the two status reads behind `agents list`, or a board
+/// read.
+///
+/// Each reader models one `bossctl review batches` process. It opens its
+/// own read-only connection and runs the review-batch queries inside a
+/// read transaction that stays open across the measured window (a CLI
+/// process mid-inspection, holding its WAL snapshot), and it sends one
+/// socket `ListProposals` at the same instant as the measured requests.
+/// The burst is a bounded set of concurrent in-flight reads rather than
+/// an open-ended hot loop. The loop form spent its whole window opening
+/// fresh connections on the blocking pool and starved the four runtime
+/// workers of CPU: a read that touches no database at all
+/// (`ListWorkerLiveStates`) took hundreds of milliseconds locally and
+/// seconds on a loaded CI host, which is what the bounds then measured.
+/// With the work bounded, the bounds trip only on a real serialization: a
+/// reader holding the engine's writer connection, or the write waiting
+/// out SQLite's busy timeout behind the readers.
+///
+/// Every reader and every held inspection is joined before anything is
+/// asserted, so nothing can still touch `state.db` once the fixture (and
+/// its temp dir) is dropped, whatever the measured outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency() {
     for count in [8, 32] {
@@ -71,101 +113,114 @@ async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency()
             .unwrap();
         let pid = std::process::id() as libc::pid_t;
         state.worker_registry.register(pid, execution.id.clone());
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Three rendezvous: start, ready (every inspection holds its
+        // snapshot and every reader has completed a warm round), go (the
+        // burst and the measured requests are released together).
         let barrier = Arc::new(tokio::sync::Barrier::new(count + 1));
+        let mut inspections = Vec::new();
+        let mut releases = Vec::new();
         let mut readers = Vec::new();
         for _ in 0..count {
-            let (state, stop, barrier) = (state.clone(), stop.clone(), barrier.clone());
-            let (run, task, path) = (execution.id.clone(), chore.id.clone(), dir.path().join("state.db"));
+            let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            releases.push(release_tx);
+            let (path, task) = (dir.path().join("state.db"), chore.id.clone());
+            // Exact direct-DB inspection path used by review batches,
+            // including a fresh connection for each CLI invocation. The
+            // queries run inside one read transaction that is held open
+            // until the measured window has closed.
+            inspections.push(tokio::task::spawn_blocking(move || {
+                let db = crate::work::WorkDb::open_read_only(path)?;
+                db.connect()?.execute_batch("BEGIN")?;
+                let root = db.resolve_review_cycle_root(&task)?;
+                let mut members = 0;
+                for batch in db.review_batches_for_cycle_root(&root)? {
+                    members += db.review_batch_members(&batch.id)?.len();
+                }
+                let _ = held_tx.send(());
+                let _ = release_rx.blocking_recv();
+                db.connect()?.execute_batch("COMMIT")?;
+                anyhow::Ok(members)
+            }));
+            let (state, barrier, run) = (state.clone(), barrier.clone(), execution.id.clone());
             readers.push(tokio::spawn(async move {
                 barrier.wait().await;
-                let mut completed = 0;
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) || completed == 0 {
-                    // Exact direct-DB inspection path used by review batches,
-                    // including a fresh connection for each CLI invocation.
-                    let (path, task) = (path.clone(), task.clone());
-                    tokio::task::spawn_blocking(move || {
-                        let db = crate::work::WorkDb::open_read_only(path).unwrap();
-                        let root = db.resolve_review_cycle_root(&task).unwrap();
-                        for batch in db.review_batches_for_cycle_root(&root).unwrap() {
-                            db.review_batch_members(&batch.id).unwrap();
-                        }
-                    })
-                    .await
-                    .unwrap();
-                    let event = call(
-                        state.clone(),
-                        FrontendRequest::ListProposals {
-                            run_id: run.clone(),
-                            kind: None,
-                            state: None,
-                        },
-                        Some(pid),
-                    )
-                    .await;
-                    assert!(matches!(event, FrontendEvent::ProposalsList { .. }), "{event:?}");
-                    completed += 1;
-                    if completed == 1 {
-                        barrier.wait().await;
-                    }
-                }
-                completed
+                // A failed inspection is reported at its join; the reader
+                // still keeps every rendezvous so nothing can hang.
+                let held = held_rx.await.is_ok();
+                let warm = list_proposals(state.clone(), run.clone(), pid).await;
+                barrier.wait().await;
+                barrier.wait().await;
+                let burst = list_proposals(state, run, pid).await;
+                (held, warm, burst)
             }));
         }
         barrier.wait().await;
         barrier.wait().await;
-        let start = std::time::Instant::now();
-        let write = tokio::time::timeout(
-            Duration::from_secs(2),
-            call(
+        barrier.wait().await;
+        let (write, reads) = tokio::join!(
+            timed(call(
                 state.clone(),
                 FrontendRequest::SubmitProposal {
-                    run_id: execution.id,
+                    run_id: execution.id.clone(),
                     kind: ProposalKind::FollowupTask,
                     payload: serde_json::json!({"proposed_name":"N", "proposed_description":"D", "rationale":"R"}),
                     idempotency_key: None,
                 },
                 Some(pid),
-            ),
-        )
-        .await
-        .expect("worker write exceeded two seconds");
-        assert!(matches!(write, FrontendEvent::ProposalSubmitted { .. }), "{write:?}");
-        let write_ms = start.elapsed().as_millis();
-        let start = std::time::Instant::now();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            assert!(matches!(
-                call(state.clone(), FrontendRequest::ListWorkerLiveStates, None).await,
-                FrontendEvent::WorkerLiveStatesList { .. }
-            ));
-            assert!(matches!(
-                call(state.clone(), FrontendRequest::ListTmuxWorkerStatuses, None).await,
-                FrontendEvent::TmuxWorkerStatusesList { .. }
-            ));
-            assert!(matches!(
-                call(
+            )),
+            timed(async {
+                let live = call(state.clone(), FrontendRequest::ListWorkerLiveStates, None).await;
+                let tmux = call(state.clone(), FrontendRequest::ListTmuxWorkerStatuses, None).await;
+                let tree = call(
                     state.clone(),
                     FrontendRequest::GetWorkTree {
                         product_id: chore.product_id.clone(),
                         fetch_seq: None,
                         delta: true,
                     },
-                    None
+                    None,
                 )
-                .await,
-                FrontendEvent::WorkTreeUpdate { .. }
-            ));
-        })
-        .await
-        .expect("app status and board reads exceeded two seconds");
-        eprintln!(
-            "{count}-way burst: worker write {write_ms}ms, agents list {}ms (bound 2000ms)",
-            start.elapsed().as_millis()
+                .await;
+                (live, tmux, tree)
+            }),
         );
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        for reader in readers {
-            assert!(reader.await.unwrap() > 0);
+        // Release the held snapshots and join everything that can touch
+        // the database before judging the window: a failed bound must
+        // not let a reader outlive the fixture's temp dir.
+        for release in releases {
+            let _ = release.send(());
         }
+        let mut outcomes = Vec::new();
+        for reader in readers {
+            outcomes.push(reader.await);
+        }
+        let mut inspected = Vec::new();
+        for inspection in inspections {
+            inspected.push(inspection.await);
+        }
+        let (write, write_ms) = write;
+        let write = write.expect("worker write exceeded two seconds");
+        assert!(matches!(write, FrontendEvent::ProposalSubmitted { .. }), "{write:?}");
+        let (reads, reads_ms) = reads;
+        let (live, tmux, tree) = reads.expect("app status and board reads exceeded two seconds");
+        assert!(matches!(live, FrontendEvent::WorkerLiveStatesList { .. }), "{live:?}");
+        assert!(matches!(tmux, FrontendEvent::TmuxWorkerStatusesList { .. }), "{tmux:?}");
+        assert!(matches!(tree, FrontendEvent::WorkTreeUpdate { .. }), "{tree:?}");
+        for outcome in outcomes {
+            let (held, warm, burst) = outcome.unwrap();
+            assert!(held, "inspection never reached its held snapshot");
+            assert!(matches!(warm, FrontendEvent::ProposalsList { .. }), "{warm:?}");
+            assert!(matches!(burst, FrontendEvent::ProposalsList { .. }), "{burst:?}");
+        }
+        for members in inspected {
+            assert_eq!(
+                members.unwrap().unwrap(),
+                1,
+                "inspection must see the fixture's one batch member"
+            );
+        }
+        eprintln!("{count}-way burst: worker write {write_ms}ms, status and board reads {reads_ms}ms (bound 2000ms)");
     }
 }
 
