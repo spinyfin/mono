@@ -4,10 +4,11 @@
 //! from idle-park *and* stale-worker reap. This registry is the worker's own
 //! "I am deliberately waiting" signal, submitted through `boss propose wait`.
 //! It suppresses only the produce-a-PR nudge and the nudge circuit breaker.
-//! Turns (including replies to human questions) do not revoke or extend the
-//! grant: a resumed session does not prove the declared job finished.
-//! The 2-hour stale-worker reap, pane-death / dead-pid reconcile, hook-trust,
-//! and every other safety check keep firing.
+//! A declaration belongs to the park it was made in: main-session activity
+//! after a Stop consumes it without refunding the charged duration
+//! ([`WaitRegistry::end_if_declared_before`]). The 2-hour stale-worker reap,
+//! pane-death / dead-pid reconcile, hook-trust, and every other safety check
+//! keep firing.
 //!
 //! Each declaration is capped at [`boss_protocol::WAIT_MAX_DURATION_SECS`];
 //! the sum of granted durations per execution is capped at
@@ -248,10 +249,12 @@ impl WaitRegistry {
         let mut guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
         let state = guard.get_mut(execution_id)?;
         if let (Some(declared), Some(boundary)) = (state.active.as_ref()?.declared_after_seq, boundary_seq)
-            && declared >= boundary
+            && declared > boundary
         {
             return None;
         }
+        // Equality means the declaration observed this Stop while the worker
+        // was already parked. It belongs to that park and ends on its resume.
         let ended = state.active.take()?;
         state.expiry_logged = false;
         tracing::info!(
@@ -289,6 +292,10 @@ impl WaitRegistry {
 }
 
 impl boss_engine_live_worker_state::DeclaredWaitSource for WaitRegistry {
+    fn resume(&self, run_id: &str, boundary_seq: Option<u64>) {
+        self.end_if_declared_before(run_id, boundary_seq);
+    }
+
     fn declared_wait(&self, run_id: &str, now_epoch_secs: i64) -> boss_engine_live_worker_state::DeclaredWait {
         use boss_engine_live_worker_state::DeclaredWait;
         if self.active(run_id, now_epoch_secs).is_some() {

@@ -139,7 +139,8 @@ async fn a_background_wakeup_turn_reads_as_working_and_preserves_the_bounded_wai
 
     dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 5)).await;
     let idle = snapshot(&server_state);
-    assert_eq!(idle.activity, WorkerActivity::Idle);
+    assert_eq!(idle.activity, WorkerActivity::WaitingOnWork);
+    assert!(!idle.activity.needs_human());
     assert!(idle.current_tool.is_none());
     assert_eq!(
         idle.wait_reason.as_deref(),
@@ -164,8 +165,8 @@ async fn a_background_wakeup_turn_reads_as_working_and_preserves_the_bounded_wai
     assert!(resumed.wait_expires_at.is_none());
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     assert!(
-        server_state.wait_registry.active(&execution_id, now).is_some(),
-        "resuming does not prove the background job ended",
+        server_state.wait_registry.active(&execution_id, now).is_none(),
+        "the wait described the idle period that just ended; it must not linger on a working pane",
     );
     assert_eq!(
         server_state.wait_registry.total_granted_secs(&execution_id),
@@ -182,7 +183,7 @@ async fn a_background_wakeup_turn_reads_as_working_and_preserves_the_bounded_wai
     let idle_again = snapshot(&server_state);
     assert_eq!(idle_again.activity, WorkerActivity::Idle);
     assert!(idle_again.current_tool.is_none());
-    assert_eq!(idle_again.wait_reason.as_deref(), Some(WAIT_REASON));
+    assert!(idle_again.wait_reason.is_none());
 }
 
 #[tokio::test]
@@ -275,8 +276,8 @@ async fn a_subagent_tool_hook_after_stop_does_not_reopen_the_durable_turn() {
 }
 
 #[tokio::test]
-async fn a_user_prompt_after_stop_preserves_the_declared_wait() {
-    // Answering a prompt does not mean the declared background job ended.
+async fn a_user_prompt_after_stop_also_ends_the_declared_wait() {
+    // Main-session activity after Stop consumes the park's declaration.
     let (server_state, _dir) = test_server_state();
     let execution_id = spawned_worker(&server_state);
     dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
@@ -300,7 +301,7 @@ async fn a_user_prompt_after_stop_preserves_the_declared_wait() {
     let resumed = snapshot(&server_state);
     assert_eq!(resumed.activity, WorkerActivity::Working);
     assert!(resumed.wait_reason.is_none());
-    assert!(wait_is_held(&server_state, &execution_id));
+    assert!(!wait_is_held(&server_state, &execution_id));
     dispatch_worker_event_fanout(&server_state, &notification(&execution_id, 5)).await;
     let asking = snapshot(&server_state);
     assert_eq!(asking.activity, WorkerActivity::WaitingForInput);
@@ -310,7 +311,7 @@ async fn a_user_prompt_after_stop_preserves_the_declared_wait() {
     );
     dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 6)).await;
     dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 7)).await;
-    assert_eq!(snapshot(&server_state).wait_reason.as_deref(), Some(WAIT_REASON));
+    assert!(snapshot(&server_state).wait_reason.is_none());
 }
 
 /// Drive the real ingress reducer and completion handler with the same wait
@@ -390,15 +391,24 @@ async fn three_status_replies_during_a_live_job_preserve_waits_and_breaker_count
             .await;
             assert_eq!(snapshot(&server_state).activity, WorkerActivity::Working);
             assert!(snapshot(&server_state).wait_reason.is_none());
+            assert!(
+                server_state.wait_registry.active(&execution_id, now).is_none(),
+                "a status reply is main-session activity after Stop, so it consumes the wait",
+            );
             dispatch_live_worker_state(&server_state, &stop(&execution_id, seq + 1)).await;
-            assert!(matches!(
-                handler.on_stop(&execution_id).await,
-                StopOutcome::WorkerWaitPending { .. }
-            ));
-            let after = server_state.wait_registry.active(&execution_id, now).unwrap();
+            if !renew {
+                assert!(
+                    !matches!(
+                        handler.on_stop(&execution_id).await,
+                        StopOutcome::WorkerWaitPending { .. }
+                    ),
+                    "the wait was consumed; a later Stop is not still waiting on work",
+                );
+            }
             assert_eq!(
-                after.expires_at_epoch, before.expires_at_epoch,
-                "questions cannot extend a wait"
+                before.granted_secs,
+                60 * 60,
+                "questions cannot refund the charged duration"
             );
             assert_eq!(breaker.counts(&execution_id), counts_before);
 
@@ -497,7 +507,10 @@ async fn a_stop_overtaken_by_the_resumed_turn_preserves_the_declared_wait() {
     assert_eq!(state.current_tool.as_deref(), Some("Read"));
     assert!(state.wait_reason.is_none(), "the stale wait reason clears");
     assert!(state.wait_expires_at.is_none());
-    assert!(wait_is_held(&server_state, &execution_id));
+    assert!(
+        !wait_is_held(&server_state, &execution_id),
+        "the late Stop still proves the main session resumed, so the wait ends",
+    );
     assert_eq!(
         server_state.wait_registry.total_granted_secs(&execution_id),
         45 * 60,
@@ -805,13 +818,13 @@ async fn a_declared_wait_overrides_waiting_for_input_while_a_bare_prompt_keeps_i
     // Mid-turn prompt: the declaring turn has not ended, so it still asks.
     assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingForInput);
     dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
-    server_state
-        .live_worker_states
-        .set_activity_for_test(SLOT, WorkerActivity::WaitingForInput);
     let waiting = snapshot(&server_state);
-    assert_eq!(waiting.activity, WorkerActivity::Idle);
+    assert_eq!(waiting.activity, WorkerActivity::WaitingOnWork);
     assert_eq!(waiting.wait_reason.as_deref(), Some(WAIT_REASON));
-    assert!(waiting.live_status.is_none(), "no generic 'awaiting input' subtitle");
+    assert_eq!(
+        waiting.live_status.as_deref(),
+        Some(boss_engine_runtime::live_status::WAITING_ON_WORK_LITERAL)
+    );
 }
 
 #[tokio::test]
