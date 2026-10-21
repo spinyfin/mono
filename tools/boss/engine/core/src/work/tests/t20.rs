@@ -652,7 +652,9 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+            "UPDATE work_executions SET status = 'abandoned',
+             cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture'
+             WHERE id = ?1",
             rusqlite::params![first_exec.id],
         )
         .unwrap();

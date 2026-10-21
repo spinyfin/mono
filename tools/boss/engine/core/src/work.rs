@@ -643,6 +643,7 @@ mod coordinator_tmux;
 mod cost_report_db;
 mod create_entities;
 mod critical_priority;
+mod decision_terminal;
 mod decisions;
 mod dep_helpers;
 mod design_postmortem;
@@ -742,6 +743,7 @@ use board_notifications::stage_task_board_change;
 pub(crate) use cached_task_runtimes::*;
 pub(crate) use chain_helpers::*;
 use create_entities::create_project_in_tx;
+pub(crate) use decision_terminal::*;
 pub(crate) use dep_helpers::*;
 pub(crate) use dispatch_class::DispatchClass;
 pub(crate) use dispatch_helpers::*;
@@ -798,6 +800,7 @@ pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
 pub use board_patch::WorkRuntimePatch;
 pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
+pub use decision_terminal::DecisionAuditContext;
 pub use exec_tail::ClearedExecutionWorkspace;
 pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,

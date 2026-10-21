@@ -296,7 +296,14 @@ impl WorkDb {
                         &tx,
                         &mut pending,
                         execution_id,
-                        CancelExecutionOpts::default(),
+                        CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                            boss_protocol::CancelSource::ReviewGuide,
+                            "review_guide_jobs",
+                            format!(
+                                "review-guide attempt {} replaced by a newer guide request for the same source series",
+                                attempt.id
+                            ),
+                        )),
                     )?;
                 }
             }

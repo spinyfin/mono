@@ -305,7 +305,7 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
 fn make_abandoned_chore_with_workspace(db: &WorkDb, label: &str) -> (String, String, String) {
     let (product_id, chore_id, exec_id) = make_waiting_human_chore(db, label);
     // Simulate the orphan sweep abandoning exec_a.
-    db.mark_execution_redundant(&exec_id).unwrap();
+    db.mark_execution_redundant(&exec_id, test_cancel_provenance()).unwrap();
     (product_id, chore_id, exec_id)
 }
 
@@ -550,6 +550,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
     }
 }
 
+mod cancel_provenance_paths_tests;
 mod claimed_dispatch_tests;
 mod latest_local_execution_tests;
 mod list_runs_filters;

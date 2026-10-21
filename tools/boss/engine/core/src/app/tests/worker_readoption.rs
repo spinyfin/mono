@@ -328,7 +328,7 @@ async fn a_hook_for_a_cancelled_execution_reaps_instead_of_readopting() {
     // A dead pid: the assertion here is about the VERDICT, and using a live pid
     // would have the reap signal this test process's own group.
     let execution_id = create_spawned_execution(db, &work_item_id, dead_pid());
-    db.cancel_execution(&execution_id).unwrap();
+    db.cancel_execution(&execution_id, test_cancel_provenance()).unwrap();
 
     crate::app::worker_events::converge_terminal_execution_contradiction(&server_state, &execution_id, "stop").await;
 

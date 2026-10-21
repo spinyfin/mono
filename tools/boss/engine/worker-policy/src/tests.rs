@@ -323,6 +323,9 @@ fn runtime_half_stays_closed() {
         FrontendRequest::ListTmuxWorkerStatuses,
         FrontendRequest::StopRun {
             run_id: "exec_other".into(),
+            reason: None,
+            source: None,
+            actor: None,
         },
         FrontendRequest::SendInputToWorker {
             run_id: "exec_other".into(),

@@ -769,6 +769,13 @@ pub struct WorkExecution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 
+    /// Who ended this execution by decision (`cancelled` / `abandoned`) and
+    /// why, stamped in the same write that moved the status. `None` for a
+    /// row that is not terminal-by-decision, and for rows cancelled before
+    /// provenance was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_provenance: Option<super::cancel_provenance::CancelProvenance>,
+
     /// When `true`, the cube workspace preference (`preferred_workspace_id`)
     /// is treated as a warmth hint only: if the preferred workspace is
     /// unavailable or busy, the coordinator falls back silently to any free

@@ -11,7 +11,7 @@
 use serde_json::json;
 
 use super::*;
-use crate::test_support::{create_test_chore, create_test_product, open_db};
+use crate::test_support::{create_test_chore, create_test_product, open_db, test_cancel_provenance};
 
 /// Unwrap the inner `Task` from a `WorkItem` returned by
 /// `get_task_with_external_ref`. Chores decode as `WorkItem::Chore`.
@@ -264,7 +264,9 @@ mod event_bus_tests {
             .event_bus()
             .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
 
-        let cancelled = db.cancel_running_execution(&execution.id).unwrap();
+        let cancelled = db
+            .cancel_running_execution(&execution.id, test_cancel_provenance())
+            .unwrap();
         assert!(cancelled, "a non-terminal execution must be cancelled");
 
         let event = sub
@@ -311,7 +313,9 @@ mod event_bus_tests {
             .event_bus()
             .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
 
-        let (cancelled, demoted) = db.cancel_running_execution_and_demote_task(&execution.id).unwrap();
+        let (cancelled, demoted) = db
+            .cancel_running_execution_and_demote_task(&execution.id, test_cancel_provenance())
+            .unwrap();
         assert!(cancelled, "a non-terminal execution must be cancelled");
         assert!(demoted, "the active task must be demoted to todo");
 

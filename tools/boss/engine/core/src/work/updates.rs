@@ -757,7 +757,13 @@ impl WorkDb {
         // (`running` / `waiting_human`) is left alone — it self-retires. The
         // reconcile guard (`work_item_is_deferred`) then keeps it parked.
         if patch.deferred == Some(true) {
-            abandon_pending_executions(&mut pending, &tx, id, &task.updated_at)?;
+            abandon_pending_executions(
+                &mut pending,
+                &tx,
+                id,
+                &task.updated_at,
+                "the work item was reclassified as deferred and leaves the dispatch pool",
+            )?;
         }
 
         if status_changed && previous_status != task.status {

@@ -188,26 +188,43 @@ impl WorkDb {
             // Abandon any non-terminal executions so they don't get
             // picked up by the dispatcher after the demote. Terminal
             // executions are left alone — they're already settled.
-            let abandoned_ids: Vec<String> = {
-                let mut stmt = tx.prepare(
-                    "SELECT id FROM work_executions
-                     WHERE work_item_id = ?1
-                       AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')",
-                )?;
-                stmt.query_map(params![work_item_id], |row| row.get(0))?
-                    .collect::<rusqlite::Result<_>>()?
-            };
+            let provenance = boss_protocol::CancelProvenance::engine(
+                boss_protocol::CancelSource::GhostActiveHeal,
+                "heal_ghost_active_chores",
+                format!(
+                    "work item {work_item_id} was `active` but none of its executions ever produced a run; \
+                     abandoned them while demoting the card back to todo"
+                ),
+            );
+            let abandoned = capture_doomed(
+                &tx,
+                "work_item_id = ?1 AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')",
+                params![work_item_id],
+            )?;
             tx.execute(
                 "UPDATE work_executions
                  SET status = 'abandoned',
-                     finished_at = COALESCE(finished_at, ?2)
+                     finished_at = COALESCE(finished_at, ?2),
+                     cancel_source = ?3,
+                     cancel_actor = ?4,
+                     cancel_reason = ?5
                  WHERE work_item_id = ?1
                    AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')",
-                params![work_item_id, now],
+                params![
+                    work_item_id,
+                    now,
+                    provenance.source.as_str(),
+                    provenance.actor,
+                    provenance.reason
+                ],
             )?;
-            for execution_id in &abandoned_ids {
-                stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
-            }
+            stage_doomed(
+                &mut pending,
+                &tx,
+                &abandoned,
+                &boss_protocol::ExecutionStatus::Abandoned,
+                &provenance,
+            )?;
             // Demote the kanban status. Use a guarded update so we
             // don't race a concurrent move to `done`/`archived`.
             // Stamps `last_status_actor = 'engine'` so the kanban can
@@ -285,16 +302,48 @@ impl WorkDb {
         let mut abandoned = Vec::new();
         let mut pending = PendingEvents::new();
         for (execution_id, work_item_id) in candidates {
+            let provenance = boss_protocol::CancelProvenance::engine(
+                boss_protocol::CancelSource::StrandedExecutionSweep,
+                "abandon_stranded_executions_on_closed_work_items",
+                format!(
+                    "never-started execution against closed work item {work_item_id} \
+                     (done, archived, or deleted); it can never be dispatched"
+                ),
+            );
+            let Some(doomed) = capture_doomed(
+                &tx,
+                "id = ?1 AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
+                params![execution_id],
+            )?
+            .pop() else {
+                continue;
+            };
             let updated = tx.execute(
                 "UPDATE work_executions
                  SET status = 'abandoned',
-                     finished_at = COALESCE(finished_at, ?2)
+                     finished_at = COALESCE(finished_at, ?2),
+                     cancel_source = ?3,
+                     cancel_actor = ?4,
+                     cancel_reason = ?5
                  WHERE id = ?1
                    AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
-                params![execution_id, now],
+                params![
+                    execution_id,
+                    now,
+                    provenance.source.as_str(),
+                    provenance.actor,
+                    provenance.reason
+                ],
             )?;
             if updated > 0 {
-                stage_execution_terminal(&mut pending, &tx, &execution_id, &work_item_id)?;
+                stage_decision_terminal(
+                    &mut pending,
+                    &tx,
+                    &doomed,
+                    &boss_protocol::ExecutionStatus::Abandoned,
+                    &provenance,
+                    &DecisionAuditContext::default(),
+                )?;
                 abandoned.push(AbandonedStrandedExecution {
                     execution_id,
                     work_item_id,
@@ -1199,7 +1248,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -1215,7 +1264,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -1238,7 +1287,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
                  FROM work_executions
                  WHERE work_item_id = ?1",
             )?;
@@ -1380,7 +1429,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND id != ?2
@@ -1409,7 +1458,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -1583,7 +1632,7 @@ impl WorkDb {
                     "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                             cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                             created_at, started_at, finished_at,
-                            pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                            pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
                      FROM work_executions
                      WHERE work_item_id = ?1
                        AND status IN ('running', 'waiting_human')
@@ -1604,7 +1653,11 @@ impl WorkDb {
     /// execution or task state. Used by the double-spawn guard to
     /// discard a redundant `ready` execution before it ever reaches
     /// `start_execution_run`.
-    pub fn mark_execution_redundant(&self, execution_id: &str) -> Result<()> {
+    pub fn mark_execution_redundant(
+        &self,
+        execution_id: &str,
+        provenance: boss_protocol::CancelProvenance,
+    ) -> Result<()> {
         let conn = self.connect()?;
         let existing = query_execution(&conn, execution_id)?;
         let now = now_string();
@@ -1612,9 +1665,18 @@ impl WorkDb {
             Some(existing) if !existing.status.is_terminal() => conn.execute(
                 "UPDATE work_executions
                  SET status = 'abandoned',
-                     finished_at = COALESCE(finished_at, ?2)
+                     finished_at = COALESCE(finished_at, ?2),
+                     cancel_source = ?3,
+                     cancel_actor = ?4,
+                     cancel_reason = ?5
                  WHERE id = ?1",
-                rusqlite::params![execution_id, now],
+                rusqlite::params![
+                    execution_id,
+                    now,
+                    provenance.source.as_str(),
+                    provenance.actor,
+                    provenance.reason
+                ],
             )?,
             _ => 0,
         };
@@ -1631,8 +1693,21 @@ impl WorkDb {
                 work_item_id = %existing.work_item_id,
                 from_status = %existing.status,
                 to_status = "abandoned",
-                reason = "redundant duplicate execution",
+                source = %provenance.source,
+                actor = %provenance.actor,
+                reason = %provenance.reason,
                 "execution terminalized: mark redundant",
+            );
+            crate::audit::record_event(
+                "execution_abandoned",
+                &decision_audit_payload(
+                    execution_id,
+                    &existing.work_item_id,
+                    existing.status.as_str(),
+                    &boss_protocol::ExecutionStatus::Abandoned,
+                    &provenance,
+                    &DecisionAuditContext::default(),
+                ),
             );
             // No open `Transaction` here — `conn` auto-commits each
             // statement, so the UPDATE above is already durable and this
@@ -1737,21 +1812,45 @@ impl WorkDb {
     /// transitioned; the execution abandon always applies (best-effort,
     /// WHERE-guarded on `status IN ('ready', 'claimed')` so a drain-loop
     /// claim is retired with the unused spawn rather than left hanging).
-    pub fn retire_stale_revision_before_dispatch(&self, execution_id: &str, task_id: &str) -> Result<bool> {
+    pub fn retire_stale_revision_before_dispatch(
+        &self,
+        execution_id: &str,
+        task_id: &str,
+        provenance: boss_protocol::CancelProvenance,
+    ) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
+        let doomed = capture_doomed(&tx, "id = ?1 AND status IN ('ready', 'claimed')", params![execution_id])?;
         let execution_rows = tx.execute(
             "UPDATE work_executions
              SET status = 'abandoned',
-                 finished_at = COALESCE(finished_at, ?2)
+                 finished_at = COALESCE(finished_at, ?2),
+                 cancel_source = ?3,
+                 cancel_actor = ?4,
+                 cancel_reason = ?5
              WHERE id = ?1
                AND status IN ('ready', 'claimed')",
-            params![execution_id, now],
+            params![
+                execution_id,
+                now,
+                provenance.source.as_str(),
+                provenance.actor,
+                provenance.reason
+            ],
         )?;
         let mut pending = PendingEvents::new();
         if execution_rows > 0 {
-            stage_execution_terminal(&mut pending, &tx, execution_id, task_id)?;
+            for row in &doomed {
+                stage_decision_terminal(
+                    &mut pending,
+                    &tx,
+                    &DoomedExecution::new(&row.id, task_id, &row.from_status),
+                    &boss_protocol::ExecutionStatus::Abandoned,
+                    &provenance,
+                    &DecisionAuditContext::default(),
+                )?;
+            }
         }
         let task_rows = tx.execute(
             "UPDATE tasks
@@ -1866,7 +1965,7 @@ fn review_guide_executions_for_task(conn: &Connection, task_id: &str) -> Result<
         "SELECT we.id, we.work_item_id, we.kind, we.status, we.repo_remote_url, we.cube_repo_id, we.cube_lease_id,
                 we.cube_workspace_id, we.workspace_path, we.priority, we.preferred_workspace_id,
                 we.created_at, we.started_at, we.finished_at,
-                we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error
+                we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error, we.cancel_source, we.cancel_actor, we.cancel_reason
          {REVIEW_GUIDE_EXECUTIONS_FOR_TASK_FROM}",
     ))?;
     let rows = stmt.query_map([task_id], map_execution)?;
@@ -1899,7 +1998,7 @@ mod event_bus_tests {
     use boss_event_bus::TopicFilter;
 
     use super::*;
-    use crate::test_support::{create_ready_chore_execution, create_test_product, open_db};
+    use crate::test_support::{create_ready_chore_execution, create_test_product, open_db, test_cancel_provenance};
     use crate::work::CreateChoreInput;
 
     #[tokio::test]
@@ -1922,7 +2021,8 @@ mod event_bus_tests {
             .event_bus()
             .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
 
-        db.mark_execution_redundant(&execution.id).unwrap();
+        db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+            .unwrap();
 
         let event = sub
             .recv()
@@ -1956,13 +2056,15 @@ mod event_bus_tests {
             .unwrap();
         let execution = create_ready_chore_execution(&db, chore.id);
 
-        db.mark_execution_redundant(&execution.id).unwrap();
+        db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+            .unwrap();
 
         let mut sub = db
             .event_bus()
             .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
 
-        db.mark_execution_redundant(&execution.id).unwrap();
+        db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+            .unwrap();
 
         tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
             .await

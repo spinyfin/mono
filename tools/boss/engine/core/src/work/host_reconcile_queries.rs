@@ -34,7 +34,7 @@ impl WorkDb {
                     e.created_at, e.started_at, e.finished_at,
                     e.pre_start_failure_count, e.dispatch_not_before, e.pr_url, e.pr_head_before, e.prefer_is_soft,
                     e.worker_branch_prefix, e.transient_failure_count, e.allow_dirty, e.branch_naming,
-                    e.dispatch_wait_reason, e.dispatch_wait_since, e.driver_runtime_state, e.driver, e.model, e.effort_level, e.pr_head_after, e.last_error,
+                    e.dispatch_wait_reason, e.dispatch_wait_since, e.driver_runtime_state, e.driver, e.model, e.effort_level, e.pr_head_after, e.last_error, e.cancel_source, e.cancel_actor, e.cancel_reason,
                     r.host_id, r.id
              FROM work_executions e
              JOIN work_runs r ON r.id = (
@@ -52,8 +52,8 @@ impl WorkDb {
             let execution = map_execution(row)?;
             Ok(HostBoundExecution {
                 execution,
-                host_id: row.get(31)?,
-                run_id: row.get(32)?,
+                host_id: row.get(34)?,
+                run_id: row.get(35)?,
             })
         })?;
         collect_rows(rows)

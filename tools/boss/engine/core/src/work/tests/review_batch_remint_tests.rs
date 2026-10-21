@@ -75,7 +75,7 @@ fn admissible_concurrent_review_batch_pair_spans_batches_of_one_cycle_root_only(
         )
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
     // Batch A reaches `supervising`, so its supervisor is the live execution
@@ -109,7 +109,7 @@ fn admissible_concurrent_review_batch_pair_spans_batches_of_one_cycle_root_only(
         )
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
     assert!(
@@ -130,7 +130,8 @@ fn admissible_concurrent_review_batch_pair_spans_batches_of_one_cycle_root_only(
 
     // (b) Two supervisors of ONE batch (a retry overlapping its live
     // predecessor) remain a genuine duplicate.
-    db.mark_execution_redundant(&supervisor_a).unwrap();
+    db.mark_execution_redundant(&supervisor_a, test_cancel_provenance())
+        .unwrap();
     let supervisor_a_retry = match db.retry_dead_review_batch_member(&supervisor_a).unwrap() {
         RetryDeadReviewBatchMember::Retried(retry) => retry.id,
         other => panic!("expected a supervisor retry, got {other:?}"),
@@ -197,7 +198,7 @@ fn failed_batch_without_a_report_is_automatically_reminted_once() {
         )
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
     assert_eq!(batch_1.generation, 1);
@@ -210,7 +211,7 @@ fn failed_batch_without_a_report_is_automatically_reminted_once() {
         )
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("a reaped generation-1 batch must be re-minted automatically, got {other:?}"),
     };
     assert_eq!(batch_2.generation, 2);
@@ -261,7 +262,7 @@ fn batch_reaped_after_a_partial_leaf_report_is_automatically_reminted() {
         )
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
     submit_review_report(
@@ -280,7 +281,8 @@ fn batch_reaped_after_a_partial_leaf_report_is_automatically_reminted() {
         )
         .unwrap();
     // The other leaf exhausted its attempts and died without reporting.
-    db.mark_execution_redundant(&executions[1].id).unwrap();
+    db.mark_execution_redundant(&executions[1].id, test_cancel_provenance())
+        .unwrap();
     {
         let conn = db.connect().unwrap();
         conn.execute(
@@ -332,12 +334,13 @@ fn automatic_remint_waits_for_the_failed_generation_to_settle() {
         )
         .unwrap()
     {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
     // One leaf abandoned, the other still live when the batch is failed
     // (the reaper's dead-root branch can produce exactly this).
-    db.mark_execution_redundant(&executions[0].id).unwrap();
+    db.mark_execution_redundant(&executions[0].id, test_cancel_provenance())
+        .unwrap();
     db.connect()
         .unwrap()
         .execute(
@@ -367,7 +370,9 @@ fn automatic_remint_waits_for_the_failed_generation_to_settle() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+            "UPDATE work_executions SET status = 'abandoned',
+             cancel_source = 'review_batch', cancel_actor = 'test', cancel_reason = 'test fixture'
+             WHERE id = ?1",
             rusqlite::params![executions[1].id],
         )
         .unwrap();
@@ -389,7 +394,8 @@ fn automatic_remint_waits_for_the_failed_generation_to_settle() {
 /// member rows `failed`, the batch `failed`.
 fn fail_batch_as_reaped(db: &WorkDb, batch_id: &str, executions: &[WorkExecution]) {
     for execution in executions {
-        db.mark_execution_redundant(&execution.id).unwrap();
+        db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+            .unwrap();
     }
     let conn = db.connect().unwrap();
     conn.execute(

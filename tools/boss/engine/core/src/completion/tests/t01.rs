@@ -1809,7 +1809,7 @@ async fn cancel_and_release_mid_spawn_cancels_row_but_holds_lease() {
     let TestHarness { handler, cube, .. } = TestHarness::with_pane(db.clone(), StubPrDetector::ok(None), pane.clone());
 
     handler
-        .cancel_and_release(&chore_id, &execution_id, "test: mid-spawn cancel")
+        .cancel_and_release(&chore_id, &execution_id, test_cancel_provenance())
         .await;
 
     let execution = db.get_execution(&execution_id).unwrap();
@@ -1840,13 +1840,39 @@ async fn cancel_and_release_with_live_worker_releases_lease() {
     let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
 
     handler
-        .cancel_and_release(&chore_id, &execution_id, "test: live worker cancel")
+        .cancel_and_release(&chore_id, &execution_id, test_cancel_provenance())
         .await;
 
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(execution.status, ExecutionStatus::Cancelled);
     assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
     assert!(execution.cube_lease_id.is_none());
+}
+
+/// `handle_unpopulate_project` tears down live workers the same way
+/// `handle_delete_work_item` does — via `cancel_and_release` with
+/// `ProjectUnpopulated` provenance. Drive that call and assert the stamp.
+#[tokio::test]
+async fn unpopulate_teardown_records_project_unpopulated_provenance() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, execution_id) = fixture_running(workspace.path());
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let provenance = boss_protocol::CancelProvenance::engine(
+        boss_protocol::CancelSource::ProjectUnpopulated,
+        "session",
+        format!(
+            "work item {chore_id} deleted while unpopulating project proj_1 \
+             (planner run run_1) with a worker still active"
+        ),
+    );
+
+    handler
+        .cancel_and_release(&chore_id, &execution_id, provenance.clone())
+        .await;
+
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert_eq!(execution.status, ExecutionStatus::Cancelled);
+    assert_eq!(execution.cancel_provenance.as_ref(), Some(&provenance));
 }
 
 /// Regression guard for the "delete-while-doing" lifecycle bug: deleting a
@@ -1879,8 +1905,13 @@ async fn delete_while_doing_teardown_releases_pane_frees_lease_and_cancels_execu
 
     // This is the call that handle_delete_work_item spawns when it detects
     // a live execution for a work item being deleted.
+    let provenance = boss_protocol::CancelProvenance::engine(
+        boss_protocol::CancelSource::WorkItemDeleted,
+        "session",
+        format!("work item {chore_id} deleted while a worker was active"),
+    );
     handler
-        .cancel_and_release(&chore_id, &execution_id, "work item deleted while a worker was active")
+        .cancel_and_release(&chore_id, &execution_id, provenance.clone())
         .await;
 
     // 1. Pane releaser was invoked — the production implementation
@@ -1908,6 +1939,11 @@ async fn delete_while_doing_teardown_releases_pane_frees_lease_and_cancels_execu
         execution.status,
         ExecutionStatus::Cancelled,
         "execution must be marked Cancelled so the reconciler never re-dispatches the deleted item",
+    );
+    assert_eq!(
+        execution.cancel_provenance.as_ref(),
+        Some(&provenance),
+        "delete-while-doing must stamp the WorkItemDeleted provenance that handle_delete_work_item supplies",
     );
     assert!(
         execution.cube_lease_id.is_none(),
@@ -1944,8 +1980,13 @@ async fn delete_while_dispatching_cancels_row_but_holds_lease_for_inflight_spawn
     // This is the call that handle_delete_work_item spawns when it
     // detects a live (here: mid-dispatch) execution for a work item
     // being deleted.
+    let provenance = boss_protocol::CancelProvenance::engine(
+        boss_protocol::CancelSource::WorkItemDeleted,
+        "session",
+        format!("work item {chore_id} deleted while a worker was active"),
+    );
     handler
-        .cancel_and_release(&chore_id, &execution_id, "work item deleted while a worker was active")
+        .cancel_and_release(&chore_id, &execution_id, provenance.clone())
         .await;
 
     // The row is terminal immediately — the orphan sweep and
@@ -1957,6 +1998,7 @@ async fn delete_while_dispatching_cancels_row_but_holds_lease_for_inflight_spawn
         ExecutionStatus::Cancelled,
         "execution must be marked Cancelled so the reconciler never re-dispatches the deleted item",
     );
+    assert_eq!(execution.cancel_provenance.as_ref(), Some(&provenance));
 
     // Pane release was attempted (it is what would reap a worker that
     // had already come up)...

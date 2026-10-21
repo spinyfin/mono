@@ -518,7 +518,7 @@ impl ExecutionRunner for FakeExecutionRunner {
             // CancelledDuringSpawn so the coordinator releases the
             // lease the cancel path left held.
             if let Some(db) = &self.work_db {
-                db.cancel_running_execution(&execution.id)
+                db.cancel_running_execution(&execution.id, test_cancel_provenance())
                     .expect("cancel row in fake mid-spawn cancel");
             }
             return Ok(RunOutcome {

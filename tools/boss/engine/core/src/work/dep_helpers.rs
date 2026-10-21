@@ -501,7 +501,7 @@ pub(crate) fn maybe_engine_block_dependent(
         // returning the cancelled row tells it which execution to
         // reap. Projects (`proj_…`) have no executions, so this only
         // applies to tasks.
-        return cancel_live_execution_for_block_in_tx(pending, conn, dependent_id, now_epoch);
+        return cancel_live_execution_for_block_in_tx(pending, conn, dependent_id, &gating, now_epoch);
     }
     Ok(None)
 }
@@ -520,21 +520,47 @@ fn cancel_live_execution_for_block_in_tx(
     pending: &mut PendingEvents,
     conn: &Connection,
     work_item_id: &str,
+    gating_prereqs: &[String],
     now_epoch: &str,
 ) -> Result<Option<WorkExecution>> {
     let Some(live) = query_live_execution_for_work_item(conn, work_item_id)? else {
         return Ok(None);
     };
+    let provenance = boss_protocol::CancelProvenance::engine(
+        boss_protocol::CancelSource::DependencyBlock,
+        "work_dependencies",
+        format!(
+            "dependent transitioned to blocked: a `blocks` dependency on {} gates it, \
+             and a blocked work item must not have a live worker",
+            gating_prereqs.join(", ")
+        ),
+    );
     conn.execute(
         "UPDATE work_executions
          SET status = 'cancelled',
-             finished_at = ?2
+             finished_at = ?2,
+             cancel_source = ?3,
+             cancel_actor = ?4,
+             cancel_reason = ?5
          WHERE id = ?1",
-        params![live.id, now_epoch],
+        params![
+            live.id,
+            now_epoch,
+            provenance.source.as_str(),
+            provenance.actor,
+            provenance.reason
+        ],
     )?;
     let updated = query_execution(conn, &live.id)?
         .with_context(|| format!("execution vanished after block-cancel: {}", live.id))?;
-    stage_execution_terminal(pending, conn, &live.id, work_item_id)?;
+    stage_decision_terminal(
+        pending,
+        conn,
+        &DoomedExecution::new(&live.id, work_item_id, live.status.as_str()),
+        &boss_protocol::ExecutionStatus::Cancelled,
+        &provenance,
+        &DecisionAuditContext::default(),
+    )?;
     tracing::info!(
         work_item_id,
         execution_id = %live.id,
@@ -549,7 +575,9 @@ fn cancel_live_execution_for_block_in_tx(
         work_item_id = %work_item_id,
         from_status = %live.status,
         to_status = %updated.status,
-        reason = "dependent transitioned to blocked",
+        source = %provenance.source,
+        actor = %provenance.actor,
+        reason = %provenance.reason,
         "execution terminalized: block cancel",
     );
     Ok(Some(updated))

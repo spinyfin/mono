@@ -1013,6 +1013,28 @@ pub(super) async fn transport_default_created_via(server_state: &Arc<ServerState
     }
 }
 
+/// The actor to record when an RPC cancels an execution as a side effect
+/// (a kanban drag back to Backlog, a work-item delete). Names the engine's
+/// resolved caller tier, whether the request arrived on the app's session,
+/// and the socket peer it observed — everything the engine can attest to
+/// about who sent the request, with no guessed identity.
+pub(super) async fn rpc_cancel_actor(
+    server_state: &Arc<ServerState>,
+    session_id: &str,
+    peer_pid: Option<libc::pid_t>,
+) -> String {
+    let tier = super::process_signals::resolve_status_actor(server_state, peer_pid);
+    let via = if transport_default_created_via(server_state, session_id).await == boss_protocol::CREATED_VIA_MAC_APP {
+        "mac_app"
+    } else {
+        "non_app_client"
+    };
+    match peer_pid {
+        Some(pid) => format!("{tier} via {via} (peer pid {pid})"),
+        None => format!("{tier} via {via} (peer pid not observed)"),
+    }
+}
+
 pub(super) fn work_item_id(item: &WorkItem) -> String {
     match item {
         WorkItem::Product(product) => product.id.clone(),

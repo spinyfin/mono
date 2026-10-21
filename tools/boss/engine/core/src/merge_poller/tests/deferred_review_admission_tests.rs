@@ -77,9 +77,10 @@ fn settled_batch(
     {
         ReviewBatchDispatch::Created { batch, executions } => {
             for execution in &executions {
-                db.mark_execution_redundant(&execution.id).unwrap();
+                db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+                    .unwrap();
             }
-            (batch, executions)
+            (*batch, executions)
         }
         other => panic!("expected a new batch, got {other:?}"),
     }

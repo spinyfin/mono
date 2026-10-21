@@ -97,6 +97,12 @@ struct ExecutionRow: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
+            if let provenance = exec.cancelProvenance {
+                Text("Cancelled: \(provenance.source) by \(provenance.actor) — \(provenance.reason)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.vertical, 2)
     }
@@ -141,6 +147,7 @@ struct ExecutionRow: View {
         case "running": .blue
         case "failed": .red
         case "abandoned": .orange
+        case "cancelled": .orange
         case "pending": .yellow
         default: .secondary
         }

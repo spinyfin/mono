@@ -655,7 +655,10 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
             released_leases: Default::default(),
         }))));
     let name = server_state.work_db.persona_display_name(&execution.id).unwrap();
-    server_state.work_db.cancel_running_execution(&execution.id).unwrap();
+    server_state
+        .work_db
+        .cancel_running_execution(&execution.id, test_cancel_provenance())
+        .unwrap();
     assert_eq!(
         server_state.release_worker_pane(&execution.id).await,
         PaneReleaseOutcome::Reaped
@@ -703,7 +706,10 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
         .unwrap();
     // A proven-dead terminal remote execution releases before any hook allocated
     // its virtual slot (also the state immediately after an engine restart).
-    server_state.work_db.cancel_running_execution(&next.id).unwrap();
+    server_state
+        .work_db
+        .cancel_running_execution(&next.id, test_cancel_provenance())
+        .unwrap();
     assert_eq!(
         server_state.release_worker_pane(&next.id).await,
         PaneReleaseOutcome::Reaped
@@ -833,7 +839,8 @@ async fn retained_remote_worker_release(completed: bool) {
         )
         .unwrap();
     } else {
-        db.cancel_running_execution(&execution.id).unwrap();
+        db.cancel_running_execution(&execution.id, test_cancel_provenance())
+            .unwrap();
     }
 
     let adapter = Arc::new(ProbeAdapter {

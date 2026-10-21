@@ -420,9 +420,12 @@ impl ExecutionCoordinator {
             let _ = self.work_db.cancel_execution_with(
                 &refreshed.id,
                 CancelExecutionOpts {
-                    reason: Some(format!("pause-only forced dispatch refused: {reason}")),
                     queued_only: true,
-                    record_failure_reason: false,
+                    ..CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                        boss_protocol::CancelSource::DispatchAdmission,
+                        "dispatch_admission",
+                        format!("pause-only forced dispatch refused: {reason}"),
+                    ))
                 },
             );
             // This row can carry a `--host` routing constraint set by
@@ -508,9 +511,16 @@ impl ExecutionCoordinator {
                 let _ = self.work_db.cancel_execution_with(
                     &execution.id,
                     CancelExecutionOpts {
-                        reason: Some("--host only applies to a queued execution".to_string()),
                         queued_only: true,
-                        record_failure_reason: false,
+                        ..CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                            boss_protocol::CancelSource::DispatchAdmission,
+                            "dispatch_admission",
+                            format!(
+                                "--host {host_id} only applies to a queued execution, but the request resolved to \
+                                 execution {} in status `{}`",
+                                execution.id, execution.status
+                            ),
+                        ))
                     },
                 );
                 bail!(

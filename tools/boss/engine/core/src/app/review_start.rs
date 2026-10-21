@@ -115,20 +115,20 @@ async fn handle_trigger_pr_review_with<F, Fut>(
                 match work_db.request_pre_merge_review_batch_for_pool(input, usize::from(server_state.review_pool_size))? {
                     crate::work::ReviewBatchDispatch::Created { batch, executions } => {
                         tracing::info!(batch_id = %batch.id, generation = batch.generation, "review start: admitted review batch");
-                        BatchOutcome::new(batch, executions, false)
+                        BatchOutcome::new(*batch, executions, false)
                     }
                     crate::work::ReviewBatchDispatch::ExistingBatch { batch, executions } => {
                         tracing::info!(batch_id = %batch.id, generation = batch.generation, "review start: reused active review batch");
-                        BatchOutcome::new(batch, executions, true)
+                        BatchOutcome::new(*batch, executions, true)
                     }
                     other => anyhow::bail!("cannot start review batch: unexpected admission outcome {other:?}"),
                 }
             }.await
-            .map(ReviewStartOutcome::Batch)
+            .map(|outcome| ReviewStartOutcome::Batch(Box::new(outcome)))
         } else {
             work_db
                 .request_pr_review(&owner.id, pr_checker)
-                .map(ReviewStartOutcome::Legacy)
+                .map(|execution| ReviewStartOutcome::Legacy(Box::new(execution)))
         };
         match result {
             Ok(outcome) => {
@@ -226,8 +226,11 @@ impl BatchOutcome {
 /// admission (`review_batch_fanout` on) or the unchanged legacy single
 /// execution (flag off).
 enum ReviewStartOutcome {
-    Batch(BatchOutcome),
-    Legacy(crate::work::WorkExecution),
+    /// Boxed: `BatchOutcome` carries a full `ReviewBatch` plus member
+    /// executions (clippy::large_enum_variant).
+    Batch(Box<BatchOutcome>),
+    /// Boxed: `WorkExecution` is similarly larger than a unit sibling.
+    Legacy(Box<crate::work::WorkExecution>),
 }
 
 impl ReviewStartOutcome {
@@ -238,7 +241,7 @@ impl ReviewStartOutcome {
     fn execution(&self) -> crate::work::WorkExecution {
         match self {
             Self::Batch(outcome) => outcome.executions[0].clone(),
-            Self::Legacy(execution) => execution.clone(),
+            Self::Legacy(execution) => execution.as_ref().clone(),
         }
     }
 

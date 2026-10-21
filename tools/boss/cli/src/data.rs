@@ -1910,6 +1910,9 @@ pub(crate) fn print_executions_section(executions: &[ExecutionRuns]) {
             print!(" pr={pr}");
         }
         println!();
+        if let Some(provenance) = &exec.cancel_provenance {
+            println!("    cancelled: {provenance}");
+        }
         print_run_history(&detail.runs, detail.runs_unavailable.as_ref(), "    ");
     }
 }

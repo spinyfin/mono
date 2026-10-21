@@ -571,7 +571,7 @@ async fn spawn_abort_survives_a_cancel_landing_during_the_cube_release() {
     wait_for_release_entered(cube.as_ref(), "lease-1").await;
 
     // The cancel lands mid-release, exactly as it did in the field.
-    db.cancel_execution(&execution_id).unwrap();
+    db.cancel_execution(&execution_id, test_cancel_provenance()).unwrap();
     gate.notify_one();
 
     // `finish_execution_run` now rejects. The double-fault line must still
@@ -2387,6 +2387,16 @@ async fn requested_host_became_ineligible_fails_review_guide_card() {
             .is_some_and(|err| { err.contains("requested host became ineligible") && err.contains("disabled") }),
         "host-ineligible cancel must persist the inner ineligibility cause on last_error; got {:?}",
         cancelled.last_error,
+    );
+    let provenance = cancelled
+        .cancel_provenance
+        .expect("requested-host pre-start cancel must stamp provenance");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::CoordinatorPreStart);
+    assert_eq!(provenance.actor, "execution_coordinator");
+    assert!(
+        provenance.reason.contains("ineligible"),
+        "reason must name the ineligibility, got {}",
+        provenance.reason
     );
 
     let card = review_guide_root_card(db.as_ref(), &fixture.root_id);

@@ -1779,7 +1779,7 @@ fn cold_path_pr_detection_covers_investigations() {
     );
 
     // Late-PR fallback set (recently-terminal) must also include it.
-    db.mark_execution_redundant(&exec.id).unwrap();
+    db.mark_execution_redundant(&exec.id, test_cancel_provenance()).unwrap();
     let late = db.list_recently_terminal_executions_pending_pr_detection(3600).unwrap();
     assert!(
         late.iter().any(|c| c.execution_id == exec.id),
@@ -2013,6 +2013,9 @@ fn blocking_a_running_dependent_cancels_its_execution() {
         ExecutionStatus::Cancelled,
         "the live execution must be cancelled in the same transaction as the block",
     );
+    let provenance = reaped.cancel_provenance.expect("block-cancel stamps provenance");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::DependencyBlock);
+    assert_eq!(provenance.actor, "work_dependencies");
     assert!(
         reaped.finished_at.is_some(),
         "the cancelled execution must be stamped finished"

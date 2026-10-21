@@ -2,14 +2,14 @@ use super::*;
 
 /// Options for [`WorkDb::cancel_execution_with`].
 ///
-/// Defaults match the historical `cancel_execution` contract: any
-/// non-terminal row may be cancelled, with reason `"explicit cancel"`.
-#[derive(Debug, Clone, Default)]
+/// There is deliberately no `Default`: a cancel without provenance cannot be
+/// expressed, so every caller must say who is cancelling and why.
+#[derive(Debug, Clone)]
 pub struct CancelExecutionOpts {
-    /// Operator- or engine-supplied reason written into the
-    /// terminalization log line (and, at the RPC layer, the engine
-    /// audit trail). Empty/whitespace is treated as unset.
-    pub reason: Option<String>,
+    /// Who is cancelling and why. Stamped on the execution row in the same
+    /// `UPDATE` that moves it to `cancelled`, and echoed in the
+    /// terminalization log line and the engine audit trail.
+    pub provenance: boss_protocol::CancelProvenance,
     /// When true, refuse any execution that is not never-started
     /// (`queued` / `ready` / `waiting_dependency` / `claimed` — see
     /// [`ExecutionStatus::is_pre_run`]). A `claimed` row is still accepted
@@ -18,13 +18,34 @@ pub struct CancelExecutionOpts {
     /// terminalize it. Live workers must be stopped via
     /// `bossctl agents stop` instead.
     pub queued_only: bool,
-    /// When true, a never-started cancel with a supplied reason writes that
-    /// reason onto `work_executions.last_error`. Opt-in so benign cancels
+    /// When true, a never-started cancel writes its reason onto
+    /// `work_executions.last_error`. Opt-in so benign cancels
     /// (parent PR merged, pause-only refusal, `bossctl executions cancel`)
     /// do not stamp a pre-start failure onto a field that `boss task show`
     /// and review-guide reconcile treat as one. Set by requested-host
     /// pre-start failure and host-ineligible cancels.
     pub record_failure_reason: bool,
+    /// The socket peer behind an RPC-driven cancel, for the audit record.
+    pub peer_pid: Option<i32>,
+}
+
+impl CancelExecutionOpts {
+    /// Cancel any non-terminal row with the given provenance.
+    pub fn new(provenance: boss_protocol::CancelProvenance) -> Self {
+        Self {
+            provenance,
+            queued_only: false,
+            record_failure_reason: false,
+            peer_pid: None,
+        }
+    }
+
+    fn audit_context(&self) -> DecisionAuditContext {
+        DecisionAuditContext {
+            queued_only: Some(self.queued_only),
+            peer_pid: self.peer_pid,
+        }
+    }
 }
 
 #[work_db_boundary::instrument]
@@ -60,18 +81,22 @@ impl WorkDb {
     /// this transaction would race the same release path.
     ///
     /// Equivalent to [`Self::cancel_execution_with`] with
-    /// [`CancelExecutionOpts::default`].
-    pub fn cancel_execution(&self, execution_id: &str) -> Result<WorkExecution> {
-        self.cancel_execution_with(execution_id, CancelExecutionOpts::default())
+    /// [`CancelExecutionOpts::new`].
+    pub fn cancel_execution(
+        &self,
+        execution_id: &str,
+        provenance: boss_protocol::CancelProvenance,
+    ) -> Result<WorkExecution> {
+        self.cancel_execution_with(execution_id, CancelExecutionOpts::new(provenance))
     }
 
-    /// Like [`Self::cancel_execution`], but accepts a reason and the
-    /// `queued_only` gate used by `bossctl executions cancel`.
+    /// Like [`Self::cancel_execution`], but accepts the `queued_only` gate
+    /// used by `bossctl executions cancel` and the other [`CancelExecutionOpts`].
     pub fn cancel_execution_with(&self, execution_id: &str, opts: CancelExecutionOpts) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let reason = normalize_optional_text(opts.reason.clone()).unwrap_or_else(|| "explicit cancel".to_owned());
+        let reason = opts.provenance.reason.clone();
         let mut pending = PendingEvents::new();
         let updated = cancel_execution_in_tx(&tx, &mut pending, execution_id, opts)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
@@ -694,7 +719,7 @@ impl WorkDb {
                     we.created_at, we.started_at, we.finished_at, \
                     we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, \
                     we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, \
-                    we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error \
+                    we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error, we.cancel_source, we.cancel_actor, we.cancel_reason \
              FROM work_executions we \
              LEFT JOIN tasks t ON t.id = we.work_item_id \
              WHERE we.status = 'ready' \
@@ -823,7 +848,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -870,7 +895,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND workspace_path IS NOT NULL
@@ -899,7 +924,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND EXISTS (
@@ -940,7 +965,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND kind = 'revision_implementation'
@@ -968,7 +993,7 @@ impl WorkDb {
                         e.pre_start_failure_count, e.dispatch_not_before, e.pr_url, e.pr_head_before,
                         e.prefer_is_soft, e.worker_branch_prefix, e.transient_failure_count,
                         e.allow_dirty, e.branch_naming, e.dispatch_wait_reason, e.dispatch_wait_since,
-                        e.driver_runtime_state, e.driver, e.model, e.effort_level, e.pr_head_after, e.last_error
+                        e.driver_runtime_state, e.driver, e.model, e.effort_level, e.pr_head_after, e.last_error, e.cancel_source, e.cancel_actor, e.cancel_reason
                  FROM work_executions e
                  JOIN tasks t ON t.id = e.work_item_id
                  WHERE t.kind IN ('chore', 'followup')
@@ -1481,7 +1506,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
              FROM work_executions
              WHERE driver_runtime_state IS NOT NULL
                AND driver_runtime_state != ''
@@ -2275,21 +2300,26 @@ pub(super) fn cancel_execution_in_tx(
             existing.status
         );
     }
-    let supplied_reason = normalize_optional_text(opts.reason);
-    let persist_last_error = existing.status.is_pre_run() && opts.record_failure_reason && supplied_reason.is_some();
-    let reason = supplied_reason.clone().unwrap_or_else(|| "explicit cancel".to_owned());
+    let provenance = &opts.provenance;
+    let persist_last_error = existing.status.is_pre_run() && opts.record_failure_reason;
     let now = now_string();
     tx.execute(
         "UPDATE work_executions
              SET status = 'cancelled',
                  finished_at = ?2,
-                 last_error = CASE WHEN ?3 THEN ?4 ELSE last_error END
+                 last_error = CASE WHEN ?3 THEN ?4 ELSE last_error END,
+                 cancel_source = ?5,
+                 cancel_actor = ?6,
+                 cancel_reason = ?7
              WHERE id = ?1",
         params![
             execution_id,
             now.as_str(),
             persist_last_error,
-            supplied_reason.as_deref().unwrap_or(""),
+            provenance.reason,
+            provenance.source.as_str(),
+            provenance.actor,
+            provenance.reason,
         ],
     )?;
     // Live cancel only: demote active → todo when this execution is
@@ -2306,19 +2336,28 @@ pub(super) fn cancel_execution_in_tx(
     // execution the engine already terminalized) must be attributable
     // regardless of which site actually fired.
     //
-    // `reason` is the operator- or engine-supplied cancel reason so the
-    // audit trail distinguishes deliberate cancellation from
-    // `orphaned` (engine lost the run) and `abandoned`.
+    // `source` / `actor` / `reason` are the cancel provenance, so the
+    // trail says who cancelled and why, and distinguishes deliberate
+    // cancellation from `orphaned` (engine lost the run) and `abandoned`.
     tracing::warn!(
         execution_id = %execution_id,
         work_item_id = %updated.work_item_id,
         from_status = %existing.status,
         to_status = %updated.status,
-        reason = %reason,
+        source = %provenance.source,
+        actor = %provenance.actor,
+        reason = %provenance.reason,
         queued_only = opts.queued_only,
         "execution terminalized: cancel",
     );
-    stage_execution_terminal(pending, tx, execution_id, &updated.work_item_id)?;
+    stage_decision_terminal(
+        pending,
+        tx,
+        &DoomedExecution::new(execution_id, &updated.work_item_id, existing.status.as_str()),
+        &ExecutionStatus::Cancelled,
+        provenance,
+        &opts.audit_context(),
+    )?;
     Ok(updated)
 }
 
@@ -2327,7 +2366,7 @@ mod event_bus_tests {
     use boss_event_bus::TopicFilter;
 
     use super::*;
-    use crate::test_support::{create_ready_chore_execution, create_test_product, open_db};
+    use crate::test_support::{create_ready_chore_execution, create_test_product, open_db, test_cancel_provenance};
     use crate::work::CreateChoreInput;
 
     fn ready_execution(db: &WorkDb) -> WorkExecution {
@@ -2372,7 +2411,7 @@ mod event_bus_tests {
             .event_bus()
             .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
 
-        db.cancel_execution(&execution.id).unwrap();
+        db.cancel_execution(&execution.id, test_cancel_provenance()).unwrap();
 
         let event = sub.recv().await.expect("ExecutionTerminal published after cancel");
         assert_eq!(
@@ -2426,7 +2465,7 @@ mod event_bus_tests {
             .event_bus()
             .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
         assert!(
-            db.cancel_execution(&execution.id).is_err(),
+            db.cancel_execution(&execution.id, test_cancel_provenance()).is_err(),
             "cancelling a terminal execution must fail"
         );
 

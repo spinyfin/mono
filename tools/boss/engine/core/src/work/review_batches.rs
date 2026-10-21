@@ -19,9 +19,9 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use super::{
-    CreateExecutionInput, DeadPrReviewCandidate, PendingEvents, WorkDb, WorkExecution, commit_and_publish,
-    existing_nonterminal_pr_review_execution, insert_execution, next_id, now_string, query_execution,
-    stage_execution_terminal,
+    CreateExecutionInput, DeadPrReviewCandidate, DecisionAuditContext, DoomedExecution, PendingEvents, WorkDb,
+    WorkExecution, capture_doomed, commit_and_publish, existing_nonterminal_pr_review_execution, insert_execution,
+    next_id, now_string, query_execution, stage_decision_terminal,
 };
 
 /// Inputs used to freeze an immutable review target before any member starts.
@@ -63,15 +63,21 @@ pub struct ReviewBatchMemberCreateInput {
 /// cannot make old- and batch-mode finalizers compete for the same review.
 #[derive(Debug)]
 pub enum ReviewBatchDispatch {
+    /// `batch` is boxed so this variant is not far larger than
+    /// `AdmissionDeferred` / `AlreadyReviewed` (clippy::large_enum_variant).
     Created {
-        batch: ReviewBatch,
+        batch: Box<ReviewBatch>,
         executions: Vec<WorkExecution>,
     },
+    /// Same boxing as [`Self::Created`].
     ExistingBatch {
-        batch: ReviewBatch,
+        batch: Box<ReviewBatch>,
         executions: Vec<WorkExecution>,
     },
-    LegacyExecution(WorkExecution),
+    /// Boxed: an inline `WorkExecution` here would make this variant far
+    /// larger than `AdmissionDeferred` / `AlreadyReviewed`
+    /// (clippy::large_enum_variant).
+    LegacyExecution(Box<WorkExecution>),
     /// The review pool's weighted reservation accounting (see
     /// [`can_admit_review_batch_in_tx`]) has no room for a new batch of this
     /// target's phase right now. No batch and no member executions were
@@ -1262,7 +1268,10 @@ impl WorkDb {
             if !remint {
                 let executions = batch_executions_in_tx(&tx, &batch.id)?;
                 tx.commit()?;
-                return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
+                return Ok(ReviewBatchDispatch::ExistingBatch {
+                    batch: Box::new(batch),
+                    executions,
+                });
             }
             // Batch completion can precede reviewer teardown. Wait for all
             // member executions to settle before admitting another
@@ -1289,7 +1298,10 @@ impl WorkDb {
                 // sees the failed batch and the deferred-admission sweep
                 // retries on its next pass once the straggler settles.
                 tx.commit()?;
-                return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
+                return Ok(ReviewBatchDispatch::ExistingBatch {
+                    batch: Box::new(batch),
+                    executions,
+                });
             }
             generation = batch.generation + 1;
         }
@@ -1324,7 +1336,7 @@ impl WorkDb {
                     );
                 }
                 tx.commit()?;
-                return Ok(ReviewBatchDispatch::LegacyExecution(execution));
+                return Ok(ReviewBatchDispatch::LegacyExecution(Box::new(execution)));
             }
         }
         // Checked here — after ExistingBatch/LegacyExecution, before the
@@ -1388,7 +1400,10 @@ impl WorkDb {
             super::resolve_attention_kind_in_tx(&tx, &batch.cycle_root_id, super::CHURN_GUARD_PARKED_ATTENTION_KIND)?;
         }
         tx.commit()?;
-        Ok(ReviewBatchDispatch::Created { batch, executions })
+        Ok(ReviewBatchDispatch::Created {
+            batch: Box::new(batch),
+            executions,
+        })
     }
 
     /// Atomically create an immutable post-merge batch and its single ready
@@ -1416,7 +1431,10 @@ impl WorkDb {
         if let Some(batch) = review_batch_for_target_in(&tx, &input.cycle_root_id, input.phase, &input.target_sha)? {
             let executions = batch_executions_in_tx(&tx, &batch.id)?;
             tx.commit()?;
-            return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
+            return Ok(ReviewBatchDispatch::ExistingBatch {
+                batch: Box::new(batch),
+                executions,
+            });
         }
         if !can_admit_review_batch_in_tx(
             &tx,
@@ -1440,7 +1458,7 @@ impl WorkDb {
         let (batch, _) = create_review_batch_in_tx(&tx, input, std::slice::from_ref(&member), 1, false)?;
         tx.commit()?;
         Ok(ReviewBatchDispatch::Created {
-            batch,
+            batch: Box::new(batch),
             executions: vec![execution],
         })
     }
@@ -2043,26 +2061,43 @@ impl WorkDb {
             // that was actually live when its cycle root died) with no
             // terminal event — nothing tears down its pane, cube lease, or
             // worker process even though the DB now says `abandoned`.
-            let member_execution_ids: Vec<String> = {
-                let mut stmt = tx.prepare(
-                    "SELECT we.id
-                     FROM work_executions we
-                     JOIN pr_review_batch_members m ON m.execution_id = we.id
-                     WHERE m.batch_id = ?1
-                       AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
-                )?;
-                stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
+            let provenance = boss_protocol::CancelProvenance::engine(
+                boss_protocol::CancelSource::ReviewBatch,
+                "reap_inert_review_batches",
+                format!(
+                    "review batch {batch_id} for cycle root {cycle_root_id} was reaped (root deleted, \
+                     settled, or the batch went stale), so its member reviewers were abandoned"
+                ),
+            );
+            let members = capture_doomed(
+                &tx,
+                "id IN (SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)
+                 AND status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+                params![batch_id],
+            )?;
             tx.execute(
                 "UPDATE work_executions
-                 SET status = 'abandoned', finished_at = ?2
+                 SET status = 'abandoned', finished_at = ?2,
+                     cancel_source = ?3, cancel_actor = ?4, cancel_reason = ?5
                  WHERE id IN (SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)
                    AND status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
-                params![batch_id, now],
+                params![
+                    batch_id,
+                    now,
+                    provenance.source.as_str(),
+                    provenance.actor,
+                    provenance.reason
+                ],
             )?;
-            for execution_id in &member_execution_ids {
-                stage_execution_terminal(&mut pending, &tx, execution_id, &cycle_root_id)?;
+            for member in &members {
+                stage_decision_terminal(
+                    &mut pending,
+                    &tx,
+                    &DoomedExecution::new(&member.id, &cycle_root_id, &member.from_status),
+                    &boss_protocol::ExecutionStatus::Abandoned,
+                    &provenance,
+                    &DecisionAuditContext::default(),
+                )?;
             }
             tx.execute(
                 "UPDATE pr_review_batch_members

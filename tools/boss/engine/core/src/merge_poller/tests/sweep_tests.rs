@@ -1307,9 +1307,11 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
 
     assert_eq!(outcome.merged, 1);
     assert_eq!(outcome.revision_invalidated, 1);
-    assert_eq!(
-        db.get_execution(&original.id).unwrap().status,
-        ExecutionStatus::Cancelled
+    let cancelled = db.get_execution(&original.id).unwrap();
+    assert_cancel_provenance(
+        &cancelled,
+        boss_protocol::CancelSource::MergePollerParentMerged,
+        "merge_poller",
     );
     let followup = match db.get_work_item(&revision.id).unwrap() {
         WorkItem::Chore(task) => task,
@@ -2552,7 +2554,12 @@ async fn ci_resolved_stops_live_worker_and_keeps_task_in_review() {
         other => panic!("expected chore, got {other:?}"),
     }
     // The worker execution is now terminal and no longer live.
-    assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Cancelled);
+    let stopped = db.get_execution(&exec_id).unwrap();
+    assert_cancel_provenance(
+        &stopped,
+        boss_protocol::CancelSource::MergePollerReviewTransition,
+        "merge_poller",
+    );
     assert!(
         db.get_live_execution_for_work_item(&chore, "").unwrap().is_none(),
         "no live worker should remain for the task",

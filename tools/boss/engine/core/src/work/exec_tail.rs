@@ -67,49 +67,32 @@ impl WorkDb {
     /// has already been moved to `todo` by `update_work_item_as_actor`,
     /// so we only need to mark the execution as cancelled before releasing
     /// the pane and workspace.
-    pub fn cancel_running_execution(&self, execution_id: &str) -> Result<bool> {
+    pub fn cancel_running_execution(
+        &self,
+        execution_id: &str,
+        provenance: boss_protocol::CancelProvenance,
+    ) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let now = now_string();
-        let cancelled = if !execution.status.is_terminal() {
-            let affected = tx.execute(
-                "UPDATE work_executions
-                 SET status      = 'cancelled',
-                     finished_at = COALESCE(finished_at, ?2)
-                 WHERE id = ?1",
-                params![execution_id, now],
-            )?;
-            affected > 0
-        } else {
-            false
-        };
         let mut pending = PendingEvents::new();
-        if cancelled {
-            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
-        }
+        let cancelled = cancel_non_terminal_in_tx(&tx, &mut pending, &execution, &provenance)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(cancelled)
     }
 
-    pub fn cancel_running_execution_and_demote_task(&self, execution_id: &str) -> Result<(bool, bool)> {
+    pub fn cancel_running_execution_and_demote_task(
+        &self,
+        execution_id: &str,
+        provenance: boss_protocol::CancelProvenance,
+    ) -> Result<(bool, bool)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let now = now_string();
+        let mut pending = PendingEvents::new();
         // Cancel the execution only if it is still non-terminal.
-        let exec_cancelled = if !execution.status.is_terminal() {
-            let affected = tx.execute(
-                "UPDATE work_executions
-                 SET status     = 'cancelled',
-                     finished_at = COALESCE(finished_at, ?2)
-                 WHERE id = ?1",
-                params![execution_id, now],
-            )?;
-            affected > 0
-        } else {
-            false
-        };
+        let exec_cancelled = cancel_non_terminal_in_tx(&tx, &mut pending, &execution, &provenance)?;
         // Demote the task only if it is still `active` AND this execution
         // is still the work item's CURRENT (latest) execution.
         //
@@ -131,10 +114,6 @@ impl WorkDb {
         // Shared with `cancel_execution_with`'s live path so the guard
         // and `last_status_actor = 'engine'` stamp cannot drift.
         let task_demoted = demote_active_if_latest_execution(&tx, &execution.work_item_id, execution_id, &now)?;
-        let mut pending = PendingEvents::new();
-        if exec_cancelled {
-            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
-        }
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok((exec_cancelled, task_demoted))
     }
@@ -300,7 +279,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, cancel_source, cancel_actor, cancel_reason
              FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -673,6 +652,59 @@ pub(super) fn preserve_execution_workspace_preference(conn: &Connection, executi
         )?;
     }
     Ok(preferred)
+}
+
+/// Move `execution` to `cancelled` with `provenance` when it is still
+/// non-terminal, staging its terminal event and audit record. Returns whether
+/// it changed. Shared by the two `cancel_running_*` entry points so neither
+/// can cancel without recording who and why.
+fn cancel_non_terminal_in_tx(
+    tx: &Connection,
+    pending: &mut PendingEvents,
+    execution: &WorkExecution,
+    provenance: &boss_protocol::CancelProvenance,
+) -> Result<bool> {
+    if execution.status.is_terminal() {
+        return Ok(false);
+    }
+    let affected = tx.execute(
+        "UPDATE work_executions
+         SET status        = 'cancelled',
+             finished_at   = COALESCE(finished_at, ?2),
+             cancel_source = ?3,
+             cancel_actor  = ?4,
+             cancel_reason = ?5
+         WHERE id = ?1",
+        params![
+            execution.id,
+            now_string(),
+            provenance.source.as_str(),
+            provenance.actor,
+            provenance.reason,
+        ],
+    )?;
+    if affected == 0 {
+        return Ok(false);
+    }
+    tracing::warn!(
+        execution_id = %execution.id,
+        work_item_id = %execution.work_item_id,
+        from_status = %execution.status,
+        to_status = "cancelled",
+        source = %provenance.source,
+        actor = %provenance.actor,
+        reason = %provenance.reason,
+        "execution terminalized: cancel running",
+    );
+    stage_decision_terminal(
+        pending,
+        tx,
+        &DoomedExecution::new(&execution.id, &execution.work_item_id, execution.status.as_str()),
+        &ExecutionStatus::Cancelled,
+        provenance,
+        &DecisionAuditContext::default(),
+    )?;
+    Ok(true)
 }
 
 #[cfg(test)]

@@ -46,7 +46,8 @@ fn remote_fixture() -> (TempDir, Arc<WorkDb>, String) {
     )
     .unwrap();
     db.set_run_remote_pid_for_execution(&execution.id, 4242).unwrap();
-    db.cancel_running_execution(&execution.id).unwrap();
+    db.cancel_running_execution(&execution.id, test_cancel_provenance())
+        .unwrap();
     (dir, db, execution.id)
 }
 

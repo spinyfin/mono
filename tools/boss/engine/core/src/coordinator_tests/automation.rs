@@ -975,6 +975,17 @@ async fn preempted_automation_work_redispatches_once_capacity_frees() {
         redispatched.id, spilled_execution_id,
         "redispatch must be a fresh execution, not the cancelled victim"
     );
+    let victim = db.get_execution(&spilled_execution_id).unwrap();
+    let provenance = victim
+        .cancel_provenance
+        .expect("preemption must stamp cancel provenance on the victim");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::SchedulerPreemption);
+    assert_eq!(provenance.actor, "dispatch_scheduler");
+    assert!(
+        provenance.reason.contains(&spilled_execution_id),
+        "reason must name the victim execution, got {}",
+        provenance.reason
+    );
 }
 
 #[tokio::test]

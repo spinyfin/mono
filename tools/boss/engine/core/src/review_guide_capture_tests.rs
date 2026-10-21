@@ -291,6 +291,11 @@ fn enqueue_is_series_scoped_and_cancels_an_obsolete_attempt() {
     assert_eq!(old_status, "superseded");
     let exec = db.get_execution(&first_exec).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Cancelled);
+    let provenance = exec
+        .cancel_provenance
+        .expect("replacing a review-guide attempt must stamp cancel provenance");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::ReviewGuide);
+    assert_eq!(provenance.actor, "review_guide_jobs");
 }
 
 #[test]

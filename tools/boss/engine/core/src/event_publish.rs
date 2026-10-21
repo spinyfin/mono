@@ -40,7 +40,13 @@ use boss_event_bus::{Event, EventBus};
 /// alongside the `Transaction` — never call [`EventBus::publish`] directly
 /// from inside a transaction.
 #[derive(Debug, Default)]
-pub struct PendingEvents(Vec<Event>);
+pub struct PendingEvents {
+    events: Vec<Event>,
+    /// Engine-audit records (`event`, payload) staged the same way: written
+    /// to `engine-audit.log` only once the transaction that produced them
+    /// has committed, so a rolled-back cancel never claims it happened.
+    audits: Vec<(String, serde_json::Value)>,
+}
 
 impl PendingEvents {
     /// An empty set of staged events.
@@ -50,12 +56,17 @@ impl PendingEvents {
 
     /// Stage `event` to publish once the transaction commits.
     pub fn push(&mut self, event: Event) {
-        self.0.push(event);
+        self.events.push(event);
+    }
+
+    /// Stage an engine-audit record to write once the transaction commits.
+    pub fn push_audit(&mut self, event: &str, payload: serde_json::Value) {
+        self.audits.push((event.to_owned(), payload));
     }
 
     /// True if nothing has been staged yet.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.events.is_empty() && self.audits.is_empty()
     }
 
     /// Consume `self`, yielding every staged event. For the rare
@@ -63,8 +74,14 @@ impl PendingEvents {
     /// [`commit_and_publish`] — its single `Connection::execute` write
     /// already auto-committed, so there's nothing left to gate the
     /// publish on; the caller publishes each event immediately instead.
+    ///
+    /// Staged audit records are written here too: the caller's write has
+    /// already committed, so there is nothing left to wait for.
     pub fn into_events(self) -> Vec<Event> {
-        self.0
+        for (event, payload) in &self.audits {
+            crate::audit::record_event(event, payload);
+        }
+        self.events
     }
 }
 
@@ -80,7 +97,10 @@ pub fn commit_and_publish(
 ) -> rusqlite::Result<()> {
     tx.commit()?;
     tracing::debug!(target: "work_write_timing", boundary = "commit");
-    for event in pending.0 {
+    for (event, payload) in &pending.audits {
+        crate::audit::record_event(event, payload);
+    }
+    for event in pending.events {
         bus.publish(event);
     }
     Ok(())

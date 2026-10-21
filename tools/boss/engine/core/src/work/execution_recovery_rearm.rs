@@ -82,11 +82,27 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         if has_started_live {
             continue;
         }
+        // Schema-migration time: there is no running engine to audit this
+        // through, so the provenance on the row is the durable record.
+        let provenance = boss_protocol::CancelProvenance::engine(
+            boss_protocol::CancelSource::SchemaMigration,
+            "execution_recovery_rearm",
+            "retired a never-started attempt shadowed by a terminal one while re-arming a \
+             work item wedged by a now-repairable recovery failure",
+        );
         conn.execute(
-            "UPDATE work_executions SET status = 'cancelled', finished_at = ?2
+            "UPDATE work_executions
+             SET status = 'cancelled', finished_at = ?2,
+                 cancel_source = ?3, cancel_actor = ?4, cancel_reason = ?5
              WHERE work_item_id = ?1
                AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')",
-            params![id, now_string()],
+            params![
+                id,
+                now_string(),
+                provenance.source.as_str(),
+                provenance.actor,
+                provenance.reason
+            ],
         )?;
         let kind = execution_kind_for_work_item(conn, &id)?;
         let pr_url = if kind == ExecutionKind::RevisionImplementation {
@@ -392,6 +408,18 @@ mod tests {
             query_execution(&conn, &pending_id).unwrap().unwrap().status,
             ExecutionStatus::Cancelled
         );
+        let pending_exec = query_execution(&conn, &pending_id).unwrap().unwrap();
+        let provenance = pending_exec
+            .cancel_provenance
+            .expect("schema-migration re-arm must stamp cancel provenance");
+        assert_eq!(provenance.source, boss_protocol::CancelSource::SchemaMigration);
+        assert_eq!(provenance.actor, "execution_recovery_rearm");
+        assert!(
+            provenance.reason.contains("re-arming"),
+            "reason must name the re-arm, got {}",
+            provenance.reason
+        );
+        assert_eq!(pending_exec.status, ExecutionStatus::Cancelled);
         drop(conn);
 
         for _ in 0..2 {

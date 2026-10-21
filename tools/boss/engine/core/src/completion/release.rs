@@ -147,8 +147,15 @@ impl WorkerCompletionHandler {
     /// where two deleted tasks kept running until `bossctl agents stop`
     /// was run by hand because nothing in the trace tied the row id to
     /// the executions that outlived it.
-    pub async fn cancel_and_release(&self, work_item_id: &str, execution_id: &str, reason: &str) {
-        let cancelled = match self.work_db.cancel_running_execution(execution_id) {
+    pub async fn cancel_and_release(
+        &self,
+        work_item_id: &str,
+        execution_id: &str,
+        provenance: boss_protocol::CancelProvenance,
+    ) {
+        let reason = provenance.reason.clone();
+        let reason = reason.as_str();
+        let cancelled = match self.work_db.cancel_running_execution(execution_id, provenance.clone()) {
             Ok(cancelled) => cancelled,
             Err(err) => {
                 tracing::warn!(
@@ -161,11 +168,16 @@ impl WorkerCompletionHandler {
                 false
             }
         };
+        if cancelled {
+            self.record_execution_cancelled(execution_id, &provenance).await;
+        }
         let outcome = self.force_release(execution_id).await;
         tracing::info!(
             work_item_id,
             execution_id,
             reason,
+            source = %provenance.source,
+            actor = %provenance.actor,
             cancelled,
             outcome = outcome.label(),
             lease_id = match &outcome {
@@ -196,8 +208,11 @@ impl WorkerCompletionHandler {
     ///
     /// Idempotent: a second call for the same execution is a no-op
     /// at both the DB and the cube-release layers.
-    pub async fn force_stop_execution(&self, execution_id: &str) {
-        let (exec_cancelled, task_demoted) = match self.work_db.cancel_running_execution_and_demote_task(execution_id) {
+    pub async fn force_stop_execution(&self, execution_id: &str, provenance: boss_protocol::CancelProvenance) {
+        let (exec_cancelled, task_demoted) = match self
+            .work_db
+            .cancel_running_execution_and_demote_task(execution_id, provenance.clone())
+        {
             Ok(result) => result,
             Err(err) => {
                 tracing::warn!(
@@ -209,11 +224,17 @@ impl WorkerCompletionHandler {
             }
         };
 
+        if exec_cancelled {
+            self.record_execution_cancelled(execution_id, &provenance).await;
+        }
         if exec_cancelled || task_demoted {
             tracing::info!(
                 execution_id,
                 exec_cancelled,
                 task_demoted,
+                source = %provenance.source,
+                actor = %provenance.actor,
+                reason = %provenance.reason,
                 "force_stop: cancelled execution and demoted task",
             );
             // Publish work-item-changed so the UI refreshes. Requires

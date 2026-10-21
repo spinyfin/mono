@@ -28,10 +28,28 @@ use crate::work::{
 };
 use boss_pr_review_sources::SourcePacket;
 use boss_protocol::{
-    Automation, AutomationTrigger, CommentAnchor, CreateAutomationInput, CreateCommentInput, CreateExecutionInput,
-    CreateProductInput, ExecutionKind, ExecutionStatus, FinishExecutionRunInput, FrontendEvent, Product,
-    RequestExecutionInput, Task, WorkComment, WorkExecution,
+    Automation, AutomationTrigger, CancelProvenance, CancelSource, CommentAnchor, CreateAutomationInput,
+    CreateCommentInput, CreateExecutionInput, CreateProductInput, ExecutionKind, ExecutionStatus,
+    FinishExecutionRunInput, FrontendEvent, Product, RequestExecutionInput, Task, WorkComment, WorkExecution,
 };
+
+/// Provenance for test cancels that are exercising some other contract
+/// (demote policy, event publish, sweep setup). Production paths must
+/// construct their own; this is never a fallback.
+pub fn test_cancel_provenance() -> CancelProvenance {
+    CancelProvenance::engine(CancelSource::Bossctl, "test", "test cancel")
+}
+
+/// Assert a decision-terminal execution recorded the given source and actor.
+pub fn assert_cancel_provenance(execution: &WorkExecution, source: CancelSource, actor: &str) {
+    assert_eq!(execution.status, ExecutionStatus::Cancelled);
+    let provenance = execution
+        .cancel_provenance
+        .as_ref()
+        .expect("decision-terminal execution stamps cancel provenance");
+    assert_eq!(provenance.source, source);
+    assert_eq!(provenance.actor, actor);
+}
 
 /// Declare `no-changes-needed` the way a worker does: submit a real `run_done`
 /// proposal through [`WorkDb::submit_worker_proposal`] (validation, derived

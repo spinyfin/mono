@@ -316,8 +316,16 @@ mod tests {
             .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
             .unwrap();
         let conn = db.connect().unwrap();
+        // Decision-terminal fixtures must stamp provenance: the schema-53
+        // trigger refuses a `cancelled`/`abandoned` write that omits it.
         conn.execute(
-            "UPDATE work_executions SET status = ?2, created_at = ?3 WHERE id = ?1",
+            "UPDATE work_executions
+             SET status = ?2,
+                 created_at = ?3,
+                 cancel_source = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END,
+                 cancel_actor = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END,
+                 cancel_reason = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'retention fixture' ELSE cancel_reason END
+             WHERE id = ?1",
             rusqlite::params![execution.id, status, created_at_epoch.to_string()],
         )
         .unwrap();
