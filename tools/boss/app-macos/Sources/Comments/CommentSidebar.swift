@@ -351,6 +351,13 @@ private struct FollowupClassifyingIndicator: View {
 /// `comment.intent` is nil, or the classified intent's icon + label once set.
 /// Always clickable — opens a menu the operator uses to manually (re)classify
 /// the comment, mirroring the engine's `CommentsSetIntent` override RPC.
+///
+/// The picker renders the engine's answer, never a local guess: a pick shows
+/// as the requested kind with a trailing ellipsis until the engine's
+/// `comment_result` echo settles it (`CommentLayer.pendingIntent(for:)`), and
+/// a refusal snaps it back to the kind the engine still holds — the reason
+/// is rendered by the row underneath (`IntentRefusalNotice`), inline, never
+/// as a modal.
 private struct IntentBadge: View {
     let comment: Comment
     @ObservedObject var layer: CommentLayer
@@ -380,7 +387,11 @@ private struct IntentBadge: View {
 
     @ViewBuilder
     private var badgeLabel: some View {
-        if let intent = comment.intent {
+        if let pending = layer.pendingIntent(for: comment) {
+            Label("\(pending.displayName)…", systemImage: pending.symbolName)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        } else if let intent = comment.intent {
             Label(intent.displayName, systemImage: intent.symbolName)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -389,6 +400,21 @@ private struct IntentBadge: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
+    }
+}
+
+/// The engine's reason for refusing the last kind change on a comment,
+/// shown under the row's badge strip while `CommentLayer.intentRefusal(for:)`
+/// holds one. Inline by design: the picker above it has already reverted,
+/// and the operator needs the reason next to the control they just used.
+private struct IntentRefusalNotice: View {
+    let reason: String
+
+    var body: some View {
+        Label(reason, systemImage: "exclamationmark.circle")
+            .font(.caption2)
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -575,14 +601,18 @@ private struct CommentRow: View {
                 bucketTwoTrack
 
                 HStack(spacing: 8) {
-                    if layer.guideVersionId == nil {
-                        IntentBadge(comment: comment, layer: layer)
-                    }
+                    // Guide threads carry the picker too: the kind is what
+                    // routes a guide comment to Revise PR or to the answer
+                    // agent, so it must be settable there as well.
+                    IntentBadge(comment: comment, layer: layer)
                     if let chipState = comment.revisionChipState {
                         RevisionChip(state: chipState)
                     }
                     AnchorStatusBadge(comment: comment)
                     CommentAgeChip(comment: comment, isLiveAnswering: isLiveAnswering)
+                }
+                if let reason = layer.intentRefusal(for: comment) {
+                    IntentRefusalNotice(reason: reason)
                 }
             }
             .padding(.horizontal, 12)

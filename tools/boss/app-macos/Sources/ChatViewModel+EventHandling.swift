@@ -222,6 +222,9 @@ extension ChatViewModel {
             // Likewise a refused project archive: the row drops its pending
             // mark and the message surfaces, with no other state touched.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
+            // A refused comment reclassification carries its request id too:
+            // the picker that sent it reverts and shows the reason inline.
+            if commentBridge.settleIntentRefusal(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
             // The engine's WorkError reply carries no request context, so we
             // can't tell which in-flight list_executions/list_attachments

@@ -84,6 +84,14 @@ final class CommentEngineBridge: CommentBackend {
     /// to the oldest still-pending call.
     private var pendingReviseDocArtifacts: [(kind: String, id: String)] = []
 
+    /// In-flight `comments_set_intent` calls, keyed by the envelope request
+    /// id `EngineClient.sendLine` stamped on them, so a `work_error` reply
+    /// can be routed back to the comment whose picker sent it — rather than
+    /// falling through to the kanban-oriented `workError` handling, which
+    /// cannot tell a refused reclassification from a failed board move.
+    /// Settled by the `comment_result` echo or the correlated error.
+    private(set) var pendingIntentRequests: [String: String] = [:]
+
     init(engine: EngineClient, author: String = CommentAuthor.current, draftStore: GuideCommentDrafts = GuideCommentDrafts()) {
         self.draftStore = draftStore
         self.engine = engine
@@ -169,7 +177,25 @@ final class CommentEngineBridge: CommentBackend {
     }
 
     func setIntent(commentId: String, intent: String) {
-        engine.sendCommentsSetIntent(commentId: commentId, intent: intent)
+        guard let requestId = engine.sendCommentsSetIntent(commentId: commentId, intent: intent) else {
+            // Nothing left the app (disconnected and not retained): the
+            // picker must not sit pending for a reply that will never come.
+            forEachLayer(containing: commentId) {
+                $0.applyIntentRefusal(commentId: commentId, reason: "Not connected to the engine. Try again.")
+            }
+            return
+        }
+        pendingIntentRequests[requestId] = commentId
+    }
+
+    /// A `work_error` reply that answers an in-flight `comments_set_intent`:
+    /// the engine refused the reclassification and `message` is its reason.
+    /// Returns `false` when `requestId` is not one of ours, so the caller's
+    /// generic handling still applies to every other error.
+    func settleIntentRefusal(message: String, requestId: String?) -> Bool {
+        guard let requestId, let commentId = pendingIntentRequests.removeValue(forKey: requestId) else { return false }
+        forEachLayer(containing: commentId) { $0.applyIntentRefusal(commentId: commentId, reason: message) }
+        return true
     }
 
     func fetchBannerState(artifactKind: String, artifactId: String) {
@@ -210,7 +236,11 @@ final class CommentEngineBridge: CommentBackend {
     /// stay fresh after a self-initiated create/dismiss.
     func handleCommentResult(_ comment: WorkComment) {
         draftStore.acknowledge(comment)
-        forEachLayer(kind: comment.artifactKind, id: comment.artifactId) { $0.reload() }
+        pendingIntentRequests = pendingIntentRequests.filter { $0.value != comment.id }
+        forEachLayer(kind: comment.artifactKind, id: comment.artifactId) {
+            $0.applyCommentResult(comment)
+            $0.reload()
+        }
     }
 
     func handleCommentsBannerState(artifactKind: String, artifactId: String, state: CommentsBannerState) {
@@ -243,6 +273,9 @@ final class CommentEngineBridge: CommentBackend {
     /// On reconnect the engine dropped every subscription; re-subscribe each
     /// active artifact and reload its layers.
     func handleReconnected() {
+        // Replies to requests sent before the drop are gone with the old
+        // session; the reload below re-reads the engine's state instead.
+        pendingIntentRequests.removeAll()
         var resubscribed = Set<String>()
         for reg in registrations.values {
             guard let layer = reg.layer else { continue }
@@ -266,6 +299,15 @@ final class CommentEngineBridge: CommentBackend {
     private func forEachLayer(kind: String, id: String, _ body: (CommentLayer) -> Void) {
         for reg in registrations.values where reg.artifactKind == kind && reg.artifactId == id {
             if let layer = reg.layer { body(layer) }
+        }
+    }
+
+    /// Every registered layer currently showing `commentId` — for replies
+    /// that identify a comment but not its artifact (a `work_error`).
+    private func forEachLayer(containing commentId: String, _ body: (CommentLayer) -> Void) {
+        for reg in registrations.values {
+            guard let layer = reg.layer, layer.comments.contains(where: { $0.id == commentId }) else { continue }
+            body(layer)
         }
     }
 }
