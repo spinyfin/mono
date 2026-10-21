@@ -239,6 +239,9 @@ extension ChatViewModel {
             // A refused Move Up/Down reorder carries its own request id:
             // show the reason on the card that was moved.
             if settleReorderWorkError(message: message, requestId: requestId) { return }
+            // A refused comment reclassification carries its request id too:
+            // the picker that sent it reverts and shows the reason inline.
+            if commentBridge.settleIntentRefusal(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
             // Legacy list_executions/list_attachments guards do not retain
             // request IDs, so they cannot match the error's envelope ID.
