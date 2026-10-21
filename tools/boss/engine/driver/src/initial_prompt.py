@@ -229,11 +229,22 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
     submit_at = None
     deadline = time.monotonic() + readiness_timeout
     stdin_open = outer_tty
+    exit_status = None
+    drain_until = None
     try:
         if outer_tty:
             tty.setraw(0, termios.TCSANOW)
         while True:
             now = time.monotonic()
+            if exit_status is None:
+                # A descendant can hold the pty slave open after the driver
+                # exits, so EOF alone never ends the relay. Once the
+                # supervisor is gone, drain briefly, then let finally reap the group.
+                ended, status = os.waitpid(pid, os.WNOHANG)
+                if ended:
+                    exit_status, drain_until = status, now + 0.5
+            elif now >= drain_until:
+                break
             if not delivered and now >= deadline:
                 raise TimeoutError(f"driver did not become ready for initial brief within {readiness_timeout}s")
             if submit_at is not None and now >= submit_at:
@@ -296,14 +307,18 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
                     # Let the TUI consume the paste event before Return; this
                     # is the same separation used by terminal paste delivery.
                     submit_at = time.monotonic() + 0.1
-        _, status = os.waitpid(pid, 0)
+        if exit_status is None:
+            _, exit_status = os.waitpid(pid, 0)
+        status = exit_status
         if not delivered:
             raise RuntimeError("driver exited before receiving the initial brief")
         return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
     finally:
         try:
             os.killpg(pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # macOS reports EPERM for a group holding an unreaped zombie
+            # (the exited driver); the live members still receive the signal.
             pass
         os.close(lifeline)
         os.close(master)
@@ -316,7 +331,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
             if child == 0:
                 os.killpg(pid, signal.SIGKILL)
                 os.waitpid(pid, 0)
-        except ChildProcessError:
+        except (ChildProcessError, ProcessLookupError, PermissionError):
             pass
 
 

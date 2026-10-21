@@ -6,9 +6,8 @@
 //! full structural `--deny` rule set).
 
 use super::{
-    ExecArgLimits, MAX_CANON_LINE_BYTES, check_arg_max_budget, check_initial_input_length,
-    check_launch_command_arg_max, check_launch_command_arg_max_for_bytes, estimated_launch_argv_bytes, local_arg_max,
-    path_prepend_clause, render_env_directive, write_initial_input_script,
+    MAX_CANON_LINE_BYTES, check_arg_max_budget, check_initial_input_length, check_launch_command_arg_max,
+    local_arg_max, path_prepend_clause, render_env_directive, write_initial_input_script,
 };
 use crate::driver::{
     AgentDriver, ClaudeDriver, CodexDriver, EnvDirective, GrokDriver, PermissionInput, SpawnRequest, WorkerKind,
@@ -266,12 +265,8 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
 }
 
 // ---------------------------------------------------------------------------
-// ARG_MAX preflight (`check_launch_command_arg_max`): each driver embeds its
-// initial prompt into the CLI's own argv via `"$(cat <file>)"` command
-// substitution, expanded when the pane's shell sources
-// `write_initial_input_script`'s output — unlike the MAX_CANON guard above,
-// which bounds what gets *typed*, this bounds what the kernel accepts at
-// the driver CLI's own `execve()`, after that expansion.
+// ARG_MAX preflight (`check_launch_command_arg_max`): the brief travels over
+// the launcher's PTY, so the exec budget covers only the driver's flags.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -289,120 +284,17 @@ fn check_arg_max_budget_environment_can_push_a_fitting_argv_over_the_limit() {
 }
 
 #[test]
-fn estimated_launch_argv_bytes_substitutes_the_real_prompt_files_size_for_the_placeholder() {
-    let workspace = TempDir::new().unwrap();
-    std::fs::create_dir_all(workspace.path().join(".claude")).unwrap();
-    let prompt = "y".repeat(12_345);
-    std::fs::write(workspace.path().join(".claude").join("initial-prompt.txt"), &prompt).unwrap();
-
-    let command = "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n";
-    let placeholder_len = "\"$(cat .claude/initial-prompt.txt)\"".len();
-    let bytes = estimated_launch_argv_bytes(command, workspace.path(), ".claude", "initial-prompt.txt").unwrap();
-
-    assert_eq!(bytes, command.len() - placeholder_len + prompt.len());
-}
-
-#[test]
-fn estimated_launch_argv_bytes_errors_when_the_prompt_file_is_missing() {
-    let workspace = TempDir::new().unwrap();
-    let command = "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n";
-    let err = estimated_launch_argv_bytes(command, workspace.path(), ".claude", "initial-prompt.txt")
-        .expect_err("must fail, not silently proceed with an unknown size");
-    assert!(err.to_string().contains("initial-prompt.txt"), "{err}");
-}
-
-/// End-to-end against this host's real `ARG_MAX`: a ~600 KB prompt, the
-/// size of the largest review-guide prompts, must still fit comfortably
-/// under this host's ARG_MAX. Regressing the estimate back to counting
-/// every argv byte as if it needed its own pointer (rather than one
-/// pointer per shell argument) would wrongly reject this.
-#[test]
-fn check_launch_command_arg_max_passes_for_a_600kb_prompt_on_this_host() {
-    let workspace = TempDir::new().unwrap();
-    std::fs::create_dir_all(workspace.path().join(".codex")).unwrap();
-    std::fs::write(
-        workspace.path().join(".codex").join("initial-prompt.txt"),
-        "z".repeat(600_000),
-    )
-    .unwrap();
-
-    let command = "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
-    let result = check_launch_command_arg_max(command, "codex", workspace.path(), ".codex", "initial-prompt.txt");
-    if crate::runner::spawn_launch_limits::local_max_arg_strlen().is_some_and(|limit| 600_000 > limit) {
-        let err = result.expect_err("Linux MAX_ARG_STRLEN must refuse a 600KB single argument");
-        let msg = err.to_string();
-        assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
-        return;
-    }
-    result.expect("a ~600KB prompt must fit under this host's real ARG_MAX");
-}
-
-/// A prompt sized to exceed this host's real, measured `ARG_MAX` must be
-/// refused before spawn — not left to fail silently inside the pane's
-/// sourced script as `execve`'s `E2BIG`.
-#[test]
-fn check_launch_command_arg_max_fails_for_a_prompt_over_this_hosts_real_arg_max() {
-    let workspace = TempDir::new().unwrap();
-    std::fs::create_dir_all(workspace.path().join(".grok")).unwrap();
+fn check_launch_command_arg_max_fails_for_a_command_over_this_hosts_real_arg_max() {
     let arg_max = local_arg_max().unwrap();
-    std::fs::write(
-        workspace.path().join(".grok").join("initial-prompt.txt"),
-        "w".repeat(arg_max + 4096),
-    )
-    .unwrap();
-
-    let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
-    let err = check_launch_command_arg_max(command, "grok", workspace.path(), ".grok", "initial-prompt.txt")
-        .expect_err("must fail, not silently proceed with a doomed exec");
-    let msg = err.to_string();
-    assert!(msg.contains("grok"), "error must name the driver: {msg}");
-    assert!(msg.contains("ARG_MAX"), "{msg}");
-}
-
-// ---------------------------------------------------------------------------
-// `check_launch_command_arg_max_for_bytes`: the same preflight for the
-// remote spawn path (`host_adapter.rs`), which ships the initial prompt to
-// a remote host over SSH from an in-memory `String` rather than a
-// workspace-relative file this process can `stat` — so it takes the
-// prompt's byte length directly instead of reading it off disk.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn check_launch_command_arg_max_for_bytes_passes_for_a_600kb_prompt_on_this_host() {
-    let command = "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
-    let result = check_launch_command_arg_max_for_bytes(
-        command,
-        "codex",
-        ".codex",
-        "initial-prompt.txt",
-        600_000,
-        ExecArgLimits::local().unwrap(),
-    );
-    if crate::runner::spawn_launch_limits::local_max_arg_strlen().is_some_and(|limit| 600_000 > limit) {
-        let err = result.expect_err("Linux MAX_ARG_STRLEN must refuse a 600KB single argument");
-        let msg = err.to_string();
-        assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
-        return;
-    }
-    result.expect("a ~600KB prompt must fit under this host's real ARG_MAX");
-}
-
-#[test]
-fn check_launch_command_arg_max_for_bytes_fails_for_a_prompt_over_this_hosts_real_arg_max() {
-    let arg_max = local_arg_max().unwrap();
-    let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
-    let err = check_launch_command_arg_max_for_bytes(
-        command,
-        "grok",
+    let command = crate::driver::initial_prompt::launcher_command(
         ".grok",
-        "initial-prompt.txt",
-        arg_max + 4096,
-        ExecArgLimits::local().unwrap(),
-    )
-    .expect_err("must fail, not silently proceed with a doomed remote exec");
+        &format!("grok --model 'grok-4.6' --settings '{}'", "w".repeat(arg_max + 4096)),
+    );
+    let err =
+        check_launch_command_arg_max(&command, "grok").expect_err("must fail, not silently proceed with a doomed exec");
     let msg = err.to_string();
     assert!(msg.contains("grok"), "error must name the driver: {msg}");
-    assert!(msg.contains("ARG_MAX"), "{msg}");
+    assert!(msg.contains("ARG_MAX") || msg.contains("MAX_ARG_STRLEN"), "{msg}");
 }
 
 /// Rename the driver binary in a real `spawn_invocation` command so the
@@ -605,13 +497,7 @@ async fn per_driver_delivery_body() {
             check_initial_input_length(&typed, case.driver_name).unwrap();
             assert_eq!(typed, ". .boss/initial-input.sh\n");
 
-            let preflight = check_launch_command_arg_max(
-                &plan.command,
-                case.driver_name,
-                workspace.path(),
-                case.config_dir,
-                case.filename,
-            );
+            let preflight = check_launch_command_arg_max(&plan.command, case.driver_name);
             preflight.unwrap_or_else(|err| {
                 panic!(
                     "{} {}-byte prompt must pass this host's preflight: {err}",

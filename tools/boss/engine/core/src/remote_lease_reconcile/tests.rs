@@ -577,3 +577,53 @@ async fn mismatched_host_adapter_cannot_prove_death_or_release_resources() {
         .unwrap();
     assert!(held);
 }
+
+#[tokio::test]
+async fn pending_staged_input_is_removed_once_the_failed_execution_is_not_live() {
+    let (_d, db) = open_db_arc();
+    let chore = create_chore(&db);
+    db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+    // A launch failed after staging and never recorded a remote pid.
+    let failed = start_remote_run(&db, &chore, "anaplian", "lease-1", None);
+    db.cancel_running_execution(&failed).unwrap();
+    db.mark_remote_input_cleanup_pending("anaplian", &failed, "/remote/mono-agent-004")
+        .unwrap();
+    // Another run is still starting; its input must not be touched.
+    let chore_two = create_chore(&db);
+    let starting = start_remote_run(&db, &chore_two, "anaplian", "lease-2", None);
+    db.mark_remote_input_cleanup_pending("anaplian", &starting, "/remote/mono-agent-005")
+        .unwrap();
+
+    let (adapter, provider) = provider("anaplian", Probe::Alive);
+    let sink = RecordingDispatchEventSink::default();
+    reconcile_remote_leases(&db, &provider, &sink, None).await;
+
+    assert_eq!(
+        *adapter.cleaned_inputs.lock().unwrap(),
+        vec![("/remote/mono-agent-004".to_owned(), failed.clone())]
+    );
+    let pending = db.pending_remote_input_cleanups().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].run_id, starting);
+}
+
+#[tokio::test]
+async fn pending_staged_input_survives_an_engine_restart_until_removal_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("work.db");
+    {
+        let db = WorkDb::open(path.clone()).unwrap();
+        db.mark_remote_input_cleanup_pending("anaplian", "exec_gone", "/remote/ws")
+            .unwrap();
+    }
+    let db = WorkDb::open(path.clone()).unwrap();
+    db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+    let (adapter, provider) = provider("anaplian", Probe::Alive);
+    let sink = RecordingDispatchEventSink::default();
+    reconcile_remote_leases(&db, &provider, &sink, None).await;
+    assert_eq!(
+        *adapter.cleaned_inputs.lock().unwrap(),
+        vec![("/remote/ws".to_owned(), "exec_gone".to_owned())]
+    );
+    assert!(db.pending_remote_input_cleanups().unwrap().is_empty());
+}

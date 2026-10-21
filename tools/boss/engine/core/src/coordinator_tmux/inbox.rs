@@ -67,6 +67,21 @@ pub fn coordinator_launch_command(executable: &str, model: &str, initial_prompt:
     )
 }
 
+/// The exact pane command `start_new` runs: the coordinator behind the terminal
+/// relay that delivers the private brief from `input_dir`.
+pub(crate) fn relay_launch_command(input_dir: &Path, executable: &str, model: &str) -> String {
+    let driver_command = coordinator_launch_command(executable, model, "");
+    format!(
+        "exec {}",
+        crate::driver::initial_prompt::launcher_command(
+            &boss_ssh_transport::shell_quote(&input_dir.to_string_lossy()),
+            driver_command
+                .strip_prefix("exec ")
+                .expect("coordinator command starts with exec"),
+        )
+    )
+}
+
 pub(crate) struct ClaudeInbox;
 
 #[derive(Deserialize)]
@@ -79,17 +94,64 @@ struct Registration {
     cwd: PathBuf,
 }
 
-/// Returns the pane pid, Claude config directory, and live session registration.
+/// Whether `pid` is `ancestor` or runs somewhere below it, following parent links.
+fn descends_from(
+    pid: libc::pid_t,
+    ancestor: libc::pid_t,
+    parent_of: impl Fn(libc::pid_t) -> Option<libc::pid_t>,
+) -> bool {
+    let mut current = pid;
+    // Bounded: the relay places Claude two forks below the pane process.
+    for _ in 0..32 {
+        if current == ancestor {
+            return true;
+        }
+        match parent_of(current) {
+            Some(parent) if parent > 1 => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The coordinator pane runs the terminal relay, which supervises Claude two
+/// forks below it, so the pane pid is not Claude's pid. Claude registers under
+/// its own pid: pick the registered session whose process runs below the pane.
+async fn resolve_claude_pid(sessions: &Path, pane_pid: libc::pid_t) -> Result<libc::pid_t> {
+    let mut entries = tokio::fs::read_dir(sessions)
+        .await
+        .context("reading the Claude session registrations")?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|stem| stem.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        if descends_from(pid, pane_pid, |pid| {
+            crate::worker_registry::parent_pid(pid).ok().flatten()
+        }) {
+            return Ok(pid);
+        }
+    }
+    bail!("no Claude inbox registration under coordinator pane process {pane_pid}")
+}
+
+/// Returns the live Claude pid, its config directory, and its session registration.
 async fn read_registration(
     tmux: &Tmux,
     record: &CoordinatorTmuxRecord,
 ) -> Result<(libc::pid_t, PathBuf, Registration)> {
-    let pid = super::pane_pid(tmux, record).await?;
+    let pane_pid = super::pane_pid(tmux, record).await?;
     let config = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
         .context("Claude config directory is unavailable")?;
-    let bytes = tokio::fs::read(config.join("sessions").join(format!("{pid}.json")))
+    let sessions = config.join("sessions");
+    let pid = resolve_claude_pid(&sessions, pane_pid).await?;
+    let bytes = tokio::fs::read(sessions.join(format!("{pid}.json")))
         .await
         .context("reading the live coordinator's Claude inbox registration")?;
     let registration: Registration =

@@ -233,7 +233,7 @@ fn prune_terminal_executions_on(
     })
 }
 
-/// Unique `codex_home` paths recorded on prune-candidate execution rows.
+/// Unique owned-home paths (Codex `codex_home` or Claude `initial_prompt_home`) recorded on prune-candidate execution rows.
 fn codex_homes_for_prune_candidates(
     conn: &Connection,
     candidates_sql: &str,
@@ -254,7 +254,7 @@ fn codex_homes_for_prune_candidates(
     let mut paths = HashSet::new();
     for raw in rows {
         let raw = raw?;
-        if let Some(path) = codex_home_from_runtime_state_json(&raw) {
+        if let Some(path) = owned_home_from_runtime_state_json(&raw) {
             paths.insert(path);
         }
     }
@@ -275,20 +275,16 @@ fn remaining_codex_home_paths(conn: &Connection) -> Result<HashSet<PathBuf>> {
     let mut paths = HashSet::new();
     for raw in rows {
         let raw = raw?;
-        if let Some(path) = codex_home_from_runtime_state_json(&raw) {
+        if let Some(path) = owned_home_from_runtime_state_json(&raw) {
             paths.insert(path);
         }
     }
     Ok(paths)
 }
 
-fn codex_home_from_runtime_state_json(raw: &str) -> Option<PathBuf> {
+fn owned_home_from_runtime_state_json(raw: &str) -> Option<PathBuf> {
     let state: boss_protocol::DriverRuntimeState = serde_json::from_str(raw).ok()?;
-    let runtime = boss_engine_driver::codex::CodexRuntimeState::from_driver_runtime_state(&state).ok()?;
-    if runtime.codex_home.as_os_str().is_empty() {
-        return None;
-    }
-    Some(runtime.codex_home)
+    boss_engine_driver::codex::owned_home_from_runtime_state(&state)
 }
 
 #[cfg(test)]
@@ -804,5 +800,35 @@ mod tests {
             "shared path still referenced by live row must not be reclaimed"
         );
         assert!(home.join("marker").is_file(), "live owner's home must survive");
+    }
+
+    #[test]
+    fn prune_reclaims_claude_input_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes_root = tmp.path().join("boss-codex-homes");
+        std::fs::create_dir_all(&homes_root).unwrap();
+        let _env_guard = boss_engine_driver::test_support::codex_homes_override(&homes_root);
+
+        let db = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let work_item_id = create_chore(&db, &product_id, "c1");
+        let now = 1_800_000_000i64;
+
+        let home = homes_root.join("claude-run");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("initial-prompt.txt"), "private brief").unwrap();
+
+        let execution_id = insert_execution(&db, &work_item_id, "abandoned", now - 20 * DAY);
+        let state = boss_protocol::DriverRuntimeState::new(serde_json::json!({"initial_prompt_home": home}));
+        db.set_driver_runtime_state(&execution_id, Some(&state)).unwrap();
+
+        let policy = ExecutionRetentionPolicy {
+            max_age_secs: DEFAULT_RETENTION_MAX_AGE_SECS,
+            keep_per_work_item: 0,
+        };
+        let outcome = db.prune_terminal_executions(policy, now, false).unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.codex_homes_reclaimed, 1, "{outcome:?}");
+        assert!(!home.exists(), "pruned Claude execution must not orphan its brief");
     }
 }

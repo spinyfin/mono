@@ -1045,16 +1045,7 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
     let input_dir = working_directory.join(".claude/coordinator-input");
     crate::driver::initial_prompt::provision(&input_dir, &input_dir, &initial_prompt, &crate::driver::ClaudeDriver)
         .context("provisioning coordinator terminal input")?;
-    let driver_command = inbox::coordinator_launch_command("claude", model, "");
-    let launch = format!(
-        "exec {}",
-        crate::driver::initial_prompt::launcher_command(
-            &boss_ssh_transport::shell_quote(&input_dir.to_string_lossy()),
-            driver_command
-                .strip_prefix("exec ")
-                .expect("coordinator command starts with exec"),
-        )
-    );
+    let launch = inbox::relay_launch_command(&input_dir, "claude", model);
     let command = format!(
         "{}unset ANTHROPIC_API_KEY; {launch}",
         crate::runner::pane_spawn::path_prepend_clause("BOSS_BIN_DIR")

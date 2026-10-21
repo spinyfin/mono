@@ -1838,6 +1838,14 @@ pub trait AgentDriver: Send + Sync {
         None
     }
 
+    /// Extra screen text that means this driver is still starting (onboarding,
+    /// sign-in, connecting splash), so the initial-brief launcher holds
+    /// delivery. Launcher-only: unlike `pane_monitor_spec().starting_markers`
+    /// these never feed the pane monitor. Each driver owns its own strings.
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     // ── WorkspaceProvisioning capability ────────────────────────────────────
 
     /// Write per-session workspace files (prompt file, agent-rules, gitignore)

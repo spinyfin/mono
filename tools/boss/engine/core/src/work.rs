@@ -663,6 +663,7 @@ mod project_postmortem_tests;
 mod queued_wait;
 #[cfg(test)]
 mod read_only_tests;
+mod remote_input_cleanup;
 pub(crate) use feedback_target::FeedbackTarget;
 mod connection_wait;
 pub(crate) mod db_diagnostics;

@@ -342,6 +342,10 @@ impl AgentDriver for GrokDriver {
         ])
     }
 
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        vec!["Connecting...".into()]
+    }
+
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         // Measured under GhosttyKit with `--no-alt-screen` (recommended
         // pane mode). See

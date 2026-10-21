@@ -783,6 +783,17 @@ impl AgentDriver for ClaudeDriver {
         true
     }
 
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        [
+            "Choose the text style",
+            "Sign in with",
+            "Sign in to",
+            "Waiting for approval",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         // Exact reproduction of the pre-spec literals in
         // `GhosttyTerminalView.makeClaudeSnapshot` / the tracker's
@@ -798,6 +809,8 @@ impl AgentDriver for ClaudeDriver {
                 "Claude Code".into(),
                 "auto mode on".into(),
                 "bypass permissions on".into(),
+                // Footer under the forced dontAsk mode (answer agent).
+                "don't ask on".into(),
                 "/effort".into(),
             ],
             busy_markers: vec!["esc to interrupt".into()],
@@ -832,8 +845,8 @@ impl AgentDriver for ClaudeDriver {
         // has the right channel: stop and summarize (a real Stop boundary).
         // Equals form (`--disallowedTools=AskUserQuestion`), not the
         // space-separated variadic form: the CLI takes `<tools...>` until the
-        // next `--` token, so a later move of this push in front of the
-        // positional prompt would swallow the prompt as a second tool name.
+        // next option, so a space-separated value would swallow any
+        // positional argument appended after it as a second tool name.
         cmd.push_str(" --disallowedTools=AskUserQuestion");
         if let Some(mode) = permission_mode_override {
             // Forced mode (e.g. `dontAsk` for the capability-restricted answer
@@ -873,7 +886,10 @@ impl AgentDriver for ClaudeDriver {
     /// prompt. Specifically:
     ///
     /// - Creates `<workspace>/<config_dir>/` (`.claude/`)
-    /// - Writes the initial prompt to `<config_dir>/<initial_prompt_filename>`
+    /// - Writes the initial prompt into a private per-run input home (recorded
+    ///   as `initial_prompt_home` runtime state for retention) and links
+    ///   `<config_dir>/<initial_prompt_filename>` to it, with the PTY launcher
+    ///   and its readiness config alongside
     /// - Writes a catch-all `.gitignore` so engine-injected files never appear
     ///   in `jj status` / `git status`
     /// - Pre-seeds `~/.claude.json` so the folder-trust dialog does not block
@@ -1540,7 +1556,13 @@ mod tests {
             .expect("ClaudeDriver supplies pane-monitor markers");
         assert_eq!(
             spec.agent_markers,
-            vec!["Claude Code", "auto mode on", "bypass permissions on", "/effort"]
+            vec![
+                "Claude Code",
+                "auto mode on",
+                "bypass permissions on",
+                "don't ask on",
+                "/effort"
+            ]
         );
         assert_eq!(spec.busy_markers, vec!["esc to interrupt"]);
         assert_eq!(

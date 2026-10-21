@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use boss_engine_codex_rollout_retention as retention;
-use boss_engine_driver::codex::{CodexRuntimeState, assert_codex_home_safe_to_delete};
+use boss_engine_driver::codex::assert_codex_home_safe_to_delete;
 
 use crate::work::WorkDb;
 
@@ -104,20 +104,9 @@ pub async fn run_one_pass_with_policy(
         let Some(state) = execution.driver_runtime_state.as_ref() else {
             continue;
         };
-        let home = match CodexRuntimeState::from_driver_runtime_state(state) {
-            Ok(runtime) => runtime.codex_home,
-            Err(_) => match state
-                .as_value()
-                .get("initial_prompt_home")
-                .and_then(|value| value.as_str())
-            {
-                Some(path) => std::path::PathBuf::from(path),
-                None => continue,
-            },
-        };
-        if home.as_os_str().is_empty() {
+        let Some(home) = boss_engine_driver::codex::owned_home_from_runtime_state(state) else {
             continue;
-        }
+        };
         let age_anchor_epoch = execution
             .finished_epoch()
             .or_else(|| execution.created_epoch())

@@ -1201,19 +1201,7 @@ impl HostAdapter for SshHostAdapter {
     }
 
     async fn cleanup_initial_input(&self, workspace: &str, run_id: &str) -> Result<()> {
-        anyhow::ensure!(
-            !run_id.is_empty()
-                && run_id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-            "invalid initial-input run id"
-        );
-        for config in [".claude", ".codex", ".grok"] {
-            let path = format!("{workspace}/{config}/runs/{run_id}");
-            let output = self.transport.run(&["rm", "-rf", "--", &path]).await?;
-            anyhow::ensure!(output.success(), "remote input cleanup failed: {}", output.stderr);
-        }
-        Ok(())
+        crate::remote_input_lifecycle::remove_run_input(&self.transport, workspace, run_id).await
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
@@ -1454,7 +1442,7 @@ impl HostAdapter for SshHostAdapter {
         // exec limits. The brief is read by the terminal launcher, never argv.
         let worker_kind = settings_input.worker_kind;
         let driver_binary = driver.descriptor().binary.to_owned();
-        let mut driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
+        let driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
             model: &spawn_config.model,
             effort: spawn_config.effort_value,
             settings_path: Some(std::path::Path::new(&remote_settings_path)),
@@ -1462,41 +1450,42 @@ impl HostAdapter for SshHostAdapter {
             permission_mode_override: worker_kind.forced_permission_mode(),
             run_id: Some(&run_id),
         });
-        driver_spawn_plan.command = stage_remote_initial_input(
-            &self.transport,
-            &run_id,
-            &remote_prompt_dir,
-            &prompt_text,
-            driver.as_ref(),
-            &driver_spawn_plan.command,
-        )
-        .await?;
-        let exec_limits = probe_remote_exec_arg_limits(&self.transport).await;
-        crate::runner::spawn_launch_limits::check_launch_command_arg_max_for_bytes(
-            &driver_spawn_plan.command,
-            driver.descriptor().name,
-            driver.descriptor().config_dir,
-            driver.descriptor().initial_prompt_filename,
-            prompt_text.len(),
-            exec_limits,
-        )?;
+        let engine_socket = self.events_socket_path.display().to_string();
+        let stage = async {
+            let command = stage_remote_initial_input(
+                &self.transport,
+                &run_id,
+                &remote_prompt_dir,
+                &prompt_text,
+                driver.as_ref(),
+                &driver_spawn_plan.command,
+            )
+            .await?;
+            let exec_limits = probe_remote_exec_arg_limits(&self.transport).await;
+            crate::runner::spawn_launch_limits::check_launch_command_arg_max_with_limits(
+                &command,
+                driver.descriptor().name,
+                exec_limits,
+            )?;
 
-        self.ship_file(
-            &run_id,
-            &remote_config_dir,
-            &remote_prompt_gitignore_path,
-            driver.config_dir_gitignore(),
-            "driver config gitignore",
-        )
-        .await?;
-        self.ship_file(
-            &run_id,
-            &remote_settings_dir,
-            &remote_settings_path,
-            &settings_json,
-            "settings",
-        )
-        .await?;
+            self.ship_file(
+                &run_id,
+                &remote_config_dir,
+                &remote_prompt_gitignore_path,
+                driver.config_dir_gitignore(),
+                "driver config gitignore",
+            )
+            .await?;
+            self.ship_file(
+                &run_id,
+                &remote_settings_dir,
+                &remote_settings_path,
+                &settings_json,
+                "settings",
+            )
+            .await?;
+            Ok(command)
+        };
 
         // 6. Open the reverse events tunnel and launch the detached
         //    remote worker (PR1 orchestration over the one master
@@ -1507,34 +1496,46 @@ impl HostAdapter for SshHostAdapter {
         // wrapper still re-checks PATH so a race between probe and
         // launch surfaces as `host_missing_driver` rather than a silent
         // substitute.
-        let plan = RemoteSpawnPlan::builder()
-            .run_id(run_id.clone())
-            .lease_id(lease_id)
-            .workspace_path(workspace.clone())
-            .maybe_repo_remote_url((!execution.repo_remote_url.is_empty()).then(|| execution.repo_remote_url.clone()))
-            .events_socket_path(remote_socket)
-            .wrapper_path(remote_wrapper_path())
-            .driver_binary(driver_binary.clone())
-            .driver_command(driver_spawn_plan.command)
-            .driver_env(
-                driver_spawn_plan
-                    .env
-                    .iter()
-                    .map(crate::runner::pane_spawn::render_env_directive)
-                    .collect::<String>(),
-            )
-            .maybe_structured_output_kind(structured_output_kind.map(|kind| kind.slug().to_owned()))
-            .pr_url_output(matches!(
-                execution.kind,
-                ExecutionKind::TaskImplementation
-                    | ExecutionKind::ChoreImplementation
-                    | ExecutionKind::ProjectDesign
-                    | ExecutionKind::InvestigationImplementation
-            ))
-            .build();
-
-        let engine_socket = self.events_socket_path.display().to_string();
-        let outcome = perform_remote_launch(&self.transport, &plan, &engine_socket).await?;
+        let driver_env = driver_spawn_plan
+            .env
+            .iter()
+            .map(crate::runner::pane_spawn::render_env_directive)
+            .collect::<String>();
+        let remote_events_socket = remote_socket.clone();
+        let launch = |command: String| {
+            let plan = RemoteSpawnPlan::builder()
+                .run_id(run_id.clone())
+                .lease_id(lease_id)
+                .workspace_path(workspace.clone())
+                .maybe_repo_remote_url(
+                    (!execution.repo_remote_url.is_empty()).then(|| execution.repo_remote_url.clone()),
+                )
+                .events_socket_path(remote_socket)
+                .wrapper_path(remote_wrapper_path())
+                .driver_binary(driver_binary.clone())
+                .driver_command(command)
+                .driver_env(driver_env)
+                .maybe_structured_output_kind(structured_output_kind.map(|kind| kind.slug().to_owned()))
+                .pr_url_output(matches!(
+                    execution.kind,
+                    ExecutionKind::TaskImplementation
+                        | ExecutionKind::ChoreImplementation
+                        | ExecutionKind::ProjectDesign
+                        | ExecutionKind::InvestigationImplementation
+                ))
+                .build();
+            let engine_socket = engine_socket.clone();
+            async move { perform_remote_launch(&self.transport, &plan, &engine_socket).await }
+        };
+        let outcome = crate::remote_input_lifecycle::with_input_lifecycle(
+            &self.transport,
+            &self.work_db,
+            &workspace,
+            &run_id,
+            stage,
+            launch,
+        )
+        .await?;
 
         if !outcome.launched {
             let reason = outcome.failure_reason.unwrap_or(REASON_WORKER_LAUNCH_FAILED);
@@ -1551,7 +1552,13 @@ impl HostAdapter for SshHostAdapter {
         // the pid is informational, not a spawn precondition.
         if let Some(pid) = outcome.remote_pid {
             match self.work_db.set_run_remote_pid_for_execution(&run_id, pid) {
-                Ok(true) => {}
+                // The recorded pid now gates the existing teardown and
+                // reconcile cleanup, which supersedes the pending marker.
+                Ok(true) => {
+                    if let Err(err) = self.work_db.clear_remote_input_cleanup(&host, &run_id) {
+                        tracing::warn!(?err, run_id = %run_id, "remote spawn: clearing input cleanup marker failed");
+                    }
+                }
                 Ok(false) => tracing::warn!(
                     host_id = %host,
                     run_id = %run_id,
@@ -1592,7 +1599,7 @@ impl HostAdapter for SshHostAdapter {
         let wait_run_id = run_id.clone();
         let reap_run_id = run_id.clone();
         let reap_workspace = workspace.clone();
-        let reap_remote_socket = plan.events_socket_path.clone();
+        let reap_remote_socket = remote_events_socket.clone();
         let reap_engine_socket = engine_socket.clone();
         crate::runner::spawn_confirmation::confirm_turn_start_or_reap(
             driver.descriptor().name,

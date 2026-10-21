@@ -494,10 +494,7 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
 
 use super::spawn_launch_limits::check_launch_command_arg_max;
 #[cfg(test)]
-pub(crate) use super::spawn_launch_limits::{
-    ExecArgLimits, check_arg_max_budget, check_launch_command_arg_max_for_bytes, estimated_launch_argv_bytes,
-    local_arg_max,
-};
+pub(crate) use super::spawn_launch_limits::{check_arg_max_budget, local_arg_max};
 
 /// Materialize the per-workspace launcher directory and return it, so the
 /// caller can put it on the worker's `PATH`.
@@ -1073,13 +1070,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // driver default flags rather than being ignored.
         spawn_plan.command =
             crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
-        check_launch_command_arg_max(
-            &spawn_plan.command,
-            driver.descriptor().name,
-            workspace_path,
-            driver.descriptor().config_dir,
-            driver.descriptor().initial_prompt_filename,
-        )?;
+        check_launch_command_arg_max(&spawn_plan.command, driver.descriptor().name)?;
         // The per-workspace launcher dir goes on *after* the BOSS_BIN_DIR
         // prepend so it ends up ahead of it. Its `boss` is pinned to an
         // absolute path, which is the only form that survives a login

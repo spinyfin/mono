@@ -124,6 +124,10 @@ pub async fn reconcile_remote_leases(
 ) -> RemoteLeaseReconcileOutcome {
     let mut outcome = RemoteLeaseReconcileOutcome::default();
 
+    // Staged briefs whose launch failed or was interrupted before a remote pid
+    // was recorded; nothing else in this pass can find them.
+    crate::remote_input_lifecycle::retry_pending(work_db, provider).await;
+
     // Terminal remote executions that still hold a persona or cube lease
     // (cancelled while the worker ran, or a crash between terminalization
     // and cleanup). A terminal status is not proof the process exited, so

@@ -224,3 +224,73 @@ async fn frame_send_releases_lifecycle_lock_before_confirmation() {
     );
     assert!(result.is_ok());
 }
+
+#[test]
+fn descent_follows_parent_links_and_ignores_unrelated_processes() {
+    let parents = std::collections::HashMap::from([(12, 11), (11, 10), (10, 1), (21, 20), (20, 1)]);
+    let parent_of = |pid| parents.get(&pid).copied();
+    assert!(descends_from(12, 10, parent_of));
+    assert!(descends_from(10, 10, parent_of));
+    assert!(!descends_from(21, 10, parent_of));
+    assert!(!descends_from(99, 10, parent_of));
+}
+
+/// The registration lookup must work through the same relay command the
+/// coordinator pane runs, where Claude is not the pane process.
+#[tokio::test]
+async fn registration_resolves_through_the_coordinator_launcher_command() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("input");
+    let sessions = root.path().join("config/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    crate::driver::initial_prompt::provision(&input, &input, "brief", &crate::driver::ClaudeDriver).unwrap();
+    let fake = root.path().join("fake-agent");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho \"{{\\\"pid\\\":$$}}\" > '{}'/$$.json\nsleep 60\n",
+            sessions.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut pane = std::process::Command::new("sh")
+        .args(["-c", &relay_launch_command(&input, fake.to_str().unwrap(), "model")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pane_pid = pane.id() as libc::pid_t;
+    let mut resolved = None;
+    let mut last_error = String::new();
+    for _ in 0..100 {
+        match resolve_claude_pid(&sessions, pane_pid).await {
+            Ok(pid) => {
+                resolved = Some(pid);
+                break;
+            }
+            Err(error) => last_error = format!("{error:#}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let registered = std::fs::read_dir(&sessions).unwrap().next().map(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .trim_end_matches(".json")
+            .parse::<libc::pid_t>()
+            .unwrap()
+    });
+    pane.kill().unwrap();
+    let relay = pane.wait_with_output().unwrap();
+    let resolved = resolved.unwrap_or_else(|| {
+        panic!(
+            "registration resolves below the relay: {last_error}; relay stderr: {}",
+            String::from_utf8_lossy(&relay.stderr)
+        )
+    });
+    assert_ne!(resolved, pane_pid);
+    assert_eq!(Some(resolved), registered);
+}
