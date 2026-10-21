@@ -21,14 +21,23 @@ struct ReviewGuideViewerHeader: View {
     @ObservedObject var chatModel: ChatViewModel
     @ObservedObject private var drafts: GuideCommentDrafts
 
-    init(chatModel: ChatViewModel, rootTaskId: String, generatedAt: String?) {
+    /// `findingsInitiallyExpanded` seeds the addendum disclosure; the
+    /// viewer leaves it at the default, the screenshot fixture
+    /// (`BossReviewGuideCapture`) uses it to photograph the collapsed state.
+    init(
+        chatModel: ChatViewModel,
+        rootTaskId: String,
+        generatedAt: String?,
+        findingsInitiallyExpanded: Bool = true
+    ) {
         self.chatModel = chatModel
         self.rootTaskId = rootTaskId
         self.generatedAt = generatedAt
         self.drafts = chatModel.commentBridge.draftStore
+        _findingsExpanded = State(initialValue: findingsInitiallyExpanded)
     }
     let rootTaskId: String
-    @State private var findingsExpanded = true
+    @State private var findingsExpanded: Bool
     /// The open version's generation timestamp (RFC 3339), or `nil` while
     /// still loading.
     let generatedAt: String?
@@ -104,13 +113,7 @@ struct ReviewGuideViewerHeader: View {
                             if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
                         }
                         if findingsExpanded {
-                            ScrollView {
-                                StructuredText(markdown: findings.addendumMarkdown)
-                                    .bossMarkdown()
-                                    .textual.textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 200)
+                            ReviewGuideFindingsAddendumList(markdown: findings.addendumMarkdown)
                         }
                     }
                     .font(.caption)
@@ -248,5 +251,40 @@ struct ReviewGuideViewerHeader: View {
                 .controlSize(.small)
         }
         .help(error ?? headline)
+    }
+}
+
+/// The expanded addendum list: as tall as its content, scrolling only once
+/// that passes `maxHeight`.
+///
+/// A bare `ScrollView` is greedy — it takes every point its parent offers —
+/// so `.frame(maxHeight:)` on one is a fixed height whenever the window has
+/// room to spare, which the viewer window always does. That is what left a
+/// two-line list sitting on ~200 points of empty panel. Measuring the
+/// content and offering the scroll view no more than that makes the cap a
+/// true maximum: the list fits two findings in two lines, fifteen scroll
+/// past the cap, and collapsing or re-expanding recreates this view, so the
+/// measurement never carries over from an earlier, larger list.
+struct ReviewGuideFindingsAddendumList: View {
+    let markdown: String
+    /// Longest the list gets before it scrolls.
+    static let maxHeight: CGFloat = 200
+    @State private var contentHeight: CGFloat?
+
+    var body: some View {
+        ScrollView {
+            StructuredText(markdown: markdown)
+                .bossMarkdown()
+                .textual.textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // The content lays out at its natural height inside the
+                // scroll view whatever height the scroll view itself has,
+                // and that height depends only on the width the parent
+                // sets, so feeding it back into the frame cannot oscillate.
+                .onGeometryChange(for: CGFloat.self, of: \.size.height) { height in
+                    contentHeight = height
+                }
+        }
+        .frame(maxHeight: min(contentHeight ?? 0, Self.maxHeight))
     }
 }
