@@ -11,7 +11,7 @@ import PaneLayout
 
 /// Slim live-state slice that the Agents slot header actually paints.
 /// `WorkerLiveState` carries extra fields (`model`, `shellPid`,
-/// `currentTool`, `tmuxHosted`, …) the slot view never reads; folding
+/// `currentTool`, …) the slot view never reads; folding
 /// the whole struct into the snapshot would re-evaluate every slot on
 /// those unused writes.
 struct WorkerSlotLiveSlice: Equatable {
@@ -54,7 +54,7 @@ struct WorkerSlotLiveSlice: Equatable {
 
     var badgeType: AgentType { AgentType.fromWire(agentType) }
     var badgeLabel: String { badgeType.badgeLabel(reviewStage: reviewStage) }
-    var isExited: Bool { activity == .terminated }
+    var isExited: Bool { activity == .terminated || activity == .errored }
 
     /// Mirrors `WorkerLiveState.isWaitingOnJob`.
     var isWaitingOnJob: Bool {

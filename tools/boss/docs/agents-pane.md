@@ -17,10 +17,10 @@ The card's caption says which of two situations you are looking at:
 - **Connecting…** — nothing is known to have failed. The engine's `AttachWorkerPane` is still on its way: the worker was just spawned, the app or engine restarted and the engine is re-attaching every live worker, or the app has just asked for the viewer again (below). This should resolve within seconds.
 - **Couldn't attach the terminal: <reason>** — the last attach attempt failed and the reason is shown. The app's own refusal (for example "its slot is still hosting run exec\_…", meaning a stale pane still occupies the slot) wins over the engine's reason (for example "request to the app failed: timed out", "no durable tmux identity is recorded for this worker"). A local worker whose durable tmux stamp is missing shows "Worker pane identity unavailable"; the engine can never attach that one.
 
-What drives recovery, so that neither caption is permanent:
+What drives recovery:
 
 - The engine retries a failed attach on its own bounded backoff (the same schedule it uses for a failed viewer inventory) while the same app session stays registered, and re-attaches every live worker when an app session registers or when it readopts workers after its own restart.
-- When the Agents tab, or the page holding the worker, comes into view, the app asks the engine once per viewer-less worker (`request_worker_pane_attach`) for that worker's `AttachWorkerPane` again. Hiding and re-showing the tab asks again. There is no timer: a card that stays on "Connecting…" while you are looking at it means the engine has nothing to attach for that run and `bossctl logs spawn` / the engine log are the next place to look.
+- When the Agents tab, or the page holding the worker, comes into view, the app asks the engine once per viewer-less worker (`request_worker_pane_attach`) for that worker's `AttachWorkerPane` again. Hiding and re-showing the tab asks again. Declined requests publish a reason; requests for released runs refresh membership so their stale cards disappear. Executions that have ended show a cleanup-pending reason until the engine releases them.
 - A successful attach clears any recorded reason on both sides; a detach for the run clears the app-side reason too.
 
 ## Filters

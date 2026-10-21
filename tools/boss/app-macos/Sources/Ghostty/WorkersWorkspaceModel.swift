@@ -254,7 +254,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// once layout has placed it. Success acknowledges reveal; the bounded
     /// asynchronous responder attempt logs its final outcome. New requests
     /// cancel superseded focus attempts; a run without a viewer is revealed as its
-    /// "Viewer not attached" card. A run unknown to both membership and the
+    /// viewer-missing card. A run unknown to both membership and the
     /// viewer map fails as `.unknownSlot`.
     func revealAgent(runId: String) -> EngineFocusResult {
         let outcome = agentsRevealHandler?(runId) ?? .notMember

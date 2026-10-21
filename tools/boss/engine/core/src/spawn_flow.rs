@@ -1015,10 +1015,9 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     // only means it runs without a viewer until the app reconnects. A
     // SlotBusy rejection is different: reconciliation has already tried to
     // clear stale occupancy, so the failure is propagated and the spawned
-    // worker is reaped.
-    // Why the viewer is missing, stamped onto the live state below so the
-    // app's pane card can say "attach failed: <reason>" instead of
-    // reading as still connecting. `None` after a successful attach.
+    // worker is reaped. Other failures are stamped onto the live state so
+    // the card says "Couldn't attach the terminal: <reason>" instead of
+    // reading as still connecting. A successful attach clears the error.
     let viewer_attach_error: Option<String> = match spawner
         .send_to_app_request(
             EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {

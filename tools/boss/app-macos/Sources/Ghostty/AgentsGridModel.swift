@@ -230,7 +230,7 @@ final class AgentsGridModel: ObservableObject {
         }
         self.viewers = viewers
         let local = states.filter(\.isLocalMember)
-        exitedRunIds = Set(local.filter { $0.activity == .terminated }.map(\.runId))
+        exitedRunIds = Set(local.filter { $0.activity == .terminated || $0.activity == .errored }.map(\.runId))
         for state in local {
             if let name = state.name, !name.isEmpty {
                 personaByRun[state.runId] = name
