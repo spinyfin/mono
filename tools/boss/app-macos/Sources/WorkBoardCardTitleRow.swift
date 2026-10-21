@@ -49,9 +49,11 @@ struct WorkBoardCardTitleRowSlice: Equatable {
 /// Activity / trek / title / blocked-by / tags.
 struct WorkBoardCardTitleRow: View, @MainActor Equatable {
     let slice: WorkBoardCardTitleRowSlice
+    var onFocusAgent: (() -> Void)? = nil
+    @State private var isAvatarHovered = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.slice == rhs.slice
+        lhs.slice == rhs.slice && (lhs.onFocusAgent == nil) == (rhs.onFocusAgent == nil)
     }
 
     var body: some View {
@@ -62,19 +64,29 @@ struct WorkBoardCardTitleRow: View, @MainActor Equatable {
                         .padding(.top, 5)
                 }
                 if let slotId = slice.assignedSlotId, let name = slice.assignedWorkerName {
-                    Group {
-                        if let nsImage = TrekIconAssets.portrait(forPersona: name) {
-                            Image(nsImage: nsImage)
-                                .resizable()
-                                .interpolation(.none)
-                                .aspectRatio(contentMode: .fit)
-                        } else {
-                            Image(systemName: "person.crop.square")
+                    if let onFocusAgent {
+                        Button(action: onFocusAgent) {
+                            avatar(name: name)
                         }
+                        .buttonStyle(.plain)
+                        .help("View agent")
+                        .accessibilityLabel("View agent")
+                        .accessibilityValue("\(name) (slot \(slotId))")
+                        .onHover { hovering in
+                            guard hovering != isAvatarHovered else { return }
+                            isAvatarHovered = hovering
+                            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                        }
+                        .onDisappear {
+                            if isAvatarHovered {
+                                NSCursor.pop()
+                                isAvatarHovered = false
+                            }
+                        }
+                    } else {
+                        avatar(name: name)
+                            .help("\(name) (slot \(slotId))")
                     }
-                    .frame(width: 24, height: 24)
-                    .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                    .help("\(name) (slot \(slotId))")
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -125,5 +137,21 @@ struct WorkBoardCardTitleRow: View, @MainActor Equatable {
                 .accessibilityLabel("Tags: \(tagChips.labels.joined(separator: ", "))")
             }
         }
+    }
+
+    private func avatar(name: String) -> some View {
+        Group {
+            if let nsImage = TrekIconAssets.portrait(forPersona: name) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .interpolation(.none)
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                Image(systemName: "person.crop.square")
+            }
+        }
+        .frame(width: 24, height: 24)
+        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+        .contentShape(Rectangle())
     }
 }
