@@ -10,13 +10,11 @@ import XCTest
 /// the gap between a bullet's own wrapped lines.**
 ///
 /// Textual spaces list items with its own environment value
-/// (`listItemSpacing`, default 0.25em) that is resolved at the *list's* font,
-/// while the lines inside an item are spaced by the paragraph style's
-/// `lineSpacing`, resolved at the item's (editorially enlarged) font. Nothing
-/// tied the two together, so a wrapped bullet's continuation lines sat further
-/// apart than consecutive bullets did and lists read as staggered. The marker
-/// fix in mono#2849 only removed the marker's contribution to the first line's
-/// height; it never touched the item gap, which is why the symptom survived it.
+/// (`listItemSpacing`) that is resolved at the *list's* font, while the lines
+/// inside an item are spaced by the paragraph style's `lineSpacing`, resolved
+/// at the item's (editorially enlarged) font. The item gap is therefore
+/// derived from the body leading, so wrapped lines never sit further apart
+/// than consecutive bullets.
 ///
 /// Every measurement here is real AppKit layout of a `StructuredText` hosted
 /// in a never-presented `NSWindow`, with hard line breaks (`  ` + newline)
@@ -136,7 +134,7 @@ final class MarkdownListRhythmTests: XCTestCase {
 
     /// The document viewer (design docs, investigation docs, expanded
     /// descriptions): enlarged body with generous leading, where the item gap
-    /// used to be resolved at the *unscaled* font and lost to the leading.
+    /// must be expressed at the *unscaled* root font to match the leading.
     func testEditorialListsShareParagraphLeadingAndSeparateItems() {
         assertRhythm(editorial: true)
     }

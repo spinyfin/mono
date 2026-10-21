@@ -927,10 +927,9 @@ private struct BossMarkdownTheme<Content: View>: View {
         let styled = content
             .textual.structuredTextStyle(BossStructuredTextStyle(editorial: isEditorial))
             .textual.highlighterTheme(isEditorial ? BossMarkdownHighlighterTheme.editorial : .default)
-            // Textual's own default (0.25em at the list's font) is tighter
-            // than the leading inside an editorial bullet, which made wrapped
-            // bullets read as staggered. The gap is derived from the same
-            // leading the paragraph style uses, so the two cannot diverge.
+            // The gap between items is derived from the same leading the
+            // paragraph style uses, so it is never tighter than the lines
+            // inside one bullet.
             .textual.listItemSpacing(MarkdownEditorialMetrics.rootListItemSpacing(editorial: isEditorial))
         if isEditorial {
             styled.modifier(EditorialInlineCodeBoxDecoration())
