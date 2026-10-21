@@ -31,9 +31,6 @@ async fn call(state: Arc<ServerState>, request: FrontendRequest, pid: Option<lib
 }
 
 const BOUND: Duration = Duration::from_secs(2);
-/// Backstop for draining a call that already missed its bound; far above any
-/// real latency, so it only fires on a genuine hang.
-const DRAIN: Duration = Duration::from_secs(60);
 
 /// Run `work` against `bound` and report the elapsed milliseconds alongside
 /// the (possibly timed-out) result. The task stays owned by the caller, so a
@@ -49,18 +46,14 @@ async fn timed_within<T>(
 
 /// Join a task that `timed_within` may have left running, so no server-side
 /// work outlives the fixture's temp dir. Returns whether it met its bound.
+/// A genuine hang is left to Bazel's test timeout rather than detaching work.
 async fn drain<T>(
-    mut work: tokio::task::JoinHandle<T>,
+    work: tokio::task::JoinHandle<T>,
     early: Option<Result<T, tokio::task::JoinError>>,
 ) -> (bool, Result<T, tokio::task::JoinError>) {
     match early {
         Some(result) => (true, result),
-        None => (
-            false,
-            tokio::time::timeout(DRAIN, &mut work)
-                .await
-                .expect("timed-out call never finished"),
-        ),
+        None => (false, work.await),
     }
 }
 
@@ -267,18 +260,23 @@ async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn call_missing_its_bound_is_drained_to_completion() {
     let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
     let mut task = tokio::spawn({
         let finished = finished.clone();
         async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            released.await.unwrap();
             finished.store(true, std::sync::atomic::Ordering::SeqCst);
             7
         }
     });
     let (early, _) = timed_within(&mut task, Duration::from_millis(20)).await;
-    assert!(early.is_none(), "the bound must trip");
-    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+    let missed_bound = early.is_none();
+    let finished_before_release = finished.load(std::sync::atomic::Ordering::SeqCst);
+    let released = release.send(());
     let (in_bound, result) = drain(task, early).await;
+    assert!(missed_bound, "the bound must trip");
+    assert!(!finished_before_release);
+    released.unwrap();
     assert!(!in_bound);
     assert_eq!(result.unwrap(), 7);
     assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
