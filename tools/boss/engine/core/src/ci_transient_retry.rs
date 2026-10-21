@@ -57,7 +57,7 @@ use crate::merge_poller::{CiProvider, PrLifecycleProbe, RequiredCheckFailure};
 use crate::work::{
     BlockedPrRemediationInput, PendingMergeCheck, REMEDIATION_CATEGORY_CI_TRANSIENT_RETRY,
     REMEDIATION_OUTCOME_BUDGET_EXHAUSTED, REMEDIATION_OUTCOME_PENDING, REMEDIATION_OUTCOME_RETRIED,
-    REMEDIATION_OUTCOME_RETRY_FAILED, WorkDb, transient_retry_signal,
+    REMEDIATION_OUTCOME_RETRY_FAILED, REMEDIATION_OUTCOME_RETRY_UNCONFIRMED, WorkDb, transient_retry_signal,
 };
 
 /// Upper bound on each `bk` invocation. The retry runs inside the merge
@@ -103,10 +103,26 @@ impl Default for BkCli {
     }
 }
 
+/// A `bk` call that did not answer in time. For a mutating call the request
+/// may already have reached Buildkite, so callers must not read it as a
+/// refusal.
+#[derive(Debug)]
+struct BkTimedOut {
+    what: String,
+}
+
+impl std::fmt::Display for BkTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bk {} timed out after {}s", self.what, BK_CALL_TIMEOUT.as_secs())
+    }
+}
+
+impl std::error::Error for BkTimedOut {}
+
 async fn bounded<T>(what: &str, call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     match tokio::time::timeout(BK_CALL_TIMEOUT, call).await {
         Ok(result) => result,
-        Err(_) => anyhow::bail!("bk {what} timed out after {}s", BK_CALL_TIMEOUT.as_secs()),
+        Err(_) => Err(BkTimedOut { what: what.to_owned() }.into()),
     }
 }
 
@@ -207,8 +223,13 @@ enum JobPhase {
 fn job_phase(state: &str) -> JobPhase {
     match state {
         "passed" => JobPhase::Passed,
-        "scheduled" | "assigned" | "accepted" | "running" | "limited" | "waiting" | "waiting_failed" | "blocked"
-        | "creating" | "pending" | "canceling" | "timing_out" | "broken" | "skipped" => JobPhase::InFlight,
+        // Only states that will still change on their own. `broken`,
+        // `skipped`, `expired`, `waiting_failed` (behind a failed
+        // dependency) and `blocked` / `blocked_failed` (waiting on a manual
+        // unblock) never reach `passed` by themselves, so they are not in
+        // flight: the fix path must be able to run.
+        "scheduled" | "assigned" | "accepted" | "running" | "limited" | "waiting" | "creating" | "pending"
+        | "canceling" | "timing_out" => JobPhase::InFlight,
         _ => JobPhase::Failed,
     }
 }
@@ -346,19 +367,26 @@ pub async fn try_transient_retry(
         };
     }
 
-    let used = work_db
-        .count_pr_blocked_remediations(
-            &candidate.work_item_id,
-            REMEDIATION_CATEGORY_CI_TRANSIENT_RETRY,
-            Some(head_sha),
-            None,
-            &[
-                REMEDIATION_OUTCOME_PENDING,
-                REMEDIATION_OUTCOME_RETRIED,
-                REMEDIATION_OUTCOME_RETRY_FAILED,
-            ],
-        )
-        .unwrap_or(TRANSIENT_RETRY_BUDGET_PER_HEAD);
+    let used = match work_db.count_pr_blocked_remediations(
+        &candidate.work_item_id,
+        REMEDIATION_CATEGORY_CI_TRANSIENT_RETRY,
+        Some(head_sha),
+        None,
+        &[
+            REMEDIATION_OUTCOME_PENDING,
+            REMEDIATION_OUTCOME_RETRIED,
+            REMEDIATION_OUTCOME_RETRY_UNCONFIRMED,
+            REMEDIATION_OUTCOME_RETRY_FAILED,
+        ],
+    ) {
+        Ok(used) => used,
+        // An unreadable ledger says nothing about the budget. Record nothing
+        // (a `budget_exhausted` row would pin the head permanently) and let
+        // the next pass count again.
+        Err(err) => {
+            return not_applicable(candidate, format!("could not count the retry ledger: {err:#}"));
+        }
+    };
     let budget = TRANSIENT_RETRY_BUDGET_PER_HEAD;
     if !retry_allowed(used, to_retry.len() as u32, budget) {
         let (_, failure, verdict) = &to_retry[0];
@@ -412,6 +440,7 @@ pub async fn try_transient_retry(
         };
         let (outcome, response) = match retrier.retry_job(job_id).await {
             Ok(out) => (REMEDIATION_OUTCOME_RETRIED, out),
+            Err(err) if err.is::<BkTimedOut>() => (REMEDIATION_OUTCOME_RETRY_UNCONFIRMED, format!("{err:#}")),
             Err(err) => (REMEDIATION_OUTCOME_RETRY_FAILED, format!("{err:#}")),
         };
         let detail = detail_for(verdict, &attempt_token, Some(&response));
@@ -431,7 +460,7 @@ pub async fn try_transient_retry(
             budget,
             "ci_transient_retry: transient CI failure handled",
         );
-        if outcome == REMEDIATION_OUTCOME_RETRIED {
+        if outcome == REMEDIATION_OUTCOME_RETRIED || outcome == REMEDIATION_OUTCOME_RETRY_UNCONFIRMED {
             retried_jobs.push(job_id.clone());
         }
     }
@@ -474,6 +503,13 @@ fn find_job<'a>(build: &'a BuildkiteBuild, failure: &RequiredCheckFailure) -> Op
         .iter()
         .filter(matches_step)
         .find(|j| j.outcome.state == "failed")
+        .or_else(|| {
+            build
+                .jobs
+                .iter()
+                .filter(matches_step)
+                .find(|j| matches!(job_phase(&j.outcome.state), JobPhase::Failed))
+        })
         .or_else(|| build.jobs.iter().find(matches_step))
 }
 
@@ -640,6 +676,8 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
         logs: HashMap<String, String>,
         retried: Mutex<Vec<String>>,
         refuse_retry: bool,
+        /// `retry_job` times out, as `bounded` reports it.
+        timeout_retry: bool,
         fetches: Mutex<u32>,
     }
 
@@ -658,6 +696,7 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
                 logs,
                 retried: Mutex::new(Vec::new()),
                 refuse_retry: false,
+                timeout_retry: false,
                 fetches: Mutex::new(0),
             }
         }
@@ -678,6 +717,12 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
         async fn retry_job(&self, job_id: &str) -> Result<String> {
             if self.refuse_retry {
                 anyhow::bail!("bk: 422 job is not retryable");
+            }
+            if self.timeout_retry {
+                return Err(BkTimedOut {
+                    what: "job retry".to_owned(),
+                }
+                .into());
             }
             self.retried.lock().unwrap().push(job_id.to_owned());
             Ok(format!("Retried job {job_id} -> {BUILD_URL}#new"))
@@ -1158,6 +1203,131 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
             *bk.fetches.lock().unwrap(),
             fetched,
             "no fetch while a fix owns the head"
+        );
+    }
+    #[tokio::test]
+    async fn a_timed_out_retry_is_unconfirmed_not_failed_and_still_spends_budget() {
+        let (_dir, db) = open_db();
+        let pr = "https://github.com/foo/bar/pull/520";
+        let (product, chore) = make_in_review(&db, "C-timeout", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let mut bk = FakeBuildkite::new(BRANCH, failed_job(1), PR_DESCRIPTION_504_LOG);
+        bk.timeout_retry = true;
+        let outcome = try_transient_retry(
+            &db,
+            pub_.as_ref(),
+            &bk,
+            &candidate(&product, &chore, pr),
+            &pr_probe(pr, "head-520"),
+            &checks_failure(),
+        )
+        .await;
+        assert!(matches!(outcome, TransientOutcome::Handled { .. }), "{outcome:?}");
+        let rows = ledger(&db, &chore, "head-520");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, REMEDIATION_OUTCOME_RETRY_UNCONFIRMED);
+        assert!(rows[0].detail.as_deref().unwrap().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn a_broken_retry_tip_is_not_in_flight_and_the_fix_path_runs() {
+        for state in ["broken", "skipped", "waiting_failed", "blocked", "expired"] {
+            let (_dir, db) = open_db();
+            let pr = "https://github.com/foo/bar/pull/521";
+            let (product, chore) = make_in_review(&db, &format!("C-{state}"), pr);
+            let pub_ = Arc::new(RecordingPublisher::default());
+            let mut bk = retried_lineage(state, PR_DESCRIPTION_504_LOG);
+            // The dead tip never ran, so it has no log and no exit status.
+            bk.logs.remove(RETRY_JOB);
+            bk.build.jobs[1].outcome.exit_status = None;
+            let outcome = try_transient_retry(
+                &db,
+                pub_.as_ref(),
+                &bk,
+                &candidate(&product, &chore, pr),
+                &pr_probe(pr, "head-521"),
+                &checks_failure(),
+            )
+            .await;
+            assert!(
+                matches!(outcome, TransientOutcome::NotApplicable { .. }),
+                "{state}: {outcome:?}"
+            );
+            assert!(bk.retried.lock().unwrap().is_empty(), "{state}");
+
+            let handled = on_ci_failure_detected_with(
+                &db,
+                pub_.as_ref(),
+                &fix_checker(),
+                &candidate(&product, &chore, pr),
+                &pr_probe(pr, "head-521"),
+                &checks_failure(),
+                &bk,
+            )
+            .await;
+            assert!(handled);
+            assert!(
+                db.active_ci_remediation_for_work_item(&chore).unwrap().is_some(),
+                "{state}: the ordinary fix path ran"
+            );
+        }
+    }
+
+    /// Hides the remediation ledger the moment a job log is read, so the
+    /// budget count that follows fails as it would on `SQLITE_BUSY`.
+    struct HidesLedger<'a> {
+        inner: FakeBuildkite,
+        db: &'a WorkDb,
+    }
+
+    #[async_trait]
+    impl BuildkiteRetrier for HidesLedger<'_> {
+        async fn fetch_build(&self, url: &str) -> Result<BuildkiteBuild> {
+            self.inner.fetch_build(url).await
+        }
+        async fn read_job_log(&self, url: &str, job_id: &str) -> Result<String> {
+            let log = self.inner.read_job_log(url, job_id).await?;
+            self.db
+                .connect()?
+                .execute_batch("ALTER TABLE pr_blocked_remediations RENAME TO pr_blocked_remediations_hidden")?;
+            Ok(log)
+        }
+        async fn retry_job(&self, job_id: &str) -> Result<String> {
+            self.inner.retry_job(job_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_ledger_skips_the_pass_without_recording_exhaustion() {
+        let (_dir, db) = open_db();
+        let pr = "https://github.com/foo/bar/pull/522";
+        let (product, chore) = make_in_review(&db, "C-ledger", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let bk = HidesLedger {
+            inner: FakeBuildkite::new(BRANCH, failed_job(1), PR_DESCRIPTION_504_LOG),
+            db: &db,
+        };
+        let outcome = try_transient_retry(
+            &db,
+            pub_.as_ref(),
+            &bk,
+            &candidate(&product, &chore, pr),
+            &pr_probe(pr, "head-522"),
+            &checks_failure(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, TransientOutcome::NotApplicable { ref reason } if reason.contains("could not count")),
+            "{outcome:?}"
+        );
+        assert!(bk.inner.retried.lock().unwrap().is_empty());
+        db.connect()
+            .unwrap()
+            .execute_batch("ALTER TABLE pr_blocked_remediations_hidden RENAME TO pr_blocked_remediations")
+            .unwrap();
+        assert!(
+            ledger(&db, &chore, "head-522").is_empty(),
+            "no budget_exhausted row may be written from a failed count"
         );
     }
 }

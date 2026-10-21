@@ -104,6 +104,12 @@ impl ExecutionFacts {
         matches!(self.status.as_str(), "running" | "waiting_human")
     }
 
+    /// Not started and not finished, and older than [`DISPATCH_STALL_SECS`]:
+    /// stuck claiming a workspace or waiting on dispatch.
+    fn is_dispatch_stalled(&self) -> bool {
+        !self.is_terminal() && !self.is_running() && self.age_secs >= DISPATCH_STALL_SECS
+    }
+
     /// The run ended because the worker died or failed, not because anyone
     /// stopped it: the only terminal states the sweep may re-dispatch from.
     fn died(&self) -> bool {
@@ -163,7 +169,7 @@ impl RevisionFacts {
             && self
                 .latest_execution
                 .as_ref()
-                .is_some_and(|e| !e.is_terminal() && !e.is_running() && e.age_secs >= DISPATCH_STALL_SECS)
+                .is_some_and(ExecutionFacts::is_dispatch_stalled)
     }
 
     fn has_running_worker(&self) -> bool {
@@ -178,8 +184,9 @@ pub struct TransientRetryFacts {
     pub check_name: String,
     /// Short label of the signal ("HTTP 504", "agent stopped").
     pub summary: String,
-    /// `retried` (job re-run requested), `retry_failed` (Buildkite refused
-    /// the retry), or `budget_exhausted`.
+    /// `retried` (job re-run requested), `retry_unconfirmed` (the request
+    /// timed out and may have been accepted), `retry_failed` (Buildkite
+    /// refused the retry), or `budget_exhausted`.
     pub outcome: String,
     pub age_secs: i64,
     pub attempt: u32,
@@ -227,7 +234,10 @@ pub struct ReviewBatchFacts {
 pub struct HeadVerdictFacts {
     /// `pr_review_verdicts.gate_outcome` wire value.
     pub gate_outcome: String,
-    /// A findings revision exists for this verdict.
+    /// A findings revision exists for this verdict and is either live
+    /// (queued, running or blocked) or already delivered. A deleted or
+    /// archived revision that never delivered does not count: nothing is
+    /// addressing the findings.
     pub has_successor_revision: bool,
 }
 
@@ -244,8 +254,17 @@ pub struct ReviewFacts {
     pub generation_cap: i64,
     /// `tasks.review_required_state` (`required`, `approved`, …).
     pub review_required_state: Option<String>,
-    /// Review-batch fanout is on, so a failed batch is replaced by admission.
+    /// Automated (batch) review is turned on for this engine, so a failed
+    /// batch is replaced by admission.
     pub fanout_enabled: bool,
+    /// The admission path owes this card a pre-merge review right now: it is
+    /// a candidate of `list_tasks_awaiting_pre_merge_review_admission` (held
+    /// in PendingReview, an admission deferral on file, or a reaped batch).
+    /// Independent of `review_required_state`, which is GitHub's human
+    /// approval gate.
+    pub admission_owed: bool,
+    /// Non-terminal `pr_review` executions belonging to the head's live batch.
+    pub reviewers: Vec<ExecutionFacts>,
 }
 
 /// Everything the sweep knows about one Review-lane card.
@@ -291,6 +310,7 @@ pub enum Category {
     ReviewFindingsUnaddressed,
     ReviewGaveUp,
     ReviewNotAdmitted,
+    ReviewerStalled,
     BlockedOther,
 }
 
@@ -316,6 +336,7 @@ impl Category {
             Self::ReviewFindingsUnaddressed => "review_findings_unaddressed",
             Self::ReviewGaveUp => "review_gave_up",
             Self::ReviewNotAdmitted => "review_not_admitted",
+            Self::ReviewerStalled => "review_reviewer_stalled",
             Self::ReviewUnreviewedAfterReap => "review_unreviewed_after_reap",
             Self::ReviewReadmissionPending => "review_readmission_pending",
             Self::BlockedOther => "blocked_other",
@@ -546,6 +567,15 @@ fn diagnose_ci(f: &BlockedFacts) -> Diagnosis {
             .filter(|t| f.ci.failing_checks.is_empty() || f.ci.failing_checks.contains(&t.check_name))
     {
         match t.outcome.as_str() {
+            "retry_unconfirmed" if t.age_secs < TRANSIENT_RETRY_FRESH_SECS => {
+                return Diagnosis::waiting(
+                    Category::CiTransientRetrying,
+                    format!(
+                        "CI retry of {} ({}) requested; awaiting confirmation from Buildkite ({}/{})",
+                        t.check_name, t.summary, t.attempt, t.budget
+                    ),
+                );
+            }
             "retried" | "pending" if t.age_secs < TRANSIENT_RETRY_FRESH_SECS => {
                 return Diagnosis::waiting(
                     Category::CiTransientRetrying,
@@ -555,7 +585,7 @@ fn diagnose_ci(f: &BlockedFacts) -> Diagnosis {
                     ),
                 );
             }
-            "retried" | "pending" => {
+            "retried" | "pending" | "retry_unconfirmed" => {
                 return Diagnosis::human(
                     Category::CiTransientExhausted,
                     format!(
@@ -630,12 +660,16 @@ fn diagnose_review(f: &BlockedFacts) -> Option<Diagnosis> {
     if !r.head_known {
         return None;
     }
+    let green =
+        f.ci_required_state.as_deref() == Some("success") && f.pr_mergeable_state.as_deref() == Some("mergeable");
     if let Some(v) = &r.head_verdict {
         return match v.gate_outcome.as_str() {
-            "completed_clean" if r.review_required_state.as_deref() == Some("required") => Some(Diagnosis::human(
-                Category::ReviewAwaitingApproval,
-                "the automated review is clean and every check passed; a required human approval is still missing",
-            )),
+            "completed_clean" if green && r.review_required_state.as_deref() == Some("required") => {
+                Some(Diagnosis::human(
+                    Category::ReviewAwaitingApproval,
+                    "the automated review is clean and every check passed; a required human approval is still missing",
+                ))
+            }
             "completed_with_findings" if !v.has_successor_revision => Some(Diagnosis::human(
                 Category::ReviewFindingsUnaddressed,
                 "the automated review found issues on this head but no revision is addressing them; create one or fix the findings by hand",
@@ -651,24 +685,46 @@ fn diagnose_review(f: &BlockedFacts) -> Option<Diagnosis> {
             _ => None,
         };
     }
-    let green =
-        f.ci_required_state.as_deref() == Some("success") && f.pr_mergeable_state.as_deref() == Some("mergeable");
+    if let Some(e) = r.reviewers.iter().find(|e| e.is_dispatch_stalled()) {
+        let wait = e
+            .dispatch_wait_reason
+            .as_deref()
+            .map(|w| format!(", waiting on {w}"))
+            .unwrap_or_default();
+        return Some(Diagnosis::waiting(
+            Category::ReviewerStalled,
+            format!(
+                "the automated reviewer has waited {} for dispatch ({}{wait}); the review cannot finish until it starts",
+                minutes(e.age_secs),
+                e.status
+            ),
+        ));
+    }
     let Some(batch) = r.latest_pre_merge_batch.as_ref() else {
         // No batch and no verdict for this head. Only call it a stall once
-        // a review is the sole thing left to wait for: checks pass and the
-        // PR still needs review approval.
-        if !green || r.review_required_state.as_deref() != Some("required") {
+        // every check passes. Whether an automated review is owed comes from
+        // the admission path, never from the human approval gate; that gate
+        // only explains a missing approval.
+        if !green {
             return None;
         }
-        return Some(if r.fanout_enabled {
-            Diagnosis::waiting(
-                Category::ReviewNotAdmitted,
-                "checks pass but no automated review has been admitted for this head yet",
-            )
-        } else {
+        if r.admission_owed {
+            return Some(if r.fanout_enabled {
+                Diagnosis::waiting(
+                    Category::ReviewNotAdmitted,
+                    "checks pass but no automated review has been admitted for this head yet",
+                )
+            } else {
+                Diagnosis::human(
+                    Category::ReviewNotAdmitted,
+                    "checks pass but no automated review has run on this head and batch review is turned off; start a review by hand",
+                )
+            });
+        }
+        return (r.review_required_state.as_deref() == Some("required")).then(|| {
             Diagnosis::human(
-                Category::ReviewNotAdmitted,
-                "checks pass but no automated review has run on this head and batch review is turned off; start a review by hand",
+                Category::ReviewAwaitingApproval,
+                "checks pass and no automated review is pending; a required human approval is still missing",
             )
         });
     };
@@ -1200,20 +1256,88 @@ mod tests {
     }
 
     #[test]
-    fn a_green_head_with_no_batch_is_a_not_admitted_stall_by_fanout_state() {
+    fn an_owed_review_is_a_not_admitted_stall_whatever_the_human_gate_says() {
+        for human in [None, Some("approved"), Some("unknown"), Some("required")] {
+            let mut f = review_ready();
+            f.review.admission_owed = true;
+            f.review.review_required_state = human.map(str::to_owned);
+            let d = diagnose(&f).unwrap_or_else(|| panic!("human state {human:?} must still get a reason"));
+            assert_eq!(d.category, Category::ReviewNotAdmitted, "{human:?}");
+            assert_eq!(d.action, Action::None, "{human:?}");
+        }
+        // Batch review off: nobody will admit it.
         let mut f = review_ready();
-        assert_eq!(diagnose(&f), None, "a review is not required, so nothing waits on one");
-        f.review.review_required_state = Some("required".into());
-        assert_eq!(diagnose(&f).unwrap().category, Category::ReviewNotAdmitted);
-        assert_eq!(diagnose(&f).unwrap().action, Action::None);
+        f.review.admission_owed = true;
         f.review.fanout_enabled = false;
-        assert_eq!(diagnose(&f).unwrap().action, Action::NeedsHuman);
+        let d = diagnose(&f).unwrap();
+        assert_eq!(
+            (d.category, d.action),
+            (Category::ReviewNotAdmitted, Action::NeedsHuman)
+        );
         // Not green yet: CI is the thing being waited on, not the review.
+        let mut f = review_ready();
+        f.review.admission_owed = true;
         f.ci_required_state = Some("pending".into());
         assert_eq!(diagnose(&f), None);
         // No observed head: nothing to say.
         let mut f = in_review();
-        f.review.fanout_enabled = true;
+        f.review.admission_owed = true;
+        assert_eq!(diagnose(&f), None);
+    }
+
+    #[test]
+    fn a_required_human_approval_alone_is_not_evidence_of_a_missing_review() {
+        let mut f = review_ready();
+        assert_eq!(diagnose(&f), None, "no review owed and no approval needed is healthy");
+        f.review.review_required_state = Some("required".into());
+        let d = diagnose(&f).unwrap();
+        assert_eq!(d.category, Category::ReviewAwaitingApproval);
+        assert_eq!(d.action, Action::NeedsHuman);
+        // Same with automated review turned off.
+        f.review.fanout_enabled = false;
+        assert_eq!(diagnose(&f).unwrap().category, Category::ReviewAwaitingApproval);
+    }
+
+    #[test]
+    fn awaiting_approval_claim_requires_a_green_head() {
+        let mut f = review_ready();
+        f.review.head_verdict = verdict("completed_clean", false);
+        f.review.review_required_state = Some("required".into());
+        assert!(diagnose(&f).is_some());
+        f.ci_required_state = Some("pending".into());
+        assert_eq!(
+            diagnose(&f),
+            None,
+            "'every check passed' must not be claimed while CI is pending"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_stuck_in_dispatch_is_reported_after_the_threshold_only() {
+        for stuck in ["claimed", "workspace_recovery", "cube_workspace_lease_attempted"] {
+            let mut f = review_ready();
+            f.review.latest_pre_merge_batch = Some(ReviewBatchFacts {
+                status: "collecting".into(),
+                generation: 1,
+            });
+            f.review.reviewers = vec![ExecutionFacts {
+                dispatch_wait_reason: Some("cube_workspace_lease".into()),
+                ..exec(stuck, DISPATCH_STALL_SECS - 1)
+            }];
+            assert_eq!(diagnose(&f), None, "a young {stuck} reviewer is not a stall");
+            f.review.reviewers[0].age_secs = 45 * 60;
+            let d = diagnose(&f).unwrap();
+            assert_eq!(d.category, Category::ReviewerStalled, "{stuck}");
+            assert_eq!(d.action, Action::None);
+            assert!(d.reason.contains("45m") && d.reason.contains(stuck), "{}", d.reason);
+        }
+        // A running reviewer is healthy however old it is.
+        let mut f = review_ready();
+        f.review.latest_pre_merge_batch = Some(ReviewBatchFacts {
+            status: "collecting".into(),
+            generation: 1,
+        });
+        f.review.reviewers = vec![exec("running", 3 * 3600)];
         assert_eq!(diagnose(&f), None);
     }
 

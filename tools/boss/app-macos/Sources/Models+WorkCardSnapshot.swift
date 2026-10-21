@@ -140,7 +140,8 @@ struct WorkCardSnapshot: Equatable {
     let isAutoBlocked: Bool
     let autoBlockTooltip: String
     /// Engine-written reason the card is blocked or stalled in Review
-    /// (`WorkTask.reviewBlockedReason`); only carried for Review cards.
+    /// (`WorkTask.reviewBlockedReason`); carried for Review cards and for Doing
+    /// cards held in PendingReview behind a stalled reviewer.
     let reviewBlockedReason: String?
     let repoChip: RepoChipPresentation?
     let ciFailureBadge: CiFailureBadge?
@@ -405,7 +406,7 @@ struct WorkCardSnapshot: Equatable {
             blockedBy: context.blockedBy,
             isAutoBlocked: context.isAutoBlocked,
             autoBlockTooltip: autoBlockTooltip,
-            reviewBlockedReason: column == .review ? task.reviewBlockedReason : nil,
+            reviewBlockedReason: column == .review || column == .doing ? task.reviewBlockedReason : nil,
             repoChip: context.repoChip,
             ciFailureBadge: context.ciFailureBadge,
             isFrontierHighlighted: context.isFrontierHighlighted,

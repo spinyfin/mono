@@ -58,6 +58,10 @@ pub const REMEDIATION_CATEGORY_REVISION_REDISPATCH: &str = "revision_redispatch"
 pub const REMEDIATION_OUTCOME_PENDING: &str = "pending";
 pub const REMEDIATION_OUTCOME_RETRIED: &str = "retried";
 pub const REMEDIATION_OUTCOME_RETRY_FAILED: &str = "retry_failed";
+/// `bk job retry` timed out after the request may already have reached
+/// Buildkite. Counts against the budget; the next pass's retry-lineage walk
+/// settles whether the retry exists.
+pub const REMEDIATION_OUTCOME_RETRY_UNCONFIRMED: &str = "retry_unconfirmed";
 pub const REMEDIATION_OUTCOME_BUDGET_EXHAUSTED: &str = "budget_exhausted";
 pub const REMEDIATION_OUTCOME_REQUESTED: &str = "requested";
 pub const REMEDIATION_OUTCOME_REQUEST_FAILED: &str = "request_failed";
@@ -126,12 +130,18 @@ type RevisionRow = (String, String, String, String, Option<String>, Option<Strin
 
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Every Review-lane card with a bound PR: `in_review` rows and
-    /// `blocked` rows parked on a review-phase reason.
+    /// Every Review-lane card with a bound PR: `in_review` rows,
+    /// `blocked` rows parked on a review-phase reason, and roots held
+    /// `active` (PendingReview) while an automated reviewer is live, so a
+    /// reviewer stuck in dispatch still gets a reason.
     pub fn list_blocked_pr_sweep_candidates(&self) -> Result<Vec<PendingMergeCheck>> {
         self.query_pending_merge_checks(&format!(
             "(t.status = 'in_review'
-               OR (t.status = 'blocked' AND t.blocked_reason IN {REVIEW_PHASE_BLOCKED_REASONS_SQL}))"
+               OR (t.status = 'blocked' AND t.blocked_reason IN {REVIEW_PHASE_BLOCKED_REASONS_SQL})
+               OR (t.status = 'active'
+                   AND EXISTS (SELECT 1 FROM work_executions we
+                               WHERE we.work_item_id = t.id AND we.kind = 'pr_review'
+                                 AND we.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned'))))"
         ))
     }
 
@@ -491,9 +501,13 @@ impl WorkDb {
             )?,
             None => 0,
         };
-        let (latest_pre_merge_batch, head_verdict) = match head_sha.as_deref() {
-            Some(sha) => self.review_facts_for_head(work_item_id, sha)?,
-            None => (None, None),
+        let admission_owed = self
+            .list_tasks_awaiting_pre_merge_review_admission()?
+            .iter()
+            .any(|c| c.task_id == work_item_id || c.cycle_root_id == work_item_id);
+        let (latest_pre_merge_batch, head_verdict, reviewers) = match head_sha.as_deref() {
+            Some(sha) => self.review_facts_for_head(work_item_id, sha, now)?,
+            None => (None, None, Vec::new()),
         };
         let facts = BlockedFacts {
             status,
@@ -512,6 +526,8 @@ impl WorkDb {
                 generation_cap: review_batches::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS,
                 review_required_state,
                 fanout_enabled: review_fanout_enabled,
+                reviewers,
+                admission_owed,
             },
         };
         Ok((facts, head_sha))
@@ -524,7 +540,8 @@ impl WorkDb {
         &self,
         work_item_id: &str,
         sha: &str,
-    ) -> Result<(Option<ReviewBatchFacts>, Option<HeadVerdictFacts>)> {
+        now: i64,
+    ) -> Result<(Option<ReviewBatchFacts>, Option<HeadVerdictFacts>, Vec<ExecutionFacts>)> {
         let conn = self.connect()?;
         let batch = conn
             .query_row(
@@ -567,7 +584,9 @@ impl WorkDb {
                      SELECT v.gate_outcome,
                             v.revision_task_id IS NOT NULL
                               AND EXISTS (SELECT 1 FROM tasks r
-                                          WHERE r.id = v.revision_task_id AND r.deleted_at IS NULL)
+                                          WHERE r.id = v.revision_task_id AND r.kind = 'revision'
+                                            AND r.deleted_at IS NULL
+                                            AND r.status IN ('todo', 'active', 'blocked'))
                      FROM pr_review_verdicts v
                      JOIN family f ON f.id = v.work_item_id
                      WHERE v.head_sha = ?2 AND v.gate_outcome IN ({outcomes})
@@ -582,7 +601,53 @@ impl WorkDb {
                 },
             )
             .optional()?;
-        Ok((batch, verdict))
+        // A findings revision that is no longer live counts as a successor
+        // only once it has delivered; the review badge owns that rule (a
+        // delivered one resolves to "not reviewed", an undelivered one keeps
+        // the findings).
+        let verdict = match verdict {
+            Some(mut v)
+                if !v.has_successor_revision
+                    && v.gate_outcome == review_verdicts::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS =>
+            {
+                let states = super::review_badge::current_head_review_states(&conn, &[work_item_id.to_owned()])?;
+                v.has_successor_revision = states
+                    .get(work_item_id)
+                    .is_some_and(|(state, _)| *state != AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS);
+                Some(v)
+            }
+            other => other,
+        };
+        // Live reviewers for this head: the members of its batch, or, with
+        // no batch (a legacy single reviewer), the card family's own
+        // `pr_review` executions.
+        let mut stmt = conn.prepare(&format!(
+            "{family}
+             SELECT e.id, e.status, CAST(e.created_at AS INTEGER), e.dispatch_wait_reason, e.last_error
+             FROM work_executions e
+             WHERE e.kind = 'pr_review'
+               AND e.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND (e.id IN (SELECT m.execution_id FROM pr_review_batch_members m
+                             JOIN pr_review_batches b ON b.id = m.batch_id
+                             WHERE b.cycle_root_id = ?1 AND b.phase = 'pre_merge' AND b.target_sha = ?2
+                               AND m.execution_id IS NOT NULL)
+                    OR (NOT EXISTS (SELECT 1 FROM pr_review_batches b
+                                    WHERE b.cycle_root_id = ?1 AND b.phase = 'pre_merge' AND b.target_sha = ?2)
+                        AND e.work_item_id IN (SELECT id FROM family)))
+             ORDER BY e.created_at ASC, e.id ASC"
+        ))?;
+        let reviewers = stmt
+            .query_map(params![work_item_id, sha], |row| {
+                Ok(ExecutionFacts {
+                    id: row.get(0)?,
+                    status: row.get(1)?,
+                    age_secs: now - row.get::<_, i64>(2)?,
+                    dispatch_wait_reason: row.get(3)?,
+                    last_error: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((batch, verdict, reviewers))
     }
 }
 
@@ -607,7 +672,7 @@ pub(crate) fn attach_review_blocked_reason(conn: &Connection, tasks: &mut [Task]
     let ids: Vec<String> = tasks
         .iter()
         .chain(chores.iter())
-        .filter(|row| row.review_section.is_some())
+        .filter(|row| row.review_section.is_some() || row.status == TaskStatus::Active)
         .map(|row| row.id.clone())
         .collect();
     if ids.is_empty() {

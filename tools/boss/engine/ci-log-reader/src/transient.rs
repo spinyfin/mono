@@ -312,8 +312,7 @@ fn download_failure_summary(line: &str) -> Option<&'static str> {
     if !line.contains(DOWNLOAD_FAILURE_NEEDLE) {
         return None;
     }
-    // The URL itself may contain "404" or "403"; judge the cause after it.
-    let cause = line.split_once("]").map_or(line, |(_, rest)| rest);
+    let cause = download_cause(line);
     if PERMANENT_DOWNLOAD_CAUSES.iter().any(|p| cause.contains(p)) {
         return None;
     }
@@ -321,6 +320,22 @@ fn download_failure_summary(line: &str) -> Option<&'static str> {
         .iter()
         .find(|(needle, _)| cause.contains(needle))
         .map(|(_, summary)| *summary)
+}
+
+/// The text after the URL on a download-failure line. The URL itself may
+/// contain "404" or "403"; only the cause is judged.
+fn download_cause(line: &str) -> &str {
+    line.split_once(']').map_or(line, |(_, rest)| rest)
+}
+
+/// Whether `line` is a failed download whose cause is permanent (wrong URL,
+/// missing credentials, checksum mismatch).
+fn is_permanent_download_failure(line: &str) -> bool {
+    if !line.contains(DOWNLOAD_FAILURE_NEEDLE) {
+        return false;
+    }
+    let cause = download_cause(line);
+    PERMANENT_DOWNLOAD_CAUSES.iter().any(|p| cause.contains(p))
 }
 
 fn first_line_containing(log: &str, needles: &[&str]) -> Option<String> {
@@ -341,6 +356,11 @@ fn first_deterministic_marker(log: &str) -> Option<(String, &'static str)> {
         }
         if is_check_finding_line(trimmed) {
             return Some((truncate(trimmed, 300), "check finding"));
+        }
+        // A pin, checksum or auth defect is the change's fault; it vetoes
+        // any transient evidence elsewhere in the log or on the same line.
+        if is_permanent_download_failure(trimmed) {
+            return Some((truncate(trimmed, 300), "dependency download failed permanently"));
         }
     }
     None
@@ -475,7 +495,7 @@ summary: 1 error(s), 1 warning(s), 0 info finding(s)
         ] {
             let verdict = classify_job(&failed(1, &download_line(permanent)));
             assert!(
-                matches!(verdict, Verdict::Indeterminate { .. }),
+                !matches!(verdict, Verdict::Transient { .. }),
                 "{permanent:?} must not be retried: {verdict:?}"
             );
         }
@@ -498,6 +518,33 @@ summary: 1 error(s), 1 warning(s), 0 info finding(s)
                 "{retryable:?} should be transient: {verdict:?}"
             );
         }
+    }
+
+    #[test]
+    fn permanent_download_failure_vetoes_earlier_transient_evidence() {
+        for permanent in [
+            "Checksum was abc but wanted def",
+            "GET returned 404 Not Found",
+            "GET returned 401 Unauthorized",
+            "GET returned 403 Forbidden",
+        ] {
+            let log = format!(
+                "fetch: connection reset by peer\nGET returned HTTP 504\n{}",
+                download_line(permanent)
+            );
+            let verdict = classify_job(&failed(1, &log));
+            assert!(
+                matches!(verdict, Verdict::Deterministic { .. }),
+                "{permanent:?} after transient noise must be deterministic: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_download_line_with_permanent_and_upstream_cause_is_not_retried() {
+        let log = download_line("GET returned 404 Not Found after connection reset by peer");
+        let verdict = classify_job(&failed(1, &log));
+        assert!(matches!(verdict, Verdict::Deterministic { .. }), "{verdict:?}");
     }
 
     /// A real `boss-ism/pr-text-leakage` violation (mono build 20351).

@@ -36,7 +36,7 @@ The sweep never: marks a check passed, overrides branch protection, retries anyt
 1. Buildkite job record: `signal_reason ∈ {agent_stop, agent_refused, process_run_error}` or `exit_status = -1` → `AgentLost`. `cancel` is deliberately not transient.
 2. Any deterministic marker in the log (`FAIL: //`, `TIMEOUT: //`, `FAILED: Build did NOT complete`, `error[E…]`, a checkleft `error[<check>/<id>]:` finding other than the "could not be resolved" refusal) → `Deterministic`, vetoing everything below.
 3. checkleft exit status 3 plus its `PR description surface: UNAVAILABLE` / `GitHub API call timed out` line → `CheckInputUnavailable` (the tool's own machine-readable statement that it did not evaluate the change). checkleft exits 3 for an undetermined changeset or a GitHub API timeout, but **not** for a PR-description lookup that answers HTTP 5xx: that refusal is still an error finding with exit 1, so the original 504 incident is classified by step 4 from the log text. A distinct exit for it is deferred (below).
-4. An upstream-unavailable signature (`HTTP 502/503/504`, `Gateway Timeout`, `connection reset by peer`, DNS failure, or a Bazel `Error downloading […]` line that also names a retryable cause such as a timeout, connection reset or HTTP 5xx) → `UpstreamUnavailable`. A download that fails with a 404, 401/403, or checksum mismatch is a change-caused failure and is never retried.
+4. An upstream-unavailable signature (`HTTP 502/503/504`, `Gateway Timeout`, `connection reset by peer`, DNS failure, or a Bazel `Error downloading […]` line that also names a retryable cause such as a timeout, connection reset or HTTP 5xx) → `UpstreamUnavailable`. A download that fails with a 404, 401/403, or checksum mismatch is a change-caused failure and is never retried: it is a deterministic marker, so it vetoes transient evidence anywhere else in the log and on the same line.
 5. Otherwise `Indeterminate` — never retried.
 
 The log window is the last 5,000 lines: a failing `bazel-build-test` job uploads every test log afterwards, so its `FAIL:` line sits 700–1,100 lines before the end (five sampled logs, 1,159–1,683 lines). A 400-line window would have called those "indeterminate" rather than "deterministic"; both are safe (neither retries), but the deterministic verdict is the one the card should show.
@@ -88,6 +88,13 @@ SELECT category, reason, action, updated_at FROM pr_blocked_diagnoses WHERE work
 
 For a transient retry, `detail` begins with `<attempt>/<budget>` followed by the machine signal and the proving log line. Budgets are counted from this table, so an engine restart never resets them.
 
+## Review-gate facts the sweep reads
+
+- **Automated review owed**: the card is a candidate of `list_tasks_awaiting_pre_merge_review_admission` (held in PendingReview, an admission deferral on file, or a reaped batch). With no batch and a green head this reads `no automated review has been admitted` (or `Needs you` when batch review is off), whatever GitHub's human approval state says. The human gate (`review_required_state`) only produces the `required human approval is still missing` reason.
+- **Stalled reviewer**: a `pr_review` execution of the head's live batch that has neither started nor finished after the dispatch-stall threshold reads `the automated reviewer has waited … for dispatch`. PendingReview roots (`active` with a live reviewer) are swept for this, and the Doing card carries the reason.
+- **Findings successor**: a findings revision counts only while it is live (todo, active, blocked) or has delivered (the review badge's delivery rule); one archived without delivering leaves the findings unaddressed.
+- **Retry timeout**: a `bk job retry` that times out is recorded `retry_unconfirmed` (it counts against the budget, the card says it awaits confirmation) and the next pass's retry-lineage walk settles whether Buildkite accepted it.
+
 ## Deferred (not in this change)
 
 - Re-admitting a reaped review batch past the generation cap, or when the review fanout flag is off. The card now says so and asks a human (`Needs you: … start one by hand`); a bounded third generation, or admission without fanout, needs a product decision on reviewer cost.
@@ -95,5 +102,5 @@ For a transient retry, `detail` begins with `<attempt>/<budget>` followed by the
 - Persisting the probe's per-PR opt-out label (`boss/no-auto-rebase`) so a conflicting PR that carries it reads `Needs you: … automatic resolution is disabled` rather than `no resolution attempt is running yet`.
 - Removing `Task::blocked_signals` or populating it from `task_blocked_signals` (it is an always-empty wire field).
 - Sampling recent history for the review-reap, dead-revision and dispatch-stall limits (see "Measurements behind the limits").
-- A distinct checkleft exit status (3) for the PR-description-unavailable refusal on a 5xx answer, so the 504 incident no longer rests on log-text matching. It needs a change to `checkleft` (`main.rs`, its tests and the README exit-code table), which would push this changeset past the repository's 30-file limit.
-- A pointer to this document from `AGENTS.md`.
+- A distinct checkleft exit status (3) for the PR-description-unavailable refusal on a 5xx answer, so the 504 incident no longer rests on log-text matching. It needs a change to `checkleft` (`main.rs`, its tests and the README exit-code table), which would push this changeset past the repository's 30-file limit (it is already at 30; the exit-code change, its test and the README table add three more files).
+- A pointer to this document from `AGENTS.md` (one more file than the 30-file limit allows).

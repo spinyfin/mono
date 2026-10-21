@@ -551,6 +551,159 @@ mod tests {
         assert!(facts.review.head_known && facts.review.head_verdict.is_none());
     }
 
+    fn insert_execution(db: &WorkDb, id: &str, work_item: &str, kind: &str, status: &str, age_secs: i64) {
+        let created = boss_engine_utils::epoch_time::now_epoch_secs() - age_secs;
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at, dispatch_wait_reason)
+                 VALUES (?1, ?2, ?3, ?4, 'git@github.com:foo/bar.git', ?5, 'cube_workspace_lease')",
+                rusqlite::params![id, work_item, kind, status, created.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn insert_member(db: &WorkDb, id: &str, batch: &str, execution: &str, attempt: i64) {
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO pr_review_batch_members
+                     (id, batch_id, attempt, created_at, provider_effort, requested_driver, resolved_model, role,
+                      status, updated_at, execution_id)
+                 VALUES (?1, ?2, ?4, '1', 'high', 'claude', 'm', 'claude_reviewer', 'pending', '1', ?3)",
+                rusqlite::params![id, batch, execution, attempt],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_batch_reviewer_stuck_in_dispatch_gets_a_reason_even_on_a_pending_review_root() {
+        let (_dir, db) = open_db();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let c = in_review_chore(&db, "reviewer-stuck");
+        insert_batch(&db, "b-live", &c.work_item_id, "head-1", "collecting", 1);
+        for (attempt, (stage, age)) in [
+            ("claimed", 45 * 60),
+            ("workspace_recovery", 45 * 60),
+            ("cube_workspace_lease_attempted", 3 * 60),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let exec_id = format!("pr_review_{stage}");
+            insert_execution(&db, &exec_id, &c.work_item_id, "pr_review", stage, age);
+            insert_member(&db, &format!("m_{stage}"), "b-live", &exec_id, attempt as i64 + 1);
+        }
+        // Held `active` (PendingReview) while its reviewers dispatch.
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&c.work_item_id])
+            .unwrap();
+        let candidates = db.list_blocked_pr_sweep_candidates().unwrap();
+        assert!(
+            candidates.iter().any(|x| x.work_item_id == c.work_item_id),
+            "an active root with a live reviewer is swept"
+        );
+        run_one_pass(&db, publisher.as_ref(), true).await;
+        let t = task(&db, &c.work_item_id);
+        assert_eq!(t.review_blocked_category.as_deref(), Some("review_reviewer_stalled"));
+        let reason = t.review_blocked_reason.unwrap();
+        assert!(
+            reason.contains("45m") && reason.contains("waiting on cube_workspace_lease"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owed_review_with_no_batch_is_reported_whatever_the_human_gate_says() {
+        let (_dir, db) = open_db();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let c = in_review_chore(&db, "owed-review");
+        for human in ["approved", "unknown", "required"] {
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET review_required_state = ?2 WHERE id = ?1",
+                    rusqlite::params![c.work_item_id, human],
+                )
+                .unwrap();
+            run_one_pass(&db, publisher.as_ref(), true).await;
+            let reason = task(&db, &c.work_item_id).review_blocked_category;
+            // Nothing owes this card a review yet, so only the human gate speaks.
+            assert_eq!(
+                reason.as_deref(),
+                (human == "required").then_some("review_awaiting_approval")
+            );
+        }
+        // The admission path now owes it one (a deferral is on file).
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO work_attention_items (id, work_item_id, kind, status, title, body_markdown, created_at)
+                 VALUES ('att1', ?1, 'pr_review_admission_deferred', 'open', 't', 'b', '1')",
+                [&c.work_item_id],
+            )
+            .unwrap();
+        for human in ["approved", "unknown", "required"] {
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET review_required_state = ?2 WHERE id = ?1",
+                    rusqlite::params![c.work_item_id, human],
+                )
+                .unwrap();
+            run_one_pass(&db, publisher.as_ref(), true).await;
+            assert_eq!(
+                task(&db, &c.work_item_id).review_blocked_category.as_deref(),
+                Some("review_not_admitted"),
+                "{human}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_archived_undelivered_findings_revision_does_not_hide_the_unaddressed_findings() {
+        let (_dir, db) = open_db();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let c = in_review_chore(&db, "archived-successor");
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(c.work_item_id.clone())
+                    .description("Address review findings")
+                    .created_via("review:test")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        insert_execution(&db, "pr_review_v", &c.work_item_id, "pr_review", "completed", 600);
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO pr_review_verdicts
+                     (id, execution_id, work_item_id, head_sha, findings_count, revision_warranted, gate_outcome,
+                      revision_task_id, created_at)
+                 VALUES ('v1', 'pr_review_v', ?1, 'head-1', 2, 1, 'completed_with_findings', ?2, '1')",
+                rusqlite::params![c.work_item_id, revision.id],
+            )
+            .unwrap();
+        // Live successor: the revision owns the findings.
+        let (facts, _) = db.blocked_pr_facts(&c.work_item_id, true).unwrap();
+        assert!(facts.review.head_verdict.unwrap().has_successor_revision);
+        // Archived without delivering: nothing owns them any more.
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'archived' WHERE id = ?1", [&revision.id])
+            .unwrap();
+        let (facts, _) = db.blocked_pr_facts(&c.work_item_id, true).unwrap();
+        assert!(!facts.review.head_verdict.unwrap().has_successor_revision);
+        run_one_pass(&db, publisher.as_ref(), true).await;
+        assert_eq!(
+            task(&db, &c.work_item_id).review_blocked_category.as_deref(),
+            Some("review_findings_unaddressed")
+        );
+    }
+
     #[tokio::test]
     async fn blocked_rule_matches_classify_review_section() {
         // Parity between the pure crate's Blocked rule and the engine's
