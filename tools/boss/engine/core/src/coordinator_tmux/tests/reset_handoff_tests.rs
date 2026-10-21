@@ -126,7 +126,7 @@ async fn prompt_submitted(server: &FakeTmux) {
     .expect("the reset must submit its prompt");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn fresh_write_wakes_reset_and_replacement_receives_present_brief_for_both_reasons() {
     for reason in [
         CoordinatorRecreateReason::OperatorReset,

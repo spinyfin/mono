@@ -11,8 +11,6 @@ rust_library(
     compile_data = glob(["src/grok/testdata/**"]) + [
         "src/codex-tmux.conf",
         "src/initial_prompt.py",
-        "src/initial_prompt_relay_test.py",
-        "src/testdata/initial_prompt_panes.json",
     ],
     crate_name = "boss_engine_driver",
     crate_root = "src/lib.rs",
@@ -50,8 +48,6 @@ rust_test(
     compile_data = glob(["src/grok/testdata/**"]) + [
         "src/codex-tmux.conf",
         "src/initial_prompt.py",
-        "src/initial_prompt_relay_test.py",
-        "src/testdata/initial_prompt_panes.json",
     ],
     crate = ":driver",
     data = [":codex_test_binary"],

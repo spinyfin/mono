@@ -128,6 +128,13 @@ class TerminalTail:
             lines.pop()
         return "\n".join(lines[-12:]).encode()
 
+    def resize(self, height, width):
+        self.height, self.width = max(1, height), max(1, width)
+        self.rows = [row[:self.width] for row in self.rows[:self.height]]
+        self.rows.extend([] for _ in range(self.height - len(self.rows)))
+        self.x = min(self.x, self.width - 1)
+        self.y = min(self.y, self.height - 1)
+
 
 def ready_for_prompt(view, raw, paste_enabled, markers, starting_markers):
     visible = view.tail()
@@ -186,11 +193,15 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
     outer_tty = os.isatty(0)
     saved = termios.tcgetattr(0) if outer_tty else None
     master, slave = pty.openpty()
+    view = TerminalTail()
 
     def resize(*_):
         size = (fcntl.ioctl(0, termios.TIOCGWINSZ, bytes(8)) if outer_tty
                 else struct.pack("HHHH", 50, 220, 0, 0))
-        fcntl.ioctl(master, termios.TIOCSWINSZ, size)
+        height, width, _, _ = struct.unpack("HHHH", size)
+        height, width = height or 50, width or 220
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+        view.resize(height, width)
 
     resize()
     pid, lifeline = spawn_supervised(argv, master, slave)
@@ -209,7 +220,6 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
     signal.signal(signal.SIGWINCH, resize)
     pending = b""
     screen = b""
-    view = TerminalTail()
     query_buffer = b""
     delivered = False
     paste_started = False
