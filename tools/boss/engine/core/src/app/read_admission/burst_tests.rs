@@ -272,10 +272,17 @@ async fn call_missing_its_bound_is_drained_to_completion() {
     let (early, _) = timed_within(&mut task, Duration::from_millis(20)).await;
     let missed_bound = early.is_none();
     let finished_before_release = finished.load(std::sync::atomic::Ordering::SeqCst);
+    let draining = drain(task, early);
+    tokio::pin!(draining);
+    let drain_pending_before_release = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(draining.as_mut(), cx).is_pending())
+    })
+    .await;
     let released = release.send(());
-    let (in_bound, result) = drain(task, early).await;
+    let (in_bound, result) = draining.await;
     assert!(missed_bound, "the bound must trip");
     assert!(!finished_before_release);
+    assert!(drain_pending_before_release, "drain must wait for the held call");
     released.unwrap();
     assert!(!in_bound);
     assert_eq!(result.unwrap(), 7);
