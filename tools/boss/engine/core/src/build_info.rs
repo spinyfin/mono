@@ -11,18 +11,26 @@
 //! (`build_info_stamp` below). Cargo builds fall back to "unknown" via
 //! build.rs.
 //!
-//! [`git_sha`], [`git_dirty`], and [`build_time`] are backed by the
-//! separate `boss_build_provenance` crate instead of being stamped
-//! directly into `build_info_stamp` (via the same `include!` mechanism
-//! BOSS_VERSION uses) — that keeps the per-commit/per-build values, and
-//! the `include!(env!(...))` machinery that reads them, out of this
-//! crate's own source. It does NOT protect engine_lib's Bazel action
-//! cache: engine_lib still recompiles whenever the commit sha changes,
-//! because `boss_build_provenance`'s compiled interface embeds those
-//! constant values. See `boss_build_provenance`'s own doc comment for
-//! the verified detail and installer/pkg.bzl's `build_info_rs` doc
-//! comment for why `BOSS_GIT_SHA`/`BOSS_BUILD_TIME` are left as the
-//! literal `"unknown"` in this crate's own stamp instead.
+//! [`version`], [`git_sha`], [`git_dirty`], and [`build_time`] are NOT
+//! compiled into this crate. The per-commit / per-build values live in
+//! the Bazel-stamped `boss_build_provenance` leaf crate, which only the
+//! `engine` binary targets link; the binary hands them to this library
+//! through [`install_provenance`] as the first thing it does at startup.
+//! Until (or unless) that happens the readers return the same `"unknown"`
+//! / `false` placeholders a Cargo (non-Bazel) build gets.
+//!
+//! Why a hand-off instead of a plain dependency: a Rust crate's compiled
+//! output changes whenever its source changes, and the stamped source
+//! embeds the commit sha, so a direct `engine_lib -> boss_build_provenance`
+//! edge recompiled `engine_lib`, every `rust_test(crate = ":engine_lib")`
+//! binary and every consumer (`boss`, `bossctl`) on every commit, and
+//! re-executed ~30 otherwise-cached tests in CI for docs-only changes.
+//! `//tools/boss/engine/core:stamped_provenance_isolation_test` guards the
+//! edge; the investigation is in
+//! `tools/boss/docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md`.
+//! See installer/pkg.bzl's `build_info_rs` doc comment for why
+//! `BOSS_GIT_SHA`/`BOSS_BUILD_TIME` are left as the literal `"unknown"`
+//! in this crate's own stamp.
 //!
 //! Two more runtime signals round out "am I running the binary I think I
 //! am":
@@ -54,6 +62,73 @@ mod build_info_stamp {
     include!(env!("BOSS_BUILD_INFO_RS"));
 }
 
+/// The per-commit / per-build identity Bazel stamps into a leaf binary
+/// (`//tools/boss/installer:build_provenance_rs` -> `boss_build_provenance`)
+/// and the binary hands to this library through [`install_provenance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Provenance {
+    /// `1.0.N` on a release tag, `1.0.N-dev-<sha>` otherwise.
+    pub version: &'static str,
+    /// Full commit sha the binary was built from.
+    pub git_sha: &'static str,
+    /// `true` if the tree had uncommitted changes (or unresolved jj
+    /// conflicts) at build time.
+    pub git_dirty: bool,
+    /// ISO-8601 UTC wall-clock time of the build that produced the stamp.
+    pub build_time: &'static str,
+}
+
+impl Provenance {
+    /// What every reader reports until a binary installs the real thing:
+    /// byte-identical to the Cargo (non-Bazel) stamp, so library code and
+    /// its tests behave the same under both build systems.
+    pub const UNSTAMPED: Provenance = Provenance {
+        version: "unknown",
+        git_sha: "unknown",
+        git_dirty: false,
+        build_time: "unknown",
+    };
+}
+
+/// Write-once holder for the installed [`Provenance`]: one static for the
+/// process, a fresh instance per unit test.
+struct ProvenanceCell(OnceLock<Provenance>);
+
+impl ProvenanceCell {
+    const fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    /// First call wins. A second call leaves the first value in place and
+    /// returns it as the error, so the caller can see what it lost to.
+    fn install(&self, provenance: Provenance) -> Result<(), Provenance> {
+        self.0
+            .set(provenance)
+            .map_err(|_rejected| *self.0.get().expect("set failed, so a value is present"))
+    }
+
+    fn get(&self) -> &Provenance {
+        self.0.get().unwrap_or(&Provenance::UNSTAMPED)
+    }
+}
+
+static PROVENANCE: ProvenanceCell = ProvenanceCell::new();
+
+/// Install the stamped build provenance for this process.
+///
+/// Called exactly once, by the `engine` binary's `main`, before anything
+/// else runs: [`build_identity`] and [`build_time`] cache their first
+/// answer, so a reader that runs ahead of this call pins the unstamped
+/// placeholders for the life of the process. First call wins; a second
+/// call changes nothing and returns the value already installed.
+///
+/// Library code never calls this. Keeping the stamped crate out of
+/// `engine_lib` is what lets a new commit sha relink the binary without
+/// recompiling the library or re-executing its tests (see module docs).
+pub fn install_provenance(provenance: Provenance) -> Result<(), Provenance> {
+    PROVENANCE.install(provenance)
+}
+
 /// Format the canonical `--version` string for a bundled Boss binary.
 ///
 /// Output: `<name> <version>`, e.g. `boss-engine 1.0.4`. The numeric
@@ -65,10 +140,11 @@ pub fn version_string(binary_name: &str) -> String {
 
 /// Stamped Boss version for forensic surfaces: `1.0.N` on a release
 /// tag (`boss-v1.0.N`), `1.0.N-dev-<sha>` otherwise. `"unknown"` when
-/// the binary is unstamped (Cargo) or the stamp is the Cargo-crate
-/// placeholder `0.0.0`. Never returns `"0.0.0"`.
+/// no provenance was installed (a Cargo build, or library code running
+/// outside the `engine` binary — tests included) or the stamp is the
+/// Cargo-crate placeholder `0.0.0`. Never returns `"0.0.0"`.
 pub fn version() -> &'static str {
-    stamped_or_unknown(boss_build_provenance::version())
+    stamped_or_unknown(PROVENANCE.get().version)
 }
 
 fn stamped_or_unknown(raw: &str) -> &str {
@@ -81,18 +157,19 @@ fn stamped_or_unknown(raw: &str) -> &str {
 
 /// Full git commit sha the engine binary was built from — long enough to
 /// feed directly to `git merge-base --is-ancestor <sha> main`. `"unknown"`
-/// on a Cargo (non-Bazel) build. Stamped via the `boss_build_provenance`
-/// crate; see this module's doc comment for why that lives in its own
-/// crate instead of `build_info_stamp` below.
+/// until the `engine` binary installs its stamp (so always `"unknown"` on
+/// a Cargo build and inside library tests); see this module's doc comment
+/// for why the stamp lives in a leaf crate the library never links.
 pub fn git_sha() -> &'static str {
-    boss_build_provenance::git_sha()
+    stamped_or_unknown(PROVENANCE.get().git_sha)
 }
 
 /// `true` if the engine binary was built from a working tree with
 /// uncommitted changes (or, in a jj workspace, unresolved conflicts on
-/// the built commit). Always `false` on a Cargo (non-Bazel) build.
+/// the built commit). `false` until the `engine` binary installs its
+/// stamp, and always `false` on a Cargo (non-Bazel) build.
 pub fn git_dirty() -> bool {
-    boss_build_provenance::git_dirty()
+    PROVENANCE.get().git_dirty
 }
 
 /// Opaque identity of the running engine build, for "did a different
@@ -119,19 +196,22 @@ pub fn build_identity() -> &'static str {
     .as_str()
 }
 
-/// Best-effort build timestamp string. Uses the stamped provenance
-/// value when available; falls back to the binary mtime sampled at
-/// first call.
+/// Best-effort build timestamp string. Uses the installed provenance
+/// value when there is one; otherwise falls back to the binary mtime
+/// sampled at first call (and cached, so the answer stays stable even
+/// if an installer later replaces the file).
 pub fn build_time() -> &'static str {
-    static CELL: OnceLock<String> = OnceLock::new();
-    CELL.get_or_init(|| {
-        let stamped = boss_build_provenance::build_time();
-        if !stamped.is_empty() && stamped != "unknown" {
-            return stamped.to_owned();
-        }
-        binary_mtime_iso8601().unwrap_or_else(|| format!("unknown (CARGO_PKG_VERSION {})", env!("CARGO_PKG_VERSION")))
-    })
-    .as_str()
+    let stamped = PROVENANCE.get().build_time;
+    if !stamped.is_empty() && stamped != "unknown" {
+        return stamped;
+    }
+    static FALLBACK: OnceLock<String> = OnceLock::new();
+    FALLBACK
+        .get_or_init(|| {
+            binary_mtime_iso8601()
+                .unwrap_or_else(|| format!("unknown (CARGO_PKG_VERSION {})", env!("CARGO_PKG_VERSION")))
+        })
+        .as_str()
 }
 
 fn binary_mtime_iso8601() -> Option<String> {
@@ -286,11 +366,57 @@ mod tests {
     }
 
     #[test]
-    fn version_is_stamped_and_never_cargo_pkg_placeholder() {
+    fn version_is_never_cargo_pkg_placeholder() {
         let s = version();
         assert!(!s.is_empty());
         assert_ne!(s, "0.0.0");
-        assert_eq!(s, boss_build_provenance::version());
+    }
+
+    #[test]
+    fn provenance_cell_reports_unstamped_until_installed() {
+        let cell = ProvenanceCell::new();
+        assert_eq!(*cell.get(), Provenance::UNSTAMPED);
+
+        let stamped = Provenance {
+            version: "1.0.700-dev-abc1234",
+            git_sha: "abc1234abc1234abc1234abc1234abc1234abc12",
+            git_dirty: true,
+            build_time: "2026-10-21T00:00:00Z",
+        };
+        assert_eq!(cell.install(stamped), Ok(()));
+        assert_eq!(*cell.get(), stamped);
+    }
+
+    #[test]
+    fn provenance_cell_is_first_wins() {
+        let cell = ProvenanceCell::new();
+        let first = Provenance {
+            version: "1.0.1",
+            git_sha: "1111111111111111111111111111111111111111",
+            git_dirty: false,
+            build_time: "2026-10-21T01:00:00Z",
+        };
+        let second = Provenance {
+            version: "1.0.2",
+            git_sha: "2222222222222222222222222222222222222222",
+            git_dirty: true,
+            build_time: "2026-10-21T02:00:00Z",
+        };
+        assert_eq!(cell.install(first), Ok(()));
+        assert_eq!(cell.install(second), Err(first));
+        assert_eq!(*cell.get(), first);
+    }
+
+    #[test]
+    fn unstamped_placeholders_match_the_cargo_stamp() {
+        // The library never links the stamped crate, so what a Cargo
+        // build reports and what an uninstalled process reports must be
+        // one and the same set of placeholders.
+        let unstamped = Provenance::UNSTAMPED;
+        assert_eq!(stamped_or_unknown(unstamped.version), "unknown");
+        assert_eq!(stamped_or_unknown(unstamped.git_sha), "unknown");
+        assert!(!unstamped.git_dirty);
+        assert_eq!(unstamped.build_time, "unknown");
     }
 
     #[test]
@@ -310,10 +436,10 @@ mod tests {
     #[test]
     fn git_dirty_does_not_panic() {
         // Best-effort provenance value; just confirm the call is wired
-        // through to `boss_build_provenance` without panicking. The
-        // actual value depends on the build (Bazel-stamped vs the Cargo
-        // `false` default) so there's nothing more specific to assert
-        // here in-tree.
+        // through the installed-provenance cell without panicking. The
+        // actual value depends on whether a binary installed a stamp
+        // (never, inside this test binary) so there's nothing more
+        // specific to assert here in-tree.
         let _ = git_dirty();
     }
 

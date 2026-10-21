@@ -9,16 +9,27 @@ build --disk_cache=~/.cache/bazelcache
 build --experimental_disk_cache_gc_max_size=250G
 build --experimental_disk_cache_gc_max_age=7d
 
-# Always stamp builds with the git-derived version so that dev builds show a
-# meaningful version string (e.g. "1.0.9-dev-a58a932") in the About panel
-# instead of the unstamped placeholder "0.0.0".  Only the version plist and
-# build_info_rs actions use ctx.info_file, so the cache impact is minimal —
-# Swift/Rust compilation targets are unaffected.
+# Always run the workspace-status script so the version plist, build_info_rs
+# and build_provenance_rs actions can read the git-derived version/sha from
+# ctx.info_file (stable-status.txt) and dev builds show a meaningful version
+# string (e.g. "1.0.9-dev-a58a932") in the About panel instead of "0.0.0".
+# Bazel runs the script and writes stable-status.txt on every build whether
+# or not --stamp is set, and those rules read ctx.info_file unconditionally.
+#
+# --stamp is deliberately OFF for ordinary builds. rules_rust's rust_binary
+# defaults to `stamp = -1` (follow --stamp), and a stamped Rustc action takes
+# stable-status.txt — which carries the commit sha — as an input, so with
+# --stamp on, every rust_binary in the repo (boss, bossctl, cube, checkleft,
+# repobin, hood, release, changelog, ...) recompiled on every commit, docs-only
+# commits included. Nothing here uses rules_rust's {STABLE_*} substitutions,
+# so the recompiles bought nothing. See
+# tools/boss/docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md.
 build --workspace_status_command=tools/boss/installer/workspace-status.sh
-build --stamp
 
-# Release config: identical stamp flags; kept as a named config so release.sh
-# and CI can use --config=release to opt into additional release-only settings.
+# Release config: the same status script plus Bazel-level stamping, kept as a
+# named config so release.sh and CI can use --config=release to opt into
+# release-only settings. A release build is a one-off, so the per-binary
+# recompiles --stamp causes do not matter there.
 build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --stamp
 
