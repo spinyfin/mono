@@ -30,11 +30,38 @@ async fn call(state: Arc<ServerState>, request: FrontendRequest, pid: Option<lib
     response
 }
 
-/// One request on a fresh socket, timed against the two-second bound.
-async fn timed<F: std::future::Future>(work: F) -> (Result<F::Output, tokio::time::error::Elapsed>, u128) {
+const BOUND: Duration = Duration::from_secs(2);
+/// Backstop for draining a call that already missed its bound; far above any
+/// real latency, so it only fires on a genuine hang.
+const DRAIN: Duration = Duration::from_secs(60);
+
+/// Run `work` against `bound` and report the elapsed milliseconds alongside
+/// the (possibly timed-out) result. The task stays owned by the caller, so a
+/// missed bound leaves it running and `drain` can still join it.
+async fn timed_within<T>(
+    work: &mut tokio::task::JoinHandle<T>,
+    bound: Duration,
+) -> (Option<Result<T, tokio::task::JoinError>>, u128) {
     let start = std::time::Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(2), work).await;
+    let result = tokio::time::timeout(bound, &mut *work).await.ok();
     (result, start.elapsed().as_millis())
+}
+
+/// Join a task that `timed_within` may have left running, so no server-side
+/// work outlives the fixture's temp dir. Returns whether it met its bound.
+async fn drain<T>(
+    mut work: tokio::task::JoinHandle<T>,
+    early: Option<Result<T, tokio::task::JoinError>>,
+) -> (bool, Result<T, tokio::task::JoinError>) {
+    match early {
+        Some(result) => (true, result),
+        None => (
+            false,
+            tokio::time::timeout(DRAIN, &mut work)
+                .await
+                .expect("timed-out call never finished"),
+        ),
+    }
 }
 
 async fn list_proposals(state: Arc<ServerState>, run_id: String, pid: libc::pid_t) -> FrontendEvent {
@@ -59,19 +86,17 @@ async fn list_proposals(state: Arc<ServerState>, run_id: String, pid: libc::pid_
 /// read transaction that stays open across the measured window (a CLI
 /// process mid-inspection, holding its WAL snapshot), and it sends one
 /// socket `ListProposals` at the same instant as the measured requests.
-/// The burst is a bounded set of concurrent in-flight reads rather than
-/// an open-ended hot loop. The loop form spent its whole window opening
-/// fresh connections on the blocking pool and starved the four runtime
-/// workers of CPU: a read that touches no database at all
-/// (`ListWorkerLiveStates`) took hundreds of milliseconds locally and
-/// seconds on a loaded CI host, which is what the bounds then measured.
-/// With the work bounded, the bounds trip only on a real serialization: a
-/// reader holding the engine's writer connection, or the write waiting
-/// out SQLite's busy timeout behind the readers.
+/// The burst is deliberately a bounded set of in-flight reads: an open-ended
+/// loop of fresh read-only connections saturates the blocking pool and
+/// starves the runtime workers of CPU, so the bounds would measure CPU
+/// scheduling instead of serialization. The bounds should trip only on a
+/// real serialization: a reader holding the engine's writer connection, or
+/// the write waiting out SQLite's busy timeout behind the readers.
 ///
-/// Every reader and every held inspection is joined before anything is
-/// asserted, so nothing can still touch `state.db` once the fixture (and
-/// its temp dir) is dropped, whatever the measured outcome.
+/// Every reader, held inspection and measured call is joined before anything
+/// is asserted (a call that misses its bound keeps running and is drained),
+/// so nothing can still touch `state.db` once the fixture (and its temp dir)
+/// is dropped, whatever the measured outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency() {
     for count in [8, 32] {
@@ -145,37 +170,40 @@ async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency()
             let (state, barrier, run) = (state.clone(), barrier.clone(), execution.id.clone());
             readers.push(tokio::spawn(async move {
                 barrier.wait().await;
-                // A failed inspection is reported at its join; the reader
-                // still keeps every rendezvous so nothing can hang.
+                // A failed inspection or a panicking request is captured as a
+                // value and reported at the join; the reader still keeps every
+                // rendezvous so the main task is never left at a barrier.
                 let held = held_rx.await.is_ok();
-                let warm = list_proposals(state.clone(), run.clone(), pid).await;
+                let warm = tokio::spawn(list_proposals(state.clone(), run.clone(), pid)).await;
                 barrier.wait().await;
                 barrier.wait().await;
-                let burst = list_proposals(state, run, pid).await;
+                let burst = tokio::spawn(list_proposals(state, run, pid)).await;
                 (held, warm, burst)
             }));
         }
         barrier.wait().await;
         barrier.wait().await;
         barrier.wait().await;
-        let (write, reads) = tokio::join!(
-            timed(call(
-                state.clone(),
-                FrontendRequest::SubmitProposal {
-                    run_id: execution.id.clone(),
-                    kind: ProposalKind::FollowupTask,
-                    payload: serde_json::json!({"proposed_name":"N", "proposed_description":"D", "rationale":"R"}),
-                    idempotency_key: None,
-                },
-                Some(pid),
-            )),
-            timed(async {
+        // Owned tasks, so a missed bound leaves them to be drained below.
+        let mut write_task = tokio::spawn(call(
+            state.clone(),
+            FrontendRequest::SubmitProposal {
+                run_id: execution.id.clone(),
+                kind: ProposalKind::FollowupTask,
+                payload: serde_json::json!({"proposed_name":"N", "proposed_description":"D", "rationale":"R"}),
+                idempotency_key: None,
+            },
+            Some(pid),
+        ));
+        let mut reads_task = tokio::spawn({
+            let (state, product_id) = (state.clone(), chore.product_id.clone());
+            async move {
                 let live = call(state.clone(), FrontendRequest::ListWorkerLiveStates, None).await;
                 let tmux = call(state.clone(), FrontendRequest::ListTmuxWorkerStatuses, None).await;
                 let tree = call(
-                    state.clone(),
+                    state,
                     FrontendRequest::GetWorkTree {
-                        product_id: chore.product_id.clone(),
+                        product_id,
                         fetch_seq: None,
                         delta: true,
                     },
@@ -183,7 +211,11 @@ async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency()
                 )
                 .await;
                 (live, tmux, tree)
-            }),
+            }
+        });
+        let (write, reads) = tokio::join!(
+            timed_within(&mut write_task, BOUND),
+            timed_within(&mut reads_task, BOUND)
         );
         // Release the held snapshots and join everything that can touch
         // the database before judging the window: a failed bound must
@@ -200,16 +232,22 @@ async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency()
             inspected.push(inspection.await);
         }
         let (write, write_ms) = write;
-        let write = write.expect("worker write exceeded two seconds");
-        assert!(matches!(write, FrontendEvent::ProposalSubmitted { .. }), "{write:?}");
+        let (write_in_bound, write) = drain(write_task, write).await;
         let (reads, reads_ms) = reads;
-        let (live, tmux, tree) = reads.expect("app status and board reads exceeded two seconds");
+        let (reads_in_bound, reads) = drain(reads_task, reads).await;
+        assert!(write_in_bound, "worker write exceeded two seconds");
+        let write = write.unwrap();
+        assert!(matches!(write, FrontendEvent::ProposalSubmitted { .. }), "{write:?}");
+        assert!(reads_in_bound, "app status and board reads exceeded two seconds");
+        let (live, tmux, tree) = reads.unwrap();
         assert!(matches!(live, FrontendEvent::WorkerLiveStatesList { .. }), "{live:?}");
         assert!(matches!(tmux, FrontendEvent::TmuxWorkerStatusesList { .. }), "{tmux:?}");
         assert!(matches!(tree, FrontendEvent::WorkTreeUpdate { .. }), "{tree:?}");
         for outcome in outcomes {
             let (held, warm, burst) = outcome.unwrap();
             assert!(held, "inspection never reached its held snapshot");
+            let warm = warm.expect("warm proposal read panicked");
+            let burst = burst.expect("burst proposal read panicked");
             assert!(matches!(warm, FrontendEvent::ProposalsList { .. }), "{warm:?}");
             assert!(matches!(burst, FrontendEvent::ProposalsList { .. }), "{burst:?}");
         }
@@ -222,6 +260,28 @@ async fn eight_and_thirty_two_readers_preserve_worker_write_and_agents_latency()
         }
         eprintln!("{count}-way burst: worker write {write_ms}ms, status and board reads {reads_ms}ms (bound 2000ms)");
     }
+}
+
+/// A call that misses its bound is reported as missed but stays owned and is
+/// run to completion by `drain`, so its work cannot outlive the fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_missing_its_bound_is_drained_to_completion() {
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut task = tokio::spawn({
+        let finished = finished.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            7
+        }
+    });
+    let (early, _) = timed_within(&mut task, Duration::from_millis(20)).await;
+    assert!(early.is_none(), "the bound must trip");
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+    let (in_bound, result) = drain(task, early).await;
+    assert!(!in_bound);
+    assert_eq!(result.unwrap(), 7);
+    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
