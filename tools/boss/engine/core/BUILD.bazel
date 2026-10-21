@@ -840,7 +840,7 @@ sh_test(
 # it is (transitively) a dependency of `engine_lib`, every commit — a
 # docs-only change included — recompiles `engine_lib`, every
 # `rust_test(crate = ":engine_lib")` binary, `boss` and `bossctl`, and
-# re-executes ~30 otherwise-cached tests in CI. That is what happened before
+# re-executes their tests. See
 # docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md.
 #
 # `genquery` evaluates against the real dependency graph at build time
@@ -869,9 +869,11 @@ sh_test(
     args = [
         "$(location :engine_lib_test_stamped_deps)",
         "$(location :engine_binary_stamped_deps)",
+        "$(location //:.bazelrc)",
     ],
     data = [
         ":engine_binary_stamped_deps",
         ":engine_lib_test_stamped_deps",
+        "//:.bazelrc",
     ],
 )

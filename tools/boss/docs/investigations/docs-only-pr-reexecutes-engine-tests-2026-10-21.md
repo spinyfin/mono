@@ -141,11 +141,35 @@ Executing action 'Compiling Rust bin engine_lib_test (689 files)': action change
 Executing action 'Compiling Rust rlib engine_lib (689 files)': action changed since cached execution.
 ```
 
-Digests before/after the sha bump: `stable-status.txt`,
-`build_provenance_generated.rs` and `libboss_build_provenance-*.rlib`
-changed; `libboss_protocol-*.rlib` (control) did not. The changed rlib is
-listed verbatim in `engine_lib`'s and `engine_lib_test`'s `Rustc` inputs
-(`--extern=boss_build_provenance=.../libboss_build_provenance-….rlib`).
+The `--explain` output says _which actions_ changed; the execution log says
+_which input digest_ changed. Same experiment, recorded with
+`--execution_log_json_file` (Bazel 9.1.0, local disk cache as normal, on the
+commit before the fix):
+
+```
+bazel test //tools/boss/engine/core:engine_lib_test --execution_log_json_file=A.json
+jj describe -m "sha bump"        # new commit id, no file change
+bazel test //tools/boss/engine/core:engine_lib_test --execution_log_json_file=B.json
+```
+
+Diffing the `inputs` of each spawn present in both logs (matched by mnemonic
+and first output) leaves exactly this chain; the digests are SHA-256 prefixes:
+
+| Spawn (mnemonic: output)                            | Input / output path that changed            | Before         | After          |
+| --------------------------------------------------- | ------------------------------------------- | -------------- | -------------- |
+| `BuildProvenanceRs`                                 | input `bazel-out/stable-status.txt`         | `8da65c7c2653` | `a0ce4fb24846` |
+| `Rustc`: `libboss_build_provenance-*.rlib`          | input `build_provenance_generated.rs`       | `c5cf22d60e3c` | `ae581834b842` |
+| `Rustc`: `engine_lib_test`                          | input `libboss_build_provenance-*.rlib`     | `e210dc5756f5` | `fae54e0a3e13` |
+| `TestRunner`: `engine_lib_test/shard_N_of_11` (×11) | input `…/engine_lib_test` (the test binary) | `3adf0f5d1ccc` | `61c14d72b1ed` |
+| `Rustc`: `repobin`                                  | input `bazel-out/stable-status.txt`         | `8da65c7c2653` | `a0ce4fb24846` |
+
+All 11 `TestRunner` spawns report `cacheHit: false` in `B.json`, and the
+second `bazel test` printed `PASSED in 86.6s`, not `(cached)`. The test
+action's own source, data and environment are unchanged; the only input that
+moved is the test binary, and it moved because the one-file stamped rlib it
+links moved. `repobin` is the `--stamp` path: its `Rustc` action takes
+`stable-status.txt` directly. (`volatile-status.txt` also differs in that
+spawn's input list, but Bazel keeps it out of the action key.)
 
 `volatile-status.txt` (build time) is not the problem: Bazel excludes it
 from action keys, which is why `BUILD_TIME` was already routed there.
@@ -189,13 +213,35 @@ downstream of it moves.) `engine_lib`, `engine_lib_test`, `boss`, `bossctl`,
 `engine` binary and in neither `engine_lib_test` nor `boss`. A subsequent
 `bazel test` reports `engine_lib_test` as `(cached) PASSED`.
 
+The matching execution-log comparison, same two commands as above on the
+fixed tree (`C.json` before the sha bump, `D.json` after, the latter also
+testing `//tools/boss/build-provenance:all`):
+
+| Spawn                                          | Before         | After          | Note                                        |
+| ---------------------------------------------- | -------------- | -------------- | ------------------------------------------- |
+| `BuildInfoRs` input `stable-status.txt`        | `12d4082591e6` | `33870c094dd9` | the sha moved                               |
+| `BuildInfoRs` output `build_info_generated.rs` | `54d7e43c0ec9` | `54d7e43c0ec9` | byte-identical, so nothing downstream moves |
+| `Rustc`: `engine_lib_test` output              | `f01121df60b4` | no spawn       | test binary not rebuilt                     |
+| `TestRunner`: `engine_lib_test` shards         | 11 spawns      | no spawn       | `(cached) PASSED`                           |
+
+`D.json` contains six spawns in total: `BuildInfoRs`, `BuildProvenanceRs`,
+the stamped crate's `Rustc`, `build-provenance_test`'s `Rustc`, and its two
+`TestRunner` records. No `engine_lib_test` compile or test spawn appears at
+all, and the only spawn whose input digest changed is `BuildInfoRs`.
+
 So a commit that changes only the sha now re-runs: `BuildProvenanceRs`,
 the one-file `boss_build_provenance` compile, the `engine` /
 `engine_fixture_test` link, and one test target,
 `//tools/boss/build-provenance:build-provenance_test` (it genuinely
-depends on the stamp; it takes under a second). On macOS the Swift
-`EngineReconnectIntegrationTests` also re-runs, because it has
-`engine_fixture_test` in its data. Everything else is a cache hit.
+depends on the stamp; it takes under a second). On macOS two more targets
+re-run, because their data reaches an engine binary that changes every
+commit: the Swift `//tools/boss/app-macos:EngineReconnectIntegrationTests`
+(it has `engine_fixture_test` in its data) and
+`//tools/boss/installer:boss_pkg_payload_contains_engine_binary_test` (its
+`:boss_pkg_payload` bundles `//tools/boss/engine/core:engine`). These are the
+only app-macos/installer tests in
+`tests(rdeps(//tools/boss/app-macos/... + //tools/boss/installer/..., //tools/boss/build-provenance))`.
+Everything else is a cache hit.
 
 ## Guard
 

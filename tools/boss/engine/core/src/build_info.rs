@@ -22,9 +22,9 @@
 //! Why a hand-off instead of a plain dependency: a Rust crate's compiled
 //! output changes whenever its source changes, and the stamped source
 //! embeds the commit sha, so a direct `engine_lib -> boss_build_provenance`
-//! edge recompiled `engine_lib`, every `rust_test(crate = ":engine_lib")`
+//! edge would recompile `engine_lib`, every `rust_test(crate = ":engine_lib")`
 //! binary and every consumer (`boss`, `bossctl`) on every commit, and
-//! re-executed ~30 otherwise-cached tests in CI for docs-only changes.
+//! re-execute their tests even for docs-only changes.
 //! `//tools/boss/engine/core:stamped_provenance_isolation_test` guards the
 //! edge; the investigation is in
 //! `tools/boss/docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md`.
@@ -117,9 +117,9 @@ static PROVENANCE: ProvenanceCell = ProvenanceCell::new();
 /// Install the stamped build provenance for this process.
 ///
 /// Called exactly once, by the `engine` binary's `main`, before anything
-/// else runs: [`build_identity`] and [`build_time`] cache their first
-/// answer, so a reader that runs ahead of this call pins the unstamped
-/// placeholders for the life of the process. First call wins; a second
+/// else runs: [`build_identity`] caches its first answer, so a reader that
+/// runs ahead of this call pins the unstamped placeholders for the life of
+/// the process. First call wins; a second
 /// call changes nothing and returns the value already installed.
 ///
 /// Library code never calls this. Keeping the stamped crate out of

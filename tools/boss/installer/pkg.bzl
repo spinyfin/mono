@@ -260,7 +260,7 @@ def _build_provenance_rs_impl(ctx):
     # deliberately just the two engine binaries (guarded by
     # //tools/boss/engine/core:stamped_provenance_isolation_test). See the
     # `LiveStatusDebugReport.engine_build_sha` doc comment for how the
-    # values are surfaced to an operator.
+    # values appear in the live-status debug report.
     #
     # VERSION is STABLE_BOSS_VERSION (`1.0.N` on a release tag, `1.0.N-dev-<sha>`
     # otherwise). It already changes every commit on a dev build, so stamping
@@ -320,10 +320,10 @@ otherwise-empty `boss-build-provenance` leaf crate — see that crate's
 BUILD.bazel and doc comment. The output changes on every commit, so every
 action downstream of it re-runs on every commit; the crate is therefore
 linked only by the `engine` rust_binary targets, which hand the values to
-engine_lib at startup (`build_info::install_provenance`). While engine_lib
-linked the crate directly, a docs-only commit recompiled engine_lib, every
-`rust_test(crate = ":engine_lib")` binary, `boss` and `bossctl`, and
-re-executed ~30 tests in CI — see
+engine_lib at startup (`build_info::install_provenance`). If engine_lib
+linked the crate directly, a docs-only commit would recompile engine_lib,
+every `rust_test(crate = ":engine_lib")` binary, `boss` and `bossctl`, and
+re-execute their tests — see
 tools/boss/docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md.
 """,
 )

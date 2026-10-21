@@ -4,12 +4,12 @@
 # stable-status.txt) must not be a transitive dependency of `engine_lib`.
 #
 # That crate's source embeds the commit sha, so it changes on every commit.
-# While `engine_lib` linked it, every commit — a docs-only change included —
-# recompiled `engine_lib`, every `rust_test(crate = ":engine_lib")` binary,
-# `boss` and `bossctl`, and re-executed ~30 otherwise-cached tests in CI
-# (see docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md).
-# The stamp is now linked only by the `engine` rust_binary targets, which
-# hand the values to `build_info::install_provenance` at startup.
+# If `engine_lib` linked it, every commit — a docs-only change included —
+# would recompile `engine_lib`, every `rust_test(crate = ":engine_lib")`
+# binary, `boss` and `bossctl`, and re-execute their tests (see
+# docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md).
+# The stamp is linked only by the `engine` rust_binary targets, which hand
+# the values to `build_info::install_provenance` at startup.
 #
 # Inputs are two `genquery` outputs evaluated against the real dependency
 # graph at build time (see BUILD.bazel):
@@ -17,12 +17,18 @@
 #   $2 — stamped targets found in deps(engine);          must be non-empty
 #        (positive control, so an empty $1 cannot be a rotted filter).
 #
+#   $3 — the root .bazelrc. `build --stamp` must not be set for ordinary
+#        builds: with it, every rust_binary's Rustc action takes
+#        stable-status.txt (which carries the commit sha) as an input and
+#        recompiles on every commit. It belongs under `build:release` only.
+#
 # Pure bash on purpose: the hermetic test wrapper strips PATH, and reading a
 # file with `$(<file)` needs no external tool.
 set -euo pipefail
 
 engine_lib_hits_file="$1"
 positive_control_file="$2"
+bazelrc_file="$3"
 
 engine_lib_hits="$(<"$engine_lib_hits_file")"
 positive_control="$(<"$positive_control_file")"
@@ -44,5 +50,17 @@ if [[ -z "${positive_control//[[:space:]]/}" ]]; then
   echo "trusting an empty engine_lib result." >&2
   exit 1
 fi
+
+while IFS= read -r line; do
+  # Strip trailing comments, then match an unconditional `build --stamp`
+  # (including `build --stamp=true`); `build:<config> --stamp` is allowed.
+  line="${line%%#*}"
+  if [[ "$line" =~ ^[[:space:]]*build[[:space:]]+(.*[[:space:]])?--stamp([[:space:]=]|$) ]]; then
+    echo "ERROR: .bazelrc sets an unconditional 'build --stamp': $line" >&2
+    echo "With --stamp, every rust_binary Rustc action reads stable-status.txt and recompiles on every commit." >&2
+    echo "Scope it to a config (e.g. 'build:release --stamp') instead." >&2
+    exit 1
+  fi
+done <"$bazelrc_file"
 
 echo "OK: the stamped provenance crate is linked by the engine binary only; engine_lib's closure is free of per-commit inputs."

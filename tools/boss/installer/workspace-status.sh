@@ -108,8 +108,8 @@ fi
 # `boss-build-provenance` leaf crate — never `build_info_rs`/engine_lib
 # directly. Only the `engine` rust_binary targets link that crate (they hand
 # the values to engine_lib at startup), so a changed sha relinks the engine
-# binary and nothing else. Keep it that way: while engine_lib linked the
-# crate, every commit recompiled engine_lib and re-executed ~30 tests in CI.
+# binary and nothing else. Keep it that way: if engine_lib linked the crate,
+# every commit would recompile engine_lib and re-execute its tests.
 # //tools/boss/engine/core:stamped_provenance_isolation_test guards the edge.
 echo "STABLE_BOSS_VERSION $BOSS_VERSION"
 echo "STABLE_BOSS_BASE_VERSION $BOSS_BASE_VERSION"
