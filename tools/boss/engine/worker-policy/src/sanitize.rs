@@ -150,6 +150,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
             attention_items,
             attention_groups,
             attention_members,
+            planner_runs,
         } => FrontendEvent::WorkTree {
             product,
             projects,
@@ -161,6 +162,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
             attention_items,
             attention_groups,
             attention_members,
+            planner_runs,
         },
         passthrough @ (FrontendEvent::Hello { .. }
         | FrontendEvent::Subscribed { .. }

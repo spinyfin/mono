@@ -1245,6 +1245,8 @@ impl WorkDb {
         let (attention_groups, attention_members) =
             super::attentions::reads::list_groups_with_members(&conn, product_id, None, None, None, None)?;
 
+        let planner_runs = super::planner_runs::latest_settled_planner_run_summaries(&conn, product_id)?;
+
         Ok(WorkTree {
             product,
             projects,
@@ -1256,6 +1258,7 @@ impl WorkDb {
             attention_items,
             attention_groups,
             attention_members,
+            planner_runs,
         })
     }
 

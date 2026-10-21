@@ -184,6 +184,157 @@ async fn work_tree_attention_snapshots_and_deltas_follow_create_and_dismiss() {
     );
 }
 
+fn claim_planner_run(db: &crate::work::WorkDb, product_id: &str, project_id: &str) -> boss_protocol::PlannerRun {
+    db.claim_planner_run(crate::work::ClaimPlannerRunInput {
+        project_id,
+        product_id,
+        design_task_id: None,
+        caller: "operator",
+    })
+    .unwrap()
+    .expect("claim planner run")
+}
+
+fn settle_planner_run(db: &crate::work::WorkDb, run_id: &str, outcome: &str) {
+    db.update_planner_run(run_id, crate::work::PlannerRunPatch::builder().outcome(outcome).build())
+        .unwrap();
+}
+
+#[tokio::test]
+async fn work_tree_carries_latest_settled_planner_run_per_project_and_follows_transitions() {
+    let (state, _dir) = test_server_state();
+    let db = &state.work_db;
+    let product = crate::test_support::create_test_product_named(db, "planner tree");
+    let project = db
+        .create_project(
+            boss_protocol::CreateProjectInput::builder()
+                .product_id(product.id.clone())
+                .name("Planned")
+                .goal("plan it")
+                .build(),
+        )
+        .unwrap();
+    let sink = make_session_sink();
+    let first = update(fetch(&state, &sink, &product.id, true).await);
+    assert_eq!(first.changes["planner_runs"], serde_json::json!([]));
+
+    // A still-running run is not part of the tree summary; the in-flight
+    // state comes from the background-work snapshot.
+    let run = claim_planner_run(db, &product.id, &project.id);
+    assert_eq!(
+        update(fetch(&state, &sink, &product.id, true).await).changes,
+        serde_json::json!({})
+    );
+
+    // running -> staged adds the summary as a keyed upsert.
+    settle_planner_run(db, &run.id, boss_protocol::PLANNER_OUTCOME_STAGED);
+    let staged = update(fetch(&state, &sink, &product.id, true).await);
+    let upserts = &staged.changes["planner_runs"]["upserts"];
+    assert_eq!(upserts.as_array().unwrap().len(), 1);
+    assert_eq!(upserts[0]["project_id"], project.id);
+    assert_eq!(upserts[0]["run_id"], run.id);
+    assert_eq!(upserts[0]["outcome"], boss_protocol::PLANNER_OUTCOME_STAGED);
+    assert!(upserts[0].get("raw_output").is_none() && upserts[0].get("result_summary").is_none());
+    assert_eq!(staged.changes["planner_runs"]["order"], serde_json::json!([project.id]));
+
+    // The full tree carries the same summary.
+    let FrontendEvent::WorkTree { planner_runs, .. } = fetch(&state, &sink, &product.id, false).await else {
+        panic!("full tree")
+    };
+    assert_eq!(planner_runs.len(), 1);
+    assert_eq!(planner_runs[0].run_id, run.id);
+    update(fetch(&state, &sink, &product.id, true).await);
+
+    // staged -> applied changes the existing record in place (no reorder).
+    settle_planner_run(db, &run.id, boss_protocol::PLANNER_OUTCOME_APPLIED);
+    let applied = update(fetch(&state, &sink, &product.id, true).await);
+    assert_eq!(
+        applied.changes["planner_runs"]["upserts"][0]["outcome"],
+        boss_protocol::PLANNER_OUTCOME_APPLIED
+    );
+    assert!(applied.changes["planner_runs"].get("order").is_none());
+
+    // Undo deletes the row: the summary is tombstoned.
+    assert!(db.delete_planner_run(&run.id).unwrap());
+    let undone = update(fetch(&state, &sink, &product.id, true).await);
+    assert_eq!(undone.changes["planner_runs"]["order"], serde_json::json!([]));
+}
+
+/// Every operator-driven planner-run transition (staged -> applied via
+/// release, row deletion via unpopulate) must reach tree subscribers as a
+/// product-topic invalidation, because the tree is the only source of the
+/// board's planner affordance.
+#[tokio::test]
+async fn release_and_unpopulate_invalidate_the_product_work_topic() {
+    let (state, _dir) = test_server_state();
+    let db = state.work_db.clone();
+    let product = crate::test_support::create_test_product_named(&db, "planner invalidation");
+    let project = db
+        .create_project(
+            boss_protocol::CreateProjectInput::builder()
+                .product_id(product.id.clone())
+                .name("Planned")
+                .goal("plan it")
+                .build(),
+        )
+        .unwrap();
+    let run = claim_planner_run(&db, &product.id, &project.id);
+    settle_planner_run(&db, &run.id, boss_protocol::PLANNER_OUTCOME_STAGED);
+
+    let sink = make_session_sink();
+    state.topic_broker.register_session("s1", sink.clone()).await;
+    state
+        .topic_broker
+        .subscribe("s1", &[crate::protocol::work_product_topic(&product.id)])
+        .await;
+    let dispatch = |request_id: &str| {
+        Dispatch::builder()
+            .server_state(state.clone())
+            .work_db(db.clone())
+            .sink(sink.clone())
+            .session_id("s1")
+            .request_id(request_id)
+            .recv_instant(Instant::now())
+            .decode_ms(0.0)
+            .build()
+    };
+    let next_invalidation_reason = || async {
+        match sink.next().await.expect("topic push").payload {
+            FrontendEvent::TopicEvent {
+                event: crate::protocol::TopicEventPayload::WorkInvalidated { reason, product_id, .. },
+                ..
+            } => {
+                assert_eq!(product_id.as_deref(), Some(product.id.as_str()));
+                reason
+            }
+            other => panic!("expected a WorkInvalidated push, got {other:?}"),
+        }
+    };
+
+    planner_ops::handle_release_project(
+        dispatch("release"),
+        FrontendRequest::ReleaseProject {
+            project_id: project.id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(next_invalidation_reason().await, "project_released");
+    assert!(matches!(
+        sink.next().await.unwrap().payload,
+        FrontendEvent::ReleaseProjectResult { .. }
+    ));
+
+    planner_ops::handle_unpopulate_project(
+        dispatch("unpopulate"),
+        FrontendRequest::UnpopulateProject {
+            project_id: project.id.clone(),
+            run_id: run.id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(next_invalidation_reason().await, "project_unpopulated");
+}
+
 #[test]
 fn same_product_reads_preserve_freshness_and_delta_sequence() {
     overlapping_reads(false);

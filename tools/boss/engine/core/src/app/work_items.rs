@@ -1424,6 +1424,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
                     attention_items: tree.attention_items,
                     attention_groups: tree.attention_groups,
                     attention_members: tree.attention_members,
+                    planner_runs: tree.planner_runs,
                 },
             );
         }

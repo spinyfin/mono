@@ -18,6 +18,16 @@ struct WorkTreeDeltaCache {
         tree = nil
     }
 
+    /// The field each keyed collection is merged on; mirrors
+    /// `boss_protocol::work_tree_delta`. Every other keyed field uses `id`.
+    private static func recordKey(forField field: String) -> String {
+        switch field {
+        case "task_runtimes": return "work_item_id"
+        case "planner_runs": return "project_id"
+        default: return "id"
+        }
+    }
+
     mutating func apply(_ update: [String: Any]) -> [String: Any]? {
         guard let nextSequence = update["sequence"] as? UInt64,
               let productID = update["product_id"] as? String,
@@ -31,7 +41,7 @@ struct WorkTreeDeltaCache {
                     next[field] = replacement
                     continue
                 }
-                let key = field == "task_runtimes" ? "work_item_id" : "id"
+                let key = Self.recordKey(forField: field)
                 guard let before = next[field] as? [[String: Any]],
                       let upserts = patch["upserts"] as? [[String: Any]] else { return nil }
                 var records: [String: [String: Any]] = [:]

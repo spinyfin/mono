@@ -530,6 +530,7 @@ fn tag_cases() -> Vec<TagCase> {
                 attention_items: vec![],
                 attention_groups: vec![],
                 attention_members: vec![],
+                planner_runs: vec![],
             },
             expected_tag: "work_tree",
         },

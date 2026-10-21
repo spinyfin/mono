@@ -181,7 +181,7 @@ extension ChatViewModel {
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
             projectsByProductID[productId] = projects.sorted(by: projectSort)
-        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas, let attentionItems, let attentionGroups, let attentionMembers):
+        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas, let attentionItems, let attentionGroups, let attentionMembers, let plannerRuns):
             applyWorkTree(
                 product: product,
                 projects: projects,
@@ -192,7 +192,8 @@ extension ChatViewModel {
                 ideas: ideas,
                 attentionItems: attentionItems,
                 attentionGroups: attentionGroups,
-                attentionMembers: attentionMembers
+                attentionMembers: attentionMembers,
+                plannerRuns: plannerRuns
             )
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
@@ -809,7 +810,6 @@ extension ChatViewModel {
     private func refetchForInvalidation(productID: String) {
         scheduleWorkTreeRefetch(productID: productID, flow: .invalidationRefetch)
         engine.sendListDeferredScopeAttentions(productId: productID)
-        refreshPlannerRuns(forProductID: productID)
     }
 
     /// Clear the in-flight guard for a completed `release_project` /

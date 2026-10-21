@@ -372,6 +372,7 @@ impl Populator {
                         .result_summary(format!("internal error: {err}"))
                         .build(),
                 );
+                Self::publish_planner_run_changed(publisher, ctx).await;
                 PopulateOutcome::Errored
             }
         }
@@ -968,6 +969,19 @@ impl Populator {
         })
     }
 
+    /// Invalidate the product's work topic after a `planner_runs` row settles,
+    /// so subscribers refetch the work tree — which carries each project's
+    /// latest settled planner run — instead of polling `list_planner_runs`.
+    /// `running` → settled is the only populator transition the tree reflects
+    /// (the in-flight state comes from the background-work snapshot), and
+    /// every settled outcome passes through [`Self::finish`] or the
+    /// internal-error path in [`Self::run_with_force`].
+    async fn publish_planner_run_changed(publisher: &dyn ExecutionPublisher, ctx: &PopulateContext) {
+        publisher
+            .publish_work_item_changed(&ctx.product_id, &ctx.project_id, "planner_run_changed")
+            .await;
+    }
+
     /// Update the claimed `planner_runs` row with the terminal patch and raise
     /// the operator-facing attention, publishing `AttentionCreated` on the
     /// project's product topic so the operator sees the outcome-specific text
@@ -997,6 +1011,7 @@ impl Populator {
         if let Err(err) = db.update_planner_run(run_id, patch) {
             tracing::warn!(project_id = %ctx.project_id, run_id, ?err, "populator: failed to update planner run");
         }
+        Self::publish_planner_run_changed(publisher, ctx).await;
         match db.create_attention(
             CreateAttentionInput::builder()
                 .kind("followup")
@@ -1316,6 +1331,12 @@ mod tests {
         // kanban refreshes in one round-trip (design §"Surfacing").
         assert_eq!(publisher.attentions_created().await, 1);
         assert_eq!(publisher.work_items_created_len().await, Some(2));
+        // The run settling invalidates the product's work topic so the work
+        // tree (which carries the latest settled planner run) is refetched.
+        assert_eq!(
+            publisher.lifecycle_reasons().await,
+            vec!["planner_run_changed".to_owned()]
+        );
     }
 
     /// Codex-eligibility Phase 2 acceptance criterion (agent-driver design
@@ -1564,6 +1585,27 @@ mod tests {
         assert_eq!(outcome, PopulateOutcome::DocMissing);
         assert_eq!(project_task_count(&db, &product_id, &project_id), 0);
         assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
+    }
+
+    /// A failed run settles the planner row without staging anything, so the
+    /// work tree's per-project planner summary changes with no task change to
+    /// piggyback on — the transition must publish its own invalidation.
+    #[tokio::test]
+    async fn failed_run_invalidates_the_product_work_topic() {
+        let db = open();
+        let (product_id, project_id, design_id) = seed(&db);
+        let steps = steps_with(DocFetchOutcomeKind::Missing, PlannerOutcomeKind::NoApiKey);
+        let publisher = RecordingPublisher::default();
+        Populator::run(
+            &db,
+            &steps,
+            &ctx(&product_id, &project_id, &design_id),
+            DEFAULT_MAX_TASKS,
+            &publisher,
+        )
+        .await;
+        let events = publisher.events.lock().await.clone();
+        assert_eq!(events, vec![(product_id, project_id, "planner_run_changed".to_owned())]);
     }
 
     #[tokio::test]

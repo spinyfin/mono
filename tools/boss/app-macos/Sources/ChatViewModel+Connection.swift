@@ -95,7 +95,6 @@ extension ChatViewModel {
         if let productID = currentSelectedProductID {
             engine.sendGetWorkTree(productId: productID, flow: .invalidationRefetch)
             engine.sendListDeferredScopeAttentions(productId: productID)
-            refreshPlannerRuns(forProductID: productID)
         }
         requestBackgroundWorkRefresh()
     }
