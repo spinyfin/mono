@@ -8,6 +8,23 @@ SIGNAL_REASON = ('Blocked unsafe process signalling: pkill/killall select proces
                  'captured from ' + chr(36) + '! when starting your process), or wait '
                  'for or time out your own command.')
 
+def signal_comment(source, i):
+    return source[i] == '#' and (i == 0 or source[i-1] in ' ;&|()<>'+chr(9)+chr(10))
+
+def signal_body_end(source, start, newline):
+    delimiter, _ = signal_heredoc(source[start:newline])
+    if delimiter is None:
+        return newline
+    end = newline + 1
+    while end < len(source):
+        next_line = source.find(chr(10), end)
+        if next_line < 0:
+            next_line = len(source)
+        if source[end:next_line].lstrip(chr(9)) == delimiter:
+            return next_line
+        end = next_line + 1
+    raise ValueError('unterminated heredoc')
+
 def signal_substitutions(source, literal_quotes=False):
     # Separate executable substitutions from ordinary quoted arguments. Keep a
     # nonnumeric placeholder at the call site so kill cannot accept their output.
@@ -16,6 +33,17 @@ def signal_substitutions(source, literal_quotes=False):
     i = 0
     while i < len(source):
         c = source[i]
+        if not literal_quotes and quote is None and signal_comment(source, i):
+            end = source.find(chr(10), i)
+            i = len(source) if end < 0 else end
+            continue
+        if not literal_quotes and quote is None and c == chr(10):
+            header = ''.join(output).rsplit(chr(10), 1)[-1]
+            tail = header + source[i:]
+            end = i + signal_body_end(tail, 0, len(header)) - len(header)
+            output.append(source[i:end+1])
+            i = end + 1
+            continue
         if c == chr(92) and quote != chr(39):
             output.append(source[i:i+2])
             i += 2
@@ -28,8 +56,18 @@ def signal_substitutions(source, literal_quotes=False):
             backtick = c == chr(96)
             start = i + (1 if backtick else 2)
             j, depth, inner_quote = start, 1, None
+            inner_start = start
+            arithmetic = source[i:i+3] == chr(36)+'(('
             while j < len(source):
                 t = source[j]
+                if inner_quote is None and signal_comment(source, j):
+                    end = source.find(chr(10), j)
+                    j = len(source) if end < 0 else end
+                    continue
+                if inner_quote is None and t == chr(10):
+                    j = (j if arithmetic else signal_body_end(source, inner_start, j)) + 1
+                    inner_start = j
+                    continue
                 if t == chr(92):
                     j += 2
                     continue
@@ -51,7 +89,11 @@ def signal_substitutions(source, literal_quotes=False):
                 j += 1
             if j == len(source):
                 raise ValueError('unterminated command substitution')
-            substitutions.append(source[start:j])
+            content = source[start:j]
+            if arithmetic:
+                substitutions.extend(signal_substitutions(content)[1])
+            else:
+                substitutions.append(content)
             output.append('__indirect_pid__')
             i = j + 1
             continue
@@ -77,10 +119,13 @@ def signal_argv(group):
     indirect = False
     while group:
         base = os.path.basename(group[0])
-        if ASSIGNMENT_RE.match(group[0]) or base in ('!', '{', '}', 'then', 'do', 'if', 'elif', 'while', 'until'):
+        if ASSIGNMENT_RE.match(group[0]) or base in ('!', '{', '}', 'then', 'do', 'if', 'elif', 'while', 'until', 'else', 'coproc'):
             group = group[1:]
             continue
-        if base not in WRAPPERS and base not in ('timeout', 'builtin', 'busybox'):
+        if base == 'function':
+            group = group[2:]
+            continue
+        if base not in WRAPPERS and base not in ('timeout', 'builtin', 'busybox', 'nice', 'ionice', 'doas'):
             break
         indirect |= base == 'xargs'
         group = group[1:]
@@ -92,6 +137,9 @@ def signal_argv(group):
                      '--role', '--type', '--other-user', '--close-from', '--command-timeout'),
             'env': ('-u', '-C', '-a', '--unset', '--chdir', '--argv0'),
             'exec': ('-a',),
+            'nice': ('-n', '--adjustment'),
+            'ionice': ('-c', '-n', '-p', '-P', '-u', '--class', '--classdata', '--pid', '--pgid', '--uid'),
+            'doas': ('-u', '-C'),
             'xargs': ('-I', '-J', '-n', '-P', '-s', '-E', '-L', '-d', '--replace', '--max-args', '--max-procs'),
             'timeout': ('-s', '-k', '--signal', '--kill-after'),
             'caffeinate': ('-t', '-w'),
@@ -115,7 +163,7 @@ def signal_argv(group):
             group = group[1:]
     return group, indirect
 
-def signal_kill(args, indirect):
+def signal_kill(args, indirect, captures):
     if args and args[0] in ('-l', '-L', '--list', '--table'):
         return
     if indirect or not args:
@@ -131,7 +179,13 @@ def signal_kill(args, indirect):
         args = args[1:]
     # pid_t is signed 32-bit on worker hosts; prevent positive literals from
     # wrapping into a process group or the all-processes sentinel.
-    if not args or any(not re.fullmatch('[0-9]+', pid) or not 0 < int(pid) <= 2147483647 for pid in args):
+    def valid(pid):
+        if pid in (chr(36)+'!', chr(36)+'{!}'):
+            return True
+        if pid.startswith(chr(36)) and pid[1:].strip('{}') in captures:
+            return True
+        return re.fullmatch('[0-9]+', pid) and 0 < int(pid) <= 2147483647
+    if not args or not all(valid(pid) for pid in args):
         _block(SIGNAL_REASON)
 
 def signal_heredoc(line):
@@ -148,6 +202,8 @@ def signal_heredoc(line):
                 quote = c
             elif quote == c:
                 quote = None
+        elif quote is None and signal_comment(line, i):
+            break
         elif quote is None and line[i:i+2] == '<<':
             if line[i:i+3] == '<<<':
                 i += 3
@@ -191,19 +247,40 @@ def signal_check(source, depth=0):
     if depth > 40:
         _block(SIGNAL_REASON + ' Shell nesting is too deep to inspect safely.')
     source = source.replace(chr(92)+chr(10), '')
-    source, substitutions = signal_substitutions(signal_source(source, depth))
+    source, substitutions = signal_substitutions(source)
+    source = signal_source(source, depth)
     for substitution in substitutions:
         signal_check(substitution, depth+1)
-    for group in command_groups(source, nested=True):
+    variables, assignments, captures = {}, set(), set()
+    groups = command_groups(source, nested=True)
+    for group in groups:
         args, indirect = signal_argv(group)
+        # Only assignment prefixes change shell variables; arguments to echo
+        # or another program cannot establish or overwrite PID provenance.
+        for word in group:
+            if not ASSIGNMENT_RE.match(word):
+                break
+            name, value = word.split('=', 1)
+            captures.discard(name)
+            if not args and name not in assignments and value in (chr(36)+'!', chr(36)+'{!}'):
+                captures.add(name)
+            assignments.add(name)
+            variables[name] = value
         if not args:
             continue
-        base = os.path.basename(args[0])
+        program = args[0]
+        if program.startswith(chr(36)):
+            program = variables.get(program[1:].strip('{}'), program)
+        base = os.path.basename(program)
+        if base == '__indirect_pid__' and any(re.search(r'(?<![A-Za-z_])(pkill|killall)(?![A-Za-z_])', sub) for sub in substitutions):
+            _block(SIGNAL_REASON)
         if base in ('pkill', 'killall'):
             _block(SIGNAL_REASON + ' Refused command: ' + base + '.')
         if base == 'kill':
-            signal_kill(args[1:], indirect)
+            signal_kill(args[1:], indirect, captures)
         if signal_shell(args):
+            if '|' in source and any(re.search(r'(?<![A-Za-z_])(pkill|killall)(?![A-Za-z_])', word) for g in groups for word in g):
+                _block(SIGNAL_REASON)
             for i, arg in enumerate(args[1:], 1):
                 if arg.startswith('-') and not arg.startswith('--') and 'c' in arg:
                     if i+1 < len(args):
