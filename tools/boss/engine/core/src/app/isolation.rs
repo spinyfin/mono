@@ -37,6 +37,7 @@ use anyhow::{Result, bail};
 
 use crate::config::{DB_PATH_ENV, EVENTS_SOCKET_ENV, PID_PATH_ENV};
 use crate::engine_control::TOKEN_PATH_ENV;
+use crate::population_timing::{DIAGNOSTICS_DIR_ENV, diagnostics_dir_override};
 
 /// Legacy production paths retained by clients during the state-root rollout.
 /// The engine itself no longer binds or writes these by default.
@@ -53,7 +54,7 @@ pub fn default_pid_path() -> Option<PathBuf> {
     boss_log_files::default_engine_pid_path()
 }
 
-/// The five pieces of engine-owned state a test fixture could collide with.
+/// The six pieces of engine-owned state a test fixture could collide with.
 ///
 /// One shape serves three roles: where production keeps each file
 /// ([`EnginePaths::production`]), what a fixture derived for itself
@@ -64,13 +65,18 @@ pub fn default_pid_path() -> Option<PathBuf> {
 /// A `None` field means "not applicable here": no production location because
 /// `HOME` is unset, no derived path because a deliberate override won, or
 /// nothing of that kind being opened on this run.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct EnginePaths {
     pub db: Option<PathBuf>,
     pub events_socket: Option<PathBuf>,
     pub pid: Option<PathBuf>,
     pub control_token: Option<PathBuf>,
     pub tmux_socket: Option<PathBuf>,
+    /// Directory the engine's day-rotated diagnostic JSONL files go under
+    /// (population timing). A directory, not a file, but it collides the
+    /// same way: a fixture appending to production's `diagnostics/` pollutes
+    /// the operator's real timeline.
+    pub diagnostics_dir: Option<PathBuf>,
 }
 
 impl EnginePaths {
@@ -97,6 +103,8 @@ impl EnginePaths {
             pid: default_pid_path(),
             control_token: boss_log_files::default_control_token_path(),
             tmux_socket: boss_log_files::default_tmux_socket_path(),
+            diagnostics_dir: boss_log_files::default_state_root()
+                .map(|root| root.join(boss_log_files::DIAGNOSTICS_DIR)),
         }
     }
 
@@ -109,20 +117,26 @@ impl EnginePaths {
             pid: Some(pid.to_path_buf()),
             control_token: Some(root.join(boss_log_files::CONTROL_TOKEN_FILENAME)),
             tmux_socket: Some(root.join(boss_log_files::TMUX_SOCKET_FILENAME)),
+            diagnostics_dir: Some(root.join(boss_log_files::DIAGNOSTICS_DIR)),
         }
     }
 
-    /// The five fields, paired with a label and the env var an operator would
+    /// The six fields, paired with a label and the env var an operator would
     /// change to move that file. Drives both the derivation and the gate, so
     /// neither can quietly forget a field. The tmux socket has no env override
     /// of its own: it follows the state root, so the gate names `state-root`.
-    fn fields(&self) -> [(&'static str, &'static str, Option<&Path>); 5] {
+    fn fields(&self) -> [(&'static str, &'static str, Option<&Path>); 6] {
         [
             ("state database", DB_PATH_ENV, self.db.as_deref()),
             ("events socket", EVENTS_SOCKET_ENV, self.events_socket.as_deref()),
             ("pid file", PID_PATH_ENV, self.pid.as_deref()),
             ("engine-control token", TOKEN_PATH_ENV, self.control_token.as_deref()),
             ("tmux socket", "state-root", self.tmux_socket.as_deref()),
+            (
+                "diagnostics directory",
+                DIAGNOSTICS_DIR_ENV,
+                self.diagnostics_dir.as_deref(),
+            ),
         ]
     }
 }
@@ -137,6 +151,7 @@ pub struct IsolationOverrides {
     pub events_socket: Option<PathBuf>,
     pub pid_path: Option<PathBuf>,
     pub control_token_path: Option<PathBuf>,
+    pub diagnostics_dir: Option<PathBuf>,
 }
 
 impl IsolationOverrides {
@@ -146,6 +161,7 @@ impl IsolationOverrides {
             events_socket: std::env::var_os(EVENTS_SOCKET_ENV).map(PathBuf::from),
             pid_path: std::env::var_os(PID_PATH_ENV).map(PathBuf::from),
             control_token_path: std::env::var_os(TOKEN_PATH_ENV).map(PathBuf::from),
+            diagnostics_dir: diagnostics_dir_override(),
         }
     }
 }
@@ -281,6 +297,15 @@ impl IsolationPaths {
                 // No env override: a fixture always gets its own socket so it
                 // cannot stamp `@boss_engine_owner` on production's tmux server.
                 tmux_socket: Some(dir.join(format!("{stem}.tmux.sock"))),
+                // A directory beside the fixture's other files
+                // (`<dir>/<stem>.diagnostics/`), under the same
+                // override-equality rule as the files above.
+                diagnostics_dir: derive_field(
+                    &overrides.diagnostics_dir,
+                    &production.diagnostics_dir,
+                    boss_log_files::DIAGNOSTICS_DIR,
+                    "diagnostics",
+                ),
             },
             state_root: Some(dir),
             stem,
@@ -294,6 +319,19 @@ impl IsolationPaths {
     pub fn scoped_path(&self, suffix: &str) -> Option<PathBuf> {
         let root = self.state_root.as_ref()?;
         Some(root.join(format!("{}.{suffix}", self.stem)))
+    }
+
+    /// Where the engine's diagnostic JSONL files go: the fixture-scoped
+    /// directory unless a deliberate private `BOSS_ENGINE_DIAGNOSTICS_DIR`
+    /// won (`env_override`), else production's `diagnostics/`. `None` only
+    /// when none of those can be resolved (`HOME` unset), in which case
+    /// diagnostics are not written.
+    pub fn resolve_diagnostics_dir(&self, env_override: Option<PathBuf>) -> Option<PathBuf> {
+        self.derived
+            .diagnostics_dir
+            .clone()
+            .or(env_override)
+            .or_else(|| self.production.diagnostics_dir.clone())
     }
 
     /// Apply the same override-equality rule as [`Self::derive_from`] to a
@@ -517,6 +555,7 @@ mod tests {
             pid: Some(PathBuf::from("/tmp/boss-test-abc123.pid")),
             control_token: Some(PathBuf::from("/tmp/boss-test-abc123.control-token")),
             tmux_socket: Some(PathBuf::from("/tmp/boss-test-abc123.tmux.sock")),
+            diagnostics_dir: Some(PathBuf::from("/tmp/boss-test-abc123.diagnostics")),
         }
     }
 
@@ -588,7 +627,8 @@ mod tests {
             db_path: Some(private.clone()),
             events_socket: Some(private.clone()),
             pid_path: Some(private.clone()),
-            control_token_path: Some(private),
+            control_token_path: Some(private.clone()),
+            diagnostics_dir: Some(private),
         });
         assert_eq!(
             paths.derived,
@@ -626,6 +666,7 @@ mod tests {
             events_socket: prod.events_socket,
             pid_path: prod.pid,
             control_token_path: prod.control_token,
+            diagnostics_dir: prod.diagnostics_dir,
         });
         assert_eq!(paths.derived, all_derived());
     }
@@ -726,6 +767,73 @@ mod tests {
         assert!(format!("{err}").contains("could not resolve production's"));
     }
 
+    // -- the diagnostics directory ----------------------------------------
+
+    #[test]
+    fn diagnostics_dir_is_scoped_beside_the_fixtures_other_files() {
+        assert_eq!(
+            derive(IsolationOverrides::default()).derived.diagnostics_dir.as_deref(),
+            Some(Path::new("/tmp/boss-test-abc123.diagnostics"))
+        );
+    }
+
+    /// An override that is production's `diagnostics/` — literally, via dot
+    /// segments, or by shape under another `$HOME` — is inherited env.
+    #[test]
+    fn production_diagnostics_override_is_not_treated_as_an_override() {
+        for inherited in [
+            "/Users/tester/Library/Application Support/Boss/diagnostics",
+            "/Users/tester/Library/Application Support/Boss/./x/../diagnostics",
+            "/Users/someone-else/Library/Application Support/Boss/diagnostics",
+        ] {
+            let paths = derive(IsolationOverrides {
+                diagnostics_dir: Some(PathBuf::from(inherited)),
+                ..IsolationOverrides::default()
+            });
+            assert_eq!(
+                paths.derived.diagnostics_dir.as_deref(),
+                Some(Path::new("/tmp/boss-test-abc123.diagnostics")),
+                "{inherited} must be derived over"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_diagnostics_dir_follows_the_override_rule() {
+        let private = PathBuf::from("/tmp/my-private-diagnostics");
+        let prod_diag = production().diagnostics_dir;
+        let scoped = Some(PathBuf::from("/tmp/boss-test-abc123.diagnostics"));
+
+        // Fixture: default and production-equal override -> scoped.
+        let fixture = derive(IsolationOverrides::default());
+        assert_eq!(fixture.resolve_diagnostics_dir(None), scoped);
+        let inherited = derive(IsolationOverrides {
+            diagnostics_dir: prod_diag.clone(),
+            ..IsolationOverrides::default()
+        });
+        assert_eq!(inherited.resolve_diagnostics_dir(prod_diag.clone()), scoped);
+
+        // Fixture: a private override wins.
+        let overridden = derive(IsolationOverrides {
+            diagnostics_dir: Some(private.clone()),
+            ..IsolationOverrides::default()
+        });
+        assert_eq!(
+            overridden.resolve_diagnostics_dir(Some(private.clone())),
+            Some(private.clone())
+        );
+
+        // Production: its own directory, or an explicit override.
+        let socket = production_socket();
+        let production_engine =
+            IsolationPaths::derive_from(socket.to_str().unwrap(), &IsolationOverrides::default(), &production());
+        assert_eq!(production_engine.resolve_diagnostics_dir(None), prod_diag);
+        assert_eq!(
+            production_engine.resolve_diagnostics_dir(Some(private.clone())),
+            Some(private)
+        );
+    }
+
     // -- the refusal gate -------------------------------------------------
 
     #[test]
@@ -776,6 +884,13 @@ mod tests {
                     ..all_derived()
                 },
             ),
+            (
+                DIAGNOSTICS_DIR_ENV,
+                EnginePaths {
+                    diagnostics_dir: prod.diagnostics_dir.clone(),
+                    ..all_derived()
+                },
+            ),
         ];
 
         for (env, resolved) in cases {
@@ -796,9 +911,15 @@ mod tests {
     #[test]
     fn gate_reports_all_collisions_together() {
         let paths = derive(IsolationOverrides::default());
-        let err = paths.ensure_isolated(&production()).expect_err("all four collide");
+        let err = paths.ensure_isolated(&production()).expect_err("all six collide");
         let msg = format!("{err}");
-        for env in [DB_PATH_ENV, EVENTS_SOCKET_ENV, PID_PATH_ENV, TOKEN_PATH_ENV] {
+        for env in [
+            DB_PATH_ENV,
+            EVENTS_SOCKET_ENV,
+            PID_PATH_ENV,
+            TOKEN_PATH_ENV,
+            DIAGNOSTICS_DIR_ENV,
+        ] {
             assert!(msg.contains(env), "error must name {env}; got: {msg}");
         }
     }
