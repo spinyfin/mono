@@ -192,9 +192,8 @@ pub struct GrokDriver {
 ///
 /// Execution shape (design §Execution shape + T-03 pane mode):
 /// ```text
-/// grok --model … --reasoning-effort … --no-alt-screen --always-approve
+/// python3 .grok/initial-prompt.py grok --model … --reasoning-effort … --no-alt-screen --always-approve
 ///      --trust --session-id <uuid> --cwd <ws> --no-subagents --no-memory
-///      "$(cat .grok/initial-prompt.txt)"
 /// ```
 ///
 /// `GROK_HOME` / scoped `HOME` / `Unset(GROK_FOLDER_TRUST)` are env
@@ -262,12 +261,8 @@ pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, ses
     // investigation's "What would have to change" section.
     cmd.push_str(" --no-subagents");
     cmd.push_str(" --no-memory");
-    // Prompt from file via command substitution — briefs run to tens of KB.
-    cmd.push_str(&format!(
-        " \"$(cat {}/{})\"\n",
-        GROK_DESCRIPTOR.config_dir, GROK_DESCRIPTOR.initial_prompt_filename,
-    ));
-    cmd
+    cmd.push('\n');
+    super::initial_prompt::launcher_command(GROK_DESCRIPTOR.config_dir, &cmd)
 }
 
 #[async_trait]
@@ -1600,7 +1595,10 @@ mod tests {
         );
 
         let cmd = &plan.command;
-        assert!(cmd.starts_with("grok "), "command starts with grok: {cmd}");
+        assert!(
+            cmd.starts_with("python3 .grok/initial-prompt.py grok "),
+            "command starts with grok: {cmd}"
+        );
         assert!(cmd.contains("--model "), "has --model: {cmd}");
         assert!(cmd.contains("grok-4.6"), "has model slug: {cmd}");
         assert!(cmd.contains("--reasoning-effort "), "has --reasoning-effort: {cmd}");
@@ -1625,8 +1623,8 @@ mod tests {
         assert!(cmd.contains("--no-subagents"), "has --no-subagents: {cmd}");
         assert!(cmd.contains("--no-memory"), "has --no-memory: {cmd}");
         assert!(
-            cmd.contains("\"$(cat .grok/initial-prompt.txt)\""),
-            "prompt via cat substitution: {cmd}"
+            cmd.contains(".grok/initial-prompt.py"),
+            "prompt through the private terminal launcher: {cmd}"
         );
         assert!(!cmd.contains("--worktree"), "forbids --worktree: {cmd}");
         assert!(!cmd.contains("--worktree-ref"), "forbids --worktree-ref: {cmd}");
@@ -2075,7 +2073,11 @@ mod tests {
                 "local macOS pane must launch without an outer Seatbelt: {}",
                 spawn.command
             );
-            assert!(spawn.command.starts_with("grok "), "{}", spawn.command);
+            assert!(
+                spawn.command.starts_with("python3 .grok/initial-prompt.py grok "),
+                "{}",
+                spawn.command
+            );
         } else {
             let sandbox_toml_path = grok_home.join("sandbox.toml");
             assert!(

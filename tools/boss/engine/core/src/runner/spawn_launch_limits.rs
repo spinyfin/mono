@@ -1,7 +1,8 @@
 //! Exec-time argv budget preflight for worker spawn.
 //!
-//! Every driver embeds its initial prompt into the CLI's own argv via a
-//! `"$(cat <config_dir>/<initial_prompt_filename>)"` command substitution.
+//! Initial briefs travel through the terminal launcher, outside argv. Keep
+//! budgeting static flags and environment, including legacy substitutions in
+//! synthetic commands, against the host's exec limits.
 //! Past `ARG_MAX` — or, on Linux, past the per-argument `MAX_ARG_STRLEN`
 //! cap — the shell's `exec` fails with `E2BIG` inside the sourced pane
 //! script, invisible to the engine. This module estimates the expanded
@@ -164,6 +165,9 @@ pub(crate) fn substitute_prompt_bytes(
     prompt_bytes: usize,
 ) -> usize {
     let placeholder = format!("\"$(cat {config_dir}/{initial_prompt_filename})\"");
+    if !command.contains(&placeholder) {
+        return command.len();
+    }
     let static_bytes = command.len().saturating_sub(placeholder.len());
     static_bytes.saturating_add(prompt_bytes)
 }
@@ -183,7 +187,12 @@ pub(crate) fn check_launch_command_arg_max(
     let prompt_bytes = std::fs::metadata(&prompt_path)
         .with_context(|| format!("reading size of initial prompt at {}", prompt_path.display()))?
         .len() as usize;
-    check_exec_arg_limits(argv_bytes, prompt_bytes, &ExecArgLimits::local()?, driver_name)
+    let largest_arg_bytes = if command.contains("$(cat ") {
+        prompt_bytes
+    } else {
+        command.len()
+    };
+    check_exec_arg_limits(argv_bytes, largest_arg_bytes, &ExecArgLimits::local()?, driver_name)
 }
 
 /// Same preflight as [`check_launch_command_arg_max`], for callers that
@@ -198,7 +207,12 @@ pub(crate) fn check_launch_command_arg_max_for_bytes(
     limits: ExecArgLimits,
 ) -> Result<()> {
     let argv_bytes = substitute_prompt_bytes(command, config_dir, initial_prompt_filename, prompt_bytes);
-    check_exec_arg_limits(argv_bytes, prompt_bytes, &limits, driver_name)
+    let largest_arg_bytes = if command.contains("$(cat ") {
+        prompt_bytes
+    } else {
+        command.len()
+    };
+    check_exec_arg_limits(argv_bytes, largest_arg_bytes, &limits, driver_name)
 }
 
 /// The pure budget check behind [`check_launch_command_arg_max`], factored

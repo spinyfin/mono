@@ -408,14 +408,9 @@ fn check_launch_command_arg_max_for_bytes_fails_for_a_prompt_over_this_hosts_rea
 /// Rename the driver binary in a real `spawn_invocation` command so the
 /// hermetic sandbox can exec the stub (it denies `claude` / `codex` by name).
 fn rename_driver_binary(command: &str, from: &str, to: &str) -> String {
-    let Some(rest) = command.strip_prefix(from) else {
-        panic!("spawn_invocation command must start with {from:?}, got {command:?}");
-    };
-    assert!(
-        rest.starts_with(' ') || rest.starts_with('\t'),
-        "driver binary must be a whole first word in spawn_invocation, got {command:?}"
-    );
-    format!("{to}{rest}")
+    let needle = format!("initial-prompt.py {from} ");
+    assert!(command.contains(&needle), "missing terminal launcher: {command}");
+    command.replacen(&needle, &format!("initial-prompt.py {to} "), 1)
 }
 
 fn write_driver_stub(stub_dir: &std::path::Path) {
@@ -423,12 +418,25 @@ fn write_driver_stub(stub_dir: &std::path::Path) {
     let stub_path = stub_dir.join("boss-driver-stub");
     std::fs::write(
         &stub_path,
-        r#"#!/bin/sh
-eval "last=\${$#}"
-printf '%s' "${#last}" > "$BOSS_STUB_RECORD/last_argv_len"
-printf '%s' "$last" > "$BOSS_STUB_RECORD/last_argv"
-printf '%s\n' "$BOSS_STUB_CHROME"
-: > "$BOSS_STUB_RECORD/turn_started"
+        r#"#!/usr/bin/env python3
+import json, os, sys, tty
+from pathlib import Path
+record = Path(os.environ['BOSS_STUB_RECORD'])
+(record / 'argv').write_text(json.dumps(sys.argv))
+(record / 'environment').write_text(json.dumps(dict(os.environ)))
+tty.setraw(0)
+os.write(1, b'\x1b[6n')
+response = b''
+while not response.endswith(b'R'):
+    response += os.read(0, 4096)
+assert response == b'\x1b[1;1R', response
+os.write(1, b'\x1b[?2004h' + os.environ['BOSS_STUB_CHROME'].encode())
+data = b''
+while not data.endswith(b'\x1b[201~\r'):
+    data += os.read(0, 65536)
+assert data.startswith(b'\x1b[200~'), data[:40]
+(record / 'received').write_bytes(data[6:-7])
+(record / 'turn_started').touch()
 "#,
     )
     .unwrap();
@@ -486,7 +494,7 @@ fn grok_spawn_plan_for_delivery_test(run_id: &str, workspace_path: &std::path::P
 /// Small and ~600 KB prompts, per driver: take the real `spawn_invocation`
 /// command, rewrite the binary to a stub the sandbox can exec, write the
 /// actual `.boss/initial-input.sh`, source it from `/bin/sh`, and assert
-/// the stub received the prompt intact as a single argument and emitted
+/// the stub received the prompt intact through terminal stdin and emitted
 /// the turn-start signal confirmation consumes.
 #[tokio::test]
 async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
@@ -561,7 +569,7 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
     ];
 
     for case in cases {
-        for prompt_bytes in [20_000usize, 600_000] {
+        for prompt_bytes in [20_000usize, 600_000, local_arg_max().unwrap() + 4096] {
             let workspace = TempDir::new().unwrap();
             let run_id = format!("run-{}-{prompt_bytes}", case.driver_name);
             let mut plan = if case.driver_name == "grok" {
@@ -570,8 +578,18 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
                 (case.spawn)(&run_id)
             };
             std::fs::create_dir_all(workspace.path().join(case.config_dir)).unwrap();
-            let prompt = "p".repeat(prompt_bytes);
-            std::fs::write(workspace.path().join(case.config_dir).join(case.filename), &prompt).unwrap();
+            let sentinel = "BRIEF_SENTINEL_PRIVATE_INITIAL_INPUT";
+            let prompt = format!(
+                "{sentinel}\n{}\nquotes: '\" $() `command` 雪\n\n",
+                "p".repeat(prompt_bytes)
+            );
+            let driver = crate::driver::DriverRegistry::default()
+                .require(case.driver_name)
+                .unwrap();
+            let config_dir = workspace.path().join(case.config_dir);
+            crate::driver::initial_prompt::provision(&config_dir, &config_dir, &prompt, driver.as_ref()).unwrap();
+            assert!(!plan.command.contains(sentinel));
+            assert!(!plan.command.contains("$(cat"));
 
             plan.command = rename_driver_binary(&plan.command, case.binary, "boss-driver-stub");
             let env_prefix: String = plan.env.iter().map(render_env_directive).collect();
@@ -592,13 +610,6 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
                 case.config_dir,
                 case.filename,
             );
-            if crate::runner::spawn_launch_limits::local_max_arg_strlen().is_some_and(|limit| prompt_bytes > limit) {
-                let err = preflight.expect_err("over MAX_ARG_STRLEN must refuse before spawn");
-                let msg = err.to_string();
-                assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
-                assert!(msg.contains(case.driver_name), "{msg}");
-                continue;
-            }
             preflight.unwrap_or_else(|err| {
                 panic!(
                     "{} {}-byte prompt must pass this host's preflight: {err}",
@@ -610,7 +621,7 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
             write_driver_stub(stub_root.path());
             let record_dir = stub_root.path().join("record");
             std::fs::create_dir_all(&record_dir).unwrap();
-            let path = format!("{}:/usr/bin:/bin", stub_root.path().display());
+            let path = format!("{}:{}", stub_root.path().display(), std::env::var("PATH").unwrap());
             let output = std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(". .boss/initial-input.sh")
@@ -631,22 +642,15 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
                 String::from_utf8_lossy(&output.stderr)
             );
 
-            let last_len: usize = std::fs::read_to_string(record_dir.join("last_argv_len"))
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "{} stub did not record last argv length: {err}; stderr={}",
-                        case.driver_name,
-                        String::from_utf8_lossy(&output.stderr)
-                    )
-                })
-                .parse()
-                .unwrap();
-            assert_eq!(
-                last_len, prompt_bytes,
-                "{} stub must receive the prompt as one argv element",
-                case.driver_name
-            );
-            let received = std::fs::read_to_string(record_dir.join("last_argv")).unwrap();
+            for surface in ["argv", "environment"] {
+                let observed = std::fs::read_to_string(record_dir.join(surface)).unwrap();
+                assert!(
+                    !observed.contains(sentinel),
+                    "{} leaked brief in {surface}",
+                    case.driver_name
+                );
+            }
+            let received = std::fs::read_to_string(record_dir.join("received")).unwrap();
             assert_eq!(
                 received, prompt,
                 "{} stub must receive the prompt intact",

@@ -20,6 +20,7 @@ use boss_protocol::{
     WorkerEvent,
 };
 
+pub mod initial_prompt;
 pub mod transcript_store;
 
 /// `large`/`max`-effort worker-prompt addendum, shared verbatim across every
@@ -1788,7 +1789,7 @@ pub struct SpawnPlan {
     /// `command` runs.
     pub env: Vec<EnvDirective>,
     /// The command line to run after `env` has been applied (e.g.
-    /// `claude --model … "$(cat …)"\n`).
+    /// `python3 .claude/initial-prompt.py claude --model …\n`).
     pub command: String,
 }
 

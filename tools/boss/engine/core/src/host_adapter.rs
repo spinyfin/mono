@@ -869,7 +869,14 @@ impl SshHostAdapter {
     /// `mkdir -p` the parent dir on the remote, stage `contents` to a
     /// local temp file, and `scp` it to `remote_path`. `label` only feeds
     /// the staging filename + error context.
-    async fn ship_file(&self, remote_dir: &str, remote_path: &str, contents: &str, label: &str) -> Result<()> {
+    async fn ship_file(
+        &self,
+        run_id: &str,
+        remote_dir: &str,
+        remote_path: &str,
+        contents: &str,
+        label: &str,
+    ) -> Result<()> {
         let host = &self.transport.host_id;
         let mkdir = self
             .transport
@@ -882,8 +889,19 @@ impl SshHostAdapter {
                 non_empty(&mkdir.stderr, mkdir.status)
             );
         }
-        let staged =
-            stage_local_file(label, contents).with_context(|| format!("staging remote {label} for host {host}"))?;
+        let staged = stage_local_file(run_id, label, contents)
+            .with_context(|| format!("staging remote {label} for host {host}"))?;
+        // Protect existing destinations before scp overwrites them, too.
+        let protected = self
+            .transport
+            .run_with_remote_paths(&["install", "-m", "600", "/dev/null", remote_path])
+            .await?;
+        if !protected.success() {
+            bail!(
+                "failed to protect remote {label} at {remote_path}: {}",
+                protected.stderr
+            );
+        }
         let push = self
             .transport
             .scp_push(staged.path(), remote_path)
@@ -893,6 +911,16 @@ impl SshHostAdapter {
             bail!(
                 "failed to scp {label} to {remote_path} on host {host}: {}",
                 non_empty(&push.stderr, push.status)
+            );
+        }
+        let permissions = self
+            .transport
+            .run_with_remote_paths(&["chmod", "600", remote_path])
+            .await?;
+        if !permissions.success() {
+            bail!(
+                "failed to protect remote {label} at {remote_path}: {}",
+                permissions.stderr
             );
         }
         Ok(())
@@ -946,12 +974,17 @@ fn non_empty(stderr: &str, status: i32) -> String {
 /// Write `contents` to a unique local staging file so `scp` has a real
 /// on-disk path to push, returning an RAII guard that unlinks it on drop.
 /// Mirrors `wrapper_distribution`'s staging pattern.
-fn stage_local_file(label: &str, contents: &str) -> Result<StagedFile> {
-    let dir = std::env::temp_dir();
+fn stage_local_file(run_id: &str, label: &str, contents: &str) -> Result<StagedFile> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir()
+        .join("boss-remote-input")
+        .join(crate::ssh_transport::sanitize_for_path(run_id));
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
     let nonce = boss_engine_utils::epoch_time::now_epoch_nanos();
     let path = dir.join(format!("boss-remote-{label}.{}.{}.tmp", std::process::id(), nonce));
-    std::fs::write(&path, contents).with_context(|| format!("writing staging file {path:?}"))?;
-    Ok(StagedFile(path))
+    let staged = StagedFile(path);
+    crate::driver::initial_prompt::write_private(staged.path(), contents.as_bytes())?;
+    Ok(staged)
 }
 
 /// RAII guard that unlinks a local staging file on drop. Unlink errors
@@ -968,6 +1001,9 @@ impl StagedFile {
 impl Drop for StagedFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        if let Some(directory) = self.0.parent() {
+            let _ = std::fs::remove_dir(directory);
+        }
     }
 }
 
@@ -1386,28 +1422,19 @@ impl HostAdapter for SshHostAdapter {
         //    settings outside the workspace tree under `~/.boss-remote/`.
         //    This keeps the remote command identical to the local driver's
         //    command rather than teaching the wrapper a second argv dialect.
-        let (remote_prompt_dir, remote_prompt_path, remote_prompt_gitignore_path) =
+        let (remote_config_dir, _, remote_prompt_gitignore_path) =
             remote_driver_config_paths(&workspace, driver.descriptor());
+        let remote_prompt_dir = format!("{remote_config_dir}/runs/{run_id}");
+        let remote_prompt_path = format!("{remote_prompt_dir}/initial-prompt.txt");
         let remote_home = remote_home_dir(&self.transport).await?;
         let remote_settings_dir = format!("{remote_home}/{REMOTE_SETTINGS_DIR}");
         let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
 
-        // Resolve the driver's SpawnPlan and fail fast, before shipping
-        // anything to the remote host, if the initial prompt embedded via
-        // this driver's `"$(cat <config_dir>/<initial_prompt_filename>)"`
-        // command substitution would overflow ARG_MAX at the remote CLI's
-        // `execve()` — the exact same E2BIG failure mode
-        // `check_launch_command_arg_max` guards against on the local pane
-        // path, reached here through the identical argv-embedding
-        // mechanism (`driver.spawn_invocation` / `RemoteSpawnPlan::driver_command`,
-        // substituted by the remote wrapper in `ssh_spawn.rs`). Past that
-        // limit the remote shell's `exec` fails invisibly to the engine,
-        // which would otherwise just see the run sit `Spawning` until
-        // `spawn_ack_sweep` gives up and redispatches into the identical,
-        // identically-doomed command.
+        // Budget only the launch command and environment against the remote
+        // exec limits. The brief is read by the terminal launcher, never argv.
         let worker_kind = settings_input.worker_kind;
         let driver_binary = driver.descriptor().binary.to_owned();
-        let driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
+        let mut driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
             model: &spawn_config.model,
             effort: spawn_config.effort_value,
             settings_path: Some(std::path::Path::new(&remote_settings_path)),
@@ -1415,6 +1442,10 @@ impl HostAdapter for SshHostAdapter {
             permission_mode_override: worker_kind.forced_permission_mode(),
             run_id: Some(&run_id),
         });
+        driver_spawn_plan.command = driver_spawn_plan.command.replace(
+            &format!("{}/initial-prompt.py", driver.descriptor().config_dir),
+            &crate::ssh_transport::shell_quote(&format!("{remote_prompt_dir}/initial-prompt.py")),
+        );
         let exec_limits = probe_remote_exec_arg_limits(&self.transport).await;
         crate::runner::spawn_launch_limits::check_launch_command_arg_max_for_bytes(
             &driver_spawn_plan.command,
@@ -1425,17 +1456,40 @@ impl HostAdapter for SshHostAdapter {
             exec_limits,
         )?;
 
-        self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
+        self.ship_file(&run_id, &remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
             .await?;
+        for (name, contents) in [
+            ("initial-prompt.py", crate::driver::initial_prompt::LAUNCHER.to_owned()),
+            (
+                "initial-prompt.json",
+                crate::driver::initial_prompt::launcher_config(driver.as_ref())?,
+            ),
+        ] {
+            self.ship_file(
+                &run_id,
+                &remote_prompt_dir,
+                &format!("{remote_prompt_dir}/{name}"),
+                &contents,
+                "initial input",
+            )
+            .await?;
+        }
         self.ship_file(
-            &remote_prompt_dir,
+            &run_id,
+            &remote_config_dir,
             &remote_prompt_gitignore_path,
             driver.config_dir_gitignore(),
             "driver config gitignore",
         )
         .await?;
-        self.ship_file(&remote_settings_dir, &remote_settings_path, &settings_json, "settings")
-            .await?;
+        self.ship_file(
+            &run_id,
+            &remote_settings_dir,
+            &remote_settings_path,
+            &settings_json,
+            "settings",
+        )
+        .await?;
 
         // 6. Open the reverse events tunnel and launch the detached
         //    remote worker (PR1 orchestration over the one master
@@ -2235,7 +2289,16 @@ mod tests {
 
     #[test]
     fn stage_local_file_writes_contents_and_embeds_label() {
-        let staged = stage_local_file("mylabel", "hello world").expect("staging file");
+        use std::os::unix::fs::PermissionsExt;
+        let staged = stage_local_file("staging-mode-test", "mylabel", "hello world").expect("staging file");
+        assert_eq!(
+            staged.path().parent().unwrap().file_name().unwrap(),
+            "staging-mode-test"
+        );
+        assert_eq!(
+            std::fs::metadata(staged.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         // While the guard is live the file exists with the exact contents.
         assert!(staged.path().exists(), "staged file should exist on disk");
@@ -2256,12 +2319,16 @@ mod tests {
     #[test]
     fn staged_file_is_removed_on_drop() {
         let path = {
-            let staged = stage_local_file("dropme", "transient").expect("staging file");
+            let staged = stage_local_file("staging-drop-test", "dropme", "transient").expect("staging file");
             assert!(staged.path().exists());
             staged.path().to_path_buf()
         };
         // Guard has dropped: the on-disk file is unlinked.
         assert!(!path.exists(), "staging file should be removed once the guard drops",);
+        assert!(
+            !path.parent().unwrap().exists(),
+            "the staging run directory must be reclaimed"
+        );
     }
 
     // ── command_repr ─────────────────────────────────────────────────────────

@@ -206,14 +206,11 @@ mod apply_permission_extra_args_tests {
             "extras must land on the single typed line, not add a second: {merged}"
         );
         assert!(
-            merged.contains("\"$(cat .grok/initial-prompt.txt)\""),
-            "prompt substitution must survive composition: {merged}"
+            merged.contains(".grok/initial-prompt.py"),
+            "private input launcher must survive composition: {merged}"
         );
         // Newline-fallback: extras land right before the trailing '\n' —
-        // i.e. AFTER everything else, including the positional prompt
-        // substitution — confirmed safe by the work item's own CLI
-        // characterisation (flags placed after the positional prompt
-        // parse fine for the installed grok CLI).
+        // after the other driver flags. The launcher forwards them verbatim.
         assert!(
             merged.trim_end().ends_with("'--deny' 'Bash(rm -rf *)'"),
             "extras must be appended after the rest of the command, not interleaved: {merged}"
@@ -727,14 +724,9 @@ impl ExecutionRunner for PaneSpawnRunner {
             )
         })?;
 
-        // Compose the worker prompt and stash it on disk so the
-        // tmux pane can `claude "$(cat .claude/initial-prompt.txt)"`
-        // — Claude Code's positional arg is treated as the first user
-        // message, which gets the worker working without us having to
-        // wait for a "Claude is ready" signal and then type into the pane.
-        // Going through a file (rather than embedding the prompt in
-        // the typed command) avoids shell quoting hell on multi-line,
-        // backtick-bearing markdown.
+        // Compose the worker prompt and store it privately. The terminal
+        // launcher reads the file and delivers it through the driver's stdin
+        // after readiness, independently of the engine's lifetime.
         //
         // Prompt composition + effort/model resolution live in the
         // shared `compose_worker_spawn` so the SSH-remote adapter
@@ -830,7 +822,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // Write the initial prompt (and gitignore + pre-trust) via the driver's
         // WorkspaceProvisioning capability. The driver's config_dir and
         // initial_prompt_filename (e.g. `.claude/initial-prompt.txt`) determine
-        // the exact path the spawn_invocation `$(cat ...)` reads from.
+        // the workspace reference the terminal launcher reads from.
         // Any opaque out-of-workspace runtime state the driver returns
         // (future Codex: Boss-owned CODEX_HOME / archive root) is persisted
         // on the execution so every teardown path can hand it back after

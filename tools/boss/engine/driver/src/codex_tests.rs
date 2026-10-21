@@ -396,7 +396,7 @@ fn pane_launch_spec_does_not_use_shell_exec() {
     let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-6-astra", "run-pane-a"));
     let trimmed = plan.command.trim_start();
     assert!(
-        trimmed.starts_with("codex "),
+        trimmed.starts_with("python3 .codex/initial-prompt.py codex "),
         "pane launch must type a plain `codex` command line, not shell-exec into it; got: {}",
         plan.command
     );

@@ -854,12 +854,8 @@ impl AgentDriver for ClaudeDriver {
             // single quote, so naive single-quoting is sufficient.
             cmd.push_str(&format!(" --settings '{}'", settings.display()));
         }
-        // Use the descriptor's config_dir and initial_prompt_filename so this
-        // stays in sync with provision_workspace's write location.
-        cmd.push_str(&format!(
-            " \"$(cat {}/{})\"\n",
-            CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
-        ));
+        cmd.push('\n');
+        let cmd = super::initial_prompt::launcher_command(CLAUDE_DESCRIPTOR.config_dir, &cmd);
         SpawnPlan {
             // Claude must authenticate via OAuth credentials
             // (~/.claude/.credentials.json), not a stray ANTHROPIC_API_KEY
@@ -886,14 +882,19 @@ impl AgentDriver for ClaudeDriver {
         &self,
         workspace: &Path,
         prompt_text: &str,
-        _run_id: &str,
+        run_id: &str,
     ) -> anyhow::Result<Option<super::DriverRuntimeState>> {
         let config_dir = workspace.join(CLAUDE_DESCRIPTOR.config_dir);
         std::fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
 
-        let prompt_path = config_dir.join(CLAUDE_DESCRIPTOR.initial_prompt_filename);
-        std::fs::write(&prompt_path, prompt_text)
-            .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
+        anyhow::ensure!(
+            !run_id.is_empty()
+                && run_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "invalid worker run id"
+        );
+        super::initial_prompt::provision(&config_dir, &config_dir.join("runs").join(run_id), prompt_text, self)?;
 
         let gitignore_path = config_dir.join(".gitignore");
         std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)
@@ -2168,10 +2169,7 @@ mod tests {
     #[test]
     fn spawn_invocation_uses_descriptor_paths() {
         let plan = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
-        let expected_cat = format!(
-            "\"$(cat {}/{})\"\n",
-            CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
-        );
+        let expected_cat = format!("python3 {}/initial-prompt.py", CLAUDE_DESCRIPTOR.config_dir);
         assert!(
             plan.command.contains(&expected_cat),
             "spawn invocation must read from descriptor paths; got: {}",

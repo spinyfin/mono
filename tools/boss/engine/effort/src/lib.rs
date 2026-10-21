@@ -999,7 +999,7 @@ mod tests {
         .unwrap();
         let claude_cmd = claude_cfg.spawn_command_in(&registry, false, None).unwrap();
         assert!(
-            claude_cmd.starts_with("claude"),
+            claude_cmd.starts_with("python3 .claude/initial-prompt.py claude "),
             "claude slug still routes to ClaudeDriver, got {claude_cmd:?}",
         );
     }
@@ -1252,7 +1252,7 @@ mod tests {
         let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().build()).unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+            "python3 .claude/initial-prompt.py claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto\n",
         );
     }
 
@@ -1270,10 +1270,10 @@ mod tests {
             "expected single-quoted --settings flag, got: {inv:?}",
         );
         let settings_at = inv.find("--settings").expect("--settings present");
-        let prompt_at = inv.find("\"$(cat").expect("prompt arg present");
+        let launcher_at = inv.find("initial-prompt.py").expect("private input launcher present");
         assert!(
-            settings_at < prompt_at,
-            "--settings must come before the positional prompt arg: {inv:?}",
+            settings_at > launcher_at && !inv.contains("$(cat"),
+            "--settings must reach the driver without expanding the brief: {inv:?}",
         );
     }
 
@@ -1289,7 +1289,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
+            "python3 .claude/initial-prompt.py claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions\n",
         );
     }
 
@@ -1305,7 +1305,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model opus --effort high --disallowedTools=AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+            "python3 .claude/initial-prompt.py claude --model opus --effort high --disallowedTools=AskUserQuestion --permission-mode auto\n",
         );
     }
 
