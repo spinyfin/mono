@@ -260,6 +260,22 @@ fn bind_runner(
 }
 
 fn sample_execution(workspace_path: &Path) -> WorkExecution {
+    // Claude now records its private input home on the execution. Keep this
+    // fixture backed by a real row, as production spawn always is.
+    let db = WorkDb::open(workspace_path.join("state.db")).unwrap();
+    if db.get_execution("exec-test-1").is_err() {
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "pane spawn fixture");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET id = ?1, status = 'running' WHERE id = ?2",
+                rusqlite::params!["exec-test-1", execution.id],
+            )
+            .unwrap();
+    }
+
     WorkExecution::builder()
         .id("exec-test-1")
         .work_item_id("task-1")

@@ -1040,14 +1040,21 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         environment.insert("BOSS_BIN".to_owned(), format!("{bin_dir}/boss"));
     }
     insert_color_environment(&mut environment);
-    // The brief rides along as `claude`'s positional initial prompt — the
-    // same shape worker panes use for `.claude/initial-prompt.txt` — so the
-    // incoming session consumes it on its first turn with no pane injection
-    // and no dependence on it choosing to read a file.
-    // Reset requests reach the coordinator through Claude's local inbox, which
-    // only delivers when cross-session input is accepted. Set it explicitly
-    // rather than inheriting whatever user or default configuration says.
-    let launch = inbox::coordinator_launch_command("claude", model, &initial_prompt);
+    // Keep one bounded input directory for this singleton session. The relay
+    // loads the brief before the next coordinator can replace these files.
+    let input_dir = working_directory.join(".claude/coordinator-input");
+    crate::driver::initial_prompt::provision(&input_dir, &input_dir, &initial_prompt, &crate::driver::ClaudeDriver)
+        .context("provisioning coordinator terminal input")?;
+    let driver_command = inbox::coordinator_launch_command("claude", model, "");
+    let launch = format!(
+        "exec {}",
+        crate::driver::initial_prompt::launcher_command(
+            &boss_ssh_transport::shell_quote(&input_dir.to_string_lossy()),
+            driver_command
+                .strip_prefix("exec ")
+                .expect("coordinator command starts with exec"),
+        )
+    );
     let command = format!(
         "{}unset ANTHROPIC_API_KEY; {launch}",
         crate::runner::pane_spawn::path_prepend_clause("BOSS_BIN_DIR")
@@ -1097,11 +1104,10 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
 }
 
 /// Compose the session-start handoff brief for a fresh coordinator
-/// session, persist it under the session directory, and return the shell
-/// fragment that hands it to `claude` as the positional initial prompt.
+/// session, persist it under the session directory, and return its text for
+/// private terminal delivery.
 ///
-/// Never fails session creation. If the brief file cannot be written, the
-/// fragment is instead a short inline prompt that says so and points the
+/// If the archived brief cannot be written, return a short recovery prompt that says so and points the
 /// session at `boss handoff show` — the incoming session must never start
 /// silently, as if there were nothing to hand off, because the engine hit
 /// a filesystem error. Every outcome is audited as
@@ -1165,16 +1171,13 @@ fn prepare_session_start_brief(
                 start_reason = reason.audit_label(),
                 "coordinator handoff: session-start brief written for the incoming session"
             );
-            format!(
-                "\"$(cat {})\"",
-                boss_ssh_transport::shell_quote(&path.to_string_lossy())
-            )
+            brief
         }
         Err(error) => {
             let error = format!("{error:#}");
             tracing::error!(
                 error = %error,
-                "coordinator handoff: could not write the session-start brief; launching with an inline notice instead"
+                "coordinator handoff: could not archive the session-start brief; preparing a private recovery notice instead"
             );
             audit::record_event(
                 "coordinator_handoff_brief",
@@ -1184,7 +1187,7 @@ fn prepare_session_start_brief(
                     "error": error,
                 }),
             );
-            boss_ssh_transport::shell_quote(&format!(
+            format!(
                 "[Boss coordinator session start] The engine could not write your session-start handoff brief \
                  ({error}). Stored handoff state per the engine: {}. Run `boss handoff show` now to read the \
                  stored coordinator handoff, tell the operator in your first reply that the brief could not be \
@@ -1192,7 +1195,7 @@ fn prepare_session_start_brief(
                  delivered. Before product-scoped work, run `boss guidance show` and report each product's \
                  guidance state in your first reply; a failure means unknown rules, not no guidance.",
                 state.audit_outcome()
-            ))
+            )
         }
     }
 }
@@ -2317,7 +2320,7 @@ mod tests {
         assert!(
             record_line["relaunch_command"]
                 .as_str()
-                .is_some_and(|command| command.contains("exec 'claude'"))
+                .is_some_and(|command| command.contains("initial-prompt.py 'claude'"))
         );
     }
 
@@ -2358,7 +2361,7 @@ mod tests {
         assert!(
             new_session
                 .iter()
-                .any(|arg| arg.contains("exec 'claude' --model") && arg.contains("sonnet")),
+                .any(|arg| arg.contains("initial-prompt.py 'claude' --model") && arg.contains("sonnet")),
             "the replacement must launch the current claude binary with the requested model, got {new_session:?}"
         );
         assert!(
@@ -2672,18 +2675,12 @@ mod tests {
             .unwrap();
 
         let command = new_session_command(&server.calls()).expect("a new-session call");
-        let brief_path = dir
-            .path()
-            .join(".claude")
-            .join(coordinator_handoff::START_BRIEF_FILENAME);
-        let expected_fragment = format!(
-            "--permission-mode auto --settings {} \"$(cat {})\"",
-            boss_ssh_transport::shell_quote(inbox::COORDINATOR_INBOUND_SETTINGS),
-            boss_ssh_transport::shell_quote(&brief_path.to_string_lossy())
-        );
-        assert!(
-            command.ends_with(&expected_fragment),
-            "launch command must hand the brief to claude as its positional initial prompt, got {command:?}"
+        assert!(command.contains("initial-prompt.py"), "{command}");
+        assert!(!command.contains("$(cat"), "{command}");
+        assert!(!command.contains("NO HANDOFF"), "{command}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".claude/coordinator-input/initial-prompt.txt")).unwrap(),
+            start_brief(dir.path()),
         );
         let brief = start_brief(dir.path());
         assert!(

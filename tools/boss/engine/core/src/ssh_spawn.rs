@@ -251,6 +251,10 @@ pub trait SshExec: Send + Sync {
     /// evaluates its own `&&`/`|`/redirects/quoting. See
     /// [`SshTransport::run_shell`] for the full quoting contract.
     async fn run_shell(&self, script: &str) -> Result<SshOutput>;
+    /// Copy a staged private file over the existing SSH master.
+    async fn scp_push(&self, _local: &std::path::Path, _remote: &str) -> Result<SshOutput> {
+        anyhow::bail!("file shipping is not supported by this transport")
+    }
     /// `ssh -O forward -R remote:local` over the master.
     async fn add_reverse_unix_forward(&self, remote_socket: &str, local_socket: &str) -> Result<SshOutput>;
     /// `ssh -O cancel -R remote:local` over the master.
@@ -259,6 +263,10 @@ pub trait SshExec: Send + Sync {
 
 #[async_trait]
 impl SshExec for SshTransport {
+    async fn scp_push(&self, local: &std::path::Path, remote: &str) -> Result<SshOutput> {
+        SshTransport::scp_push(self, local, remote).await
+    }
+
     fn host_id(&self) -> &str {
         &self.host_id
     }
@@ -793,6 +801,7 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Call {
+        Push(String, String),
         Run(Vec<String>),
         AddForward { remote: String, local: String },
         CancelForward { remote: String, local: String },
@@ -880,6 +889,20 @@ mod tests {
 
     #[async_trait]
     impl SshExec for FakeExec {
+        async fn scp_push(&self, local: &std::path::Path, remote: &str) -> Result<SshOutput> {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(local)?.permissions().mode() & 0o777, 0o600);
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::Push(remote.to_owned(), std::fs::read_to_string(local)?));
+            Ok(SshOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+
         fn host_id(&self) -> &str {
             "fake"
         }
@@ -1020,6 +1043,65 @@ mod tests {
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
             structured_output_kind: Some("review-result".into()),
             pr_url_output: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_initial_input_is_private_and_uses_an_absolute_launcher() {
+        use crate::driver::AgentDriver;
+        let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n");
+        let driver = crate::driver::ClaudeDriver;
+        let invocation = driver.spawn_invocation(crate::driver::SpawnRequest {
+            model: "opus",
+            effort: None,
+            settings_path: None,
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: Some("run-1"),
+        });
+        let directory = "/remote/work space/.claude/runs/run-1";
+        let sentinel = "PRIVATE_REMOTE_BRIEF_SENTINEL";
+        let command = crate::host_adapter::stage_remote_initial_input(
+            &exec,
+            "run-1",
+            directory,
+            sentinel,
+            &driver,
+            &invocation.command,
+        )
+        .await
+        .unwrap();
+        assert!(command.starts_with("python3 '/remote/work space/.claude/runs/run-1'/initial-prompt.py "));
+        assert!(!command.contains("python3 .claude/initial-prompt.py"));
+        let mut plan = sample_plan();
+        plan.driver_command = command;
+        perform_remote_launch(&exec, &plan, "/tmp/engine.sock").await.unwrap();
+        let calls = exec.calls();
+        for name in ["initial-prompt.txt", "initial-prompt.py", "initial-prompt.json"] {
+            let remote = format!("{directory}/{name}");
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| matches!(call, Call::Push(path, _) if path == &remote))
+            );
+            assert!(calls.contains(&Call::Run(vec![
+                "install".into(),
+                "-m".into(),
+                "600".into(),
+                "/dev/null".into(),
+                remote.clone()
+            ])));
+            assert!(calls.contains(&Call::Run(vec!["chmod".into(), "600".into(), remote])));
+        }
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, Call::Push(_, body) if body == sentinel))
+        );
+        for call in calls {
+            if let Call::Run(arguments) = call {
+                assert!(!arguments.iter().any(|argument| argument.contains(sentinel)));
+            }
         }
     }
 

@@ -5,6 +5,7 @@ engine. Only the driver and its flags are arguments. Subsequent input, resize,
 signals, output and exit status pass through to the same interactive session.
 """
 
+import codecs
 import errno
 import fcntl
 import json
@@ -19,9 +20,9 @@ import sys
 import termios
 import time
 import tty
+import unicodedata
 
 
-ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 # Detached SSH workers write a log, not an outer terminal. Answer the startup
 # queries ourselves in that topology; attached tmux workers use the real
 # terminal's replies. No keyboard enhancements are advertised by the log sink.
@@ -34,13 +35,152 @@ REPLIES = {
 }
 
 
+class TerminalTail:
+    """Bounded current-screen text for startup detection, excluding scrollback."""
+
+    def __init__(self, height=50, width=220):
+        self.height, self.width = height, width
+        self.rows = [[] for _ in range(height)]
+        self.x = self.y = 0
+        self.pending = ""
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def feed(self, output):
+        self.pending += self.decoder.decode(output)
+        while self.pending:
+            char = self.pending[0]
+            consumed = 1
+            if char == "\x1b":
+                if len(self.pending) < 2:
+                    break
+                if self.pending[1] == "[":
+                    match = re.match(r"\x1b\[([0-?]*)([ -/]*)([@-~])", self.pending)
+                    if not match:
+                        break
+                    self.control(match[1], match[3])
+                    consumed = match.end()
+                elif self.pending[1] == "]":
+                    match = re.search(r"\x07|\x1b\\", self.pending)
+                    if not match:
+                        break
+                    consumed = match.end()
+                else:
+                    consumed = 2
+            elif char == "\r":
+                self.x = 0
+            elif char == "\n":
+                self.y += 1
+            elif char == "\b":
+                self.x = max(0, self.x - 1)
+            elif char >= " ":
+                if self.x >= self.width:
+                    self.x = 0
+                    self.y += 1
+                self.scroll()
+                row = self.rows[self.y]
+                while len(row) <= self.x:
+                    row.append(" ")
+                row[self.x] = char
+                self.x += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+            self.scroll()
+            self.pending = self.pending[consumed:]
+
+    def scroll(self):
+        while self.y >= self.height:
+            self.rows.pop(0)
+            self.rows.append([])
+            self.y -= 1
+
+    def control(self, parameters, command):
+        if any(char not in "0123456789;" for char in parameters):
+            return
+        values = [int(value or "0") for value in parameters.split(";")]
+        count = values[0] or 1
+        if command in ("H", "f"):
+            self.y = min(self.height - 1, max(0, count - 1))
+            self.x = min(self.width - 1, max(0, (values[1] if len(values) > 1 else 1) - 1))
+        elif command == "A":
+            self.y = max(0, self.y - count)
+        elif command == "B":
+            self.y = min(self.height - 1, self.y + count)
+        elif command == "C":
+            self.x = min(self.width - 1, self.x + count)
+        elif command == "D":
+            self.x = max(0, self.x - count)
+        elif command == "G":
+            self.x = min(self.width - 1, count - 1)
+        elif command == "J":
+            if values[0] in (2, 3):
+                self.rows = [[] for _ in range(self.height)]
+            elif values[0] == 0:
+                self.rows[self.y] = self.rows[self.y][:self.x]
+                for row in range(self.y + 1, self.height):
+                    self.rows[row] = []
+        elif command == "K":
+            if values[0] == 2:
+                self.rows[self.y] = []
+            elif values[0] == 0:
+                self.rows[self.y] = self.rows[self.y][:self.x]
+
+    def tail(self):
+        lines = ["".join(row).rstrip() for row in self.rows]
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines[-12:]).encode()
+
+
+def ready_for_prompt(view, raw, paste_enabled, markers, starting_markers):
+    visible = view.tail()
+    return (raw and paste_enabled and any(marker in visible for marker in markers)
+            and not any(marker in visible for marker in starting_markers))
+
+
 def write_all(fd, data):
     while data:
         count = os.write(fd, data)
         data = data[count:]
 
 
-def run(argv, prompt, markers):
+def spawn_supervised(argv, master, slave):
+    # The supervisor shares the driver session, but survives TERM/HUP. A
+    # private pipe ties that session to the relay even when SIGKILL prevents
+    # the relay from forwarding signals or running its finally block.
+    reader, writer = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(writer)
+        os.close(master)
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_IGN)
+        child = os.fork()
+        if child == 0:
+            os.close(reader)
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(signum, signal.SIG_DFL)
+            for fd in (0, 1, 2):
+                os.dup2(slave, fd)
+            if slave > 2:
+                os.close(slave)
+            os.environ.setdefault("TERM", "xterm-256color")
+            os.execvp(argv[0], argv)
+        os.close(slave)
+        for fd in (0, 1, 2):
+            os.close(fd)
+        while True:
+            ended, status = os.waitpid(child, os.WNOHANG)
+            if ended:
+                os._exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
+            readable, _, _ = select.select([reader], [], [], 0.05)
+            if readable and not os.read(reader, 1):
+                os.killpg(os.getpid(), signal.SIGKILL)
+    os.close(reader)
+    os.close(slave)
+    return pid, writer
+
+
+def run(argv, prompt, markers, starting_markers, readiness_timeout=30):
     if b"\x1b[201~" in prompt or b"\0" in prompt:
         raise ValueError("initial brief contains a terminal paste terminator or NUL")
     outer_tty = os.isatty(0)
@@ -53,18 +193,7 @@ def run(argv, prompt, markers):
         fcntl.ioctl(master, termios.TIOCSWINSZ, size)
 
     resize()
-    pid = os.fork()
-    if pid == 0:
-        os.close(master)
-        os.setsid()
-        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
-        for fd in (0, 1, 2):
-            os.dup2(slave, fd)
-        if slave > 2:
-            os.close(slave)
-        os.environ.setdefault("TERM", "xterm-256color")
-        os.execvp(argv[0], argv)
-    os.close(slave)
+    pid, lifeline = spawn_supervised(argv, master, slave)
 
     def forward(signum, _frame):
         try:
@@ -80,13 +209,15 @@ def run(argv, prompt, markers):
     signal.signal(signal.SIGWINCH, resize)
     pending = b""
     screen = b""
+    view = TerminalTail()
     query_buffer = b""
     delivered = False
     paste_started = False
     submitting = False
     paste_enabled = False
+    ready_since = None
     submit_at = None
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + readiness_timeout
     stdin_open = outer_tty
     try:
         if outer_tty:
@@ -94,7 +225,7 @@ def run(argv, prompt, markers):
         while True:
             now = time.monotonic()
             if not delivered and now >= deadline:
-                raise TimeoutError("driver did not become ready for initial brief within 30s")
+                raise TimeoutError(f"driver did not become ready for initial brief within {readiness_timeout}s")
             if submit_at is not None and now >= submit_at:
                 pending += b"\r"
                 submit_at = None
@@ -122,6 +253,7 @@ def run(argv, prompt, markers):
                     query_buffer = query_buffer[consumed:][-32:]
                 if not paste_started:
                     screen = (screen + output)[-65536:]
+                    view.feed(output)
                     # The mode transition can span reads. A raw terminal and
                     # driver chrome are both required: never paste into a shell
                     # or a canonical terminal that could truncate the brief.
@@ -129,11 +261,16 @@ def run(argv, prompt, markers):
                     disable = screen.rfind(b"\x1b[?2004l")
                     if enable >= 0 or disable >= 0:
                         paste_enabled = enable > disable
-                    raw = not termios.tcgetattr(master)[3] & termios.ICANON
-                    visible = ANSI.sub(b"", screen)
-                    if raw and paste_enabled and any(marker in visible for marker in markers):
+            if not paste_started:
+                raw = not termios.tcgetattr(master)[3] & termios.ICANON
+                if ready_for_prompt(view, raw, paste_enabled, markers, starting_markers):
+                    if ready_since is None:
+                        ready_since = now
+                    elif now - ready_since >= 0.2:
                         pending += b"\x1b[200~" + prompt + b"\x1b[201~"
                         paste_started = True
+                else:
+                    ready_since = None
             if 0 in readable:
                 data = os.read(0, 65536)
                 if data:
@@ -152,9 +289,13 @@ def run(argv, prompt, markers):
         _, status = os.waitpid(pid, 0)
         if not delivered:
             raise RuntimeError("driver exited before receiving the initial brief")
-        code = os.waitstatus_to_exitcode(status)
-        return code if code >= 0 else 128 - code
+        return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
     finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.close(lifeline)
         os.close(master)
         if saved is not None:
             termios.tcsetattr(0, termios.TCSADRAIN, saved)
@@ -163,7 +304,7 @@ def run(argv, prompt, markers):
         try:
             child, _ = os.waitpid(pid, os.WNOHANG)
             if child == 0:
-                os.kill(pid, signal.SIGKILL)
+                os.killpg(pid, signal.SIGKILL)
                 os.waitpid(pid, 0)
         except ChildProcessError:
             pass
@@ -173,7 +314,9 @@ def main():
     argv = sys.argv[1:]
     if not argv:
         raise ValueError("missing worker driver")
-    markers = [s.encode() for s in json.loads(Path(__file__).with_name("initial-prompt.json").read_text())]
+    config = json.loads(Path(__file__).with_name("initial-prompt.json").read_text())
+    markers = [s.encode() for s in config["agent_markers"]]
+    starting_markers = [s.encode() for s in config["starting_markers"]]
     if not markers:
         raise ValueError("missing driver readiness markers")
     prompt_path = Path(__file__).with_name("initial-prompt.txt")
@@ -181,7 +324,7 @@ def main():
         if os.fstat(prompt_file.fileno()).st_mode & 0o777 != 0o600:
             raise PermissionError("initial brief must have mode 0600")
         prompt = prompt_file.read()
-    return run(argv, prompt, markers)
+    return run(argv, prompt, markers, starting_markers)
 
 
 if __name__ == "__main__":

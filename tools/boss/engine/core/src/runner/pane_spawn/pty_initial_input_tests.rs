@@ -447,48 +447,47 @@ assert data.startswith(b'\x1b[200~'), data[:40]
     }
 }
 
-fn grok_spawn_plan_for_delivery_test(run_id: &str, workspace_path: &std::path::Path) -> crate::driver::SpawnPlan {
-    use crate::driver::grok::{
-        GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV, GROK_SKIP_POSTURE_ASSERT_ENV, grok_home_for_run,
-    };
-    let _lock = GROK_HOMES_ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let prior_homes_env = std::env::var_os(GROK_HOMES_ROOT_ENV);
-    let prior_skip_env = std::env::var_os(GROK_SKIP_POSTURE_ASSERT_ENV);
-    let homes_root = TempDir::new().unwrap();
-    // SAFETY: serialised by `_lock`, restored before this helper returns.
-    unsafe {
-        std::env::set_var(GROK_HOMES_ROOT_ENV, homes_root.path());
-        std::env::set_var(GROK_SKIP_POSTURE_ASSERT_ENV, "1");
+struct DeliveryEnvironment {
+    prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl Drop for DeliveryEnvironment {
+    fn drop(&mut self) {
+        for (key, value) in &self.prior {
+            // SAFETY: the caller holds the Grok environment lock until drop.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
-    let grok_home = grok_home_for_run(run_id).unwrap();
-    std::fs::create_dir_all(&grok_home).unwrap();
-    std::fs::write(
-        grok_home.join("boss-session-id"),
-        "11111111-2222-4333-8444-555555555555\n",
-    )
-    .unwrap();
-    std::fs::write(
-        grok_home.join("boss-workspace-path"),
-        format!("{}\n", workspace_path.display()),
-    )
-    .unwrap();
-    let plan = GrokDriver::default().spawn_invocation(SpawnRequest {
-        model: "grok-4.6",
-        effort: Some("high"),
-        settings_path: None,
-        non_opus_auto_mode: false,
-        permission_mode_override: None,
-        run_id: Some(run_id),
-    });
-    match prior_homes_env {
-        Some(v) => unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, v) },
-        None => unsafe { std::env::remove_var(GROK_HOMES_ROOT_ENV) },
+}
+
+#[test]
+fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
+    use crate::driver::{grok, test_support};
+    let root = TempDir::new().unwrap();
+    let auth = root.path().join("auth.json");
+    std::fs::write(&auth, r#"{"OPENAI_API_KEY":"test-key"}"#).unwrap();
+    let _codex = test_support::codex_auth_source_override(&root.path().join("codex"), &auth);
+    let _grok = test_support::grok_homes_override(&root.path().join("grok"));
+    let _transcripts = test_support::transcript_store_override(&root.path().join("transcripts"));
+    let mut environment = DeliveryEnvironment { prior: Vec::new() };
+    for (key, value) in [
+        (grok::GROK_AUTH_SOURCE_ENV, auth.as_os_str()),
+        (grok::GROK_SKIP_POSTURE_ASSERT_ENV, std::ffi::OsStr::new("1")),
+    ] {
+        environment.prior.push((key, std::env::var_os(key)));
+        // SAFETY: `_grok` holds the shared environment lock through block_on.
+        unsafe { std::env::set_var(key, value) };
     }
-    match prior_skip_env {
-        Some(v) => unsafe { std::env::set_var(GROK_SKIP_POSTURE_ASSERT_ENV, v) },
-        None => unsafe { std::env::remove_var(GROK_SKIP_POSTURE_ASSERT_ENV) },
-    }
-    plan
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(per_driver_delivery_body());
 }
 
 /// Small and ~600 KB prompts, per driver: take the real `spawn_invocation`
@@ -496,8 +495,7 @@ fn grok_spawn_plan_for_delivery_test(run_id: &str, workspace_path: &std::path::P
 /// actual `.boss/initial-input.sh`, source it from `/bin/sh`, and assert
 /// the stub received the prompt intact through terminal stdin and emitted
 /// the turn-start signal confirmation consumes.
-#[tokio::test]
-async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
+async fn per_driver_delivery_body() {
     use crate::runner::spawn_confirmation::{confirm_spawn_started, pane_shows_driver_ready};
     use std::time::Duration;
 
@@ -572,12 +570,6 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
         for prompt_bytes in [20_000usize, 600_000, local_arg_max().unwrap() + 4096] {
             let workspace = TempDir::new().unwrap();
             let run_id = format!("run-{}-{prompt_bytes}", case.driver_name);
-            let mut plan = if case.driver_name == "grok" {
-                grok_spawn_plan_for_delivery_test(&run_id, workspace.path())
-            } else {
-                (case.spawn)(&run_id)
-            };
-            std::fs::create_dir_all(workspace.path().join(case.config_dir)).unwrap();
             let sentinel = "BRIEF_SENTINEL_PRIVATE_INITIAL_INPUT";
             let prompt = format!(
                 "{sentinel}\n{}\nquotes: '\" $() `command` 雪\n\n",
@@ -587,7 +579,17 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
                 .require(case.driver_name)
                 .unwrap();
             let config_dir = workspace.path().join(case.config_dir);
-            crate::driver::initial_prompt::provision(&config_dir, &config_dir, &prompt, driver.as_ref()).unwrap();
+            driver
+                .provision_workspace(workspace.path(), &prompt, &run_id)
+                .await
+                .unwrap();
+            assert!(
+                std::fs::symlink_metadata(config_dir.join(case.filename))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            let mut plan = (case.spawn)(&run_id);
             assert!(!plan.command.contains(sentinel));
             assert!(!plan.command.contains("$(cat"));
 

@@ -4,7 +4,7 @@
 //! ## The failure this closes
 //!
 //! Boss launches each worker as an **interactive** `claude` session in
-//! a tmux pane (`runner.rs`: `claude … "$(cat initial-prompt.txt)"`
+//! a tmux pane (`runner.rs`: a PTY launcher that delivers the brief over stdin
 //! with no `--print`). When claude exhausts its own internal retries on
 //! a transient API error — "API Error: The socket connection was closed
 //! unexpectedly", `overloaded_error`, a 5xx, a 429, a request timeout —

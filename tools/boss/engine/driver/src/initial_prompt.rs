@@ -22,7 +22,21 @@ pub fn launcher_config(driver: &dyn crate::AgentDriver) -> Result<String> {
         .pane_monitor_spec()
         .context("driver has no initial-input readiness markers")?;
     anyhow::ensure!(!spec.agent_markers.is_empty(), "driver has no readiness markers");
-    Ok(serde_json::to_string(&spec.agent_markers)?)
+    let mut starting_markers = spec.starting_markers;
+    starting_markers.extend(
+        [
+            "Choose the text style",
+            "Sign in with",
+            "Sign in to",
+            "Waiting for approval",
+            "Connecting...",
+        ]
+        .map(String::from),
+    );
+    Ok(serde_json::to_string(&serde_json::json!({
+        "agent_markers": spec.agent_markers,
+        "starting_markers": starting_markers,
+    }))?)
 }
 
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -41,9 +55,19 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// The config directory belongs to this leased worker workspace. Drivers
 /// with retained per-run homes keep the actual brief there; the workspace
-/// reference is removed with the lease. Claude has no isolated provider home,
-/// so its per-run input directory is retained with the workspace instead.
+/// reference holds no prompt bytes. Claude records a private input home under
+/// the same engine-owned homes root for the restart-safe retention sweep.
 pub fn provision(config_dir: &Path, run_home: &Path, prompt: &str, driver: &dyn crate::AgentDriver) -> Result<()> {
+    let preflight = boss_command_runner::output_blocking_timeout(
+        std::process::Command::new("python3").args(["-c", "import fcntl, pty, termios"]),
+        std::time::Duration::from_secs(5),
+    )
+    .context("python3 with Unix PTY support is required for private initial brief delivery")?;
+    anyhow::ensure!(
+        preflight.status.success(),
+        "python3 initial brief preflight failed: {}",
+        String::from_utf8_lossy(&preflight.stderr)
+    );
     fs::create_dir_all(run_home)?;
     let prompt_path = run_home.join("initial-prompt.txt");
     write_private(&prompt_path, prompt.as_bytes())?;
@@ -71,13 +95,38 @@ mod tests {
     fn terminal_relay_preserves_followups_resize_and_exit_status() {
         let temp = tempfile::tempdir().unwrap();
         provision(temp.path(), temp.path(), "private sentinel", &crate::ClaudeDriver).unwrap();
+        fs::write(
+            temp.path().join("panes.json"),
+            include_str!("testdata/initial_prompt_panes.json"),
+        )
+        .unwrap();
+        let configs: serde_json::Map<String, serde_json::Value> = ["claude", "codex", "grok"]
+            .into_iter()
+            .map(|name| {
+                let driver = crate::DriverRegistry::default().require(name).unwrap();
+                (
+                    name.to_owned(),
+                    serde_json::from_str(&launcher_config(driver.as_ref()).unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        fs::write(
+            temp.path().join("configs.json"),
+            serde_json::to_string(&configs).unwrap(),
+        )
+        .unwrap();
         let harness = temp.path().join("relay-test.py");
         fs::write(&harness, include_str!("initial_prompt_relay_test.py")).unwrap();
-        let output = std::process::Command::new("python3")
-            .arg(harness)
-            .arg(temp.path())
-            .output()
-            .unwrap();
+        let trace = temp.path().join("relay-trace.txt");
+        let output = boss_command_runner::output_blocking_timeout_in_group(
+            std::process::Command::new("python3")
+                .arg(harness)
+                .arg(temp.path())
+                .env("BOSS_RELAY_TRACE", &trace),
+            std::time::Duration::from_secs(45),
+            |_| {},
+        )
+        .unwrap_or_else(|error| panic!("{error}: {}", fs::read_to_string(trace).unwrap_or_default()));
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 

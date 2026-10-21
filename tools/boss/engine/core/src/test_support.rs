@@ -955,12 +955,20 @@ macro_rules! stub_host_adapter {
 
     // ── release_workspace ───────────────────────────────────────────────────
     (@munch $ty:ty [$($acc:tt)*] @release_workspace async fn release_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @heartbeat_lease $($rest)*);
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @cleanup_initial_input $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @release_workspace $($rest:tt)*) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*
             async fn release_workspace(&self, _lease_id: &str) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @heartbeat_lease $($rest)*);
+        ] @cleanup_initial_input $($rest)*);
+    };
+
+    // ── cleanup_initial_input (trait default unless overridden) ────────────
+    (@munch $ty:ty [$($acc:tt)*] @cleanup_initial_input async fn cleanup_initial_input $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn cleanup_initial_input $a -> $r $b] @heartbeat_lease $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @cleanup_initial_input $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @heartbeat_lease $($rest)*);
     };
 
     // ── heartbeat_lease ─────────────────────────────────────────────────────

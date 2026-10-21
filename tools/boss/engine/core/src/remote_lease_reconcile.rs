@@ -301,6 +301,13 @@ async fn reap_dead_remote_execution(
         return false;
     }
 
+    if let Some(workspace) = execution.workspace_path.as_deref()
+        && let Err(error) = adapter.cleanup_initial_input(workspace, &execution.id).await
+    {
+        tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
+        return false;
+    }
+
     let prior_status = execution.status.as_str().to_owned();
 
     // Recover WHY it died before the workspace goes back to cube and takes
@@ -513,6 +520,12 @@ async fn release_terminal_remote_resources(
     let Ok(execution) = work_db.get_execution(&handle.execution_id) else {
         return;
     };
+    if let Some(workspace) = execution.workspace_path.as_deref()
+        && let Err(error) = adapter.cleanup_initial_input(workspace, &execution.id).await
+    {
+        tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
+        return;
+    }
     let Some(lease_id) = execution.cube_lease_id.as_deref() else {
         return;
     };

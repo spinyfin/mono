@@ -24,6 +24,8 @@ enum Probe {
 #[builder(on(String, into))]
 struct StubAdapter {
     host_id: String,
+    #[builder(default)]
+    cleaned_inputs: Mutex<Vec<(String, String)>>,
     probe: Probe,
     force_released: Mutex<Vec<(String, Option<String>)>>,
     /// How many times `probe_remote_worker_alive` was called.
@@ -41,6 +43,10 @@ struct StubAdapter {
 crate::stub_host_adapter! { StubAdapter {
     fn host_id(&self) -> &str {
         &self.host_id
+    }
+    async fn cleanup_initial_input(&self, workspace: &str, run_id: &str) -> Result<()> {
+        self.cleaned_inputs.lock().unwrap().push((workspace.to_owned(), run_id.to_owned()));
+        Ok(())
     }
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
         self.force_released
@@ -323,6 +329,7 @@ async fn leaves_live_remote_worker_untouched() {
     // A live worker must never be reaped or have its lease released.
     assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
     assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());
 }
 
 /// A remote chore that succeeds parks in `waiting_review` with its
@@ -395,6 +402,7 @@ async fn inconclusive_probe_never_reaps() {
     assert_eq!(outcome.reaped, 0);
     assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
     assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -413,6 +421,7 @@ async fn run_without_remote_pid_is_skipped() {
     assert_eq!(outcome.reaped, 0);
     assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
     assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -430,6 +439,7 @@ async fn local_runs_are_not_candidates() {
     assert_eq!(outcome, RemoteLeaseReconcileOutcome::default());
     assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
     assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -446,6 +456,10 @@ async fn terminal_remote_persona_backstop_preserves_history_and_live_leases() {
     reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
     assert!(db.terminal_remote_cleanup_runs().unwrap().is_empty());
     assert_eq!(adapter.force_released.lock().unwrap()[0].0, "dead");
+    assert_eq!(
+        *adapter.cleaned_inputs.lock().unwrap(),
+        vec![("/remote/mono-agent-004".to_owned(), dead.clone())]
+    );
     assert!(db.get_execution(&dead).unwrap().cube_lease_id.is_none());
     let next = start_remote_run(&db, &create_chore(&db), "anaplian", "next", Some(3));
     assert_eq!(db.persona_display_name(&next).unwrap(), dead_name);
@@ -478,6 +492,7 @@ async fn cancelled_remote_worker_still_alive_keeps_lease_and_persona() {
     let (adapter, provider) = provider("anaplian", Probe::Alive);
     reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
     assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());
     assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease"));
     assert_eq!(db.terminal_remote_cleanup_runs().unwrap().len(), 1);
 }
@@ -494,6 +509,7 @@ async fn terminal_remote_run_without_pid_releases_persona_but_leaves_lease_to_tt
     // No pid → nothing to probe: the cube lease is left to its TTL, but the
     // persona (which has no TTL) is freed for reuse.
     assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());
     assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease"));
     let next = start_remote_run(&db, &create_chore(&db), "anaplian", "next", Some(3));
     assert_eq!(db.persona_display_name(&next).unwrap(), name);
@@ -534,6 +550,7 @@ async fn terminal_persona_retention_is_bounded_without_releasing_remote_resource
             .unwrap();
         assert_eq!(held, host_exists && !expired);
         assert!(adapter.force_released.lock().unwrap().is_empty());
+        assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());
         assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease"));
     }
 }
@@ -547,6 +564,7 @@ async fn mismatched_host_adapter_cannot_prove_death_or_release_resources() {
     let (adapter, provider) = provider("wrong-host", Probe::Dead);
     reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
     assert!(adapter.force_released.lock().unwrap().is_empty());
+    assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());
     assert_eq!(db.get_execution(&id).unwrap().cube_lease_id.as_deref(), Some("lease"));
     let held: bool = db
         .connect()

@@ -91,16 +91,11 @@ impl Jj for SshHostAdapter {
 }
 
 /// Paths for engine-owned files in a remote driver's workspace config
-/// directory. Keeping the prompt and ignore file together prevents the
-/// prompt from appearing in the worker's change.
-fn remote_driver_config_paths(
-    workspace: &str,
-    descriptor: &crate::driver::DriverDescriptor,
-) -> (String, String, String) {
+/// directory. Per-run input is staged below it and excluded by the ignore file.
+fn remote_driver_config_paths(workspace: &str, descriptor: &crate::driver::DriverDescriptor) -> (String, String) {
     let directory = format!("{workspace}/{}", descriptor.config_dir);
-    let prompt = format!("{directory}/{}", descriptor.initial_prompt_filename);
     let gitignore = format!("{directory}/.gitignore");
-    (directory, prompt, gitignore)
+    (directory, gitignore)
 }
 
 /// The one implementation behind every `recovery_pr_base` default.
@@ -246,6 +241,11 @@ pub trait HostAdapter: Send + Sync {
     ) -> Result<CubeWorkspaceLease>;
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
+
+    /// Reclaim only this dead run's staged input, before releasing its lease.
+    async fn cleanup_initial_input(&self, _workspace: &str, _run_id: &str) -> Result<()> {
+        Ok(())
+    }
 
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
 
@@ -877,54 +877,59 @@ impl SshHostAdapter {
         contents: &str,
         label: &str,
     ) -> Result<()> {
-        let host = &self.transport.host_id;
-        let mkdir = self
-            .transport
-            .run_with_remote_paths(&["mkdir", "-p", remote_dir])
-            .await
-            .with_context(|| format!("mkdir {remote_dir} on host {host}"))?;
-        if !mkdir.success() {
-            bail!(
-                "failed to create remote {label} dir {remote_dir} on host {host}: {}",
-                non_empty(&mkdir.stderr, mkdir.status)
-            );
-        }
-        let staged = stage_local_file(run_id, label, contents)
-            .with_context(|| format!("staging remote {label} for host {host}"))?;
-        // Protect existing destinations before scp overwrites them, too.
-        let protected = self
-            .transport
-            .run_with_remote_paths(&["install", "-m", "600", "/dev/null", remote_path])
-            .await?;
-        if !protected.success() {
-            bail!(
-                "failed to protect remote {label} at {remote_path}: {}",
-                protected.stderr
-            );
-        }
-        let push = self
-            .transport
-            .scp_push(staged.path(), remote_path)
-            .await
-            .with_context(|| format!("scp {label} to host {host}"))?;
-        if !push.success() {
-            bail!(
-                "failed to scp {label} to {remote_path} on host {host}: {}",
-                non_empty(&push.stderr, push.status)
-            );
-        }
-        let permissions = self
-            .transport
-            .run_with_remote_paths(&["chmod", "600", remote_path])
-            .await?;
-        if !permissions.success() {
-            bail!(
-                "failed to protect remote {label} at {remote_path}: {}",
-                permissions.stderr
-            );
-        }
-        Ok(())
+        ship_file(&self.transport, run_id, remote_dir, remote_path, contents, label).await
     }
+}
+
+pub(crate) async fn ship_file(
+    transport: &dyn crate::ssh_spawn::SshExec,
+    run_id: &str,
+    remote_dir: &str,
+    remote_path: &str,
+    contents: &str,
+    label: &str,
+) -> Result<()> {
+    let host = transport.host_id();
+    let mkdir = transport
+        .run_with_remote_paths(&["mkdir", "-p", remote_dir])
+        .await
+        .with_context(|| format!("mkdir {remote_dir} on host {host}"))?;
+    if !mkdir.success() {
+        bail!(
+            "failed to create remote {label} dir {remote_dir} on host {host}: {}",
+            non_empty(&mkdir.stderr, mkdir.status)
+        );
+    }
+    let staged =
+        stage_local_file(run_id, label, contents).with_context(|| format!("staging remote {label} for host {host}"))?;
+    // Protect existing destinations before scp overwrites them, too.
+    let protected = transport
+        .run_with_remote_paths(&["install", "-m", "600", "/dev/null", remote_path])
+        .await?;
+    if !protected.success() {
+        bail!(
+            "failed to protect remote {label} at {remote_path}: {}",
+            protected.stderr
+        );
+    }
+    let push = transport
+        .scp_push(staged.path(), remote_path)
+        .await
+        .with_context(|| format!("scp {label} to host {host}"))?;
+    if !push.success() {
+        bail!(
+            "failed to scp {label} to {remote_path} on host {host}: {}",
+            non_empty(&push.stderr, push.status)
+        );
+    }
+    let permissions = transport.run_with_remote_paths(&["chmod", "600", remote_path]).await?;
+    if !permissions.success() {
+        bail!(
+            "failed to protect remote {label} at {remote_path}: {}",
+            permissions.stderr
+        );
+    }
+    Ok(())
 }
 
 /// Probe the remote host's `ARG_MAX` / page size / OS so the argv preflight
@@ -1195,6 +1200,22 @@ impl HostAdapter for SshHostAdapter {
         Ok(())
     }
 
+    async fn cleanup_initial_input(&self, workspace: &str, run_id: &str) -> Result<()> {
+        anyhow::ensure!(
+            !run_id.is_empty()
+                && run_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "invalid initial-input run id"
+        );
+        for config in [".claude", ".codex", ".grok"] {
+            let path = format!("{workspace}/{config}/runs/{run_id}");
+            let output = self.transport.run(&["rm", "-rf", "--", &path]).await?;
+            anyhow::ensure!(output.success(), "remote input cleanup failed: {}", output.stderr);
+        }
+        Ok(())
+    }
+
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
         crate::cube_commands::release_workspace(self, lease_id).await
     }
@@ -1422,10 +1443,9 @@ impl HostAdapter for SshHostAdapter {
         //    settings outside the workspace tree under `~/.boss-remote/`.
         //    This keeps the remote command identical to the local driver's
         //    command rather than teaching the wrapper a second argv dialect.
-        let (remote_config_dir, _, remote_prompt_gitignore_path) =
+        let (remote_config_dir, remote_prompt_gitignore_path) =
             remote_driver_config_paths(&workspace, driver.descriptor());
         let remote_prompt_dir = format!("{remote_config_dir}/runs/{run_id}");
-        let remote_prompt_path = format!("{remote_prompt_dir}/initial-prompt.txt");
         let remote_home = remote_home_dir(&self.transport).await?;
         let remote_settings_dir = format!("{remote_home}/{REMOTE_SETTINGS_DIR}");
         let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
@@ -1442,10 +1462,15 @@ impl HostAdapter for SshHostAdapter {
             permission_mode_override: worker_kind.forced_permission_mode(),
             run_id: Some(&run_id),
         });
-        driver_spawn_plan.command = driver_spawn_plan.command.replace(
-            &format!("{}/initial-prompt.py", driver.descriptor().config_dir),
-            &crate::ssh_transport::shell_quote(&format!("{remote_prompt_dir}/initial-prompt.py")),
-        );
+        driver_spawn_plan.command = stage_remote_initial_input(
+            &self.transport,
+            &run_id,
+            &remote_prompt_dir,
+            &prompt_text,
+            driver.as_ref(),
+            &driver_spawn_plan.command,
+        )
+        .await?;
         let exec_limits = probe_remote_exec_arg_limits(&self.transport).await;
         crate::runner::spawn_launch_limits::check_launch_command_arg_max_for_bytes(
             &driver_spawn_plan.command,
@@ -1456,24 +1481,6 @@ impl HostAdapter for SshHostAdapter {
             exec_limits,
         )?;
 
-        self.ship_file(&run_id, &remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
-            .await?;
-        for (name, contents) in [
-            ("initial-prompt.py", crate::driver::initial_prompt::LAUNCHER.to_owned()),
-            (
-                "initial-prompt.json",
-                crate::driver::initial_prompt::launcher_config(driver.as_ref())?,
-            ),
-        ] {
-            self.ship_file(
-                &run_id,
-                &remote_prompt_dir,
-                &format!("{remote_prompt_dir}/{name}"),
-                &contents,
-                "initial input",
-            )
-            .await?;
-        }
         self.ship_file(
             &run_id,
             &remote_config_dir,
@@ -2151,6 +2158,42 @@ pub(crate) async fn resolve_host_adapter(
     Ok(adapter)
 }
 
+/// Stage the real launch artifacts through the same injectable transport as spawn.
+pub(crate) async fn stage_remote_initial_input(
+    transport: &dyn crate::ssh_spawn::SshExec,
+    run_id: &str,
+    directory: &str,
+    prompt: &str,
+    driver: &dyn crate::driver::AgentDriver,
+    command: &str,
+) -> Result<String> {
+    let prefix = format!("python3 {}/initial-prompt.py ", driver.descriptor().config_dir);
+    let arguments = command
+        .strip_prefix(&prefix)
+        .context("missing driver terminal launcher")?;
+    let command =
+        crate::driver::initial_prompt::launcher_command(&crate::ssh_transport::shell_quote(directory), arguments);
+    for (name, content) in [
+        ("initial-prompt.txt", prompt.to_owned()),
+        ("initial-prompt.py", crate::driver::initial_prompt::LAUNCHER.to_owned()),
+        (
+            "initial-prompt.json",
+            crate::driver::initial_prompt::launcher_config(driver)?,
+        ),
+    ] {
+        ship_file(
+            transport,
+            run_id,
+            directory,
+            &format!("{directory}/{name}"),
+            &content,
+            "initial-input",
+        )
+        .await?;
+    }
+    Ok(command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2258,9 +2301,8 @@ mod tests {
     #[test]
     fn remote_spawn_ignores_engine_owned_driver_config_files() {
         let driver = crate::driver::ClaudeDriver;
-        let (directory, prompt, gitignore) = remote_driver_config_paths("/remote/workspace", driver.descriptor());
+        let (directory, gitignore) = remote_driver_config_paths("/remote/workspace", driver.descriptor());
         assert_eq!(directory, "/remote/workspace/.claude");
-        assert_eq!(prompt, "/remote/workspace/.claude/initial-prompt.txt");
         assert_eq!(gitignore, "/remote/workspace/.claude/.gitignore");
         assert_eq!(driver.config_dir_gitignore(), "*\n");
     }

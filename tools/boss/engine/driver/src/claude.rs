@@ -894,7 +894,8 @@ impl AgentDriver for ClaudeDriver {
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "invalid worker run id"
         );
-        super::initial_prompt::provision(&config_dir, &config_dir.join("runs").join(run_id), prompt_text, self)?;
+        let prompt_home = super::codex::codex_home_for_run(&format!("claude-{run_id}"))?;
+        super::initial_prompt::provision(&config_dir, &prompt_home, prompt_text, self)?;
 
         let gitignore_path = config_dir.join(".gitignore");
         std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)
@@ -905,19 +906,14 @@ impl AgentDriver for ClaudeDriver {
         // swallowed by pre_trust_workspace.
         pre_trust_workspace(workspace);
 
-        // Claude creates no per-run state outside the cube workspace, so
-        // there is nothing for teardown (or a future retention sweep) to
-        // clean up. A Codex driver would return its Boss-owned CODEX_HOME
-        // (or archive root) here instead.
-        Ok(None)
+        // Record the private input home for the existing restart-safe home
+        // retention sweep; the workspace link does not own these bytes.
+        Ok(Some(super::DriverRuntimeState::new(serde_json::json!({
+            "initial_prompt_home": prompt_home,
+        }))))
     }
 
-    /// No-op: Claude needs no teardown. It creates no per-run state outside
-    /// the cube workspace — the `.claude/` config dir `provision_workspace`
-    /// writes lives inside the workspace, which cube owns and tears down
-    /// itself. `runtime_state` is expected to be `None` for Claude and is
-    /// ignored; we deliberately do not invent a cleanup target from the
-    /// engine environment or by scanning a shared provider home.
+    /// The recorded private input home is reclaimed by per-run retention.
     async fn teardown_workspace(
         &self,
         _workspace: Option<&Path>,
@@ -2086,21 +2082,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn provision_workspace_writes_prompt_gitignore_and_pretrust() {
+    #[test]
+    fn provision_workspace_writes_prompt_gitignore_and_pretrust() {
         // Redirect this thread's trust store without changing process HOME.
         let workspace = TempDir::new().unwrap();
         let fake_home = TempDir::new().unwrap();
         let _config = claude_config_override(&fake_home.path().join(".claude.json"));
 
-        let driver = ClaudeDriver;
-        let runtime_state = driver
-            .provision_workspace(workspace.path(), "hello prompt", "run-1")
-            .await
+        let _homes = crate::test_support::codex_homes_override(&fake_home.path().join("homes"));
+        let runtime_state = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ClaudeDriver.provision_workspace(workspace.path(), "hello prompt", "run-1"))
             .unwrap();
         assert!(
-            runtime_state.is_none(),
-            "Claude creates no out-of-workspace runtime state"
+            runtime_state.is_some(),
+            "Claude records its private input home for retention"
         );
 
         // Prompt file at the descriptor-derived path.

@@ -1,8 +1,9 @@
 //! Exec-time argv budget preflight for worker spawn.
 //!
 //! Initial briefs travel through the terminal launcher, outside argv. Keep
-//! budgeting static flags and environment, including legacy substitutions in
-//! synthetic commands, against the host's exec limits.
+//! budgeting static flags and environment against the host's exec limits.
+//! Substitution accounting below is exercised by synthetic test commands;
+//! production driver commands do not interpolate brief files.
 //! Past `ARG_MAX` — or, on Linux, past the per-argument `MAX_ARG_STRLEN`
 //! cap — the shell's `exec` fails with `E2BIG` inside the sourced pane
 //! script, invisible to the engine. This module estimates the expanded
