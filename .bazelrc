@@ -19,10 +19,9 @@ build --experimental_disk_cache_gc_max_age=7d
 # --stamp is deliberately OFF for ordinary builds. rules_rust's rust_binary
 # defaults to `stamp = -1` (follow --stamp), and a stamped Rustc action takes
 # stable-status.txt — which carries the commit sha — as an input, so with
-# --stamp on, every rust_binary in the repo (boss, bossctl, cube, checkleft,
-# repobin, hood, release, changelog, ...) recompiled on every commit, docs-only
-# commits included. Nothing here uses rules_rust's {STABLE_*} substitutions,
-# so the recompiles bought nothing. See
+# --stamp on, every rust_binary in the repo recompiles on every commit,
+# docs-only commits included. Nothing here uses rules_rust's {STABLE_*}
+# substitutions, so stamping buys nothing outside release builds. See
 # tools/boss/docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md.
 build --workspace_status_command=tools/boss/installer/workspace-status.sh
 

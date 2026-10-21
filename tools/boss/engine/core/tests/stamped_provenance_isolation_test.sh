@@ -17,10 +17,12 @@
 #   $2 — stamped targets found in deps(engine);          must be non-empty
 #        (positive control, so an empty $1 cannot be a rotted filter).
 #
-#   $3 — the root .bazelrc. `build --stamp` must not be set for ordinary
-#        builds: with it, every rust_binary's Rustc action takes
-#        stable-status.txt (which carries the commit sha) as an input and
-#        recompiles on every commit. It belongs under `build:release` only.
+#   $3, $4 — the root .bazelrc and the .ci.bazelrc it imports. `--stamp` must
+#        not be set for ordinary builds: with it, every rust_binary's Rustc
+#        action takes stable-status.txt (which carries the commit sha) as an
+#        input and recompiles on every commit. Under any verb (`build`,
+#        `common`, `test`) and any config (`build:ci`, ...) it is allowed only
+#        in `build:release`.
 #
 # Pure bash on purpose: the hermetic test wrapper strips PATH, and reading a
 # file with `$(<file)` needs no external tool.
@@ -28,7 +30,7 @@ set -euo pipefail
 
 engine_lib_hits_file="$1"
 positive_control_file="$2"
-bazelrc_file="$3"
+bazelrc_files=("$3" "$4")
 
 engine_lib_hits="$(<"$engine_lib_hits_file")"
 positive_control="$(<"$positive_control_file")"
@@ -51,16 +53,21 @@ if [[ -z "${positive_control//[[:space:]]/}" ]]; then
   exit 1
 fi
 
-while IFS= read -r line; do
-  # Strip trailing comments, then match an unconditional `build --stamp`
-  # (including `build --stamp=true`); `build:<config> --stamp` is allowed.
-  line="${line%%#*}"
-  if [[ "$line" =~ ^[[:space:]]*build[[:space:]]+(.*[[:space:]])?--stamp([[:space:]=]|$) ]]; then
-    echo "ERROR: .bazelrc sets an unconditional 'build --stamp': $line" >&2
-    echo "With --stamp, every rust_binary Rustc action reads stable-status.txt and recompiles on every commit." >&2
-    echo "Scope it to a config (e.g. 'build:release --stamp') instead." >&2
-    exit 1
-  fi
-done <"$bazelrc_file"
+for bazelrc_file in "${bazelrc_files[@]}"; do
+  while IFS= read -r line; do
+    # Strip trailing comments, then match `--stamp` (or `--stamp=true|1`)
+    # under build/common/test, optionally scoped to a `:config`.
+    line="${line%%#*}"
+    if [[ "$line" =~ ^[[:space:]]*(build|common|test)(:([A-Za-z0-9_-]+))?[[:space:]]+(.*[[:space:]])?--stamp(=true|=1|[[:space:]]|$) ]]; then
+      if [[ "${BASH_REMATCH[3]}" == "release" ]]; then
+        continue
+      fi
+      echo "ERROR: ${bazelrc_file##*/} enables --stamp outside build:release: $line" >&2
+      echo "With --stamp, every rust_binary Rustc action reads stable-status.txt and recompiles on every commit." >&2
+      echo "Scope it to 'build:release --stamp' instead." >&2
+      exit 1
+    fi
+  done <"$bazelrc_file"
+done
 
 echo "OK: the stamped provenance crate is linked by the engine binary only; engine_lib's closure is free of per-commit inputs."

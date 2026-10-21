@@ -870,10 +870,12 @@ sh_test(
         "$(location :engine_lib_test_stamped_deps)",
         "$(location :engine_binary_stamped_deps)",
         "$(location //:.bazelrc)",
+        "$(location //:.ci.bazelrc)",
     ],
     data = [
         ":engine_binary_stamped_deps",
         ":engine_lib_test_stamped_deps",
         "//:.bazelrc",
+        "//:.ci.bazelrc",
     ],
 )

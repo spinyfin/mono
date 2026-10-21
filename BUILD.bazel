@@ -6,7 +6,10 @@ exports_files([
 ])
 
 exports_files(
-    [".bazelrc"],
+    [
+        ".bazelrc",
+        ".ci.bazelrc",
+    ],
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/test-sandbox:__pkg__",
