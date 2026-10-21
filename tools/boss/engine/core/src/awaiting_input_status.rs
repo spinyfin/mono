@@ -298,10 +298,14 @@ pub async fn mirror_declared_wait_reclassifications(
         mirror_awaiting_input(
             work_db,
             publisher,
+            registry,
+            *slot_id,
             &state.run_id,
             is_pr_review,
-            Some(*prior),
-            Some(*new),
+            ActivityTransition {
+                prior: Some(*prior),
+                new: Some(*new),
+            },
         )
         .await;
     }

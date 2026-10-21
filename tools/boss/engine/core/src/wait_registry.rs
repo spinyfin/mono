@@ -267,10 +267,12 @@ impl WaitRegistry {
         let mut guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
         let state = guard.get_mut(execution_id)?;
         if let (Some(declared), Some(boundary)) = (state.active.as_ref()?.declared_after_seq, boundary_seq)
-            && declared >= boundary
+            && declared > boundary
         {
             return None;
         }
+        // Equality means the declaration observed this Stop while the worker
+        // was already parked. It belongs to that park and ends on its resume.
         let ended = state.active.take()?;
         state.expiry_logged = false;
         tracing::info!(

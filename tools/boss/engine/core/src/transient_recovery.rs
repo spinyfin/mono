@@ -507,7 +507,7 @@ async fn process_state(
             // session: if it didn't clear the error by the next
             // sweep, fall through to orphan+respawn.
             let already_nudged = nudged_executions.remove(&execution_id);
-            let try_nudge = !already_nudged && state.activity == WorkerActivity::Idle;
+            let try_nudge = !already_nudged && can_nudge(state.activity);
 
             if try_nudge {
                 let msg = if stall_reason == "no_activity" {
@@ -768,6 +768,13 @@ fn worker_error_class_to_policy(class: WorkerErrorClass) -> ErrorClass {
         WorkerErrorClass::Permanent => ErrorClass::Permanent,
         WorkerErrorClass::Indeterminate => ErrorClass::Indeterminate,
     }
+}
+
+fn can_nudge(activity: WorkerActivity) -> bool {
+    matches!(
+        activity,
+        WorkerActivity::Idle | WorkerActivity::WaitingOnWork | WorkerActivity::WaitOverdue
+    )
 }
 
 fn should_inspect(activity: WorkerActivity) -> bool {
@@ -1722,6 +1729,22 @@ mod tests {
         let prefix = out.strip_suffix('…').unwrap();
         assert_eq!(prefix, "éé", "must walk back to the char boundary at 4");
         assert!(prefix.len() <= 5);
+    }
+
+    #[test]
+    fn nudge_only_non_human_parked_workers() {
+        for (activity, expected) in [
+            (WorkerActivity::Spawning, false),
+            (WorkerActivity::Working, false),
+            (WorkerActivity::Idle, true),
+            (WorkerActivity::WaitingForInput, false),
+            (WorkerActivity::WaitingOnWork, true),
+            (WorkerActivity::WaitOverdue, true),
+            (WorkerActivity::Errored, false),
+            (WorkerActivity::Terminated, false),
+        ] {
+            assert_eq!(can_nudge(activity), expected, "{activity:?}");
+        }
     }
 
     #[test]
