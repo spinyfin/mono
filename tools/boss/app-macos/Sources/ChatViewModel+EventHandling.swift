@@ -47,6 +47,7 @@ extension ChatViewModel {
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
             pendingProjectDesignDocOpen = nil
+            engine.resetConnectTreeClaims()
             disconnectOffsiteBackupEdit()
             if engine.hasUnsentAction(kind: "recreate_coordinator") {
                 coordinatorResetWaiting = false

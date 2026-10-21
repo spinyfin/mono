@@ -41,7 +41,7 @@ extension ChatViewModel {
         // prior session (the engine restores it from the keychain at
         // boot) without waiting for a device-flow transition.
         engine.sendGitHubAuthStatus()
-        if let productID = currentSelectedProductID {
+        if let productID = currentSelectedProductID, engine.claimConnectTree(productId: productID) {
             engine.sendGetWorkTree(productId: productID, flow: flow)
         }
         startBackgroundWorkPolling()

@@ -166,7 +166,10 @@ final class WorkFetchOwnershipTests: XCTestCase {
         XCTAssertEqual(trees.first?["product_id"] as? String, "product_a")
     }
 
-    func testDisconnectedNavigationFlushesOnlyFinalProductOnReconnect() throws {
+    /// Verifies the isConnected guards: navigating while disconnected queues
+    /// nothing, and the single reconnect tree comes from the connect handler.
+    /// Queue keying is covered by `testQueuedTreesKeepNewestRequestPerProduct...`.
+    func testDisconnectedNavigationQueuesNothingAndConnectFetchesFinalProductOnce() throws {
         let path = socketPath()
         defer { unlink(path) }
         let server = try TestSocketServer(path: path)
@@ -194,6 +197,25 @@ final class WorkFetchOwnershipTests: XCTestCase {
         let trees = payloads.filter { $0["type"] as? String == "get_work_tree" }
         XCTAssertEqual(trees.count, 1)
         XCTAssertEqual(trees.first?["product_id"] as? String, "product_c")
+    }
+
+    func testQueuedSelectedTreeAndConnectTreeSendExactlyOneOnReconnect() throws {
+        let path = socketPath()
+        defer { unlink(path) }
+        let server = try TestSocketServer(path: path)
+        let socketModel = ChatViewModel(socketPath: path)
+        socketModel.products = model.products
+        socketModel.selectedWorkProductID = "product_a"
+        socketModel.engine.sendGetWorkTree(productId: "product_a", flow: .invalidationRefetch)
+        socketModel.engine.sendGetWorkTree(productId: "product_b", flow: .invalidationRefetch)
+        XCTAssertEqual(socketModel.engine.queuedReadCountForTesting, 2)
+        socketModel.engine.start()
+        defer { socketModel.engine.stop(); socketModel.applyEventForTest(.disconnected) }
+        let peer = try XCTUnwrap(server.accept(timeout: 5))
+        defer { peer.close() }
+        XCTAssertTrue(waitUntil { socketModel.isConnected })
+        let trees = try drain(peer).filter { $0["type"] as? String == "get_work_tree" }
+        XCTAssertEqual(trees.compactMap { $0["product_id"] as? String }.sorted(), ["product_a", "product_b"])
     }
 
     func testQueuedTreesKeepNewestRequestPerProductDespiteFetchSequence() throws {

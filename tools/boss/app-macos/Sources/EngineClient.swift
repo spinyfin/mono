@@ -239,6 +239,7 @@ final class EngineClient: @unchecked Sendable {
                 self.reachableState.withLock { $0 = true }
                 self.reachedReady = true
                 self.socketIndex = 0
+                self.connectTreeClaims.withLock { $0.removeAll() }
                 // Ordered behind any previous connection's pending lines
                 // and `.disconnected`, so a fast reconnect cannot land
                 // `.connected` before the old connection's teardown.
@@ -504,13 +505,29 @@ final class EngineClient: @unchecked Sendable {
         queuedReads.withLock { $0.contains { $0.id == requestId } }
     }
 
+    /// Products whose post-connect tree has been issued on the current
+    /// connection, by either the queue flush or the connect handler, so
+    /// whichever runs second does not send a duplicate.
+    private let connectTreeClaims = OSAllocatedUnfairLock(initialState: Set<String>())
+
+    /// True when the caller may send the connect-time tree for `productId`
+    /// (the queue flush has not already sent one on this connection).
+    func claimConnectTree(productId: String) -> Bool {
+        connectTreeClaims.withLock { $0.insert(productId).inserted }
+    }
+
+    func resetConnectTreeClaims() {
+        connectTreeClaims.withLock { $0.removeAll() }
+    }
+
     private func flushQueuedReads() {
-        let drained = queuedReads.withLock { state -> [(id: String, data: Data)] in
-            let copy = state.map { (id: $0.id, data: $0.data) }
+        let drained = queuedReads.withLock { state -> [(id: String, data: Data, treeProductID: String?)] in
+            let copy = state.map { (id: $0.id, data: $0.data, treeProductID: $0.treeProductID) }
             state.removeAll()
             return copy
         }
         for item in drained {
+            if let productID = item.treeProductID, !claimConnectTree(productId: productID) { continue }
             guard let payload = (try? JSONSerialization.jsonObject(with: item.data)) as? [String: Any] else { continue }
             write(payload, envelopeRequestId: item.id)
         }
