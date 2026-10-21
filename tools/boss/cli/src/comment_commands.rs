@@ -148,6 +148,9 @@ pub(crate) struct CommentRunsArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct CommentReplyArgs {
+    /// Versioned JSON object: version, title, instruction, optional replacements.
+    #[arg(long)]
+    pub(crate) proposed_edit: Option<String>,
     /// The comprehensive answer to post. Pass the full text inline —
     /// there is deliberately no `--body-file` (a file-reading flag on this
     /// command would let a read-only session exfiltrate arbitrary file

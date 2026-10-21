@@ -1234,6 +1234,9 @@ final class FakeCommentBackend: CommentBackend {
     func reviseDoc(artifactKind: String, artifactId: String) {
         reviseDocCalls.append((artifactKind, artifactId))
     }
+    func approveEdit(entryID: String, instruction: String?) {}
+    func dismissEdit(entryID: String) {}
+    func revealRevision(_ id: String) {}
     func postFollowup(commentId: String, body: String) {
         postFollowupCalls.append((commentId, body))
     }

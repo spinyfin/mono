@@ -30,6 +30,9 @@ protocol CommentBackend: AnyObject {
     func fetchBannerState(artifactKind: String, artifactId: String)
     /// Post an operator follow-up reply in a bucket-2 comment's thread.
     func postFollowup(commentId: String, body: String)
+    func approveEdit(entryID: String, instruction: String?)
+    func dismissEdit(entryID: String)
+    func revealRevision(_ id: String)
     /// The `[Revise]`-banner action: batch-address every unaddressed
     /// `revision` comment on the artifact.
     func reviseDoc(artifactKind: String, artifactId: String)
@@ -66,6 +69,7 @@ final class CommentEngineBridge: CommentBackend {
     var onSubmissionRejected: ((String) -> Void)?
     /// Told when a submission is accepted, so a stale "not saved" notice clears.
     var onSubmissionAccepted: (() -> Void)?
+    var onRevealRevision: ((String) -> Void)?
 
     /// Active registrations keyed by the layer's identity. Weak layer refs so a
     /// closed viewer deallocates; stale entries are pruned lazily on routing.
@@ -185,6 +189,16 @@ final class CommentEngineBridge: CommentBackend {
         return true
     }
 
+    func approveEdit(entryID: String, instruction: String?) {
+        engine.sendCommentsApproveEdit(entryID: entryID, instruction: instruction)
+    }
+
+    func dismissEdit(entryID: String) {
+        engine.sendCommentsDismissEdit(entryID: entryID)
+    }
+
+    func revealRevision(_ id: String) { onRevealRevision?(id) }
+
     func postFollowup(commentId: String, body: String) {
         engine.sendCommentsPostFollowup(commentId: commentId, body: body, author: author)
     }
@@ -231,6 +245,22 @@ final class CommentEngineBridge: CommentBackend {
             if Self.topic(artifactKind: reg.artifactKind, artifactId: reg.artifactId) == topic {
                 layer.reload()
             }
+        }
+    }
+
+    /// Revision lifecycle changes refresh the status shown on approved cards.
+    func handleProposalRevisionInvalidation(itemIDs: [String]) {
+        let changed = Set(itemIDs)
+        guard !changed.isEmpty else { return }
+        for reg in registrations.values {
+            guard let layer = reg.layer else { continue }
+            let referencesChangedRevision = layer.comments.contains { comment in
+                comment.threadEntries.contains { entry in
+                    guard let id = entry.proposedEdit?.revisionID else { return false }
+                    return changed.contains(id)
+                }
+            }
+            if referencesChangedRevision { layer.reload() }
         }
     }
 

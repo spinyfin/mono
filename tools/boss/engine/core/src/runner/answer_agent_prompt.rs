@@ -314,6 +314,10 @@ async fn compose_guide_answer_prompt(
          {task_instruction} You may not edit, push, \
          or mutate any state. When you have a complete answer, post it with:\n\n\
          ```\n{cmd} --body \"<your comprehensive answer>\"\n```\n\n\
+         When recommending a change to this PR, add --proposed-edit with a single-quoted JSON object \
+         alongside --body: {{\"version\":1,\"title\":\"Short edit title\",\"instruction\":\"What to change, where, and why\",\"replacements\":[]}}. \
+         Optional replacements contain path, old_text, and new_text strings; include them only when confident. \
+         Keep the full prose answer in --body. The reviewer must approve the proposal; you must not edit the branch. \
          Post exactly one reply, then stop.\n",
         cmd = crate::answer_agent::THREAD_REPLY_COMMAND,
     ));

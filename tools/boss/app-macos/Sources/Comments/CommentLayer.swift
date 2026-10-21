@@ -815,6 +815,19 @@ final class CommentLayer: NSObject, ObservableObject {
     /// Returns whether the reply was accepted; the composer keeps its text
     /// when it was not (retry queue full).
     @discardableResult
+    func approveEdit(entryID: String, instruction: String?) -> Bool {
+        guard let backend, backend.canAcceptUserSubmission(describing: "Approve proposed edit") else { return false }
+        backend.approveEdit(entryID: entryID, instruction: instruction)
+        return true
+    }
+
+    func dismissEdit(entryID: String) {
+        guard let backend, backend.canAcceptUserSubmission(describing: "Dismiss proposed edit") else { return }
+        backend.dismissEdit(entryID: entryID)
+    }
+
+    func revealRevision(_ id: String) { backend?.revealRevision(id) }
+
     func postFollowup(body: String, for comment: Comment) -> Bool {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, comment.status == .answered else { return false }

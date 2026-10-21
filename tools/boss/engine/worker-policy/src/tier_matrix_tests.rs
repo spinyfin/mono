@@ -72,6 +72,7 @@ fn sanctioned_write_fixtures() -> Vec<FrontendRequest> {
         FrontendRequest::CommentsPostAnswer {
             run_id: "e".into(),
             body: "answer".into(),
+            proposed_edit: None,
         },
         FrontendRequest::CommentsRecordGuideOutcome {
             run_id: "e".into(),

@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 52;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 53;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -46,6 +46,17 @@ const TASKS_CRITICAL_PROVENANCE_46: &str = "ALTER TABLE tasks ADD COLUMN critica
 /// — comes back `Working` rather than `Idle`. NULL on every pre-existing row,
 /// which parses as `unknown`; see `semantic_progress::SemanticTurnCondition`.
 const WORK_RUNS_SEMANTIC_TURN_CONDITION_50: &str = "ALTER TABLE work_runs ADD COLUMN semantic_turn_condition TEXT";
+
+const PROPOSED_EDIT_COLUMN_53: &str = "ALTER TABLE comment_thread_entries ADD COLUMN proposed_edit TEXT";
+
+const SUPERSEDE_ANSWER_PROPOSALS_53: &str = "CREATE TRIGGER IF NOT EXISTS supersede_answer_proposals
+            AFTER UPDATE OF status ON work_comments
+            WHEN OLD.status = 'answered' AND NEW.status <> 'answered'
+            BEGIN
+                UPDATE comment_thread_entries
+                SET proposed_edit = json_set(proposed_edit, '$.state', 'superseded')
+                WHERE comment_id = NEW.id AND json_extract(proposed_edit, '$.state') = 'proposed';
+            END";
 
 /// Serves the shared-PR probes (`o.pr_url = t.pr_url`, `pr_url = ?`) so they
 /// are index lookups instead of full `tasks` scans.
@@ -253,6 +264,10 @@ impl WorkDb {
         if version < 52 && !table_has_column(&tx, "work_executions", "progression_neighbourhood")? {
             tx.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")?;
         }
+        if version < 53 && !table_has_column(&tx, "comment_thread_entries", "proposed_edit")? {
+            tx.execute_batch(PROPOSED_EDIT_COLUMN_53)?;
+        }
+        tx.execute_batch(SUPERSEDE_ANSWER_PROPOSALS_53)?;
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
                 "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
@@ -772,7 +787,13 @@ mod floor_tests {
             43,
             44,
             45,
+            46,
+            47,
+            48,
+            49,
+            50,
             51,
+            52,
             CURRENT_SCHEMA_VERSION,
             CURRENT_SCHEMA_VERSION + 1,
         ] {
@@ -846,6 +867,10 @@ mod floor_tests {
                 conn.execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
                     .unwrap();
             }
+            if version >= 53 {
+                conn.execute_batch(PROPOSED_EDIT_COLUMN_53).unwrap();
+                conn.execute_batch(SUPERSEDE_ANSWER_PROPOSALS_53).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -887,6 +912,8 @@ mod floor_tests {
             expected
                 .execute_batch("ALTER TABLE work_executions ADD COLUMN progression_neighbourhood TEXT")
                 .unwrap();
+            expected.execute_batch(PROPOSED_EDIT_COLUMN_53).unwrap();
+            expected.execute_batch(SUPERSEDE_ANSWER_PROPOSALS_53).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

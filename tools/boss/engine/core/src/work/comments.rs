@@ -141,6 +141,30 @@ pub(super) fn wire_resolution(resolution: AnchorResolution) -> CommentResolution
     }
 }
 
+/// Shared by the standalone transition and atomic answer/proposal ingestion.
+pub(super) fn transition_comment_to_answered_on(conn: &Connection, comment_id: &str) -> Result<WorkComment> {
+    let now = now_string();
+    let n = conn.execute(
+        "UPDATE work_comments
+             SET status = CASE WHEN intent = ?5 THEN ?6 ELSE ?2 END,
+                 status_actor = 'engine', updated_at = ?3,
+                 reopened_at = CASE WHEN intent = ?5 THEN NULL ELSE reopened_at END
+             WHERE id = ?1 AND status = ?4",
+        params![
+            comment_id,
+            COMMENT_STATUS_ANSWERED,
+            now,
+            COMMENT_STATUS_ANSWERING,
+            INTENT_REVISION,
+            COMMENT_STATUS_ACTIVE,
+        ],
+    )?;
+    if n == 0 {
+        bail!("comment {comment_id} not found, or not 'answering' (expected answering → answered)");
+    }
+    query_comment(conn, comment_id)?.with_context(|| format!("missing comment after answered transition: {comment_id}"))
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Create an `active` comment. Returns the inserted row.
@@ -419,27 +443,7 @@ impl WorkDb {
     /// [`Self::latest_answer_agent_run_for_comment`]).
     pub fn transition_comment_to_answered(&self, comment_id: &str) -> Result<WorkComment> {
         let conn = self.connect()?;
-        let now = now_string();
-        let n = conn.execute(
-            "UPDATE work_comments
-             SET status = CASE WHEN intent = ?5 THEN ?6 ELSE ?2 END,
-                 status_actor = 'engine', updated_at = ?3,
-                 reopened_at = CASE WHEN intent = ?5 THEN NULL ELSE reopened_at END
-             WHERE id = ?1 AND status = ?4",
-            params![
-                comment_id,
-                COMMENT_STATUS_ANSWERED,
-                now,
-                COMMENT_STATUS_ANSWERING,
-                INTENT_REVISION,
-                COMMENT_STATUS_ACTIVE,
-            ],
-        )?;
-        if n == 0 {
-            bail!("comment {comment_id} not found, or not 'answering' (expected answering → answered)");
-        }
-        query_comment(&conn, comment_id)?
-            .with_context(|| format!("missing comment after answered transition: {comment_id}"))
+        transition_comment_to_answered_on(&conn, comment_id)
     }
 
     /// Bucket-2 track (P3b): `answering → answer_failed`, fired when the

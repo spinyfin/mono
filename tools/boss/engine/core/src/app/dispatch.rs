@@ -83,6 +83,9 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::CommentsDismiss { .. } => Box::pin(comments::handle_comments_dismiss(ctx, r)),
         r @ FrontendRequest::CommentsGet { .. } => Box::pin(comments::handle_comments_get(ctx, r)),
         r @ FrontendRequest::CommentsList { .. } => Box::pin(comments::handle_comments_list(ctx, r)),
+        r @ (FrontendRequest::CommentsApproveEdit { .. } | FrontendRequest::CommentsDismissEdit { .. }) => {
+            Box::pin(comments::handle_comments_proposed_edit(ctx, r))
+        }
         r @ FrontendRequest::CommentsPostAnswer { .. } => Box::pin(comments::handle_comments_post_answer(ctx, r)),
         r @ FrontendRequest::CommentsPostFollowup { .. } => Box::pin(comments::handle_comments_post_followup(ctx, r)),
         r @ FrontendRequest::CommentsRecordGuideOutcome { .. } => {

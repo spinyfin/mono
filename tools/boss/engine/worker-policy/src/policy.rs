@@ -561,6 +561,8 @@ fn worker_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::CommentsPostFollowup { .. }
         | FrontendRequest::CommentsResolve { .. }
         | FrontendRequest::CommentsReviseDoc { .. }
+        | FrontendRequest::CommentsApproveEdit { .. }
+        | FrontendRequest::CommentsDismissEdit { .. }
         | FrontendRequest::CommentsSetIntent { .. }
         | FrontendRequest::CommentsSetStatus { .. }
         | FrontendRequest::CommentsUpdateAnchor { .. }

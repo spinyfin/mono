@@ -453,6 +453,44 @@ pub struct CommentThreadEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer_agent_run_id: Option<String>,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_edit: Option<AnswerProposedEdit>,
+}
+
+/// Explicit answer-agent output. Version 1 has one executable instruction and
+/// optional exact replacements; prose is never interpreted as a proposal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProposedEditInput {
+    pub version: u32,
+    pub title: String,
+    pub instruction: String,
+    #[serde(default)]
+    pub replacements: Vec<ProposedTextReplacement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProposedTextReplacement {
+    pub path: String,
+    pub old_text: String,
+    pub new_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposedEditState {
+    Proposed,
+    Approved,
+    Dismissed,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnswerProposedEdit {
+    pub proposal: ProposedEditInput,
+    pub state: ProposedEditState,
+    pub revision_id: Option<String>,
+    #[serde(default)]
+    pub revision_status: Option<String>,
 }
 
 /// `comment_thread_entries.entry_kind` values. `THREAD_ENTRY_KIND_NUDGE` is

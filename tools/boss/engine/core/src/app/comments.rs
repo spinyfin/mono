@@ -1641,7 +1641,12 @@ pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequ
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::CommentsPostAnswer { run_id, body } = req else {
+    let FrontendRequest::CommentsPostAnswer {
+        run_id,
+        body,
+        proposed_edit,
+    } = req
+    else {
         unreachable!()
     };
     if body.trim().is_empty() {
@@ -1698,34 +1703,9 @@ pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequ
         }
     };
 
-    if let Err(err) = work_db.complete_answer_agent_run(&run.id, ANSWER_AGENT_RUN_STATUS_REPLIED, Some(&body), None) {
-        send_work_error(&sink, &request_id, &err);
-        return;
-    }
-    crate::answer_agent_observability::record_replied(&server_state.metrics);
-
-    if let Err(err) = work_db.create_comment_thread_entry(
-        &comment_id,
-        THREAD_ENTRY_KIND_ANSWER,
-        "engine",
-        &body,
-        None,
-        Some(&run.id),
-    ) {
-        // The run is already `replied` — surfacing this as a hard error would
-        // tempt the agent into a (now-guarded, hence failing) retry. Log
-        // loudly and continue to the status transition; the thread entry is
-        // an audit/UI artifact, not load-bearing for `answering → answered`.
-        tracing::error!(
-            comment_id = %comment_id,
-            run_id = %run.id,
-            err = %err,
-            "CommentsPostAnswer: run completed but failed to create the thread entry",
-        );
-    }
-
-    match work_db.transition_comment_to_answered(&comment_id) {
+    match work_db.post_answer_with_proposal(&run_id, &run.id, &comment_id, &body, proposed_edit) {
         Ok(comment) => {
+            crate::answer_agent_observability::record_replied(&server_state.metrics);
             let revision = publish_comment_invalidation(
                 &server_state,
                 &session_id,
@@ -1741,11 +1721,89 @@ pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequ
             tracing::error!(
                 comment_id = %comment_id,
                 err = %err,
-                "CommentsPostAnswer: run completed and thread entry posted, but failed to \
-                 transition the comment to 'answered'",
+                "CommentsPostAnswer: atomic answer write failed",
             );
             send_work_error(&sink, &request_id, &err);
         }
+    }
+}
+
+pub(super) async fn handle_comments_proposed_edit(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        peer_pid,
+        ..
+    } = ctx;
+    if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::WorkError {
+                message: "proposal actions require app or Boss authority".to_owned(),
+            },
+        );
+        return;
+    }
+    let (entry_id, instruction, approve) = match req {
+        FrontendRequest::CommentsApproveEdit { entry_id, instruction } => (entry_id, instruction, true),
+        FrontendRequest::CommentsDismissEdit { entry_id } => (entry_id, None, false),
+        _ => unreachable!(),
+    };
+    let result = if approve {
+        work_db
+            .approve_proposed_edit(&entry_id, instruction, &GhPrStateChecker)
+            .and_then(|outcome| match outcome {
+                ReviseDocOutcome::Created { task_id, .. } | ReviseDocOutcome::AlreadyInFlight { task_id } => {
+                    Ok(task_id)
+                }
+                ReviseDocOutcome::PrClosed { reason } | ReviseDocOutcome::NotApplicable { reason } => {
+                    anyhow::bail!(reason)
+                }
+                ReviseDocOutcome::NoUnresolvedComments => anyhow::bail!("proposal is no longer actionable"),
+            })
+            .map(Some)
+    } else {
+        work_db.dismiss_proposed_edit(&entry_id).map(|_| None)
+    };
+    match result {
+        Ok(task_id) => {
+            if let Some(task_id) = task_id {
+                let product_id = work_db
+                    .get_work_item(&task_id)
+                    .ok()
+                    .map(|item| item.product_id().to_owned());
+                publish_work_invalidation(
+                    &server_state,
+                    &session_id,
+                    &request_id,
+                    product_id
+                        .as_deref()
+                        .map(|id| vec![work_product_topic(id)])
+                        .unwrap_or_default(),
+                    "answer_proposal_approved",
+                    product_id,
+                    vec![task_id],
+                )
+                .await;
+            }
+            // The entry id belongs to exactly one comment; use the same read
+            // surface as approval rather than trusting a caller-supplied id.
+            let comment = work_db.comment_for_proposed_edit(&entry_id);
+            respond_comment_invalidation(
+                &server_state,
+                &session_id,
+                &request_id,
+                &sink,
+                comment,
+                "answer_proposal_changed",
+            )
+            .await;
+        }
+        Err(err) => send_work_error(&sink, &request_id, &err),
     }
 }
 
@@ -1903,6 +1961,7 @@ mod tests {
         handle_comments_post_answer(
             ctx,
             FrontendRequest::CommentsPostAnswer {
+                proposed_edit: None,
                 run_id: execution_id.clone(),
                 body: "Here's the answer.".to_owned(),
             },
@@ -1956,6 +2015,7 @@ mod tests {
         handle_comments_post_answer(
             dispatch_ctx(&server_state, &work_db, &sink),
             FrontendRequest::CommentsPostAnswer {
+                proposed_edit: None,
                 run_id: execution_id.clone(),
                 body: "First answer.".to_owned(),
             },
@@ -1968,6 +2028,7 @@ mod tests {
         handle_comments_post_answer(
             dispatch_ctx(&server_state, &work_db, &sink),
             FrontendRequest::CommentsPostAnswer {
+                proposed_edit: None,
                 run_id: execution_id,
                 body: "Second answer.".to_owned(),
             },
@@ -2030,6 +2091,7 @@ mod tests {
         handle_comments_post_answer(
             dispatch_ctx(&server_state, &work_db, &sink),
             FrontendRequest::CommentsPostAnswer {
+                proposed_edit: None,
                 run_id: other_execution.id,
                 body: "irrelevant".to_owned(),
             },
@@ -2525,6 +2587,7 @@ mod tests {
         handle_comments_post_answer(
             dispatch_ctx(&server_state, &work_db, &sink),
             FrontendRequest::CommentsPostAnswer {
+                proposed_edit: None,
                 run_id: execution_id,
                 body: "Here's the answer to the question you retracted.".to_owned(),
             },
@@ -2544,7 +2607,7 @@ mod tests {
                 .list_comment_thread_entries(&comment_id)
                 .unwrap()
                 .iter()
-                .all(|e| e.entry_kind != THREAD_ENTRY_KIND_ANSWER),
+                .all(|e| e.entry_kind != boss_protocol::THREAD_ENTRY_KIND_ANSWER),
             "the retracted question's answer must not be posted to the thread",
         );
     }

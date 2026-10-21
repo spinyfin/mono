@@ -898,6 +898,15 @@ final class ChatViewModel: ObservableObject {
 
     private func commonInit() {
         bindBoardReadObserver()
+        commentBridge.onRevealRevision = { [weak self] id in
+            guard let self else { return }
+            guard let productID = self.task(withID: id)?.productID ?? self.currentSelectedProductID else {
+                self.workErrorMessage = "The revision is not loaded yet. Refresh the board and try again."
+                return
+            }
+            self.revealWorkCard(id, productID: productID)
+        }
+
         commentBridge.onSubmissionRejected = { [weak self] action in
             self?.showActionNotSaved(requestKind: action)
         }

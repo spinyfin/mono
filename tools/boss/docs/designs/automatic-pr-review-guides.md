@@ -419,3 +419,40 @@ Immediately after the title, include a short, nonempty section headed exactly `#
 ```
 
 Automatic updates use the existing `review_guide_source_capture` and `review_guide_generation` rollout flags and review pool. New heads supersede obsolete queued attempts; every replacement starts from the still-published version. Submission validates the changed-since section, a nonempty Evidence section, and all links against the new PR comparison. A failed update keeps the prior version readable, and the engine projects revision status and resolved findings to the card and viewer.
+
+## Structured edits proposed by question answers
+
+A read-only answer agent can recommend an executable edit without changing the PR branch. It posts the ordinary prose through `boss comment reply --body ...` and, when it recommends a change to the PR, includes `--proposed-edit '<JSON>'`. The optional JSON object is separate from the prose; the engine never extracts proposals from answer text.
+
+Version 1 has this shape:
+
+```json
+{
+  "version": 1,
+  "title": "Clarify maintenance cost",
+  "instruction": "In docs/design.md, explain that assembly cost must be proportional to the change, because DB scoping alone does not bound it.",
+  "replacements": [
+    {
+      "path": "docs/design.md",
+      "old_text": "delta-only invalidation",
+      "new_text": "change-proportional board maintenance"
+    }
+  ]
+}
+```
+
+`title` and `instruction` must be nonempty. `replacements` defaults to an empty list and contains optional exact text suggestions, not automatically applied patches. Unsupported versions are rejected before completing the answer run. The RPC field is optional for compatibility with older reply clients. Future incompatible shapes require a new version; additive optional fields can retain version 1. The answer agent's permissions remain unchanged: its only mutation is posting its answer to its bound thread. It cannot approve a proposal or write the branch.
+
+Schema 53 adds nullable JSON `comment_thread_entries.proposed_edit`. An answer entry is the proposal's stable identity and carries its comment and answer-run foreign keys. The stored envelope contains `proposal`, `state` (`proposed`, `approved`, `dismissed`, or `superseded`), and `revision_id`. `revision_status` is hydrated from the linked task on reads. Answer text, proposal, run completion, and the question's answered transition commit together. Existing answer rows retain null proposals. A subsequent follow-up or reclassification supersedes an unapproved proposal when the comment leaves `answered`; approved and dismissed history remains intact.
+
+The app sends `comments_approve_edit` with `entry_id` and an optional reviewer-edited `instruction`, or `comments_dismiss_edit` with `entry_id`. Both require app/Boss authority. Approval uses the existing review-guide comment-to-revision transaction: it accepts only an actionable proposal on an answered question, changes the comment to a revisable intent, assembles the normal guide directive with the approved instruction, exact replacements, originating comment ID and answer entry ID, creates the same-PR revision, claims the comment, and saves the approved state and revision ID atomically. The normal revision chain controls sequencing with other revisions. Concurrent or retried approval returns the already-created revision without inserting another task, including when that revision's PR subsequently closes.
+
+The established guide rule applies to first approval after merge or closure: return `PrClosed`, leave the proposal proposed and the question answered, and create neither a revision nor a new chore. There is no document-chore fallback for guide feedback. Dismissal keeps the audit record but removes the card's actions. These are deliberate choices to preserve existing guide semantics.
+
+The comment thread renders the proposal below its answer. Approve as revision is one click; Edit then approve expands an inline instruction editor; Dismiss removes the actions after the engine confirms the state. Approved cards show revision status and an Open revision action. Superseded cards explain that a later conversation replaced the proposal. Errors use the existing work-error banner, with no modal. The feature is live on deployment for newly produced structured proposals; old prose-only answers are not converted retroactively.
+
+Implementation entry points (line references at introduction):
+
+- Answer-agent task/output protocol: `tools/boss/engine/core/src/runner/answer_agent_prompt.rs:313`; reply ingestion: `tools/boss/engine/core/src/app/comments.rs:1635`.
+- Existing comment classification and question dispatch: `tools/boss/engine/core/src/app/comments.rs:87` and `tools/boss/engine/core/src/app/comments.rs:255`.
+- Existing comment-to-revision path: `tools/boss/engine/core/src/work/guide_feedback.rs:35`; proposal approval enters the same transaction through `revise_guide_pr_with_proposal`.

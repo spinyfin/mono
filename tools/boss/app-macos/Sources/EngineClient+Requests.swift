@@ -1118,6 +1118,16 @@ extension EngineClient {
     /// The `[Revise]`-banner action: batch-address every unaddressed
     /// `revision` comment on the artifact. Engine replies
     /// `comments_revise_doc_result`.
+    func sendCommentsApproveEdit(entryID: String, instruction: String?) {
+        var request: [String: Any] = ["type": "comments_approve_edit", "entry_id": entryID]
+        if let instruction { request["instruction"] = instruction }
+        sendLine(request)
+    }
+
+    func sendCommentsDismissEdit(entryID: String) {
+        sendLine(["type": "comments_dismiss_edit", "entry_id": entryID])
+    }
+
     func sendCommentsReviseDoc(artifactKind: String, artifactId: String) {
         sendLine([
             "type": "comments_revise_doc",

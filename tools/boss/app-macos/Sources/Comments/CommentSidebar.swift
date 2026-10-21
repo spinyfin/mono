@@ -229,6 +229,7 @@ private struct RevisionChip: View {
 /// `Comment.from` filters it out on load.
 private struct ThreadEntriesView: View {
     let entries: [CommentThreadEntry]
+    @ObservedObject var layer: CommentLayer
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -252,6 +253,9 @@ private struct ThreadEntriesView: View {
                     RoundedRectangle(cornerRadius: 4)
                         .fill(backgroundColor(for: entry.entryKind))
                 )
+                if let proposal = entry.proposedEdit {
+                    ProposedEditCard(entryID: entry.id, edit: proposal, layer: layer)
+                }
             }
         }
     }
@@ -569,7 +573,7 @@ private struct CommentRow: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                 if !comment.threadEntries.isEmpty {
-                    ThreadEntriesView(entries: comment.threadEntries)
+                    ThreadEntriesView(entries: comment.threadEntries, layer: layer)
                 }
 
                 bucketTwoTrack
