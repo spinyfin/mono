@@ -436,7 +436,7 @@ Breakdown size: 36 entries (36 in-scope, 0 deferred) — the wire/journal/execut
 
 All entries deliver to `spinyfin/mono`, each as one PR, normally within about 1,500 changed lines / 25 files. Effort reflects one worker session per capability. The legacy removal split is grounded in current source: `ssh_spawn.rs` alone is 1,462 lines, the three observation/reconciliation files total 1,125, and the wrapper/distribution Rust files add 854 before their adapter callers. These are separate deletions after acceptance, not one oversized adapter PR. Dependencies below are gates, not an instruction to serialize the entire list. The source phases are §3.2: the in-flight brief-delivery prerequisite, then protocol/spoke/hub/provisioning first, local and capacity next, offline qualification next, A afterward; board work is independent.
 
-At depth zero, Protocol, Provisioner discovery and Invalidation measurement can run in parallel; §3.2 step 1 is not a new entry because [PR #3238](https://github.com/spinyfin/mono/pull/3238) already delivers it (see the prerequisite below), and it gates only the Spoke worker supervisor. After Protocol, Spoke journal, Hub stream and Host credentials can run in parallel in separate crates. Managed package/provider work proceeds alongside hub consumers. Local spoke and Capacity scheduling develop in parallel after the hub contracts exist; their production rollout follows remote acceptance, without making provisioning a false implementation dependency. A's remote app endpoint begins only after B qualification; its client and gate then precede hub deployment. Board runtime caching and invalidation separation are parallel after measurement; hook batching and dispatch concurrency are independent of them.
+At depth zero, Protocol, Provisioner discovery and Invalidation measurement can run in parallel; §3.2 step 1 is not a new entry because [PR #3238](https://github.com/spinyfin/mono/pull/3238) already delivers it (see the prerequisite below), and it gates only the Spoke worker supervisor. After Protocol, Spoke journal and outbound session, Hub authenticated stream manager and Host enrollment and certificate lifecycle can run in parallel in separate crates. Managed package/provider work proceeds alongside hub consumers. Local spoke and Capacity scheduling develop in parallel after the hub contracts exist; their production rollout follows remote acceptance, without making provisioning a false implementation dependency. A's remote app endpoint begins only after B qualification; its client and gate then precede hub deployment. Board runtime caching and invalidation separation are parallel after measurement; hook batching and dispatch concurrency are independent of them.
 
 Substantial shared-file ordering is explicit: Workspace executor precedes Supervisor extraction; Hub adapter precedes Hub observation projection in `host_adapter.rs` / server wiring; Hub observation projection precedes hook-write batching in the ingress transaction code; the remote app endpoint precedes client behavior in shared request/envelope definitions. The later task must forward-port the earlier one's changes preservingly, never replace them with an older snapshot. Incidental BUILD/module registration conflicts do not serialize otherwise independent crates.
 
@@ -478,6 +478,7 @@ Scope: in-scope
 Extract and reuse the existing local cube transport and recovery filesystem operations for the spoke. Wire the typed workspace commands to that executor in the daemon, keeping lease policy and GitHub decisions in the hub (§§2.1–2.2).
 
 - **Deliverables:** lower-level host execution crate and migrated local caller; complete WorkspaceOp validation/dispatch with lease reconciliation; Bazel tests for interrupted acquisition, recovery bookmark preservation and rejected paths/operations.
+  - Extract the `driver::initial_prompt::provision` caller wiring and run-input-home reclamation into `host-execution`, with no `engine/core` dependency, for spoke spawn and Stop/exit.
 - **Effort:** large
 - **Dependencies:** Spoke journal and outbound session
 
@@ -487,7 +488,8 @@ Scope: in-scope
 
 Run provisioned drivers in token-identified tmux sessions (§3.2 step 3). Reuse host-execution, tmux and driver code, with durable Spawn/Adopt/Deliver/Stop phases and real host preflight.
 
-- **Deliverables:** driver provisioning and the [PR #3238](https://github.com/spinyfin/mono/pull/3238) brief relay launched from `host-execution` under the service user, closing that prerequisite's supervisor-side gaps; token-based adoption/control plus local lease heartbeat ownership; real-tmux Bazel tests for duplicate spawn, crash ambiguity, daemon restart and sibling-safe stop.
+- **Deliverables:** driver provisioning and the [PR #3238](https://github.com/spinyfin/mono/pull/3238) brief relay launched from `host-execution` under the service user; token-based adoption/control plus local lease heartbeat ownership; real-tmux Bazel tests for duplicate spawn, crash ambiguity, daemon restart and sibling-safe stop.
+  - Validate `Spawn.prompt_utf8` as UTF-8 before driver provisioning, wire run-input-home cleanup on Stop/exit, reject an unset or non-private/unwritable private-home root, and map a backward-compatible machine-readable relay signal to a typed brief-not-delivered Spawn outcome distinct from `Exited(exit_code)`; keep the local caller honoring that signal until Local spoke adoption.
 - **Effort:** large
 - **Dependencies:** [PR #3238](https://github.com/spinyfin/mono/pull/3238) merged; Host workspace and recovery executor
 
@@ -578,6 +580,7 @@ Scope: in-scope
 Create independently installable daemon packages using the repository release pipeline (§2.6). Include the dedicated-user service environment and preserve live tmux/journal state across service restart; no host is enrolled merely by installing files.
 
 - **Deliverables:** signed manifests/platform packages and pinned verification trust; launchd/systemd definitions and idempotent bootstrap installer; Bazel packaging/verification tests for wrong platform, digest/signature failure and owner-only paths.
+  - Pin `BOSS_CODEX_HOMES_DIR` inside owner-only service state in both service definitions and verify the root is writable and private as the service user, with no shared-temp fallback.
 - **Effort:** large
 - **Dependencies:** Spoke worker supervisor
 
@@ -608,6 +611,7 @@ Scope: in-scope
 Implement the selected cloud API/cloud-init adapter against the job contract (§2.2). The provider channel installs the package, delivers the enrollment secret and credentials to the dedicated user, starts the service and reports readiness without SSH.
 
 - **Deliverables:** concrete cloud provisioner and versioned cloud-init payload; secret-reference bootstrap and as-user tool/credential preflight; Bazel provider-contract tests plus a repo-owned fresh-host acceptance runner/report format.
+  - Preflight `python3` with `fcntl`, `pty` and `termios` as the service user in the installed service environment; report failures through `failed_preflights` and keep the host unschedulable.
 - **Effort:** large
 - **Dependencies:** Hub managed provisioning jobs
 
@@ -618,6 +622,7 @@ Scope: in-scope
 Implement the selected MDM adapter for already managed machines (§2.2), including policy/job retries and service-user credential access. This can run in parallel with Linux provisioning because provider crates/payloads are separate and shared job APIs already landed.
 
 - **Deliverables:** concrete MDM job adapter and installer payload; authenticated secret delivery and service-user/launchd preflight; Bazel provider-contract tests plus a repo-owned fresh-host acceptance runner/report format.
+  - Preflight `python3` with `fcntl`, `pty` and `termios` as the service user in the installed launchd environment; report failures through `failed_preflights` and keep the host unschedulable.
 - **Effort:** large
 - **Dependencies:** Hub managed provisioning jobs
 
