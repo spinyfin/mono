@@ -86,7 +86,11 @@ rust_library(
     deps = [
         "//lib/rust/git_utils",
         "//tools/boss/backoff",
-        "//tools/boss/build-provenance",
+        # NOT "//tools/boss/build-provenance": that crate's source embeds
+        # the commit sha and changes every commit. It is linked only by the
+        # two `engine` rust_binary targets below, which hand the values to
+        # `build_info::install_provenance` at startup. See
+        # `stamped_provenance_isolation_test` at the bottom of this file.
         "//tools/boss/claude_client",
         "//tools/boss/codex_auth",
         "//tools/boss/command-runner",
@@ -179,6 +183,11 @@ rust_binary(
     deps = [
         ":engine_lib",
         "//tools/boss/build-info",
+        # The per-commit stamped crate (VERSION, GIT_SHA, GIT_DIRTY,
+        # BUILD_TIME). Linked here, in the leaf binary, and handed to
+        # engine_lib via build_info::install_provenance in main.rs, so only
+        # this binary relinks when the commit sha changes.
+        "//tools/boss/build-provenance",
         "//tools/boss/engine/utils",
         "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
@@ -197,6 +206,9 @@ rust_binary(
     deps = [
         ":engine_lib",
         "//tools/boss/build-info",
+        # Same stamped leaf crate as the production binary: main.rs is
+        # shared, and the fixture reports the real build identity.
+        "//tools/boss/build-provenance",
         "//tools/boss/engine/utils",
         "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
@@ -817,5 +829,53 @@ sh_test(
         "//tools/boss/bossctl:srcs",
         "//tools/boss/engine/driver:srcs",
         "//tools/boss/protocol:srcs",
+    ],
+)
+
+# ── Stamped-provenance isolation guard ───────────────────────────────────────
+#
+# `//tools/boss/build-provenance` is the one crate whose source changes on
+# every commit: it `include!`s the Bazel-stamped commit sha. It must stay a
+# leaf that only the two `engine` rust_binary targets above link. The moment
+# it is (transitively) a dependency of `engine_lib`, every commit — a
+# docs-only change included — recompiles `engine_lib`, every
+# `rust_test(crate = ":engine_lib")` binary, `boss` and `bossctl`, and
+# re-executes their tests. See
+# docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md.
+#
+# `genquery` evaluates against the real dependency graph at build time
+# (hermetic, cached, no `bazel query` subprocess), so the test fails on the
+# PR that reintroduces the edge rather than showing up later as CI slowness.
+# `engine_lib_test` is the query root because its closure is `engine_lib`'s
+# closure plus test-only deps — anything `boss`/`bossctl` would inherit.
+genquery(
+    name = "engine_lib_test_stamped_deps",
+    expression = 'filter("//tools/boss/(build-provenance:|installer:build_provenance_rs)", deps(//tools/boss/engine/core:engine_lib_test))',
+    scope = [":engine_lib_test"],
+)
+
+# Positive control: the same filter over the production binary must find the
+# crate, so an empty result above means "not linked", not "filter rotted".
+genquery(
+    name = "engine_binary_stamped_deps",
+    expression = 'filter("//tools/boss/build-provenance:build-provenance$", deps(//tools/boss/engine/core:engine))',
+    scope = [":engine"],
+)
+
+sh_test(
+    name = "stamped_provenance_isolation_test",
+    size = "small",
+    srcs = ["tests/stamped_provenance_isolation_test.sh"],
+    args = [
+        "$(location :engine_lib_test_stamped_deps)",
+        "$(location :engine_binary_stamped_deps)",
+        "$(location //:.bazelrc)",
+        "$(location //:.ci.bazelrc)",
+    ],
+    data = [
+        ":engine_binary_stamped_deps",
+        ":engine_lib_test_stamped_deps",
+        "//:.bazelrc",
+        "//:.ci.bazelrc",
     ],
 )

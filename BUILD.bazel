@@ -6,8 +6,14 @@ exports_files([
 ])
 
 exports_files(
-    [".bazelrc"],
-    visibility = ["//tools/test-sandbox:__pkg__"],
+    [
+        ".bazelrc",
+        ".ci.bazelrc",
+    ],
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/test-sandbox:__pkg__",
+    ],
 )
 
 # Exported narrowly so `engine/core`'s self-test can embed the root

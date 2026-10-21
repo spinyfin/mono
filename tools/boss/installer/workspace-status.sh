@@ -105,12 +105,12 @@ fi
 #
 # STABLE_BOSS_GIT_SHA_FULL / STABLE_BOSS_GIT_DIRTY are read ONLY by
 # `build_provenance_rs`, which stamps its own dedicated, single-purpose
-# `boss-build-provenance` crate — never `build_info_rs`/engine_lib directly.
-# That keeps the stamping logically separate from engine_lib's own source,
-# but does NOT protect engine_lib's action cache the way build_info_rs's
-# byte-stable output does: engine_lib still recompiles whenever the commit
-# sha changes, because engine_lib depends on this crate's compiled output.
-# See that crate's own doc comment for the verified detail.
+# `boss-build-provenance` leaf crate — never `build_info_rs`/engine_lib
+# directly. Only the `engine` rust_binary targets link that crate (they hand
+# the values to engine_lib at startup), so a changed sha relinks the engine
+# binary and nothing else. Keep it that way: if engine_lib linked the crate,
+# every commit would recompile engine_lib and re-execute its tests.
+# //tools/boss/engine/core:stamped_provenance_isolation_test guards the edge.
 echo "STABLE_BOSS_VERSION $BOSS_VERSION"
 echo "STABLE_BOSS_BASE_VERSION $BOSS_BASE_VERSION"
 echo "STABLE_BOSS_GIT_SHA $SHA"

@@ -23,11 +23,19 @@ rust_library(
         # Absolute path to the generated provenance-constants file.
         "BOSS_BUILD_PROVENANCE_RS": "$(execpath //tools/boss/installer:build_provenance_rs)",
     },
+    # Only the `engine` rust_binary targets may link this crate — never
+    # `engine_lib`. Its source embeds the commit sha, so every dependent
+    # recompiles on every commit; the binaries hand the values to engine_lib
+    # at runtime instead (build_info::install_provenance). Package-level
+    # visibility cannot express "binaries only", so
+    # //tools/boss/engine/core:stamped_provenance_isolation_test enforces it.
     visibility = [
         "//tools/boss/engine/core:__pkg__",
     ],
 )
 
+# Genuinely depends on the stamp, so this is the one test target a
+# docs-only commit still executes (it takes well under a second).
 rust_test(
     name = "build-provenance_test",
     size = "small",
