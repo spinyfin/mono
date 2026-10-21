@@ -158,3 +158,45 @@ async fn a_multiple_choice_proposal_with_bad_options_is_rejected_at_submission()
         );
     }
 }
+
+#[tokio::test]
+async fn unparkable_multiple_choice_retains_answerable_options() {
+    let (state, _dir, execution_id, task_id) = live_chore_execution();
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", [&task_id, "in_review"])
+        .unwrap();
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(&execution_id, ProposalKind::RunDone, multiple_choice_payload()),
+        )
+        .await,
+    );
+    let (id, kind, options): (String, String, String) = state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT a.id, a.question_type, a.choice_options FROM attentions a
+         JOIN attention_groups g ON g.id = a.group_id
+         WHERE g.association_task_id = ?1 AND g.state = ?2",
+            [&task_id, "open"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(kind, "multiple_choice");
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&options).unwrap(),
+        vec!["Gradual", "All at once", "Behind a flag"]
+    );
+    let group = state
+        .work_db
+        .answer_attention(&id, Some("Gradual".into()), false, false)
+        .unwrap();
+    let members = state.work_db.list_attentions_for_group(&group.id).unwrap();
+    assert_eq!(members[0].answer.as_deref(), Some("Gradual"));
+}

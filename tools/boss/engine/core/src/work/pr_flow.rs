@@ -558,14 +558,40 @@ impl WorkDb {
         // a task does. The question card is what makes the decision answerable,
         // so folding the question into a `worker_failed` detail would leave
         // the row looking failed when it is waiting on a human.
+        let mut question_attention = None;
         match query_task(&tx, &work_item_id)? {
-            Some(_)
+            Some(task)
                 if question.is_some()
                     && !tx.query_row(
                         "SELECT EXISTS(SELECT 1 FROM operator_questions WHERE execution_id = ?1 AND status = 'open')",
                         [execution_id],
                         |row| row.get::<_, bool>(0),
-                    )? => {}
+                    )? =>
+            {
+                // The parent may belong to the merge poller or another blocker.
+                // Keep that lifecycle intact and use the existing answerable
+                // attention surface, atomically with terminalizing this run.
+                let question = question.expect("question guard");
+                let (question_type, choice_options) = match &question.answer_type {
+                    boss_protocol::OperatorAnswerType::MultipleChoice { choices } => {
+                        ("multiple_choice", Some(serde_json::to_string(choices)?))
+                    }
+                    _ => ("yes_no", None),
+                };
+                question_attention = Some(super::attentions::create_attention_in_tx(
+                    &tx,
+                    boss_protocol::CreateAttentionInput::builder()
+                        .kind("question")
+                        .group_key(format!("worker_question|{execution_id}"))
+                        .association_task_id(task.id)
+                        .source_task_id(work_item_id.clone())
+                        .source_kind("task_transcript")
+                        .question_type(question_type)
+                        .maybe_choice_options(choice_options)
+                        .prompt_text(format!("{}\n\n{}", question.text, question.explanation))
+                        .build(),
+                )?);
+            }
             Some(task) if matches!(task.status, TaskStatus::Active | TaskStatus::Todo) => {
                 tx.execute(
                     "UPDATE tasks
@@ -631,6 +657,7 @@ impl WorkDb {
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerFailureCompletion {
+            question_attention,
             execution: updated_execution,
             work_item: task.map(task_to_item),
             released_lease_id: original_lease_id,
