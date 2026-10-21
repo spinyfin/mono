@@ -54,6 +54,136 @@ fn update(event: FrontendEvent) -> boss_protocol::work_tree_delta::WorkTreeUpdat
     update
 }
 
+#[tokio::test]
+async fn standalone_attention_reads_do_not_acquire_the_writer_connection() {
+    let (state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&state.work_db, "reader");
+    let task = crate::test_support::create_test_chore(&state.work_db, &product.id, "read filter");
+    state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    assert!(
+        state
+            .record_selected_product("session-app", Some(product.id.clone()))
+            .await
+    );
+    let reader = Arc::new(state.work_db.reader().unwrap());
+    let worker_state = state.clone();
+    let selector = boss_protocol::short_id_wire_form(task.short_id.unwrap());
+    let writer = state.work_db.connect().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tokio::runtime::Runtime::new().unwrap().block_on(async move {
+            let sink = make_session_sink();
+            for request in [
+                FrontendRequest::ListAttentionItemsForWorkItem {
+                    work_item_id: selector.clone(),
+                },
+                FrontendRequest::ListAttentionGroups {
+                    product_id: product.id,
+                    project_id: None,
+                    task_id: Some(selector),
+                    kind: None,
+                    state: None,
+                },
+            ] {
+                let ctx = Dispatch::builder()
+                    .server_state(worker_state.clone())
+                    .work_db(reader.clone())
+                    .sink(sink.clone())
+                    .session_id("attention reader")
+                    .request_id("read")
+                    .recv_instant(Instant::now())
+                    .decode_ms(0.0)
+                    .build();
+                match request {
+                    req @ FrontendRequest::ListAttentionItemsForWorkItem { .. } => {
+                        attentions::handle_list_attention_items_for_work_item(ctx, req).await
+                    }
+                    req => attentions::handle_list_attention_groups(ctx, req).await,
+                }
+                let response = sink.next().await.unwrap().payload;
+                assert!(matches!(
+                    response,
+                    FrontendEvent::AttentionItemsForWorkItemList { .. } | FrontendEvent::AttentionGroupsList { .. }
+                ));
+            }
+            tx.send(()).unwrap();
+        });
+    });
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    // Release even on failure so a regression cannot leave a deadlocked thread.
+    drop(writer);
+    worker.join().unwrap();
+    result.expect("attention reads must finish while the writer is held");
+}
+
+#[tokio::test]
+async fn work_tree_attention_snapshots_and_deltas_follow_create_and_dismiss() {
+    let (state, _dir) = test_server_state();
+    let db = &state.work_db;
+    let product = crate::test_support::create_test_product_named(db, "attention tree");
+    let other = crate::test_support::create_test_product_named(db, "other");
+    let task = crate::test_support::create_test_chore(db, &product.id, "attention task");
+    let sink = make_session_sink();
+    let first = update(fetch(&state, &sink, &product.id, true).await);
+    for field in ["attention_items", "attention_groups", "attention_members"] {
+        assert_eq!(first.changes[field], serde_json::json!([]));
+    }
+    db.upsert_external_tracker_attention(&product.id, "external_tracker_auth_failed", "Auth", "Reconnect")
+        .unwrap();
+    db.upsert_external_tracker_attention(&other.id, "external_tracker_auth_failed", "Other", "Other")
+        .unwrap();
+    let (member, group) = db
+        .create_attention(
+            boss_protocol::CreateAttentionInput::builder()
+                .kind("followup")
+                .association_task_id(&task.id)
+                .source_kind("task_transcript")
+                .source_task_id(&task.id)
+                .proposed_name("Follow up")
+                .proposed_description("Do the followup")
+                .build(),
+        )
+        .unwrap();
+    let created = update(fetch(&state, &sink, &product.id, true).await);
+    assert_eq!(created.base_sequence, Some(first.sequence));
+    assert_eq!(
+        created.changes["attention_items"]["upserts"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(created.changes["attention_groups"]["upserts"][0]["id"], group.id);
+    assert_eq!(created.changes["attention_members"]["upserts"][0]["id"], member.id);
+
+    let FrontendEvent::WorkTree {
+        attention_items,
+        attention_groups,
+        attention_members,
+        ..
+    } = fetch(&state, &sink, &product.id, false).await
+    else {
+        panic!("full tree")
+    };
+    assert_eq!(
+        serde_json::to_value(&attention_items).unwrap(),
+        serde_json::to_value(db.list_attention_items_for_work_item(&product.id).unwrap()).unwrap()
+    );
+    assert_eq!(attention_groups[0].id, group.id);
+    assert_eq!(attention_members[0].id, member.id);
+    update(fetch(&state, &sink, &product.id, true).await);
+    db.dismiss_attention(&group.id, None).unwrap();
+    db.resolve_external_tracker_attention(&product.id, "external_tracker_auth_failed")
+        .unwrap();
+    let dismissed = update(fetch(&state, &sink, &product.id, true).await);
+    assert_eq!(dismissed.changes["attention_groups"]["order"], serde_json::json!([]));
+    assert_eq!(dismissed.changes["attention_members"]["order"], serde_json::json!([]));
+    assert_eq!(dismissed.changes["attention_items"]["upserts"][0]["status"], "resolved");
+    assert_eq!(
+        update(fetch(&state, &sink, &product.id, true).await).changes,
+        serde_json::json!({})
+    );
+}
+
 #[test]
 fn same_product_reads_preserve_freshness_and_delta_sequence() {
     overlapping_reads(false);

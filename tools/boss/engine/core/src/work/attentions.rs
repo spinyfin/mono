@@ -17,6 +17,8 @@
 //! `generation` and starts a fresh group — this is what keeps "one group ⇒
 //! one revision" true across iteration.
 
+pub(super) mod reads;
+
 use super::proposals::mark_followup_proposal_decided_in_tx;
 use super::*;
 use std::collections::HashSet;
@@ -532,23 +534,7 @@ impl WorkDb {
         state: Option<&str>,
     ) -> Result<Vec<AttentionGroup>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {GROUP_COLS} FROM attention_groups
-             WHERE product_id = ?1
-               AND (?2 IS NULL OR association_project_id = ?2)
-               AND (?3 IS NULL OR association_task_id = ?3)
-               AND (?4 IS NULL OR kind = ?4)
-               AND (
-                    (?5 IS NULL AND state IN ('open', 'partially_answered'))
-                    OR state = ?5
-               )
-             ORDER BY created_at DESC, id DESC"
-        ))?;
-        let rows = stmt.query_map(
-            params![product_id, project_id, task_id, kind, state],
-            map_attention_group,
-        )?;
-        collect_rows(rows)
+        reads::list_groups(&conn, product_id, project_id, task_id, kind, state)
     }
 
     /// Fetch one group by `atg_…` id or `A<n>` short id.

@@ -66,6 +66,97 @@ final class ApplyAttentionGroupsListTests: XCTestCase {
         ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
     }
 
+    func testFullAndDeltaTreeWireDecodingIncludesAttentionDTOs() async throws {
+        func wire<T: Encodable>(_ value: T) throws -> Any {
+            try JSONSerialization.jsonObject(with: JSONEncoder().encode(value))
+        }
+        let group = makeGroup(id: "atg_wire", state: "open")
+        let member = makeMember(id: "atn_wire", groupID: group.id, ordinal: 1)
+        let item = WorkAttentionItem(id: "attn_wire", workItemID: "prod_1", kind: "external_tracker_auth_failed",
+                                     status: "open", title: "Reconnect", bodyMarkdown: "Reconnect", createdAt: "1")
+        let tree: [String: Any] = [
+            "type": "work_tree",
+            "product": ["id": "prod_1", "name": "Fixture", "slug": "fixture", "description": "",
+                        "status": "active", "created_at": "1", "updated_at": "1"],
+            "attention_items": try wire([item]), "attention_groups": try wire([group]),
+            "attention_members": try wire([member])
+        ]
+        for payload in [tree, ["type": "work_tree_update", "update": [
+            "product_id": "prod_1", "sequence": 1, "changes": tree
+        ]]] {
+            let model = makeModel()
+            let applied = expectation(description: "tree decoded")
+            let client = EngineClient(socketPath: "/tmp/boss-decode-\(UUID().uuidString).sock")
+            client.onEvent = { event in
+                if case .workTree = event {
+                    model.applyEventForTest(event)
+                    applied.fulfill()
+                }
+            }
+            let data = try JSONSerialization.data(withJSONObject: ["payload": payload])
+            client.consumeLineForTesting(try XCTUnwrap(String(data: data, encoding: .utf8)))
+            await fulfillment(of: [applied], timeout: 3)
+            XCTAssertEqual(model.attentionItemsByWorkItemID["prod_1"], [item])
+            XCTAssertEqual(model.attentionGroupsByProductID["prod_1"], [group])
+            XCTAssertEqual(model.attentionMembers(forGroup: group.id), [member])
+        }
+    }
+
+    func testWorkTreeAppliesAttentionListsAndClearsDismissedGroupsWithoutFetching() {
+        let model = makeModel()
+        model.engine.simulateConnectedForTesting = true
+        let product = WorkProduct(id: "prod_1", name: "Fixture", slug: "fixture", description: "",
+                                  repoRemoteURL: nil, status: "active", createdAt: "1", updatedAt: "1")
+        let group = makeGroup(id: "atg_tree", state: "open")
+        let member = makeMember(id: "atn_tree", groupID: group.id, ordinal: 1)
+        var item = WorkAttentionItem(id: "attn_tree", workItemID: product.id, kind: "external_tracker_auth_failed",
+                                     status: "open", title: "Reconnect", bodyMarkdown: "Reconnect tracker", createdAt: "1")
+        var requests: [String] = []
+        model.engine.outboundRecorder = { requests.append($0["type"] as? String ?? "") }
+        model.applyEventForTest(.workTree(product: product, projects: [], tasks: [], chores: [],
+                                         taskRuntimes: [], dependencies: [], ideas: [],
+                                         attentionItems: [item], attentionGroups: [group], attentionMembers: [member]))
+        XCTAssertEqual(model.attentionItemsByWorkItemID[product.id], [item])
+        XCTAssertEqual(model.attentionGroupsByProductID[product.id]?.map(\.id), [group.id])
+        XCTAssertEqual(model.attentionMembers(forGroup: group.id).map(\.id), [member.id])
+        XCTAssertEqual(model.openAttentionGroupCount, 1)
+        XCTAssertFalse(requests.contains("list_attention_groups"))
+        XCTAssertFalse(requests.contains("list_attention_items_for_work_item"))
+
+        item.status = "resolved"
+        requests.removeAll()
+        model.applyEventForTest(.workTree(product: product, projects: [], tasks: [], chores: [],
+                                         taskRuntimes: [], dependencies: [], ideas: [],
+                                         attentionItems: [item], attentionGroups: [], attentionMembers: []))
+        XCTAssertEqual(model.attentionItemsByWorkItemID[product.id], [item])
+        XCTAssertEqual(model.openAttentionGroupCount, 0)
+        XCTAssertNil(model.attentionMembersByGroupID[group.id])
+        XCTAssertTrue(requests.isEmpty, "An applied tree needs no attention-list follow-up")
+    }
+
+    func testTreeRefreshTriggersNeverRequestStandaloneAttentionLists() async {
+        let model = makeModel()
+        model.engine.simulateConnectedForTesting = true
+        let first = WorkProduct(id: "prod_1", name: "First", slug: "first", description: "",
+                                repoRemoteURL: nil, status: "active", createdAt: "1", updatedAt: "1")
+        let second = WorkProduct(id: "prod_2", name: "Second", slug: "second", description: "",
+                             repoRemoteURL: nil, status: "active", createdAt: "1", updatedAt: "1")
+        model.applyEventForTest(.productsList(products: [first, second]))
+        model.selectWorkProduct(first.id)
+        var requests: [String] = []
+        model.engine.outboundRecorder = { requests.append($0["type"] as? String ?? "") }
+        model.applyEventForTest(.connected)
+        model.selectWorkProduct(second.id)
+        model.applyEventForTest(.workInvalidated(topic: "work.product.prod_2", productId: second.id, itemIds: []))
+        model.applyEventForTest(.resyncRequired)
+        try? await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(requests.contains("get_work_tree"))
+        XCTAssertTrue(requests.contains("list_deferred_scope_attentions"))
+        XCTAssertFalse(requests.contains("list_attention_groups"))
+        XCTAssertFalse(requests.contains("list_attention_items_for_work_item"))
+        model.applyEventForTest(.disconnected)
+    }
+
     // MARK: - Empty response
 
     func testEmptyResponseClearsExistingGroupsForProduct() {

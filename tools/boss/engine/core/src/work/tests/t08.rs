@@ -52,6 +52,58 @@ fn followup(task_id: &str, name: &str) -> CreateAttentionInput {
 }
 
 #[test]
+fn group_listing_batches_members_in_two_selects_regardless_of_group_count() {
+    thread_local! {
+        static SELECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let (db, product, project, _) = fixture();
+    let reader = db.reader().unwrap();
+    let mut seeded = 0;
+    for count in [1, 12, 64] {
+        for index in seeded..count {
+            for prompt in ["first", "second"] {
+                db.create_attention(question(&project, &format!("docs/{index}.md"), prompt))
+                    .unwrap();
+            }
+        }
+        seeded = count;
+        reader.connect().unwrap().trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(|event| {
+                if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+                    && sql.trim_start().starts_with("SELECT")
+                {
+                    SELECTS.with(|count| count.set(count.get() + 1));
+                }
+            }),
+        );
+        SELECTS.with(|count| count.set(0));
+        let (groups, members) = reader
+            .list_attention_groups_with_members(&product, None, None, None, None)
+            .unwrap();
+        assert_eq!(SELECTS.with(std::cell::Cell::get), 2);
+        reader
+            .connect()
+            .unwrap()
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        assert_eq!(groups.len(), count);
+        assert_eq!(members.len(), count * 2);
+        for group in groups {
+            let actual: Vec<_> = members.iter().filter(|member| member.group_id == group.id).collect();
+            assert_eq!(
+                actual.iter().map(|member| member.ordinal).collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        }
+    }
+    let (groups, members) = reader
+        .list_attention_groups_with_members(&product, None, None, Some("followup"), None)
+        .unwrap();
+    assert!(groups.is_empty());
+    assert!(members.is_empty());
+}
+
+#[test]
 fn create_question_assigns_group_short_id_and_grouping_key() {
     let (db, product_id, project_id, _task) = fixture();
     let (attention, group) = db

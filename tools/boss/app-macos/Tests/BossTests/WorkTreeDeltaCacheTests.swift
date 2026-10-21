@@ -2,6 +2,23 @@ import XCTest
 @testable import Boss
 
 final class WorkTreeDeltaCacheTests: XCTestCase {
+    func testAttentionDeltasRetainUnchangedRowsAndRemoveDismissedGroups() throws {
+        var cache = WorkTreeDeltaCache()
+        let fields = ["attention_items", "attention_groups", "attention_members"]
+        var initial: [String: Any] = ["product": ["id": "product"]]
+        for field in fields { initial[field] = [["id": "old"], ["id": "kept"]] }
+        XCTAssertNotNil(cache.apply(["product_id": "product", "sequence": UInt64(1), "changes": initial]))
+        var changes: [String: Any] = [:]
+        for field in fields {
+            changes[field] = ["upserts": [["id": "new"]], "order": ["kept", "new"]]
+        }
+        let tree = try XCTUnwrap(cache.apply(["product_id": "product", "sequence": UInt64(2),
+                                             "base_sequence": UInt64(1), "changes": changes]))
+        for field in fields {
+            XCTAssertEqual((tree[field] as? [[String: Any]])?.compactMap { $0["id"] as? String }, ["kept", "new"])
+        }
+    }
+
     func testSnapshotPatchDeletionReorderAndGapRecovery() throws {
         var cache = WorkTreeDeltaCache()
         cache.startConnection(1)
