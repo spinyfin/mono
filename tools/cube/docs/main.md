@@ -601,7 +601,10 @@ the group. Both stdout and stderr are logged and audited on success or failure.
   arrives mid-cleanup takes a different workspace (or mints one) and never
   sees a half-cleaned tree. Dirty, conflicted and quarantined workspaces are
   skipped, because a recovery lease (`--allow-dirty`) must be able to claim
-  them. A busy workspace (exit 75) is released and skipped. A failed cleanup,
+  them. A busy workspace (exit 75) is released and skipped only if it had no
+  earlier cleanup failure. Retries that report busy or no longer have a declared
+  cleanup step remain failed and withheld until a successful cleanup or explicit
+  `--clear-failed-cleanup`. A failed cleanup,
   or one whose process died, leaves the mark in place — the workspace is not
   leased in a broken state — and is retried (at most every ten minutes, without
   waiting for disk pressure) until it succeeds. Marked workspaces appear as

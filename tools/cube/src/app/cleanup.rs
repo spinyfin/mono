@@ -55,12 +55,13 @@
 //!   be able to claim them, and the aged-unhealthy pass owns their fate.
 //! - **A failure is not a clean.** A cleanup that fails (or whose process dies)
 //!   leaves the workspace marked and out of the pool — it is never leased in a
-//!   half-cleaned state — and is retried, throttled, until it succeeds.
+//!   half-cleaned state — until it succeeds or `--clear-failed-cleanup` is used.
+//!   Shell exits 126/127 and spawn failures stay withheld because an earlier
+//!   command may have partly run.
 //! - **The repo's command may decline.** Exit status
 //!   [`CLEANUP_BUSY_EXIT_CODE`] means "in use right now, nothing done": the
-//!   mark is lifted and cube moves on to another workspace. So is a command
-//!   that could not run at all (shell exit 126/127): a workspace nothing was
-//!   done to is not withheld for it.
+//!   mark is lifted only if this attempt had no earlier failure. A retry that
+//!   reports busy or has no declared step stays failed and withheld.
 //!
 //! ## Bytes freed
 //!
@@ -290,7 +291,7 @@ struct Candidate {
     record: WorkspaceRecord,
     repo: RepoRecord,
     /// `None` only for a workspace that still carries a mark although its repo
-    /// no longer declares a cleanup step; such a mark is lifted, not retried.
+    /// no longer declares a cleanup step; the unresolved failure stays withheld.
     step: Option<CleanupStep>,
     reason: CleanupReason,
 }
@@ -562,14 +563,19 @@ fn execute(
     }
 
     let Some(step) = &candidate.step else {
-        // The repo stopped declaring a cleanup step while this workspace was
-        // marked. There is nothing to retry; lift the mark rather than withhold
-        // the workspace forever.
-        finish(store, record, CleanupResult::Skipped, now, now);
+        let error = "repo no longer declares a cleanup step; earlier cleanup remains unresolved";
+        finish(store, record, CleanupResult::Failed, now, now);
         eprintln!(
-            "cube: cleanup: {}: its repo no longer declares a cleanup step; lifting the mark",
+            "cube: cleanup: {}: {error}; withholding from leases",
             record.workspace_id,
         );
+        audit_outcome(database_path, candidate, opts, "failed", 0, 0, error);
+        report.failed.push(FailedCleanup {
+            repo: record.repo.clone(),
+            workspace_id: record.workspace_id.clone(),
+            reason: candidate.reason,
+            error: error.to_string(),
+        });
         return;
     };
 
@@ -621,7 +627,7 @@ fn execute(
             status: Some(CLEANUP_BUSY_EXIT_CODE),
             stderr,
             ..
-        }) => {
+        }) if candidate.reason == CleanupReason::LowDisk => {
             finish(store, record, CleanupResult::Skipped, now, finished_at);
             eprintln!(
                 "cube: cleanup: {} is busy, leaving it alone{}",

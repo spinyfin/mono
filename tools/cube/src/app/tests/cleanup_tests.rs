@@ -489,7 +489,7 @@ fn a_repo_that_declares_no_cleanup_is_left_alone() {
 }
 
 #[test]
-fn a_mark_whose_repo_no_longer_declares_cleanup_is_lifted_not_retried_forever() {
+fn a_mark_whose_repo_no_longer_declares_cleanup_stays_withheld() {
     let pool = Pool::seed(1);
     let long_ago = 1_000;
     assert!(
@@ -506,11 +506,40 @@ fn a_mark_whose_repo_no_longer_declares_cleanup_is_lifted_not_retried_forever() 
     pool.pass(&runner, false);
 
     assert!(runner.ran_in().is_empty(), "there is no command to run");
-    assert_eq!(
-        pool.cleanup_status(0),
-        None,
-        "the workspace is not withheld for a step that is gone"
+    assert_eq!(pool.cleanup_status(0), Some(CleanupStatus::Failed));
+    assert!(!pool.claim(0), "removing the declaration cannot repair partial cleanup");
+    let events = audit_events(&pool.tempdir);
+    assert!(
+        events.iter().any(
+            |e| e["outcome"] == "failed" && e["output"].as_str().unwrap_or_default().contains("no longer declares")
+        )
     );
+}
+
+#[test]
+fn failed_or_stale_cleanup_stays_withheld_when_retry_is_busy() {
+    for failed in [true, false] {
+        let pool = Pool::seed(1);
+        assert!(pool.store.begin_workspace_cleanup("mono", &pool.id(0), 1, 0).unwrap());
+        if failed {
+            pool.store
+                .finish_workspace_cleanup("mono", &pool.id(0), CleanupResult::Failed, 1, 1)
+                .unwrap();
+        }
+        let _volume = testing::with_reading(AMPLE_TEST_VOLUME);
+        let runner =
+            CleanupRunner::new(AMPLE_TEST_VOLUME.available_bytes, 0).outcome(|_| Err(exit_status(75, "busy retry")));
+        let report = pool.pass(&runner, false);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(pool.cleanup_status(0), Some(CleanupStatus::Failed));
+        assert!(!pool.claim(0), "a busy retry cannot repair partial cleanup");
+        let events = audit_events(&pool.tempdir);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["outcome"] == "failed" && e["output"].as_str().unwrap_or_default().contains("busy retry"))
+        );
+    }
 }
 
 #[test]

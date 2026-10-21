@@ -93,11 +93,15 @@ pub fn output_bounded(
     });
     let started = Instant::now();
     let deadline = started + timeout;
+    let mut poll_delay = Duration::from_millis(1);
     let status = loop {
         on_poll(started.elapsed());
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(poll_delay.min(deadline.saturating_duration_since(Instant::now())));
+                poll_delay = (poll_delay * 2).min(Duration::from_millis(20));
+            }
             Ok(None) => {
                 kill(&mut child);
                 return Err(timed_out());
