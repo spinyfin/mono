@@ -649,7 +649,14 @@ pub async fn run_one_pass_observed(
     // Last, after every lifecycle transition above has written its state:
     // say WHY each Review-lane card that is still blocked or stalled is so,
     // and re-kick the one path that has no owner (a dead revision).
-    let blocked = crate::blocked_pr_sweep::run_one_pass(work_db, publisher).await;
+    let blocked = crate::blocked_pr_sweep::run_one_pass(
+        work_db,
+        publisher,
+        completion_handler
+            .map(|handler| handler.review_batch_fanout_enabled())
+            .unwrap_or(false),
+    )
+    .await;
     outcome.blocked_pr_diagnosed = blocked.diagnosed;
     outcome.blocked_pr_redispatched = blocked.redispatched;
 
@@ -1942,7 +1949,7 @@ pub(crate) async fn reconcile_stranded(
                 candidate,
                 probe_result,
                 &failures,
-                &crate::ci_transient_retry::BkCli::default(),
+                crate::ci_transient_retry::poller_retrier().as_ref(),
             )
             .await
             {
@@ -1972,7 +1979,7 @@ pub(crate) async fn dispatch_ci_axis(
             candidate,
             probe_result,
             failures,
-            &crate::ci_transient_retry::BkCli::default(),
+            crate::ci_transient_retry::poller_retrier().as_ref(),
         )
         .await
     {

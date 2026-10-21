@@ -9,9 +9,12 @@
 //!    an agent that stopped or refused the job, or a job that never produced
 //!    an exit status, is infrastructure by definition.
 //! 2. A tool's distinct machine-readable outcome: checkleft exits `3` when
-//!    it could not gather its inputs (a GitHub API timeout / 5xx while
-//!    resolving the PR description) as opposed to `1` for a real finding.
-//!    See `tools/checkleft/README.md` "Exit codes".
+//!    it could not determine what changed or its GitHub call timed out, as
+//!    opposed to `1` for a real finding (`tools/checkleft/README.md`, "Exit
+//!    codes"). A failed PR-description lookup that answers HTTP 5xx is **not**
+//!    yet a distinct outcome: checkleft reports it as an error finding with
+//!    exit `1`, so that case (the original incident) is classified by step 3
+//!    from the log text, not by exit status.
 //! 3. A conservative allowlist of upstream-unavailable log signatures (HTTP
 //!    5xx from an API, gateway timeouts, connection resets, DNS failures),
 //!    applied only when the same log carries no deterministic marker (a
@@ -186,7 +189,40 @@ const UPSTREAM_SIGNATURES: &[(&str, &str)] = &[
     ("Could not resolve host", "DNS failure"),
     ("Temporary failure in name resolution", "DNS failure"),
     ("TLS handshake timeout", "TLS handshake timeout"),
-    ("Error downloading [", "dependency download failed"),
+];
+
+/// Bazel prints `Error downloading [<url>] to <path>: <cause>` for every
+/// failed fetch, permanent or not. It is evidence only together with a
+/// retryable cause on the same line.
+const DOWNLOAD_FAILURE_NEEDLE: &str = "Error downloading [";
+
+/// Causes that make a failed download change-caused or permanent: a wrong
+/// URL, missing credentials, or a pinned checksum that does not match.
+const PERMANENT_DOWNLOAD_CAUSES: &[&str] = &[
+    "returned 404",
+    "404 Not Found",
+    "Not Found",
+    "returned 401",
+    "returned 403",
+    "Unauthorized",
+    "Forbidden",
+    "hecksum",
+    "SHA-256",
+    "sha256",
+];
+
+/// Causes that name an unreachable or overloaded server, with the card label.
+const RETRYABLE_DOWNLOAD_CAUSES: &[(&str, &str)] = &[
+    ("timed out", "dependency download timed out"),
+    ("Timeout", "dependency download timed out"),
+    ("onnection reset", "dependency download connection reset"),
+    ("returned 500", "dependency download HTTP 500"),
+    ("returned 502", "dependency download HTTP 502"),
+    ("returned 503", "dependency download HTTP 503"),
+    ("returned 504", "dependency download HTTP 504"),
+    ("500 Internal Server Error", "dependency download HTTP 500"),
+    ("Service Unavailable", "dependency download HTTP 503"),
+    ("Bad Gateway", "dependency download HTTP 502"),
 ];
 
 /// Classify one failed job from its structured record and cleaned log tail.
@@ -266,6 +302,24 @@ fn upstream_summary(line: &str) -> Option<&'static str> {
     UPSTREAM_SIGNATURES
         .iter()
         .find(|(needle, _)| line.contains(needle))
+        .map(|(_, summary)| *summary)
+        .or_else(|| download_failure_summary(line))
+}
+
+/// A failed Bazel download is transient only when the same line names a
+/// retryable cause and no permanent one.
+fn download_failure_summary(line: &str) -> Option<&'static str> {
+    if !line.contains(DOWNLOAD_FAILURE_NEEDLE) {
+        return None;
+    }
+    // The URL itself may contain "404" or "403"; judge the cause after it.
+    let cause = line.split_once("]").map_or(line, |(_, rest)| rest);
+    if PERMANENT_DOWNLOAD_CAUSES.iter().any(|p| cause.contains(p)) {
+        return None;
+    }
+    RETRYABLE_DOWNLOAD_CAUSES
+        .iter()
+        .find(|(needle, _)| cause.contains(needle))
         .map(|(_, summary)| *summary)
 }
 
@@ -403,6 +457,48 @@ summary: 1 error(s), 1 warning(s), 0 info finding(s)
 ^^^ +++
 🚨 Error: The command exited with status 1
 ";
+
+    fn download_line(cause: &str) -> String {
+        format!(
+            "ERROR: An error occurred during the fetch of repository 'foo':\n   Traceback\n\tError downloading [https://example.com/v404/foo.tar.gz] to /tmp/out/foo.tar.gz: {cause}"
+        )
+    }
+
+    #[test]
+    fn bazel_download_failures_need_a_retryable_cause() {
+        for permanent in [
+            "GET returned 404 Not Found",
+            "GET returned 403 Forbidden",
+            "GET returned 401 Unauthorized",
+            "Checksum was abc but wanted def",
+            "",
+        ] {
+            let verdict = classify_job(&failed(1, &download_line(permanent)));
+            assert!(
+                matches!(verdict, Verdict::Indeterminate { .. }),
+                "{permanent:?} must not be retried: {verdict:?}"
+            );
+        }
+        for retryable in [
+            "Read timed out",
+            "Connect timed out",
+            "GET returned 503 Service Unavailable",
+            "GET returned 502 Bad Gateway",
+            "Connection reset",
+        ] {
+            let verdict = classify_job(&failed(1, &download_line(retryable)));
+            assert!(
+                matches!(
+                    verdict,
+                    Verdict::Transient {
+                        signal: TransientSignal::UpstreamUnavailable,
+                        ..
+                    }
+                ),
+                "{retryable:?} should be transient: {verdict:?}"
+            );
+        }
+    }
 
     /// A real `boss-ism/pr-text-leakage` violation (mono build 20351).
     const PR_TEXT_LEAKAGE_LOG: &str = "\

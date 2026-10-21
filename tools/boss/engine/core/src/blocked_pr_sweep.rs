@@ -19,7 +19,7 @@
 //! review re-admission already have owners, so for those the sweep only
 //! renders their state. Every re-dispatch is a `pr_blocked_remediations`
 //! row, and `boss_blocked_pr_diagnosis::DEAD_REVISION_REDISPATCH_BUDGET`
-//! is counted from that table.
+//! is counted from that table, per PR head.
 
 use boss_blocked_pr_diagnosis::{Action, diagnose};
 use boss_protocol::RequestExecutionInput;
@@ -27,7 +27,7 @@ use boss_protocol::RequestExecutionInput;
 use crate::coordinator::ExecutionPublisher;
 use crate::work::{
     BlockedPrRemediationInput, PendingMergeCheck, REMEDIATION_CATEGORY_REVISION_REDISPATCH,
-    REMEDIATION_OUTCOME_REQUEST_FAILED, REMEDIATION_OUTCOME_REQUESTED, WorkDb,
+    REMEDIATION_OUTCOME_PENDING, REMEDIATION_OUTCOME_REQUEST_FAILED, REMEDIATION_OUTCOME_REQUESTED, WorkDb,
 };
 
 /// Per-pass counters, folded into the merge poller's `SweepOutcome`.
@@ -46,7 +46,14 @@ pub struct BlockedPrSweepOutcome {
 }
 
 /// Diagnose every Review-lane card with a bound PR.
-pub async fn run_one_pass(work_db: &WorkDb, publisher: &dyn ExecutionPublisher) -> BlockedPrSweepOutcome {
+///
+/// `review_fanout_enabled` is whether review-batch fanout is on, which
+/// decides whether a failed review batch will be replaced.
+pub async fn run_one_pass(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    review_fanout_enabled: bool,
+) -> BlockedPrSweepOutcome {
     let mut outcome = BlockedPrSweepOutcome::default();
     let candidates = match work_db.list_blocked_pr_sweep_candidates() {
         Ok(rows) => rows,
@@ -56,7 +63,7 @@ pub async fn run_one_pass(work_db: &WorkDb, publisher: &dyn ExecutionPublisher) 
         }
     };
     for candidate in &candidates {
-        diagnose_one(work_db, publisher, candidate, &mut outcome).await;
+        diagnose_one(work_db, publisher, candidate, review_fanout_enabled, &mut outcome).await;
     }
     if outcome.diagnosed + outcome.cleared + outcome.redispatched > 0 {
         tracing::info!(
@@ -76,10 +83,11 @@ pub async fn diagnose_one(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
+    review_fanout_enabled: bool,
     outcome: &mut BlockedPrSweepOutcome,
 ) {
     outcome.examined += 1;
-    let (facts, head_sha) = match work_db.blocked_pr_facts(&candidate.work_item_id) {
+    let (facts, head_sha) = match work_db.blocked_pr_facts(&candidate.work_item_id, review_fanout_enabled) {
         Ok(v) => v,
         Err(err) => {
             tracing::warn!(work_item_id = %candidate.work_item_id, ?err, "blocked-pr sweep: failed to gather facts");
@@ -145,8 +153,10 @@ pub async fn diagnose_one(
 
 /// Re-request an execution for a revision whose last run died with no
 /// successor — the same path `bossctl work start` uses. The diagnosis has
-/// already checked the per-revision budget; the ledger row written here is
-/// what that budget is counted from.
+/// already checked the per-head budget. The ledger row is written as
+/// `pending` before the request and finished afterwards, so the budget
+/// holds across a crash in between, and a ledger that cannot be written
+/// means no re-dispatch.
 async fn redispatch_revision(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -154,6 +164,27 @@ async fn redispatch_revision(
     head_sha: Option<&str>,
     revision_id: &str,
 ) -> bool {
+    let reservation = BlockedPrRemediationInput::builder()
+        .work_item_id(candidate.work_item_id.clone())
+        .maybe_head_sha(head_sha)
+        .category(REMEDIATION_CATEGORY_REVISION_REDISPATCH)
+        .signal("dead_revision")
+        .target(revision_id)
+        .action("request_execution")
+        .outcome(REMEDIATION_OUTCOME_PENDING)
+        .build();
+    let row_id = match work_db.record_pr_blocked_remediation(reservation) {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                revision_id,
+                ?err,
+                "blocked-pr sweep: could not reserve a re-dispatch in the ledger; not re-dispatching",
+            );
+            return false;
+        }
+    };
     // Any still-live execution row means another path got here first; the
     // guard returns it and we must not stack a second one.
     let result = work_db.request_execution_with_live_check(
@@ -166,18 +197,8 @@ async fn redispatch_revision(
         Ok(exec) => (REMEDIATION_OUTCOME_REQUESTED, format!("execution {}", exec.id)),
         Err(err) => (REMEDIATION_OUTCOME_REQUEST_FAILED, format!("{err:#}")),
     };
-    let ledger = BlockedPrRemediationInput::builder()
-        .work_item_id(candidate.work_item_id.clone())
-        .maybe_head_sha(head_sha)
-        .category(REMEDIATION_CATEGORY_REVISION_REDISPATCH)
-        .signal("dead_revision")
-        .target(revision_id)
-        .action("request_execution")
-        .outcome(outcome)
-        .detail(detail.clone())
-        .build();
-    if let Err(err) = work_db.record_pr_blocked_remediation(ledger) {
-        tracing::warn!(work_item_id = %candidate.work_item_id, ?err, "blocked-pr sweep: failed to record re-dispatch");
+    if let Err(err) = work_db.update_pr_blocked_remediation(row_id, outcome, &detail) {
+        tracing::warn!(work_item_id = %candidate.work_item_id, ?err, "blocked-pr sweep: failed to finish re-dispatch ledger row");
     }
     match result {
         Ok(_) => {
@@ -269,13 +290,13 @@ mod tests {
         let publisher = Arc::new(RecordingPublisher::default());
         let c = in_review_chore(&db, "healthy");
 
-        let outcome = run_one_pass(&db, publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
         assert_eq!(outcome.examined, 1);
         assert_eq!(outcome.diagnosed, 0);
         assert!(task(&db, &c.work_item_id).review_blocked_reason.is_none());
 
         set_ci_failing(&db, &c.work_item_id);
-        let outcome = run_one_pass(&db, publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
         assert_eq!(outcome.diagnosed, 1);
         let t = task(&db, &c.work_item_id);
         assert_eq!(t.review_blocked_category.as_deref(), Some("ci_failing_no_remediation"));
@@ -291,7 +312,7 @@ mod tests {
         );
 
         // Unchanged facts: no second publish.
-        let outcome = run_one_pass(&db, publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
         assert_eq!(outcome.diagnosed, 0);
 
         db.connect()
@@ -301,7 +322,7 @@ mod tests {
                 [&c.work_item_id],
             )
             .unwrap();
-        let outcome = run_one_pass(&db, publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
         assert_eq!(outcome.cleared, 1);
         assert!(task(&db, &c.work_item_id).review_blocked_reason.is_none());
         assert!(
@@ -332,7 +353,7 @@ mod tests {
         };
         db.record_pr_blocked_remediation(row(REMEDIATION_OUTCOME_RETRIED, "1/2 upstream_unavailable: HTTP 504"))
             .unwrap();
-        run_one_pass(&db, publisher.as_ref()).await;
+        run_one_pass(&db, publisher.as_ref(), true).await;
         let t = task(&db, &c.work_item_id);
         assert_eq!(t.review_blocked_category.as_deref(), Some("ci_transient_retrying"));
         assert_eq!(
@@ -342,7 +363,7 @@ mod tests {
 
         db.record_pr_blocked_remediation(row(REMEDIATION_OUTCOME_BUDGET_EXHAUSTED, "2/2 declined"))
             .unwrap();
-        let outcome = run_one_pass(&db, publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
         assert_eq!(outcome.needs_human, 1);
         let t = task(&db, &c.work_item_id);
         assert_eq!(t.review_blocked_category.as_deref(), Some("ci_transient_exhausted"));
@@ -356,7 +377,7 @@ mod tests {
         // A ledger row for another head does not leak onto this one.
         let c2 = in_review_chore(&db, "other-head");
         set_ci_failing(&db, &c2.work_item_id);
-        run_one_pass(&db, publisher.as_ref()).await;
+        run_one_pass(&db, publisher.as_ref(), true).await;
         assert_eq!(
             task(&db, &c2.work_item_id).review_blocked_category.as_deref(),
             Some("ci_failing_no_remediation")
@@ -392,7 +413,7 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let outcome = run_one_pass(&db, publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
         assert_eq!(outcome.redispatched, 1, "{outcome:?}");
         let t = task(&db, &c.work_item_id);
         assert_eq!(t.review_blocked_category.as_deref(), Some("revision_dead"));
@@ -400,7 +421,7 @@ mod tests {
             t.review_blocked_reason
                 .as_deref()
                 .unwrap()
-                .contains("has no running worker (last run orphaned); re-dispatching (1/2)"),
+                .contains("has no running worker (last run orphaned); re-dispatching (1/2 on this PR head)"),
             "{:?}",
             t.review_blocked_reason
         );
@@ -419,8 +440,8 @@ mod tests {
             .list_pr_blocked_remediations(
                 &c.work_item_id,
                 crate::work::REMEDIATION_CATEGORY_REVISION_REDISPATCH,
+                Some("head-1"),
                 None,
-                Some(&revision.id),
             )
             .unwrap();
         assert_eq!(ledger.len(), 1);
@@ -428,10 +449,106 @@ mod tests {
 
         // With a live execution the revision is no longer dead: the card
         // moves to In Revision and the reason is cleared.
-        let outcome = run_one_pass(&db, publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
         assert_eq!(outcome.redispatched, 0);
         assert_eq!(outcome.cleared, 1);
         assert!(task(&db, &c.work_item_id).review_blocked_reason.is_none());
+    }
+
+    fn insert_batch(db: &WorkDb, id: &str, root: &str, target_sha: &str, status: &str, generation: i64) {
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO pr_review_batches
+                     (id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url,
+                      status, target_sha, updated_at, generation, explicit)
+                 VALUES (?1, ?2, 'base', '{}', ?3, 'pre_merge', 1, 'https://github.com/foo/bar/pull/1', ?4, ?5, ?3, ?6, 0)",
+                rusqlite::params![id, root, format!("{generation}"), status, target_sha, generation],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_batch_diagnosis_is_scoped_to_the_current_head() {
+        let (_dir, db) = open_db();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let c = in_review_chore(&db, "batch-head");
+        insert_batch(&db, "b-old", &c.work_item_id, "head-0", "failed", 2);
+        let (facts, _) = db.blocked_pr_facts(&c.work_item_id, true).unwrap();
+        assert!(
+            facts.review.latest_pre_merge_batch.is_none(),
+            "a failed batch for an earlier head is not the current head's batch"
+        );
+        run_one_pass(&db, publisher.as_ref(), true).await;
+        assert!(task(&db, &c.work_item_id).review_blocked_reason.is_none());
+
+        insert_batch(&db, "b-new", &c.work_item_id, "head-1", "failed", 1);
+        let (facts, _) = db.blocked_pr_facts(&c.work_item_id, true).unwrap();
+        let batch = facts.review.latest_pre_merge_batch.unwrap();
+        assert_eq!((batch.status.as_str(), batch.generation), ("failed", 1));
+        run_one_pass(&db, publisher.as_ref(), true).await;
+        assert_eq!(
+            task(&db, &c.work_item_id).review_blocked_category.as_deref(),
+            Some("review_readmission_pending")
+        );
+        run_one_pass(&db, publisher.as_ref(), false).await;
+        assert_eq!(
+            task(&db, &c.work_item_id).review_blocked_category.as_deref(),
+            Some("review_unreviewed_after_reap"),
+            "with fanout off no replacement is coming"
+        );
+    }
+
+    #[tokio::test]
+    async fn redispatch_budget_counts_per_head_across_revisions_and_resets_on_a_new_head() {
+        let (_dir, db) = open_db();
+        let c = in_review_chore(&db, "head-budget");
+        let ledger_row = |head: &str, revision: &str, outcome: &str| {
+            db.record_pr_blocked_remediation(
+                BlockedPrRemediationInput::builder()
+                    .work_item_id(c.work_item_id.clone())
+                    .head_sha(head)
+                    .category(REMEDIATION_CATEGORY_REVISION_REDISPATCH)
+                    .signal("dead_revision")
+                    .target(revision)
+                    .action("request_execution")
+                    .outcome(outcome)
+                    .build(),
+            )
+            .unwrap()
+        };
+        // Two different revisions, one head: shared allowance. A pending
+        // reservation counts like a finished request.
+        ledger_row("head-1", "rev_a", REMEDIATION_OUTCOME_REQUESTED);
+        ledger_row("head-1", "rev_b", REMEDIATION_OUTCOME_PENDING);
+        let (facts, _) = db.blocked_pr_facts(&c.work_item_id, true).unwrap();
+        assert_eq!(facts.head_redispatches_used, 2);
+        // A different head starts over.
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_head_sha = 'head-2' WHERE id = ?1",
+                [&c.work_item_id],
+            )
+            .unwrap();
+        let (facts, _) = db.blocked_pr_facts(&c.work_item_id, true).unwrap();
+        assert_eq!(facts.head_redispatches_used, 0);
+    }
+
+    #[tokio::test]
+    async fn review_verdicts_are_read_for_the_current_head_only() {
+        let (_dir, db) = open_db();
+        let c = in_review_chore(&db, "verdict-head");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET review_required_state = 'required' WHERE id = ?1",
+                [&c.work_item_id],
+            )
+            .unwrap();
+        let (facts, _) = db.blocked_pr_facts(&c.work_item_id, true).unwrap();
+        assert_eq!(facts.review.review_required_state.as_deref(), Some("required"));
+        assert!(facts.review.head_known && facts.review.head_verdict.is_none());
     }
 
     #[tokio::test]

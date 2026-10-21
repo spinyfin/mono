@@ -1183,7 +1183,7 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_updated_at: Option<String>,
 
-    /// Why this Review-lane card is not progressing, in one operator-facing
+    /// Why this Review-lane card is not progressing, in one human-readable
     /// sentence ("CI retrying: HTTP 504 in checks (1/2)", "Needs you: merge
     /// conflict with main; automatic resolution is disabled"). Written by the
     /// engine's blocked-PR sweep from the facts it diagnosed, including every

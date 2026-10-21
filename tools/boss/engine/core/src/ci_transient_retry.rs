@@ -1,9 +1,10 @@
 //! Engine-direct retry of a PR-branch Buildkite job that failed on positive
 //! infrastructure evidence (`boss_ci_log_reader::transient`).
 //!
-//! Runs inside `ci_watch::on_ci_failure_detected`, before the budgeted
-//! fix-revision path, whenever the probe reports failing required checks.
-//! It is deliberately narrow:
+//! Runs inside `ci_watch::on_ci_failure_detected_with`, after every in-flight
+//! guard (active rebase or conflict attempt, active CI remediation, in-flight
+//! ci-fix revision) and before the budgeted fix-revision path, whenever the
+//! probe reports failing required checks. It is deliberately narrow:
 //!
 //! - every failing check must be a Buildkite job on the PR's own branch, and
 //!   every one must classify `Transient`; a single deterministic or
@@ -15,12 +16,30 @@
 //!   `(work item, head SHA)`, counted from the durable
 //!   `pr_blocked_remediations` ledger; past that the head falls through to
 //!   the fix path and the card says the budget is spent;
-//! - a job Buildkite already shows as retried is never retried again.
+//! - a job whose Buildkite retry lineage still has a running or passed
+//!   descendant is never retried again, and a descendant that failed is
+//!   classified like any other failure (and consumes the next budgeted
+//!   retry);
+//! - the step is idempotent per `(work item, head)`: the poller calls it
+//!   once a minute while CI stays red, so an exhausted head, a head already
+//!   judged non-transient, and a head owned by a fix path are skipped
+//!   without another Buildkite fetch or ledger row.
+//!
+//! Relationship to the pre-triage `retrigger` attempt in `ci_watch`: that
+//! path re-runs a whole build for checks whose GitHub conclusion is
+//! `STARTUP_FAILURE` or `CANCELLED`, with no log evidence and no budget of
+//! its own. This path retries one job because its log or Buildkite record
+//! proves an infrastructure fault. `ci_watch` leaves any failure set that
+//! pre-triage would retrigger to that path, so one failure never takes both.
 //!
 //! Every decision — retried, refused by Buildkite, or declined for budget —
-//! is a ledger row the blocked-PR sweep renders on the card.
+//! is a ledger row the blocked-PR sweep renders on the card. The row is
+//! written as `pending` before `bk job retry` runs, so a crash between the
+//! two steps still counts against the budget.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -29,7 +48,7 @@ use boss_ci_log_reader::transient::{
     retry_allowed, tail_lines_of,
 };
 use boss_ci_log_reader::{
-    BuildkiteBuild, BuildkiteLogReader, CiLogReader, fetch_buildkite_build, parse_buildkite_build_id,
+    BuildkiteBuild, BuildkiteJob, BuildkiteLogReader, CiLogReader, fetch_buildkite_build, parse_buildkite_build_id,
     parse_buildkite_pipeline_slug, retry_buildkite_job,
 };
 
@@ -37,9 +56,13 @@ use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{CiProvider, PrLifecycleProbe, RequiredCheckFailure};
 use crate::work::{
     BlockedPrRemediationInput, PendingMergeCheck, REMEDIATION_CATEGORY_CI_TRANSIENT_RETRY,
-    REMEDIATION_OUTCOME_BUDGET_EXHAUSTED, REMEDIATION_OUTCOME_RETRIED, REMEDIATION_OUTCOME_RETRY_FAILED, WorkDb,
-    transient_retry_signal,
+    REMEDIATION_OUTCOME_BUDGET_EXHAUSTED, REMEDIATION_OUTCOME_PENDING, REMEDIATION_OUTCOME_RETRIED,
+    REMEDIATION_OUTCOME_RETRY_FAILED, WorkDb, transient_retry_signal,
 };
+
+/// Upper bound on each `bk` invocation. The retry runs inside the merge
+/// poller's serial pass, so a hung CLI must not stall every other PR.
+const BK_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Buildkite access the retry needs. Production uses the `bk` CLI through
 /// [`BkCli`]; tests substitute canned builds and logs.
@@ -48,6 +71,22 @@ pub trait BuildkiteRetrier: Send + Sync {
     async fn fetch_build(&self, build_url: &str) -> Result<BuildkiteBuild>;
     async fn read_job_log(&self, build_url: &str, job_id: &str) -> Result<String>;
     async fn retry_job(&self, job_id: &str) -> Result<String>;
+}
+
+/// The retrier the merge poller uses. Production is the real `bk` CLI;
+/// under unit tests it is [`NoTransientRetry`] so poller fixtures never
+/// spawn `bk` or retry a real job (the same seam shape as
+/// `ci_watch::ci_log_reader_hooks`). Tests that exercise the retry pass
+/// their own [`BuildkiteRetrier`] to `on_ci_failure_detected_with`.
+pub(crate) fn poller_retrier() -> Box<dyn BuildkiteRetrier> {
+    #[cfg(test)]
+    {
+        Box::new(NoTransientRetry)
+    }
+    #[cfg(not(test))]
+    {
+        Box::new(BkCli::default())
+    }
 }
 
 /// The real thing: `bk api`, `bk job log`, `bk job retry`.
@@ -64,27 +103,37 @@ impl Default for BkCli {
     }
 }
 
+async fn bounded<T>(what: &str, call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(BK_CALL_TIMEOUT, call).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("bk {what} timed out after {}s", BK_CALL_TIMEOUT.as_secs()),
+    }
+}
+
 #[async_trait]
 impl BuildkiteRetrier for BkCli {
     async fn fetch_build(&self, build_url: &str) -> Result<BuildkiteBuild> {
-        fetch_buildkite_build(&self.binary, build_url).await
+        bounded("api", fetch_buildkite_build(&self.binary, build_url)).await
     }
 
     async fn read_job_log(&self, build_url: &str, job_id: &str) -> Result<String> {
         let slug = parse_buildkite_pipeline_slug(build_url).ok_or_else(|| anyhow::anyhow!("no pipeline slug"))?;
         let number = parse_buildkite_build_id(build_url).ok_or_else(|| anyhow::anyhow!("no build number"))?;
-        BuildkiteLogReader::with_binary(&self.binary, slug, number)
-            .read_log_full(job_id)
-            .await
+        bounded(
+            "job log",
+            BuildkiteLogReader::with_binary(&self.binary, slug, number).read_log_full(job_id),
+        )
+        .await
     }
 
     async fn retry_job(&self, job_id: &str) -> Result<String> {
-        retry_buildkite_job(&self.binary, job_id).await
+        bounded("job retry", retry_buildkite_job(&self.binary, job_id)).await
     }
 }
 
 /// Retry disabled — used by the plain `on_ci_failure_detected` entry point
-/// so every existing caller and test keeps its exact behaviour.
+/// and by poller fixtures under test, so every existing caller and test
+/// keeps its exact behaviour.
 pub struct NoTransientRetry;
 
 #[async_trait]
@@ -109,6 +158,59 @@ pub enum TransientOutcome {
     /// Not every failure was positively transient, or the retry budget for
     /// this head is spent: the caller proceeds with the ordinary fix path.
     NotApplicable { reason: String },
+}
+
+/// Heads already judged not-retryable, keyed by work item, head and failing
+/// job set. The poller re-runs the step once a minute while CI stays red;
+/// a non-transient verdict cannot change for the same head and jobs, so
+/// remembering it avoids re-fetching the build and the full job log each
+/// pass. In-process only: after an engine restart the verdict is derived
+/// once more.
+fn judged_non_transient() -> &'static Mutex<HashSet<String>> {
+    static JUDGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    JUDGED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+const JUDGED_CAP: usize = 4_096;
+
+fn judged_key(work_item_id: &str, head_sha: &str, failures: &[RequiredCheckFailure]) -> String {
+    let mut parts: Vec<String> = failures
+        .iter()
+        .map(|f| format!("{}#{}", f.name, f.provider_job_id.as_deref().unwrap_or(&f.target_url)))
+        .collect();
+    parts.sort();
+    format!("{work_item_id}|{head_sha}|{}", parts.join(","))
+}
+
+fn is_judged(key: &str) -> bool {
+    judged_non_transient().lock().is_ok_and(|set| set.contains(key))
+}
+
+fn remember_judged(key: String) {
+    if let Ok(mut set) = judged_non_transient().lock() {
+        if set.len() >= JUDGED_CAP {
+            set.clear();
+        }
+        set.insert(key);
+    }
+}
+
+/// Where a job in a retry lineage stands.
+enum JobPhase {
+    /// Not finished: a retry is queued or running.
+    InFlight,
+    Passed,
+    /// Ended without passing; eligible for classification.
+    Failed,
+}
+
+fn job_phase(state: &str) -> JobPhase {
+    match state {
+        "passed" => JobPhase::Passed,
+        "scheduled" | "assigned" | "accepted" | "running" | "limited" | "waiting" | "waiting_failed" | "blocked"
+        | "creating" | "pending" | "canceling" | "timing_out" | "broken" | "skipped" => JobPhase::InFlight,
+        _ => JobPhase::Failed,
+    }
 }
 
 /// Classify every failing check and retry the jobs when all are transient.
@@ -136,10 +238,35 @@ pub async fn try_transient_retry(
         };
     }
 
+    // Idempotency: the poller calls this once a minute while CI is red.
+    let judged = judged_key(&candidate.work_item_id, head_sha, failures);
+    if is_judged(&judged) {
+        return TransientOutcome::NotApplicable {
+            reason: "this head and job set was already judged not transient".to_owned(),
+        };
+    }
+    match work_db.count_pr_blocked_remediations(
+        &candidate.work_item_id,
+        REMEDIATION_CATEGORY_CI_TRANSIENT_RETRY,
+        Some(head_sha),
+        None,
+        &[REMEDIATION_OUTCOME_BUDGET_EXHAUSTED],
+    ) {
+        Ok(0) => {}
+        Ok(_) => {
+            return TransientOutcome::NotApplicable {
+                reason: "transient retry budget already exhausted for this head".to_owned(),
+            };
+        }
+        Err(err) => {
+            return not_applicable(candidate, format!("could not read the retry ledger: {err:#}"));
+        }
+    }
+
     // One build fetch per distinct build URL.
     let mut builds: HashMap<String, BuildkiteBuild> = HashMap::new();
     let mut to_retry: Vec<(String, &RequiredCheckFailure, Verdict)> = Vec::new();
-    let mut already_retried = Vec::new();
+    let mut in_flight = Vec::new();
     for failure in failures {
         let build_url = failure.target_url.split('#').next().unwrap_or("").to_owned();
         if !builds.contains_key(&build_url) {
@@ -157,6 +284,7 @@ pub async fn try_transient_retry(
         }
         let build = &builds[&build_url];
         if build.branch != head_branch {
+            remember_judged(judged);
             return not_applicable(
                 candidate,
                 format!(
@@ -165,20 +293,27 @@ pub async fn try_transient_retry(
                 ),
             );
         }
-        let Some(job) = find_job(build, failure) else {
+        let Some(found) = find_job(build, failure) else {
             return not_applicable(
                 candidate,
                 format!("no job in build {} matches {}", build.number, failure.name),
             );
         };
-        if job.retry.superseded
-            || build
-                .jobs
-                .iter()
-                .any(|j| j.retry.source_job_id.as_deref() == Some(&job.id))
-        {
-            already_retried.push(job.id.clone());
-            continue;
+        let job = lineage_tip(build, found);
+        match job_phase(&job.outcome.state) {
+            JobPhase::InFlight | JobPhase::Passed => {
+                // The retry is running or already cleared; the next probe
+                // reflects it. Nothing to flip, nothing to mint.
+                in_flight.push(job.id.clone());
+                continue;
+            }
+            JobPhase::Failed if job.retry.superseded => {
+                return not_applicable(
+                    candidate,
+                    format!("job {} was retried but its retry is not in the build", job.id),
+                );
+            }
+            JobPhase::Failed => {}
         }
         let log_tail = match retrier.read_job_log(&build_url, &job.id).await {
             Ok(raw) => Some(tail_lines_of(&clean_buildkite_log(&raw), LOG_TAIL_LINES)),
@@ -196,6 +331,7 @@ pub async fn try_transient_retry(
         match verdict {
             Verdict::Transient { .. } => to_retry.push((job.id.clone(), failure, verdict)),
             other => {
+                remember_judged(judged);
                 return not_applicable(
                     candidate,
                     format!("{} is {}: {}", failure.name, other.kind(), other.summary()),
@@ -205,10 +341,8 @@ pub async fn try_transient_retry(
     }
 
     if to_retry.is_empty() {
-        // Every failing job already has a retry in flight; the next probe
-        // will see it as in-progress. Nothing to flip, nothing to mint.
         return TransientOutcome::Handled {
-            retried_jobs: already_retried,
+            retried_jobs: in_flight,
         };
     }
 
@@ -218,7 +352,11 @@ pub async fn try_transient_retry(
             REMEDIATION_CATEGORY_CI_TRANSIENT_RETRY,
             Some(head_sha),
             None,
-            &[REMEDIATION_OUTCOME_RETRIED, REMEDIATION_OUTCOME_RETRY_FAILED],
+            &[
+                REMEDIATION_OUTCOME_PENDING,
+                REMEDIATION_OUTCOME_RETRIED,
+                REMEDIATION_OUTCOME_RETRY_FAILED,
+            ],
         )
         .unwrap_or(TRANSIENT_RETRY_BUDGET_PER_HEAD);
     let budget = TRANSIENT_RETRY_BUDGET_PER_HEAD;
@@ -244,15 +382,16 @@ pub async fn try_transient_retry(
         );
     }
 
-    let mut retried_jobs = already_retried;
+    let mut retried_jobs = in_flight;
     let mut attempt = used;
     for (job_id, failure, verdict) in &to_retry {
         attempt += 1;
-        let (outcome, response) = match retrier.retry_job(job_id).await {
-            Ok(out) => (REMEDIATION_OUTCOME_RETRIED, out),
-            Err(err) => (REMEDIATION_OUTCOME_RETRY_FAILED, format!("{err:#}")),
-        };
-        record(
+        let attempt_token = format!("{attempt}/{budget}");
+        // Reserve the budget slot before acting: if the engine dies after
+        // `bk job retry` the attempt is still counted, and if the ledger
+        // cannot be written the retry is not made.
+        let action = format!("bk job retry {job_id}");
+        let Some(row_id) = record(
             work_db,
             candidate,
             head_sha,
@@ -260,12 +399,25 @@ pub async fn try_transient_retry(
             verdict,
             RetryRecord {
                 job_id: Some(job_id),
-                action: &format!("bk job retry {job_id}"),
-                outcome,
-                attempt_token: format!("{attempt}/{budget}"),
-                response: Some(&response),
+                action: &action,
+                outcome: REMEDIATION_OUTCOME_PENDING,
+                attempt_token: attempt_token.clone(),
+                response: None,
             },
-        );
+        ) else {
+            return not_applicable(
+                candidate,
+                "could not reserve a retry in the ledger; not retrying".to_owned(),
+            );
+        };
+        let (outcome, response) = match retrier.retry_job(job_id).await {
+            Ok(out) => (REMEDIATION_OUTCOME_RETRIED, out),
+            Err(err) => (REMEDIATION_OUTCOME_RETRY_FAILED, format!("{err:#}")),
+        };
+        let detail = detail_for(verdict, &attempt_token, Some(&response));
+        if let Err(err) = work_db.update_pr_blocked_remediation(row_id, outcome, &detail) {
+            tracing::warn!(work_item_id = %candidate.work_item_id, ?err, "ci_transient_retry: failed to finish ledger row");
+        }
         tracing::info!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
@@ -300,11 +452,9 @@ fn not_applicable(candidate: &PendingMergeCheck, reason: String) -> TransientOut
 }
 
 /// The failing check's job: by the `#<job-uuid>` fragment GitHub carries,
-/// else by step key / display name against the check name's last segment.
-fn find_job<'a>(
-    build: &'a BuildkiteBuild,
-    failure: &RequiredCheckFailure,
-) -> Option<&'a boss_ci_log_reader::BuildkiteJob> {
+/// else by step key / display name against the check name's last segment,
+/// considering only jobs no retry has superseded.
+fn find_job<'a>(build: &'a BuildkiteBuild, failure: &RequiredCheckFailure) -> Option<&'a BuildkiteJob> {
     if let Some(id) = failure
         .provider_job_id
         .as_deref()
@@ -315,10 +465,33 @@ fn find_job<'a>(
         return Some(job);
     }
     let step = failure.name.rsplit('/').next().unwrap_or(&failure.name);
-    build.jobs.iter().find(|j| {
-        j.outcome.state == "failed"
+    let matches_step = |j: &&BuildkiteJob| {
+        !j.retry.superseded
             && (j.step_key.as_deref() == Some(step) || j.name.as_deref().is_some_and(|n| n.ends_with(step)))
-    })
+    };
+    build
+        .jobs
+        .iter()
+        .filter(matches_step)
+        .find(|j| j.outcome.state == "failed")
+        .or_else(|| build.jobs.iter().find(matches_step))
+}
+
+/// Follow `retry.source_job_id` links from `job` to the newest job in its
+/// retry chain.
+fn lineage_tip<'a>(build: &'a BuildkiteBuild, job: &'a BuildkiteJob) -> &'a BuildkiteJob {
+    let mut current = job;
+    for _ in 0..build.jobs.len() {
+        match build
+            .jobs
+            .iter()
+            .find(|j| j.retry.source_job_id.as_deref() == Some(current.id.as_str()))
+        {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    current
 }
 
 /// What one retry decision wrote to the ledger.
@@ -332,26 +505,10 @@ struct RetryRecord<'a> {
     response: Option<&'a str>,
 }
 
-fn record(
-    work_db: &WorkDb,
-    candidate: &PendingMergeCheck,
-    head_sha: &str,
-    check_name: &str,
-    verdict: &Verdict,
-    rec: RetryRecord<'_>,
-) {
-    let RetryRecord {
-        job_id,
-        action,
-        outcome,
-        attempt_token,
-        response,
-    } = rec;
-    // `signal` is the card-facing "<summary> in <check>"; `detail` is
-    // "<attempt>/<budget> <machine signal>: <proving log line>", optionally
-    // followed by Buildkite's response in brackets. The sweep parses the
-    // leading "<attempt>/<budget>" token; operators read the rest.
-    let signal = transient_retry_signal(verdict.summary(), check_name);
+/// `detail` is "<attempt>/<budget> <machine signal>: <proving log line>",
+/// optionally followed by Buildkite's response in brackets. The sweep parses
+/// the leading "<attempt>/<budget>" token; the rest is human-readable context.
+fn detail_for(verdict: &Verdict, attempt_token: &str, response: Option<&str>) -> String {
     let mut detail = match verdict {
         Verdict::Transient { signal, evidence, .. } => format!("{attempt_token} {}: {evidence}", signal.as_str()),
         other => format!("{attempt_token} {}: {}", other.kind(), other.evidence()),
@@ -359,6 +516,27 @@ fn record(
     if let Some(response) = response.map(str::trim).filter(|r| !r.is_empty()) {
         detail.push_str(&format!(" [{response}]"));
     }
+    detail
+}
+
+/// Append a ledger row; returns its id, or `None` (logged) if the write failed.
+fn record(
+    work_db: &WorkDb,
+    candidate: &PendingMergeCheck,
+    head_sha: &str,
+    check_name: &str,
+    verdict: &Verdict,
+    rec: RetryRecord<'_>,
+) -> Option<i64> {
+    let RetryRecord {
+        job_id,
+        action,
+        outcome,
+        attempt_token,
+        response,
+    } = rec;
+    // `signal` is the card-facing "<summary> in <check>".
+    let signal = transient_retry_signal(verdict.summary(), check_name);
     let input = BlockedPrRemediationInput::builder()
         .work_item_id(candidate.work_item_id.clone())
         .head_sha(head_sha)
@@ -367,10 +545,14 @@ fn record(
         .maybe_target(job_id)
         .action(action)
         .outcome(outcome)
-        .detail(detail)
+        .detail(detail_for(verdict, &attempt_token, response))
         .build();
-    if let Err(err) = work_db.record_pr_blocked_remediation(input) {
-        tracing::warn!(work_item_id = %candidate.work_item_id, ?err, "ci_transient_retry: failed to record ledger row");
+    match work_db.record_pr_blocked_remediation(input) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(work_item_id = %candidate.work_item_id, ?err, "ci_transient_retry: failed to record ledger row");
+            None
+        }
     }
 }
 
@@ -458,6 +640,7 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
         logs: HashMap<String, String>,
         retried: Mutex<Vec<String>>,
         refuse_retry: bool,
+        fetches: Mutex<u32>,
     }
 
     impl FakeBuildkite {
@@ -475,6 +658,7 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
                 logs,
                 retried: Mutex::new(Vec::new()),
                 refuse_retry: false,
+                fetches: Mutex::new(0),
             }
         }
     }
@@ -482,6 +666,7 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
     #[async_trait]
     impl BuildkiteRetrier for FakeBuildkite {
         async fn fetch_build(&self, _: &str) -> Result<BuildkiteBuild> {
+            *self.fetches.lock().unwrap() += 1;
             Ok(self.build.clone())
         }
         async fn read_job_log(&self, _: &str, job_id: &str) -> Result<String> {
@@ -682,9 +867,7 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
         let pr = "https://github.com/foo/bar/pull/508";
         let (product, chore) = make_in_review(&db, "C-dup", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
-        let mut job = failed_job(1);
-        job.retry.superseded = true;
-        let bk = FakeBuildkite::new(BRANCH, job, PR_DESCRIPTION_504_LOG);
+        let bk = retried_lineage("running", PR_DESCRIPTION_504_LOG);
 
         let outcome = try_transient_retry(
             &db,
@@ -698,11 +881,32 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
         assert_eq!(
             outcome,
             TransientOutcome::Handled {
-                retried_jobs: vec![JOB.to_owned()]
+                retried_jobs: vec![RETRY_JOB.to_owned()]
             }
         );
         assert!(bk.retried.lock().unwrap().is_empty(), "Buildkite already shows a retry");
         assert!(ledger(&db, &chore, "head-508").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_superseded_job_whose_retry_is_missing_falls_to_the_fix_path() {
+        let (_dir, db) = open_db();
+        let pr = "https://github.com/foo/bar/pull/513";
+        let (product, chore) = make_in_review(&db, "C-orphan-retry", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let mut job = failed_job(1);
+        job.retry.superseded = true;
+        let bk = FakeBuildkite::new(BRANCH, job, PR_DESCRIPTION_504_LOG);
+        let outcome = try_transient_retry(
+            &db,
+            pub_.as_ref(),
+            &bk,
+            &candidate(&product, &chore, pr),
+            &pr_probe(pr, "head-513"),
+            &checks_failure(),
+        )
+        .await;
+        assert!(matches!(outcome, TransientOutcome::NotApplicable { .. }), "{outcome:?}");
     }
 
     #[tokio::test]
@@ -735,7 +939,7 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
             pub_.as_ref(),
             &bk,
             &candidate(&product, &chore, pr),
-            &pr_probe(pr, "head-509"),
+            &pr_probe(pr, "head-509b"),
             &checks_failure(),
         )
         .await;
@@ -745,9 +949,215 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
                 retried_jobs: Vec::new()
             }
         );
-        let rows = ledger(&db, &chore, "head-509");
+        let rows = ledger(&db, &chore, "head-509b");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outcome, REMEDIATION_OUTCOME_RETRY_FAILED);
         assert!(rows[0].detail.as_deref().unwrap().contains("not retryable"));
+    }
+
+    const RETRY_JOB: &str = "02b26b9d-a8bd-4329-b5d4-f3e5fedb0613";
+
+    /// `FakeBuildkite` for a build whose original job (`JOB`) was retried
+    /// into `RETRY_JOB` in `state`.
+    fn retried_lineage(state: &str, log: &str) -> FakeBuildkite {
+        let mut original = failed_job(1);
+        original.retry.superseded = true;
+        let mut retry = failed_job(1);
+        retry.id = RETRY_JOB.to_owned();
+        retry.outcome.state = state.to_owned();
+        retry.retry.source_job_id = Some(JOB.to_owned());
+        let mut bk = FakeBuildkite::new(BRANCH, original, log);
+        bk.logs.insert(RETRY_JOB.to_owned(), log.to_owned());
+        bk.build.jobs.push(retry);
+        bk
+    }
+
+    fn failures_without_fragment() -> Vec<RequiredCheckFailure> {
+        vec![RequiredCheckFailure {
+            job_key: None,
+            name: "buildkite/mono/checks".into(),
+            conclusion: "FAILURE".into(),
+            target_url: BUILD_URL.to_owned(),
+            provider: CiProvider::Buildkite,
+            provider_job_id: None,
+        }]
+    }
+
+    #[tokio::test]
+    async fn retry_lineage_is_followed_to_the_newest_job_with_and_without_a_fragment() {
+        let pr = "https://github.com/foo/bar/pull/510";
+        for (label, failures) in [
+            ("fragment", checks_failure()),
+            ("step-key", failures_without_fragment()),
+        ] {
+            // A running or passed retry: handled, nothing re-retried.
+            for state in ["running", "scheduled", "passed"] {
+                let (_dir, db) = open_db();
+                let (product, chore) = make_in_review(&db, &format!("C-{label}-{state}"), pr);
+                let pub_ = Arc::new(RecordingPublisher::default());
+                let bk = retried_lineage(state, PR_DESCRIPTION_504_LOG);
+                let outcome = try_transient_retry(
+                    &db,
+                    pub_.as_ref(),
+                    &bk,
+                    &candidate(&product, &chore, pr),
+                    &pr_probe(pr, "head-510"),
+                    &failures,
+                )
+                .await;
+                assert_eq!(
+                    outcome,
+                    TransientOutcome::Handled {
+                        retried_jobs: vec![RETRY_JOB.to_owned()]
+                    },
+                    "{label} {state}"
+                );
+                assert!(bk.retried.lock().unwrap().is_empty(), "{label} {state}");
+            }
+
+            // A retry that failed again is classified: transient -> the
+            // second budgeted retry of the retry, deterministic -> fix path.
+            let (_dir, db) = open_db();
+            let (product, chore) = make_in_review(&db, &format!("C-{label}-failed"), pr);
+            let pub_ = Arc::new(RecordingPublisher::default());
+            let bk = retried_lineage("failed", PR_DESCRIPTION_504_LOG);
+            let outcome = try_transient_retry(
+                &db,
+                pub_.as_ref(),
+                &bk,
+                &candidate(&product, &chore, pr),
+                &pr_probe(pr, "head-510"),
+                &failures,
+            )
+            .await;
+            assert!(
+                matches!(outcome, TransientOutcome::Handled { .. }),
+                "{label}: {outcome:?}"
+            );
+            assert_eq!(*bk.retried.lock().unwrap(), vec![RETRY_JOB.to_owned()], "{label}");
+
+            let (_dir, db) = open_db();
+            let (product, chore) = make_in_review(&db, &format!("C-{label}-det"), pr);
+            let bk = retried_lineage("failed", BAZEL_TEST_FAILURE_LOG);
+            let outcome = try_transient_retry(
+                &db,
+                pub_.as_ref(),
+                &bk,
+                &candidate(&product, &chore, pr),
+                &pr_probe(pr, "head-510"),
+                &failures,
+            )
+            .await;
+            assert!(
+                matches!(outcome, TransientOutcome::NotApplicable { .. }),
+                "{label}: {outcome:?}"
+            );
+            assert!(bk.retried.lock().unwrap().is_empty(), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_passes_over_one_head_fetch_and_record_once() {
+        let pr = "https://github.com/foo/bar/pull/511";
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // Deterministic head: judged once, then skipped without a fetch.
+        let (_dir, db) = open_db();
+        let (product, chore) = make_in_review(&db, "C-passes-det", pr);
+        let bk = FakeBuildkite::new(BRANCH, failed_job(1), BAZEL_TEST_FAILURE_LOG);
+        for _ in 0..4 {
+            let outcome = try_transient_retry(
+                &db,
+                pub_.as_ref(),
+                &bk,
+                &candidate(&product, &chore, pr),
+                &pr_probe(pr, "head-511-det"),
+                &checks_failure(),
+            )
+            .await;
+            assert!(matches!(outcome, TransientOutcome::NotApplicable { .. }));
+        }
+        assert_eq!(*bk.fetches.lock().unwrap(), 1, "one Buildkite fetch for the head");
+
+        // Exhausted head: one budget_exhausted row, one fetch, over many passes.
+        let (_dir, db) = open_db();
+        let (product, chore) = make_in_review(&db, "C-passes-exh", pr);
+        let bk = FakeBuildkite::new(BRANCH, failed_job(1), PR_DESCRIPTION_504_LOG);
+        for _ in 0..TRANSIENT_RETRY_BUDGET_PER_HEAD {
+            db.record_pr_blocked_remediation(
+                BlockedPrRemediationInput::builder()
+                    .work_item_id(chore.clone())
+                    .head_sha("head-511-exh")
+                    .category(REMEDIATION_CATEGORY_CI_TRANSIENT_RETRY)
+                    .signal("HTTP 504 in buildkite/mono/checks")
+                    .target(JOB)
+                    .action("bk job retry")
+                    .outcome(REMEDIATION_OUTCOME_RETRIED)
+                    .detail("1/2")
+                    .build(),
+            )
+            .unwrap();
+        }
+        for _ in 0..4 {
+            try_transient_retry(
+                &db,
+                pub_.as_ref(),
+                &bk,
+                &candidate(&product, &chore, pr),
+                &pr_probe(pr, "head-511-exh"),
+                &checks_failure(),
+            )
+            .await;
+        }
+        assert_eq!(*bk.fetches.lock().unwrap(), 1);
+        let exhausted = ledger(&db, &chore, "head-511-exh")
+            .into_iter()
+            .filter(|r| r.outcome == REMEDIATION_OUTCOME_BUDGET_EXHAUSTED)
+            .count();
+        assert_eq!(exhausted, 1, "the exhaustion is recorded once, not once a minute");
+    }
+
+    #[tokio::test]
+    async fn an_active_fix_path_means_no_buildkite_fetch_at_all() {
+        let (_dir, db) = open_db();
+        let pr = "https://github.com/foo/bar/pull/512";
+        let (product, chore) = make_in_review(&db, "C-guard", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let bk = FakeBuildkite::new(BRANCH, failed_job(1), BAZEL_TEST_FAILURE_LOG);
+        // First pass mints the ci-fix revision (deterministic failure).
+        on_ci_failure_detected_with(
+            &db,
+            pub_.as_ref(),
+            &fix_checker(),
+            &candidate(&product, &chore, pr),
+            &pr_probe(pr, "head-512"),
+            &checks_failure(),
+            &bk,
+        )
+        .await;
+        let fetched = *bk.fetches.lock().unwrap();
+        // While that revision runs, later passes (even with a different,
+        // never-judged failure set) must not touch Buildkite.
+        let other = vec![RequiredCheckFailure {
+            name: "buildkite/mono/other".into(),
+            ..checks_failure().remove(0)
+        }];
+        for _ in 0..3 {
+            on_ci_failure_detected_with(
+                &db,
+                pub_.as_ref(),
+                &fix_checker(),
+                &candidate(&product, &chore, pr),
+                &pr_probe(pr, "head-512"),
+                &other,
+                &bk,
+            )
+            .await;
+        }
+        assert_eq!(
+            *bk.fetches.lock().unwrap(),
+            fetched,
+            "no fetch while a fix owns the head"
+        );
     }
 }

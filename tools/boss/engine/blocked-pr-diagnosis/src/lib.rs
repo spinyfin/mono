@@ -1,4 +1,4 @@
-//! Why a Review-lane card is blocked or stalled, as one operator-facing
+//! Why a Review-lane card is blocked or stalled, as one human-readable
 //! sentence plus the one safe thing the engine may do about it.
 //!
 //! The engine's blocked-PR sweep (`blocked_pr_sweep` in `engine/core`)
@@ -16,11 +16,14 @@
 //! review that was reaped at its generation cap), so "blocked" here means
 //! "will not reach merge without something happening".
 
-/// How many times the sweep may re-dispatch one dead `todo` revision before
-/// it stops and asks a human. Each re-dispatch is a fresh worker run; the
-/// engine's own orphan sweep already caps consecutive dead runs at three,
-/// and two sweep re-dispatches on top of the original dispatch is the same
-/// "three runs died" budget seen from the PR's side.
+/// How many times the sweep may re-dispatch dead revisions on one PR head
+/// before it stops and asks a human. The budget is per `(work item, PR head)`
+/// across all revisions, so a fresh revision on the same head does not get a
+/// fresh allowance, and a new head starts over. Each re-dispatch is a fresh
+/// worker run; the engine's own orphan sweep already caps consecutive dead
+/// runs at three, and two sweep re-dispatches on top of the original
+/// dispatch is the same "three runs died" budget seen from the PR's side.
+/// A revision is additionally capped at the same number over its lifetime.
 pub const DEAD_REVISION_REDISPATCH_BUDGET: u32 = 2;
 
 /// A dead `active` revision belongs to the orphan sweep (90s minimum age,
@@ -100,6 +103,12 @@ impl ExecutionFacts {
     fn is_running(&self) -> bool {
         matches!(self.status.as_str(), "running" | "waiting_human")
     }
+
+    /// The run ended because the worker died or failed, not because anyone
+    /// stopped it: the only terminal states the sweep may re-dispatch from.
+    fn died(&self) -> bool {
+        matches!(self.status.as_str(), "failed" | "orphaned")
+    }
 }
 
 /// One open or recently open revision in the PR's chain.
@@ -117,7 +126,9 @@ pub struct RevisionFacts {
     pub latest_execution: Option<ExecutionFacts>,
     /// Number of `work_executions` rows that are not terminal.
     pub live_execution_count: usize,
-    /// Sweep re-dispatches already recorded against this revision.
+    /// Sweep re-dispatches already recorded against this revision over its
+    /// lifetime (the secondary cap; the per-head count is
+    /// [`BlockedFacts::head_redispatches_used`]).
     pub redispatches_used: u32,
 }
 
@@ -126,12 +137,25 @@ impl RevisionFacts {
         matches!(self.status.as_str(), "todo" | "active" | "blocked")
     }
 
-    /// Open, nothing non-terminal, and the newest run ended without the
-    /// revision reaching Review: the worker died or was reaped.
+    /// Open, nothing non-terminal, and the newest run ended by failing or
+    /// being orphaned: the worker died. A run someone cancelled or abandoned
+    /// is [`Self::is_halted`], never re-dispatched automatically.
     fn is_dead(&self) -> bool {
         matches!(self.status.as_str(), "todo" | "active")
             && self.live_execution_count == 0
-            && self.latest_execution.as_ref().is_some_and(ExecutionFacts::is_terminal)
+            && self.latest_execution.as_ref().is_some_and(ExecutionFacts::died)
+    }
+
+    /// Open, nothing non-terminal, and the newest run was stopped on purpose
+    /// (cancelled or abandoned) or completed without moving the revision to
+    /// Review. Re-dispatching would override that decision.
+    fn is_halted(&self) -> bool {
+        matches!(self.status.as_str(), "todo" | "active")
+            && self.live_execution_count == 0
+            && self
+                .latest_execution
+                .as_ref()
+                .is_some_and(|e| e.is_terminal() && !e.died())
     }
 
     fn is_dispatch_stalled(&self) -> bool {
@@ -191,17 +215,37 @@ pub struct ConflictFacts {
     pub auto_maintenance_enabled: bool,
 }
 
+/// The newest pre-merge review batch **for the observed PR head**.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReviewBatchFacts {
     pub status: String,
     pub generation: i64,
-    pub has_settled_verdict: bool,
 }
 
+/// The newest review verdict recorded for the observed PR head.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HeadVerdictFacts {
+    /// `pr_review_verdicts.gate_outcome` wire value.
+    pub gate_outcome: String,
+    /// A findings revision exists for this verdict.
+    pub has_successor_revision: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ReviewFacts {
+    /// The PR head is known (the poller has observed one).
+    pub head_known: bool,
+    /// Newest batch whose target is the observed head; `None` means no batch
+    /// has been admitted for it.
     pub latest_pre_merge_batch: Option<ReviewBatchFacts>,
+    /// Newest non-stale verdict on the observed head, batch or legacy.
+    pub head_verdict: Option<HeadVerdictFacts>,
     pub generation_cap: i64,
+    /// `tasks.review_required_state` (`required`, `approved`, …).
+    pub review_required_state: Option<String>,
+    /// Review-batch fanout is on, so a failed batch is replaced by admission.
+    pub fanout_enabled: bool,
 }
 
 /// Everything the sweep knows about one Review-lane card.
@@ -215,6 +259,9 @@ pub struct BlockedFacts {
     pub ci_required_state: Option<String>,
     pub pr_mergeable_state: Option<String>,
     pub revisions: Vec<RevisionFacts>,
+    /// Dead-revision re-dispatches already recorded for this PR head, across
+    /// every revision of the card.
+    pub head_redispatches_used: u32,
     pub ci: CiFacts,
     pub conflict: ConflictFacts,
     pub review: ReviewFacts,
@@ -237,8 +284,13 @@ pub enum Category {
     RevisionBlocked,
     RevisionDead,
     DispatchStalled,
+    RevisionHalted,
     ReviewUnreviewedAfterReap,
     ReviewReadmissionPending,
+    ReviewAwaitingApproval,
+    ReviewFindingsUnaddressed,
+    ReviewGaveUp,
+    ReviewNotAdmitted,
     BlockedOther,
 }
 
@@ -259,6 +311,11 @@ impl Category {
             Self::RevisionBlocked => "revision_blocked",
             Self::RevisionDead => "revision_dead",
             Self::DispatchStalled => "dispatch_stalled",
+            Self::RevisionHalted => "revision_halted",
+            Self::ReviewAwaitingApproval => "review_awaiting_approval",
+            Self::ReviewFindingsUnaddressed => "review_findings_unaddressed",
+            Self::ReviewGaveUp => "review_gave_up",
+            Self::ReviewNotAdmitted => "review_not_admitted",
             Self::ReviewUnreviewedAfterReap => "review_unreviewed_after_reap",
             Self::ReviewReadmissionPending => "review_readmission_pending",
             Self::BlockedOther => "blocked_other",
@@ -299,6 +356,16 @@ impl Diagnosis {
 
     fn human(category: Category, reason: impl Into<String>) -> Self {
         Self::new(category, format!("Needs you: {}", reason.into()), Action::NeedsHuman)
+    }
+
+    /// Prefix the reason with what the card is blocked on, keeping the
+    /// "Needs you:" marker first.
+    fn in_context(mut self, context: &str) -> Self {
+        self.reason = match self.reason.strip_prefix("Needs you: ") {
+            Some(rest) => format!("Needs you: {context}: {rest}"),
+            None => format!("{context}: {}", self.reason),
+        };
+        self
     }
 
     fn waiting(category: Category, reason: impl Into<String>) -> Self {
@@ -357,26 +424,11 @@ pub fn diagnose(f: &BlockedFacts) -> Option<Diagnosis> {
     }
     // Not in the Blocked section, but stalled: a revision with no live
     // worker, a revision stuck in dispatch, or an unreviewed head.
-    if let Some(r) = open.iter().find(|r| r.is_dead()) {
-        return Some(dead_revision(r, Category::RevisionDead));
-    }
-    if let Some(r) = open.iter().find(|r| r.is_dispatch_stalled()) {
-        let e = r.latest_execution.as_ref()?;
-        let wait = e
-            .dispatch_wait_reason
-            .as_deref()
-            .map(|w| format!(", waiting on {w}"))
-            .unwrap_or_default();
-        return Some(Diagnosis::waiting(
-            Category::DispatchStalled,
-            format!(
-                "{} \"{}\" has waited {} for dispatch ({}{wait})",
-                r.origin.label(),
-                r.name,
-                minutes(e.age_secs),
-                e.status
-            ),
-        ));
+    if let Some(d) = open
+        .iter()
+        .find_map(|r| revision_health(r, f.head_redispatches_used, Category::RevisionDead))
+    {
+        return Some(d);
     }
     diagnose_review(f)
 }
@@ -407,8 +459,8 @@ fn diagnose_conflict(f: &BlockedFacts) -> Diagnosis {
                     ),
                 );
             }
-            if rev.is_dead() {
-                return dead_revision(rev, Category::MergeConflictRevisionDead);
+            if let Some(d) = revision_health(rev, f.head_redispatches_used, Category::MergeConflictRevisionDead) {
+                return d.in_context("merge conflict with main");
             }
             if rev.is_open() {
                 return Diagnosis::waiting(
@@ -448,9 +500,53 @@ fn diagnose_ci(f: &BlockedFacts) -> Diagnosis {
     } else {
         f.ci.failing_checks.join(", ")
     };
-    if let Some(t) = &f.ci.last_transient_retry {
+    // The linked fix revision comes first: it is the newest cause of the
+    // card's state, and it must be health-checked before either the retry
+    // ledger or the creation budget can speak for it.
+    let fix =
+        f.ci.active_fix_attempt
+            .as_ref()
+            .and_then(|a| a.revision_task_id.as_deref())
+            .and_then(|id| f.revisions.iter().find(|r| r.id == id))
+            .or_else(|| {
+                f.revisions
+                    .iter()
+                    .find(|r| r.origin == RevisionOrigin::CiFix && r.is_open())
+            });
+    if let Some(rev) = fix {
+        if rev.status == "blocked" {
+            return Diagnosis::human(
+                Category::CiFixRevisionBlocked,
+                format!(
+                    "CI failing on {checks}; fix revision \"{}\" is blocked ({})",
+                    rev.name,
+                    blocked_label(rev)
+                ),
+            );
+        }
+        if let Some(d) = revision_health(rev, f.head_redispatches_used, Category::CiFixRevisionDead) {
+            return d.in_context(&format!("CI failing on {checks}"));
+        }
+        return Diagnosis::waiting(
+            Category::CiFixRevisionLive,
+            format!(
+                "CI failing on {checks}: fix revision \"{}\" {} (attempt {}/{})",
+                rev.name,
+                if rev.has_running_worker() { "running" } else { "queued" },
+                f.ci.attempts_used,
+                f.ci.budget
+            ),
+        );
+    }
+    // With no live fix revision, the newest transient-retry row speaks only
+    // while it still describes the current failure.
+    if let Some(t) =
+        f.ci.last_transient_retry
+            .as_ref()
+            .filter(|t| f.ci.failing_checks.is_empty() || f.ci.failing_checks.contains(&t.check_name))
+    {
         match t.outcome.as_str() {
-            "retried" if t.age_secs < TRANSIENT_RETRY_FRESH_SECS => {
+            "retried" | "pending" if t.age_secs < TRANSIENT_RETRY_FRESH_SECS => {
                 return Diagnosis::waiting(
                     Category::CiTransientRetrying,
                     format!(
@@ -459,7 +555,7 @@ fn diagnose_ci(f: &BlockedFacts) -> Diagnosis {
                     ),
                 );
             }
-            "retried" => {
+            "retried" | "pending" => {
                 return Diagnosis::human(
                     Category::CiTransientExhausted,
                     format!(
@@ -499,41 +595,6 @@ fn diagnose_ci(f: &BlockedFacts) -> Diagnosis {
             ),
         );
     }
-    let fix =
-        f.ci.active_fix_attempt
-            .as_ref()
-            .and_then(|a| a.revision_task_id.as_deref())
-            .and_then(|id| f.revisions.iter().find(|r| r.id == id))
-            .or_else(|| {
-                f.revisions
-                    .iter()
-                    .find(|r| r.origin == RevisionOrigin::CiFix && r.is_open())
-            });
-    if let Some(rev) = fix {
-        if rev.status == "blocked" {
-            return Diagnosis::human(
-                Category::CiFixRevisionBlocked,
-                format!(
-                    "CI failing on {checks}; fix revision \"{}\" is blocked ({})",
-                    rev.name,
-                    blocked_label(rev)
-                ),
-            );
-        }
-        if rev.is_dead() {
-            return dead_revision(rev, Category::CiFixRevisionDead);
-        }
-        return Diagnosis::waiting(
-            Category::CiFixRevisionLive,
-            format!(
-                "CI failing on {checks}: fix revision \"{}\" {} (attempt {}/{})",
-                rev.name,
-                if rev.has_running_worker() { "running" } else { "queued" },
-                f.ci.attempts_used,
-                f.ci.budget
-            ),
-        );
-    }
     if !f.ci.auto_maintenance_enabled {
         return Diagnosis::human(
             Category::CiFailingNoRemediation,
@@ -561,12 +622,60 @@ fn diagnose_ci(f: &BlockedFacts) -> Diagnosis {
     )
 }
 
+/// Reasons for a card whose only open gate is the automated review. Only
+/// reached when CI, conflicts and revisions are all healthy, so every
+/// outcome here names why the review gate is not progressing.
 fn diagnose_review(f: &BlockedFacts) -> Option<Diagnosis> {
-    let batch = f.review.latest_pre_merge_batch.as_ref()?;
-    if batch.status != "failed" || batch.has_settled_verdict {
+    let r = &f.review;
+    if !r.head_known {
         return None;
     }
-    if batch.generation >= f.review.generation_cap {
+    if let Some(v) = &r.head_verdict {
+        return match v.gate_outcome.as_str() {
+            "completed_clean" if r.review_required_state.as_deref() == Some("required") => Some(Diagnosis::human(
+                Category::ReviewAwaitingApproval,
+                "the automated review is clean and every check passed; a required human approval is still missing",
+            )),
+            "completed_with_findings" if !v.has_successor_revision => Some(Diagnosis::human(
+                Category::ReviewFindingsUnaddressed,
+                "the automated review found issues on this head but no revision is addressing them; create one or fix the findings by hand",
+            )),
+            "revision_creation_failed" => Some(Diagnosis::human(
+                Category::ReviewFindingsUnaddressed,
+                "the automated review found issues on this head but creating the revision for them failed; create one by hand",
+            )),
+            "gave_up" => Some(Diagnosis::human(
+                Category::ReviewGaveUp,
+                "the automated review gave up on this head; start a review by hand",
+            )),
+            _ => None,
+        };
+    }
+    let green =
+        f.ci_required_state.as_deref() == Some("success") && f.pr_mergeable_state.as_deref() == Some("mergeable");
+    let Some(batch) = r.latest_pre_merge_batch.as_ref() else {
+        // No batch and no verdict for this head. Only call it a stall once
+        // a review is the sole thing left to wait for: checks pass and the
+        // PR still needs review approval.
+        if !green || r.review_required_state.as_deref() != Some("required") {
+            return None;
+        }
+        return Some(if r.fanout_enabled {
+            Diagnosis::waiting(
+                Category::ReviewNotAdmitted,
+                "checks pass but no automated review has been admitted for this head yet",
+            )
+        } else {
+            Diagnosis::human(
+                Category::ReviewNotAdmitted,
+                "checks pass but no automated review has run on this head and batch review is turned off; start a review by hand",
+            )
+        });
+    };
+    if batch.status != "failed" {
+        return None;
+    }
+    if batch.generation >= r.generation_cap {
         return Some(Diagnosis::human(
             Category::ReviewUnreviewedAfterReap,
             format!(
@@ -575,16 +684,65 @@ fn diagnose_review(f: &BlockedFacts) -> Option<Diagnosis> {
             ),
         ));
     }
+    if !r.fanout_enabled {
+        return Some(Diagnosis::human(
+            Category::ReviewUnreviewedAfterReap,
+            format!(
+                "not reviewed: the automated review failed (generation {}/{}) and batch review is turned off, so no replacement will start; start one by hand",
+                batch.generation, r.generation_cap
+            ),
+        ));
+    }
     Some(Diagnosis::waiting(
         Category::ReviewReadmissionPending,
         format!(
             "automated review failed (generation {}/{}); a replacement is being re-admitted",
-            batch.generation, f.review.generation_cap
+            batch.generation, r.generation_cap
         ),
     ))
 }
 
-fn dead_revision(r: &RevisionFacts, category: Category) -> Diagnosis {
+/// Health of one open revision, shared by the generic, CI and conflict
+/// paths so a stalled or dead fix revision can never read as "queued":
+/// dead (worker died), halted (someone stopped it), or stuck in dispatch.
+/// `None` means the revision is healthy (queued or running).
+fn revision_health(r: &RevisionFacts, head_used: u32, dead_category: Category) -> Option<Diagnosis> {
+    if r.is_dead() {
+        return Some(dead_revision(r, head_used, dead_category));
+    }
+    if r.is_halted() {
+        let last = r.latest_execution.as_ref().map_or("unknown", |e| e.status.as_str());
+        return Some(Diagnosis::human(
+            Category::RevisionHalted,
+            format!(
+                "{} \"{}\" has no running worker because its last run was {last}; start it by hand or close it",
+                r.origin.label(),
+                r.name
+            ),
+        ));
+    }
+    if r.is_dispatch_stalled() {
+        let e = r.latest_execution.as_ref()?;
+        let wait = e
+            .dispatch_wait_reason
+            .as_deref()
+            .map(|w| format!(", waiting on {w}"))
+            .unwrap_or_default();
+        return Some(Diagnosis::waiting(
+            Category::DispatchStalled,
+            format!(
+                "{} \"{}\" has waited {} for dispatch ({}{wait})",
+                r.origin.label(),
+                r.name,
+                minutes(e.age_secs),
+                e.status
+            ),
+        ));
+    }
+    None
+}
+
+fn dead_revision(r: &RevisionFacts, head_used: u32, category: Category) -> Diagnosis {
     let (last, age) = r
         .latest_execution
         .as_ref()
@@ -613,14 +771,16 @@ fn dead_revision(r: &RevisionFacts, category: Category) -> Diagnosis {
             )
         };
     }
-    if r.redispatches_used < DEAD_REVISION_REDISPATCH_BUDGET {
+    // The head budget is the contract; the per-revision count only tightens it.
+    let used = head_used.max(r.redispatches_used);
+    if used < DEAD_REVISION_REDISPATCH_BUDGET {
         Diagnosis::new(
             category,
             format!(
-                "{} \"{}\" has no running worker (last run {last}); re-dispatching ({}/{})",
+                "{} \"{}\" has no running worker (last run {last}); re-dispatching ({}/{} on this PR head)",
                 r.origin.label(),
                 r.name,
-                r.redispatches_used + 1,
+                used + 1,
                 DEAD_REVISION_REDISPATCH_BUDGET
             ),
             Action::RedispatchRevision {
@@ -631,7 +791,7 @@ fn dead_revision(r: &RevisionFacts, category: Category) -> Diagnosis {
         Diagnosis::human(
             category,
             format!(
-                "{} \"{}\" died {} times (last run {last}); start it by hand or close it",
+                "{} \"{}\" died {} times on this PR head (last run {last}); start it by hand or close it",
                 r.origin.label(),
                 r.name,
                 DEAD_REVISION_REDISPATCH_BUDGET + 1
@@ -825,7 +985,11 @@ mod tests {
                 revision_id: "rev_1".into()
             }
         );
-        assert!(d.reason.contains("re-dispatching (1/2)"), "{}", d.reason);
+        assert!(
+            d.reason.contains("re-dispatching (1/2 on this PR head)"),
+            "{}",
+            d.reason
+        );
 
         f.revisions[0].redispatches_used = DEAD_REVISION_REDISPATCH_BUDGET;
         let d = diagnose(&f).unwrap();
@@ -964,26 +1128,210 @@ mod tests {
         );
     }
 
+    fn review_ready() -> BlockedFacts {
+        let mut f = in_review();
+        f.review.head_known = true;
+        f.review.fanout_enabled = true;
+        f
+    }
+
+    fn failed_batch(generation: i64) -> Option<ReviewBatchFacts> {
+        Some(ReviewBatchFacts {
+            status: "failed".into(),
+            generation,
+        })
+    }
+
+    fn verdict(outcome: &str, has_successor_revision: bool) -> Option<HeadVerdictFacts> {
+        Some(HeadVerdictFacts {
+            gate_outcome: outcome.into(),
+            has_successor_revision,
+        })
+    }
+
     #[test]
     fn reaped_review_batch_is_readmitting_below_cap_and_human_at_cap() {
-        let mut f = in_review();
-        f.review.latest_pre_merge_batch = Some(ReviewBatchFacts {
-            status: "failed".into(),
-            generation: 1,
-            has_settled_verdict: false,
-        });
+        let mut f = review_ready();
+        f.review.latest_pre_merge_batch = failed_batch(1);
         let d = diagnose(&f).unwrap();
         assert_eq!(d.category, Category::ReviewReadmissionPending);
-        f.review.latest_pre_merge_batch.as_mut().unwrap().generation = 2;
+        f.review.latest_pre_merge_batch = failed_batch(2);
         let d = diagnose(&f).unwrap();
         assert_eq!(d.category, Category::ReviewUnreviewedAfterReap);
         assert_eq!(d.action, Action::NeedsHuman);
-        f.review.latest_pre_merge_batch.as_mut().unwrap().has_settled_verdict = true;
-        assert_eq!(
-            diagnose(&f),
-            None,
-            "a settled verdict is a review decision, not a stall"
+    }
+
+    #[test]
+    fn failed_review_batch_with_fanout_off_is_not_reported_as_readmitting() {
+        let mut f = review_ready();
+        f.review.fanout_enabled = false;
+        f.review.latest_pre_merge_batch = failed_batch(1);
+        let d = diagnose(&f).unwrap();
+        assert_eq!(d.category, Category::ReviewUnreviewedAfterReap);
+        assert_eq!(d.action, Action::NeedsHuman);
+        assert!(!d.reason.contains("re-admitted"), "{}", d.reason);
+    }
+
+    #[test]
+    fn review_gate_stalls_each_get_a_specific_reason() {
+        // Clean review, human approval still required.
+        let mut f = review_ready();
+        f.review.head_verdict = verdict("completed_clean", false);
+        assert_eq!(diagnose(&f), None, "clean and nothing else required is healthy");
+        f.review.review_required_state = Some("required".into());
+        let d = diagnose(&f).unwrap();
+        assert_eq!(d.category, Category::ReviewAwaitingApproval);
+        assert_eq!(d.action, Action::NeedsHuman);
+
+        // Findings with no revision to address them.
+        let mut f = review_ready();
+        f.review.head_verdict = verdict("completed_with_findings", false);
+        assert_eq!(diagnose(&f).unwrap().category, Category::ReviewFindingsUnaddressed);
+        f.review.head_verdict = verdict("completed_with_findings", true);
+        assert_eq!(diagnose(&f), None, "a findings revision owns it");
+
+        // Revision creation failed / reviewer gave up.
+        f.review.head_verdict = verdict("revision_creation_failed", false);
+        assert_eq!(diagnose(&f).unwrap().category, Category::ReviewFindingsUnaddressed);
+        f.review.head_verdict = verdict("gave_up", false);
+        let d = diagnose(&f).unwrap();
+        assert_eq!(d.category, Category::ReviewGaveUp);
+        assert_eq!(d.action, Action::NeedsHuman);
+    }
+
+    #[test]
+    fn a_green_head_with_no_batch_is_a_not_admitted_stall_by_fanout_state() {
+        let mut f = review_ready();
+        assert_eq!(diagnose(&f), None, "a review is not required, so nothing waits on one");
+        f.review.review_required_state = Some("required".into());
+        assert_eq!(diagnose(&f).unwrap().category, Category::ReviewNotAdmitted);
+        assert_eq!(diagnose(&f).unwrap().action, Action::None);
+        f.review.fanout_enabled = false;
+        assert_eq!(diagnose(&f).unwrap().action, Action::NeedsHuman);
+        // Not green yet: CI is the thing being waited on, not the review.
+        f.ci_required_state = Some("pending".into());
+        assert_eq!(diagnose(&f), None);
+        // No observed head: nothing to say.
+        let mut f = in_review();
+        f.review.fanout_enabled = true;
+        assert_eq!(diagnose(&f), None);
+    }
+
+    #[test]
+    fn cancelled_or_abandoned_revisions_are_never_redispatched() {
+        for status in ["cancelled", "abandoned"] {
+            // A queued revision whose run was cancelled before it started,
+            // and a running one the user stopped (task demoted to todo).
+            for (rev_status, age) in [("todo", 30), ("todo", 4_000)] {
+                let mut f = in_review();
+                f.revisions = vec![revision(rev_status, RevisionOrigin::Review, Some(exec(status, age)))];
+                let d = diagnose(&f).unwrap();
+                assert_eq!(d.category, Category::RevisionHalted, "{status}");
+                assert_eq!(d.action, Action::NeedsHuman, "{status}");
+                assert!(d.reason.contains(status), "{}", d.reason);
+            }
+        }
+        let mut f = in_review();
+        f.ci_required_state = Some("fail".into());
+        f.revisions = vec![revision("todo", RevisionOrigin::CiFix, Some(exec("cancelled", 60)))];
+        let d = diagnose(&f).unwrap();
+        assert_eq!(d.action, Action::NeedsHuman);
+        assert!(
+            d.reason.starts_with("Needs you: CI failing on required checks: "),
+            "{}",
+            d.reason
         );
+    }
+
+    #[test]
+    fn redispatch_budget_is_per_pr_head_across_revisions() {
+        let mut f = in_review();
+        f.revisions = vec![revision("todo", RevisionOrigin::Review, Some(exec("failed", 600)))];
+        // A brand-new revision (0 used itself) on a head already at the cap.
+        f.head_redispatches_used = DEAD_REVISION_REDISPATCH_BUDGET;
+        let d = diagnose(&f).unwrap();
+        assert_eq!(d.action, Action::NeedsHuman);
+        assert!(d.reason.contains("on this PR head"), "{}", d.reason);
+        // A head change resets the head count; the revision's own count
+        // still caps it.
+        f.head_redispatches_used = 0;
+        assert!(matches!(
+            diagnose(&f).unwrap().action,
+            Action::RedispatchRevision { .. }
+        ));
+        f.revisions[0].redispatches_used = DEAD_REVISION_REDISPATCH_BUDGET;
+        assert_eq!(diagnose(&f).unwrap().action, Action::NeedsHuman);
+    }
+
+    #[test]
+    fn stalled_fix_revisions_are_not_reported_as_queued() {
+        let stalled = |origin| {
+            revision(
+                "todo",
+                origin,
+                Some(ExecutionFacts {
+                    dispatch_wait_reason: Some("cube_workspace_lease".into()),
+                    ..exec("workspace_recovery", DISPATCH_STALL_SECS + 60)
+                }),
+            )
+        };
+        let mut f = in_review();
+        f.ci_required_state = Some("fail".into());
+        f.ci.failing_checks = vec!["checks".into()];
+        f.revisions = vec![stalled(RevisionOrigin::CiFix)];
+        let d = diagnose(&f).unwrap();
+        assert_eq!(d.category, Category::DispatchStalled);
+        assert!(d.reason.starts_with("CI failing on checks: "), "{}", d.reason);
+
+        let mut f = in_review();
+        f.pr_mergeable_state = Some("conflicting".into());
+        f.conflict.active_attempt = Some(AttemptFacts {
+            status: "running".into(),
+            revision_task_id: Some("rev_1".into()),
+            ..Default::default()
+        });
+        f.revisions = vec![stalled(RevisionOrigin::MergeConflict)];
+        assert_eq!(diagnose(&f).unwrap().category, Category::DispatchStalled);
+    }
+
+    #[test]
+    fn final_in_budget_fix_revision_is_live_not_exhausted_and_can_be_redispatched() {
+        let mut f = in_review();
+        f.ci_required_state = Some("fail".into());
+        f.ci.attempts_used = 3;
+        f.ci.budget = 3;
+        f.revisions = vec![revision("active", RevisionOrigin::CiFix, Some(exec("running", 60)))];
+        assert_eq!(diagnose(&f).unwrap().category, Category::CiFixRevisionLive);
+        f.revisions = vec![revision("todo", RevisionOrigin::CiFix, Some(exec("orphaned", 600)))];
+        let d = diagnose(&f).unwrap();
+        assert_eq!(d.category, Category::CiFixRevisionDead);
+        assert!(matches!(d.action, Action::RedispatchRevision { .. }));
+    }
+
+    #[test]
+    fn stale_transient_row_does_not_override_a_live_fix_revision() {
+        let mut f = in_review();
+        f.ci_required_state = Some("fail".into());
+        f.ci.failing_checks = vec!["buildkite/mono/checks".into()];
+        f.ci.attempts_used = 1;
+        f.revisions = vec![revision("active", RevisionOrigin::CiFix, Some(exec("running", 60)))];
+        for outcome in ["retried", "budget_exhausted", "retry_failed"] {
+            f.ci.last_transient_retry = Some(TransientRetryFacts {
+                check_name: "buildkite/mono/checks".into(),
+                summary: "HTTP 504".into(),
+                outcome: outcome.into(),
+                age_secs: 5,
+                attempt: 2,
+                budget: 2,
+            });
+            let d = diagnose(&f).unwrap();
+            assert_eq!(d.category, Category::CiFixRevisionLive, "{outcome}: {}", d.reason);
+        }
+        // Without a fix revision, a row for a check that is no longer
+        // failing says nothing about the current failure.
+        f.revisions.clear();
+        f.ci.failing_checks = vec!["buildkite/mono/other".into()];
+        assert_eq!(diagnose(&f).unwrap().category, Category::CiFailingNoRemediation);
     }
 
     #[test]
@@ -1014,8 +1362,13 @@ mod tests {
             Category::RevisionBlocked,
             Category::RevisionDead,
             Category::DispatchStalled,
+            Category::RevisionHalted,
             Category::ReviewUnreviewedAfterReap,
             Category::ReviewReadmissionPending,
+            Category::ReviewAwaitingApproval,
+            Category::ReviewFindingsUnaddressed,
+            Category::ReviewGaveUp,
+            Category::ReviewNotAdmitted,
             Category::BlockedOther,
         ];
         let keys: std::collections::BTreeSet<&str> = all.iter().map(|c| c.key()).collect();

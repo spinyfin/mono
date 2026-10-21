@@ -387,17 +387,6 @@ pub async fn on_ci_failure_detected_with(
     if auto_pr_maintenance_disabled(work_db, candidate, &probe.labels) {
         return false;
     }
-    if let crate::ci_transient_retry::TransientOutcome::Handled { retried_jobs } =
-        crate::ci_transient_retry::try_transient_retry(work_db, publisher, retrier, candidate, probe, failures).await
-    {
-        tracing::info!(
-            work_item_id = %candidate.work_item_id,
-            pr_url = %candidate.pr_url,
-            retried_jobs = ?retried_jobs,
-            "ci_watch: failing checks were transient; jobs retried, no fix revision minted",
-        );
-        return true;
-    }
     // §Q7 composed ordering: an active conflict-resolution attempt
     // (or auto-rebase escalation) for this PR owns the slot until
     // terminal. CI watch defers; the next sweep re-evaluates once the
@@ -563,6 +552,25 @@ pub async fn on_ci_failure_detected_with(
         }
     }
 
+    // Transient-infrastructure retry runs only once every in-flight guard
+    // above has passed, so a head already owned by a rebase, conflict fix,
+    // CI remediation or ci-fix revision never re-fetches Buildkite.
+    // A failure set pre-triage would `retrigger` (every check STARTUP_FAILURE
+    // or CANCELLED) belongs to that path; the job-level retry never also
+    // claims it.
+    if classify_pre_triage(failures) != "retrigger"
+        && let crate::ci_transient_retry::TransientOutcome::Handled { retried_jobs } =
+            crate::ci_transient_retry::try_transient_retry(work_db, publisher, retrier, candidate, probe, failures)
+                .await
+    {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            retried_jobs = ?retried_jobs,
+            "ci_watch: failing checks were transient; jobs retried, no fix revision minted",
+        );
+        return true;
+    }
     // Budget check (design §Q3). A used >= budget here means we've
     // already burned the allotment for this PR — flip the parent to
     // `ci_failure_exhausted` and emit the typed event, but do not

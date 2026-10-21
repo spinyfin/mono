@@ -15,8 +15,8 @@
 //!   cannot reset them.
 
 use boss_blocked_pr_diagnosis::{
-    AttemptFacts, BlockedFacts, CiFacts, ConflictFacts, ExecutionFacts, ReviewBatchFacts, ReviewFacts, RevisionFacts,
-    RevisionOrigin, TransientRetryFacts,
+    AttemptFacts, BlockedFacts, CiFacts, ConflictFacts, ExecutionFacts, HeadVerdictFacts, ReviewBatchFacts,
+    ReviewFacts, RevisionFacts, RevisionOrigin, TransientRetryFacts,
 };
 use rusqlite::OptionalExtension;
 
@@ -53,6 +53,9 @@ pub const REMEDIATION_CATEGORY_CI_TRANSIENT_RETRY: &str = "ci_transient_retry";
 /// run died with no successor.
 pub const REMEDIATION_CATEGORY_REVISION_REDISPATCH: &str = "revision_redispatch";
 
+/// Written before the action runs, so a crash between the reservation and
+/// the outcome still counts against the budget. Replaced by the real outcome.
+pub const REMEDIATION_OUTCOME_PENDING: &str = "pending";
 pub const REMEDIATION_OUTCOME_RETRIED: &str = "retried";
 pub const REMEDIATION_OUTCOME_RETRY_FAILED: &str = "retry_failed";
 pub const REMEDIATION_OUTCOME_BUDGET_EXHAUSTED: &str = "budget_exhausted";
@@ -103,10 +106,19 @@ struct TaskRow {
     ci_required_state: Option<String>,
     ci_required_detail: Option<String>,
     pr_mergeable_state: Option<String>,
+    review_required_state: Option<String>,
     head_sha: Option<String>,
     attempts_used: i64,
     product_id: String,
 }
+
+/// Ledger outcomes that spend the dead-revision re-dispatch budget. A
+/// `pending` row is a reservation whose action may not have finished.
+const REDISPATCH_BUDGET_OUTCOMES: [&str; 3] = [
+    REMEDIATION_OUTCOME_PENDING,
+    REMEDIATION_OUTCOME_REQUESTED,
+    REMEDIATION_OUTCOME_REQUEST_FAILED,
+];
 
 /// One open revision row: `(id, description, status, created_via,
 /// blocked_reason, blocked_detail)`.
@@ -176,7 +188,8 @@ impl WorkDb {
             .optional()?)
     }
 
-    pub fn record_pr_blocked_remediation(&self, input: BlockedPrRemediationInput) -> Result<()> {
+    /// Append a ledger row and return its id.
+    pub fn record_pr_blocked_remediation(&self, input: BlockedPrRemediationInput) -> Result<i64> {
         let conn = self.connect()?;
         conn.execute(
             "INSERT INTO pr_blocked_remediations
@@ -193,6 +206,16 @@ impl WorkDb {
                 input.detail,
                 now_string(),
             ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Replace a reserved row's outcome and detail once its action finished.
+    pub fn update_pr_blocked_remediation(&self, id: i64, outcome: &str, detail: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE pr_blocked_remediations SET outcome = ?2, detail = ?3 WHERE id = ?1",
+            params![id, outcome, detail],
         )?;
         Ok(())
     }
@@ -246,7 +269,14 @@ impl WorkDb {
 
     /// Gather everything `boss_blocked_pr_diagnosis::diagnose` needs about
     /// one card. Also returns the PR head SHA the facts were keyed on.
-    pub fn blocked_pr_facts(&self, work_item_id: &str) -> Result<(BlockedFacts, Option<String>)> {
+    ///
+    /// `review_fanout_enabled` says whether a failed review batch is replaced
+    /// by batch admission (the reason text differs when it is not).
+    pub fn blocked_pr_facts(
+        &self,
+        work_item_id: &str,
+        review_fanout_enabled: bool,
+    ) -> Result<(BlockedFacts, Option<String>)> {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         // The raw row reads hold the one shared connection guard, so they are
         // scoped: every `self.*` helper below (`count_pr_blocked_remediations`,
@@ -259,10 +289,10 @@ impl WorkDb {
                 REMEDIATION_CATEGORY_REVISION_REDISPATCH,
                 None,
                 Some(&revision.id),
-                &[REMEDIATION_OUTCOME_REQUESTED, REMEDIATION_OUTCOME_REQUEST_FAILED],
+                &REDISPATCH_BUDGET_OUTCOMES,
             )?;
         }
-        self.blocked_pr_facts_from_rows(work_item_id, now, task, revisions)
+        self.blocked_pr_facts_from_rows(work_item_id, now, task, revisions, review_fanout_enabled)
     }
 
     /// The card's own `tasks` row plus its open revisions, read under one
@@ -272,7 +302,8 @@ impl WorkDb {
         let conn = self.connect()?;
         let task: TaskRow = conn.query_row(
             "SELECT status, blocked_reason, blocked_detail, ci_required_state, ci_required_detail,
-                    pr_mergeable_state, pr_head_sha, COALESCE(ci_attempts_used, 0), product_id
+                    pr_mergeable_state, review_required_state, pr_head_sha, COALESCE(ci_attempts_used, 0),
+                    product_id
              FROM tasks WHERE id = ?1",
             [work_item_id],
             |row| {
@@ -283,9 +314,10 @@ impl WorkDb {
                     ci_required_state: row.get(3)?,
                     ci_required_detail: row.get(4)?,
                     pr_mergeable_state: row.get(5)?,
-                    head_sha: row.get(6)?,
-                    attempts_used: row.get(7)?,
-                    product_id: row.get(8)?,
+                    review_required_state: row.get(6)?,
+                    head_sha: row.get(7)?,
+                    attempts_used: row.get(8)?,
+                    product_id: row.get(9)?,
                 })
             },
         )?;
@@ -362,6 +394,7 @@ impl WorkDb {
         now: i64,
         task: TaskRow,
         revisions: Vec<RevisionFacts>,
+        review_fanout_enabled: bool,
     ) -> Result<(BlockedFacts, Option<String>)> {
         let TaskRow {
             status,
@@ -370,6 +403,7 @@ impl WorkDb {
             ci_required_state,
             ci_required_detail,
             pr_mergeable_state,
+            review_required_state,
             head_sha,
             attempts_used,
             product_id,
@@ -447,25 +481,20 @@ impl WorkDb {
                 }),
             auto_maintenance_enabled,
         };
-        let conn = self.connect()?;
-        let latest_pre_merge_batch = conn
-            .query_row(
-                "SELECT b.status, b.generation,
-                        EXISTS (SELECT 1 FROM pr_review_verdicts v
-                                WHERE v.batch_id = b.id AND v.gate_outcome != ?2)
-                 FROM pr_review_batches b
-                 WHERE b.cycle_root_id = ?1 AND b.phase = 'pre_merge'
-                 ORDER BY b.created_at DESC, b.generation DESC, b.id DESC LIMIT 1",
-                params![work_item_id, review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD],
-                |row| {
-                    Ok(ReviewBatchFacts {
-                        status: row.get(0)?,
-                        generation: row.get(1)?,
-                        has_settled_verdict: row.get(2)?,
-                    })
-                },
-            )
-            .optional()?;
+        let head_redispatches_used = match head_sha.as_deref() {
+            Some(sha) => self.count_pr_blocked_remediations(
+                work_item_id,
+                REMEDIATION_CATEGORY_REVISION_REDISPATCH,
+                Some(sha),
+                None,
+                &REDISPATCH_BUDGET_OUTCOMES,
+            )?,
+            None => 0,
+        };
+        let (latest_pre_merge_batch, head_verdict) = match head_sha.as_deref() {
+            Some(sha) => self.review_facts_for_head(work_item_id, sha)?,
+            None => (None, None),
+        };
         let facts = BlockedFacts {
             status,
             blocked_reason,
@@ -473,14 +502,87 @@ impl WorkDb {
             ci_required_state,
             pr_mergeable_state,
             revisions,
+            head_redispatches_used,
             ci,
             conflict,
             review: ReviewFacts {
+                head_known: head_sha.is_some(),
                 latest_pre_merge_batch,
+                head_verdict,
                 generation_cap: review_batches::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS,
+                review_required_state,
+                fanout_enabled: review_fanout_enabled,
             },
         };
         Ok((facts, head_sha))
+    }
+
+    /// The newest pre-merge batch and newest review verdict for the card's
+    /// **observed PR head**. Both are keyed on `sha`, so a batch or verdict
+    /// from an earlier head never reads as the current one.
+    fn review_facts_for_head(
+        &self,
+        work_item_id: &str,
+        sha: &str,
+    ) -> Result<(Option<ReviewBatchFacts>, Option<HeadVerdictFacts>)> {
+        let conn = self.connect()?;
+        let batch = conn
+            .query_row(
+                "SELECT b.status, b.generation
+                 FROM pr_review_batches b
+                 WHERE b.cycle_root_id = ?1 AND b.phase = 'pre_merge' AND b.target_sha = ?2
+                 ORDER BY b.generation DESC, b.created_at DESC, b.id DESC LIMIT 1",
+                params![work_item_id, sha],
+                |row| {
+                    Ok(ReviewBatchFacts {
+                        status: row.get(0)?,
+                        generation: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        let outcomes = [
+            review_verdicts::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+            review_verdicts::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+            review_verdicts::REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED,
+            review_verdicts::REVIEW_GATE_OUTCOME_GAVE_UP,
+        ]
+        .iter()
+        .map(|o| format!("'{o}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+        // The card plus every revision descended from it: verdicts are
+        // recorded against whichever of them the review ran on.
+        let family = "WITH RECURSIVE family(id, depth) AS (
+                SELECT ?1, 0
+                UNION ALL
+                SELECT t.id, f.depth + 1 FROM family f
+                JOIN tasks t ON t.parent_task_id = f.id
+                WHERE t.kind = 'revision' AND f.depth < 64
+             )";
+        let verdict = conn
+            .query_row(
+                &format!(
+                    "{family}
+                     SELECT v.gate_outcome,
+                            v.revision_task_id IS NOT NULL
+                              AND EXISTS (SELECT 1 FROM tasks r
+                                          WHERE r.id = v.revision_task_id AND r.deleted_at IS NULL)
+                     FROM pr_review_verdicts v
+                     JOIN family f ON f.id = v.work_item_id
+                     WHERE v.head_sha = ?2 AND v.gate_outcome IN ({outcomes})
+                     ORDER BY v.created_at DESC, v.id DESC LIMIT 1"
+                ),
+                params![work_item_id, sha],
+                |row| {
+                    Ok(HeadVerdictFacts {
+                        gate_outcome: row.get(0)?,
+                        has_successor_revision: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok((batch, verdict))
     }
 }
 
