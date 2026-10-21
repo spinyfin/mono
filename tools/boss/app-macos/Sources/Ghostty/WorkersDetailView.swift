@@ -501,6 +501,8 @@ struct WorkerSlotView: View, @MainActor Equatable {
         switch live?.activity {
         case .working: return .blue
         case .waitingForInput: return .orange
+        case .waitingOnWork: return .teal
+        case .waitOverdue: return .yellow
         case .idle: return .green
         case .spawning: return .secondary
         case .errored: return .red

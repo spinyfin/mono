@@ -26,9 +26,12 @@ use crate::semantic_progress::{
 };
 use boss_engine_driver::ProgressFidelity;
 
+mod declared_wait;
 mod never_started_reap;
 mod prompt_acceptance;
 pub mod semantic_progress;
+pub use declared_wait::{DeclaredWait, DeclaredWaitSource};
+use declared_wait::{ParkedBy, SharedWaitSource, is_idle_prompt_message, reconcile_parked, settle_parked};
 pub use never_started_reap::NeverStartedReapCommit;
 pub use prompt_acceptance::turn_evidence_kind;
 
@@ -195,7 +198,17 @@ pub struct LiveWorkerStateRegistry {
     pending_hooks: Mutex<HashMap<String, PendingHooks>>,
     #[cfg(any(test, feature = "test-support"))]
     pub test_hooks: TestHooks,
+    collaborators: Collaborators,
+}
+
+/// Optional engine services the registry reads from. Each is unset in tests
+/// and tools that have no use for it.
+#[derive(Default)]
+struct Collaborators {
     persona_store: Option<std::sync::Arc<boss_work_db::WorkDb>>,
+    /// Where a parked worker's own declared wait is read from; unset reads as
+    /// "no wait".
+    wait_source: Mutex<Option<SharedWaitSource>>,
 }
 
 #[derive(Default)]
@@ -289,6 +302,12 @@ struct SlotMeta {
     /// clearing hook emitted between the two proves that `Stop` did not
     /// consume the notification, and undoes the repair.
     notification_repair: Option<NotificationRepair>,
+    /// The pending notification is one that blocks on a person (a permission
+    /// prompt, an elicitation) rather than the driver's idle prompt. Only a
+    /// blocking prompt keeps a worker in `WaitingForInput` while it has a
+    /// live declared wait — see [`declared_wait`].
+    #[builder(default = false)]
+    blocking_prompt_pending: bool,
     /// Epoch-seconds timestamp recorded when `register_spawn` creates the
     /// entry. Used by `mark_stalled_spawns` to detect workers that have
     /// been stuck in `Spawning` without any hook event (the initial
@@ -571,7 +590,10 @@ impl LiveWorkerStateRegistry {
     /// Use durable persona leases for every production registration/release path.
     pub fn with_work_db(work_db: std::sync::Arc<boss_work_db::WorkDb>) -> Self {
         Self {
-            persona_store: Some(work_db),
+            collaborators: Collaborators {
+                persona_store: Some(work_db),
+                ..Collaborators::default()
+            },
             ..Self::default()
         }
     }
@@ -592,7 +614,7 @@ impl LiveWorkerStateRegistry {
     fn release_persona_locked(&self, run_id: &str) {
         #[cfg(any(test, feature = "test-support"))]
         self.notify_persona_boundary();
-        if let Some(db) = &self.persona_store
+        if let Some(db) = &self.collaborators.persona_store
             && let Err(error) = db.release_persona(run_id)
         {
             tracing::error!(run_id, %error, "could not release durable persona lease");
@@ -749,7 +771,7 @@ impl LiveWorkerStateRegistry {
         // could deadlock.
         #[cfg(any(test, feature = "test-support"))]
         self.notify_persona_boundary();
-        if let Some(db) = &self.persona_store {
+        if let Some(db) = &self.collaborators.persona_store {
             match db.lease_persona_for_execution(&state.run_id) {
                 Ok(name) => state.name = name,
                 Err(error) => {
@@ -894,7 +916,7 @@ impl LiveWorkerStateRegistry {
         let run_id = run_id.into();
         // A prior DB failure may have left a placeholder name: look the persona
         // up outside the registry lock, then revalidate before patching.
-        let needs_name_repair = self.persona_store.is_some()
+        let needs_name_repair = self.collaborators.persona_store.is_some()
             && self
                 .inner
                 .lock()
@@ -903,7 +925,7 @@ impl LiveWorkerStateRegistry {
                 .is_some_and(|entry| {
                     entry.state.run_id == run_id && entry.state.name == boss_protocol::placeholder_worker_name(&run_id)
                 });
-        let repaired_name = match (needs_name_repair, &self.persona_store) {
+        let repaired_name = match (needs_name_repair, &self.collaborators.persona_store) {
             (true, Some(db)) => match db.lease_persona_for_execution(&run_id) {
                 Ok(name) => Some(name),
                 Err(error) => {
@@ -1801,6 +1823,49 @@ impl LiveWorkerStateRegistry {
         guard.get(&slot_id)?.meta.last_stop_seq
     }
 
+    /// Install the source parked workers' declared waits are read from.
+    /// Called once, when the engine wires its wait registry.
+    pub fn set_wait_source(&self, source: std::sync::Arc<dyn DeclaredWaitSource>) {
+        *self
+            .collaborators
+            .wait_source
+            .lock()
+            .expect("wait source mutex poisoned") = Some(source);
+    }
+
+    fn wait_source(&self) -> Option<SharedWaitSource> {
+        self.collaborators
+            .wait_source
+            .lock()
+            .expect("wait source mutex poisoned")
+            .clone()
+    }
+
+    /// Re-read every parked slot's declared wait and move it accordingly: a
+    /// wait declared (or renewed) after the worker parked makes it
+    /// `WaitingOnWork`; a wait that expired without a re-wake makes it
+    /// `WaitOverdue`. Hook events only fire while the worker is active, so
+    /// this periodic pass is what notices a deadline passing on a silent one.
+    ///
+    /// Returns `(slot, prior, new)` for every slot that changed, so callers
+    /// can broadcast and mirror a departure from `WaitingForInput` onto the
+    /// durable row (this pass is off the hook-dispatch path).
+    pub fn reconcile_declared_waits(&self, now_epoch_secs: i64) -> Vec<(u8, WorkerActivity, WorkerActivity)> {
+        let Some(source) = self.wait_source() else {
+            return Vec::new();
+        };
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut changed = Vec::new();
+        for (slot_id, entry) in guard.iter_mut() {
+            let wait = source.declared_wait(&entry.state.run_id, now_epoch_secs);
+            if let Some(next) = reconcile_parked(entry.state.activity, entry.meta.blocking_prompt_pending, wait) {
+                changed.push((*slot_id, entry.state.activity, next));
+                entry.state.activity = next;
+            }
+        }
+        changed
+    }
+
     /// [`Self::apply_sequenced_event`] with the hook's full provenance, and
     /// the turn-resume evidence the reduction produced.
     ///
@@ -1821,6 +1886,9 @@ impl LiveWorkerStateRegistry {
     /// and is refused.
     pub fn apply_hook_event(&self, slot_id: u8, origin: HookOrigin, event: &WorkerEvent) -> HookApplied {
         let ingress_seq = origin.ingress_seq;
+        // Resolved before `inner` is locked: the source has its own lock and
+        // must never be taken while the slot map is held.
+        let wait_source = self.wait_source();
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
         // The wire state and the per-slot bookkeeping this arm reads and
@@ -1953,12 +2021,14 @@ impl LiveWorkerStateRegistry {
                 meta.tool_completed_since_prompt = false;
                 state.activity = WorkerActivity::Working;
                 state.current_tool = None;
+                meta.blocking_prompt_pending = false;
             }
             WorkerEvent::PreToolUse { tool_name, .. } => {
                 state.activity = WorkerActivity::Working;
                 state.current_tool = Some(tool_name.clone());
                 meta.notification_pending = false;
                 meta.notification_pending_seq = None;
+                meta.blocking_prompt_pending = false;
             }
             WorkerEvent::PostToolUse { .. } => {
                 state.current_tool = None;
@@ -1971,7 +2041,7 @@ impl LiveWorkerStateRegistry {
                 state.activity = WorkerActivity::Working;
             }
             WorkerEvent::ToolPoll { .. } | WorkerEvent::ModelProgress { .. } => {}
-            WorkerEvent::Notification { .. } => {
+            WorkerEvent::Notification { message, .. } => {
                 // Only trust this as an "awaiting human input" signal when
                 // the run's driver declared `Capability::AwaitingInputSignal`
                 // (see `set_awaiting_input_capable`). Absent that — a
@@ -1981,21 +2051,43 @@ impl LiveWorkerStateRegistry {
                 // WaitingForInput" contract is enforced, the other being
                 // `mark_stalled_spawns`'s own `awaiting_input_capable` check.
                 if meta.awaiting_input_capable {
-                    state.activity = WorkerActivity::WaitingForInput;
+                    let blocking = !is_idle_prompt_message(message);
                     state.current_tool = None;
                     meta.notification_pending = true;
                     meta.notification_pending_seq = ingress_seq;
+                    meta.blocking_prompt_pending |= blocking;
+                    // A parked worker's own declared wait decides whether an
+                    // idle prompt is a human's problem.
+                    state.activity = settle_parked(
+                        WorkerActivity::WaitingForInput,
+                        before.activity,
+                        ParkedBy::Notification,
+                        meta.blocking_prompt_pending,
+                        wait_state(&wait_source, &state.run_id),
+                    );
                 }
             }
             WorkerEvent::Stop { .. } => {
                 meta.notification_pending_seq = None;
                 let was_pending = std::mem::take(&mut meta.notification_pending);
+                // Not taken: a blocking prompt outlives the `Stop` that parks
+                // the worker on it, so the periodic wait pass keeps leaving it
+                // alone. The next turn (`UserPromptSubmit` / `PreToolUse`)
+                // clears it.
+                let blocking = meta.blocking_prompt_pending;
                 state.current_tool = None;
-                state.activity = if was_pending {
+                let raw = if was_pending {
                     WorkerActivity::WaitingForInput
                 } else {
                     WorkerActivity::Idle
                 };
+                state.activity = settle_parked(
+                    raw,
+                    before.activity,
+                    ParkedBy::Stop,
+                    blocking,
+                    wait_state(&wait_source, &state.run_id),
+                );
             }
             WorkerEvent::SessionEnd { .. } => {
                 state.activity = WorkerActivity::Terminated;
@@ -2024,6 +2116,7 @@ impl LiveWorkerStateRegistry {
                 // guard see through a `SessionEnd` the process did not honor.
                 meta.notification_pending = false;
                 meta.notification_pending_seq = None;
+                meta.blocking_prompt_pending = false;
             }
         }
 
@@ -2724,6 +2817,13 @@ fn worker_event_name(event: &WorkerEvent) -> &'static str {
         WorkerEvent::ToolPoll { .. } => "ToolPoll",
         WorkerEvent::ModelProgress { .. } => "ModelProgress",
         WorkerEvent::SessionEnd { .. } => "SessionEnd",
+    }
+}
+
+fn wait_state(source: &Option<SharedWaitSource>, run_id: &str) -> DeclaredWait {
+    match source {
+        Some(source) => source.declared_wait(run_id, boss_engine_utils::epoch_time::now_epoch_secs()),
+        None => DeclaredWait::None,
     }
 }
 

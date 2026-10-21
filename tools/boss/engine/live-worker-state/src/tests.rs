@@ -4,6 +4,9 @@ use boss_protocol::StopReason;
 #[path = "tests/revival_tests.rs"]
 mod revival_tests;
 
+#[path = "tests/live_worker_state_declared_wait_tests.rs"]
+mod declared_wait_tests;
+
 fn pre_tool(tool: &str) -> WorkerEvent {
     WorkerEvent::PreToolUse {
         session_id: "s".into(),
