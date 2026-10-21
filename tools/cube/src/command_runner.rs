@@ -1,4 +1,5 @@
 use std::io::{IsTerminal, Read};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -41,6 +42,17 @@ pub trait CommandRunner {
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct RealCommandRunner;
+
+/// SIGKILL every process in the group led by `pid`. Best effort: the group may
+/// already be gone.
+fn kill_process_group(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
 
 impl RealCommandRunner {
     pub fn invocation(cwd: &Path, program: &str, args: &[&str]) -> CommandInvocation {
@@ -175,7 +187,10 @@ impl RealCommandRunner {
             .current_dir(&invocation.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Its own process group, so the timeout can take down the whole tree
+            // (a `sh -c` wrapper's children outlive a kill of the wrapper alone).
+            .process_group(0);
         Self::configure_env(&mut cmd);
         for (k, v) in &invocation.env {
             cmd.env(k, v);
@@ -223,6 +238,7 @@ impl RealCommandRunner {
                         // Kill the child so cube stops waiting and any lock it
                         // holds is released; reap it to avoid a zombie, and
                         // join the drain threads so the pipe fds close.
+                        kill_process_group(child.id());
                         let _ = child.kill();
                         let _ = child.wait();
                         let _ = out_handle.join();
@@ -305,6 +321,25 @@ mod tests {
             )
             .expect("fast command should succeed");
         assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn run_with_timeout_kills_descendants_of_the_command() {
+        let runner = RealCommandRunner;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("survived");
+        // The shell backgrounds a grandchild that would write the marker after
+        // the deadline; killing only the direct child would let it.
+        let script = format!("(sleep 1; touch '{}') & wait", marker.display());
+        let err = runner
+            .run_with_timeout(
+                &RealCommandRunner::invocation(dir.path(), "sh", &["-c", &script]),
+                Duration::from_millis(200),
+            )
+            .expect_err("should time out");
+        assert!(matches!(err, CubeError::CommandTimedOut { .. }), "got {err:?}");
+        thread::sleep(Duration::from_millis(1800));
+        assert!(!marker.exists(), "a descendant outlived the timeout");
     }
 
     #[test]
