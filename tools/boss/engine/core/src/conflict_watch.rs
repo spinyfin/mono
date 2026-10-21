@@ -1153,6 +1153,68 @@ fn close_superseded_moot_revision(work_db: &WorkDb, work_item_id: &str, revision
     }
 }
 
+/// Close every engine-created merge-conflict revision of the work item whose
+/// spawning `conflict_resolutions` attempt already ended, now that GitHub
+/// reports the PR mergeable.
+///
+/// [`on_resolved`] only reaches the *active* attempt, and the merge poller
+/// only dispatches it while the parent still carries a `merge_conflict`
+/// signal. A revision whose attempt ended first was parked `blocked` by the
+/// revision reconciler and then closed by nothing, so it kept the parent in
+/// Review > Blocked on a PR that no longer conflicts. The merge poller calls
+/// this on every definitive-clean mergeability probe. Only `merge-conflict:`
+/// revisions are touched; a revision with a live worker is left alone by
+/// [`WorkDb::close_moot_revision_task`]. Returns the number closed.
+pub(crate) fn retire_moot_conflict_revisions(
+    work_db: &WorkDb,
+    candidate: &PendingMergeCheck,
+    labels: &[String],
+) -> usize {
+    if auto_pr_maintenance_disabled(work_db, candidate, labels) {
+        return 0;
+    }
+    let revision_ids = match work_db.open_conflict_revisions_of_ended_attempts(&candidate.work_item_id) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "conflict_watch: failed to look up open conflict revisions of ended attempts",
+            );
+            return 0;
+        }
+    };
+    let mut closed = 0;
+    for revision_task_id in &revision_ids {
+        let archival_reason = format!(
+            "PR is mergeable again and the attempt that spawned this merge-conflict revision already ended; \
+             revision moot (work_item_id={}, revision_task_id={revision_task_id})",
+            candidate.work_item_id,
+        );
+        match work_db.close_moot_revision_task(
+            revision_task_id,
+            ArchiveProvenance::new(ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION, &archival_reason),
+        ) {
+            Ok(Some(_)) => {
+                closed += 1;
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    revision_task_id,
+                    "conflict_watch: closed a stale merge-conflict revision; its attempt ended and the PR is mergeable",
+                );
+            }
+            Ok(None) => {} // a worker is still live on it, or it just settled
+            Err(err) => tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                revision_task_id,
+                ?err,
+                "conflict_watch: failed to close stale merge-conflict revision",
+            ),
+        }
+    }
+    closed
+}
+
 /// Abandon any active `ci_remediations` attempt for this work item and
 /// clear its `ci_failure` in-flight signal — best-effort, silent no-op when
 /// none exists. Design §Q1 ("conflict pre-empts CI") means conflict and CI

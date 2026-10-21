@@ -475,6 +475,48 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Ids of engine-created CI-fix revisions of `work_item_id` that are
+    /// still open (`todo`/`active`/`blocked`) although the `ci_remediations`
+    /// attempt that spawned them has already ended (any status other than
+    /// `pending`/`running`: `failed`, `abandoned`, `retriggered`, `succeeded`).
+    ///
+    /// `ci_watch::on_ci_resolved` only sees the *active* attempt, so a
+    /// revision whose attempt ended first (the reconciler parks it as
+    /// `blocked: spawning_attempt_retired_unsuccessfully`) is never closed
+    /// when CI later goes green. Callers feed these ids to
+    /// [`Self::close_moot_revision_task`].
+    ///
+    /// Provenance is double-checked on the revision itself
+    /// (`created_via LIKE 'ci-fix:%'`), so a human-filed revision is never
+    /// returned. Queue-side attempts (`merge_queue_rebounce`,
+    /// `trunk_queue_eviction`) are excluded: a green PR-head probe says
+    /// nothing about a failure that lived on the queue's synthetic commit.
+    pub fn open_ci_fix_revisions_of_ended_attempts(&self, work_item_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        open_revisions_of_ended_attempts(
+            &conn,
+            "ci_remediations",
+            CREATED_VIA_CI_FIX_PREFIX,
+            " AND (a.failure_kind IS NULL OR a.failure_kind NOT IN ('trunk_queue_eviction', 'merge_queue_rebounce'))",
+            work_item_id,
+        )
+    }
+
+    /// Merge-conflict counterpart of
+    /// [`Self::open_ci_fix_revisions_of_ended_attempts`]: open
+    /// `merge-conflict:` revisions of `work_item_id` whose
+    /// `conflict_resolutions` attempt has ended.
+    pub fn open_conflict_revisions_of_ended_attempts(&self, work_item_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        open_revisions_of_ended_attempts(
+            &conn,
+            "conflict_resolutions",
+            CREATED_VIA_MERGE_CONFLICT_PREFIX,
+            "",
+            work_item_id,
+        )
+    }
+
     /// Stamp `resolved_by_rung` on a still-live attempt *before* the
     /// resolution has actually completed — used by the escalation-ladder
     /// harness when it hands the conflict to a rung-2 small focused
@@ -1179,4 +1221,32 @@ impl WorkDb {
         tx.commit()?;
         Ok(recovered)
     }
+}
+
+/// Shared query behind [`WorkDb::open_ci_fix_revisions_of_ended_attempts`]
+/// and [`WorkDb::open_conflict_revisions_of_ended_attempts`]. `table` and
+/// `attempt_filter` are compile-time literals from those two callers (never
+/// user input); `attempt_filter` may reference the attempt row as `a`.
+fn open_revisions_of_ended_attempts(
+    conn: &Connection,
+    table: &str,
+    created_via_prefix: &str,
+    attempt_filter: &str,
+    work_item_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT t.id
+           FROM {table} a
+           JOIN tasks t ON t.id = a.revision_task_id
+          WHERE a.work_item_id = ?1
+            AND a.status NOT IN ('pending', 'running')
+            {attempt_filter}
+            AND t.kind = 'revision'
+            AND t.created_via LIKE ?2 || '%'
+            AND t.status IN ('todo', 'active', 'blocked')
+            AND t.deleted_at IS NULL
+          ORDER BY t.id",
+    ))?;
+    let rows = stmt.query_map(params![work_item_id, created_via_prefix], |row| row.get::<_, String>(0))?;
+    collect_rows(rows)
 }

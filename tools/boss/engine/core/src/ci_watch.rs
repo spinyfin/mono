@@ -2171,6 +2171,75 @@ fn close_superseded_moot_revision(work_db: &WorkDb, work_item_id: &str, revision
     }
 }
 
+/// Close every engine-created CI-fix revision of the work item whose
+/// spawning attempt already ended, now that CI is green on the PR head.
+///
+/// [`on_ci_resolved`] only reaches an *active* attempt, and only while the
+/// parent still carries a blocking signal. A revision whose attempt ended
+/// first — `failed`, or `retriggered` when the CI worker judged the failure
+/// flaky and pushed nothing — was parked `blocked:
+/// spawning_attempt_retired_unsuccessfully` by the revision reconciler and
+/// then never closed by anything: it kept counting as an in-progress
+/// revision, so the parent sat in Review > Blocked with a "revision
+/// blocked" badge while its PR was green and mergeable. The merge poller
+/// calls this on every clean CI probe (`dispatch_ci_axis`), so it also
+/// covers the head SHA having moved since the attempt ended.
+///
+/// Only revisions stamped `ci-fix:` are touched (human-filed and
+/// review-finding revisions never are), and queue-side attempts are skipped
+/// because a green PR-head probe says nothing about them. A revision a
+/// worker is still live on is left alone by
+/// [`WorkDb::close_moot_revision_task`]. Returns the number closed.
+pub(crate) fn retire_moot_ci_fix_revisions(
+    work_db: &WorkDb,
+    candidate: &PendingMergeCheck,
+    labels: &[String],
+) -> usize {
+    if auto_pr_maintenance_disabled(work_db, candidate, labels) {
+        return 0;
+    }
+    let revision_ids = match work_db.open_ci_fix_revisions_of_ended_attempts(&candidate.work_item_id) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "ci_watch: failed to look up open CI-fix revisions of ended attempts",
+            );
+            return 0;
+        }
+    };
+    let mut closed = 0;
+    for revision_task_id in &revision_ids {
+        let archival_reason = format!(
+            "CI is green on the PR head and the attempt that spawned this CI-fix revision already ended; \
+             revision moot (work_item_id={}, revision_task_id={revision_task_id})",
+            candidate.work_item_id,
+        );
+        match work_db.close_moot_revision_task(
+            revision_task_id,
+            ArchiveProvenance::new(ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION, &archival_reason),
+        ) {
+            Ok(Some(_)) => {
+                closed += 1;
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    revision_task_id,
+                    "ci_watch: closed a stale CI-fix revision; its attempt ended and CI is green",
+                );
+            }
+            Ok(None) => {} // a worker is still live on it, or it just settled
+            Err(err) => tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                revision_task_id,
+                ?err,
+                "ci_watch: failed to close stale CI-fix revision",
+            ),
+        }
+    }
+    closed
+}
+
 /// Whether the CI-fix revision `revision_task_id` spawned for a Trunk
 /// queue eviction has concluded, and so the PR may be auto-resubmitted to
 /// the queue.

@@ -1516,6 +1516,10 @@ pub(crate) async fn sweep_one(
                         outcome,
                     )
                     .await;
+                    // The PR no longer conflicts: close any merge-conflict
+                    // revision whose attempt ended before it could be retired
+                    // (the signal-driven retire above never sees those).
+                    conflict_watch::retire_moot_conflict_revisions(work_db, candidate, &probe_result.labels);
                     // CI-side detect: a `Failing` rollup still needs
                     // its own fan-out regardless of what the side-table
                     // says, because the chore is currently `in_review`
@@ -1962,6 +1966,15 @@ pub(crate) async fn dispatch_ci_axis(
             outcome.ci_cleared += 1;
         }
         ci_watch::on_ci_in_flight(work_db, publisher, candidate, probe_result).await;
+    }
+    // CI is green on the current head. Close any engine-created CI-fix
+    // revision whose spawning attempt already ended: `on_ci_resolved` only
+    // runs while the parent still carries a blocking signal and only sees the
+    // active attempt, so without this a revision parked after its attempt
+    // ended (e.g. `retriggered`) keeps the parent in Review > Blocked on a
+    // green PR indefinitely.
+    if matches!(ci, OpenPrCiStatus::Clean) {
+        ci_watch::retire_moot_ci_fix_revisions(work_db, candidate, &probe_result.labels);
     }
 }
 

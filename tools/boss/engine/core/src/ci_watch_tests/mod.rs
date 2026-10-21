@@ -12,4 +12,5 @@ mod rebase_first;
 mod rebounce;
 mod revision;
 mod revision_description;
+mod stale_revision;
 mod trunk_eviction;
