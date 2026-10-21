@@ -44,6 +44,12 @@
 //!   meanwhile takes another workspace or mints one. The claim is taken under
 //!   the repo lock, like the pool trim's removal, so the trim cannot remove a
 //!   workspace out from under it either.
+//! - **One pass at a time.** A pass holds a cleanup lock (separate from the
+//!   per-repo lease lock, so leases never wait on it) across its free-space
+//!   decisions, the commands and the measurements. A manual pass waits its turn
+//!   and then re-reads free space, so it cleans nothing the pass before it
+//!   already made unnecessary; the periodic pass, which runs inside a lease,
+//!   skips itself when another is running.
 //! - **Not workspaces holding recoverable work.** Dirty, conflicted and
 //!   quarantined workspaces are skipped: a recovery lease (`--allow-dirty`) must
 //!   be able to claim them, and the aged-unhealthy pass owns their fate.
@@ -52,7 +58,9 @@
 //!   half-cleaned state — and is retried, throttled, until it succeeds.
 //! - **The repo's command may decline.** Exit status
 //!   [`CLEANUP_BUSY_EXIT_CODE`] means "in use right now, nothing done": the
-//!   mark is lifted and cube moves on to another workspace.
+//!   mark is lifted and cube moves on to another workspace. So is a command
+//!   that could not run at all (shell exit 126/127): a workspace nothing was
+//!   done to is not withheld for it.
 //!
 //! ## Bytes freed
 //!
@@ -76,7 +84,7 @@ use crate::store::{CleanupResult, CleanupStatus, Store, WorkspaceCleanupState, W
 use crate::app::disk::{DiskSpace, human_bytes};
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::workspace_path_exists;
-use crate::app::util::{current_epoch_s, repo_lock_path};
+use crate::app::util::{cleanup_lock_path, current_epoch_s, repo_lock_path};
 
 /// Upper bound on one cleanup command. A multi-GiB tree with read-only
 /// directories takes tens of seconds to remove; this is the bound on a wedged
@@ -93,6 +101,11 @@ const CLEANUP_STALE_SECS: i64 = 60 * 60;
 /// polite to a command that is probably failing for a reason that persists.
 const CLEANUP_RETRY_SECS: i64 = 10 * 60;
 
+/// Shell exit statuses for "found but not executable" and "not found": the
+/// command did not run.
+const SHELL_NOT_EXECUTABLE: i32 = 126;
+const SHELL_NOT_FOUND: i32 = 127;
+
 /// Longest stretch of a command's output kept in the audit record.
 const AUDIT_OUTPUT_LIMIT: usize = 2048;
 
@@ -101,7 +114,7 @@ const AUDIT_OUTPUT_LIMIT: usize = 2048;
 pub(super) enum CleanupTrigger {
     /// The pool GC pass that runs from `cube workspace lease`.
     Periodic,
-    /// An operator running `cube workspace gc`.
+    /// An explicit `cube workspace gc` invocation.
     Manual,
 }
 
@@ -114,6 +127,15 @@ pub(super) enum CleanupReason {
     /// not wait for disk pressure, because the workspace is withheld from the
     /// pool until it succeeds.
     RetryFailed,
+}
+
+impl CleanupReason {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::LowDisk => "free space is below the low-water mark",
+            Self::RetryFailed => "retrying an earlier cleanup that failed or died",
+        }
+    }
 }
 
 pub(super) struct CleanupOptions<'a> {
@@ -142,6 +164,25 @@ pub(super) struct PlannedCleanup {
     /// Seconds since the workspace was last leased or released; `-1` if cube
     /// has never leased it.
     pub(super) idle_secs: i64,
+}
+
+impl PlannedCleanup {
+    fn idle_description(&self) -> String {
+        if self.idle_secs < 0 {
+            "never leased by cube".to_string()
+        } else {
+            format!("idle {}", human_duration(self.idle_secs))
+        }
+    }
+}
+
+fn human_duration(secs: i64) -> String {
+    match secs {
+        s if s >= 86_400 => format!("{}d", s / 86_400),
+        s if s >= 3_600 => format!("{}h", s / 3_600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -220,11 +261,22 @@ impl CleanupReport {
                     "Dry run: free space is low but no free workspace is eligible for cleanup.".to_string()
                 };
             }
-            return format!(
-                "Dry run: would clean up to {} workspace(s), least recently used first, stopping once free \
-                 space clears the high-water mark.",
+            let mut out = format!(
+                "Dry run: would clean up to {} workspace(s), in this order (least recently used first), \
+                 stopping once free space clears the high-water mark:",
                 self.planned.len(),
             );
+            for (i, plan) in self.planned.iter().enumerate() {
+                out.push_str(&format!(
+                    "\n  {}. {}/{} — {}, {}",
+                    i + 1,
+                    plan.repo,
+                    plan.workspace_id,
+                    plan.reason.describe(),
+                    plan.idle_description(),
+                ));
+            }
+            return out;
         }
         if !self.had_work() {
             return "no workspace cleanup needed".to_string();
@@ -364,6 +416,17 @@ pub(super) fn run_cleanup_pass(
     opts: &CleanupOptions<'_>,
 ) -> CleanupReport {
     let mut report = CleanupReport::builder().dry_run(opts.dry_run).build();
+    let _pass_lock = match acquire_pass_lock(database_path, opts) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!("cube: cleanup: another cleanup pass is running; skipping this one");
+            return report;
+        }
+        Err(e) => {
+            eprintln!("cube: cleanup: cannot take the cleanup lock: {e}");
+            return report;
+        }
+    };
     let now = match current_epoch_s() {
         Ok(now) => now,
         Err(e) => {
@@ -434,6 +497,20 @@ pub(super) fn run_cleanup_pass(
     report
 }
 
+/// The lock that keeps cleanup passes from overlapping. A dry run changes
+/// nothing and needs none. The periodic pass runs inside a lease and must not
+/// make it wait on a cleanup command, so it yields; a manual pass waits.
+fn acquire_pass_lock(database_path: Option<&Path>, opts: &CleanupOptions<'_>) -> Result<Option<Option<RepoLock>>> {
+    if opts.dry_run {
+        return Ok(Some(None));
+    }
+    let path = cleanup_lock_path(database_path)?;
+    match opts.trigger {
+        CleanupTrigger::Manual => Ok(Some(Some(RepoLock::acquire(&path)?))),
+        CleanupTrigger::Periodic => Ok(RepoLock::try_acquire(&path)?.map(Some)),
+    }
+}
+
 fn deadline_reached(opts: &CleanupOptions<'_>) -> bool {
     opts.deadline.is_some_and(|d| Instant::now() >= d)
 }
@@ -493,7 +570,7 @@ fn execute(
         // The repo stopped declaring a cleanup step while this workspace was
         // marked. There is nothing to retry; lift the mark rather than withhold
         // the workspace forever.
-        finish(store, record, CleanupResult::Skipped, now);
+        finish(store, record, CleanupResult::Skipped, now, now);
         eprintln!(
             "cube: cleanup: {}: its repo no longer declares a cleanup step; lifting the mark",
             record.workspace_id,
@@ -507,7 +584,7 @@ fn execute(
             cwd: record.workspace_path.clone(),
             program: "sh".to_string(),
             args: vec!["-c".to_string(), step.command.clone()],
-            env: workspace_step_env(&record.workspace_path, candidate.repo.source.as_deref()),
+            env: cleanup_env(record, candidate.repo.source.as_deref(), step),
         },
         CLEANUP_STEP_TIMEOUT,
     );
@@ -516,7 +593,7 @@ fn execute(
 
     match outcome {
         Ok(output) => {
-            finish(store, record, CleanupResult::Cleaned, finished_at);
+            finish(store, record, CleanupResult::Cleaned, now, finished_at);
             let bytes_freed = before
                 .zip(DiskSpace::probe(&record.workspace_path).ok())
                 .map(|(before, after)| after.available_bytes.saturating_sub(before.available_bytes))
@@ -550,7 +627,7 @@ fn execute(
             stderr,
             ..
         }) => {
-            finish(store, record, CleanupResult::Skipped, finished_at);
+            finish(store, record, CleanupResult::Skipped, now, finished_at);
             eprintln!(
                 "cube: cleanup: {} is busy, leaving it alone{}",
                 record.workspace_id,
@@ -563,9 +640,31 @@ fn execute(
             audit_outcome(database_path, candidate, opts, "busy", 0, duration_ms, &stderr);
             report.busy.push(record.workspace_id.clone());
         }
+        Err(CubeError::CommandFailed {
+            status: Some(status @ (SHELL_NOT_EXECUTABLE | SHELL_NOT_FOUND)),
+            stderr,
+            ..
+        }) => {
+            // The command never ran, so nothing was done to the workspace and
+            // withholding it would only block a lease for a condition that no
+            // retry changes.
+            finish(store, record, CleanupResult::Skipped, now, finished_at);
+            let error = format!("exit {status}: {stderr}");
+            eprintln!(
+                "cube: cleanup: {} could not run the cleanup command, leaving the workspace in the pool: {error}",
+                record.workspace_id,
+            );
+            audit_outcome(database_path, candidate, opts, "unrunnable", 0, duration_ms, &error);
+            report.failed.push(FailedCleanup {
+                repo: record.repo.clone(),
+                workspace_id: record.workspace_id.clone(),
+                reason: candidate.reason,
+                error,
+            });
+        }
         Err(e) => {
             // Left marked: not leasable until a retry succeeds.
-            finish(store, record, CleanupResult::Failed, finished_at);
+            finish(store, record, CleanupResult::Failed, now, finished_at);
             let error = match &e {
                 CubeError::CommandFailed { stderr, status, .. } if !stderr.is_empty() => {
                     format!(
@@ -603,8 +702,18 @@ fn begin(store: &Store, database_path: Option<&Path>, record: &WorkspaceRecord, 
     )
 }
 
-fn finish(store: &Store, record: &WorkspaceRecord, result: CleanupResult, now: i64) {
-    if let Err(e) = store.finish_workspace_cleanup(&record.repo, &record.workspace_id, result, now) {
+/// The step's environment: the workspace being cleaned, and the checkout the
+/// step was declared in, which can differ (see [`CleanupStep`]).
+fn cleanup_env(record: &WorkspaceRecord, source: Option<&Path>, step: &CleanupStep) -> Vec<(String, String)> {
+    let mut env = workspace_step_env(&record.workspace_path, source);
+    let root = step.root.as_deref().unwrap_or(&record.workspace_path);
+    env.push(("CUBE_CLEANUP_ROOT".to_string(), root.display().to_string()));
+    env
+}
+
+/// Record how the attempt that began at `attempt` ended.
+fn finish(store: &Store, record: &WorkspaceRecord, result: CleanupResult, attempt: i64, now: i64) {
+    if let Err(e) = store.finish_workspace_cleanup(&record.repo, &record.workspace_id, result, attempt, now) {
         // The mark stays `running` and is taken over once stale: the safe
         // direction to fail, since the workspace stays out of the pool.
         eprintln!(

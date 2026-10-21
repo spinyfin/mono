@@ -2420,3 +2420,50 @@ fn heartbeating_a_lease_emits_an_event_carrying_its_age() {
         "every heartbeat must record how long the lease has been held",
     );
 }
+
+/// A workspace carrying a cleanup mark (mid-cleanup, or failed and awaiting
+/// retry) sorts first, yet the lease neither fails nor waits: it takes the
+/// next healthy free workspace.
+#[test]
+fn workspace_lease_skips_a_cleanup_marked_workspace_and_takes_the_next() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
+    std::fs::create_dir_all(workspace_root.join("mono-agent-005").join(".jj")).expect("workspace dir");
+    seed_mono_repo(&workspace_root, &database_path);
+
+    let mut store = Store::open_at(&database_path).expect("store");
+    let candidates: Vec<_> = ["mono-agent-004", "mono-agent-005"]
+        .iter()
+        .map(|id| crate::metadata::WorkspaceCandidate {
+            workspace_id: id.to_string(),
+            workspace_path: workspace_root.join(id),
+        })
+        .collect();
+    store.sync_workspaces("mono", &candidates).expect("sync");
+    // A fresh `running` mark, so the pool GC that runs inside the lease leaves
+    // it alone (it is only taken over once stale).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(
+        store
+            .begin_workspace_cleanup("mono", "mono-agent-004", now, 0)
+            .expect("begin cleanup")
+    );
+
+    // Only the second workspace is probed and reset; the marked one is never
+    // touched.
+    let second_path = workspace_root.join("mono-agent-005");
+    let runner = lease_runner_for(&second_path, "def5678");
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "mid-cleanup"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("a marked workspace must not fail the lease");
+
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-005");
+    runner.assert_exhausted();
+}

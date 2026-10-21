@@ -31,6 +31,8 @@ steps:
 # Bazel output base (10-16 GiB once fully built; nothing else ever reclaims it).
 # All of the Bazel-specific logic lives in the script, not in cube. It exits 75
 # ("busy") if a Bazel command is running in the workspace, and never touches the
-# shared repository cache or any other workspace's output base.
+# shared repository cache or any other workspace's output base. The script is
+# addressed through CUBE_CLEANUP_ROOT (the checkout this file was read from)
+# because a free workspace can sit on a revision that predates the script.
 cleanup:
-  command: bash .cube/cleanup-bazel-output-base.sh
+  command: bash "$CUBE_CLEANUP_ROOT/.cube/cleanup-bazel-output-base.sh"

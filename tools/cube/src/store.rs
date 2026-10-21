@@ -67,6 +67,10 @@ pub struct WorkspaceListFilter<'a> {
     /// `state` is ignored.
     pub effective_state: Option<EffectiveState>,
     pub holder_pattern: Option<&'a str>,
+    /// Leave out workspaces carrying a cleanup mark (running or failed). The
+    /// lease path sets it: a marked workspace is not claimable, so it must not
+    /// be a candidate in the first place.
+    pub exclude_cleanup_marked: bool,
 }
 
 /// One row swept by [`Store::expire_stale_leases`]. The lease handler
@@ -273,6 +277,9 @@ impl Store {
                     bound.push(WorkspaceState::Leased.as_str().to_string());
                 }
             }
+        }
+        if filter.exclude_cleanup_marked {
+            sql.push_str(" AND cleanup_status IS NULL");
         }
         if let Some(holder_pattern) = filter.holder_pattern {
             sql.push_str(" AND holder GLOB ?");
@@ -1044,7 +1051,10 @@ impl Store {
     }
 
     /// Record how a cleanup begun with [`Store::begin_workspace_cleanup`]
-    /// ended. Only a row still marked `running` is touched.
+    /// ended. Only a row still marked `running` by *that attempt* is touched:
+    /// `attempt_started_at_epoch_s` is the `now_epoch_s` the attempt passed to
+    /// `begin_workspace_cleanup`, so an attempt that outlived a stale-mark
+    /// takeover cannot clear or fail the newer attempt's mark.
     ///
     /// - [`CleanupResult::Cleaned`] lifts the mark and stamps
     ///   `last_cleaned_at_epoch_s`, so the same untouched workspace is not
@@ -1058,6 +1068,7 @@ impl Store {
         repo: &str,
         workspace_id: &str,
         result: CleanupResult,
+        attempt_started_at_epoch_s: i64,
         now_epoch_s: i64,
     ) -> Result<(), CubeError> {
         let (status, cleaned_at): (Option<&str>, Option<i64>) = match result {
@@ -1073,11 +1084,35 @@ impl Store {
                     cleanup_status = ?3,
                     last_cleaned_at_epoch_s = COALESCE(?4, last_cleaned_at_epoch_s)
                 WHERE repo = ?1 AND workspace_id = ?2 AND cleanup_status = ?5
+                  AND cleanup_started_at_epoch_s = ?6
                 "#,
-                params![repo, workspace_id, status, cleaned_at, CleanupStatus::Running.as_str(),],
+                params![
+                    repo,
+                    workspace_id,
+                    status,
+                    cleaned_at,
+                    CleanupStatus::Running.as_str(),
+                    attempt_started_at_epoch_s,
+                ],
             )
             .map_err(CubeError::Storage)?;
         Ok(())
+    }
+
+    /// Lift every `failed` cleanup mark (optionally only on one workspace id),
+    /// returning those workspaces to the pool. A `running` mark is left alone.
+    /// Returns how many marks were lifted.
+    pub fn clear_failed_cleanup_marks(&self, workspace_id: Option<&str>) -> Result<usize, CubeError> {
+        self.connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET cleanup_status = NULL
+                WHERE cleanup_status = ?1 AND (?2 IS NULL OR workspace_id = ?2)
+                "#,
+                params![CleanupStatus::Failed.as_str(), workspace_id],
+            )
+            .map_err(CubeError::Storage)
     }
 
     /// The cleanup mark on one workspace, `None` when it carries none (or does
@@ -2225,7 +2260,7 @@ mod tests {
 
         // Finishing lifts the mark and the workspace is claimable again.
         store
-            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Cleaned, 300)
+            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Cleaned, 100, 300)
             .expect("finish");
         assert!(
             store
@@ -2281,7 +2316,7 @@ mod tests {
             "a fresh running cleanup is not taken over"
         );
         store
-            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Failed, 110)
+            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Failed, 100, 110)
             .expect("finish");
 
         let state = store
@@ -2332,6 +2367,43 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_attempt_cannot_finish_a_newer_attempts_mark() {
+        let (tempdir, mut store) = open_store();
+        seed_two_workspaces(&tempdir, &mut store);
+
+        assert!(
+            store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 100, 0)
+                .expect("begin")
+        );
+        // The first attempt is presumed dead and taken over...
+        assert!(
+            store
+                .begin_workspace_cleanup("mono", "mono-agent-001", 200, 150)
+                .expect("begin")
+        );
+        // ...then wakes up and reports. It must not touch the newer mark.
+        store
+            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Cleaned, 100, 210)
+            .expect("finish");
+        assert_eq!(
+            store
+                .get_workspace_cleanup_status("mono", "mono-agent-001")
+                .expect("status"),
+            Some(super::CleanupStatus::Running),
+        );
+        store
+            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Cleaned, 200, 220)
+            .expect("finish");
+        assert_eq!(
+            store
+                .get_workspace_cleanup_status("mono", "mono-agent-001")
+                .expect("status"),
+            None,
+        );
+    }
+
+    #[test]
     fn a_skipped_cleanup_lifts_the_mark_without_recording_a_cleaning() {
         let (tempdir, mut store) = open_store();
         seed_two_workspaces(&tempdir, &mut store);
@@ -2342,7 +2414,7 @@ mod tests {
                 .expect("begin")
         );
         store
-            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Skipped, 110)
+            .finish_workspace_cleanup("mono", "mono-agent-001", super::CleanupResult::Skipped, 100, 110)
             .expect("finish");
 
         let state = store

@@ -40,9 +40,20 @@ pub const CLEANUP_BUSY_EXIT_CODE: i32 = 75;
 /// done, and any other exit is a failure that cube logs and retries. The
 /// command must be idempotent: a cleanup that was interrupted is re-run from
 /// the top.
+///
+/// The declaration may have been read from the repo's source checkout rather
+/// than the workspace (see [`read_cleanup_step`]), and a workspace on an older
+/// revision may not contain the files the command refers to. cube therefore
+/// exports `CUBE_CLEANUP_ROOT`, the checkout the declaration came from, so a
+/// command can address its own assets as `"$CUBE_CLEANUP_ROOT/.cube/..."`
+/// whichever checkout declared it.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CleanupStep {
     pub command: String,
+    /// The checkout whose `.cube/setup.yaml` declared this step. Set by
+    /// [`read_cleanup_step`], never by the file.
+    #[serde(skip)]
+    pub root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -275,7 +286,8 @@ pub fn read_setup_config(workspace_path: &Path) -> Result<Option<SetupConfig>, C
 /// could never be cleaned.
 pub fn read_cleanup_step(workspace_path: &Path, fallback: Option<&Path>) -> Result<Option<CleanupStep>, CubeError> {
     for root in std::iter::once(workspace_path).chain(fallback) {
-        if let Some(cleanup) = read_setup_config(root)?.and_then(|config| config.cleanup) {
+        if let Some(mut cleanup) = read_setup_config(root)?.and_then(|config| config.cleanup) {
+            cleanup.root = Some(root.to_path_buf());
             return Ok(Some(cleanup));
         }
     }
@@ -538,7 +550,13 @@ steps:
 
         // The workspace declares nothing (e.g. it sits on an older commit).
         let found = read_cleanup_step(workspace.path(), Some(source.path())).unwrap();
-        assert_eq!(found.unwrap().command, "from-source");
+        let found = found.unwrap();
+        assert_eq!(found.command, "from-source");
+        assert_eq!(
+            found.root.as_deref(),
+            Some(source.path()),
+            "the step remembers where it came from"
+        );
 
         // Its own declaration wins when it has one.
         fs::create_dir_all(setup_config_path(workspace.path()).parent().unwrap()).unwrap();
@@ -548,7 +566,9 @@ steps:
         )
         .unwrap();
         let found = read_cleanup_step(workspace.path(), Some(source.path())).unwrap();
-        assert_eq!(found.unwrap().command, "from-workspace");
+        let found = found.unwrap();
+        assert_eq!(found.command, "from-workspace");
+        assert_eq!(found.root.as_deref(), Some(workspace.path()));
 
         assert!(
             read_cleanup_step(source.path().join("missing").as_path(), None)

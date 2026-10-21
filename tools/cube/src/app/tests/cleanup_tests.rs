@@ -295,7 +295,19 @@ fn dry_run_lists_the_plan_and_changes_nothing() {
     assert!(report.cleaned.is_empty());
     let planned: Vec<_> = report.planned.iter().map(|p| p.workspace_id.as_str()).collect();
     assert_eq!(planned, ["mono-agent-001", "mono-agent-002", "mono-agent-003"]);
-    assert!(report.summary().starts_with("Dry run: would clean up to 3"));
+    let summary = report.summary();
+    assert!(summary.starts_with("Dry run: would clean up to 3"), "{summary}");
+    let order: Vec<_> = (1..=3)
+        .map(|n| {
+            summary
+                .find(&format!("{n}. mono/mono-agent-00{n}"))
+                .expect("each workspace is listed")
+        })
+        .collect();
+    assert!(
+        order.is_sorted(),
+        "listed in the order a real pass would take them: {summary}"
+    );
     for index in 0..3 {
         assert_eq!(pool.cleanup_status(index), None);
     }
@@ -405,7 +417,7 @@ fn a_failed_cleanup_withholds_the_workspace_and_is_retried_without_pressure() {
             .expect("begin")
     );
     pool.store
-        .finish_workspace_cleanup("mono", &pool.id(0), CleanupResult::Failed, long_ago)
+        .finish_workspace_cleanup("mono", &pool.id(0), CleanupResult::Failed, long_ago, long_ago)
         .expect("finish");
     let _healthy = testing::with_reading(AMPLE_TEST_VOLUME);
     let retry_runner = CleanupRunner::new(AMPLE_TEST_VOLUME.available_bytes, 0);
@@ -486,7 +498,7 @@ fn a_mark_whose_repo_no_longer_declares_cleanup_is_lifted_not_retried_forever() 
             .expect("begin")
     );
     pool.store
-        .finish_workspace_cleanup("mono", &pool.id(0), CleanupResult::Failed, long_ago)
+        .finish_workspace_cleanup("mono", &pool.id(0), CleanupResult::Failed, long_ago, long_ago)
         .expect("finish");
     write_setup_yaml(&pool.workspaces[0], "version: 1\nsteps: []\n");
     let runner = CleanupRunner::new(AMPLE_TEST_VOLUME.available_bytes, 0);
@@ -555,6 +567,16 @@ fn workspace_gc_dry_run_reports_the_cleanup_plan_through_the_cli() {
     runner.assert_exhausted();
 
     assert!(result.message.contains("would clean up to 1"), "{}", result.message);
+    assert!(
+        result.message.contains("mono/mono-agent-001"),
+        "the plain-text plan names the workspace: {}",
+        result.message
+    );
+    assert!(
+        result.message.contains("free space is below the low-water mark"),
+        "the plain-text plan says why: {}",
+        result.message
+    );
     let planned = result.payload["workspace_cleanup"]["planned"].as_array().unwrap();
     assert_eq!(planned.len(), 1);
     assert_eq!(planned[0]["workspace_id"], "mono-agent-001");
@@ -638,6 +660,9 @@ fn a_pass_that_could_not_clean_anything_does_not_pin_the_short_interval() {
 fn real_commands_run_in_the_workspace_and_exit_statuses_map_to_outcomes() {
     use crate::command_runner::RealCommandRunner;
 
+    // Spawns real processes: keep PATH-mutating tests out while it does.
+    let _env = super::support::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
     let (low, _) = marks();
     let pool = Pool::seed(3);
     write_setup_yaml(
@@ -681,4 +706,141 @@ fn real_commands_run_in_the_workspace_and_exit_statuses_map_to_outcomes() {
         .find(|e| e["event"] == "workspace.cleanup" && e["workspace_id"] == "mono-agent-001")
         .expect("audit event");
     assert!(audited["output"].as_str().unwrap().starts_with("cleaning "));
+}
+
+/// The fallback case: only the repo's source checkout has the script, the
+/// workspace (on an older revision) does not. The command finds it through
+/// `CUBE_CLEANUP_ROOT`, and the workspace is cleaned rather than withheld.
+#[test]
+fn a_cleanup_script_only_the_source_checkout_has_is_found_through_cleanup_root() {
+    use crate::command_runner::RealCommandRunner;
+
+    // Spawns real processes: keep PATH-mutating tests out while it does.
+    let _env = super::support::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (low, _) = marks();
+    let pool = Pool::seed(1);
+    let source = pool.tempdir.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("clean.sh"), "touch \"$CUBE_WORKSPACE/cleaned.marker\"\n").unwrap();
+    write_setup_yaml(
+        &source,
+        "version: 1\ncleanup:\n  command: 'sh \"$CUBE_CLEANUP_ROOT/clean.sh\"'\n",
+    );
+    // The workspace predates the declaration; the repo's source is the fallback.
+    write_setup_yaml(&pool.workspaces[0], "version: 1\nsteps: []\n");
+    let mut repo = pool.store.get_repo("mono").unwrap().unwrap();
+    repo.source = Some(source.clone());
+    pool.store.upsert_repo(&repo).unwrap();
+    let _volume = testing::with_reading(volume_with_free(low - GIB));
+
+    let report = pool.pass(&RealCommandRunner, false);
+
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(report.cleaned.len(), 1);
+    assert!(
+        pool.workspaces[0].join("cleaned.marker").exists(),
+        "the script ran against the workspace though only the source has it"
+    );
+    assert_eq!(pool.cleanup_status(0), None);
+}
+
+/// A command that could not run (127, 126) did nothing to the workspace, so
+/// it is not withheld from leases for it.
+#[test]
+fn a_command_that_cannot_run_does_not_withhold_the_workspace() {
+    use crate::command_runner::RealCommandRunner;
+
+    // Spawns real processes: keep PATH-mutating tests out while it does.
+    let _env = super::support::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (low, _) = marks();
+    let pool = Pool::seed(1);
+    write_setup_yaml(
+        &pool.workspaces[0],
+        "version: 1\ncleanup:\n  command: 'bash .cube/not-in-this-revision.sh'\n",
+    );
+    let _volume = testing::with_reading(volume_with_free(low - GIB));
+
+    let report = pool.pass(&RealCommandRunner, false);
+
+    assert_eq!(report.failed.len(), 1, "still reported");
+    assert_eq!(pool.cleanup_status(0), None, "but not marked: it stays leasable");
+    assert!(pool.claim(0), "a lease can take it");
+}
+
+/// A pass that overlaps another does not start a second cleanup: the periodic
+/// pass yields, and a finished pass has released the lock for the next.
+#[test]
+fn an_overlapping_periodic_pass_yields_to_a_running_one() {
+    use crate::lock::RepoLock;
+
+    let (low, _) = marks();
+    let pool = Pool::seed(2);
+    let start = low - GIB;
+    let _volume = testing::with_reading(volume_with_free(start));
+    let lock_path = pool.tempdir.path().join("locks").join("workspace-cleanup.lock");
+    let held = RepoLock::acquire(&lock_path).expect("another pass holds the cleanup lock");
+
+    let runner = CleanupRunner::new(start, 30 * GIB);
+    let report = run_cleanup_pass(
+        &runner,
+        &pool.store,
+        Some(&pool.database_path),
+        &CleanupOptions {
+            repo: None,
+            workspace: None,
+            trigger: CleanupTrigger::Periodic,
+            dry_run: false,
+            deadline: None,
+        },
+    );
+    assert!(runner.ran_in().is_empty(), "the overlapping pass cleaned nothing");
+    assert!(report.cleaned.is_empty());
+
+    drop(held);
+    pool.pass(&runner, false);
+    assert_eq!(
+        runner.ran_in(),
+        ["mono-agent-001"],
+        "with the lock free, a pass proceeds"
+    );
+}
+
+/// A workspace withheld by a cleanup mark does not pass as plain `free`, and
+/// `gc --clear-failed-cleanup` returns it to the pool.
+#[test]
+fn a_failed_cleanup_is_visible_in_the_list_and_can_be_cleared() {
+    let pool = Pool::seed(2);
+    assert!(
+        pool.store
+            .begin_workspace_cleanup("mono", &pool.id(0), 1_000, 0)
+            .expect("begin")
+    );
+    pool.store
+        .finish_workspace_cleanup("mono", &pool.id(0), CleanupResult::Failed, 1_000, 1_000)
+        .expect("finish");
+
+    let runner = FakeRunner::new(vec![]);
+    let listed = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "list"]),
+        Some(&pool.database_path),
+        &runner,
+    )
+    .expect("list");
+    assert!(
+        listed.message.contains("cleanup failed, retrying"),
+        "{}",
+        listed.message
+    );
+    assert_eq!(listed.payload["retention"]["cleanup_withheld"], 1);
+    assert_eq!(listed.payload["retention"]["effective_free"], 1);
+
+    assert_eq!(
+        pool.store.clear_failed_cleanup_marks(Some(&pool.id(1))).expect("clear"),
+        0,
+        "only the named workspace is considered"
+    );
+    assert_eq!(pool.store.clear_failed_cleanup_marks(None).expect("clear"), 1);
+    assert_eq!(pool.cleanup_status(0), None);
 }

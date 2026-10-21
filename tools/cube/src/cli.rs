@@ -285,6 +285,12 @@ pub enum WorkspaceCommand {
         /// List what would be forgotten and cleaned without doing it.
         #[arg(long)]
         dry_run: bool,
+        /// Lift the `failed` cleanup mark from workspaces (all, or just
+        /// `--workspace`) before the cleanup pass, returning them to the pool.
+        /// For a workspace withheld by a cleanup that keeps failing and that
+        /// an operator has decided to leave alone. Ignored with `--dry-run`.
+        #[arg(long)]
+        clear_failed_cleanup: bool,
     },
     /// Position the working copy on the head of a PR branch.
     ///
@@ -1154,7 +1160,7 @@ mod tests {
         let cli = Cli::parse_from(["cube", "workspace", "gc"]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Gc { workspace, dry_run },
+                command: WorkspaceCommand::Gc { workspace, dry_run, .. },
             } => {
                 assert!(workspace.is_none());
                 assert!(!dry_run);
@@ -1168,7 +1174,7 @@ mod tests {
         let cli = Cli::parse_from(["cube", "workspace", "gc", "--workspace", "mono-agent-001", "--dry-run"]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Gc { workspace, dry_run },
+                command: WorkspaceCommand::Gc { workspace, dry_run, .. },
             } => {
                 assert_eq!(workspace.as_deref(), Some("mono-agent-001"));
                 assert!(dry_run);

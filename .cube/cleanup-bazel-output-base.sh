@@ -14,9 +14,16 @@
 # next to it is untouched); it does not touch the checkout.
 #
 # Contract with cube (see tools/cube/src/setup.rs):
-#   exit 0   cleaned, or nothing to clean
+#   exit 0   cleaned, nothing to clean, or declined: the output base is not
+#            provably this workspace's, so this step has nothing it may remove
+#            (logged to stderr; nothing was touched)
 #   exit 75  busy: a Bazel command is running in this workspace; nothing done
-#   other    failure; cube keeps the workspace out of the pool and retries
+#   other    failure after shutdown or removal began; cube keeps the workspace
+#            out of the pool and retries
+#
+# Declining is exit 0, not a failure, because it is deterministic: cube would
+# withhold an intact workspace and retry forever for a condition that never
+# changes.
 #
 # How the output base is found: from this workspace's own `bazel-*` symlinks
 # (they point at <output_base>/execroot/<name>/...), never by guessing at the
@@ -42,8 +49,14 @@ fail() {
   exit 1
 }
 
+# Nothing has been touched and nothing this step may remove was found.
+decline() {
+  echo "cleanup-bazel-output-base: $*; nothing cleaned" >&2
+  exit 0
+}
+
 workspace="${CUBE_WORKSPACE:-$PWD}"
-cd "$workspace" || fail "cannot enter workspace $workspace"
+cd "$workspace" || decline "cannot enter workspace $workspace"
 physical_workspace="$(pwd -P)"
 
 # 1. Find the output base through the workspace's bazel-* symlinks.
@@ -63,7 +76,7 @@ for link in bazel-*; do
   if [ -z "$output_base" ]; then
     output_base="$candidate"
   elif [ "$output_base" != "$candidate" ]; then
-    fail "the bazel-* symlinks in $workspace point at different output bases ($output_base and $candidate); refusing to guess"
+    decline "the bazel-* symlinks in $workspace point at different output bases ($output_base and $candidate); refusing to guess"
   fi
 done
 
@@ -79,14 +92,14 @@ fi
 # 2. It must be this workspace's base, by Bazel's own record of whose it is.
 case "$output_base" in
   /?*) ;;
-  *) fail "output base '$output_base' is not an absolute path" ;;
+  *) decline "output base '$output_base' is not an absolute path" ;;
 esac
 marker="$output_base/DO_NOT_BUILD_HERE"
-[ -f "$marker" ] || fail "$output_base has no DO_NOT_BUILD_HERE; it is not a Bazel output base, refusing to remove it"
+[ -f "$marker" ] || decline "$output_base has no DO_NOT_BUILD_HERE; it is not a Bazel output base, refusing to remove it"
 recorded=""
 IFS= read -r recorded <"$marker" || true
 if [ "$recorded" != "$workspace" ] && [ "$recorded" != "$physical_workspace" ]; then
-  fail "$output_base belongs to '$recorded', not to this workspace ($workspace); refusing to remove it"
+  decline "$output_base belongs to '$recorded', not to this workspace ($workspace); refusing to remove it"
 fi
 
 # 3. A live server is shut down if it is idle and means "busy" if it is not.

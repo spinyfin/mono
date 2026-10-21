@@ -11,6 +11,15 @@ pub struct RepoLock {
 
 impl RepoLock {
     pub fn acquire(lock_path: &Path) -> Result<Self, CubeError> {
+        Self::open_and_lock(lock_path, true)?.ok_or_else(|| unreachable!("a blocking lock always acquires"))
+    }
+
+    /// Take the lock if nobody holds it; `None` when it is held elsewhere.
+    pub fn try_acquire(lock_path: &Path) -> Result<Option<Self>, CubeError> {
+        Self::open_and_lock(lock_path, false)
+    }
+
+    fn open_and_lock(lock_path: &Path, blocking: bool) -> Result<Option<Self>, CubeError> {
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent).map_err(|e| CubeError::LockIo {
                 path: parent.to_path_buf(),
@@ -27,11 +36,16 @@ impl RepoLock {
                 path: lock_path.to_path_buf(),
                 source: e,
             })?;
-        FileExt::lock_exclusive(&file).map_err(|e| CubeError::LockIo {
+        let io_error = |source| CubeError::LockIo {
             path: lock_path.to_path_buf(),
-            source: e,
-        })?;
-        Ok(Self { _file: file })
+            source,
+        };
+        if blocking {
+            FileExt::lock_exclusive(&file).map_err(io_error)?;
+        } else if !FileExt::try_lock_exclusive(&file).map_err(io_error)? {
+            return Ok(None);
+        }
+        Ok(Some(Self { _file: file }))
     }
 }
 
@@ -49,6 +63,16 @@ mod tests {
         let lock_path = dir.path().join("nested/locks/repo.lock");
         let _lock = RepoLock::acquire(&lock_path).unwrap();
         assert!(lock_path.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn try_acquire_reports_a_held_lock_instead_of_waiting() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("repo.lock");
+        let held = RepoLock::try_acquire(&lock_path).unwrap().expect("free lock");
+        assert!(RepoLock::try_acquire(&lock_path).unwrap().is_none());
+        drop(held);
+        assert!(RepoLock::try_acquire(&lock_path).unwrap().is_some());
     }
 
     #[test]
