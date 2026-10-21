@@ -98,6 +98,24 @@ enum BossWindowCapture {
         }
     }
 
+    /// With `--capture-dump-scroll`, print every NSScrollView's visible rect
+    /// and document size before the grab so a capture can be compared
+    /// numerically, not just by eye.
+    @MainActor
+    static func dumpScrollOffsets(in view: NSView?, label: String) {
+        guard CommandLine.arguments.contains("--capture-dump-scroll"), let view else { return }
+        func walk(_ view: NSView) {
+            if let scroll = view as? NSScrollView {
+                let r = scroll.documentVisibleRect
+                let d = scroll.documentView?.frame.size ?? .zero
+                print("\(label) scrollview visible=\(Int(r.origin.x)),\(Int(r.origin.y)) size=\(Int(r.width))x\(Int(r.height)) doc=\(Int(d.width))x\(Int(d.height))")
+            }
+            for sub in view.subviews { walk(sub) }
+        }
+        walk(view)
+        fflush(stdout)
+    }
+
     /// Capture the primary window's chrome + content to `path` as PNG.
     ///
     /// The window need not be ordered front or key — measured: a never-ordered
@@ -127,6 +145,7 @@ enum BossWindowCapture {
             throw CaptureError.noFrameView
         }
         frameView.layoutSubtreeIfNeeded()
+        dumpScrollOffsets(in: frameView, label: "capture")
         let bounds = frameView.bounds
         guard bounds.width > 1, bounds.height > 1 else {
             throw CaptureError.emptyBounds
