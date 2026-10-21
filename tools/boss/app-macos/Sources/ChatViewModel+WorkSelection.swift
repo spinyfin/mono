@@ -72,8 +72,6 @@ extension ChatViewModel {
         refreshWorkSubscriptions()
         if isConnected {
             engine.sendGetWorkTree(productId: productID, flow: .productSwitch)
-            engine.sendListAttentionItemsForWorkItem(workItemID: productID)
-            engine.sendListAttentionGroups(productId: productID)
             engine.sendListDeferredScopeAttentions(productId: productID)
         }
     }

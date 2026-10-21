@@ -296,13 +296,6 @@ extension EngineClient {
         ], queueIfDisconnected: true)
     }
 
-    func sendListAttentionItemsForWorkItem(workItemID: String) {
-        sendLine([
-            "type": "list_attention_items_for_work_item",
-            "work_item_id": workItemID,
-        ], queueIfDisconnected: true)
-    }
-
     /// Accept an open `deferred_scope` attention item without filing a
     /// followup task. Replies with `attention_item_updated`.
     @discardableResult
@@ -367,27 +360,6 @@ extension EngineClient {
     }
 
     // MARK: Attention groups (attentions.md — Notifications toolbar + window)
-
-    /// List attention groups for a product. Omitting `state` lets the engine
-    /// default to open + partially_answered — the actionable set the
-    /// Notifications window renders. Replies with `attention_groups_list`.
-    func sendListAttentionGroups(
-        productId: String,
-        projectId: String? = nil,
-        taskId: String? = nil,
-        kind: String? = nil,
-        state: String? = nil
-    ) {
-        var payload: [String: Any] = [
-            "type": "list_attention_groups",
-            "product_id": productId,
-        ]
-        if let projectId { payload["project_id"] = projectId }
-        if let taskId { payload["task_id"] = taskId }
-        if let kind { payload["kind"] = kind }
-        if let state { payload["state"] = state }
-        sendLine(payload, queueIfDisconnected: true)
-    }
 
     /// Fetch one group (`atg_…` or `A<n>`) plus its members. Replies with
     /// `attention_group_result`.

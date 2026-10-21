@@ -1,7 +1,7 @@
 use super::*;
 use boss_protocol::{
     PLANNER_OUTCOME_APPLIED, PLANNER_OUTCOME_PLANNER_FAILED, PLANNER_OUTCOME_RUNNING, PLANNER_OUTCOME_STAGED,
-    PlannerRun,
+    PlannerRun, PlannerRunSummary,
 };
 
 /// Audit summary recorded when an engine restart interrupts a Planner run.
@@ -71,6 +71,42 @@ fn map_planner_run(row: &Row<'_>) -> rusqlite::Result<PlannerRun> {
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
     })
+}
+
+/// The latest settled (non-`running`) `planner_runs` row of every project in
+/// `product_id`, as blob-free [`PlannerRunSummary`] values ordered by
+/// `project_id`. One batched statement for the whole product, run on the
+/// caller's connection so `get_work_tree` reads it in the same transaction as
+/// the rest of the tree. "Latest" uses the same `created_at DESC, id DESC`
+/// order as [`WorkDb::list_planner_runs_for_project`].
+pub(crate) fn latest_settled_planner_run_summaries(
+    conn: &Connection,
+    product_id: &str,
+) -> Result<Vec<PlannerRunSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT pr.id, pr.project_id, pr.outcome, pr.created_at, pr.updated_at
+         FROM planner_runs pr
+         WHERE pr.product_id = ?1
+           AND pr.outcome != ?2
+           AND pr.id = (
+               SELECT latest.id FROM planner_runs latest
+               WHERE latest.project_id = pr.project_id
+                 AND latest.outcome != ?2
+               ORDER BY latest.created_at DESC, latest.id DESC
+               LIMIT 1
+           )
+         ORDER BY pr.project_id",
+    )?;
+    let rows = stmt.query_map(params![product_id, PLANNER_OUTCOME_RUNNING], |row| {
+        Ok(PlannerRunSummary {
+            run_id: row.get(0)?,
+            project_id: row.get(1)?,
+            outcome: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    })?;
+    rows.map(|r| r.map_err(Into::into)).collect()
 }
 
 const SELECT_PLANNER_RUN: &str = "SELECT id, project_id, product_id, design_task_id, caller,
@@ -878,5 +914,117 @@ mod tests {
             rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
             vec![older.id, newer.id]
         );
+    }
+
+    // ---- work-tree summary ----
+
+    fn claim(db: &WorkDb, product_id: &str, project_id: &str) -> PlannerRun {
+        db.claim_planner_run(ClaimPlannerRunInput {
+            project_id,
+            product_id,
+            design_task_id: None,
+            caller: "operator",
+        })
+        .unwrap()
+        .expect("claim")
+    }
+
+    fn settle(db: &WorkDb, run_id: &str, outcome: &str) {
+        db.update_planner_run(run_id, PlannerRunPatch::builder().outcome(outcome).build())
+            .unwrap();
+    }
+
+    fn summaries(db: &WorkDb, product_id: &str) -> Vec<PlannerRunSummary> {
+        db.get_work_tree(product_id).unwrap().planner_runs
+    }
+
+    #[test]
+    fn work_tree_summary_is_the_latest_settled_run_per_project_and_follows_transitions() {
+        let db = open();
+        let (product_id, alpha) = product_and_project(&db);
+        let beta = db
+            .create_project(
+                boss_protocol::CreateProjectInput::builder()
+                    .product_id(product_id.clone())
+                    .name("Beta")
+                    .goal("build it too")
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let untouched = db
+            .create_project(
+                boss_protocol::CreateProjectInput::builder()
+                    .product_id(product_id.clone())
+                    .name("Gamma")
+                    .goal("never planned")
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        assert!(summaries(&db, &product_id).is_empty(), "no runs, no summaries");
+
+        // Alpha: a failed run, then a retry that is still running — the
+        // summary stays on the settled failure; the live run is not in it.
+        let failed = claim(&db, &product_id, &alpha);
+        settle(&db, &failed.id, PLANNER_OUTCOME_PLANNER_FAILED);
+        let retry = claim(&db, &product_id, &alpha);
+        // Beta: only a running run, which has no settled summary yet.
+        let beta_run = claim(&db, &product_id, &beta);
+
+        let tree = summaries(&db, &product_id);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].project_id, alpha);
+        assert_eq!(tree[0].run_id, failed.id);
+        assert_eq!(tree[0].outcome, PLANNER_OUTCOME_PLANNER_FAILED);
+        assert_eq!(tree[0].created_at, failed.created_at);
+
+        // Transition: the retry stages, the summary moves to it.
+        settle(&db, &retry.id, PLANNER_OUTCOME_STAGED);
+        settle(&db, &beta_run.id, PLANNER_OUTCOME_PLANNER_FAILED);
+        let tree = summaries(&db, &product_id);
+        assert_eq!(tree.len(), 2, "alpha and beta, not the never-planned project");
+        let alpha_summary = tree.iter().find(|s| s.project_id == alpha).unwrap();
+        assert_eq!(alpha_summary.run_id, retry.id);
+        assert_eq!(alpha_summary.outcome, PLANNER_OUTCOME_STAGED);
+        assert!(tree.iter().all(|s| s.project_id != untouched));
+
+        // Release flips staged -> applied; undo deletes the row, falling back
+        // to the earlier settled failure.
+        settle(&db, &retry.id, PLANNER_OUTCOME_APPLIED);
+        let tree = summaries(&db, &product_id);
+        let alpha_summary = tree.iter().find(|s| s.project_id == alpha).unwrap();
+        assert_eq!(alpha_summary.outcome, PLANNER_OUTCOME_APPLIED);
+        assert!(db.delete_planner_run(&retry.id).unwrap());
+        let tree = summaries(&db, &product_id);
+        let alpha_summary = tree.iter().find(|s| s.project_id == alpha).unwrap();
+        assert_eq!(alpha_summary.run_id, failed.id);
+    }
+
+    #[test]
+    fn work_tree_summary_is_scoped_to_the_product() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let (other_product, other_project) = {
+            let product = create_test_product_with_repo(&db, "Other", Some("git@github.com:test/other.git"));
+            let project = db
+                .create_project(
+                    boss_protocol::CreateProjectInput::builder()
+                        .product_id(product.id.clone())
+                        .name("Elsewhere")
+                        .goal("x")
+                        .build(),
+                )
+                .unwrap();
+            (product.id, project.id)
+        };
+        let mine = claim(&db, &product_id, &project_id);
+        settle(&db, &mine.id, PLANNER_OUTCOME_STAGED);
+        let theirs = claim(&db, &other_product, &other_project);
+        settle(&db, &theirs.id, PLANNER_OUTCOME_PLANNER_FAILED);
+
+        let tree = summaries(&db, &product_id);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].run_id, mine.id);
     }
 }

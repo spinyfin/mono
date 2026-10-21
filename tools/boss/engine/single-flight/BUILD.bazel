@@ -1,0 +1,19 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "single-flight",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_single_flight",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)
+
+rust_test(
+    name = "single-flight_test",
+    size = "small",
+    crate = ":single-flight",
+    edition = "2024",
+)

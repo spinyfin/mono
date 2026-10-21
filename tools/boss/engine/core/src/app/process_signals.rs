@@ -162,7 +162,7 @@ pub(super) fn reap_worker_process_tree(shell_pid: i32, grace: Duration) {
     // fatal (the process may already have exited).
     let rc = unsafe { libc::kill(target, libc::SIGTERM) };
     tracing::debug!(pid, target, rc, "reap_worker_process_tree: SIGTERM");
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         if grace > Duration::from_secs(0) {
             tokio::time::sleep(grace).await;
         }

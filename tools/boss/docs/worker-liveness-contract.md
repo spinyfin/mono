@@ -128,6 +128,99 @@ enough for the real tmux wrapper to read `#{pane_dead}` and
 status, and the ordinary release path removes the retained session only after
 its live `BOSS_SPAWN_TOKEN` exactly matches the durable run identity.
 
+## Hook events are applied in the worker's emission order
+
+`LiveWorkerState.activity` is reduced from the hook stream by
+`LiveWorkerStateRegistry::apply_sequenced_event`
+(`engine/core/src/live_worker_state.rs`), and the reducer is simple:
+`UserPromptSubmit` / `PreToolUse` / `PostToolUse` → `Working` (with the
+tool on `PreToolUse`), `Stop` → `Idle` (or `WaitingForInput` when a
+`Notification` preceded it), `SessionEnd` → `Terminated`. There is no
+"turn gate": a `PreToolUse` after a `Stop` is a new turn, whether or not a
+`UserPromptSubmit` came first. It must be, because Claude Code wakes a
+stopped session **on its own** when a background command finishes, and
+that resumed turn opens with tool hooks and no prompt.
+
+What can go wrong is ordering. The events-socket accept loop
+(`engine/core/src/app/events_accept.rs`) dispatches every connection on its
+own task, so two hooks the worker emitted in order can reach the reducer in
+either order — and the race is not symmetric. A turn boundary persists the
+transcript path and folds the transcript into the run's cost snapshot (a
+bounded settle loop with sleeps, plus transcript reads and DB writes whose
+latency is not bounded by those sleeps) on its way to the reducer; a
+`PreToolUse` goes almost straight there. When a `Stop` is slow and the
+re-woken turn's first `PreToolUse` is fast, the `Stop` lands second and
+rewinds the slot to `Idle` with no tool — and it stays that way until the
+next hook, which for a multi-minute `checkleft run` is the whole run.
+
+The 2026-10-15 "Idle while visibly running `checkleft`" incident is
+**consistent with** that race but the race is not proven to be its cause:
+the engine log lines for the incident window (`hook event received`, `hook
+payload arrived at dispatcher`, `dropping hook fan-out`) were not available
+when the fix was written. The settle loop's sleeps alone (~200ms) are far
+shorter than the minutes the pane stayed Idle, so a delay that long would
+have to come from elsewhere in the `Stop`'s ingress (transcript read, DB
+lock contention). Another unruled-out cause is the shim's resilience path:
+after its roughly ten-second connection retry budget, it appends the hook
+to `.boss/events-pending.jsonl`, exits successfully, and retries delivery
+only when another hook fires. A buffered `PreToolUse` may therefore arrive
+with `PostToolUse` after the entire long command. Check shim stderr for
+`buffering event for later delivery` and the pending file for that payload.
+An engine `hook event received` followed by `dropping hook fan-out`
+distinguishes a slot-less drop from shim buffering; `hook payload arrived
+at dispatcher` confirms dispatch. Missing receipt alone cannot distinguish
+buffering from a hook that never fired. Every `Stale` refusal logs
+`ingress_seq` and `last_applied_seq`, proving reducer reordering, but not
+by itself proving the cause of the historical incident. The incident's
+engine logs and original pending buffer require coordinator investigation;
+neither delivery failure nor slot-less dropping is repaired by ordering.
+
+Three things close the ordering hole:
+
+- **Accept order is emission order, and the reducer honours it.** The
+  `boss-event` shim connects synchronously from inside the driver's hook,
+  so the order the accept loop sees connections is the order the worker
+  emitted them. The loop stamps that order as `ingress_seq` before spawning
+  the task; the registry remembers the newest sequence it applied per slot
+  (`LiveWorkerStateRegistry::apply_hook_event`) and treats an older event as
+  late (`ApplyEventOutcome::Stale`). A late event does not touch `activity`,
+  `current_tool` or the display timestamps, and does not trigger the
+  live-status loop's `Stop`/`PostToolUse` refresh. Hook events are
+  incremental, though, so late events still contribute: a late
+  `Notification` repairs only an Idle slot whose newest `Stop` was its
+  first clearing event. An earlier `PreToolUse` or `Stop` consumes it;
+  Errored and Terminated slots are never repaired to waiting. A late
+  `Stop` reports the turn boundary it opened (below), and stale main-session
+  activity can consume an older boundary without changing the display.
+  Liveness bookkeeping (`record_driver_signal`) already happened at ingress.
+  Unsequenced callers (the Codex stdout reader, engine-synthesized events,
+  tests) keep the always-apply `apply_event`.
+- **The live-state transition and its durable projection run before the
+  slow half of ingress.** `dispatch_live_worker_state`
+  (`engine/core/src/app/worker_events.rs`) applies the event, broadcasts,
+  and mirrors the awaiting-input state onto the execution row, and only then
+  persists the transcript path and captures cost. The row write is decided
+  from the pane's activity at write time, inside a gate that serializes the
+  writes, so an older handler that stalls can never leave `waiting_human`
+  over a pane that has since moved on.
+- **A declared wait ends on turn ordering, not on the activity the slot
+  showed.** A wait (`boss propose wait`) describes the idle period that
+  follows the declaration. The registry tracks the turn boundary (`Stop`)
+  the main session is parked behind and reports when the main session
+  starts a new turn after it (`HookApplied::resumed_after`): the first
+  main-session `UserPromptSubmit`/`PreToolUse`/`PostToolUse` after the
+  `Stop`, or the late `Stop` itself once main-session activity numbered above
+  it has already been applied. The ingress then calls
+  `WaitRegistry::end_if_declared_before`, which ends the wait only if it was
+  declared before that boundary (the wait records the newest accepted hook
+  sequence, including hooks still outstanding), so a late `Stop` cannot end a wait declared in the turn
+  that overtook it. Hooks stamped with an `agent_id` (a backgrounded
+  subagent's tools) are not main-session activity, a permission-prompt
+  `Notification` is not a turn boundary, and a wait declared mid-turn
+  survives the rest of that turn. The per-execution wait budget stays
+  charged. Workers are told, in their prompt, to re-declare before ending a
+  resumed turn if they are still waiting.
+
 ## Rules of thumb for future work here
 
 - **A dead pane is terminal evidence.** `remain-on-exit` keeps a tmux session listed after its worker command has exited. `#{pane_dead}=1` must not be treated as a live worker, and it must not disprove an inferred death.
@@ -135,4 +228,5 @@ its live `BOSS_SPAWN_TOKEN` exactly matches the durable run identity.
 - **`Unknown` is not `Gone`.** A worker with no recorded pid is mid-spawn, not dead. `WorkerProcess::Unknown` and `PaneReleaseOutcome::NoLiveWorker` both exist to keep that case from being read as death — treating it as death reaps live-but-slow spawns and releases cube leases out from under workspaces a worker is about to occupy.
 - **`EPERM` means alive.** `kill(pid, 0)` returning `EPERM` proves the process exists.
 - **A pid is a durable number, not a durable handle.** Once the OS recycles it — macOS wraps at ~99999 — the same integer names an unrelated process, and the reap signals its whole process _group_. Anything that signals a process or restores state from the pid must use a bounded probe (`probe_execution_worker_within`, `probe_work_item_worker`), which declines to answer once the run row ages past `REDISPATCH_PID_TRUST_SECS`. The unbounded `probe_execution_worker` is only for callers whose failure direction is to decline to act, where a stale pid costs a missed reconciliation rather than a killed bystander.
+- **Never infer activity from pane output or timers.** `activity` is reduced from the hook stream, in emission order (`ingress_seq`). If a pane looks busy while the slot says `Idle`, the bug is in ingress ordering or the reducer — fix that, not the symptom.
 - **Don't lengthen a timeout to fix a contradiction.** A longer spawn-ack window narrows the race without closing it, and leaves the system with no answer for the times it still loses.

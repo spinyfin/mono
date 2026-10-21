@@ -100,7 +100,7 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         // duplicate a healthy dispatch still inside its initial spawn
         // round-trip.
         let pane_reconcile_state = server_state.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             pane_reconcile_state.retry_startup_pane_reconcile().await;
         });
         // Push pool sizes immediately after registration so the app's
@@ -121,7 +121,7 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         // tmux session. Attachment is retried by the supervisor until the
         // current app session acknowledges its viewer.
         let state = server_state.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             attach_coordinator_to_registered_app(state).await;
         });
         // Mirror the coordinator re-attach for worker panes: a run this
@@ -129,7 +129,7 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         // an app restart) never received `AttachWorkerPane` from anywhere
         // else, so every live tmux-hosted worker needs one now.
         let state = server_state.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             state.reattach_worker_panes_to_registered_app().await;
         });
     }
@@ -649,7 +649,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
     // stall every other request on the app connection, including the app's
     // replies to engine-to-app requests. Detach it; the reply still lands on
     // the original `request_id`.
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let _in_flight = ResetInFlight(server_state.coordinator_reset_in_flight.clone());
         CoordinatorReset::builder()
             .server_state(server_state)
@@ -883,7 +883,7 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
             // grace window and well over the time it takes the
             // dispatcher to enqueue + the writer task to flush.
             let trigger = server_state.shutdown_trigger.clone();
-            tokio::spawn(async move {
+            boss_task_scope::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 trigger.notify_one();
             });

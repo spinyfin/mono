@@ -16,8 +16,10 @@ enum BossBadgeWidthCapture {
         )
         task.tags = ["WWWWWWWWWWWWWWWWWWWWWWWW", "Short"]
         let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(
-            column: .backlog,
+            column: .doing,
             projectName: "Boss-ism leakage: generic regex check in checkleft with a very long project label",
+            liveState: WorkerLiveState(name: "Spock", slotId: 1, runId: "capture-agent", model: "fixture", shellPid: 0, lastEventAt: nil, currentTool: nil, lastToolEndedAt: nil, activity: .working, liveStatus: nil, liveStatusAt: nil, recoveryStatus: nil, tmuxHosted: true),
+            liveStatus: "Running bazel tests for engine core",
             repoChip: RepoChipPresentation(
                 shortName: "a-very-long-repository-name-that-exceeds-the-card-content-width",
                 fullURL: "https://github.com/example/repository", provenance: .taskOverride
@@ -27,7 +29,7 @@ enum BossBadgeWidthCapture {
             ForEach([CGFloat(280), 340], id: \.self) { width in
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Lane: \(Int(width)) pt").font(.headline)
-                    WorkBoardCardView(snapshot: snapshot)
+                    WorkBoardCardView(snapshot: snapshot, onFocusAgent: {})
                     Spacer(minLength: 0)
                 }
                 .padding(14)

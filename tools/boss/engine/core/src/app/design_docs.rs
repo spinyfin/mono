@@ -233,7 +233,7 @@ pub(super) async fn handle_get_product_design_doc(ctx: Dispatch, req: FrontendRe
     )
     .await
     {
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             revalidate_product_design_doc(design_docs, guard, repo_remote_url, path, git_ref).await;
         });
     }

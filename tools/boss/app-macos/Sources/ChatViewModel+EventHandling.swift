@@ -66,7 +66,6 @@ extension ChatViewModel {
                 // SECOND time (a confirmed cold-start double-fetch) — the
                 // per-product fetch counter makes both visible.
                 engine.sendGetWorkTree(productId: productID, flow: .coldStart)
-                engine.sendListAttentionGroups(productId: productID)
             }
             startBackgroundWorkPolling()
         case .resyncRequired:
@@ -182,7 +181,7 @@ extension ChatViewModel {
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
             projectsByProductID[productId] = projects.sorted(by: projectSort)
-        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas):
+        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas, let attentionItems, let attentionGroups, let attentionMembers, let plannerRuns):
             applyWorkTree(
                 product: product,
                 projects: projects,
@@ -190,7 +189,11 @@ extension ChatViewModel {
                 chores: chores,
                 taskRuntimes: taskRuntimes,
                 dependencies: dependencies,
-                ideas: ideas
+                ideas: ideas,
+                attentionItems: attentionItems,
+                attentionGroups: attentionGroups,
+                attentionMembers: attentionMembers,
+                plannerRuns: plannerRuns
             )
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
@@ -806,10 +809,7 @@ extension ChatViewModel {
     /// arms of `.workInvalidated`, which want identical refreshes.
     private func refetchForInvalidation(productID: String) {
         scheduleWorkTreeRefetch(productID: productID, flow: .invalidationRefetch)
-        engine.sendListAttentionItemsForWorkItem(workItemID: productID)
-        engine.sendListAttentionGroups(productId: productID)
         engine.sendListDeferredScopeAttentions(productId: productID)
-        refreshPlannerRuns(forProductID: productID)
     }
 
     /// Clear the in-flight guard for a completed `release_project` /

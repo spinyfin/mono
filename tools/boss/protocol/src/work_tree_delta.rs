@@ -62,7 +62,9 @@ fn diff(old: &Value, next: &Value) -> Value {
             continue;
         }
         let key = match field.as_str() {
-            "tasks" | "chores" | "projects" | "ideas" => "id",
+            "tasks" | "chores" | "projects" | "ideas" | "attention_items" | "attention_groups"
+            | "attention_members" => "id",
+            "planner_runs" => "project_id",
             "task_runtimes" => "work_item_id",
             _ => {
                 changes.insert(field.clone(), json!({"replace": value}));

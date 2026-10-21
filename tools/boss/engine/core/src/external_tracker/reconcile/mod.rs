@@ -289,7 +289,7 @@ pub fn spawn_loop(
     publisher: Arc<dyn WorkInvalidationPublisher>,
     credential_resolver: Arc<dyn TrackerCredentialResolver>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         loop {
             // The reconciler's GitHub calls go out through `GhRunner`
             // (`gh api graphql` / `gh api`), which is instrumented but

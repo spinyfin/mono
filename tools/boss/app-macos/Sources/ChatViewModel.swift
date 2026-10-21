@@ -164,10 +164,17 @@ final class ChatViewModel: ObservableObject {
     /// detail). Absent key means "not yet fetched", not "no merges".
     @Published var attentionMergesByAttentionID: [String: [AttentionMerge]] = [:]
     /// Planner audit rows (`planner_runs`) keyed by project id, newest
-    /// first — as returned by `list_planner_runs`. Backs the Planner
+    /// first — as returned by `list_planner_runs`. Fetched on demand by the
+    /// popover and the inspector only; the kanban affordance itself renders
+    /// from [[plannerRunSummaryByProjectID]]. Backs the Planner
     /// review/release/undo surface (design auto-populate-project-tasks-on-
     /// design-pr-merge.md task 10).
     @Published var plannerRunsByProjectID: [String: [PlannerRun]] = [:]
+    /// Each project's latest settled planner run, blob-free, seeded from every
+    /// `work_tree` snapshot and delta. This — not `list_planner_runs` — is what
+    /// the kanban planner affordance renders from, so a board refresh costs no
+    /// extra planner request.
+    @Published var plannerRunSummaryByProjectID: [String: PlannerRunSummary] = [:]
     /// Project ids with an in-flight `release_project` or
     /// `unpopulate_project` request — disables the action buttons until
     /// the engine replies (or `workError` clears it on failure).

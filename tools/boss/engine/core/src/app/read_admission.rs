@@ -31,9 +31,41 @@ pub(super) struct ConnectionReads {
 pub(super) struct WaitingRead {
     engine: Arc<ReadAdmission>,
     connection: Arc<ConnectionReads>,
-    _pending: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    pending: (OwnedSemaphorePermit, OwnedSemaphorePermit),
     deadline: tokio::time::Instant,
     tracked: Option<TrackedRead>,
+}
+
+/// A read that missed its admission deadline, still holding its queue slot.
+///
+/// The slot is released when this is dropped, and the caller must enqueue
+/// the busy reply *before* that. The reader loop's headroom gate
+/// ([`reply_headroom`]) only counts replies it can see: queued envelopes
+/// plus the reads these permits represent. If the slot were freed first,
+/// the reader could admit another request into it while the busy reply is
+/// still on its way to the queue, so outstanding replies would exceed the
+/// reserve and a full lane of replies would disconnect the session.
+pub(super) struct RejectedRead {
+    message: &'static str,
+    _pending: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+}
+
+impl RejectedRead {
+    pub(super) fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
+impl std::fmt::Debug for RejectedRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RejectedRead").field("message", &self.message).finish()
+    }
+}
+
+impl PartialEq<&str> for RejectedRead {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
 }
 
 // Deliberately very high, pending measurement of normal traffic: the
@@ -140,7 +172,7 @@ impl ReadAdmission {
         Ok(WaitingRead {
             engine: self.clone(),
             connection: connection.clone(),
-            _pending: (global, local),
+            pending: (global, local),
             deadline: tokio::time::Instant::now() + self.wait,
             tracked: None,
         })
@@ -162,7 +194,10 @@ impl WaitingRead {
         Arc::as_ptr(&self.connection) as usize
     }
 
-    pub(super) async fn acquire(self) -> Result<ReadPermits, &'static str> {
+    /// Wait for the active permits. The queue slot moves into the returned
+    /// [`RejectedRead`] on failure rather than being released here; see its
+    /// documentation for why the busy reply must be queued before it drops.
+    pub(super) async fn acquire(self) -> Result<ReadPermits, RejectedRead> {
         let result = tokio::time::timeout_at(self.deadline, async {
             if let Some(read) = &self.tracked {
                 read.stage("connection permit");
@@ -200,7 +235,10 @@ impl WaitingRead {
                     None,
                     self.connection_id(),
                 );
-                Err(message)
+                Err(RejectedRead {
+                    message,
+                    _pending: self.pending,
+                })
             }
         }
     }

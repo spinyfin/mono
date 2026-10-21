@@ -104,19 +104,40 @@ pub(super) async fn handle_git_hub_auth_status(ctx: Dispatch, req: FrontendReque
         // re-auth needed. `update_org_state` only notifies on a real
         // change, which the forwarder then pushes on `github.auth`.
         if let GitHubAuthState::Authorized { record, .. } = current {
-            // Detached so the bulk permits and ordering turn are released once
-            // the reply is sent; at most one re-check runs at a time.
-            let Ok(permit) = server_state.org_recheck.clone().try_acquire_owned() else {
-                return;
-            };
-            tokio::spawn(async move {
-                let _permit = permit;
-                let controller = server_state.github_auth.clone();
-                let flow = controller.device_flow();
-                let org_sink = WorkDbOrgStateSink::new(server_state.work_db.as_ref());
-                let resolved = probe_and_record_org_state(&org_sink, flow.as_ref(), &record.token).await;
-                controller.update_org_state(resolved);
-            });
+            spawn_org_recheck(server_state, record.token);
         }
     }
+}
+
+/// Run the org/SSO probe for `token` against the work DB's products and the
+/// controller's shared HTTP client, returning the aggregate org state.
+///
+/// The one place the engine wires [`probe_and_record_org_state`] to its
+/// `WorkDb`; the forwarder's initial probe and the on-demand rechecks all go
+/// through it.
+pub(super) async fn probe_org_state(server_state: &ServerState, token: &str) -> OrgAuthState {
+    let flow = server_state.github_auth.device_flow();
+    let org_sink = WorkDbOrgStateSink::new(server_state.work_db.as_ref());
+    probe_and_record_org_state(&org_sink, flow.as_ref(), token).await
+}
+
+/// Re-run the org/SSO probe in the background and record the result.
+///
+/// This is the explicit trigger for re-probing after the forwarder's own
+/// once-per-authorization probe: the app's `GitHubAuthStatus` "Re-check", and
+/// a product's external-tracker config changing (the probe only covers
+/// GitHub-tracked products, so a product newly bound to GitHub — or an org
+/// edit — must be re-probed to resolve a state the forwarder left `Unknown`).
+/// Detached so the caller's permits and ordering turn are released once its
+/// reply is sent; at most one re-check runs at a time (`org_recheck`), and a
+/// request that finds one in flight is dropped rather than queued.
+pub(super) fn spawn_org_recheck(server_state: Arc<ServerState>, token: String) {
+    let Ok(permit) = server_state.org_recheck.clone().try_acquire_owned() else {
+        return;
+    };
+    boss_task_scope::spawn(async move {
+        let _permit = permit;
+        let resolved = probe_org_state(&server_state, &token).await;
+        server_state.github_auth.update_org_state(resolved);
+    });
 }

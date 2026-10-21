@@ -15,6 +15,7 @@ rust_library(
     ],
     deps = [
         "//tools/boss/engine/dispatch-events",
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
         "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
@@ -31,6 +32,7 @@ rust_test(
     ),
     deps = [
         "//tools/boss/engine/dispatch-events",
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
         "//tools/boss/log-files",
     ] + all_crate_deps(

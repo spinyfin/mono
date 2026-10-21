@@ -14,7 +14,7 @@ enum EngineEvent {
     case engineRequest(requestId: String, request: EngineRequestKind)
     case productsList(products: [WorkProduct])
     case projectsList(productId: String, projects: [WorkProject])
-    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime], dependencies: [WorkItemDependency], ideas: [WorkIdea])
+    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime], dependencies: [WorkItemDependency], ideas: [WorkIdea], attentionItems: [WorkAttentionItem] = [], attentionGroups: [AttentionGroup] = [], attentionMembers: [Attention] = [], plannerRuns: [PlannerRunSummary] = [])
     case workItemCreated(item: WorkItemPayload)
     /// Batch counterpart of `workItemCreated`, pushed on a product's work
     /// topic by background jobs that create many rows at once with no

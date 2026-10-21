@@ -14,6 +14,7 @@ rust_library(
     ],
     deps = [
         "//tools/boss/engine/event-bus",
+        "//tools/boss/engine/task-scope",
     ] + all_crate_deps(normal = True),
 )
 
@@ -24,6 +25,7 @@ rust_test(
     edition = "2024",
     deps = [
         "//tools/boss/engine/event-bus",
+        "//tools/boss/engine/task-scope",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

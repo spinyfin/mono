@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+boss-task-scope = { path = "../task-scope" }
 anyhow = { workspace = true }
 boss-backoff = { path = "../../backoff" }
 boss-build-info = { path = "../../build-info" }
@@ -57,6 +58,7 @@ boss-ssh-transport = { path = "../ssh-transport" }
 boss-timer-wheel = { path = "../timer-wheel" }
 boss-engine-day-rotated-log = { path = "../day-rotated-log" }
 boss-event-bus = { path = "../event-bus" }
+boss-single-flight = { path = "../single-flight" }
 boss-engine-stdout-progress = { path = "../stdout-progress" }
 boss-engine-structured-output = { path = "../structured-output" }
 boss-engine-transient-error = { path = "../transient-error" }

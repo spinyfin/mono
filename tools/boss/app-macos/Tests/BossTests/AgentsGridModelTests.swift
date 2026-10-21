@@ -468,6 +468,242 @@ final class AgentsGridModelTests: XCTestCase {
         }
     }
 
+    // MARK: - Released runs never linger
+
+    /// A release that lands while Agents is hidden applies at once under the
+    /// layout's hidden rule, and the released run renders as finished (not a
+    /// viewerless live member) until its detach removes it. Re-entering
+    /// Agents shows current membership with no placeholder and nothing to
+    /// tidy.
+    func testReleaseWhileHiddenCompactsAndRendersFinishedUntilDetach() throws {
+        let workspace = WorkersWorkspaceModel()
+        let grid = roomyGrid()
+        let runA = makeState(runId: "run-a", slotId: 1, name: "Riker")
+        let runB = makeState(runId: "run-b", slotId: 2, name: "Data", startedAt: "2026-10-09T00:00:01Z")
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-a", slot: 1))
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-b", slot: 2))
+        let sessionA = try XCTUnwrap(workspace.viewersByRunId["run-a"]?.session)
+
+        let seed = LiveWorkerStateStore()
+        seed.update(states: [runA, runB])
+        grid.sync(isVisible: true, workspace: workspace, liveStates: seed)
+        XCTAssertEqual(grid.layout.logicalCellIndex(ofRun: "run-a"), 0)
+        grid.sync(isVisible: false, workspace: workspace, liveStates: seed)
+
+        // Hidden: the engine finalizes run-a and drops it from the feed.
+        let store = LiveWorkerStateStore()
+        store.update(states: [runB])
+        grid.sync(isVisible: false, workspace: workspace, liveStates: store)
+        XCTAssertNil(grid.layout.logicalCellIndex(ofRun: "run-a"))
+        XCTAssertFalse(grid.layout.pages.contains { page in
+            page.cells.contains { if case .placeholder = $0.content { return true } else { return false } }
+        }, "hidden releases compact away, no placeholder")
+        // The surface stays mounted (detach pending) but is a finished pane.
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-a", "run-b"])
+        let pending = render(grid, runId: "run-a", workspace: workspace, store: store)
+        XCTAssertTrue(pending.isPlaceholder)
+        XCTAssertTrue(pending.session === sessionA)
+        XCTAssertEqual(pending.bodyKind, .placeholder)
+        XCTAssertEqual(pending.headerTitle, "Riker finished")
+        XCTAssertNil(pending.headerBadge)
+        XCTAssertEqual(pending.statusPillLabel, "Finished")
+
+        // Hidden: the detach arrives. The run is no longer rendered at all.
+        assertSuccess(workspace.detachWorkerPane(runId: "run-a"))
+        grid.sync(isVisible: false, workspace: workspace, liveStates: store)
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-b"])
+
+        // Back to Agents: current membership, packed, nothing stale.
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+        XCTAssertEqual(grid.layout.visibleCount, 1)
+        XCTAssertEqual(grid.layout.logicalCellIndex(ofRun: "run-b"), 0)
+        XCTAssertFalse(grid.layout.isTidyHighlighted)
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-b"])
+        let liveB = render(grid, runId: "run-b", workspace: workspace, store: store)
+        XCTAssertFalse(liveB.isPlaceholder)
+        XCTAssertEqual(liveB.headerBadge, .coding)
+        XCTAssertEqual(liveB.headerTitle, "Data is working")
+    }
+
+    /// A release while Agents is visible leaves the finished placeholder in
+    /// the run's cell. Once the detach removes the viewer it is the finished
+    /// card — never the viewer-missing card with an "Unknown" type.
+    func testReleaseWhileVisibleRendersFinishedCardAfterDetach() throws {
+        let workspace = WorkersWorkspaceModel()
+        let grid = roomyGrid()
+        let runA = makeState(runId: "run-a", slotId: 1, name: "Riker")
+        let runB = makeState(runId: "run-b", slotId: 2, name: "Data", startedAt: "2026-10-09T00:00:01Z")
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-a", slot: 1))
+        let seed = LiveWorkerStateStore()
+        seed.update(states: [runA, runB])
+        grid.sync(isVisible: true, workspace: workspace, liveStates: seed)
+
+        let store = LiveWorkerStateStore()
+        store.update(states: [runB])
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+        assertSuccess(workspace.detachWorkerPane(runId: "run-a"))
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+
+        let page = try XCTUnwrap(grid.layout.currentPage)
+        XCTAssertEqual(page.cells[0].content, .placeholder(runId: "run-a"))
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-a", "run-b"])
+        let finished = render(grid, runId: "run-a", workspace: workspace, store: store)
+        XCTAssertEqual(finished.bodyKind, .placeholder)
+        XCTAssertEqual(finished.headerTitle, "Riker finished")
+        XCTAssertNil(finished.headerBadge)
+        XCTAssertEqual(finished.statusPillLabel, "Finished")
+        XCTAssertFalse(finished.showsLiveStatusToggle)
+        XCTAssertFalse(finished.isViewerMissing)
+    }
+
+    /// Visible release before the detach arrives: the placed cell is the
+    /// finished placeholder while the surface stays attached, and a later
+    /// detach leaves the placeholder intact.
+    func testVisibleReleaseBeforeDetachShowsPlaceholderWithSurfaceAttached() throws {
+        let workspace = WorkersWorkspaceModel()
+        let grid = roomyGrid()
+        let runA = makeState(runId: "run-a", slotId: 1, name: "Riker")
+        let runB = makeState(runId: "run-b", slotId: 2, name: "Data", startedAt: "2026-10-09T00:00:01Z")
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-a", slot: 1))
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-b", slot: 2))
+        let sessionA = try XCTUnwrap(workspace.viewersByRunId["run-a"]?.session)
+        let store = LiveWorkerStateStore()
+        store.update(states: [runA, runB])
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+
+        store.update(states: [runB])
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+
+        let page = try XCTUnwrap(grid.layout.currentPage)
+        XCTAssertEqual(page.cells[0].content, .placeholder(runId: "run-a"))
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-a", "run-b"])
+        let pending = render(grid, runId: "run-a", workspace: workspace, store: store)
+        XCTAssertTrue(pending.session === sessionA, "surface stays attached until the detach")
+        XCTAssertEqual(pending.bodyKind, .placeholder)
+        XCTAssertEqual(pending.headerTitle, "Riker finished")
+        let liveB = render(grid, runId: "run-b", workspace: workspace, store: store)
+        XCTAssertEqual(liveB.bodyKind, .terminal)
+
+        assertSuccess(workspace.detachWorkerPane(runId: "run-a"))
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+        XCTAssertEqual(try XCTUnwrap(grid.layout.currentPage).cells[0].content, .placeholder(runId: "run-a"))
+        let detached = render(grid, runId: "run-a", workspace: workspace, store: store)
+        XCTAssertNil(detached.session)
+        XCTAssertEqual(detached.bodyKind, .placeholder)
+        XCTAssertEqual(detached.headerTitle, "Riker finished")
+    }
+
+    /// A viewer attached before its first live-state snapshot is never
+    /// placed in the layout: it is mounted hidden and has no cell to draw
+    /// a finished card in.
+    func testAttachBeforeSnapshotStaysUnplaced() {
+        let workspace = WorkersWorkspaceModel()
+        let grid = roomyGrid()
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-a", slot: 1))
+        grid.sync(isVisible: true, workspace: workspace, liveStates: LiveWorkerStateStore())
+
+        XCTAssertNil(grid.layout.logicalCellIndex(ofRun: "run-a"))
+        XCTAssertEqual(grid.unplacedViewers.compactMap(\.runId), ["run-a"])
+        XCTAssertTrue(grid.layout.isEmpty)
+    }
+
+    /// Release followed by immediate slot reuse: the new run takes the slot
+    /// (after the stale viewer is detached), the old run is never rendered
+    /// as live again, and the feed's consecutive slot reuse is accepted by
+    /// the store rather than freezing membership.
+    func testReleaseThenImmediateSlotReuseShowsOnlyTheNewRun() throws {
+        let workspace = WorkersWorkspaceModel()
+        let grid = roomyGrid()
+        let store = LiveWorkerStateStore()
+        let runA = makeState(runId: "run-a", slotId: 1, name: "Riker")
+        _ = workspace.attachWorkerPane(makeAttach(runId: "run-a", slot: 1))
+        store.update(states: [runA])
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+
+        // Engine frees slot 1 and spawns run-c into it before the old
+        // viewer's detach has landed: the attach is refused as SlotBusy,
+        // the engine detaches the stale viewer, then retries.
+        store.update(states: [])
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+        guard case .failure(.slotBusy(let occupant)) = workspace.attachWorkerPane(makeAttach(runId: "run-c", slot: 1)) else {
+            XCTFail("expected SlotBusy while run-a's viewer is still attached")
+            return
+        }
+        XCTAssertEqual(occupant, "run-a")
+        assertSuccess(workspace.detachWorkerPane(runId: "run-a"))
+        guard case .success = workspace.attachWorkerPane(makeAttach(runId: "run-c", slot: 1)) else {
+            XCTFail("expected the retried attach to succeed")
+            return
+        }
+        let runC = makeState(runId: "run-c", slotId: 1, name: "Worf", agentType: "review", startedAt: "2026-10-09T00:00:05Z")
+        store.update(states: [runC])
+        XCTAssertEqual(store.byRunID.keys.sorted(), ["run-c"], "consecutive slot reuse is an accepted snapshot")
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+
+        XCTAssertEqual(grid.renderRunIds(attached: workspace.viewersByRunId.keys), ["run-c"])
+        XCTAssertEqual(grid.layout.logicalCellIndex(ofRun: "run-c"), 0)
+        XCTAssertNil(grid.layout.logicalCellIndex(ofRun: "run-a"))
+        let liveC = render(grid, runId: "run-c", workspace: workspace, store: store)
+        XCTAssertFalse(liveC.isPlaceholder)
+        XCTAssertEqual(liveC.slotId, 1)
+        XCTAssertEqual(liveC.headerBadge, .review)
+        XCTAssertEqual(liveC.headerTitle, "Worf is working")
+        XCTAssertEqual(liveC.bodyKind, .terminal)
+    }
+
+    /// Same reuse without viewers, while visible: run-a's placeholder cell
+    /// is the lowest free cell, so the arrival in its old slot takes that
+    /// cell. The released run is then neither placed nor attached and is
+    /// not rendered; were it rendered, it would still read as finished.
+    func testArrivalReusesReleasedCellAndReleasedRunIsNotRendered() throws {
+        let grid = roomyGrid()
+        let workspace = WorkersWorkspaceModel()
+        let store = LiveWorkerStateStore()
+        let runA = makeState(runId: "run-a", slotId: 1, name: "Riker")
+        let runB = makeState(runId: "run-b", slotId: 2, name: "Data", startedAt: "2026-10-09T00:00:01Z")
+        store.update(states: [runA, runB])
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+        store.update(states: [runB])
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+        let runC = makeState(runId: "run-c", slotId: 1, name: "Worf", startedAt: "2026-10-09T00:00:05Z")
+        store.update(states: [runB, runC])
+        grid.sync(isVisible: true, workspace: workspace, liveStates: store)
+
+        let page = try XCTUnwrap(grid.layout.currentPage)
+        XCTAssertEqual(page.cells[0].content, .occupied(PaneMember(
+            runId: "run-c", startedAt: try XCTUnwrap(WorkerStaleness.parse("2026-10-09T00:00:05Z")),
+            project: .unfiled, type: .coding, isWaiting: false, hasViewer: false
+        )))
+        XCTAssertEqual(grid.renderRunIds(attached: [String]()), ["run-b", "run-c"])
+        XCTAssertNil(grid.personaName(for: "run-a"))
+        let finishedA = render(grid, runId: "run-a", workspace: workspace, store: store)
+        XCTAssertTrue(finishedA.isPlaceholder)
+        XCTAssertNil(finishedA.headerBadge)
+    }
+
+    private func assertSuccess(_ result: EngineReleaseResult, file: StaticString = #filePath, line: UInt = #line) {
+        guard case .success = result else {
+            XCTFail("expected detach success, got \(result)", file: file, line: line)
+            return
+        }
+    }
+
+    private func render(
+        _ grid: AgentsGridModel,
+        runId: String,
+        workspace: WorkersWorkspaceModel,
+        store: LiveWorkerStateStore
+    ) -> WorkerSlotSnapshot {
+        grid.renderSnapshot(runId: runId, workspace: workspace, liveStates: store, liveStatusDisabledSlotIDs: [])
+    }
+
+    private func roomyGrid() -> AgentsGridModel {
+        AgentsGridModel(
+            policy: PaneCapacityPolicy(minColumns: 1, minRows: 1, headerHeight: 0, maxPanesPerPage: 8, gap: 0, deadBand: 0),
+            geometry: PaneGeometry(area: PaneSize(width: 400, height: 200), cell: PaneSize(width: 100, height: 100))
+        )
+    }
+
     func testWorkerCellMeasurementIgnoresBossAndNormalizesBackingScale() {
         let one = BackingScaleView(scale: 1)
         let two = BackingScaleView(scale: 2)
@@ -570,13 +806,6 @@ final class AgentsGridModelTests: XCTestCase {
         grid.requestViewersForVisiblePage()
         XCTAssertEqual(requests, ["shown", "hidden"])
         XCTAssertFalse(grid.viewerlessRunIdsOnSelectedPage.contains("exited"))
-    }
-
-    private func roomyGrid() -> AgentsGridModel {
-        AgentsGridModel(
-            policy: PaneCapacityPolicy(minColumns: 1, minRows: 1, headerHeight: 0, maxPanesPerPage: 8, gap: 0, deadBand: 0),
-            geometry: PaneGeometry(area: PaneSize(width: 400, height: 200), cell: PaneSize(width: 100, height: 100))
-        )
     }
 
     private func makeAttach(runId: String, slot: Int) -> EngineAttachRequest {

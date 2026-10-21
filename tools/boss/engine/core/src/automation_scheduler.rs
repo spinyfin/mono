@@ -357,7 +357,7 @@ pub fn spawn_loop(
     is_paused: Arc<dyn Fn() -> bool + Send + Sync>,
     timer_wheel: Arc<TimerWheel>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let mut was_paused = false;
         loop {
             let now = boss_engine_utils::epoch_time::now_epoch_secs();

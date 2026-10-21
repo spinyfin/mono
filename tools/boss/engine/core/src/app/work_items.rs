@@ -814,7 +814,7 @@ pub(super) async fn apply_work_item_patch(
                 // task/chore) collapse inside force_release.
                 if let Some(execution_id) = terminal_chore_execution(&work_db, &item) {
                     let handler = server_state.completion_handler.clone();
-                    tokio::spawn(async move {
+                    boss_task_scope::spawn(async move {
                         handler.force_release(&execution_id).await;
                     });
                 }
@@ -829,7 +829,7 @@ pub(super) async fn apply_work_item_patch(
                 // Idempotent for the same reasons as above.
                 if let Some(execution_id) = in_review_chore_execution(&work_db, &item) {
                     let handler = server_state.completion_handler.clone();
-                    tokio::spawn(async move {
+                    boss_task_scope::spawn(async move {
                         handler.force_release(&execution_id).await;
                     });
                 }
@@ -844,7 +844,7 @@ pub(super) async fn apply_work_item_patch(
                 if let Some(execution_id) = active_to_todo_execution(&work_db, &previous_task_status, &item) {
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = id.clone();
-                    tokio::spawn(async move {
+                    boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(
                                 &id_for_cancel,
@@ -1142,7 +1142,7 @@ pub(super) async fn apply_work_item_patch(
                         build_chore_update_message(&old_name, &new_name, &old_description, &new_description)
                     {
                         let server_for_notify = server_state.clone();
-                        tokio::spawn(async move {
+                        boss_task_scope::spawn(async move {
                             match server_for_notify.send_input_to_worker(&run_id, msg.clone()).await {
                                 Ok(_) => {}
                                 Err(err)
@@ -1247,7 +1247,7 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                     };
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = tombstoned_id.clone();
-                    tokio::spawn(async move {
+                    boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(
                                 &id_for_cancel,
@@ -1367,10 +1367,23 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         .lock()
         .expect("board reads poisoned")
         .begin(&request_id, product_id.clone());
-    match work_db.get_work_tree_instrumented(&product_id, &mut trace) {
-        Ok(tree) => {
+    let started = Instant::now();
+    let loaded = server_state
+        .work_tree_loads
+        .load(&work_db, &server_state.work_revision, &product_id, &mut trace);
+    trace.record_plain("shared_load_wait", crate::population_timing::elapsed_ms(started));
+    let result = loaded.and_then(|loaded| {
+        loaded
+            .value
+            .as_ref()
+            .map(|tree| (loaded.sequence, tree.clone()))
+            .map_err(Clone::clone)
+    });
+    match result {
+        Ok((sequence, tree)) => {
             let mut reads = sink.board_reads.lock().expect("board reads poisoned");
-            let tree = reads.finish(&request_id, tree);
+            let (snapshot_revision, tree) = reads.finish_at(&request_id, sequence, tree);
+            trace.set_items(tree.tasks.len() + tree.chores.len());
             let mut cache = sink.work_tree_cache.lock().expect("work tree cache poisoned");
             if delta {
                 match cache.update(&tree) {
@@ -1380,7 +1393,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
                         send_response_with_revision(
                             &sink,
                             &request_id,
-                            server_state.current_work_revision(),
+                            snapshot_revision,
                             FrontendEvent::WorkTreeUpdate { update },
                         );
                     }
@@ -1399,7 +1412,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
             send_response_with_revision(
                 &sink,
                 &request_id,
-                server_state.current_work_revision(),
+                snapshot_revision,
                 FrontendEvent::WorkTree {
                     product: tree.product,
                     projects: tree.projects,
@@ -1408,6 +1421,10 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
                     task_runtimes: tree.task_runtimes,
                     dependencies: tree.dependencies,
                     ideas: tree.ideas,
+                    attention_items: tree.attention_items,
+                    attention_groups: tree.attention_groups,
+                    attention_members: tree.attention_members,
+                    planner_runs: tree.planner_runs,
                 },
             );
         }
@@ -1423,7 +1440,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
             // the next occurrence is diagnosable from the trace rather than
             // from a screenshot of the resulting "Work Error" modal.
             tracing::error!(product_id = %product_id, error = %err, "get_work_tree failed: product board unavailable");
-            send_work_error(&sink, &request_id, &err);
+            send_work_error(&sink, &request_id, err);
         }
     }
 }

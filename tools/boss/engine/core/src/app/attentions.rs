@@ -88,7 +88,7 @@ pub(super) async fn handle_list_attention_items_for_work_item(ctx: Dispatch, req
     let FrontendRequest::ListAttentionItemsForWorkItem { work_item_id } = req else {
         unreachable!()
     };
-    let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
+    let work_item_id = match server_state.resolve_work_item_id_with_db(&work_db, &work_item_id).await {
         Ok(id) => id,
         Err(err) => {
             send_work_error(&sink, &request_id, &err);
@@ -293,7 +293,7 @@ pub(super) async fn handle_list_attention_groups(ctx: Dispatch, req: FrontendReq
     // DB filter below is an exact-match `association_task_id = ?`, so an
     // unresolved short id would silently match nothing rather than error.
     let project_id = match project_id {
-        Some(id) => match server_state.resolve_work_item_id(&id).await {
+        Some(id) => match server_state.resolve_work_item_id_with_db(&work_db, &id).await {
             Ok(id) => Some(id),
             Err(err) => {
                 send_work_error(&sink, &request_id, &err);
@@ -303,7 +303,7 @@ pub(super) async fn handle_list_attention_groups(ctx: Dispatch, req: FrontendReq
         None => None,
     };
     let task_id = match task_id {
-        Some(id) => match server_state.resolve_work_item_id(&id).await {
+        Some(id) => match server_state.resolve_work_item_id_with_db(&work_db, &id).await {
             Ok(id) => Some(id),
             Err(err) => {
                 send_work_error(&sink, &request_id, &err);
@@ -313,25 +313,13 @@ pub(super) async fn handle_list_attention_groups(ctx: Dispatch, req: FrontendReq
         None => None,
     };
     {
-        let listed = work_db
-            .list_attention_groups(
-                &product_id,
-                project_id.as_deref(),
-                task_id.as_deref(),
-                kind.as_deref(),
-                state.as_deref(),
-            )
-            .and_then(|groups| {
-                // Bundle every group's member rows in one reply so the
-                // Notifications window renders inline controls without a
-                // round-trip per group. Flattened across groups; the
-                // client buckets by `group_id`.
-                let mut members = Vec::new();
-                for group in &groups {
-                    members.extend(work_db.list_attentions_for_group(&group.id)?);
-                }
-                Ok((groups, members))
-            });
+        let listed = work_db.list_attention_groups_with_members(
+            &product_id,
+            project_id.as_deref(),
+            task_id.as_deref(),
+            kind.as_deref(),
+            state.as_deref(),
+        );
         match listed {
             Ok((groups, members)) => {
                 send_response(

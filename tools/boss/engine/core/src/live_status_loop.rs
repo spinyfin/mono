@@ -708,7 +708,7 @@ impl LiveStatusManager {
             disabled: self.disabled.clone(),
             debug_store: self.debug_store.clone(),
         };
-        let join = tokio::spawn(run_slot_loop(cfg, receiver));
+        let join = boss_task_scope::spawn(run_slot_loop(cfg, receiver));
         guard.insert(
             slot_id,
             SlotHandle {

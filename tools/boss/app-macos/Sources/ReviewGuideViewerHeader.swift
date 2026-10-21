@@ -82,14 +82,36 @@ struct ReviewGuideViewerHeader: View {
                     Text(findings.statusText)
                         .font(.caption)
                         .accessibilityIdentifier("review-guide-findings-status")
-                    DisclosureGroup("AI review findings addendum", isExpanded: $findingsExpanded) {
-                        ScrollView {
-                            StructuredText(markdown: findings.addendumMarkdown)
-                                .bossMarkdown()
-                                .textual.textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Button {
+                            findingsExpanded.toggle()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2.weight(.semibold))
+                                    .rotationEffect(.degrees(findingsExpanded ? 90 : 0))
+                                    .frame(width: 10)
+                                Text("AI review findings addendum")
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(Rectangle())
                         }
-                        .frame(maxHeight: 200)
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(.isHeader)
+                        .accessibilityValue(findingsExpanded ? "expanded" : "collapsed")
+                        .accessibilityIdentifier("review-guide-findings-toggle")
+                        .onHover { hovering in
+                            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                        }
+                        if findingsExpanded {
+                            ScrollView {
+                                StructuredText(markdown: findings.addendumMarkdown)
+                                    .bossMarkdown()
+                                    .textual.textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(maxHeight: 200)
+                        }
                     }
                     .font(.caption)
                 }

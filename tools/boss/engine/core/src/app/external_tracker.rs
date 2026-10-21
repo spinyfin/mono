@@ -39,6 +39,13 @@ pub(super) async fn handle_set_product_external_tracker(ctx: Dispatch, req: Fron
                 );
                 match result {
                     Ok(product) => {
+                        // The org/SSO probe only covers GitHub-tracked products, so a
+                        // binding change can resolve (or invalidate) the auth state the
+                        // forwarder left `Unknown`. Re-probe via the same bounded
+                        // recheck as the app's "Re-check"; no-op when not connected.
+                        if let GitHubAuthState::Authorized { record, .. } = server_state.github_auth.current_state() {
+                            github_auth::spawn_org_recheck(server_state.clone(), record.token);
+                        }
                         let item = WorkItem::Product(product);
                         let product_id = item.product_id().to_string();
                         let revision = publish_work_invalidation(
@@ -83,7 +90,7 @@ pub(super) async fn handle_sync_product_external_tracker(ctx: Dispatch, req: Fro
         let credential_resolver = server_state.tracker_credential_resolver.clone();
         let sink2 = sink.clone();
         let request_id2 = request_id.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             match crate::external_tracker::reconcile::run_one_pass_for_product(
                 work_db.as_ref(),
                 registry.as_ref(),

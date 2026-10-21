@@ -201,7 +201,7 @@ async fn sample_via_ps() -> Option<SyspolicydSample> {
 /// (not every tick) so the engine log carries the signature without
 /// flooding while the wedge persists.
 pub fn spawn_loop(health: Arc<SyspolicydHealth>, interval: Duration) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let mut was_wedged = false;
         loop {
             match sample_via_ps().await {

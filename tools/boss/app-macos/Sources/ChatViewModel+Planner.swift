@@ -4,57 +4,76 @@ extension ChatViewModel {
     // MARK: Planner review/release/undo
     // (design: tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md, task 10)
 
-    /// Planner runs for a project, newest first — as returned by the engine.
+    /// Planner runs for a project, newest first — as last returned by
+    /// `list_planner_runs`. Empty until the popover or inspector has asked.
     func plannerRuns(forProjectID projectID: String) -> [PlannerRun] {
         plannerRunsByProjectID[projectID] ?? []
     }
 
-    /// The most recent run from the project-scoped audit trail. History,
-    /// the inspector, and popover detail key off this list; the kanban
-    /// hourglass uses [[plannerAffordancePresentation(forProjectID:)]] so
-    /// current running state can come from the global snapshot.
+    /// The most recent run from the project-scoped audit trail. History and
+    /// the inspector key off this list; the kanban hourglass and glyph use
+    /// [[plannerAffordancePresentation(forProjectID:)]], which reads the
+    /// tree-carried summary and the global background-work snapshot.
     func latestPlannerRun(forProjectID projectID: String) -> PlannerRun? {
         plannerRuns(forProjectID: projectID).first
     }
 
     /// Kanban accessory presentation: global snapshot for current running
-    /// identity, project-scoped query for staged/applied/failed history.
+    /// identity, the work tree's per-project summary for settled history.
     func plannerAffordancePresentation(forProjectID projectID: String) -> PlannerRunAffordancePresentation? {
         PlannerRunAffordancePresentation.from(
             projectID: projectID,
-            cachedRuns: plannerRuns(forProjectID: projectID),
+            summary: plannerRunSummaryByProjectID[projectID],
             backgroundWork: backgroundWork
         )
     }
 
-    /// Cached `PlannerRun` matching the affordance identity, or `nil` when
-    /// the hourglass is showing a globally-discovered run the project
-    /// query has not returned yet. The popover waits for this row.
+    /// Full `PlannerRun` for the affordance's popover, or `nil` while it has
+    /// to be fetched: nothing cached for the affordance's run, or the cached
+    /// row predates the state the tree summary reports (e.g. cached as
+    /// `staged` after the run was released). The popover waits for this row.
     func plannerRunForAffordancePopover(forProjectID projectID: String) -> PlannerRun? {
-        guard let presentation = plannerAffordancePresentation(forProjectID: projectID) else {
+        guard let presentation = plannerAffordancePresentation(forProjectID: projectID),
+              let cached = plannerRuns(forProjectID: projectID).first(where: { $0.id == presentation.runID })
+        else {
             return nil
         }
-        return plannerRuns(forProjectID: projectID).first { $0.id == presentation.runID }
+        if let summary = plannerRunSummaryByProjectID[projectID], summary.runID == cached.id {
+            return summary.isNoNewerThan(cached) ? cached : nil
+        }
+        return cached
     }
 
-    /// Ask the engine for this project's planner-run audit trail. Safe to
-    /// call repeatedly (e.g. from `onAppear`) — the reply simply replaces
-    /// the cached array.
+    /// Replace the cached planner summaries for one product with those the
+    /// engine sent in its work tree (full snapshot or reconciled delta).
+    /// A project absent from `summaries` has no settled run. If the inspector
+    /// is open on a project whose summary just moved, its history is reloaded
+    /// so the sheet never shows a run list older than the board.
+    func applyPlannerRunSummaries(_ summaries: [PlannerRunSummary], forProductID productID: String, projects: [WorkProject]) {
+        let previous = plannerRunSummaryByProjectID
+        var next = previous
+        for project in projectsByProductID[productID] ?? [] {
+            next.removeValue(forKey: project.id)
+        }
+        for project in projects {
+            next.removeValue(forKey: project.id)
+        }
+        for summary in summaries {
+            next[summary.projectID] = summary
+        }
+        guard next != previous else { return }
+        plannerRunSummaryByProjectID = next
+        if let inspected = plannerInspectorProjectID, next[inspected] != previous[inspected] {
+            refreshPlannerRuns(projectID: inspected)
+        }
+    }
+
+    /// Ask the engine for this project's planner-run audit trail. Only the
+    /// popover click, the inspector, and the post-action reload call this;
+    /// board refreshes get planner state from the work tree instead.
     func refreshPlannerRuns(projectID: String) {
         guard isConnected else { return }
         engine.sendListPlannerRuns(projectId: projectID)
-    }
-
-    /// Refresh every known project's planner-run audit trail for a product.
-    /// Called on `workInvalidated` for the product's work topic so a
-    /// planner run created after [[PlannerRunAffordance]]'s first appearance
-    /// (e.g. a design-PR-triggered auto-populate landing while the board is
-    /// already open) surfaces its icon within seconds instead of only after
-    /// the view remounts.
-    func refreshPlannerRuns(forProductID productID: String) {
-        for project in projectsByProductID[productID] ?? [] {
-            refreshPlannerRuns(projectID: project.id)
-        }
     }
 
     /// Release a project's staged auto-populate batch: flips `autostart =

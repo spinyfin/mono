@@ -308,7 +308,7 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
     } else {
         None
     };
-    Some(tokio::spawn(async move {
+    Some(boss_task_scope::spawn(async move {
         // Own the guard before the future is polled, including cancellation.
         let guard = guard;
         boss_gh_telemetry::scope(boss_gh_telemetry::callers::REVIEW_GUIDE_SOURCE_CAPTURE, async move {

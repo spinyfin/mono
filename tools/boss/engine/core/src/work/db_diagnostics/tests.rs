@@ -164,6 +164,26 @@ async fn spawned_work_inherits_the_request_context() {
 }
 
 #[tokio::test]
+async fn attributed_background_work_drains_with_the_engine_scope() {
+    let mut task = None;
+    Attribution {
+        verb: "shutdown_request".into(),
+        ..Attribution::default()
+    }
+    .scope(boss_task_scope::run(async {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        task = Some(spawn(async move {
+            assert_eq!(CONTEXT.with(|context| context.verb.clone()), "shutdown_request");
+            started.send(()).unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }));
+        ready.await.unwrap();
+    }))
+    .await;
+    assert!(task.unwrap().await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
 async fn blocking_work_inherits_the_request_context() {
     Attribution {
         verb: "blocking_request".into(),

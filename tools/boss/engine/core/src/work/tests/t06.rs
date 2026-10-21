@@ -1,5 +1,24 @@
 use super::*;
 
+#[test]
+fn list_engine_attempts_zero_limit_does_not_query_attempt_tables() {
+    let (_dir, path) = disk_db_path("zero-limit-engine-attempts");
+    let db = WorkDb::open(path).unwrap();
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE conflict_resolutions;
+             DROP TABLE ci_remediations;
+             DROP TABLE IF EXISTS rebase_attempts;",
+        )
+        .unwrap();
+
+    let attempts = db.list_engine_attempts(&[], None, &[], None, Some(0)).unwrap();
+    assert!(attempts.is_empty());
+    // A positive limit still queries the missing tables.
+    assert!(db.list_engine_attempts(&[], None, &[], None, Some(1)).is_err());
+}
+
 /// `retry_ci_remediation_for_work_item` always zeroes the
 /// `ci_attempts_used` counter, and additionally flips the parent
 /// from `blocked: ci_failure_exhausted` back to `in_review` when

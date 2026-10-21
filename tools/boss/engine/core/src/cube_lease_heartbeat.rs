@@ -444,7 +444,7 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let breaker = HeartbeatFailureBreaker::default();
         loop {
             let outcome = run_one_pass(

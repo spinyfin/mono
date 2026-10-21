@@ -31,6 +31,7 @@ use crate::coordinator::{
 use crate::driver::AgentDriver;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::external_tracker::WorkDbOrgStateSink;
+use crate::external_tracker::auth_forwarder::run_auth_forwarder;
 use crate::external_tracker::github_oauth::{
     DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore, probe_and_record_org_state,
 };
@@ -82,6 +83,7 @@ mod dependencies;
 mod design_docs;
 mod effort;
 mod engine_meta;
+mod events_accept;
 mod executions;
 mod external_tracker;
 mod github_auth;
@@ -117,6 +119,7 @@ pub(crate) mod proposals;
 // `pub(crate)` so `crate::attention_lifecycle` can name
 // `PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND` in the lifecycle registry
 // (crate-internal only — nothing outside the engine sees this module).
+mod panic_hook;
 pub(crate) mod readoption;
 mod review;
 mod review_guide;
@@ -129,6 +132,7 @@ mod subscriptions;
 #[cfg(test)]
 mod tests;
 mod tmux_teardown;
+mod transcript_persist;
 mod trunk_auth;
 mod trust;
 mod viewer_reconcile;
@@ -693,6 +697,9 @@ struct ServerState {
     /// [`crate::wait_registry`].
     #[builder(default)]
     wait_registry: Arc<crate::wait_registry::WaitRegistry>,
+    /// Newest accepted hook, including connections not yet dispatched.
+    #[builder(default)]
+    accepted_hook_seq: Arc<AtomicU64>,
     /// In-flight completion-teardown marks, shared with the completion
     /// handler so [`crate::terminal_work_sweep`] (wired in
     /// `app::server::serve`) never reclaims a pane whose own teardown is
@@ -915,6 +922,8 @@ struct ServerState {
     boot_id: u64,
     next_session_id: AtomicU64,
     work_revision: Arc<AtomicU64>,
+    #[builder(default)]
+    work_tree_loads: work_tree_loads::WorkTreeLoads,
     /// Pid of the process the engine trusts as the macOS app — must
     /// match a session's `peer_pid` for `RegisterAppSession` to
     /// succeed. `None` only in tests; production seeds this from
@@ -2311,6 +2320,7 @@ mod read_admission;
 mod read_freshness;
 mod session_queue;
 mod session_write;
+mod work_tree_loads;
 use session_queue::*;
 
 async fn handle_frontend_connection(
@@ -2366,7 +2376,7 @@ async fn handle_frontend_connection(
     // reconnected, which is not what a kill switch means.
     let writer_flags = server_state.feature_flags.clone();
     let writer_session_id = session_id.clone();
-    let writer_task = tokio::spawn(async move {
+    let writer_task = boss_task_scope::spawn(async move {
         while let Some(mut event) = writer_sink.next().await {
             // The exposure boundary's single write choke point. Every frame
             // leaving a worker-classified connection passes through here —
@@ -2432,6 +2442,11 @@ async fn handle_frontend_connection(
         writer_sink.trigger_shutdown();
     });
 
+    // Every exit from the read loop — EOF, peer disconnect, or a genuine
+    // read failure — must reach the teardown below: skipping it would leave
+    // the session registered with the broker (and, for the app, as the live
+    // app session) with nobody left to drain it.
+    let mut read_failure: Option<anyhow::Error> = None;
     loop {
         let line_result = tokio::select! {
             _ = &mut shutdown_rx => {
@@ -2448,8 +2463,17 @@ async fn handle_frontend_connection(
                 reader.next_line().await
             } => line,
         };
-        let Some(line) = line_result.context("socket read failed")? else {
-            break;
+        let line = match line_result {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) if read_error_is_peer_disconnect(&error) => {
+                tracing::info!(session_id = %session_id, %error, "peer closed the socket with frames unread; ending session");
+                break;
+            }
+            Err(error) => {
+                read_failure = Some(anyhow::Error::new(error).context("socket read failed"));
+                break;
+            }
         };
         // Population-timing window opens at line receipt, before decode, so
         // engine-side segments sum to ~the app-observed request duration.
@@ -2558,18 +2582,17 @@ async fn handle_frontend_connection(
         if let Some(waiting) = waiting_read {
             let sink = sink.clone();
             let session_id = session_id.clone();
-            tokio::spawn(async move {
+            boss_task_scope::spawn(async move {
                 match waiting.acquire().await {
                     Ok(permits) => {
                         // Synchronous SQLite work must not occupy the async
                         // runtime threads that serve writes and live status.
                         // Keep permits inside the blocking job even if its
                         // client disconnects; cancellation cannot inflate capacity.
-                        let runtime = tokio::runtime::Handle::current();
-                        let result = tokio::task::spawn_blocking(move || {
+                        let result = boss_task_scope::spawn_blocking_future(async move {
                             permits.started();
                             let _permits = permits;
-                            runtime.block_on(dispatch_fut);
+                            dispatch_fut.await;
                         })
                         .await;
                         if let Err(err) = result {
@@ -2583,15 +2606,18 @@ async fn handle_frontend_connection(
                             );
                         }
                     }
-                    Err(message) => {
+                    Err(rejected) => {
                         tracing::warn!(%session_id, %request_id, ?lane, wait_ms = recv_instant.elapsed().as_millis() as u64, "read RPC rejected: admission deadline expired");
                         send_response(
                             &sink,
                             &request_id,
                             FrontendEvent::Error {
-                                message: message.into(),
+                                message: rejected.message().into(),
                             },
                         );
+                        // Only now may the queue slot go back: the reader's
+                        // headroom gate counted this reply through it.
+                        drop(rejected);
                     }
                 }
             });
@@ -2606,5 +2632,18 @@ async fn handle_frontend_connection(
     server_state.drop_app_session_if_matches(&session_id).await;
     sink.close();
     let _ = writer_task.await;
-    Ok(())
+    read_failure.map_or(Ok(()), Err)
+}
+
+/// Whether a socket read error means the peer went away, as opposed to the
+/// engine failing. Linux reports `ECONNRESET` on a Unix stream whose peer
+/// closed while frames were still unread in its receive buffer: the normal
+/// end of a `boss` CLI invocation that exits on its reply without draining
+/// later pushes, or of the app quitting mid-burst. macOS reports the same
+/// close as plain EOF. Either way the session simply ends.
+fn read_error_is_peer_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+    )
 }

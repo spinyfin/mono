@@ -6,6 +6,7 @@ use super::idea::Idea;
 use super::product::Product;
 use super::project::Project;
 use super::task::{Task, TaskRuntime};
+use crate::{Attention, AttentionGroup, PlannerRunSummary, WorkAttentionItem};
 use serde::{Deserialize, Serialize};
 
 /// Input to `LinkWorkItemExternalRef`: manually bind a work item to a
@@ -340,4 +341,23 @@ pub struct WorkTree {
     /// field existed.
     #[serde(default)]
     pub ideas: Vec<Idea>,
+    /// Product-scoped operational alerts, including resolved items, matching
+    /// `list_attention_items_for_work_item` for this product.
+    #[serde(default)]
+    #[builder(default)]
+    pub attention_items: Vec<WorkAttentionItem>,
+    /// Open and partially answered groups, matching `list_attention_groups`.
+    #[serde(default)]
+    #[builder(default)]
+    pub attention_groups: Vec<AttentionGroup>,
+    /// Members of the included groups, bucketed by `group_id` by clients.
+    #[serde(default)]
+    #[builder(default)]
+    pub attention_members: Vec<Attention>,
+    /// Per project, the latest settled (non-`running`) planner run, without
+    /// blobs. At most one entry per project; projects that never had a
+    /// settled run have none. Full history stays on `list_planner_runs`.
+    #[serde(default)]
+    #[builder(default)]
+    pub planner_runs: Vec<PlannerRunSummary>,
 }

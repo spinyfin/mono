@@ -1,3 +1,5 @@
+mod absence;
+
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

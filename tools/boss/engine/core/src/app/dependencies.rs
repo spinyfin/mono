@@ -63,7 +63,7 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
                     let active_runs = work_db.active_run_ids_for_execution(&execution.id).unwrap_or_default();
                     let handler = server_state.completion_handler.clone();
                     let exec_for_release = execution.id.clone();
-                    tokio::spawn(async move {
+                    boss_task_scope::spawn(async move {
                         for run_id in active_runs {
                             handler.force_release(&run_id).await;
                         }

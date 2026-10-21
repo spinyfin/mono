@@ -467,7 +467,7 @@ impl ConflictRemediationQueue {
         let candidate = candidate.clone();
         let attempt = attempt.clone();
         let probe = probe.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             // The guard releases the slot on *every* exit path, including a
             // panic inside the job or the runtime dropping the task — a
             // leaked `InFlight` entry would silently wedge remediation for

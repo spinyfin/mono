@@ -61,6 +61,14 @@ pub enum FrontendEvent {
         dependencies: Vec<WorkItemDependency>,
         #[serde(default)]
         ideas: Vec<Idea>,
+        #[serde(default)]
+        attention_items: Vec<WorkAttentionItem>,
+        #[serde(default)]
+        attention_groups: Vec<AttentionGroup>,
+        #[serde(default)]
+        attention_members: Vec<Attention>,
+        #[serde(default)]
+        planner_runs: Vec<crate::PlannerRunSummary>,
     },
     WorkItemResult {
         item: WorkItem,

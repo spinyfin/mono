@@ -114,17 +114,19 @@ struct ProjectDesignDocAffordancePresentation: Equatable {
 // ===========================================================================
 // Planner review/release/undo surface (design: tools/boss/docs/designs/
 // auto-populate-project-tasks-on-design-pr-merge.md, task 10). Thin client
-// over `list_planner_runs` / `release_project` / `unpopulate_project`: a
-// kanban project-header accessory summarising the project's latest planner
-// run, a popover with the Release/Undo actions, and a full inspector sheet
-// (raw model output + rationale) for the whole audit trail.
+// over the work tree's planner summary and `list_planner_runs` /
+// `release_project` / `unpopulate_project`: a kanban project-header
+// accessory summarising the project's latest planner run (from the tree), a
+// popover with the Release/Undo actions, and a full inspector sheet (raw
+// model output + rationale) for the whole audit trail, both of which fetch
+// the full rows on demand.
 // ===========================================================================
 
 /// Pure-data presentation for [[PlannerRunAffordance]]. Current running
 /// state comes from the global background-work snapshot (`source_id` is
-/// `planner_runs.id`); staged/applied/failed history still comes from the
-/// project-scoped `list_planner_runs` cache. Lives outside the view so
-/// tests can assert running identity without a SwiftUI host.
+/// `planner_runs.id`); settled staged/applied/failed history comes from the
+/// per-project [[PlannerRunSummary]] the work tree carries. Lives outside
+/// the view so tests can assert running identity without a SwiftUI host.
 
 struct PlannerRunAffordancePresentation: Equatable {
     let runID: String
@@ -151,44 +153,41 @@ struct PlannerRunAffordancePresentation: Equatable {
     /// Reconcile the two planner read paths for one project.
     ///
     /// - A live `project_planner` snapshot item is the running identity,
-    ///   unless the cached row for that `source_id` already has a terminal
-    ///   outcome (completion arrived through the project query first).
-    /// - With no live item, a cached non-running latest run is history.
-    /// - A cache-only `running` row is not shown as running: the global
+    ///   unless the tree summary for that `source_id` already has a terminal
+    ///   outcome (completion arrived through the tree first).
+    /// - With no live item, the summary's settled run is history.
+    /// - The summary never describes a `running` run, and the global
     ///   snapshot is authoritative for that dimension, so a completed run
     ///   dropped from the snapshot cannot keep the hourglass lit, and two
     ///   indicators cannot disagree about whether a given run is running.
     static func from(
         projectID: String,
-        cachedRuns: [PlannerRun],
+        summary: PlannerRunSummary?,
         backgroundWork: [BackgroundWorkItem]
     ) -> PlannerRunAffordancePresentation? {
         let live = backgroundWork.first { item in
             item.isProjectPlanner && item.projectID == projectID
         }
         if let live {
-            if let cached = cachedRuns.first(where: { $0.id == live.sourceID }),
-               !cached.isRunning {
-                return from(cachedRun: cached)
+            if let summary, summary.runID == live.sourceID {
+                return from(summary: summary)
             }
             return running(runID: live.sourceID)
         }
-        guard let history = cachedRuns.first(where: { !$0.isRunning }) else {
-            return nil
-        }
-        return from(cachedRun: history)
+        guard let summary else { return nil }
+        return from(summary: summary)
     }
 
     /// Run identity the hourglass currently claims is running, or `nil`.
     /// Shared so a later toolbar badge can consume the same outcome.
     static func liveRunningRunID(
         projectID: String,
-        cachedRuns: [PlannerRun],
+        summary: PlannerRunSummary?,
         backgroundWork: [BackgroundWorkItem]
     ) -> String? {
         guard let presentation = from(
             projectID: projectID,
-            cachedRuns: cachedRuns,
+            summary: summary,
             backgroundWork: backgroundWork
         ), presentation.isRunning else {
             return nil
@@ -208,19 +207,18 @@ struct PlannerRunAffordancePresentation: Equatable {
         )
     }
 
-    /// Both call sites guard `!isRunning` before reaching here, so this
-    /// path never renders the live hourglass — that comes from
-    /// `running(runID:)` instead. `isRunning` is hardcoded `false`
-    /// accordingly, and the outcome maps below cover only the terminal
-    /// `PLANNER_OUTCOME_*` values a cached row can carry.
-    private static func from(cachedRun run: PlannerRun) -> PlannerRunAffordancePresentation {
+    /// Settled-run glyph. The live hourglass comes from
+    /// `running(runID:)` instead, so `isRunning` is hardcoded `false` here,
+    /// and the outcome maps below cover only the terminal
+    /// `PLANNER_OUTCOME_*` values a summary can carry.
+    private static func from(summary: PlannerRunSummary) -> PlannerRunAffordancePresentation {
         PlannerRunAffordancePresentation(
-            runID: run.id,
-            systemImage: systemImage(for: run.outcome),
-            tooltip: run.outcomeLabel,
-            accessibilityLabel: "Planner: \(run.outcomeLabel)",
+            runID: summary.runID,
+            systemImage: systemImage(for: summary.outcome),
+            tooltip: summary.outcomeLabel,
+            accessibilityLabel: "Planner: \(summary.outcomeLabel)",
             isRunning: false,
-            tintKind: tintKind(for: run.outcome)
+            tintKind: tintKind(for: summary.outcome)
         )
     }
 
@@ -274,16 +272,16 @@ struct PlannerPopoverWaitState: Equatable {
 }
 
 /// Per-project Planner affordance for the kanban project-section header,
-/// mirroring [[ProjectDesignDocAffordance]]. Fetches the project's planner
-/// runs on first appearance. The hourglass can appear from the global
-/// snapshot before that reply lands; click then refreshes and opens
-/// [[PlannerRunPopoverView]] once the matching row arrives.
+/// mirroring [[ProjectDesignDocAffordance]]. Renders from the work tree's
+/// per-project summary and the global snapshot, so it fetches nothing on
+/// appear. Click opens [[PlannerRunPopoverView]] straight away when a
+/// current full row is cached; otherwise it asks for the project's runs and
+/// opens once the matching row arrives.
 
 struct PlannerRunAffordance: View {
     @ObservedObject var model: ChatViewModel
     let project: WorkProject
     @State private var isPopoverPresented = false
-    @State private var hasRequestedRuns = false
     @State private var popoverWaitState = PlannerPopoverWaitState()
 
     private var presentation: PlannerRunAffordancePresentation? {
@@ -310,14 +308,13 @@ struct PlannerRunAffordance: View {
                 .popover(isPresented: $isPopoverPresented) {
                     if let popoverRun {
                         PlannerRunPopoverView(model: model, project: project, run: popoverRun)
+                    } else {
+                        // The run moved on under the open popover; the
+                        // refresh in flight replaces this with its new state.
+                        ProgressView().controlSize(.small).padding(14)
                     }
                 }
             }
-        }
-        .onAppear {
-            guard !hasRequestedRuns else { return }
-            hasRequestedRuns = true
-            model.refreshPlannerRuns(projectID: project.id)
         }
         .onChange(of: popoverRun?.id) { _, newID in
             if popoverWaitState.cachedRunArrived(id: newID) {
@@ -327,11 +324,20 @@ struct PlannerRunAffordance: View {
         .onChange(of: presentation?.runID) { _, newID in
             popoverWaitState.presentationRunIDChanged(to: newID)
         }
+        .onChange(of: model.plannerRunSummaryByProjectID[project.id]) { _, _ in
+            // The run changed under an open popover (released, undone, a new
+            // run settled): its cached row is now stale, so reload it rather
+            // than leave the popover blank or showing the old state.
+            if isPopoverPresented {
+                model.refreshPlannerRuns(projectID: project.id)
+            }
+        }
     }
 
-    /// Open the existing popover when the matching `PlannerRun` is cached.
-    /// If the hourglass is lit only from the global snapshot, refresh the
-    /// project-scoped query and present after that row arrives.
+    /// Open the existing popover when a current `PlannerRun` is cached.
+    /// Otherwise (never fetched, still running, or cached before the run
+    /// last changed) refresh the project-scoped query and present after the
+    /// matching row arrives.
     private func presentPopover() {
         if popoverRun != nil {
             isPopoverPresented = true

@@ -556,7 +556,7 @@ impl WorkerCompletionHandler {
         let publisher = self.publisher.clone();
         let (execution_id, work_item_id) = (execution.id.clone(), execution.work_item_id.clone());
         let repo_remote_url = execution.repo_remote_url.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             super::queue_ci_audit::audit_queue_ci_delivery(
                 branch_verifier.as_ref(),
                 &work_db,
@@ -590,7 +590,7 @@ impl WorkerCompletionHandler {
             let (execution_id, work_item_id, pr_url) =
                 (execution.id.clone(), work_item_id.to_owned(), pr_url.to_owned());
             let repo_remote_url = execution.repo_remote_url.clone();
-            tokio::spawn(async move {
+            boss_task_scope::spawn(async move {
                 super::queue_ci_audit::audit_queue_ci_delivery(
                     branch_verifier.as_ref(),
                     &work_db,
@@ -613,7 +613,7 @@ impl WorkerCompletionHandler {
         let work_item_id = work_item_id.to_owned();
         let repo_remote_url = execution.repo_remote_url.clone();
         let pr_url = pr_url.to_owned();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             audit_declared_delivery(
                 branch_verifier.as_ref(),
                 &work_db,
@@ -655,7 +655,7 @@ impl WorkerCompletionHandler {
         let work_item_id = work_item_id.to_owned();
         let repo_remote_url = execution.repo_remote_url.clone();
         let pr_url = pr_url.to_owned();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             run_declared_delivery_post_effects(
                 &work_db,
                 publisher.as_ref(),
