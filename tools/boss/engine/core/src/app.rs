@@ -559,7 +559,7 @@ struct ServerStateOverrides {
     /// Global limiter for on-demand coordinator guidance fetches. `None` uses
     /// `coordinator_guidance::MAX_CONCURRENT_FETCHES` permits.
     guidance_fetches: Option<Arc<tokio::sync::Semaphore>>,
-    org_recheck: Option<Arc<tokio::sync::Semaphore>>,
+    org_recheck: Option<Arc<github_auth::OrgRecheck>>,
     /// Fake live-CI probe. `None` uses `CommandMergeProbe`.
     merge_probe: Option<Arc<dyn MergeProbe>>,
     /// Fake Trunk token store. `None` uses `boss_trunk_auth::TrunkTokenStore`.
@@ -824,9 +824,9 @@ struct ServerState {
     /// connections.
     #[builder(default = Arc::new(tokio::sync::Semaphore::new(coordinator_guidance::MAX_CONCURRENT_FETCHES)))]
     guidance_fetches: Arc<tokio::sync::Semaphore>,
-    /// Bounds the detached org/SSO re-checks started by `GitHubAuthStatus`.
-    #[builder(default = Arc::new(tokio::sync::Semaphore::new(1)))]
-    org_recheck: Arc<tokio::sync::Semaphore>,
+    /// Serializes and coalesces all org/SSO probes.
+    #[builder(default)]
+    org_recheck: Arc<github_auth::OrgRecheck>,
     /// Primary-path `execution_id → pr_url` staging cache. Populated
     /// by [`dispatch_live_worker_state`] from `PostToolUse` Bash
     /// hooks that surface a `gh pr create` (or `view` / `edit`)

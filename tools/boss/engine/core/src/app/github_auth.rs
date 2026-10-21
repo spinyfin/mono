@@ -129,15 +129,64 @@ pub(super) async fn probe_org_state(server_state: &ServerState, token: &str) -> 
 /// GitHub-tracked products, so a product newly bound to GitHub — or an org
 /// edit — must be re-probed to resolve a state the forwarder left `Unknown`).
 /// Detached so the caller's permits and ordering turn are released once its
-/// reply is sent; at most one re-check runs at a time (`org_recheck`), and a
-/// request that finds one in flight is dropped rather than queued.
+/// reply is sent. All probes share one worker and one pending rerun.
 pub(super) fn spawn_org_recheck(server_state: Arc<ServerState>, token: String) {
-    let Ok(permit) = server_state.org_recheck.clone().try_acquire_owned() else {
-        return;
-    };
-    boss_task_scope::spawn(async move {
-        let _permit = permit;
-        let resolved = probe_org_state(&server_state, &token).await;
-        server_state.github_auth.update_org_state(resolved);
+    let queue = server_state.org_recheck.clone();
+    queue.request(token, move |token| {
+        let server_state = server_state.clone();
+        async move {
+            let resolved = probe_org_state(&server_state, &token).await;
+            server_state.github_auth.update_org_state(&token, resolved);
+        }
     });
 }
+
+/// The idle transition and request registration share a lock so requests
+/// cannot be stranded between the worker's last check and its exit.
+#[derive(Default)]
+pub(super) struct OrgRecheck {
+    state: std::sync::Mutex<RecheckState>,
+}
+
+#[derive(Default)]
+struct RecheckState {
+    running: bool,
+    pending: Option<String>,
+}
+
+impl OrgRecheck {
+    fn request<F, Fut>(self: &Arc<Self>, token: String, probe: F)
+    where
+        F: Fn(String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.pending = Some(token);
+            if state.running {
+                return;
+            }
+            state.running = true;
+        }
+        let queue = self.clone();
+        boss_task_scope::spawn(async move {
+            loop {
+                let token = {
+                    let mut state = queue.state.lock().unwrap();
+                    match state.pending.take() {
+                        Some(token) => token,
+                        None => {
+                            state.running = false;
+                            return;
+                        }
+                    }
+                };
+                probe(token).await;
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+#[path = "github_auth_tests.rs"]
+mod tests;
