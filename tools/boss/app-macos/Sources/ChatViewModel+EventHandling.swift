@@ -298,8 +298,13 @@ extension ChatViewModel {
             }
             if handleCoordinatorResetError(message) { return }
             workErrorMessage = message
-        case .workerLiveStatesList(let states):
+        case .workerLiveStatesList(let states, let doingSections):
+            guard WorkerLiveState.hasUniqueIds(states) else { return }
             liveWorkerStates.update(states: states)
+            if doingSectionsByID != doingSections {
+                cachedSectionsByColumn[.doing] = nil
+                doingSectionsByID = doingSections
+            }
         case .liveStatusDisabledSlotsList(let slotIds):
             liveStatusDisabledSlotIDs = Set(slotIds)
         case .liveStatusEnabledSet(let slotId, let enabled):

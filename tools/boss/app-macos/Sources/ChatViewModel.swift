@@ -459,6 +459,9 @@ final class ChatViewModel: ObservableObject {
     /// panel, ContentView root). Only the views that actually read
     /// live state subscribe to the store.
     let liveWorkerStates = LiveWorkerStateStore()
+    /// Engine-owned membership; publish only when a card changes section,
+    /// not for every tool/activity event in the high-rate live worker feed.
+    @Published var doingSectionsByID: [String: DoingSection] = [:]
 
     /// Slot ids whose live-status summarizer has been manually
     /// disabled by the human via the Agents-tab toggle. Sourced from

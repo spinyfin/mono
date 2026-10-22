@@ -929,7 +929,10 @@ fn tag_cases() -> Vec<TagCase> {
         },
         TagCase {
             label: "WorkerLiveStatesList",
-            event: FrontendEvent::WorkerLiveStatesList { states: vec![] },
+            event: FrontendEvent::WorkerLiveStatesList {
+                states: vec![],
+                doing_sections: Default::default(),
+            },
             expected_tag: "worker_live_states_list",
         },
         TagCase {
