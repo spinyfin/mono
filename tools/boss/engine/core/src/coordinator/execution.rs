@@ -1,9 +1,10 @@
 //! Per-execution scheduling: work-item resolution, host selection, workspace
 //! leasing/recovery, and pre-start failure handling. Part of the `coordinator`
 //! module split; see [`super`] for the struct and shared types.
-use crate::work::{CancelActor, CancelExecutionOpts, CancelledExecution};
+use crate::work::{CancelExecutionOpts, CancelledExecution};
 use anyhow::bail;
 use boss_protocol::ReviewBatchPhase;
+use boss_protocol::StatusActor;
 
 use super::*;
 
@@ -92,7 +93,7 @@ impl ExecutionCoordinator {
                 &cancelled.execution.id,
                 &cancelled.execution.work_item_id,
                 prior_status,
-                CancelActor::Engine,
+                StatusActor::Engine,
                 reason,
                 cancelled.work_item_parked,
             ))
@@ -112,7 +113,7 @@ impl ExecutionCoordinator {
             &cancelled.execution.id,
             &cancelled.execution.work_item_id,
             prior_status,
-            CancelActor::Engine,
+            StatusActor::Engine,
             reason,
             cancelled.work_item_parked,
         );
@@ -1037,7 +1038,7 @@ impl ExecutionCoordinator {
                             queued_only: true,
                             record_failure_reason: true,
                             keep_work_item_schedulable: false,
-                            actor: CancelActor::Engine,
+                            actor: StatusActor::Engine,
                         },
                     ) {
                         Ok(cancelled) => {
@@ -2667,7 +2668,7 @@ impl ExecutionCoordinator {
                 queued_only: true,
                 record_failure_reason: true,
                 keep_work_item_schedulable: false,
-                actor: CancelActor::Engine,
+                actor: StatusActor::Engine,
             },
         ) {
             Ok(cancelled) => {

@@ -832,6 +832,10 @@ fn parent_no_longer_revisable(error: &anyhow::Error) -> bool {
 /// Soft-delete a revision/follow-up this call materialised whose owning
 /// proposal turned out not to be the decision that stands (see the
 /// `current_state != Applied` guard in `commit_applied_review_verdict`).
+/// Reason recorded for executions retired with a tombstoned orphaned
+/// remediation.
+const TOMBSTONE_CANCEL_REASON: &str = "orphaned review remediation tombstoned";
+
 /// Soft-delete drops the task from every `tasks.deleted_at IS NULL` list
 /// query (including the `autostart` scheduler query). That is not enough
 /// for dispatch: `list_ready_executions` selects `work_executions` by
@@ -839,12 +843,26 @@ fn parent_no_longer_revisable(error: &anyhow::Error) -> bool {
 /// freshly minted autostart revision's `ready` row would otherwise stay
 /// on every drain until the start-time deleted-item guard fails it.
 /// Cancel the task's never-started executions in the same transaction so
-/// the orphan sweep and reconciler will not re-dispatch it.
+/// the orphan sweep and reconciler will not re-dispatch it. Each retired
+/// execution gets a cancel provenance record.
 fn tombstone_orphaned_remediation_in_tx(tx: &rusqlite::Transaction<'_>, task_id: &str, now: &str) -> Result<()> {
     tx.execute(
         "UPDATE tasks SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
         params![task_id, now],
     )?;
+    let pending_executions: Vec<WorkExecution> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM work_executions
+             WHERE work_item_id = ?1
+               AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
+        )?;
+        let ids = stmt
+            .query_map(params![task_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.iter()
+            .map(|id| query_execution(tx, id).require("execution", id))
+            .collect::<Result<Vec<_>>>()?
+    };
     tx.execute(
         "UPDATE work_executions
          SET status = 'cancelled',
@@ -853,6 +871,16 @@ fn tombstone_orphaned_remediation_in_tx(tx: &rusqlite::Transaction<'_>, task_id:
            AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
         params![task_id, now],
     )?;
+    for execution in pending_executions {
+        record_cancel_provenance(
+            &execution.id,
+            task_id,
+            execution.status,
+            StatusActor::Engine,
+            TOMBSTONE_CANCEL_REASON,
+            false,
+        );
+    }
     Ok(())
 }
 

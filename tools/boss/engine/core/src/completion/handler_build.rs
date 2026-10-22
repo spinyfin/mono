@@ -83,17 +83,16 @@ impl WorkerCompletionHandler {
         prior_status: ExecutionStatus,
         chain_root_id: &str,
     ) {
-        self.dispatch_events
-            .emit(
-                DispatchEvent::new(Stage::ExecutionCancelled, DispatchOutcome::Ok, &execution.id)
-                    .with_work_item(&execution.work_item_id)
-                    .with_details(serde_json::json!({
-                        "reason": "parent_pr_merged",
-                        "prior_status": prior_status.as_str(),
-                        "chain_root_id": chain_root_id,
-                    })),
-            )
-            .await;
+        let mut event = crate::work::execution_cancelled_event(
+            &execution.id,
+            &execution.work_item_id,
+            prior_status,
+            boss_protocol::StatusActor::Engine,
+            "parent_pr_merged",
+            false,
+        );
+        event.details["chain_root_id"] = serde_json::Value::String(chain_root_id.to_owned());
+        self.dispatch_events.emit(event).await;
     }
 
     /// Point structured-output reads at `dir` instead of the process-wide

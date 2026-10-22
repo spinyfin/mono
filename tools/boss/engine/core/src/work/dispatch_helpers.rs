@@ -272,7 +272,7 @@ pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) 
 
 /// Hydrate the per-item runtime for every task and chore. This is the
 /// primary N+1 on the `get_work_tree` path: one call per work item, each
-/// running 1-4 point queries. Returns the runtimes alongside the total
+/// running a handful of point queries. Returns the runtimes alongside the total
 /// number of SQL statements executed, so [`crate::population_timing`] can
 /// attribute the per-row subquery fan-out.
 pub(crate) fn collect_task_runtimes(
@@ -284,7 +284,7 @@ pub(crate) fn collect_task_runtimes(
     let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
     let mut queries = 0u64;
     for task in tasks.iter().chain(chores.iter()) {
-        runtimes.push(compute_task_runtime(conn, &task.id, &mut queries, now)?.runtime);
+        runtimes.push(compute_task_runtime(conn, &task.id, Some(task), &mut queries, now)?.runtime);
     }
     Ok((runtimes, queries))
 }
@@ -294,9 +294,9 @@ pub(crate) fn collect_task_runtimes(
 /// whether a live-execution fallback, a non-abandoned-execution fallback for
 /// an all-abandoned work item, and a latest-run lookup are needed) so N+1
 /// callers can report an accurate aggregate subquery count.
-pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
+pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, task: Option<&Task>, queries: &mut u64) -> Result<TaskRuntime> {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
-    Ok(compute_task_runtime(conn, work_item_id, queries, now)?.runtime)
+    Ok(compute_task_runtime(conn, work_item_id, task, queries, now)?.runtime)
 }
 
 /// A freshly computed runtime plus what the board runtime cache needs to know
@@ -331,6 +331,7 @@ pub(crate) struct ComputedRuntime {
 pub(crate) fn compute_task_runtime(
     conn: &Connection,
     work_item_id: &str,
+    task: Option<&Task>,
     queries: &mut u64,
     now: i64,
 ) -> Result<ComputedRuntime> {
@@ -373,7 +374,7 @@ pub(crate) fn compute_task_runtime(
         }
     };
     let wait = super::queued_wait::for_execution(conn, execution.as_ref(), now)?;
-    let dispatch_hold_reason = dispatch_hold_reason_for(conn, work_item_id, execution.as_ref(), queries)?;
+    let dispatch_hold_reason = dispatch_hold_reason_for(conn, task, execution.as_ref(), queries)?;
     let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at, dispatch_wait_since) =
         if let Some(execution) = execution {
             *queries += 1;
@@ -597,9 +598,15 @@ pub(crate) fn reconcile_work_item_execution(
         );
         return Ok(());
     }
-    let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<()> {
+    // Returns whether a row was minted: `false` when a decline-to-mint gate
+    // (bound PR, deliberate park, unresolved repo) applies.
+    let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<bool> {
         if primary_pr_awaits_review(conn, work_item_id)? {
-            return Ok(());
+            tracing::debug!(
+                work_item_id,
+                "reconcile: skipping execution mint — the row already has a PR awaiting review",
+            );
+            return Ok(false);
         }
         if work_item_is_deliberately_parked(conn, work_item_id)? {
             tracing::info!(
@@ -607,7 +614,7 @@ pub(crate) fn reconcile_work_item_execution(
                 "reconcile: skipping execution mint — this row's run ended in a deliberate park \
                  (`bossctl work start` resumes it)",
             );
-            return Ok(());
+            return Ok(false);
         }
         // Resolve through the single helper so per-row overrides beat the
         // product default (multi-repo design Q5). On a `None` we don't create
@@ -616,7 +623,7 @@ pub(crate) fn reconcile_work_item_execution(
         let Some(repo_remote_url) = resolve_repo_for_work_item(conn, work_item_id)? else {
             let label = repo_unresolved_kind_label(conn, work_item_id)?;
             record_repo_unresolved_attention(conn, work_item_id, label)?;
-            return Ok(());
+            return Ok(false);
         };
         // A merge-cancelled PR-review revision is converted to a followup in
         // place. Its exact prior workspace was persisted before teardown;
@@ -646,7 +653,7 @@ pub(crate) fn reconcile_work_item_execution(
                 .build(),
         )?;
         result.created.push(created);
-        Ok(())
+        Ok(true)
     };
 
     match query_latest_execution_for_work_item(conn, work_item_id)? {
@@ -688,7 +695,9 @@ pub(crate) fn reconcile_work_item_execution(
                 converge_stranded_autostart_row(conn, result, &task, &execution, &insert_fresh)?;
             }
         }
-        None => insert_fresh(result, None)?,
+        None => {
+            insert_fresh(result, None)?;
+        }
     }
 
     Ok(())

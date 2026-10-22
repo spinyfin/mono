@@ -47,10 +47,9 @@ fn assert_parked_by_cancel(task: &Task, execution_id: &str) {
     assert!(task.dispatch_failed_at.is_some());
 }
 
-/// The reported incident shape: the row's only execution is cancelled before
-/// it ever starts (mid-spawn, or `bossctl executions cancel` on a queued
-/// row). The row used to stay `todo` + `autostart` with nothing queued and
-/// render in Doing as "Queued — reason unknown" forever.
+/// The row's only execution is cancelled before it ever starts (mid-spawn,
+/// or `bossctl executions cancel` on a queued row). The row is parked in
+/// Backlog rather than left `todo` + `autostart` with nothing queued.
 #[test]
 fn cancelling_the_governing_never_started_execution_parks_the_row() {
     let (db, _product_id, chore_id) = setup_product_and_chore();
@@ -64,9 +63,9 @@ fn cancelling_the_governing_never_started_execution_parks_the_row() {
         .cancel_execution_with_outcome(
             &execution.id,
             CancelExecutionOpts {
-                reason: Some("operator cancelled it".to_owned()),
+                reason: Some("cancel requested".to_owned()),
                 queued_only: true,
-                actor: CancelActor::Human,
+                actor: StatusActor::Human,
                 ..CancelExecutionOpts::default()
             },
         )
@@ -81,7 +80,7 @@ fn cancelling_the_governing_never_started_execution_parks_the_row() {
     assert_parked_by_cancel(&parked, &execution.id);
     let body = parked.dispatch_failed_error.as_deref().unwrap();
     assert!(
-        body.contains("cancelled by an operator (operator cancelled it)"),
+        body.contains("cancelled by a human (cancel requested)"),
         "the actor and the caller's reason are rendered verbatim: {body}"
     );
     let runtime = db.get_task_runtime(&chore_id).unwrap();
@@ -101,7 +100,7 @@ fn cancelling_a_live_execution_parks_the_row_with_the_reason() {
     assert_eq!(task(&db, &chore_id).status, TaskStatus::Active);
 
     let (cancelled, moved) = db
-        .cancel_running_execution_and_demote_task_as(&execution.id, CancelActor::Human, "bossctl agents stop")
+        .cancel_running_execution_and_demote_task_as(&execution.id, StatusActor::Human, "bossctl agents stop")
         .unwrap();
     assert!(cancelled && moved);
     let parked = task(&db, &chore_id);
@@ -111,12 +110,11 @@ fn cancelling_a_live_execution_parks_the_row_with_the_reason() {
             .dispatch_failed_error
             .as_deref()
             .unwrap()
-            .contains("cancelled by an operator (bossctl agents stop)")
+            .contains("cancelled by a human (bossctl agents stop)")
     );
 }
 
-/// An engine-decided cancel names the engine, so the operator reading the
-/// banner knows no human stopped it.
+/// An engine-decided cancel names the engine in the banner.
 #[test]
 fn an_engine_cancel_names_the_engine_in_the_park_text() {
     let (db, _product_id, chore_id) = setup_product_and_chore();
@@ -285,4 +283,180 @@ fn task_runtime_states_why_a_dispatch_pending_row_has_nothing_queued() {
     let queued = db.get_task_runtime(&chore_id).unwrap();
     assert_eq!(queued.execution_id.as_deref(), Some(pending.id.as_str()));
     assert_eq!(queued.dispatch_hold_reason, None);
+}
+
+/// A re-armed row (`autostart = 1` behind an execution that ran) used to
+/// exercise each decline-to-mint gate.
+fn rearmed_chore() -> (WorkDb, String, String, String) {
+    let (db, product_id, chore_id) = setup_product_and_chore();
+    let execution = create_ready_chore_execution(&db, chore_id.clone());
+    raw_terminalize(&db, &execution.id, "completed", true);
+    (db, product_id, chore_id, execution.id)
+}
+
+fn exec_sql(db: &WorkDb, sql: &str, id: &str) {
+    db.connect().unwrap().execute(sql, [id]).unwrap();
+}
+
+fn hold(db: &WorkDb, chore_id: &str) -> Option<String> {
+    db.get_task_runtime(chore_id).unwrap().dispatch_hold_reason
+}
+
+const SET_PR: &str = "UPDATE tasks SET pr_url = 'https://github.com/example/repo/pull/7' WHERE id = ?1";
+const SET_DEFERRED: &str = "UPDATE tasks SET deferred = 1 WHERE id = ?1";
+const SET_HUMAN_DRIVEN: &str = "UPDATE tasks SET human_driven = 1 WHERE id = ?1";
+const SET_PARKED: &str = "UPDATE work_executions SET run_done_outcome = 'blocked' WHERE work_item_id = ?1";
+const CLEAR_REPO: &str =
+    "UPDATE products SET repo_remote_url = NULL WHERE id = (SELECT product_id FROM tasks WHERE id = ?1)";
+
+#[test]
+fn each_decline_to_mint_gate_states_its_own_hold_reason() {
+    for (sql, expected) in [
+        (SET_HUMAN_DRIVEN, "human_driven"),
+        (SET_DEFERRED, "deferred"),
+        (SET_PR, "pr_awaits_review"),
+        (SET_PARKED, "deliberately_parked"),
+        (CLEAR_REPO, "repo_unresolved"),
+    ] {
+        let (db, _product_id, chore_id, _execution_id) = rearmed_chore();
+        assert_eq!(
+            hold(&db, &chore_id).as_deref(),
+            Some("awaiting_reconcile"),
+            "{expected}: baseline"
+        );
+        exec_sql(&db, sql, &chore_id);
+        assert_eq!(hold(&db, &chore_id).as_deref(), Some(expected));
+    }
+}
+
+/// With two gates active the engine reports the one the reconciler checks
+/// first: human-driven, deferred, bound PR, deliberate park, unresolved repo.
+#[test]
+fn hold_reason_precedence_matches_the_reconciler_decline_order() {
+    let precedence = [
+        (vec![SET_DEFERRED, SET_HUMAN_DRIVEN], "human_driven"),
+        (vec![SET_PR, SET_DEFERRED], "deferred"),
+        (vec![SET_PARKED, SET_PR], "pr_awaits_review"),
+        (vec![CLEAR_REPO, SET_PARKED], "deliberately_parked"),
+    ];
+    for (statements, expected) in precedence {
+        let (db, _product_id, chore_id, _execution_id) = rearmed_chore();
+        for sql in statements {
+            exec_sql(&db, sql, &chore_id);
+        }
+        assert_eq!(hold(&db, &chore_id).as_deref(), Some(expected));
+    }
+}
+
+/// A row kind the reconciler never mints an execution for says so, instead
+/// of promising a reconcile that will not happen.
+#[test]
+fn a_kind_the_reconciler_never_visits_states_why_nothing_is_queued() {
+    let (db, product_id, chore_id, _execution_id) = rearmed_chore();
+    exec_sql(&db, "UPDATE tasks SET kind = 'task' WHERE id = ?1", &chore_id);
+    assert_eq!(hold(&db, &chore_id).as_deref(), Some("no_execution_kind"));
+    let result = db.reconcile_product_executions(&product_id).unwrap();
+    assert!(result.created.is_empty(), "the reconciler really does skip this kind");
+    assert_eq!(hold(&db, &chore_id).as_deref(), Some("no_execution_kind"));
+
+    exec_sql(
+        &db,
+        "UPDATE tasks SET kind = 'chore', blocked_reason = 'awaiting_operator_answer' WHERE id = ?1",
+        &chore_id,
+    );
+    assert_eq!(hold(&db, &chore_id).as_deref(), Some("blocked_reason"));
+}
+
+/// A cancelled never-started latest execution cannot be parked while an
+/// older non-terminal execution exists; the row says so.
+#[test]
+fn a_cancel_that_cannot_park_behind_an_older_pending_execution_says_so() {
+    let (db, product_id, chore_id) = setup_product_and_chore();
+    let older = create_ready_chore_execution(&db, chore_id.clone());
+    let newer = create_ready_chore_execution(&db, chore_id.clone());
+    exec_sql(
+        &db,
+        &format!(
+            "UPDATE work_executions SET created_at = '1700000001' WHERE id = '{}' AND ?1 IS NOT NULL",
+            older.id
+        ),
+        &chore_id,
+    );
+    exec_sql(
+        &db,
+        &format!(
+            "UPDATE work_executions SET created_at = '1700000002' WHERE id = '{}' AND ?1 IS NOT NULL",
+            newer.id
+        ),
+        &chore_id,
+    );
+    raw_terminalize(&db, &newer.id, "cancelled", false);
+
+    assert_eq!(hold(&db, &chore_id).as_deref(), Some("shadowed_pending_execution"));
+    db.reconcile_product_executions(&product_id).unwrap();
+    assert_eq!(
+        hold(&db, &chore_id).as_deref(),
+        Some("shadowed_pending_execution"),
+        "the reconciler cannot park it, so the reason persists"
+    );
+}
+
+/// A row that is not dispatch-pending never carries a hold reason, and the
+/// check short-circuits before any gate query.
+#[test]
+fn rows_that_are_not_dispatch_pending_carry_no_hold_reason() {
+    let (db, _product_id, chore_id, _execution_id) = rearmed_chore();
+    exec_sql(&db, "UPDATE tasks SET autostart = 0 WHERE id = ?1", &chore_id);
+    assert_eq!(hold(&db, &chore_id), None);
+    exec_sql(
+        &db,
+        "UPDATE tasks SET autostart = 1, status = 'in_review' WHERE id = ?1",
+        &chore_id,
+    );
+    assert_eq!(hold(&db, &chore_id), None);
+
+    let task = task(&db, &chore_id);
+    let conn = db.connect().unwrap();
+    let mut queries = 0u64;
+    assert_eq!(
+        crate::work::exec_status_helpers::dispatch_hold_reason_for(&conn, Some(&task), None, &mut queries).unwrap(),
+        None
+    );
+    assert_eq!(queries, 0, "a non-pending row costs no query");
+}
+
+/// A cancel stamp is not erased by the attention pass on the strength of the
+/// cancelled execution's own run, even when it started in the same second.
+#[test]
+fn attention_reconcile_keeps_a_cancel_park_stamped_in_the_run_start_second() {
+    let (db, _product_id, chore_id) = setup_product_and_chore();
+    let execution = create_ready_chore_execution(&db, chore_id.clone());
+    db.start_execution_run(&execution.id, "worker-1", "cube-repo", "lease", "ws", "/tmp/ws")
+        .unwrap();
+    db.cancel_running_execution_and_demote_task_as(&execution.id, StatusActor::Human, "stop")
+        .unwrap();
+    // Force the run start and the stamp into the same epoch second.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET started_at = '1700000000' WHERE execution_id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET dispatch_failed_at = '1700000000' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+
+    db.reconcile_stale_attention_signals().unwrap();
+
+    let row = task(&db, &chore_id);
+    assert_eq!(
+        row.dispatch_failed_reason.as_deref(),
+        Some(EXECUTION_CANCELLED_DISPATCH_FAILED_REASON)
+    );
+    assert!(!row.autostart);
 }

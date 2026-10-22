@@ -1954,7 +1954,7 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 queued_only: true,
                 record_failure_reason: false,
                 keep_work_item_schedulable: false,
-                actor: CancelActor::Engine,
+                actor: StatusActor::Engine,
             },
         )
         .unwrap();
@@ -1974,7 +1974,7 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 queued_only: true,
                 record_failure_reason: true,
                 keep_work_item_schedulable: false,
-                actor: CancelActor::Engine,
+                actor: StatusActor::Engine,
             },
         )
         .unwrap();
@@ -2001,7 +2001,7 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 queued_only: true,
                 record_failure_reason: false,
                 keep_work_item_schedulable: false,
-                actor: CancelActor::Engine,
+                actor: StatusActor::Engine,
             },
         )
         .unwrap_err()
