@@ -514,6 +514,11 @@ pub enum FrontendEvent {
     /// blindly replace their local map.
     WorkerLiveStatesList {
         states: Vec<LiveWorkerState>,
+        /// Board payload keyed by owning work-item id. Replaces the entire
+        /// prior map; absent keys mean Queued, independent of dispatch status.
+        /// Computed by the engine, including comparison-to-card attribution.
+        #[serde(default)]
+        doing_sections: std::collections::BTreeMap<String, crate::DoingSection>,
     },
     /// On-demand tmux evidence for the current live-worker snapshot. Kept
     /// separate from [`Self::WorkerLiveStatesList`] so hook broadcasts do not

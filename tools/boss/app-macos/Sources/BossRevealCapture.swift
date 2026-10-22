@@ -87,13 +87,13 @@ enum BossRevealCapture {
                 exit(1)
             }
         }
-        let rowCount = CommandLine.arguments.first { $0.hasPrefix("--capture-reveal-rows=") }
+        let rowCount = state == "doing-sections" ? 3 : CommandLine.arguments.first { $0.hasPrefix("--capture-reveal-rows=") }
             .flatMap { Int(String($0.dropFirst("--capture-reveal-rows=".count))) } ?? 30
         let variableHeights = CommandLine.arguments.contains("--capture-reveal-variable-heights")
-        let targetIndex = footerMode == nil
+        let targetIndex = state == "doing-sections" ? 2 : (footerMode == nil
             ? (CommandLine.arguments.first { $0.hasPrefix("--capture-reveal-target=") }
                 .flatMap { Int(String($0.dropFirst("--capture-reveal-target=".count))) } ?? rowCount - 1)
-            : 0
+            : 0)
         let targetID = "reveal-row-\(targetIndex)"
         var rows = (0..<max(rowCount, targetIndex + 1)).map { index in
             WorkTask(
@@ -135,6 +135,16 @@ enum BossRevealCapture {
                 )
             )]
         }
+        if state == "doing-sections" {
+            for index in rows.indices {
+                rows[index].status = "active"
+                rows[index].name = ["Implement the change", "Review the pull request", "Waiting for dispatch"][index]
+                rows[index].prURL = nil
+            }
+            model.applyEventForTest(.workerLiveStatesList(
+                states: [], doingSections: [rows[0].id: .coding, rows[1].id: .reviewing]
+            ))
+        }
         model.applyEventForTest(.workTree(
             product: product, projects: [], tasks: [], chores: rows,
             taskRuntimes: runtimes, dependencies: [], ideas: []
@@ -150,7 +160,7 @@ enum BossRevealCapture {
         for column in WorkBoardColumnKey.allCases {
             for section in model.workSections(in: column) where section.isCollapsible {
                 BossDefaults.store.set(
-                    collapsed ? section.defaultExpanded : false,
+                    state == "doing-sections" ? false : (collapsed ? section.defaultExpanded : false),
                     forKey: WorkBoardSectionCollapse.storageKey(sectionID: section.id)
                 )
             }

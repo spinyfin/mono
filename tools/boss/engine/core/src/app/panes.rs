@@ -227,8 +227,7 @@ pub(super) async fn handle_list_worker_live_states(ctx: Dispatch, req: FrontendR
         unreachable!()
     };
     {
-        let states = server_state.live_worker_states_snapshot();
-        send_response(&sink, &request_id, FrontendEvent::WorkerLiveStatesList { states });
+        send_response(&sink, &request_id, server_state.live_worker_board_snapshot());
     }
 }
 

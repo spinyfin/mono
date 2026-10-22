@@ -47,20 +47,12 @@ extension ChatViewModel {
         )
     }
 
-    /// Build the Doing column's "Needs Attention" section — blocked tasks
-    /// whose worker ended by asking the user a question
-    /// (`WorkTask.isAwaitingOperatorAnswer`), rendered collapsible above any
-    /// project groups. Returns `nil` when `items` is empty so the caller
-    /// omits the section entirely rather than render an empty header.
-    ///
-    /// Oldest question first (`operatorQuestion.askedAt` ascending), so the
-    /// task that has waited longest is at the top; ties — and a missing or
-    /// unparseable timestamp, which sorts last — break on task id for a
-    /// stable order. `AutomationTime.parse` accepts both the engine's epoch
-    /// seconds and RFC 3339.
-    static func needsAttentionSection(items: [WorkTask]) -> WorkBoardSection? {
+    /// Queued cards retain the existing oldest-question-first ordering for
+    /// items awaiting an operator answer, followed by other queued cards in
+    /// board order. The same collapsible section shape renders all three lanes.
+    static func queuedSection(items: [WorkTask]) -> WorkBoardSection? {
         guard !items.isEmpty else { return nil }
-        let sorted = items.sorted { lhs, rhs in
+        let sorted = items.filter(\.isAwaitingOperatorAnswer).sorted { lhs, rhs in
             let lhsAsked = lhs.operatorQuestion.flatMap { AutomationTime.parse($0.askedAt) }
             let rhsAsked = rhs.operatorQuestion.flatMap { AutomationTime.parse($0.askedAt) }
             switch (lhsAsked, rhsAsked) {
@@ -71,12 +63,11 @@ extension ChatViewModel {
             }
         }
         return WorkBoardSection(
-            id: "doing-needs-attention",
-            title: "Needs Attention",
-            items: sorted,
+            id: "doing-queued",
+            title: "Queued",
+            items: sorted + items.filter { !$0.isAwaitingOperatorAnswer },
             isCollapsible: true,
             defaultExpanded: true,
-            groupKey: .needsAttention,
             countLabel: "\(sorted.count) \(sorted.count == 1 ? "decision" : "decisions") waiting"
         )
     }
@@ -358,32 +349,18 @@ extension ChatViewModel {
         if column == .review {
             return Self.reviewSections(items: items, missingSectionIsExpected: missingReviewSectionIsExpected(for:))
         }
-        // Doing's "Needs Attention" section sits above everything else —
-        // flat or project-grouped alike: a task waiting on an answer needs attention
-        // regardless of which project it belongs to, so the project
-        // groups are built from the remaining items only.
-        var needsAttention: [WorkBoardSection] = []
-        var remaining = items
         if column == .doing {
-            let awaiting = items.filter(\.isAwaitingOperatorAnswer)
-            remaining = items.filter { !$0.isAwaitingOperatorAnswer }
-            if let section = Self.needsAttentionSection(items: awaiting) {
-                needsAttention.append(section)
-            }
+            return Self.doingSections(items: items, membership: doingSectionsByID)
         }
         guard workBoardGrouping == .project else {
-            // With a Needs Attention section present, an empty flat section
-            // would only be a headerless no-op under it.
-            if remaining.isEmpty, !needsAttention.isEmpty { return needsAttention }
-            return needsAttention
-                + [WorkBoardSection(id: column.rawValue, title: column.title, items: remaining)]
+            return [WorkBoardSection(id: column.rawValue, title: column.title, items: items)]
         }
 
-        let grouped = Dictionary(grouping: remaining) { task in
+        let grouped = Dictionary(grouping: items) { task in
             projectName(for: task.projectID) ?? "No Project"
         }
 
-        return needsAttention + grouped.keys.sorted().compactMap { key in
+        return grouped.keys.sorted().compactMap { key in
             guard let sectionItems = grouped[key], !sectionItems.isEmpty else { return nil }
             let projectID = sectionItems.first?.projectID
             return WorkBoardSection(

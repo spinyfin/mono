@@ -133,18 +133,18 @@ final class RevisionKanbanTests: XCTestCase {
     // MARK: project grouping
 
     /// Chore-parented revisions (nil projectID) must appear under the "No
-    /// Project" section in project-grouped mode, alongside other
+    /// Project" section in project-grouped Backlog, alongside other
     /// un-projected work — kind is not a grouping axis.
     func testChoreParentedRevisionGroupsUnderNoProject() {
         let model = makeModel()
         model.workBoardGrouping = .project
-        let chore = makeChore(id: "chore_c19", status: "active")
+        let chore = makeChore(id: "chore_c19", status: "todo")
         let revision = makeChoreParentedRevision(
-            id: "task_t29", status: "todo", seq: 1, parentID: chore.id, autostart: true
+            id: "task_t29", status: "todo", seq: 1, parentID: chore.id, autostart: false
         )
         model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
 
-        let sections = model.workSections(in: .doing)
+        let sections = model.workSections(in: .backlog)
         let titles = sections.map(\.title)
         XCTAssertTrue(titles.contains("No Project"),
                       "chore-parented revision must appear in the 'No Project' section")
@@ -153,6 +153,27 @@ final class RevisionKanbanTests: XCTestCase {
             noProjectSection?.items.contains { $0.id == revision.id } ?? false,
             "revision must be in the No Project section"
         )
+    }
+
+    func testChoreParentedRevisionInDoingFollowsEngineMembershipInProjectMode() {
+        let model = makeModel()
+        model.workBoardGrouping = .project
+        let chore = makeChore(id: "chore_c19", status: "active")
+        let revision = makeChoreParentedRevision(
+            id: "task_t29", status: "todo", seq: 1, parentID: chore.id, autostart: true
+        )
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
+
+        let queued = model.workSections(in: .doing)
+        XCTAssertEqual(queued.map(\.title), ["Queued"])
+        XCTAssertEqual(Set(queued.flatMap(\.items).map(\.id)), [chore.id, revision.id])
+        XCTAssertEqual(queued.flatMap(\.items).count, 2)
+
+        model.applyEventForTest(.workerLiveStatesList(states: [], doingSections: [revision.id: .coding]))
+        let started = model.workSections(in: .doing)
+        XCTAssertEqual(started.map(\.title), ["Coding", "Queued"])
+        XCTAssertEqual(started[0].items.map(\.id), [revision.id])
+        XCTAssertEqual(started[1].items.map(\.id), [chore.id])
     }
 
     /// Project-task-parented revisions (with a projectID) must appear under
