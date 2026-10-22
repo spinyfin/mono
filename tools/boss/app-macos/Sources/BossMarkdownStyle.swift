@@ -382,7 +382,7 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
                 // paragraph inside a list row gets the same points as prose,
                 // whatever font the surrounding row sets.
                 .textual.lineSpacing(.fontScaled(MarkdownEditorialMetrics.bodyLeading(editorial: true)))
-                // Keep fontScale next (applied first) (applied first) so it reads the
+                // Keep fontScale next (applied first) so it reads the
                 // sans font set by the `.font` call below it in the chain
                 // and scales *that*, mirroring BossHeadingStyle.headingLabel.
                 // Reversing this order lets the later `.font` win instead,
