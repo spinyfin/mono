@@ -906,6 +906,7 @@ impl AgentDriver for ClaudeDriver {
             "invalid worker run id"
         );
         let prompt_home = super::codex::codex_home_for_run(&format!("claude-{run_id}"))?;
+        super::initial_prompt::warm_preflight().await?;
         super::initial_prompt::provision(&config_dir, &prompt_home, prompt_text, self)?;
 
         let gitignore_path = config_dir.join(".gitignore");

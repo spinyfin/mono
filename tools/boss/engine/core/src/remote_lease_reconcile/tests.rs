@@ -457,14 +457,17 @@ async fn terminal_remote_persona_backstop_preserves_history_and_live_leases() {
     let dead_name = db.persona_display_name(&dead).unwrap();
     let live_name = db.persona_display_name(&live).unwrap();
     db.cancel_running_execution(&dead).unwrap();
+    db.mark_remote_input_cleanup_pending("anaplian", "input_attempt_1", "/remote/mono-agent-004", &dead)
+        .unwrap();
     let (adapter, provider) = provider("anaplian", Probe::Dead);
     reconcile_remote_leases(&db, &provider, &RecordingDispatchEventSink::new(), None).await;
     assert!(db.terminal_remote_cleanup_runs().unwrap().is_empty());
     assert_eq!(adapter.force_released.lock().unwrap()[0].0, "dead");
     assert_eq!(
         *adapter.cleaned_inputs.lock().unwrap(),
-        vec![("/remote/mono-agent-004".to_owned(), dead.clone())]
+        vec![("/remote/mono-agent-004".to_owned(), "input_attempt_1".to_owned())]
     );
+    assert!(db.pending_remote_input_cleanups().unwrap().is_empty());
     assert!(db.get_execution(&dead).unwrap().cube_lease_id.is_none());
     let next = start_remote_run(&db, &create_chore(&db), "anaplian", "next", Some(3));
     assert_eq!(db.persona_display_name(&next).unwrap(), dead_name);

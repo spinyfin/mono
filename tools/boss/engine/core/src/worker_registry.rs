@@ -19,7 +19,11 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-const ANCESTOR_WALK_DEPTH: usize = 8;
+/// The pane shell is registered, but the worker's tools run below the PTY
+/// relay, its supervisor, the driver CLI (possibly a node wrapper plus a
+/// native binary) and the tool's own shells, so the walk must outlast that
+/// whole launcher chain with room for a few ordinary wrappers.
+const ANCESTOR_WALK_DEPTH: usize = 16;
 
 /// First slot id reserved for remote workers' virtual slots.
 ///
@@ -535,5 +539,38 @@ mod tests {
         let reg = WorkerRegistry::new();
         let self_pid = std::process::id() as libc::pid_t;
         assert_eq!(reg.lookup_with_ancestor_walk(self_pid), None);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn ancestor_walk_reaches_registered_shell_through_deep_launcher_chain() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("nest.sh");
+        let marker = dir.path().join("deepest.pid");
+        std::fs::write(
+            &script,
+            "if [ \"$1\" -gt 0 ]; then sh \"$0\" $(($1 - 1)) \"$2\"; true; else echo $$ > \"$2\"; sleep 5; fi\n",
+        )
+        .unwrap();
+        // The registered shell sits 11 processes above the deepest caller.
+        let mut outer = Command::new("sh").arg(&script).arg("11").arg(&marker).spawn().unwrap();
+        let mut deepest = None;
+        for _ in 0..200 {
+            if let Ok(raw) = std::fs::read_to_string(&marker)
+                && let Ok(pid) = raw.trim().parse::<libc::pid_t>()
+            {
+                deepest = Some(pid);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let deepest = deepest.expect("deepest process published its pid");
+        let reg = WorkerRegistry::new();
+        reg.register(outer.id() as libc::pid_t, "chain-run");
+        let found = reg.lookup_with_ancestor_walk(deepest);
+        let _ = outer.kill();
+        let _ = outer.wait();
+        assert_eq!(found.as_deref(), Some("chain-run"));
     }
 }

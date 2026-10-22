@@ -1,7 +1,8 @@
 pub use boss_transcript_markdown as transcript_markdown;
 pub use coordinator_tmux::inbox::{
-    COORDINATOR_INBOUND_SETTINGS, DELIVERY_TIMEOUT as COORDINATOR_DELIVERY_TIMEOUT, coordinator_launch_command,
+    COORDINATOR_INBOUND_SETTINGS, DELIVERY_TIMEOUT as COORDINATOR_DELIVERY_TIMEOUT,
     deliver as deliver_coordinator_handoff_to_inbox, deliver_with_turn as deliver_coordinator_handoff_with_turn,
+    relay_launch_command, resolve_claude_pid,
 };
 
 pub mod abandoned_branch_pr_sweep;

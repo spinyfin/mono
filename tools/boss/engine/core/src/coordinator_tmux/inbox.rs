@@ -57,10 +57,11 @@ pub const DELIVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// set explicitly rather than inherited from user or default configuration.
 pub const COORDINATOR_INBOUND_SETTINGS: &str = r#"{"crossSessionInbound":"accept"}"#;
 
-/// Shared production command; `initial_prompt` is an already quoted shell expression.
-pub fn coordinator_launch_command(executable: &str, model: &str, initial_prompt: &str) -> String {
+/// Shared production command. The brief is never part of it: the terminal
+/// relay delivers it from a private file (see [`relay_launch_command`]).
+fn coordinator_launch_command(executable: &str, model: &str) -> String {
     format!(
-        "exec {} --model {} --permission-mode auto --settings {} {initial_prompt}",
+        "exec {} --model {} --permission-mode auto --settings {}",
         boss_ssh_transport::shell_quote(executable),
         boss_ssh_transport::shell_quote(model),
         boss_ssh_transport::shell_quote(COORDINATOR_INBOUND_SETTINGS)
@@ -69,8 +70,8 @@ pub fn coordinator_launch_command(executable: &str, model: &str, initial_prompt:
 
 /// The exact pane command `start_new` runs: the coordinator behind the terminal
 /// relay that delivers the private brief from `input_dir`.
-pub(crate) fn relay_launch_command(input_dir: &Path, executable: &str, model: &str) -> String {
-    let driver_command = coordinator_launch_command(executable, model, "");
+pub fn relay_launch_command(input_dir: &Path, executable: &str, model: &str) -> String {
+    let driver_command = coordinator_launch_command(executable, model);
     format!(
         "exec {}",
         crate::driver::initial_prompt::launcher_command(
@@ -106,7 +107,7 @@ fn descends_from(
 /// The coordinator pane runs the terminal relay, which supervises Claude two
 /// forks below it, so the pane pid is not Claude's pid. Claude registers under
 /// its own pid: pick the registered session whose process runs below the pane.
-async fn resolve_claude_pid(sessions: &Path, pane_pid: libc::pid_t) -> Result<libc::pid_t> {
+pub async fn resolve_claude_pid(sessions: &Path, pane_pid: libc::pid_t) -> Result<libc::pid_t> {
     let mut entries = tokio::fs::read_dir(sessions)
         .await
         .context("reading the Claude session registrations")?;

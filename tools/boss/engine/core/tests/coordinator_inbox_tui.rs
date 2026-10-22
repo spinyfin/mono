@@ -62,6 +62,15 @@ pub(super) async fn terminal_handoff(real_model: bool) -> Result<()> {
     } else {
         format!("http://{}", model_fixture().await?)
     };
+    // Production delivers the brief through the terminal relay from a private
+    // input directory, so the fixture does the same.
+    let input = cwd.join("coordinator-input");
+    boss_engine::driver::initial_prompt::provision(
+        &input,
+        &input,
+        "Reply with exactly: fixture ready",
+        &boss_engine::driver::ClaudeDriver,
+    )?;
     let program = declared_tmux_binary()?;
     let socket = cwd.join("tmux.sock");
     let _guard = TmuxServerGuard::new(program.clone(), socket.clone());
@@ -97,10 +106,10 @@ pub(super) async fn terminal_handoff(real_model: bool) -> Result<()> {
         .arg(format!("ANTHROPIC_API_KEY={key}"))
         .arg("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1")
         .args(["/bin/sh", "-c"])
-        .arg(boss_engine::coordinator_launch_command(
+        .arg(boss_engine::relay_launch_command(
+            &input,
             declared_claude()?.to_str().unwrap(),
             "claude-sonnet-4-5",
-            "'Reply with exactly: fixture ready'",
         ))
         .output()
         .await?;
@@ -118,7 +127,15 @@ pub(super) async fn terminal_handoff(real_model: bool) -> Result<()> {
         )
         .await?;
         let pane = tmux(&program, &socket, &["capture-pane", "-p", "-t", "fixture"]).await?;
-        if let Ok(bytes) = std::fs::read(config.join("sessions").join(format!("{}.json", pid.trim()))) {
+        let claude_pid = match pid.trim().parse::<libc::pid_t>() {
+            Ok(pane_pid) => boss_engine::resolve_claude_pid(&config.join("sessions"), pane_pid)
+                .await
+                .ok(),
+            Err(_) => None,
+        };
+        if let Some(claude_pid) = claude_pid
+            && let Ok(bytes) = std::fs::read(config.join("sessions").join(format!("{claude_pid}.json")))
+        {
             let value: Value = serde_json::from_slice(&bytes)?;
             if value["status"] == "idle" && pane.contains("fixture ready") {
                 break value;
