@@ -1809,7 +1809,12 @@ async fn cancel_and_release_mid_spawn_cancels_row_but_holds_lease() {
     let TestHarness { handler, cube, .. } = TestHarness::with_pane(db.clone(), StubPrDetector::ok(None), pane.clone());
 
     handler
-        .cancel_and_release(&chore_id, &execution_id, "test: mid-spawn cancel")
+        .cancel_and_release(
+            &chore_id,
+            &execution_id,
+            boss_protocol::StatusActor::Human,
+            "test: mid-spawn cancel",
+        )
         .await;
 
     let execution = db.get_execution(&execution_id).unwrap();
@@ -1840,7 +1845,12 @@ async fn cancel_and_release_with_live_worker_releases_lease() {
     let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
 
     handler
-        .cancel_and_release(&chore_id, &execution_id, "test: live worker cancel")
+        .cancel_and_release(
+            &chore_id,
+            &execution_id,
+            boss_protocol::StatusActor::Human,
+            "test: live worker cancel",
+        )
         .await;
 
     let execution = db.get_execution(&execution_id).unwrap();
@@ -1880,7 +1890,12 @@ async fn delete_while_doing_teardown_releases_pane_frees_lease_and_cancels_execu
     // This is the call that handle_delete_work_item spawns when it detects
     // a live execution for a work item being deleted.
     handler
-        .cancel_and_release(&chore_id, &execution_id, "work item deleted while a worker was active")
+        .cancel_and_release(
+            &chore_id,
+            &execution_id,
+            boss_protocol::StatusActor::Human,
+            "work item deleted while a worker was active",
+        )
         .await;
 
     // 1. Pane releaser was invoked — the production implementation
@@ -1945,7 +1960,12 @@ async fn delete_while_dispatching_cancels_row_but_holds_lease_for_inflight_spawn
     // detects a live (here: mid-dispatch) execution for a work item
     // being deleted.
     handler
-        .cancel_and_release(&chore_id, &execution_id, "work item deleted while a worker was active")
+        .cancel_and_release(
+            &chore_id,
+            &execution_id,
+            boss_protocol::StatusActor::Human,
+            "work item deleted while a worker was active",
+        )
         .await;
 
     // The row is terminal immediately — the orphan sweep and

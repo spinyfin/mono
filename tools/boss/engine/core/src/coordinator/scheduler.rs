@@ -2037,7 +2037,7 @@ impl ExecutionCoordinator {
                         &victim.execution_id,
                         &victim_execution.work_item_id,
                         victim_execution.status.clone(),
-                        crate::work::CancelActor::Engine,
+                        boss_protocol::StatusActor::Engine,
                         "preempted; requeued as a fresh execution",
                         false,
                     ))

@@ -146,8 +146,7 @@ enum BossRevealCapture {
             ))
         }
         // A `todo` + `autostart` row whose only execution is `cancelled` and
-        // for which the engine has nothing queued — the shape that used to
-        // render in Doing as "Queued — reason unknown".
+        // for which the engine has nothing queued.
         if state == "stranded" {
             rows = Array(rows.suffix(1))
             rows[0].status = "todo"
@@ -169,7 +168,7 @@ enum BossRevealCapture {
             rows[0].name = "Rebase stale PR branches onto main before building on them"
             rows[0].shortID = 42
             rows[0].dispatchFailedReason = "execution_cancelled"
-            rows[0].dispatchFailedError = "Execution `exec_capture_cancelled` was cancelled by an operator "
+            rows[0].dispatchFailedError = "Execution `exec_capture_cancelled` was cancelled by a human "
                 + "(explicit cancel). This work item was moved to Backlog and will not restart on its own. "
                 + "Run `bossctl work start task_42` (or drag the card to Doing) to resume it."
             rows[0].dispatchFailedAt = now

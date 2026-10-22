@@ -156,26 +156,25 @@ pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 pub const DELIBERATE_PARK_DISPATCH_FAILED_REASON: &str = "deliberate_park";
 
 /// `tasks.dispatch_failed_reason` value stamped when the execution that
-/// governed a work item was **cancelled** — by an operator (`bossctl
-/// executions cancel`, `bossctl agents stop`, a kanban drag back to Backlog,
-/// the app's cancel action) or by an engine lifecycle transition that
+/// governed a work item was **cancelled** — by a person (`bossctl executions
+/// cancel`, `bossctl agents stop`, a kanban drag back to Backlog, the app's
+/// cancel action), the coordinator, or an engine lifecycle transition that
 /// deliberately stopped it. A cancel means "stop until asked", so the row is
 /// moved to Backlog with `autostart = 0` in the same transaction and will not
 /// restart on its own; `dispatch_failed_error` records who cancelled it
-/// ([`CancelActor`]) and why, and
-/// `dispatch_failed_at` when. The same cancel also lands on the execution's
-/// dispatch timeline as an `execution_cancelled` event with the same
-/// provenance. Like
-/// [`DELIBERATE_PARK_DISPATCH_FAILED_REASON`] this is not a dispatch
-/// failure: [`crate::dispatch_failure_recovery_sweep`] must never retry it.
-/// Only an explicit `bossctl work start` (or kanban drag-to-Doing) resumes
-/// the row, which also clears the stamp when the fresh run starts.
+/// ([`StatusActor`]) and why, and `dispatch_failed_at` when. The same cancel
+/// is recorded in `engine-audit.log` and, at the app-level cancel sites, on
+/// the execution's dispatch timeline as an `execution_cancelled` event with
+/// the same provenance. Like [`DELIBERATE_PARK_DISPATCH_FAILED_REASON`] this
+/// is not a dispatch failure: [`crate::dispatch_failure_recovery_sweep`] must
+/// never retry it. Only an explicit `bossctl work start` (or kanban
+/// drag-to-Doing) resumes the row, which also clears the stamp when the fresh
+/// run starts.
 ///
-/// Before this reason existed a cancelled never-started execution left its
-/// row `todo` with `autostart = 1` and nothing queued — the kanban rendered
-/// it in Doing as "Queued — reason unknown" indefinitely, because the
-/// reconciler never mints a replacement behind a terminal same-kind
-/// execution (see `reconcile_work_item_execution`).
+/// The reconciler never mints a replacement behind a terminal same-kind
+/// execution (see `reconcile_work_item_execution`), so without this park a
+/// cancelled never-started execution would leave its row `todo` with
+/// `autostart = 1` and nothing queued.
 pub const EXECUTION_CANCELLED_DISPATCH_FAILED_REASON: &str = "execution_cancelled";
 
 /// One-line CLI headline for a `tasks.dispatch_failed_reason` value.
@@ -776,6 +775,7 @@ pub(crate) use dispatch_helpers::*;
 pub(crate) use driver_allocation::*;
 pub(crate) use exec_status_helpers::*;
 pub(crate) use exec_tail::content_checksum;
+use executions_runs::record_cancel_provenance;
 use ideas::list_ideas_in_tx;
 pub(crate) use insert_helpers::*;
 // Private on purpose: only the list-read submodules under `work` build
@@ -831,7 +831,7 @@ pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
     ExecutionRetentionPolicy,
 };
-pub use executions_runs::{CancelActor, CancelExecutionOpts, CancelledExecution, execution_cancelled_event};
+pub use executions_runs::{CancelExecutionOpts, CancelledExecution, describe_cancel_actor, execution_cancelled_event};
 pub use github_api_usage_db::{GithubApiCallRow, GithubApiUsageBucket};
 pub use github_merge_intents::{GithubMergeIntent, GithubMergeIntentInsertInput, GithubMergeIntentRecordOutcome};
 pub use mappers::CiInFlightObservation;

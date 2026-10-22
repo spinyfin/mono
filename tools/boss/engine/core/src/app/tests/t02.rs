@@ -1878,6 +1878,34 @@ fn resolve_status_actor_returns_boss_when_peer_is_boss_descendant() {
 }
 
 #[test]
+fn resolve_cancel_actor_records_a_coordinator_descendant_as_boss() {
+    let (server_state, _dir) = test_server_state();
+    let our_pid = std::process::id() as libc::pid_t;
+    server_state.set_boss_pid(our_pid);
+    assert_eq!(
+        resolve_cancel_actor(&server_state, Some(our_pid)),
+        boss_protocol::StatusActor::Boss,
+    );
+}
+
+#[test]
+fn resolve_cancel_actor_records_everyone_else_as_human() {
+    let (server_state, _dir) = test_server_state();
+    let our_pid = std::process::id() as libc::pid_t;
+    assert_eq!(
+        resolve_cancel_actor(&server_state, Some(our_pid)),
+        boss_protocol::StatusActor::Human,
+        "no coordinator registered",
+    );
+    server_state.set_boss_pid(our_pid);
+    assert_eq!(
+        resolve_cancel_actor(&server_state, None),
+        boss_protocol::StatusActor::Human,
+        "unknown peer",
+    );
+}
+
+#[test]
 fn resolve_status_actor_returns_human_when_no_boss_pid_registered() {
     let (server_state, _dir) = test_server_state();
     let our_pid = std::process::id() as libc::pid_t;

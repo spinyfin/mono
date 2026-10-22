@@ -1988,7 +1988,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            WorkCardLiveStatus.pendingWithoutReasonLabel
+            WorkCardLiveStatus.queuedWithoutReasonLabel
         )
     }
 
@@ -2026,7 +2026,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            WorkCardLiveStatus.pendingWithoutReasonLabel
+            WorkCardLiveStatus.queuedWithoutReasonLabel
         )
     }
 

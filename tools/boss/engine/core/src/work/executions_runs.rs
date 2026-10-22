@@ -6,9 +6,9 @@ use super::*;
 ///
 /// Defaults match the historical `cancel_execution` contract: any
 /// non-terminal row may be cancelled, with reason `"explicit cancel"`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CancelExecutionOpts {
-    /// Operator- or engine-supplied reason written into the
+    /// Caller-supplied reason written into the
     /// terminalization log line (and, at the RPC layer, the engine
     /// audit trail). Empty/whitespace is treated as unset.
     pub reason: Option<String>,
@@ -41,79 +41,67 @@ pub struct CancelExecutionOpts {
     /// `reconcile_work_item_execution` otherwise has to converge later.
     pub keep_work_item_schedulable: bool,
     /// Who decided the cancel. Written into the park text ("was cancelled
-    /// by an operator (…)") and the terminalization log line; the
-    /// app-level caller also puts it on the execution's dispatch timeline.
-    /// Defaults to [`CancelActor::Engine`]: every entry point that does not
-    /// name an actor is reached from engine code, and the RPC handler for
-    /// an operator cancel sets [`CancelActor::Human`] explicitly.
-    pub actor: CancelActor,
+    /// by a human (…)") and the terminalization log line; the app-level
+    /// caller also puts it on the execution's dispatch timeline. Defaults to
+    /// [`StatusActor::Engine`]: every entry point that does not name an
+    /// actor is reached from engine code, and an RPC handler names the
+    /// caller it resolved from the peer pid.
+    pub actor: StatusActor,
 }
 
-/// Who cancelled an execution, and the durable record of it.
-///
-/// Every path that terminalizes an execution as `cancelled` names the party
-/// that decided it alongside the reason it already supplied. Two surfaces
-/// carry that provenance. The halt stamp on the work item: when the
-/// cancelled execution was the row's governing one, `park_work_item_after_cancel`
-/// writes a body naming the actor and the reason into
-/// `tasks.dispatch_failed_error`, which the kanban card's "Stopped — execution
-/// cancelled" banner, `boss task show` and `bossctl agents status` print
-/// verbatim. The per-execution dispatch timeline: every app-level cancel site
-/// emits [`execution_cancelled_event`] through the engine's structured
-/// [`crate::dispatch_events::DispatchEventSink`], so `bossctl dispatch
-/// diagnose` shows the cancel — actor, reason, the status that was
-/// terminalized, and whether the row was parked — instead of a timeline that
-/// stops at `pane_spawned` while the durable row says `cancelled`. Before
-/// this, only the merge poller's parent-PR-merged cancel reached the
-/// timeline; an operator looking at a stranded row could see *that* its
-/// execution was cancelled but not by whom or why.
-///
-/// The party that decided to cancel an execution. Mirrors the
-/// `tasks.last_status_actor` vocabulary (`human` / `engine`) so the two
-/// provenance fields read the same way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CancelActor {
-    /// An operator: the app's stop/cancel action, `bossctl executions
-    /// cancel`, `bossctl agents stop`, a kanban drag back to Backlog, a
-    /// work-item delete.
-    Human,
-    /// An engine lifecycle transition that deliberately ended the run: a
-    /// parent PR merging, a requested host becoming ineligible, scheduler
-    /// preemption, forced-dispatch residue cleanup, a teardown cascade.
-    /// The default, because every `WorkDb` cancel entry point that takes no
-    /// explicit actor is reached from engine code.
-    #[default]
-    Engine,
-    /// The cancel happened before provenance was recorded (a row stranded
-    /// by an older engine that the reconciler converges later). Rendered
-    /// honestly as "not recorded" rather than guessed.
-    Unrecorded,
-}
-
-impl CancelActor {
-    /// Machine-readable form used in dispatch-event details and log fields.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CancelActor::Human => "human",
-            CancelActor::Engine => "engine",
-            CancelActor::Unrecorded => "unrecorded",
-        }
-    }
-
-    /// Prose form for the park text ("was cancelled by …").
-    pub fn describe(self) -> &'static str {
-        match self {
-            CancelActor::Human => "an operator",
-            CancelActor::Engine => "the engine",
-            CancelActor::Unrecorded => "a party the engine did not record",
+impl Default for CancelExecutionOpts {
+    fn default() -> Self {
+        Self {
+            reason: None,
+            queued_only: false,
+            record_failure_reason: false,
+            keep_work_item_schedulable: false,
+            actor: StatusActor::Engine,
         }
     }
 }
 
-impl std::fmt::Display for CancelActor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+/// Prose form of a cancel's actor for the park text ("was cancelled by …").
+/// `None` is a cancel that predates provenance, rendered as "not recorded"
+/// rather than guessed. Uses the `tasks.last_status_actor` vocabulary
+/// ([`StatusActor`]) so dispatch events and the status column read the same.
+pub fn describe_cancel_actor(actor: Option<StatusActor>) -> &'static str {
+    match actor {
+        Some(StatusActor::Human) => "a human",
+        Some(StatusActor::Boss) => "the coordinator",
+        Some(StatusActor::Engine) => "the engine",
+        Some(StatusActor::Boothby) => "Boothby",
+        None => "a party the engine did not record",
     }
+}
+
+/// Durable record of one cancel, written to `engine-audit.log` by every path
+/// that terminalizes an execution as `cancelled`: [`WorkDb::cancel_execution_with`]
+/// and its in-transaction variants, the running-execution cancels behind
+/// `agents stop` / `cancel_and_release`, a dependency block, and the
+/// review-revision tombstone. One funnel keeps the vocabulary identical
+/// across them: who (`actor`, the `tasks.last_status_actor` vocabulary), why
+/// (`reason`), the status that was terminalized (`from_status`), and whether
+/// the cancel also moved the owning row (`work_item_moved`).
+pub(crate) fn record_cancel_provenance(
+    execution_id: &str,
+    work_item_id: &str,
+    from_status: ExecutionStatus,
+    actor: StatusActor,
+    reason: &str,
+    work_item_moved: bool,
+) {
+    crate::audit::record_event(
+        "execution_cancelled",
+        &serde_json::json!({
+            "execution_id": execution_id,
+            "work_item_id": work_item_id,
+            "from_status": from_status.as_str(),
+            "actor": actor.as_str(),
+            "reason": reason,
+            "work_item_moved": work_item_moved,
+        }),
+    );
 }
 
 /// The `execution_cancelled` dispatch-timeline event for one cancel.
@@ -126,7 +114,7 @@ pub fn execution_cancelled_event(
     execution_id: &str,
     work_item_id: &str,
     prior_status: ExecutionStatus,
-    actor: CancelActor,
+    actor: StatusActor,
     reason: &str,
     work_item_moved: bool,
 ) -> DispatchEvent {
@@ -2458,7 +2446,14 @@ pub(super) fn cancel_execution_in_tx_with_outcome(
     let work_item_parked = if opts.keep_work_item_schedulable {
         false
     } else {
-        park_work_item_after_cancel(tx, &existing.work_item_id, execution_id, opts.actor, &reason, &now)?
+        park_work_item_after_cancel(
+            tx,
+            &existing.work_item_id,
+            execution_id,
+            Some(opts.actor),
+            &reason,
+            &now,
+        )?
     };
     let updated = query_execution(tx, execution_id)?
         .with_context(|| format!("unknown execution after cancel: {execution_id}"))?;
@@ -2476,11 +2471,19 @@ pub(super) fn cancel_execution_in_tx_with_outcome(
         work_item_id = %updated.work_item_id,
         from_status = %existing.status,
         to_status = %updated.status,
-        actor = %opts.actor,
+        actor = opts.actor.as_str(),
         reason = %reason,
         queued_only = opts.queued_only,
         work_item_parked,
         "execution terminalized: cancel",
+    );
+    record_cancel_provenance(
+        execution_id,
+        &updated.work_item_id,
+        existing.status.clone(),
+        opts.actor,
+        &reason,
+        work_item_parked,
     );
     stage_execution_terminal(pending, tx, execution_id, &updated.work_item_id)?;
     Ok((updated, work_item_parked))
@@ -2658,13 +2661,12 @@ mod cancel_provenance_tests {
     use super::*;
 
     #[test]
-    fn actor_vocabulary_matches_last_status_actor() {
-        assert_eq!(CancelActor::Human.as_str(), "human");
-        assert_eq!(CancelActor::Engine.as_str(), "engine");
-        assert_eq!(CancelActor::Unrecorded.as_str(), "unrecorded");
-        assert_eq!(CancelActor::default(), CancelActor::Engine);
-        assert_eq!(CancelActor::Human.describe(), "an operator");
-        assert_eq!(CancelActor::Human.to_string(), "human");
+    fn actor_prose_uses_the_status_actor_vocabulary() {
+        assert_eq!(describe_cancel_actor(Some(StatusActor::Human)), "a human");
+        assert_eq!(describe_cancel_actor(Some(StatusActor::Boss)), "the coordinator");
+        assert_eq!(describe_cancel_actor(Some(StatusActor::Engine)), "the engine");
+        assert_eq!(describe_cancel_actor(None), "a party the engine did not record");
+        assert_eq!(CancelExecutionOpts::default().actor, StatusActor::Engine);
     }
 
     #[test]
@@ -2673,8 +2675,8 @@ mod cancel_provenance_tests {
             "exec_1",
             "task_1",
             ExecutionStatus::Ready,
-            CancelActor::Human,
-            "operator cancelled it",
+            StatusActor::Human,
+            "cancel requested",
             true,
         );
         assert_eq!(event.stage, Stage::ExecutionCancelled.as_str());
@@ -2683,7 +2685,7 @@ mod cancel_provenance_tests {
         assert_eq!(event.work_item_id.as_deref(), Some("task_1"));
         let details = event.details;
         assert_eq!(details["actor"], "human");
-        assert_eq!(details["reason"], "operator cancelled it");
+        assert_eq!(details["reason"], "cancel requested");
         assert_eq!(details["prior_status"], "ready");
         assert_eq!(details["work_item_moved"], true);
     }
