@@ -14,6 +14,7 @@ use std::sync::Mutex;
 enum Probe {
     Alive,
     Dead,
+    Unknown,
     /// The probe round-trip itself failed (host down).
     Error,
 }
@@ -63,6 +64,7 @@ crate::stub_host_adapter! { StubAdapter {
         match self.probe {
             Probe::Alive => Ok(Some(true)),
             Probe::Dead => Ok(Some(false)),
+            Probe::Unknown => Ok(None),
             Probe::Error => bail!("ssh probe transport failure"),
         }
     }
@@ -596,7 +598,7 @@ async fn pending_input_restart_requires_confirmed_death_and_preserves_new_attemp
             .unwrap();
     }
     let db = WorkDb::open(path).unwrap();
-    for probe in [Probe::Alive, Probe::Error] {
+    for probe in [Probe::Alive, Probe::Unknown, Probe::Error] {
         let (adapter, provider) = provider("anaplian", probe);
         crate::remote_input_lifecycle::retry_pending(&db, &provider).await;
         assert!(adapter.cleaned_inputs.lock().unwrap().is_empty());

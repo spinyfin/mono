@@ -752,7 +752,10 @@ mod tests {
         assert!(argv.contains(&"BOSS_LEASE_ID=lease-1".to_owned()));
         assert!(argv.contains(&"BOSS_WORKSPACE=/ws/mono-agent-007".to_owned()));
         assert!(argv.contains(&"BOSS_DRIVER=codex".to_owned()));
-        assert!(argv.iter().any(|arg| arg.starts_with("BOSS_DRIVER_COMMAND=codex -m")));
+        assert!(
+            argv.iter()
+                .any(|arg| arg.starts_with("BOSS_DRIVER_COMMAND=python3 .codex/initial-prompt.py codex -m"))
+        );
         assert!(
             argv.iter()
                 .any(|arg| arg.starts_with("BOSS_DRIVER_ENV=export CODEX_HOME"))

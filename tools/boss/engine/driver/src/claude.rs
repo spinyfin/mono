@@ -784,13 +784,9 @@ impl AgentDriver for ClaudeDriver {
     }
 
     fn launcher_starting_markers(&self) -> Vec<String> {
-        [
-            "Choose the text style",
-            "Sign in with",
-            "Sign in to",
-        ]
-        .map(String::from)
-        .to_vec()
+        ["Choose the text style", "Sign in with", "Sign in to"]
+            .map(String::from)
+            .to_vec()
     }
 
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
