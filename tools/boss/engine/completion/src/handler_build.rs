@@ -108,17 +108,16 @@ impl WorkerCompletionHandler {
         prior_status: ExecutionStatus,
         chain_root_id: &str,
     ) {
-        self.dispatch_events
-            .emit(
-                DispatchEvent::new(Stage::ExecutionCancelled, DispatchOutcome::Ok, &execution.id)
-                    .with_work_item(&execution.work_item_id)
-                    .with_details(serde_json::json!({
-                        "reason": "parent_pr_merged",
-                        "prior_status": prior_status.as_str(),
-                        "chain_root_id": chain_root_id,
-                    })),
-            )
-            .await;
+        let mut event = crate::dispatch_events::execution_cancelled_event(
+            &execution.id,
+            &execution.work_item_id,
+            prior_status.as_str(),
+            boss_protocol::StatusActor::Engine.as_str(),
+            "parent_pr_merged",
+            false,
+        );
+        event.details["chain_root_id"] = serde_json::Value::String(chain_root_id.to_owned());
+        self.dispatch_events.emit(event).await;
     }
 
     /// Point structured-output reads at `dir` instead of the process-wide
@@ -610,8 +609,8 @@ impl CompletionRequests for WorkerCompletionHandler {
             .await;
     }
 
-    async fn force_stop_execution(&self, execution_id: &str) {
-        WorkerCompletionHandler::force_stop_execution(self, execution_id).await;
+    async fn force_stop_execution_as(&self, execution_id: &str, actor: boss_protocol::StatusActor, reason: &str) {
+        WorkerCompletionHandler::force_stop_execution_as(self, execution_id, actor, reason).await;
     }
 
     async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {

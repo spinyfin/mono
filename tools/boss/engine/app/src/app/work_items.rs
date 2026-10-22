@@ -1106,11 +1106,13 @@ pub(super) async fn apply_work_item_patch_from(
                 {
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = id.clone();
+                    let cancel_actor = resolve_cancel_actor(&server_state, peer_pid);
                     boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(
                                 &id_for_cancel,
                                 &execution_id,
+                                cancel_actor,
                                 "kanban drag: active → todo (dragged back to Backlog)",
                             )
                             .await;
@@ -1539,7 +1541,7 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                 // checked. Cancel each live execution's row so the
                 // orphan sweep and reconciler won't re-dispatch it, then
                 // release the pane and leased cube workspace. We use
-                // `cancel_and_release` rather than `force_stop_execution`
+                // `cancel_and_release` rather than `force_stop_execution_as`
                 // because there is no task to demote back to `todo` —
                 // the row is already tombstoned. Idempotent: terminal
                 // executions return `None` and never reach this branch.
@@ -1549,11 +1551,13 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                     };
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = tombstoned_id.clone();
+                    let cancel_actor = resolve_cancel_actor(&server_state, peer_pid);
                     boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(
                                 &id_for_cancel,
                                 &execution_id,
+                                cancel_actor,
                                 "work item deleted while a worker was active",
                             )
                             .await;
