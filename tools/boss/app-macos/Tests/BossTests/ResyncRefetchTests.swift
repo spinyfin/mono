@@ -298,9 +298,28 @@ final class ResyncRefetchTests: XCTestCase {
 
         model.applyEventForTest(.disconnected)
         model.applyEventForTest(.connected)
-        try? await Task.sleep(for: .milliseconds(100))
 
+        // The connect burst sends its reads synchronously, so the absence is
+        // checked against a request it is known to have sent.
+        XCTAssertEqual(recorder.counts["list_products"], 1)
         XCTAssertNil(recorder.counts["get_product_design_doc"])
+        XCTAssertNil(recorder.counts["get_driver_quota_usage"])
+    }
+
+    func testReconnectRecoversQuotaWhoseFirstCompletionWasEvicted() async {
+        let (model, recorder) = makeModel()
+        model.refreshDriverQuota(force: true)
+        XCTAssertTrue(model.isRefreshingDriverQuota)
+        XCTAssertTrue(model.driverQuota.neverChecked)
+        recorder.reset()
+
+        model.applyEventForTest(.resyncRequired)
+        model.applyEventForTest(.disconnected)
+        model.applyEventForTest(.connected)
+
+        XCTAssertEqual(recorder.counts["get_driver_quota_usage"], 1)
+        XCTAssertEqual(recorder.sent.first { $0["type"] as? String == "get_driver_quota_usage" }?["refresh"] as? Bool, false)
+        XCTAssertFalse(model.resyncQuotaReadOwed)
     }
 
     // MARK: - Model: backoff and trailing edge

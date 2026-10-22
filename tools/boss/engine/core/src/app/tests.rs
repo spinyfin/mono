@@ -469,6 +469,7 @@ mod coordinator_reset;
 mod dispatch_pause;
 mod driver_start_signal;
 mod engine_health_report;
+mod engine_pool_config;
 mod metadata_persistence;
 mod open_document;
 mod pause_broadcast;

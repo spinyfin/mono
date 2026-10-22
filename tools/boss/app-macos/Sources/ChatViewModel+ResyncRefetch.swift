@@ -150,7 +150,6 @@ extension ChatViewModel {
     ///   timer, so a dropped one stays stale until asked for.
     /// - `engine_health_result` and `git_hub_auth_state`.
     /// - comment invalidations: each open comment layer reloads once.
-    ///
     /// - `engine_pool_config`: pool sizes and coordinator model, pushed once
     ///   at session registration, so a dropped one is never re-sent. The
     ///   `get_engine_pool_config` read replies with the same event and has
@@ -184,9 +183,10 @@ extension ChatViewModel {
     /// cached driver quota and the open design docs. Their cached state and
     /// the open reader references survive a disconnect.
     func sendResyncOnlyReads() {
-        if isRefreshingDriverQuota || !driverQuota.neverChecked {
+        if resyncQuotaReadOwed || isRefreshingDriverQuota || !driverQuota.neverChecked {
             engine.sendGetDriverQuotaUsage(refresh: false)
         }
+        resyncQuotaReadOwed = false
         var docRefs: [DesignDocRef] = []
         for ref in [selectedDesignDocRef, pendingAsyncViewerRef].compactMap({ $0 }) where !docRefs.contains(ref) {
             docRefs.append(ref)
@@ -199,7 +199,13 @@ extension ChatViewModel {
     /// connect burst does not re-read ([[sendResyncOnlyReads]]) stays owed
     /// until the next connect sends it.
     func cancelPendingResyncRefetch() {
-        if resyncRefetchGate.isDirty { resyncOnlyReadsOwed = true }
+        if resyncRefetchGate.isDirty {
+            resyncOnlyReadsOwed = true
+            // Decide now: handleConnected clears the in-flight flag before the
+            // owed reads go out, so a refresh whose completion was evicted
+            // would otherwise look like nothing was waiting on the quota.
+            if isRefreshingDriverQuota || !driverQuota.neverChecked { resyncQuotaReadOwed = true }
+        }
         pendingResyncRefetchTask?.cancel()
         pendingResyncRefetchTask = nil
         resyncRefetchGate.cancel()

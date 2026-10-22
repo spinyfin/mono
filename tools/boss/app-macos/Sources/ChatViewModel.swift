@@ -89,6 +89,9 @@ final class ChatViewModel: ObservableObject {
     /// A resync was dropped by a disconnect or connect before it fired; the
     /// next connect owes the reads its burst doesn't cover.
     var resyncOnlyReadsOwed = false
+    /// Part of `resyncOnlyReadsOwed`: a quota snapshot or refresh was awaited
+    /// when the resync was dropped, so the cached quota read is owed too.
+    var resyncQuotaReadOwed = false
     /// Views currently showing a task's execution history (card popover,
     /// transcript viewer), by task id, each identified by a per-view token.
     /// A task with no entry has no consumer: its history is not cached and
