@@ -23,6 +23,7 @@ extension ChatViewModel {
     func openReviewGuide(versionId: String, rootTaskId: String) {
         pendingReviewGuideVersionId = versionId
         pendingReviewGuideRootTaskId = rootTaskId
+        loadAttachments(taskId: rootTaskId)
         // Clear the design-doc / task-description identity guards for this
         // shared singleton window so a late reply for either cannot
         // overwrite the guide we are about to show.

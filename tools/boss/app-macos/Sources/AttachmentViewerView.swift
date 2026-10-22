@@ -182,6 +182,8 @@ struct AttachmentRow: View {
 /// engine's content-addressed store — never through the loopback gallery.
 struct AttachmentThumbnail: View {
     let attachment: AttachmentVM
+    var maxPixelSize: Int = 80
+    var contentMode: ContentMode = .fill
 
     var body: some View {
         Group {
@@ -191,7 +193,7 @@ struct AttachmentThumbnail: View {
             } else if let image = loadedImage {
                 Image(nsImage: image)
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .aspectRatio(contentMode: contentMode)
             } else {
                 Image(systemName: "photo.badge.exclamationmark")
                     .foregroundStyle(.secondary)
@@ -203,7 +205,7 @@ struct AttachmentThumbnail: View {
     }
 
     private var loadedImage: NSImage? {
-        AttachmentImageCache.thumbnail(for: attachment)
+        AttachmentImageCache.thumbnail(for: attachment, maxPixelSize: maxPixelSize)
     }
 }
 
@@ -301,7 +303,12 @@ struct AttachmentViewerView: View {
     let ref: AttachmentViewerRef
 
     @EnvironmentObject private var chatModel: ChatViewModel
-    @State private var selectedAttachmentId: String?
+    private var selectedAttachmentId: Binding<String?> {
+        Binding(
+            get: { chatModel.selectedAttachmentIDByTaskID[ref.taskId] },
+            set: { chatModel.selectedAttachmentIDByTaskID[ref.taskId] = $0 }
+        )
+    }
 
     private var attachments: [AttachmentVM] {
         chatModel.attachmentsByTaskID[ref.taskId] ?? []
@@ -368,7 +375,7 @@ struct AttachmentViewerView: View {
                     description: Text("No evidence has been attached to this task yet.")
                 )
             } else {
-                List(selection: $selectedAttachmentId) {
+                List(selection: selectedAttachmentId) {
                     ForEach(attachmentGroups) { group in
                         if group.label.isEmpty {
                             ForEach(group.items) { attachment in
@@ -392,7 +399,7 @@ struct AttachmentViewerView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if let id = selectedAttachmentId, let attachment = attachments.first(where: { $0.id == id }) {
+        if let id = selectedAttachmentId.wrappedValue, let attachment = attachments.first(where: { $0.id == id }) {
             AttachmentDetailView(attachment: attachment)
         } else {
             ContentUnavailableView(
