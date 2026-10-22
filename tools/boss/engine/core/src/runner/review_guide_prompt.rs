@@ -61,5 +61,31 @@ pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExec
     };
     prompt.push_str("\n\n");
     prompt.push_str(&boss_review_guide::render_source_context(&packet));
+    // Guide executions point to a comparison, not a task. The captured
+    // series already carries the canonical root resolved at source capture.
+    // Reuse the gallery's chain-wide query so revisions contribute evidence.
+    let attachments = work_db.list_work_attachments_for_chain(&capture.root_task_id)?;
+    prompt.push_str("\n### Registered screenshots\n\n");
+    if attachments.is_empty() {
+        prompt.push_str("No screenshots are registered for this task or its revisions.\n");
+    } else {
+        prompt.push_str("Screenshots registered for this task and its revisions (metadata only; captions are author descriptions, not verified image contents):\n\n");
+        // Serialize only review metadata, never local paths or evidence URLs.
+        // JSON quoting also keeps multiline captions from creating headings.
+        let manifest: Vec<_> = attachments
+            .iter()
+            .map(|attachment| {
+                serde_json::json!({
+                    "id": attachment.id,
+                    "caption": attachment.caption,
+                    "pixel_width": attachment.pixel_width,
+                    "pixel_height": attachment.pixel_height,
+                    "image_available": !attachment.is_reclaimed(),
+                })
+            })
+            .collect();
+        prompt.push_str(&serde_json::to_string_pretty(&manifest)?);
+        prompt.push('\n');
+    }
     Ok(prompt)
 }

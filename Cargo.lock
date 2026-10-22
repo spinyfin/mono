@@ -1031,6 +1031,7 @@ name = "boss-review-guide"
 version = "0.1.0"
 dependencies = [
  "boss-pr-review-sources",
+ "boss-pr-template",
  "regex",
  "sha2",
 ]

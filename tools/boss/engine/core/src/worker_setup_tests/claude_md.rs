@@ -218,6 +218,26 @@ fn claude_md_pr_section_is_front_and_centre() {
 }
 
 #[test]
+fn claude_md_requires_concrete_pr_evidence_or_specific_limitations() {
+    let rendered = claude_md_for(&sample_input());
+    for rule in [
+        "Every PR body must contain an evidence section.",
+        "commands run and their results",
+        "repeated-run counts for flake fixes",
+        "measurements, before/after behavior",
+        "screenshots registered via `\"$BOSS_BIN\" attach`",
+        "A bare \"tests pass\" is not enough",
+        "state the specific limitation and what would be",
+        "needed to gather it",
+        "Summarize registered screenshots by caption in the evidence",
+        "Do not put an attachment URL",
+    ] {
+        assert!(rendered.contains(rule), "missing evidence rule: {rule}");
+    }
+    assert!(!rendered.contains("describe\nthe screenshot in prose"));
+}
+
+#[test]
 fn claude_md_has_cube_pr_create_section() {
     let input = sample_input();
     let rendered = claude_md_for(&input);

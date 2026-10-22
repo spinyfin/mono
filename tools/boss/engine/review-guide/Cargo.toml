@@ -6,6 +6,7 @@ workspace = "../../../.."
 
 [dependencies]
 boss-pr-review-sources = { path = "../pr-review-sources" }
+boss-pr-template = { path = "../pr-template" }
 regex = { workspace = true }
 
 [dev-dependencies]

@@ -2641,7 +2641,7 @@ async fn review_guide_submission_publishes_for_its_attributed_codex_execution() 
         .unwrap();
     let pid = std::process::id() as libc::pid_t;
     state.worker_registry.register(pid, execution.id.clone());
-    let guide = "# Guide\n## Problem\n## Implementation\n## Example\n## Review";
+    let guide = "# Guide\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation results reported; no screenshots registered.";
     let request = || {
         submit_request(
             &execution.id,
@@ -2699,7 +2699,7 @@ async fn review_guide_invented_link_is_rejected_and_a_corrected_resubmission_pub
         .unwrap();
     let pid = std::process::id() as libc::pid_t;
     state.worker_registry.register(pid, execution.id.clone());
-    let invented = "# Guide\n## Problem\nSee [x](https://github.com/acme/widget/blob/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/src/retry.rs#L1)\n## Implementation\n## Example\n## Review";
+    let invented = "# Guide\n## Problem\nSee [x](https://github.com/acme/widget/blob/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/src/retry.rs#L1)\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation results reported; no screenshots registered.";
     let rejected = call_with_peer(
         &state,
         Some(pid),
@@ -2734,7 +2734,7 @@ async fn review_guide_invented_link_is_rejected_and_a_corrected_resubmission_pub
         .unwrap();
     assert_eq!(still_running.status, "running");
     assert!(!db.get_execution(&execution.id).unwrap().status.is_terminal());
-    let corrected = "# Guide\n## Problem\n## Implementation\n## Example\n## Review";
+    let corrected = "# Guide\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation results reported; no screenshots registered.";
     let published = call_with_peer(
         &state,
         Some(pid),

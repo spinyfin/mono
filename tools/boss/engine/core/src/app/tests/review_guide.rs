@@ -4,6 +4,7 @@ use crate::work::{PrSourceCaptureTrigger, PublishReviewGuideOutcome};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const PR_URL: &str = "https://github.com/acme/widget/pull/91";
+const REPORTED_EVIDENCE: &str = "`bazel test //widget:layout_test` passed (12 tests).";
 
 struct Fixture {
     state: Arc<ServerState>,
@@ -16,7 +17,8 @@ impl Fixture {
     fn new(fail_capture: bool) -> Self {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
-        let packet = source_capture_packet(PR_URL, "base", "head");
+        let mut packet = source_capture_packet(PR_URL, "base", "head");
+        packet.body = Some(format!("## Validation\n\n{REPORTED_EVIDENCE}"));
         let output = packet.clone();
         let collect: crate::review_guide_capture::PacketCollectFn = Arc::new(move |url, observed, branch, _| {
             assert_eq!(url, PR_URL);
@@ -141,6 +143,172 @@ impl Fixture {
         assert_eq!(already_requested, already);
         attempt
     }
+
+    async fn prompt(&self, attempt_id: &str) -> String {
+        let db = &self.state.work_db;
+        let attempt = db.dispatch_pr_review_guide_attempt(attempt_id, &self.root).unwrap();
+        let execution = db.get_execution(attempt.execution_id.as_deref().unwrap()).unwrap();
+        let item = db.get_work_item(&self.root).unwrap();
+        crate::runner::compose_worker_spawn(
+            db,
+            "guide-fixture",
+            &execution,
+            &item,
+            self._dir.path(),
+            None,
+            crate::runner::WorkerSpawnOpts::default(),
+        )
+        .await
+        .unwrap()
+        .prompt_text
+    }
+
+    fn screenshot(&self, task: &str, caption: &str) -> String {
+        let db = &self.state.work_db;
+        let execution = crate::test_support::create_ready_chore_execution(db, task);
+        let image = boss_engine_attachments::IngestedImage {
+            content_digest: format!("fixture-{}", execution.id),
+            media_type: boss_protocol::AttachmentMediaType::Png,
+            pixel_width: 800,
+            pixel_height: 600,
+            size_bytes: 256,
+            source_name: "private-capture.png".to_owned(),
+        };
+        db.submit_work_attachment(crate::work::SubmitAttachmentInput {
+            execution_id: &execution.id,
+            work_item_id: task,
+            image: &image,
+            caption,
+        })
+        .unwrap()
+        .unwrap()
+        .attachment
+        .id
+    }
+
+    fn publish_fixture_guide(&self, attempt: &boss_protocol::ReviewGuideAttempt, notice: &str) {
+        // Deterministic driver response: tests the contract/publication seam,
+        // not whether a live model follows the prose instructions.
+        let markdown = format!(
+            "# Layout review\n\n## Problem\nThe layout needs verification.\n\n\
+             ## Core fix\nThe author reports a layout adjustment.\n\n\
+             ## Walkthrough\nThis fixture supplies no source files.\n\n\
+             ## Tests\nThe PR describes a layout test run.\n\n\
+             ## Evidence\nAuthor-reported: {REPORTED_EVIDENCE}\n\n\
+             Source verification is limited: this fixture has no source files; pinned source is needed to assess coverage against the intent.\n\n\
+             {notice}\n"
+        );
+        let db = &self.state.work_db;
+        let capture = db
+            .get_pr_review_guide_comparison_by_id(&attempt.comparison_id)
+            .unwrap()
+            .unwrap();
+        let guide = boss_review_guide::validate_guide_output_with_resolver(&markdown, &capture.packet, |_, _, _, _| {
+            panic!("fixture has no source references")
+        })
+        .unwrap();
+        let PublishReviewGuideOutcome::Published(version) = db
+            .publish_pr_review_guide_version(&attempt.id, &guide.markdown, &markdown)
+            .unwrap()
+        else {
+            panic!("expected fixture publication")
+        };
+        let stored = db.get_pr_review_guide_version(&version.id).unwrap().unwrap();
+        assert_eq!(stored.markdown, markdown.trim());
+        println!("Fixture-generated guide:\n{}", stored.markdown);
+    }
+}
+
+#[tokio::test]
+async fn guide_evidence_prompt_and_fixture_report_no_registered_screenshots() {
+    let f = Fixture::new(false);
+    let attempt = f.generate("no-screenshots", false).await;
+    let prompt = f.prompt(&attempt.id).await;
+    assert!(prompt.contains(&format!("### PR description\n\n## Validation\n\n{REPORTED_EVIDENCE}")));
+    assert!(
+        prompt.contains("### Registered screenshots\n\nNo screenshots are registered for this task or its revisions.")
+    );
+    assert!(prompt.contains("section headed exactly `## Evidence`"));
+    f.publish_fixture_guide(
+        &attempt,
+        "No screenshots are registered for this task or its revisions.",
+    );
+}
+
+#[tokio::test]
+async fn guide_evidence_prompt_includes_root_and_revision_screenshots_without_urls() {
+    let f = Fixture::new(false);
+    let db = &f.state.work_db;
+    let product = create_product(db);
+    let revision = create_active_chore(db, &product, "Layout revision");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET kind = 'revision', parent_task_id = ?1, status = 'in_review' WHERE id = ?2",
+            rusqlite::params![f.root, revision],
+        )
+        .unwrap();
+    let root_image = f.screenshot(&f.root, "Wide layout before the fix");
+    let revision_image = f.screenshot(&revision, "Wide layout after the fix");
+    assert_eq!(
+        db.mark_attachments_reclaimed(std::slice::from_ref(&root_image))
+            .unwrap(),
+        1
+    );
+    let unrelated = create_active_chore(db, &product, "Another change");
+    let unrelated_image = f.screenshot(&unrelated, "Unrelated evidence");
+    let attempt = f.generate("screenshots", false).await;
+    let prompt = f.prompt(&attempt.id).await;
+    let manifest_text = prompt.split("### Registered screenshots").last().unwrap();
+    let manifest_start = manifest_text.find('[').unwrap();
+    let manifest = serde_json::Deserializer::from_str(&manifest_text[manifest_start..])
+        .into_iter::<serde_json::Value>()
+        .next()
+        .unwrap()
+        .unwrap();
+    let rows = manifest.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    for (id, caption, available) in [
+        (&root_image, "Wide layout before the fix", false),
+        (&revision_image, "Wide layout after the fix", true),
+    ] {
+        let row = rows.iter().find(|row| row["id"] == *id).unwrap();
+        assert_eq!(row["caption"], caption);
+        assert_eq!(row["pixel_width"], 800);
+        assert_eq!(row["pixel_height"], 600);
+        assert_eq!(row["image_available"], available);
+        assert_eq!(row.as_object().unwrap().len(), 5);
+    }
+    for absent in [
+        &unrelated_image,
+        "Unrelated evidence",
+        "private-capture.png",
+        "localhost",
+        "127.0.0.1",
+    ] {
+        assert!(!manifest.to_string().contains(absent));
+    }
+    f.publish_fixture_guide(&attempt, "Screenshots are attached to the task: Wide layout before the fix; Wide layout after the fix (800 × 600 each, described by author captions; images not inspected).");
+
+    // An incremental update must refresh metadata rather than relying on the
+    // screenshot notice embedded in the previous guide.
+    let new_image = f.screenshot(&revision, "Narrow layout after revision");
+    let sequence = db.allocate_pr_review_guide_source_observation_sequence().unwrap();
+    let packet = source_capture_packet(PR_URL, "base", "revised-head");
+    db.persist_pr_review_guide_source_capture(&f.root, sequence, PrSourceCaptureTrigger::Completion, &packet)
+        .unwrap();
+    let capture = db.get_latest_pr_review_guide_source_capture(&f.root).unwrap().unwrap();
+    db.record_review_guide_revision_head(&f.root, PR_URL, "revised-head", &revision, sequence)
+        .unwrap();
+    let update = db
+        .create_automatic_pr_review_guide_attempt(&capture.series_id, &capture.comparison_id)
+        .unwrap();
+    let update = db.dispatch_pr_review_guide_attempt(&update.id, &f.root).unwrap();
+    assert_eq!(update.prompt_version, boss_review_guide::UPDATE_PROMPT_VERSION);
+    let prompt = f.prompt(&update.id).await;
+    assert!(prompt.contains("including a refreshed `## Evidence` section"));
+    assert!(prompt.contains(&new_image));
+    assert!(prompt.contains("Narrow layout after revision"));
 }
 
 #[tokio::test]

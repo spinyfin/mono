@@ -382,6 +382,14 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            PR exists\" when you're a revision worker. `{boss} pr status`\n\
            resolves your actually-bound PR correctly either way.\n\
          - Do not hard-wrap PR bodies.\n\
+         - **Every PR body must contain an evidence section.** Show concretely how\n\
+           the change achieves its stated intent: commands run and their results,\n\
+           repeated-run counts for flake fixes, measurements, before/after behavior,\n\
+           and screenshots registered via `{boss} attach`, as applicable. Describe\n\
+           registered screenshots by caption and what you verified; keep attachment\n\
+           URLs out of the PR body. A bare \"tests pass\" is not enough. Where evidence\n\
+           could not be gathered, state the specific limitation and what would be\n\
+           needed to gather it. Distinguish observed results from expectations.\n\
          - **Declare work that ships inert prominently in the PR body.** If your change\n\
            does not take effect on deploy (a default-off flag, per-environment config,\n\
            unscheduled task, missing capability, or other human action), state that it\n\
@@ -652,8 +660,9 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          PR body.** The link it prints is only reachable on this machine;\n\
          nobody reading the PR on GitHub can open it. This applies whether or\n\
          not the evidence server is listening: if it isn't, the image is\n\
-         still stored, but that is still not a reason to paste a URL, describe\n\
-         the screenshot in prose, or inline it as base64 as a substitute. Where\n\
+         still stored, but that is still not a reason to paste a URL or inline\n\
+         it as base64. Summarize registered screenshots by caption in the evidence\n\
+         section; that notice does not give GitHub readers access to the images. Where\n\
          a PR body needs evidence a GitHub reader can actually open, use\n\
          something that is — a CI artifact, a deploy preview, a code\n\
          reference.\n\

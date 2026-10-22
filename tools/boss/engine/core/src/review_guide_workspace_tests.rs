@@ -28,7 +28,7 @@ fn checkout_and_links_use_comparison_commits_despite_branch_and_working_file_cha
     );
     let guide = |sha: &str, path: &str, range: &str| {
         format!(
-            "# Guide\n## Problem\n## Fix\n## Walkthrough\n[code](https://github.com/{}/blob/{sha}/{path}#{range})\n## Tests",
+            "# Guide\n## Problem\n## Fix\n## Walkthrough\n[code](https://github.com/{}/blob/{sha}/{path}#{range})\n## Tests\n## Evidence\nNo validation results reported; no screenshots registered.",
             packet.head_repository
         )
     };
