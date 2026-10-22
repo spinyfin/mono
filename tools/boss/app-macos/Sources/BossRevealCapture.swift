@@ -34,6 +34,12 @@ enum BossRevealCapture {
             .map { String($0.dropFirst("--capture-reveal-state=".count)) }
     }
 
+    /// Position of a fixture card in `rows`. Fixture variants trim the row
+    /// list, so a card is found by id rather than by its original index.
+    nonisolated static func index(ofCard id: String, in rows: [WorkTask]) -> Int? {
+        rows.firstIndex { $0.id == id }
+    }
+
     static func start(updateModel: UpdateModel) {
         guard let state, let path = BossCaptureArgs.shared.captureTo else { return }
         if state == "badge-width" {
@@ -155,7 +161,7 @@ enum BossRevealCapture {
                             if touch {
                                 // Mimic activity on a few other PRs so Pending's
                                 // recency order changes around the target.
-                                for j in stride(from: i, to: refreshed.count, by: 7) where j != targetIndex {
+                                for j in stride(from: i, to: refreshed.count, by: 7) where refreshed[j].id != targetID {
                                     refreshed[j].updatedAt = stamp
                                 }
                             }
@@ -165,10 +171,11 @@ enum BossRevealCapture {
                                 // Activity on one chosen card moves it to the top of Pending.
                                 refreshed[touchIndex].updatedAt = stamp
                             }
-                            if touchTarget, i == 0 {
+                            if touchTarget, i == 0,
+                               let index = Self.index(ofCard: targetID, in: refreshed) {
                                 // Activity on the revealed card itself moves it to
                                 // the top of Pending.
-                                refreshed[targetIndex].updatedAt = stamp
+                                refreshed[index].updatedAt = stamp
                             }
                             print("applying simulated work-tree refresh \(i + 1) touch=\(touch)")
                             model.applyEventForTest(.workTree(
