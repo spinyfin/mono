@@ -627,6 +627,38 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Forget the cached `conflicted` verdict of every free workspace in
+    /// `repo`, returning how many rows that touched.
+    ///
+    /// Bookmarks belong to the repo's shared jj store, so a conflicted
+    /// bookmark is reported by `jj status` in every workspace of that repo and
+    /// the lease scan caches each one it probes as `conflicted`. Once the
+    /// conflict is repaired in any one workspace it is gone from all of them;
+    /// clearing the cache (back to "not checked", not to `clean`) lets the
+    /// next lease probe them as ordinary free candidates instead of leaving
+    /// them withheld until the revalidation window or pool GC gets round to
+    /// each one.
+    pub fn clear_cached_conflicted_health(&self, repo: &str) -> Result<usize, CubeError> {
+        let updated = self
+            .connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    health_status = NULL,
+                    unhealthy_since_epoch_s = NULL
+                WHERE repo = ?1 AND state = ?2 AND health_status = ?3
+                "#,
+                params![
+                    repo,
+                    WorkspaceState::Free.as_str(),
+                    WorkspaceHealth::Conflicted.as_str()
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(updated)
+    }
+
     /// Claim a specific workspace by `workspace_id`, atomically transitioning
     /// it from `free` to `leased`. Returns `None` if the workspace is not
     /// currently free (e.g., already leased or doesn't exist). Unlike

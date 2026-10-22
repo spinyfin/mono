@@ -80,6 +80,72 @@ pub(super) fn lease_runner_for(workspace_path: &std::path::Path, head: &str) -> 
 /// its parents carry. `output` is the tab-separated line
 /// [`reuse_guard::HEAD_STATUS_TEMPLATE`] produces — build it with
 /// [`head_status_output`].
+/// The lease-time reclaim's attempt on one cached-dirty workspace, ending in
+/// a refusal: fetch, a head-status read that finds `@` non-empty on an
+/// unpushed exec bookmark, the orphan probe confirming a commit no remote
+/// has, and a salvage log that comes back empty — a capture that cannot be
+/// proven complete — so the workspace is left exactly as it was and the lease
+/// falls through to provisioning. For tests whose subject is the scan or the
+/// mint, not the reclaim.
+///
+/// A workspace this lease's scan already probed is not status-checked again;
+/// one it did not (`probed_this_lease = false`) gets one `jj status` between
+/// the orphan probe and the salvage log.
+pub(super) fn reclaim_refusal_commands(
+    workspace_path: &std::path::Path,
+    probed_this_lease: bool,
+) -> Vec<ExpectedCommand> {
+    use crate::app::salvage::{SALVAGE_LOG_TEMPLATE, salvage_log_limit_arg, salvage_revset};
+    let revset = salvage_revset("main");
+    let limit = salvage_log_limit_arg();
+    let mut v = vec![
+        ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+        head_status_command(
+            workspace_path,
+            &head_status_output("abcd1234", false, "boss/exec_local", "boss/exec_local", ""),
+        ),
+        unpushed_probe_command(workspace_path, "abcd1234\t6e6b90bc\n"),
+    ];
+    if !probed_this_lease {
+        v.push(ExpectedCommand::ok(
+            workspace_path.to_path_buf(),
+            "jj",
+            &["status", "--no-pager"],
+            jj_status_dirty(),
+        ));
+    }
+    v.push(ExpectedCommand::ok(
+        workspace_path.to_path_buf(),
+        "jj",
+        &[
+            "log",
+            "--no-graph",
+            "-n",
+            &limit,
+            "-r",
+            &revset,
+            "-T",
+            SALVAGE_LOG_TEMPLATE,
+        ],
+        "",
+    ));
+    v
+}
+
+/// [`reclaim_refusal_commands`] for the first [`LEASE_UNHEALTHY_RECLAIM_MAX_PROBES`]
+/// of `ids` under `workspace_root`, in the order the reclaim tries them
+/// (which, for rows marked unhealthy in id order, is id order).
+pub(super) fn reclaim_refusals_for(
+    workspace_root: &std::path::Path,
+    ids: &[String],
+    probed_this_lease: bool,
+) -> Vec<ExpectedCommand> {
+    ids.iter()
+        .take(crate::app::lease_reclaim::LEASE_UNHEALTHY_RECLAIM_MAX_PROBES)
+        .flat_map(|id| reclaim_refusal_commands(&workspace_root.join(id), probed_this_lease))
+        .collect()
+}
+
 pub(super) fn head_status_command(workspace_path: &std::path::Path, output: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
         workspace_path.to_path_buf(),

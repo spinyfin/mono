@@ -464,6 +464,33 @@ Selection should prefer:
 Cube does not need perfect cache prediction in v1. "Prefer a free existing
 workspace over creating a new one" is already a meaningful win.
 
+In practice a lease walks these doors in order and takes the first that
+opens:
+
+1. a free workspace whose cached health is clean or unknown (probed, bounded
+   by a probe cap and a time budget);
+2. a free workspace whose only problem is a conflicted bookmark — the tree
+   is empty, so the bookmark is repaired and the workspace used. Bookmarks
+   live in the repo's shared jj store, so one conflict is reported from every
+   workspace the scan probes; repairing it clears the cached `conflicted`
+   verdict of the siblings too;
+3. a quarantined workspace the reuse guard can verify holds nothing unpushed;
+4. a free workspace cached `dirty` or `conflicted` that the lease can
+   **salvage and reset**: any unpushed work is written to a salvage record
+   first (manifest plus per-commit patches, outside the workspace and the jj
+   store), and the non-empty `@` stays a visible head in the shared store —
+   in practice pinned by the Boss engine's `boss-recovery/exec_*` bookmark.
+   This is the retention GC's reclaim, run on demand instead of a day later;
+   a workspace that cannot be salvaged is left exactly as it was;
+5. only then a fresh workspace.
+
+Every mint through door 5 is audited as `workspace.provisioned_no_eligible_free`
+with the free workspaces the lease looked at and why each was rejected, the
+pool's cached-unhealthy set broken down by health and release reason, and the
+reclaim scan's own report. A pool that grows while `cube workspace list` shows
+free rows is diagnosed from that event, not reconstructed from creation
+timestamps.
+
 ### Create
 
 Creating a workspace must be atomic with respect to the pool: a directory that
