@@ -37,7 +37,8 @@ final class WorkFetchOwnershipTests: XCTestCase {
         XCTAssertFalse(verbs.contains("list_attention_groups"), "the tree reply owns this refresh")
         model.applyEventForTest(.workTree(product: product("product_a"), projects: [], tasks: [],
                                          chores: [], taskRuntimes: [], dependencies: [], ideas: []))
-        XCTAssertEqual(verbs.filter { $0 == "list_attention_groups" }.count, 1)
+        XCTAssertFalse(verbs.contains("list_attention_groups"), "the tree snapshot includes attention groups")
+        XCTAssertEqual(trees.count, 1, "applying the snapshot must not fetch another tree")
     }
 
     func testConnectWithoutSelectionFetchesOnlyAfterAutoSelection() {
@@ -158,10 +159,12 @@ final class WorkFetchOwnershipTests: XCTestCase {
         XCTAssertEqual(flows, ["cold_start", "reconnect"])
     }
 
-    func testResyncStillRefreshesSelectedTreeOnceIncludingProductsReply() {
+    func testResyncStillRefreshesSelectedTreeOnceIncludingProductsReply() async {
         model.isConnected = true
         model.applyEventForTest(.resyncRequired)
         model.applyEventForTest(.productsList(products: model.products))
+        let settled = await model.waitForRefetchBurstsForTest()
+        XCTAssertTrue(settled, "the resync refetch burst never fired")
         XCTAssertEqual(trees.count, 1)
         XCTAssertEqual(trees.first?["product_id"] as? String, "product_a")
     }
