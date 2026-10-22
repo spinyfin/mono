@@ -1052,8 +1052,9 @@ async fn write_live_entry(
             outcome.state_writes += 1;
             // The macOS app is push-only, so the write only reaches the
             // Merging lane via this event.
+            // Only this task's merge-queue columns changed (runtime-class).
             ctx.publisher
-                .publish_work_item_changed(
+                .publish_work_item_runtime_changed(
                     &member.product_id,
                     &member.intent.work_item_id,
                     "trunk_queue_state_updated",

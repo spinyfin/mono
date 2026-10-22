@@ -1336,6 +1336,40 @@ pub(super) async fn handle_restore_work_item(ctx: Dispatch, req: FrontendRequest
     }
 }
 
+/// Re-read a few cards of one product without assembling its board: the
+/// answer to a runtime-class invalidation. The reply is stamped with the
+/// revision read *before* the snapshot, like the tree's, so a write that lands
+/// during the read can only make the reply look older than it is.
+pub(super) async fn handle_get_work_runtime_patch(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetWorkRuntimePatch { product_id, item_ids } = req else {
+        unreachable!()
+    };
+    let snapshot_revision = server_state.current_work_revision();
+    match work_db.get_work_runtime_patch(&product_id, &item_ids) {
+        Ok(patch) => {
+            crate::board_invalidation_metrics::record_runtime_patch(&server_state.metrics, patch.items.len());
+            send_response_with_revision(
+                &sink,
+                &request_id,
+                snapshot_revision,
+                FrontendEvent::WorkRuntimePatch {
+                    product_id,
+                    items: patch.items,
+                    absent: patch.absent,
+                },
+            );
+        }
+        Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}
+
 pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -1368,9 +1402,13 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         .expect("board reads poisoned")
         .begin(&request_id, product_id.clone());
     let started = Instant::now();
-    let loaded = server_state
-        .work_tree_loads
-        .load(&work_db, &server_state.work_revision, &product_id, &mut trace);
+    let loaded = server_state.work_tree_loads.load(
+        &work_db,
+        &server_state.work_revision,
+        &server_state.metrics,
+        &product_id,
+        &mut trace,
+    );
     trace.record_plain("shared_load_wait", crate::population_timing::elapsed_ms(started));
     let result = loaded.and_then(|loaded| {
         loaded
@@ -1574,7 +1612,8 @@ pub(super) async fn handle_set_task_doc_pointer(ctx: Dispatch, req: FrontendRequ
         Ok(task) => {
             let item = WorkItem::Task(task);
             let product_id = item.product_id().to_string();
-            let revision = publish_work_invalidation(
+            // Only this task's doc pointer columns were written: runtime-class.
+            let revision = publish_runtime_work_invalidation(
                 &server_state,
                 &session_id,
                 &request_id,

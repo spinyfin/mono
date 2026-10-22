@@ -1746,6 +1746,21 @@ pub trait ExecutionPublisher: Send + Sync {
     /// happens inside `start_execution_run`.
     async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str);
 
+    /// Like [`Self::publish_work_item_changed`], but for a change that touched
+    /// only the runtime fields of this one card: its dispatch wait, PR poll
+    /// state, merge-queue position or doc pointer. No card was added,
+    /// removed, re-parented or re-statused and no dependency edge moved, so
+    /// subscribers may re-read just this card instead of the whole product
+    /// board. A site must call this only when its write meets that bar;
+    /// anything uncertain stays on `publish_work_item_changed`, which is the
+    /// full-board invalidation.
+    ///
+    /// The default forwards to `publish_work_item_changed`: a publisher that
+    /// does not tell the classes apart treats every change as structural.
+    async fn publish_work_item_runtime_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
+        self.publish_work_item_changed(product_id, work_item_id, reason).await;
+    }
+
     /// Push a typed [`FrontendEvent`] verbatim on the work item's
     /// product topic. Used for activity-feed events such as
     /// `ConflictResolutionStarted` / `Succeeded` / `Failed` /

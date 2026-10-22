@@ -1173,10 +1173,23 @@ pub fn make_dispatchable_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<E
 pub struct RecordingPublisher {
     pub publish_calls: Mutex<Vec<(String, String, String, String)>>,
     pub events: Mutex<Vec<(String, String, String)>>,
+    /// The subset of `events` published through
+    /// `publish_work_item_runtime_changed` (runtime-class invalidations).
+    pub runtime_events: Mutex<Vec<(String, String, String)>>,
     pub typed_events: Mutex<Vec<(String, FrontendEvent)>>,
 }
 
 impl RecordingPublisher {
+    /// Reasons published as runtime-class invalidations, in order.
+    pub async fn runtime_reasons(&self) -> Vec<String> {
+        self.runtime_events
+            .lock()
+            .await
+            .iter()
+            .map(|(_, _, reason)| reason.clone())
+            .collect()
+    }
+
     /// `publish_work_item_changed` reasons with poll-state housekeeping
     /// (`pr_poll_state_updated`) filtered out, so lifecycle-focused assertions
     /// don't have to account for the background sweep's bookkeeping writes.
@@ -1254,6 +1267,13 @@ impl ExecutionPublisher for RecordingPublisher {
             .lock()
             .await
             .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
+    }
+    async fn publish_work_item_runtime_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
+        self.runtime_events
+            .lock()
+            .await
+            .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
+        self.publish_work_item_changed(product_id, work_item_id, reason).await;
     }
     async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
         let projection = match &event {

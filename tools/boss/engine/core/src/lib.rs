@@ -70,6 +70,7 @@ pub mod attachment_server;
 pub mod codex_guard_trace;
 pub mod codex_home_retention_sweep;
 pub mod codex_unobserved_command;
+pub mod board_invalidation_metrics;
 pub mod dispatch_failure_recovery_sweep;
 pub mod dispatch_inflight;
 pub mod dispatch_metrics;

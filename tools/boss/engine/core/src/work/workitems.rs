@@ -1147,12 +1147,7 @@ impl WorkDb {
             // follow-ups carrying a project_id; the chores lane holds only
             // project-less rows. Sorting on ordinal ASC puts the design task
             // (ordinal 0) first in the project's task chain.
-            let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
-                 FROM tasks
-                 WHERE product_id = ?1 AND (kind IN ('project_task', 'design', 'investigation', 'revision', 'design_postmortem') OR (kind IN ('chore', 'followup') AND project_id IS NOT NULL)) AND deleted_at IS NULL AND status != 'archived'
-                 ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
-            )?;
+            let mut stmt = conn.prepare(&super::board_patch::tasks_lane_query())?;
             let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_source_and_provenance)?;
             collect_rows(rows)?
         };
@@ -1165,12 +1160,7 @@ impl WorkDb {
             // kanban board (same treatment as archived projects), while
             // leaving them queryable/listable via `boss task|chore list
             // --include-archived` (they are NOT tombstoned, unlike delete).
-            let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
-                 FROM tasks
-                 WHERE product_id = ?1 AND kind IN ('chore', 'followup') AND project_id IS NULL AND deleted_at IS NULL AND status != 'archived'
-                 ORDER BY created_at ASC",
-            )?;
+            let mut stmt = conn.prepare(&super::board_patch::chores_lane_query())?;
             let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_source_and_provenance)?;
             collect_rows(rows)?
         };
@@ -1200,95 +1190,11 @@ impl WorkDb {
         let dependencies = collect_product_dependencies(&conn, product_id)?;
         trace.record_query(segment::DB_DEPENDENCIES, elapsed_ms(t), dependencies.len());
 
-        // Compute revision projections (revision_seq, revision_parent_pr_url)
-        // for every `kind = 'revision'` task. These are derived fields —
-        // not stored columns — so they are calculated fresh here.
-        let t = Instant::now();
-        let mut tasks = attach_revision_projections(tasks, &chores);
-        // Compute has_in_progress_revision for every chain-root task that
-        // has at least one descendant revision that
-        // `TaskStatus::can_still_change_pr`.
-        attach_in_progress_revision_flag(&mut tasks, &mut chores);
-        // Compute ready_for_review for every Review-lane task that is
-        // waiting on the operator and nothing else (no block, no
-        // in-progress revision, CI green, no merge conflict). Must run
-        // after attach_in_progress_revision_flag, which it reads.
-        attach_ready_for_review_flag(&mut tasks, &mut chores);
-        trace.record_plain(segment::ASSEMBLE, elapsed_ms(t));
-
-        // Compute ai_reviewing for tasks held in Doing while a pr_review
-        // execution is in flight. Surfaces the "Reviewing (AI)" badge on
-        // the kanban card. Errors are non-fatal — log and continue with
-        // the field defaulting to false. Single batched `IN (...)` query.
-        let t = Instant::now();
-        if let Err(err) = attach_ai_reviewing_flag(&conn, &mut tasks, &mut chores) {
-            tracing::warn!(?err, "get_work_tree: failed to attach ai_reviewing flag; ignoring");
-        }
-        trace.record_plain(segment::DB_AI_REVIEWING, elapsed_ms(t));
-
-        // Resolve the single AI-review-state badge (reviewing / reviewed
-        // with findings / reviewed all clear / review not required / no
-        // badge) for every task and chore. Must run after the ai_reviewing
-        // attach above (reads it) and after attach_revision_projections
-        // above (reads revision_seq). Errors are non-fatal — log and leave
-        // the field at its default (no badge). Single batched `IN (...)`
-        // query against `pr_review_verdicts`.
-        let t = Instant::now();
-        if let Err(err) = attach_ai_review_state(&conn, &mut tasks, &mut chores) {
-            tracing::warn!(?err, "get_work_tree: failed to attach ai_review_state; ignoring");
-        }
-        trace.record_plain(segment::DB_AI_REVIEW_STATE, elapsed_ms(t));
-
-        // Resolve which labelled Review-column section each card is grouped
-        // under. Reads ready_for_review, has_in_progress_revision and
-        // ai_review_state, so it must run after all three attaches above.
-        attach_review_section(&mut tasks, &mut chores);
-        if let Err(err) = attach_pr_updated_at(&conn, &mut tasks, &mut chores) {
-            tracing::warn!(?err, "get_work_tree: failed to attach pr_updated_at; ignoring");
-        }
-
-        // Resolve has_attachments for every task/chore so the kanban card can
-        // gate its screenshot-viewer affordance without a per-card query.
-        // Errors are non-fatal — log and leave the field at its default
-        // (affordance hidden). Single batched `IN (...)` query.
-        let t = Instant::now();
-        if let Err(err) = attach_has_attachments_flag(&conn, &mut tasks, &mut chores) {
-            tracing::warn!(?err, "get_work_tree: failed to attach has_attachments flag; ignoring");
-        }
-        trace.record_plain(segment::DB_HAS_ATTACHMENTS, elapsed_ms(t));
-
-        // Resolve review-guide lifecycle/readable-version for every PR-bearing
-        // task/chore so the Review-card guide affordance renders without a
-        // per-card query. Errors are non-fatal — log and leave the fields at
-        // their default (affordance hidden). Single batched `IN (...)` query.
-        let t = Instant::now();
-        if let Err(err) = attach_review_guide_state(&conn, &mut tasks, &mut chores) {
-            tracing::warn!(?err, "get_work_tree: failed to attach review_guide_state; ignoring");
-        }
-        trace.record_plain(segment::DB_REVIEW_GUIDE_STATE, elapsed_ms(t));
-
-        // Resolve the per-task doc-link state for every work item so a
-        // card with `tasks.doc_*` set renders the Review-lane doc-link
-        // icon — independent of `kind`. Design cards with a project also
-        // overlay the parent project's `design_doc_*` state in the app.
-        // Pass `|_| None` for the workspace lookup: cube is not consulted
-        // in get_work_tree, and the app prefers the GitHub raw-content URL
-        // for in-review docs on the PR head branch anyway. Errors per
-        // task are non-fatal — log and leave the field None (affordance
-        // hidden).
-        //
-        // A single prefilter finds the rows with a pointer; each of those
-        // costs 1-3 resolution queries. `resolved` is the number of
-        // pointer-bearing items and `doc_pointer_queries` is the aggregate
-        // statement count, recorded alongside `db.task_runtimes`.
-        let t = Instant::now();
-        let (resolved, doc_pointer_queries) = attach_task_doc_link_states_for_groups(
-            &conn,
-            &mut [&mut tasks[..], &mut chores[..]],
-            "get_work_tree",
-            product_id,
-        );
-        trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
+        // Derived per-card fields (revision projections, review/CI flags,
+        // badges, doc links). Shared with the runtime patch so a patched
+        // card is the card this tree would have produced.
+        let tasks =
+            super::board_patch::attach_board_derivations(&conn, tasks, &mut chores, product_id, "get_work_tree", trace);
 
         let ideas = list_ideas_in_tx(&conn, product_id, None)?;
         let attention_items = super::attentions::reads::list_items(&conn, product_id)?;

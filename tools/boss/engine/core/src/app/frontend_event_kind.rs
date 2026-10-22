@@ -14,6 +14,7 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::ChoresList { .. } => "ChoresList",
         FrontendEvent::RevisionsList { .. } => "RevisionsList",
         FrontendEvent::WorkTreeUpdate { .. } => "WorkTreeUpdate",
+        FrontendEvent::WorkRuntimePatch { .. } => "WorkRuntimePatch",
         FrontendEvent::WorkTree { .. } => "WorkTree",
         FrontendEvent::WorkItemResult { .. } => "WorkItemResult",
         FrontendEvent::WorkItemsByPrResult { .. } => "WorkItemsByPrResult",

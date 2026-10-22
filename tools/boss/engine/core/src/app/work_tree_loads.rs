@@ -18,6 +18,7 @@ impl WorkTreeLoads {
         &self,
         db: &WorkDb,
         revision: &AtomicU64,
+        metrics: &crate::metrics::Registry,
         product_id: &str,
         trace: &mut crate::population_timing::PopulationTrace,
     ) -> Result<Arc<boss_single_flight::Loaded<(u64, boss_protocol::WorkTree)>>, String> {
@@ -29,6 +30,7 @@ impl WorkTreeLoads {
                 // connection. Only the batch owner scans it (with Deferred).
                 // The detached spawn_blocking job survives client disconnects.
                 let snapshot_revision = revision.load(Ordering::SeqCst);
+                crate::board_invalidation_metrics::record_full_assembly(metrics);
                 db.get_work_tree_cached(product_id, trace, &self.runtimes)
                     .map(|tree| (snapshot_revision, tree))
                     .map_err(|err| err.to_string())
