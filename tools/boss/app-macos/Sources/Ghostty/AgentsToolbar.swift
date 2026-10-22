@@ -6,7 +6,7 @@ struct AgentsToolbar: View {
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
-            controls
+            controls.frame(maxWidth: .infinity, alignment: .leading)
             ScrollView(.horizontal) {
                 controls.fixedSize(horizontal: true, vertical: false)
             }
@@ -18,7 +18,8 @@ struct AgentsToolbar: View {
     }
 
     // Preserve every control's readable width. When their combined ideal
-    // width no longer fits, the toolbar scrolls instead of squeezing labels.
+    // width fits, the spacer expands so the trailing group stays pinned to
+    // the right; otherwise the toolbar scrolls instead of squeezing labels.
     private var controls: some View {
         HStack(spacing: 10) {
             if feedUnavailable {
@@ -54,11 +55,8 @@ struct AgentsToolbar: View {
             Text(grid.poolStrip)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
         }
         .lineLimit(1)
-        .fixedSize(horizontal: true, vertical: false)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var filterMenus: some View {

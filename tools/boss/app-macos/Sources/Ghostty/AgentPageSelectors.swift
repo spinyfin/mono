@@ -20,10 +20,7 @@ struct AgentPageSelectors<Chip: View>: View {
                 }
             }
         }
-        .lineLimit(1)
-        .fixedSize(horizontal: true, vertical: false)
     }
-
 }
 
 extension AgentPageSelectors where Chip == AgentPageSelectorChip {
