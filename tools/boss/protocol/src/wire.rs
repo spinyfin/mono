@@ -2376,8 +2376,13 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::WorkError`] when `body` is blank or exceeds the
     /// engine's size cap — a handoff is a brief, not a transcript. Replies
     /// with [`FrontendEvent::CoordinatorHandoffSet`].
+    /// Requires coordinator peer ancestry and the private session authorization;
+    /// an omitted credential from an older client fails closed.
     SetCoordinatorHandoff {
         body: String,
+        /// Session credential from the private start brief, never an environment variable.
+        #[serde(default)]
+        authorization: String,
     },
 
     /// Set the interactive-pool ("Bridge Crew" + "Lower Decks") concurrency

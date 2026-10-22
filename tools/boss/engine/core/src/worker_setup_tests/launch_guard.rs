@@ -63,6 +63,22 @@ fn launch_decision(bash_command: &str) -> String {
     run_launch_guard(bash_command).0
 }
 
+#[test]
+fn launch_guard_blocks_all_handoff_subcommands() {
+    for command in [
+        "boss handoff write -",
+        "boss handoff show",
+        "boss handoff clear",
+        "/opt/bin/boss --json handoff show",
+        "env X=y /opt/bin/boss handoff write /tmp/brief",
+        "exec /opt/bin/boss handoff write -",
+        "bash -lc '/opt/bin/boss handoff write -'",
+        "BOSS_BIN=/opt/bin/boss\n\"$BOSS_BIN\" handoff show",
+    ] {
+        assert_eq!(launch_decision(command), "block", "{command}");
+    }
+}
+
 // --- the observed launches that must be blocked ---
 
 /// The first incident, verbatim. `./bazel-bin/...` carries no bundle

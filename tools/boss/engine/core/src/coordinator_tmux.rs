@@ -1117,7 +1117,7 @@ fn prepare_session_start_brief(
     let state = work_db.coordinator_handoff_state();
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let transcript_dir = coordinator_handoff::existing_transcript_dir(working_directory);
-    let brief = coordinator_handoff::compose_start_brief(
+    let mut brief = coordinator_handoff::compose_start_brief(
         StartBriefInputs::builder()
             .state(&state)
             .maybe_previous(previous)
@@ -1128,6 +1128,14 @@ fn prepare_session_start_brief(
             .maybe_guidance_error(guidance_error)
             .build(),
     );
+    if let Ok(Some(authorization)) = work_db.coordinator_handoff_authorization() {
+        brief.push_str(&format!(
+            "\nPrivate handoff write authorization for this session: {authorization}\n\
+             Supply it explicitly as `boss handoff write --authorization <authorization> <file>` (or `-` for stdin). \
+             It is not the spawn token. Keep it in this main session: never export it, put it in shared instructions, \
+             handoffs, or delegate it to a subagent. The engine requires both this credential and coordinator process ancestry.\n"
+        ));
+    }
     let (handoff_written_at, written_by_previous) = match &state {
         HandoffState::Present(handoff) => (
             Some(handoff.written_at),
@@ -2682,6 +2690,22 @@ mod tests {
             "the very first session must not be told a handoff is missing, got {brief:?}"
         );
         assert!(brief.contains("first coordinator session on this engine"), "{brief}");
+        let authorization = db.coordinator_handoff_authorization().unwrap().unwrap();
+        assert!(brief.contains(&authorization));
+        assert!(
+            !server.calls().iter().flatten().any(|arg| arg.contains(&authorization)),
+            "credential must not be exported to tmux or launch arguments"
+        );
+        assert!(
+            !std::fs::read_to_string(dir.path().join(RENDERED_PROMPT_FILENAME))
+                .unwrap()
+                .contains(&authorization)
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(brief_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]

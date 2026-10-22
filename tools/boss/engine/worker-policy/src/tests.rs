@@ -354,6 +354,7 @@ fn coordinator_verbs_stay_closed() {
         },
         FrontendRequest::GetCoordinatorHandoff,
         FrontendRequest::SetCoordinatorHandoff {
+            authorization: String::new(),
             body: "- greyarea is down".into(),
         },
         FrontendRequest::ListCoordinatorGuidance { product_id: None },

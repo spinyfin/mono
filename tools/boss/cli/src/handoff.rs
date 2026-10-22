@@ -35,6 +35,9 @@ pub(crate) enum HandoffCommand {
 pub(crate) struct HandoffWriteArgs {
     /// Path to the handoff text, or `-` to read it from stdin.
     pub(crate) file: String,
+    /// Private credential delivered in this coordinator session's start brief.
+    #[arg(long)]
+    pub(crate) authorization: String,
 }
 
 pub(crate) async fn run_handoff_command(command: HandoffCommand, ctx: &RunContext) -> Result<(), CliError> {
@@ -59,7 +62,7 @@ async fn run_write(ctx: &RunContext, args: HandoffWriteArgs) -> Result<(), CliEr
     let mut client = connect_for_work(ctx).await?;
     let handoff: CoordinatorHandoffView = rpc_call!(
         client,
-        FrontendRequest::SetCoordinatorHandoff { body },
+        FrontendRequest::SetCoordinatorHandoff { body, authorization: args.authorization },
         "handoff write",
         FrontendEvent::CoordinatorHandoffSet { handoff } => handoff,
     )?;

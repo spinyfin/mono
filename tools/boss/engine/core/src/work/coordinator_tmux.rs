@@ -10,6 +10,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use super::WorkDb;
 
 const SESSION_NAME_KEY: &str = "coordinator.tmux_session_name";
+const HANDOFF_AUTHORIZATION_KEY: &str = "coordinator.handoff_authorization";
 const SPAWN_TOKEN_KEY: &str = "coordinator.tmux_spawn_token";
 const SPAWN_STATE_KEY: &str = "coordinator.tmux_spawn_state";
 const MODEL_KEY: &str = "coordinator.tmux_model";
@@ -51,6 +52,10 @@ pub(crate) struct CoordinatorTmuxRecord {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    pub(crate) fn coordinator_handoff_authorization(&self) -> Result<Option<String>> {
+        self.get_metadata(HANDOFF_AUTHORIZATION_KEY)
+    }
+
     pub(crate) fn coordinator_tmux_record(&self) -> Result<Option<CoordinatorTmuxRecord>> {
         let conn = self.connect()?;
         let value_for = |key: &str| {
@@ -107,9 +112,11 @@ impl WorkDb {
     ) -> Result<()> {
         let mut conn = self.connect()?;
         let spawned_at = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
+        let authorization = crate::engine_control::generate_token();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (key, value) in [
             (SESSION_NAME_KEY, session_name),
+            (HANDOFF_AUTHORIZATION_KEY, authorization.as_str()),
             (SPAWN_TOKEN_KEY, spawn_token),
             (SPAWN_STATE_KEY, "intended"),
             (MODEL_KEY, model),

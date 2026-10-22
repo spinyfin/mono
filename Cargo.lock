@@ -438,6 +438,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "boss-backoff",
+ "boss-engine-utils",
  "boss-log-files",
  "boss-protocol",
  "libc",

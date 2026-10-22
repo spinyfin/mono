@@ -337,10 +337,14 @@ async fn handoff_write_through_the_handler_replaces_the_coordinator() {
     assert!(runner.position("new-session").is_none());
 
     let write_sink = make_session_sink();
+    state.set_boss_pid(std::process::id() as libc::pid_t);
+    let mut write_dispatch = dispatch(&state, &write_sink, "write-1");
+    write_dispatch.peer_pid = Some(std::process::id() as libc::pid_t);
     coordinator_handoff::handle_set_coordinator_handoff(
-        dispatch(&state, &write_sink, "write-1"),
+        write_dispatch,
         FrontendRequest::SetCoordinatorHandoff {
             body: "- fresh facts".to_owned(),
+            authorization: state.work_db.coordinator_handoff_authorization().unwrap().unwrap(),
         },
     )
     .await;

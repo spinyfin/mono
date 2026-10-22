@@ -7,7 +7,7 @@
 //! and future TUI/web frontends share one set of rules.
 
 #[cfg(target_os = "macos")]
-mod process_args;
+use boss_engine_utils::process_args;
 mod replay;
 mod retry;
 #[cfg(test)]

@@ -1,8 +1,10 @@
-//! Darwin process arguments without launching the setuid `ps` executable,
-//! which macOS refuses to execute inside a Seatbelt sandbox.
+//! Process arguments without launching `ps`. Darwin uses sysctl because macOS
+//! refuses to execute the setuid `ps` inside a Seatbelt sandbox; Linux uses procfs.
 
+#[cfg(target_os = "macos")]
 use std::ffi::c_int;
 
+#[cfg(target_os = "macos")]
 fn read_sysctl(name: &mut [c_int], buffer: &mut [u8]) -> Option<usize> {
     let mut len = buffer.len();
     // SAFETY: Both slices are valid for their supplied lengths, len is a
@@ -20,7 +22,8 @@ fn read_sysctl(name: &mut [c_int], buffer: &mut [u8]) -> Option<usize> {
     (result == 0 && len <= buffer.len()).then_some(len)
 }
 
-pub(super) fn command(pid: u32) -> Option<String> {
+#[cfg(target_os = "macos")]
+pub fn command(pid: u32) -> Option<String> {
     let mut size = [0; size_of::<c_int>()];
     read_sysctl(&mut [libc::CTL_KERN, libc::KERN_ARGMAX], &mut size)?;
     let capacity = usize::try_from(c_int::from_ne_bytes(size)).ok()?;
@@ -32,6 +35,7 @@ pub(super) fn command(pid: u32) -> Option<String> {
     parse_command(&buffer[..len])
 }
 
+#[cfg(target_os = "macos")]
 fn parse_command(buffer: &[u8]) -> Option<String> {
     let (argc, rest) = buffer.split_at_checked(size_of::<c_int>())?;
     let argc = usize::try_from(c_int::from_ne_bytes(argc.try_into().ok()?)).ok()?;
@@ -52,7 +56,24 @@ fn parse_command(buffer: &[u8]) -> Option<String> {
     Some(command.join(" "))
 }
 
-#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub fn command(pid: u32) -> Option<String> {
+    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let command = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!command.is_empty()).then_some(command)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn command(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 

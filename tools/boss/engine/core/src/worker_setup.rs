@@ -1117,6 +1117,7 @@ fn deny_rules(input: &WorkerSetupInput, fence: DataDirFence) -> Vec<String> {
     // (see `claude::BOSS_LAUNCH_GUARD_COMMAND`), which is path-agnostic.
     rules.push("Bash(bossctl)".to_owned());
     rules.push("Bash(bossctl:*)".to_owned());
+    rules.push("Bash(boss handoff:*)".to_owned());
 
     // `boss` lifecycle verbs that bounce the engine out from under
     // the worker. The rest of the `boss` surface (list/show/etc.)

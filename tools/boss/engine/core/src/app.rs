@@ -2572,6 +2572,20 @@ async fn handle_frontend_connection(
             .worker_tier_denial(&peer_class, &request)
             .or(row_scope_denial)
         {
+            if let FrontendRequest::SetCoordinatorHandoff { authorization, .. } = &request {
+                let expected = server_state.work_db.coordinator_handoff_authorization().ok().flatten();
+                let caller = coordinator_handoff::rejected_caller(
+                    peer_pid,
+                    &[authorization.as_str(), expected.as_deref().unwrap_or_default()],
+                );
+                crate::audit::record_event(
+                    "coordinator_handoff_rejected",
+                    &serde_json::json!({
+                        "pid": peer_pid, "caller": caller, "reason": "worker-tier denial",
+                        "run_id": peer_class.worker_run_id(),
+                    }),
+                );
+            }
             tracing::warn!(
                 session_id = %session_id,
                 run_id = peer_class.worker_run_id().unwrap_or("<unresolved>"),

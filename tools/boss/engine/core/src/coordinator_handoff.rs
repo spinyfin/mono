@@ -444,10 +444,21 @@ pub(crate) fn existing_transcript_dir(working_directory: &Path) -> Option<PathBu
 /// Write the brief where the coordinator's launch command reads it from.
 /// Returns the absolute path written.
 pub(crate) fn write_start_brief(working_directory: &Path, brief: &str) -> Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = working_directory.join(".claude");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(START_BRIEF_FILENAME);
-    std::fs::write(&path, brief).with_context(|| format!("writing session-start brief to {}", path.display()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("opening session-start brief at {}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(brief.as_bytes())
+        .with_context(|| format!("writing session-start brief to {}", path.display()))?;
     Ok(path)
 }
 
