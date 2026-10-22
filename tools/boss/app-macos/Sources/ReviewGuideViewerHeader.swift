@@ -120,6 +120,7 @@ struct ReviewGuideViewerHeader: View {
                 }
                 currentnessBanner(for: task)
                 mergeFeedbackRow(for: task)
+                ReviewGuideAttachments(chatModel: chatModel, rootTaskId: rootTaskId)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)

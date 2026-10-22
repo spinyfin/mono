@@ -13,6 +13,7 @@ final class QueuedReadReconnectTests: XCTestCase {
         let client = model.engine
         let disconnected = expectation(description: "entered reconnect backoff")
         let contentReceived = expectation(description: "viewer received queued guide response")
+        let attachmentsReceived = expectation(description: "viewer received queued screenshot response")
         var sawDisconnect = false
         var droppedRequests: [String] = []
         var transportErrors: [String] = []
@@ -25,6 +26,7 @@ final class QueuedReadReconnectTests: XCTestCase {
             case .notConnected(let kind): droppedRequests.append(kind)
             case .transportError(let message): transportErrors.append(message)
             case .reviewGuideContent: contentReceived.fulfill()
+            case .attachmentsList: attachmentsReceived.fulfill()
             default: break
             }
         }
@@ -43,13 +45,13 @@ final class QueuedReadReconnectTests: XCTestCase {
         ))
         model.openReviewGuide(versionId: "version", rootTaskId: "root")
         let guideID = try XCTUnwrap(model.pendingReviewGuideRequestId)
-        XCTAssertEqual(client.queuedReadCountForTesting, 2)
+        XCTAssertEqual(client.queuedReadCountForTesting, 3)
         guard case .loading = model.asyncMarkdownViewerVM.state else {
             return XCTFail("guide must wait for reconnect")
         }
 
-        let wireReads = expectation(description: "both queued envelopes reached socket")
-        wireReads.expectedFulfillmentCount = 2
+        let wireReads = expectation(description: "tree, guide, and screenshot envelopes reached socket")
+        wireReads.expectedFulfillmentCount = 3
         let server = try QueuedReadSocketServer(path: path) { payload, requestID in
             let kind = payload["type"] as? String
             // The model also refreshes its restored product on .connected;
@@ -60,10 +62,14 @@ final class QueuedReadReconnectTests: XCTestCase {
             } else if kind == "get_review_guide_content" {
                 XCTAssertEqual(requestID, guideID)
                 wireReads.fulfill()
+            } else if kind == "list_attachments_for_work_item" {
+                XCTAssertEqual(payload["work_item_id"] as? String, "root")
+                XCTAssertEqual(payload["include_revision_chain"] as? Bool, true)
+                wireReads.fulfill()
             }
         }
         defer { server.stop() }
-        await fulfillment(of: [wireReads, contentReceived], timeout: 10)
+        await fulfillment(of: [wireReads, contentReceived, attachmentsReceived], timeout: 10)
         XCTAssertEqual(client.queuedReadCountForTesting, 0)
         XCTAssertTrue(droppedRequests.isEmpty)
         XCTAssertNil(model.pendingReviewGuideRequestId)
@@ -71,6 +77,8 @@ final class QueuedReadReconnectTests: XCTestCase {
             return XCTFail("the replayed guide response must finish loading")
         }
         XCTAssertEqual(markdown, "# Reconnected guide")
+        XCTAssertEqual(model.attachmentsByTaskID["root"], [])
+        XCTAssertFalse(model.attachmentsInFlightTaskIDs.contains("root"))
         XCTAssertNil(model.workErrorMessage)
     }
 }
@@ -130,17 +138,10 @@ private final class QueuedReadSocketServer {
                           let payload = envelope["payload"] as? [String: Any],
                           let kind = payload["type"] as? String else { continue }
                     onRead(payload, id)
-                    if kind == "get_review_guide_content" {
+                    if let response = Self.response(for: kind) {
                         let reply: [String: Any] = [
                             "request_id": id,
-                            "payload": [
-                                "type": "review_guide_content", "version_id": "version",
-                                "content": [
-                                    "id": "version", "series_id": "series", "comparison_id": "comparison",
-                                    "attempt_id": "attempt", "markdown": "# Reconnected guide",
-                                    "content_hash": "hash", "prompt_version": "v1", "generated_at": "2026-01-01",
-                                ],
-                            ],
+                            "payload": response,
                         ]
                         guard var data = try? JSONSerialization.data(withJSONObject: reply) else { return }
                         data.append(0x0A)
@@ -161,5 +162,23 @@ private final class QueuedReadSocketServer {
     func stop() {
         shutdown(listenFD, SHUT_RDWR)
         close(listenFD)
+    }
+
+    private static func response(for kind: String) -> [String: Any]? {
+        switch kind {
+        case "get_review_guide_content":
+            return [
+                "type": "review_guide_content", "version_id": "version",
+                "content": [
+                    "id": "version", "series_id": "series", "comparison_id": "comparison",
+                    "attempt_id": "attempt", "markdown": "# Reconnected guide",
+                    "content_hash": "hash", "prompt_version": "v1", "generated_at": "2026-01-01",
+                ],
+            ]
+        case "list_attachments_for_work_item":
+            return ["type": "attachments_list", "work_item_id": "root", "attachments": []]
+        default:
+            return nil
+        }
     }
 }

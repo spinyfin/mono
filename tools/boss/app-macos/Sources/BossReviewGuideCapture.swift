@@ -11,6 +11,8 @@ import SwiftUI
 ///   empty addendum.
 /// - `--capture-findings-collapsed` — start with the addendum disclosure
 ///   collapsed instead of expanded.
+/// - `--capture-attachments=<n>` and `--capture-attachment-image=<png>` —
+///   seed registered evidence using a local screenshot (default: no evidence).
 ///
 /// Hosts the same header + document composition `AsyncMarkdownViewerView`
 /// mounts for a loaded guide, with a disconnected `ChatViewModel` seeded
@@ -32,7 +34,7 @@ enum BossReviewGuideCapture {
         let versionID = "prgv_capture"
         var task = WorkTask(
             id: "review-guide-capture", productID: "fixture", projectID: nil, kind: "task",
-            name: "Findings panel fixture", description: "", status: "in_review",
+            name: "Review guide viewer fixture", description: "", status: "in_review",
             priority: "medium", ordinal: 0,
             prURL: "https://github.com/spinyfin/mono/pull/3065", deletedAt: nil,
             createdAt: "2026-10-20T12:00:00Z", updatedAt: "2026-10-20T12:00:00Z"
@@ -40,6 +42,12 @@ enum BossReviewGuideCapture {
         task.reviewGuideLifecycle = "ready"
         task.reviewGuideReadableVersionId = versionID
         model.taskIndexByID = [task.id: task]
+        do {
+            model.attachmentsByTaskID[task.id] = try BossReviewGuideAttachmentCapture.attachments(taskId: task.id)
+        } catch {
+            fputs("review guide evidence fixture failed: \(error)\n", stderr)
+            exit(1)
+        }
         model.reviewGuideFindingsBySeriesID[seriesID] = findings(count: count)
         // The guide on screen is the readable version, so the currentness
         // banner stays quiet, as it does for a freshly opened guide.
@@ -136,8 +144,12 @@ enum BossReviewGuideCapture {
     private static let guideMarkdown = """
     # What this PR changes
 
-    The review guide viewer's findings panel sizes its addendum list to its \
-    content, up to a height cap.
+    Review guides show registered screenshot evidence alongside review findings.
+
+    ## Evidence
+
+    Registered screenshots appear above this guide. Select a thumbnail to
+    inspect it in the screenshot viewer. This fixture uses sample evidence.
 
     ## Why
 
@@ -150,9 +162,11 @@ enum BossReviewGuideCapture {
     the addendum.
     - Collapse and re-expand the addendum; the panel should resize both ways.
     - Open a guide with many findings and confirm the list scrolls past the cap.
+    - Check the empty screenshot state, a single image, and before/after pairs.
 
     ## Risk
 
     Layout only. No engine or protocol change.
+
     """
 }

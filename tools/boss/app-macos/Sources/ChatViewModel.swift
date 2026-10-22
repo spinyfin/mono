@@ -213,6 +213,8 @@ final class ChatViewModel: ObservableObject {
     /// Cleared per-task before each fresh fetch, mirroring
     /// [[executionsByTaskID]].
     @Published var attachmentsByTaskID: [String: [AttachmentVM]] = [:]
+    /// Shared selection lets guide thumbnails select an image in an already-open viewer.
+    @Published var selectedAttachmentIDByTaskID: [String: String] = [:]
     /// Task ids with an in-flight `list_attachments_for_work_item` request.
     /// Mirrors [[executionsInFlightTaskIDs]] for the same reason.
     var attachmentsInFlightTaskIDs: Set<String> = []
