@@ -69,6 +69,7 @@ use crate::paths;
 use crate::reuse_guard::escape_revset_string;
 
 use crate::app::errors::{CubeError, Result};
+use crate::app::health::{HeadStatus, probe_workspace_reuse};
 use crate::app::jj::run_jj_within;
 
 /// Schema version of `manifest.json`, so a future reader can tell what it is
@@ -402,6 +403,64 @@ pub(super) fn attributed_holder(record: &WorkspaceRecord) -> Option<&str> {
 /// [`attributed_holder`].
 pub(super) fn attributed_task(record: &WorkspaceRecord) -> Option<&str> {
     record.task.as_deref().or(record.last_task.as_deref())
+}
+
+/// What [`probe_and_salvage`] learned and, when the workspace held unpushed
+/// work, where that work was captured.
+pub(super) struct ProbedAndSalvaged {
+    pub(super) status: HeadStatus,
+    /// The salvage record, when `@` held work no remote has. `None` when the
+    /// workspace was already reusable and nothing needed capturing.
+    pub(super) salvaged_to: Option<PathBuf>,
+}
+
+/// Why [`probe_and_salvage`] stopped short of a reset-ready workspace.
+pub(super) enum ProbeSalvageError {
+    /// The fetch or head-status read failed (or ran out of budget).
+    Probe(Box<CubeError>),
+    /// The probe found unpushed work and the capture could not be proven
+    /// complete, so the workspace must be left exactly as it was.
+    Salvage {
+        status: Box<HeadStatus>,
+        error: Box<CubeError>,
+    },
+}
+
+/// The look-before-touching half of every reclaim of a free workspace: fetch
+/// and read the reuse guard's verdict, then salvage anything no remote has.
+///
+/// Both the retention GC and the lease-time reclaim run exactly this, so the
+/// "an incomplete salvage licenses nothing" rule lives in one place. Callers
+/// keep only what is theirs: the audit event names and what happens next. On
+/// `Ok` the workspace is safe to reset; on `Err` it must be left alone, and
+/// the caller owns discarding the record of any *later* failure with
+/// [`discard_salvage_record`].
+pub(super) fn probe_and_salvage(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    record: &WorkspaceRecord,
+    main_branch: &str,
+    now_epoch_s: i64,
+    deadline: Option<Instant>,
+) -> std::result::Result<ProbedAndSalvaged, ProbeSalvageError> {
+    let status = probe_workspace_reuse(runner, database_path, &record.workspace_path, main_branch, deadline)
+        .map_err(|e| ProbeSalvageError::Probe(Box::new(e)))?;
+    if status.is_reusable() {
+        return Ok(ProbedAndSalvaged {
+            status,
+            salvaged_to: None,
+        });
+    }
+    match salvage_workspace(runner, database_path, record, main_branch, now_epoch_s, deadline) {
+        Ok(path) => Ok(ProbedAndSalvaged {
+            status,
+            salvaged_to: Some(path),
+        }),
+        Err(error) => Err(ProbeSalvageError::Salvage {
+            status: Box::new(status),
+            error: Box::new(error),
+        }),
+    }
 }
 
 /// Delete a salvage record written by [`salvage_workspace`].

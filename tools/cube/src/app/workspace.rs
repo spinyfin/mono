@@ -34,6 +34,10 @@ use crate::app::health::{
     WorkspaceHealthOutcome, check_workspace_health, read_head_status, repair_conflicted_bookmarks,
 };
 use crate::app::jj::{cleanup_workspace_logs, current_workspace_commit, run_jj, workspace_path_exists};
+use crate::app::lease_reclaim::{
+    ProvisionPath, ProvisioningContext, ReclaimLimits, ReclaimUndo, ScanProbes, reclaim_unhealthy_workspace_for_lease,
+    report_provisioning,
+};
 use crate::app::provision::{
     auto_create_workspace, discover_workspaces, find_workspace_record, format_lease_message, format_setup_message,
     gc_broken_empty_workspace, run_setup_for_workspace,
@@ -141,6 +145,15 @@ const LEASE_HEALTH_SCAN_BUDGET: Duration = Duration::from_secs(5);
 /// health scan when nothing usable was found. Its probes each include a
 /// `jj git fetch`, so it is bounded in time as well as in probe count.
 const QUARANTINE_RECLAIM_BUDGET: Duration = Duration::from_secs(5);
+
+/// Wall-clock budget for the cached-unhealthy reclaim that runs after the
+/// quarantine reclaim, when the pool still has nothing usable to hand out.
+/// Each attempt is a fetch plus a head-status read, and a candidate with
+/// unpushed work adds one `jj diff` per salvaged commit; ten seconds covers
+/// a couple of attempts on a healthy remote and is a small price against
+/// the alternative, which is a fresh workspace and a cold Bazel build.
+/// See [`crate::app::lease_reclaim`].
+const LEASE_UNHEALTHY_RECLAIM_BUDGET: Duration = Duration::from_secs(10);
 
 /// Wall-clock budget for the compaction pass a lease runs when it finds the
 /// pool's volume below its free-space floor.
@@ -260,6 +273,7 @@ pub(super) fn run_workspace(
                     prior_lease_expires_at_epoch_s = swept.lease_expires_at_epoch_s,
                 );
             }
+            let expired_ids: Vec<String> = expired.iter().map(|e| e.workspace_id.clone()).collect();
             let expired_by_workspace_id: std::collections::HashMap<&str, &crate::store::ExpiredLease> =
                 expired.iter().map(|e| (e.workspace_id.as_str(), e)).collect();
             // Self-heal any rows whose on-disk directory has been deleted
@@ -620,6 +634,11 @@ pub(super) fn run_workspace(
             // (workspace_id, path) so the lease path can GC them and reuse the
             // freed slot rather than surfacing a "broken-empty" failure.
             let mut broken_empty: Vec<(String, PathBuf)> = Vec::new();
+            // What this lease's own probes learned about each workspace they
+            // found unusable, so a later reclaim of one of them (see
+            // `reclaim_unhealthy_workspace_for_lease`) does not pay for a
+            // second `jj status` to learn the same thing.
+            let mut scan_probes: ScanProbes = ScanProbes::new();
 
             for ws in &ordered {
                 let ws_id = &ws.workspace_id;
@@ -827,6 +846,7 @@ pub(super) fn run_workspace(
                             "skipped": conflicted_candidate.is_some(),
                         }));
                         store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Conflicted)?;
+                        scan_probes.insert(ws_id.clone(), Some(bookmarks.clone()));
                         if conflicted_candidate.is_none() {
                             conflicted_candidate = Some((ws_id.clone(), bookmarks.clone()));
                         }
@@ -841,6 +861,7 @@ pub(super) fn run_workspace(
                             "reason": "dirty_working_copy",
                         }));
                         store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Dirty)?;
+                        scan_probes.insert(ws_id.clone(), None);
                         audit!(
                             database_path,
                             "workspace.health_check_skipped",
@@ -967,6 +988,51 @@ pub(super) fn run_workspace(
                 }
             }
 
+            // Still nothing: before growing the pool, reclaim a free workspace
+            // the registry holds as dirty or conflicted (released with
+            // unpushed work preserved, returned by an expired lease, or
+            // tainted by a store-wide bookmark conflict). Any unpushed work is
+            // salvaged first; a candidate that cannot be salvaged is left
+            // exactly as it was. Workspaces whose lease expired in this very
+            // call are not candidates: the reset guard below refuses them.
+            let mut lease_reclaim_bookmarks: Vec<String> = Vec::new();
+            let mut lease_reclaim_report = None;
+            let mut lease_reclaim_undo: Option<ReclaimUndo> = None;
+            if chosen_id.is_none() {
+                match reclaim_unhealthy_workspace_for_lease(
+                    runner,
+                    &store,
+                    database_path,
+                    &repo,
+                    &repo_record.main_branch,
+                    &scan_probes,
+                    &ReclaimLimits {
+                        exclude: &exclude,
+                        expired_this_call: &expired_ids,
+                        now_epoch_s: leased_at_epoch_s,
+                        deadline: Some(Instant::now() + LEASE_UNHEALTHY_RECLAIM_BUDGET),
+                    },
+                ) {
+                    Ok((reclaimed, report)) => {
+                        if let Some(reclaimed) = reclaimed {
+                            health_checks.push(json!({
+                                "workspace_id": reclaimed.workspace_id,
+                                "health": "unhealthy_reclaimed",
+                                "skipped": false,
+                                "conflicted_bookmarks": reclaimed.conflicted_bookmarks,
+                            }));
+                            lease_reclaim_bookmarks = reclaimed.conflicted_bookmarks;
+                            lease_reclaim_undo = Some(reclaimed.undo);
+                            chosen_id = Some(reclaimed.workspace_id);
+                        }
+                        lease_reclaim_report = Some(report);
+                    }
+                    Err(e) => {
+                        eprintln!("cube: unhealthy reclaim: scan failed, provisioning instead: {e}");
+                    }
+                }
+            }
+
             // A claim can still be refused (a cleanup began on the row after
             // the scan listed it); that is a reason to provision, not an error.
             let claimed_chosen = match chosen_id {
@@ -983,11 +1049,16 @@ pub(super) fn run_workspace(
                     .map(|ws| (ws, ws_id)),
                 None => None,
             };
+            if claimed_chosen.is_none()
+                && let Some(undo) = lease_reclaim_undo.take()
+            {
+                undo.roll_back(&store, database_path, "claim_refused");
+            }
             let (mut workspace, mut was_auto_created, repair_bookmarks) = if let Some((ws, ws_id)) = claimed_chosen {
                 let bookmarks = conflicted_candidate
                     .filter(|(id, _)| *id == ws_id)
                     .map(|(_, b)| b)
-                    .unwrap_or_default();
+                    .unwrap_or(lease_reclaim_bookmarks);
                 (ws, false, bookmarks)
             } else {
                 // No clean or repairable workspace. Self-heal any broken-empty
@@ -1001,9 +1072,9 @@ pub(super) fn run_workspace(
                 }
 
                 // Pool is empty, fully leased, only had broken-empty husks
-                // (now GC'd), or all free slots are dirty: grow the pool by
-                // one. Dirty workspaces are left untouched so their unpushed
-                // work is preserved for later inspection. The pool is an
+                // (now GC'd), or every free slot is dirty or conflicted and
+                // the lease-time reclaim could not salvage any of them: grow
+                // the pool by one. Those slots are left untouched. The pool is an
                 // optimisation (reuse a known-good checkout), never a hard
                 // cap — a lease for a reachable repo always succeeds.
                 //
@@ -1015,14 +1086,30 @@ pub(super) fn run_workspace(
                 // volume below its free-space floor that compaction could not
                 // recover — a fact about the host, not the pool — which
                 // `auto_create_workspace` surfaces loudly.
+                // Say why, before growing: for every free workspace, the
+                // reason this lease did not use it.
+                report_provisioning(
+                    database_path,
+                    &ProvisioningContext::builder()
+                        .repo(&repo)
+                        .path(ProvisionPath::NoEligibleFree)
+                        .effective_free(&effective_free)
+                        .cached_unhealthy(&cached_unhealthy)
+                        .exclude(&exclude)
+                        .probes(probes)
+                        .maybe_scan_truncated(scan_truncated)
+                        .health_checks(&health_checks)
+                        .maybe_reclaim(lease_reclaim_report.as_ref())
+                        .build(),
+                );
                 let new_candidate = auto_create_workspace(runner, database_path, &repo_record, &candidates)?;
                 let new_id = new_candidate.workspace_id.clone();
                 candidates.push(new_candidate);
                 store.sync_workspaces(&repo, &candidates)?;
                 // Claim the workspace we just created by id. A generic claim
                 // could otherwise grab a leftover free-but-dirty workspace and
-                // destructively reset it — the dirty entries are intentionally
-                // preserved for the operator.
+                // destructively reset it — the free dirty slots the reclaim
+                // could not salvage are left untouched.
                 let ws = store
                     .claim_specific_workspace(
                         &repo,
@@ -1077,12 +1164,43 @@ pub(super) fn run_workspace(
             // but the conflicts would still appear in `jj status` for the
             // new worker — better to clean them up now so the workspace is
             // truly pristine.
-            if !repair_bookmarks.is_empty()
-                && let Err(error) =
+            if !repair_bookmarks.is_empty() {
+                if let Err(error) =
                     repair_conflicted_bookmarks(runner, database_path, &workspace.workspace_path, &repair_bookmarks)
-            {
-                let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
-                return Err(error);
+                {
+                    let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
+                    if let Some(undo) = &lease_reclaim_undo {
+                        undo.roll_back(&store, database_path, "bookmark_repair_failed");
+                    }
+                    return Err(error);
+                }
+                // Bookmarks live in the repo's shared jj store, not in any
+                // one workspace, so `jj status` reported this same conflict
+                // from every free workspace the scan probed and each of them
+                // was cached `conflicted` — withheld from every later lease
+                // until the revalidation window or pool GC happened to
+                // re-probe it. The repair just removed the conflict for all
+                // of them at once; let the cache say so.
+                match store.clear_cached_conflicted_health(&workspace.repo) {
+                    Ok(cleared) if cleared > 0 => {
+                        audit!(
+                            database_path,
+                            "workspace.conflicted_cache_cleared",
+                            repo = workspace.repo,
+                            repaired_in = workspace.workspace_id,
+                            bookmarks = repair_bookmarks,
+                            cleared = cleared,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "warning: cube repaired conflicted bookmarks in {} but could not clear the \
+                             cached `conflicted` health of its sibling workspaces: {error}",
+                            workspace.workspace_id,
+                        );
+                    }
+                }
             }
 
             // If the workspace we just claimed was reclaimed-from-expired
@@ -1115,6 +1233,9 @@ pub(super) fn run_workspace(
                 } = error
                 else {
                     let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
+                    if let Some(undo) = &lease_reclaim_undo {
+                        undo.roll_back(&store, database_path, "reset_failed");
+                    }
                     return Err(error);
                 };
 
@@ -1150,6 +1271,22 @@ pub(super) fn run_workspace(
                     workspace_id = workspace.workspace_id,
                     prior_lease_id = refused_prior_lease_id,
                     prior_holder = refused_prior_holder,
+                );
+
+                report_provisioning(
+                    database_path,
+                    &ProvisioningContext::builder()
+                        .repo(&repo)
+                        .path(ProvisionPath::ResetRefused)
+                        .effective_free(&effective_free)
+                        .cached_unhealthy(&cached_unhealthy)
+                        .exclude(&exclude)
+                        .probes(probes)
+                        .maybe_scan_truncated(scan_truncated)
+                        .health_checks(&health_checks)
+                        .maybe_reclaim(lease_reclaim_report.as_ref())
+                        .refused(&workspace.workspace_id)
+                        .build(),
                 );
 
                 let retry_lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
@@ -1277,6 +1414,9 @@ pub(super) fn run_workspace(
                 "setup": setup_report,
                 "health_check": health_checks,
                 "health_scan": scan_summary,
+                // Present only when the scan found nothing usable and the
+                // lease tried to reclaim a cached-unhealthy workspace.
+                "unhealthy_reclaim": lease_reclaim_report.as_ref().map(|r| r.to_json()),
                 // Present only when this lease found the volume below its
                 // free-space floor and reclaimed. Absent is the normal case
                 // and means "there was nothing to relieve".

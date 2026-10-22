@@ -2,7 +2,7 @@
 //! unhealthy workspaces, stale logs, and the background pool GC trigger.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use git_utils::pr_bookmark;
@@ -23,7 +23,8 @@ use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, t
 use crate::app::reconcile::reconcile_free_workspace_health;
 use crate::app::reset::reset_workspace_after_fetch_within;
 use crate::app::salvage::{
-    attributed_holder, attributed_task, discard_salvage_record, gc_aged_salvage_records, salvage_workspace,
+    ProbeSalvageError, ProbedAndSalvaged, attributed_holder, attributed_task, discard_salvage_record,
+    gc_aged_salvage_records, probe_and_salvage,
 };
 use crate::app::util::current_epoch_s;
 
@@ -865,80 +866,52 @@ pub(super) fn gc_aged_unhealthy_workspaces(
         // this probe is 120s per attempt with two retries behind it, so one
         // slow remote could otherwise hold a lease for several minutes and
         // blow both this pass's 20s budget and the engine's 90s lease timeout.
-        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, &main_branch, deadline)
-        {
-            Ok(status) => status,
-            Err(e) if jj::is_time_budget_error(&e) => {
-                // Deferral, not a health verdict: this candidate was never
-                // actually evaluated, so it must not be reported the same way
-                // as a genuine probe failure below.
-                eprintln!(
-                    "cube: retention: {}: time budget exhausted, leaving retained (not evaluated): {e}",
-                    record.workspace_id,
-                );
-                audit!(
-                    database_path,
-                    "workspace.retention_budget_exhausted",
-                    repo = record.repo,
-                    workspace_id = record.workspace_id,
-                    prior_health = prior_health,
-                    age_secs = age_secs,
-                    error = e.to_string(),
-                );
-                continue;
-            }
-            Err(e) => {
-                eprintln!(
-                    "cube: retention: {}: reuse probe failed, leaving retained: {e}",
-                    record.workspace_id,
-                );
-                audit!(
-                    database_path,
-                    "workspace.retention_probe_error",
-                    repo = record.repo,
-                    workspace_id = record.workspace_id,
-                    prior_health = prior_health,
-                    age_secs = age_secs,
-                    error = e.to_string(),
-                );
-                continue;
-            }
-        };
-
-        // Anything the workspace holds that no remote has gets salvaged before
-        // the reset. A failed salvage is a hard stop for this workspace: the
-        // whole basis for bounding retention is that expiry cannot lose work.
-        // "Failed" includes any capture that cannot be proven complete — an
-        // empty log after a probe that refused reuse, or a stack larger than
-        // the export cap — see `salvage_workspace`.
-        let mut salvaged_to: Option<PathBuf> = None;
-        if !status.is_reusable() {
-            match salvage_workspace(runner, database_path, &record, &main_branch, now_epoch_s, deadline) {
-                Ok(path) => {
-                    let path_str = path.display().to_string();
+        let (status, salvaged_to) =
+            match probe_and_salvage(runner, database_path, &record, &main_branch, now_epoch_s, deadline) {
+                Ok(ProbedAndSalvaged { status, salvaged_to }) => (status, salvaged_to),
+                Err(ProbeSalvageError::Probe(e)) if jj::is_time_budget_error(&e) => {
+                    // Deferral, not a health verdict: this candidate was never
+                    // actually evaluated, so it must not be reported the same way
+                    // as a genuine probe failure below.
                     eprintln!(
-                        "cube: retention: {} held unpushed work; salvaged to {path_str} before reclaiming",
+                        "cube: retention: {}: time budget exhausted, leaving retained (not evaluated): {e}",
                         record.workspace_id,
                     );
                     audit!(
                         database_path,
-                        "workspace.retention_salvaged",
+                        "workspace.retention_budget_exhausted",
                         repo = record.repo,
                         workspace_id = record.workspace_id,
                         prior_health = prior_health,
-                        prior_holder = attributed_holder(&record),
-                        prior_task = attributed_task(&record),
                         age_secs = age_secs,
-                        head_change_id = status.head_change_id(),
-                        unpushed_commits = status.unpushed_summary(),
-                        salvage_path = path_str,
+                        error = e.to_string(),
                     );
-                    salvaged_to = Some(path);
+                    continue;
                 }
-                Err(e) => {
+                Err(ProbeSalvageError::Probe(e)) => {
+                    eprintln!(
+                        "cube: retention: {}: reuse probe failed, leaving retained: {e}",
+                        record.workspace_id,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.retention_probe_error",
+                        repo = record.repo,
+                        workspace_id = record.workspace_id,
+                        prior_health = prior_health,
+                        age_secs = age_secs,
+                        error = e.to_string(),
+                    );
+                    continue;
+                }
+                // A failed salvage is a hard stop for this workspace: the whole
+                // basis for bounding retention is that expiry cannot lose work.
+                // "Failed" includes any capture that cannot be proven complete —
+                // see `salvage_workspace`.
+                Err(ProbeSalvageError::Salvage { status, error: e }) => {
                     eprintln!(
                         "cube: retention: {}: salvage failed, leaving retained rather than \
-                         reclaiming: {e}",
+                     reclaiming: {e}",
                         record.workspace_id,
                     );
                     audit!(
@@ -954,8 +927,28 @@ pub(super) fn gc_aged_unhealthy_workspaces(
                     );
                     continue;
                 }
-            }
-        } else if is_quarantined {
+            };
+        if let Some(path) = &salvaged_to {
+            let path_str = path.display().to_string();
+            eprintln!(
+                "cube: retention: {} held unpushed work; salvaged to {path_str} before reclaiming",
+                record.workspace_id,
+            );
+            audit!(
+                database_path,
+                "workspace.retention_salvaged",
+                repo = record.repo,
+                workspace_id = record.workspace_id,
+                prior_health = prior_health,
+                prior_holder = attributed_holder(&record),
+                prior_task = attributed_task(&record),
+                age_secs = age_secs,
+                head_change_id = status.head_change_id(),
+                unpushed_commits = status.unpushed_summary(),
+                salvage_path = path_str,
+            );
+        }
+        if salvaged_to.is_none() && is_quarantined {
             audit!(
                 database_path,
                 "workspace.quarantine_cleared",

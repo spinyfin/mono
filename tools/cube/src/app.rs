@@ -18,6 +18,7 @@ mod gc;
 mod gh_pr;
 mod health;
 mod jj;
+mod lease_reclaim;
 mod pr;
 mod provision;
 mod reclaim;

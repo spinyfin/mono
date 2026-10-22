@@ -11,6 +11,7 @@ mod gh_pr_tests;
 mod goto_tests;
 mod health_recovery_tests;
 mod jj_tests;
+mod lease_reclaim_tests;
 mod lease_tests;
 mod list_status_tests;
 mod pr_push_tests;
