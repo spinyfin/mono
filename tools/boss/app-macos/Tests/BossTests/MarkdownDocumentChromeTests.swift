@@ -787,13 +787,9 @@ final class MarkdownDocumentChromeTests: XCTestCase {
 
     /// The findings addendum must size to its content: two findings take a
     /// few lines, the 200-point cap only ever caps a long list, and
-    /// collapsing the disclosure gives the height back. A greedy
-    /// `ScrollView` under `.frame(maxHeight:)` used to hold the whole cap
-    /// (~200 points of empty panel under a two-line list) whenever the
-    /// window had room to spare — which the viewer, hosting the header
-    /// above a flexible document body, always does. The probe reproduces
-    /// that composition: header on top of a flexible sibling in a window
-    /// far taller than the header.
+    /// collapsing the disclosure gives the height back. The probe
+    /// hosts the header on top of a flexible sibling in a window far taller
+    /// than the header, as the viewer does.
     func testReviewGuideViewerHeaderFindingsPanelFitsItsContent() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         var task = Self.makeReviewGuideTestTask(id: "task_1")
@@ -856,7 +852,7 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertGreaterThan(bare, 0)
 
         // Status line + disclosure row + two one-line bullets: well under
-        // the cap. The greedy layout measured ~225 points here.
+        // the cap.
         XCTAssertLessThan(
             twoExpanded - bare, 120,
             "two findings must not reserve the height cap (bare=\(bare) expanded=\(twoExpanded))"

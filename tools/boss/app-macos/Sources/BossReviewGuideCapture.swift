@@ -136,14 +136,13 @@ enum BossReviewGuideCapture {
     private static let guideMarkdown = """
     # What this PR changes
 
-    The review guide viewer's findings panel sized its addendum list to the \
-    height cap rather than to its content, pushing the guide body down.
+    The review guide viewer's findings panel sizes its addendum list to its \
+    content, up to a height cap.
 
     ## Why
 
-    A `ScrollView` takes every point its parent offers. Capping it with a \
-    maximum height turns that cap into a fixed height whenever the parent has \
-    room to spare, which the viewer window always does.
+    Short lists fit their content, and longer lists scroll once they pass \
+    the cap.
 
     ## How to review
 

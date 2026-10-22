@@ -257,14 +257,12 @@ struct ReviewGuideViewerHeader: View {
 /// The expanded addendum list: as tall as its content, scrolling only once
 /// that passes `maxHeight`.
 ///
-/// A bare `ScrollView` is greedy — it takes every point its parent offers —
-/// so `.frame(maxHeight:)` on one is a fixed height whenever the window has
-/// room to spare, which the viewer window always does. That is what left a
-/// two-line list sitting on ~200 points of empty panel. Measuring the
-/// content and offering the scroll view no more than that makes the cap a
-/// true maximum: the list fits two findings in two lines, fifteen scroll
-/// past the cap, and collapsing or re-expanding recreates this view, so the
-/// measurement never carries over from an earlier, larger list.
+/// A bare `ScrollView` takes every point its parent offers, so capping it
+/// with `.frame(maxHeight:)` alone makes the cap a fixed height. The list
+/// instead measures its content and offers the scroll view
+/// `min(content, maxHeight)`: short lists fit, long ones scroll. Collapsing
+/// or re-expanding recreates this view, so the measurement never carries
+/// over from an earlier, larger list.
 struct ReviewGuideFindingsAddendumList: View {
     let markdown: String
     /// Longest the list gets before it scrolls.
