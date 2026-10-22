@@ -458,7 +458,7 @@ new file mode 100755
 index 0000000..ed7735d
 --- /dev/null
 +++ b/rust/private/test_wrapper.sh
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,169 @@
 +#!/usr/bin/env bash
 +# Copyright 2024 The Bazel Authors. All rights reserved.
 +#
@@ -580,26 +580,37 @@ index 0000000..ed7735d
 +
 +# Filter tests for this shard.
 +# test_index % TEST_TOTAL_SHARDS == TEST_SHARD_INDEX
-+# Split on newlines via IFS word-splitting, NOT a `<<<` here-string. bash
-+# implements a here-string by writing a temp file under $TMPDIR, and a Bazel
-+# test action on macOS is not always permitted to create one ("cannot create
-+# temp file for here document: Operation not permitted"). When that happens the
-+# loop body never runs, shard_tests stays empty, and the shard exits 0 -- every
-+# shard reports PASSED without executing a single test. Same defect and same
-+# remedy as //third_party/patches:rules_apple-4.5.1-no-test-env-heredoc.patch.
++#
++# The partition is a single awk pass, not a bash `for` loop over the list. A
++# loop runs its body once per enumerated test, and macOS ships bash 3.2, where
++# each `(( ))` + array-append iteration costs ~0.2 ms: at ~6,400 tests that was
++# ~1.2 s of CPU per shard, paid by every shard on every run, and on a loaded
++# host the loop's wall time stretched to tens of seconds before the shard
++# exec'd its first test. awk does the same split in a few milliseconds
++# regardless of suite size, and the assignment is unchanged: the k-th
++# enumerated test (0-based) goes to shard k % TEST_TOTAL_SHARDS.
++if ! shard_list=$(printf '%s\n' "${test_list}" | awk \
++        -v total="${TEST_TOTAL_SHARDS}" -v shard="${TEST_SHARD_INDEX}" \
++        '(NR - 1) % total == shard'); then
++    echo "rust_test wrapper: partitioning the enumerated tests into shard ${TEST_SHARD_INDEX} of ${TEST_TOTAL_SHARDS} failed; cannot run the shard." >&2
++    exit 1
++fi
++enumerated=$(printf '%s\n' "${test_list}" | awk 'END { print NR }')
++
++# Split the shard's names on newlines via IFS word-splitting, NOT a `<<<`
++# here-string or a `read` loop over one. bash implements a here-string by
++# writing a temp file under $TMPDIR, and a Bazel test action on macOS is not
++# always permitted to create one ("cannot create temp file for here document:
++# Operation not permitted"). When that happens the split yields nothing,
++# shard_tests stays empty, and the shard exits 0 -- every shard reports PASSED
++# without executing a single test. Same defect and same remedy as
++# //third_party/patches:rules_apple-4.5.1-no-test-env-heredoc.patch.
 +# Globbing is disabled for the split so a test name is never expanded against
 +# the working directory.
-+shard_tests=()
-+index=0
 +saved_ifs="$IFS"
 +IFS=$'\n'
 +set -f
-+for test_name in $test_list; do
-+    if (( index % TEST_TOTAL_SHARDS == TEST_SHARD_INDEX )); then
-+        shard_tests+=("$test_name")
-+    fi
-+    ((index++)) || true
-+done
++shard_tests=(${shard_list})
 +set +f
 +IFS="$saved_ifs"
 +
@@ -608,8 +619,8 @@ index 0000000..ed7735d
 +# tests available means the partition step itself broke -- fail loudly instead
 +# of reporting the green that used to mask exactly that.
 +if [[ ${#shard_tests[@]} -eq 0 ]]; then
-+    if (( index > TEST_SHARD_INDEX )); then
-+        echo "rust_test wrapper: partitioned 0 of ${index} enumerated tests into shard ${TEST_SHARD_INDEX} of ${TEST_TOTAL_SHARDS}; refusing to report success" >&2
++    if (( enumerated > TEST_SHARD_INDEX )); then
++        echo "rust_test wrapper: partitioned 0 of ${enumerated} enumerated tests into shard ${TEST_SHARD_INDEX} of ${TEST_TOTAL_SHARDS}; refusing to report success" >&2
 +        exit 1
 +    fi
 +    exit 0

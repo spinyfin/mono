@@ -397,3 +397,28 @@ main4,cold,2,207.516,206.51,1373,24.51
 (`edit_test_code` run 3 in each layout is the profiled pair quoted in the action-time
 table. `build_after_edits` is the first 4-target build after several accumulated source
 probes — equivalent in kind to `edit_test_code`.)
+
+## Follow-up (2026-10-21): the wrapper's partition loop
+
+**Symptom:** during a `bazel test` of `engine_lib_test`, all 11 shard processes were observed sitting in `bash …/engine_lib_test_test_wrapper.sh` for over a minute, each at 25–35 % CPU, before exec'ing the test binary.
+
+**Measured per shard** (standalone harness against the built binary, Apple M2 Max, 1-minute load 130–280, macOS `/bin/bash` 3.2.57 — the bash the hermetic test sandbox puts on `PATH`). The suite had grown to **6,429 tests** (from 3,226 when sharding was adopted), so each shard partitions ~585 names.
+
+| Phase                                                  | CPU (user+sys) | Wall under load |
+| ------------------------------------------------------ | -------------: | --------------: |
+| `--list --format terse` (binary startup + enumeration) |         0.02 s |           1.8 s |
+| capture into a bash variable (563 KB)                  |             ~0 |          0.15 s |
+| `grep ': test$' \| sed`                                |        ~0.01 s |          0.09 s |
+| bash `for` loop: `(( ))` + array append × 6,429        |     **1.15 s** |    **5.7–27 s** |
+| libtest matching 585 `--exact` filters (`--list`)      |        ~0.01 s |          0.01 s |
+
+The only material cost is the bash loop: ~0.18 ms per enumerated test per shard on bash 3.2, linear in the suite size, paid by every shard on every run (~13 CPU-seconds per run at 11 shards). Its wall time is what balloons on a contended host — the same 1.2 s of CPU took 7 s to 27 s of wall at load 130–280 — which is the "minutes in bash before the tests start" symptom. The `--exact` argv with hundreds of names is free; libtest's filter matching is not a factor at this size. The 100–120 MB RSS reported for the bash processes did not reproduce (10–15 MB here), and a sampled `bazel test` run during this investigation saw every shard exec its binary within ~2 s of starting, so the minute-long stall needs the host to be heavily oversubscribed.
+
+**Fix** (in `third_party/patches/rules_rust-0.70.0-test-wrapper.patch`): partition with a single `awk '(NR - 1) % total == shard'` pass and split its output into the argv array with one IFS word-split, instead of iterating in bash. Same assignment (`index % TEST_TOTAL_SHARDS`, enumeration order), same guarantees (`--test_filter` applied during enumeration, loud failure on empty enumeration or a broken partition, `TEST_SHARD_STATUS_FILE` touched). Byte-identical shard lists before and after for the engine binary.
+
+| Wrapper end to end, per shard (enumerate → partition → exec `--list`) |    CPU | Wall under load |
+| --------------------------------------------------------------------- | -----: | --------------: |
+| before (bash loop)                                                    |  1.2 s |          6–17 s |
+| after (awk)                                                           | 0.05 s |      0.25–0.3 s |
+
+`//tools/test-sandbox:test_wrapper_scale_test` guards this: it drives the wrapper template against a fake libtest binary enumerating 20,000 tests, asserts the exact partition across 11 shards (plus filter composition and the empty-enumeration failure), and bounds the wrapper's total CPU.
