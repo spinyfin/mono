@@ -239,6 +239,23 @@ pub(super) async fn handle_get_engine_health(ctx: Dispatch, req: FrontendRequest
     }
 }
 
+pub(super) async fn handle_get_engine_pool_config(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetEnginePoolConfig = req else {
+        unreachable!()
+    };
+    send_response(
+        &sink,
+        &request_id,
+        super::sessions::engine_pool_config_event(&server_state),
+    );
+}
+
 pub(super) async fn handle_list_feature_flags(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

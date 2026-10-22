@@ -151,6 +151,10 @@ extension ChatViewModel {
     /// - `engine_health_result` and `git_hub_auth_state`.
     /// - comment invalidations: each open comment layer reloads once.
     ///
+    /// - `engine_pool_config`: pool sizes and coordinator model, pushed once
+    ///   at session registration, so a dropped one is never re-sent. The
+    ///   `get_engine_pool_config` read replies with the same event and has
+    ///   none of registration's side effects.
     /// - driver quota: a cached read when a snapshot is loaded or a refresh
     ///   is awaited, so a lost completion push can't leave the pane on
     ///   "Checking…" with Refresh disabled.
@@ -168,7 +172,18 @@ extension ChatViewModel {
         engine.sendListWorkerLiveStates()
         engine.sendGetEngineHealth()
         engine.sendGitHubAuthStatus()
+        engine.sendGetEnginePoolConfig()
         commentBridge.reloadOpenLayers()
+        sendResyncOnlyReads()
+        if !productJoined {
+            scheduleInvalidationRefetch(productID: currentSelectedProductID, includesAllOpenConsumers: true)
+        }
+    }
+
+    /// The reads a resync recovers that the connect burst does not send:
+    /// cached driver quota and the open design docs. Their cached state and
+    /// the open reader references survive a disconnect.
+    func sendResyncOnlyReads() {
         if isRefreshingDriverQuota || !driverQuota.neverChecked {
             engine.sendGetDriverQuotaUsage(refresh: false)
         }
@@ -177,14 +192,14 @@ extension ChatViewModel {
             docRefs.append(ref)
         }
         for ref in docRefs { engine.sendGetProductDesignDoc(ref: ref) }
-        if !productJoined {
-            scheduleInvalidationRefetch(productID: currentSelectedProductID, includesAllOpenConsumers: true)
-        }
     }
 
-    /// Drop a pending resync refetch. A (re)connect re-reads all of it, and
-    /// a disconnect would queue the requests for the next connection.
+    /// Drop a pending resync refetch. A (re)connect re-reads most of it, and
+    /// a disconnect would queue the requests for the next connection. What the
+    /// connect burst does not re-read ([[sendResyncOnlyReads]]) stays owed
+    /// until the next connect sends it.
     func cancelPendingResyncRefetch() {
+        if resyncRefetchGate.isDirty { resyncOnlyReadsOwed = true }
         pendingResyncRefetchTask?.cancel()
         pendingResyncRefetchTask = nil
         resyncRefetchGate.cancel()

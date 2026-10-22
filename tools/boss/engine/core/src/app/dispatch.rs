@@ -151,6 +151,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::GetDispatchState => Box::pin(engine_meta::handle_get_dispatch_state(ctx, r)),
         r @ FrontendRequest::GetOffsiteBackup => Box::pin(engine_meta::handle_get_offsite_backup(ctx, r)),
         r @ FrontendRequest::GetEngineHealth => Box::pin(engine_meta::handle_get_engine_health(ctx, r)),
+        r @ FrontendRequest::GetEnginePoolConfig => Box::pin(engine_meta::handle_get_engine_pool_config(ctx, r)),
         r @ FrontendRequest::GetEngineVersion => Box::pin(engine_meta::handle_get_engine_version(ctx, r)),
         r @ FrontendRequest::GetExecution { .. } => Box::pin(executions::handle_get_execution(ctx, r)),
         r @ FrontendRequest::GetHost { .. } => Box::pin(hosts::handle_get_host(ctx, r)),

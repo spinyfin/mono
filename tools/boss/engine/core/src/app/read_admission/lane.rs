@@ -15,6 +15,7 @@ macro_rules! with_live_variants {
     ($callback:ident) => {
         $callback! {
             GetEngineHealth,
+            GetEnginePoolConfig,
             GetEngineVersion,
             ListHostedPaneStatuses,
             ListTmuxWorkerStatuses,

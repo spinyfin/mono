@@ -137,6 +137,7 @@ final class ResyncRefetchTests: XCTestCase {
                 "list_worker_live_states": 1,
                 "get_engine_health": 1,
                 "git_hub_auth_status": 1,
+                "get_engine_pool_config": 1,
                 "get_work_tree": 1,
                 "list_deferred_scope_attentions": 1,
                 "list_engine_attempts": 1,
@@ -151,7 +152,7 @@ final class ResyncRefetchTests: XCTestCase {
         model.applyEventForTest(.resyncRequired)
         await waitForSet(model, recorder)
 
-        for verb in ["list_products", "list_worker_live_states", "get_engine_health", "git_hub_auth_status", "get_work_tree"] {
+        for verb in ["list_products", "list_worker_live_states", "get_engine_health", "git_hub_auth_status", "get_engine_pool_config", "get_work_tree"] {
             XCTAssertEqual(recorder.counts[verb], 1, "\(verb) re-reads state a dropped push could have covered")
         }
         for verb in ["list_live_status_disabled_slots", "list_planner_runs", "list_attention_groups", "list_attention_items_for_work_item"] {
@@ -251,6 +252,55 @@ final class ResyncRefetchTests: XCTestCase {
         await waitForSet(model, recorder)
 
         XCTAssertEqual(recorder.counts["get_product_design_doc"], 1, "the same doc open in two places is read once")
+    }
+
+    func testDroppedPoolConfigIsRecoveredOnResync() async {
+        let (model, recorder) = makeModel()
+        var configs: [(Int, Int, Int, String)] = []
+        model.panePoolConfigHandler = { configs.append(($0, $1, $2, $3)) }
+        recorder.reset()
+
+        // The registration push was evicted; the resync's read brings it back.
+        model.applyEventForTest(.resyncRequired)
+        await waitForSet(model, recorder)
+        XCTAssertEqual(recorder.counts["get_engine_pool_config"], 1)
+        XCTAssertTrue(configs.isEmpty)
+
+        model.applyEventForTest(.enginePoolConfig(workerSlots: 6, automationSlots: 2, reviewSlots: 3, coordinatorModel: "sonnet"))
+        XCTAssertEqual(configs.count, 1)
+        XCTAssertEqual(configs.first?.0, 6)
+        XCTAssertEqual(configs.first?.1, 2)
+        XCTAssertEqual(configs.first?.2, 3)
+        XCTAssertEqual(configs.first?.3, "sonnet")
+    }
+
+    func testReconnectBeforeTheTimerStillRecoversDesignDocAndQuota() async {
+        let (model, recorder) = makeModel()
+        let ref = DesignDocRef(repoRemoteURL: "https://github.com/org/repo.git", path: "docs/a.md", gitRef: "main")
+        model.selectedDesignDocRef = ref
+        model.applyEventForTest(.driverQuotaUsageResult(snapshot: DriverQuotaSnapshot(generatedAtEpochS: 1_700_000_000)))
+        recorder.reset()
+
+        model.applyEventForTest(.resyncRequired)
+        model.applyEventForTest(.disconnected)
+        model.applyEventForTest(.connected)
+        await waitUntil(recorder, verb: "get_product_design_doc", count: 1)
+
+        XCTAssertEqual(recorder.counts["get_product_design_doc"], 1, "the connect burst alone never re-reads the open doc")
+        XCTAssertEqual(recorder.counts["get_driver_quota_usage"], 1)
+        XCTAssertFalse(model.resyncOnlyReadsOwed)
+    }
+
+    func testReconnectWithoutAPendingResyncSendsNoResyncOnlyReads() async {
+        let (model, recorder) = makeModel()
+        model.selectedDesignDocRef = DesignDocRef(repoRemoteURL: "https://github.com/org/repo.git", path: "docs/a.md", gitRef: "main")
+        recorder.reset()
+
+        model.applyEventForTest(.disconnected)
+        model.applyEventForTest(.connected)
+        try? await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertNil(recorder.counts["get_product_design_doc"])
     }
 
     // MARK: - Model: backoff and trailing edge

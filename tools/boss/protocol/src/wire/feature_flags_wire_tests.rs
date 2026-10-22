@@ -274,6 +274,15 @@ fn get_engine_health_request_round_trips() {
 }
 
 #[test]
+fn get_engine_pool_config_request_round_trips() {
+    let original = FrontendRequest::GetEnginePoolConfig;
+    let json = serde_json::to_string(&original).unwrap();
+    assert!(json.contains("get_engine_pool_config"), "serialized: {json}");
+    let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+    assert!(matches!(parsed, FrontendRequest::GetEnginePoolConfig));
+}
+
+#[test]
 fn engine_health_result_event_round_trips_healthy() {
     let original = FrontendEvent::EngineHealthResult {
         report: EngineHealthReport {

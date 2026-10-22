@@ -108,15 +108,7 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         // engine dispatches any AttachWorkerPane. This is the single source
         // of truth: the engine's runtime pool config drives the app's
         // capacity check, so they can never be independently out of sync.
-        send_push(
-            &sink,
-            FrontendEvent::EnginePoolConfig {
-                worker_slots: server_state.worker_pool_size,
-                automation_slots: server_state.automation_pool_size,
-                review_slots: server_state.review_pool_size,
-                coordinator_model: server_state.coordinator_model.clone(),
-            },
-        );
+        send_push(&sink, engine_pool_config_event(&server_state));
         // The engine, rather than the app, owns the coordinator's detached
         // tmux session. Attachment is retried by the supervisor until the
         // current app session acknowledges its viewer.
@@ -132,6 +124,17 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         boss_task_scope::spawn(async move {
             state.reattach_worker_panes_to_registered_app().await;
         });
+    }
+}
+
+/// The pool-size and coordinator-model snapshot, shared by the push at
+/// session registration and the `get_engine_pool_config` read.
+pub(super) fn engine_pool_config_event(server_state: &ServerState) -> FrontendEvent {
+    FrontendEvent::EnginePoolConfig {
+        worker_slots: server_state.worker_pool_size,
+        automation_slots: server_state.automation_pool_size,
+        review_slots: server_state.review_pool_size,
+        coordinator_model: server_state.coordinator_model.clone(),
     }
 }
 

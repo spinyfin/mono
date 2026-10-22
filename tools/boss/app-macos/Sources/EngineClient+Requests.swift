@@ -112,6 +112,14 @@ extension EngineClient {
         sendLine(["type": "get_engine_health"], queueIfDisconnected: true)
     }
 
+    /// Ask the engine for its pool sizes and coordinator model. Replies with
+    /// `engine_pool_config`, the same event it pushes at session
+    /// registration; used on `resync_required` because that push is
+    /// uncorrelated and can be evicted.
+    func sendGetEnginePoolConfig() {
+        sendLine(["type": "get_engine_pool_config"], queueIfDisconnected: true)
+    }
+
     /// Pause or resume global dispatch — the same `SetDispatchPaused`
     /// RPC `bossctl dispatch resume` drives. Replies with
     /// `FrontendEvent::DispatchStateResult`; the caller re-polls

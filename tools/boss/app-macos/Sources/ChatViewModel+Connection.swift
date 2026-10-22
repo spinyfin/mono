@@ -47,6 +47,10 @@ extension ChatViewModel {
             engine.sendGetWorkTree(productId: productID, flow: flow)
         }
         startBackgroundWorkPolling()
+        if resyncOnlyReadsOwed {
+            resyncOnlyReadsOwed = false
+            sendResyncOnlyReads()
+        }
     }
 
     /// Leave the initiating sheet or gesture intact when the retry queue is full.
