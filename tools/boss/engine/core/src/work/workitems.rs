@@ -1,3 +1,4 @@
+use super::board_runtime_cache::BoardRuntimeCache;
 use super::*;
 
 use std::time::Instant;
@@ -1073,6 +1074,27 @@ impl WorkDb {
     /// other caller goes through the wrapper above with a disabled trace, so
     /// the timing is genuinely free off the RPC path.
     pub fn get_work_tree_instrumented(&self, product_id: &str, trace: &mut PopulationTrace) -> Result<WorkTree> {
+        self.assemble_work_tree(product_id, trace, None)
+    }
+
+    /// [`get_work_tree_instrumented`] reusing per-item runtimes from `cache`
+    /// instead of rebuilding every card's runtime from point queries. Returns
+    /// exactly the tree the uncached path would for the same snapshot.
+    pub(crate) fn get_work_tree_cached(
+        &self,
+        product_id: &str,
+        trace: &mut PopulationTrace,
+        cache: &BoardRuntimeCache,
+    ) -> Result<WorkTree> {
+        self.assemble_work_tree(product_id, trace, Some(cache))
+    }
+
+    fn assemble_work_tree(
+        &self,
+        product_id: &str,
+        trace: &mut PopulationTrace,
+        runtime_cache: Option<&BoardRuntimeCache>,
+    ) -> Result<WorkTree> {
         let mut connection = self.connect()?;
         // All projections must describe one consistent database snapshot.
         let conn = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
@@ -1135,10 +1157,13 @@ impl WorkDb {
         trace.set_items(tasks.len() + chores.len());
 
         // Primary N+1: one runtime lookup per task and chore, each running
-        // 1-3 point queries. `runtime_queries` is the aggregate statement
+        // 1-3 point queries (only for cache misses on the cached path). `runtime_queries` is the aggregate statement
         // count, which makes the per-row fan-out visible in the log.
         let t = Instant::now();
-        let (task_runtimes, runtime_queries) = collect_task_runtimes(&conn, &tasks, &chores)?;
+        let (task_runtimes, runtime_queries) = match runtime_cache {
+            Some(cache) => collect_task_runtimes_cached(&conn, product_id, &tasks, &chores, cache)?,
+            None => collect_task_runtimes(&conn, &tasks, &chores)?,
+        };
         trace.record_nplus1(
             segment::DB_TASK_RUNTIMES,
             elapsed_ms(t),

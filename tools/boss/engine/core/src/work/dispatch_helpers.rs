@@ -294,6 +294,44 @@ pub(crate) fn collect_task_runtimes(
 /// an all-abandoned work item, and a latest-run lookup are needed) so N+1
 /// callers can report an accurate aggregate subquery count.
 pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    Ok(compute_task_runtime(conn, work_item_id, queries, now)?.runtime)
+}
+
+/// A freshly computed runtime plus what the board runtime cache needs to know
+/// about how far it may be reused.
+pub(crate) struct ComputedRuntime {
+    pub runtime: TaskRuntime,
+    /// False when the projection consulted another work item's state (see
+    /// [`queued_wait::DispatchWait::reads_other_items`]); the item's own epoch
+    /// does not version that, so the result must be recomputed every time.
+    pub cacheable: bool,
+    /// Epoch seconds from which the result changes without any write: the
+    /// moment a future `dispatch_not_before` elapses. `None` when the result
+    /// is not time-dependent.
+    pub expires_at: Option<i64>,
+}
+
+/// The one implementation of the per-item runtime projection. `now` is read
+/// once by the caller and used for every time comparison so the result and its
+/// `expires_at` agree. The inputs it reads, and what versions each one for the
+/// board runtime cache (`board_runtime_epoch`, schema 49):
+/// - the item's `work_executions` rows: any insert, update or delete;
+/// - the chosen execution's latest `work_runs` row: insert, delete, or an
+///   update of `status`, `execution_id` or `created_at`;
+/// - `dispatch_not_before` against `now`: `expires_at`;
+/// - dependency gating and chain-hold blockers: not versioned, `cacheable`
+///   is false.
+///
+/// A new input must be added to one of those four mechanisms, or the cache
+/// will serve it stale; `board_runtime_cache_equivalence` in the work-tree
+/// tests is the net that catches a missed one.
+pub(crate) fn compute_task_runtime(
+    conn: &Connection,
+    work_item_id: &str,
+    queries: &mut u64,
+    now: i64,
+) -> Result<ComputedRuntime> {
     let latest = query_latest_execution_for_work_item(conn, work_item_id)?;
     *queries += 1;
     // `current_execution_id` (the operator-facing label for
@@ -332,7 +370,7 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries:
             None => latest,
         }
     };
-    let wait = super::queued_wait::for_execution(conn, execution.as_ref())?;
+    let wait = super::queued_wait::for_execution(conn, execution.as_ref(), now)?;
     let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at, dispatch_wait_since) =
         if let Some(execution) = execution {
             *queries += 1;
@@ -341,8 +379,7 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries:
                 Some((id, status)) => (Some(status), Some(id)),
                 None => (None, None),
             };
-            let dispatch_retry_at =
-                dispatch_retry_at_for_execution(&execution, boss_engine_utils::epoch_time::now_epoch_secs());
+            let dispatch_retry_at = dispatch_retry_at_for_execution(&execution, now);
             let dispatch_wait_since = if wait.reason.is_some()
                 && wait.reason == execution.dispatch_wait_reason
                 && execution.status == ExecutionStatus::Ready
@@ -362,7 +399,13 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries:
         } else {
             (None, None, None, None, None, None)
         };
-    Ok(TaskRuntime::builder()
+    // Both time-dependent fields are set only while their deadline is still in
+    // the future at `now`, so the earlier of them is when the result changes.
+    let expires_at = [&dispatch_retry_at, &wait.not_before]
+        .into_iter()
+        .filter_map(|deadline| deadline.as_deref()?.parse::<i64>().ok())
+        .min();
+    let runtime = TaskRuntime::builder()
         .work_item_id(work_item_id)
         .maybe_execution_status(execution_status)
         .maybe_run_status(run_status)
@@ -373,7 +416,12 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries:
         .maybe_dispatch_wait_since(dispatch_wait_since)
         .maybe_dispatch_not_before(wait.not_before)
         .maybe_dispatch_wait_blocker(wait.blocker)
-        .build())
+        .build();
+    Ok(ComputedRuntime {
+        runtime,
+        cacheable: !wait.reads_other_items,
+        expires_at,
+    })
 }
 
 /// `TaskRuntime.dispatch_retry_at` for one execution: `Some(epoch_secs)`

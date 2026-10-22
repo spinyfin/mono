@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 48;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 49;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -52,6 +52,75 @@ const IN_FLIGHT_WORKSPACES_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS work_ex
 /// the resolved history.
 const ATTENTION_OPEN_KIND_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS work_attention_items_open_kind_idx ON work_attention_items(kind) WHERE status = 'open'";
+
+/// Schema 49: per-item version counters for the board runtime cache.
+///
+/// `board_runtime_epoch.epoch` increases whenever an input of that item's
+/// `TaskRuntime` is written (see `dispatch_helpers::compute_task_runtime` for
+/// the input list), so a cached runtime is reusable exactly while its epoch is
+/// unchanged. The bump happens in the writer's own transaction, which makes it
+/// visible to a reader in the same snapshot as the data, and it fires for any
+/// connection or process that writes the database.
+///
+/// Rows are never deleted: epochs only grow, so a recreated id can never alias
+/// an older cached value, and the table holds at most one small row per item
+/// that ever had an execution. `work_executions` bumps on any column update
+/// (over-invalidating is harmless and survives new runtime fields); `work_runs`
+/// bumps on the columns `query_latest_run` reads.
+const BOARD_RUNTIME_EPOCH_49: &str = "CREATE TABLE IF NOT EXISTS board_runtime_epoch (
+         work_item_id TEXT PRIMARY KEY NOT NULL,
+         epoch INTEGER NOT NULL
+     ) WITHOUT ROWID;
+     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_execution_insert
+     AFTER INSERT ON work_executions
+     BEGIN
+         INSERT INTO board_runtime_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_execution_update
+     AFTER UPDATE ON work_executions
+     BEGIN
+         INSERT INTO board_runtime_epoch(work_item_id, epoch) VALUES (NEW.work_item_id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_execution_reassigned
+     AFTER UPDATE OF work_item_id ON work_executions
+     WHEN OLD.work_item_id IS NOT NEW.work_item_id
+     BEGIN
+         INSERT INTO board_runtime_epoch(work_item_id, epoch) VALUES (OLD.work_item_id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_execution_delete
+     AFTER DELETE ON work_executions
+     BEGIN
+         INSERT INTO board_runtime_epoch(work_item_id, epoch) VALUES (OLD.work_item_id, 1)
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_run_insert
+     AFTER INSERT ON work_runs
+     BEGIN
+         INSERT INTO board_runtime_epoch(work_item_id, epoch)
+         SELECT work_item_id, 1 FROM work_executions WHERE id = NEW.execution_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_run_update
+     AFTER UPDATE OF status, execution_id, created_at ON work_runs
+     BEGIN
+         INSERT INTO board_runtime_epoch(work_item_id, epoch)
+         SELECT work_item_id, 1 FROM work_executions WHERE id = NEW.execution_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+         INSERT INTO board_runtime_epoch(work_item_id, epoch)
+         SELECT work_item_id, 1 FROM work_executions
+         WHERE id = OLD.execution_id AND OLD.execution_id IS NOT NEW.execution_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END;
+     CREATE TRIGGER IF NOT EXISTS board_runtime_epoch_run_delete
+     AFTER DELETE ON work_runs
+     BEGIN
+         INSERT INTO board_runtime_epoch(work_item_id, epoch)
+         SELECT work_item_id, 1 FROM work_executions WHERE id = OLD.execution_id
+         ON CONFLICT(work_item_id) DO UPDATE SET epoch = epoch + 1;
+     END";
 
 // Derive requirements once from the fresh-database SQL, but check every DB.
 static BASELINE_OBJECTS: std::sync::LazyLock<Result<std::collections::BTreeSet<String>>> =
@@ -160,6 +229,9 @@ impl WorkDb {
         }
         if version < 48 {
             tx.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL)?;
+        }
+        if version < 49 {
+            tx.execute_batch(BOARD_RUNTIME_EPOCH_49)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -727,6 +799,9 @@ mod floor_tests {
             if version >= 48 {
                 conn.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap();
             }
+            if version >= 49 {
+                conn.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -762,6 +837,7 @@ mod floor_tests {
             expected.execute_batch(TASKS_CRITICAL_PROVENANCE_46).unwrap();
             expected.execute_batch(IN_FLIGHT_WORKSPACES_INDEX_SQL).unwrap();
             expected.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap();
+            expected.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

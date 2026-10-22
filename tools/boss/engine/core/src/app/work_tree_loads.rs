@@ -8,6 +8,9 @@ pub(super) struct WorkTreeLoads {
     // data_version is comparable only on the SAME connection. This dedicated
     // reader holds no transaction and never acquires the writer connection.
     probe: StdMutex<Option<WorkDb>>,
+    // Per-item runtimes shared by every product's assembly, validated against
+    // per-item epochs in each load's own snapshot (see `board_runtime_cache`).
+    runtimes: crate::work::board_runtime_cache::BoardRuntimeCache,
 }
 
 impl WorkTreeLoads {
@@ -26,7 +29,7 @@ impl WorkTreeLoads {
                 // connection. Only the batch owner scans it (with Deferred).
                 // The detached spawn_blocking job survives client disconnects.
                 let snapshot_revision = revision.load(Ordering::SeqCst);
-                db.get_work_tree_instrumented(product_id, trace)
+                db.get_work_tree_cached(product_id, trace, &self.runtimes)
                     .map(|tree| (snapshot_revision, tree))
                     .map_err(|err| err.to_string())
             },

@@ -145,6 +145,91 @@ fn measure(db: &WorkDb, product: &str, expected: Option<usize>) {
     );
     if expected.is_some() {
         measure_deltas(db, product);
+        measure_cached_runtimes(db, product, samples);
+    }
+}
+
+/// Per-item runtime cache: the same assembly, with runtimes served from the
+/// epoch-validated cache. Every cached tree must equal the uncached one, so the
+/// timings below compare identical outputs.
+fn measure_cached_runtimes(db: &WorkDb, product: &str, samples: usize) {
+    use crate::work::board_runtime_cache::BoardRuntimeCache;
+    let assemble = |cache: Option<&BoardRuntimeCache>, label: &str| {
+        let start = Instant::now();
+        let mut trace = PopulationTrace::new(product, "scale-cache", None, start);
+        let tree = match cache {
+            Some(cache) => db.get_work_tree_cached(product, &mut trace, cache),
+            None => db.get_work_tree_instrumented(product, &mut trace),
+        }
+        .unwrap();
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let (runtime_ms, _, queries) = trace.segment_counts(segment::DB_TASK_RUNTIMES).unwrap();
+        println!(
+            "scale runtime_cache pass={label} assemble_ms={total_ms:.3} task_runtimes_ms={runtime_ms:.3} \
+             runtime_queries={}",
+            queries.unwrap()
+        );
+        (tree, total_ms, runtime_ms)
+    };
+    let runtimes = |tree: &boss_protocol::WorkTree| serde_json::to_value(&tree.task_runtimes).unwrap();
+
+    let (reference, _, _) = assemble(None, "uncached");
+    let cache = BoardRuntimeCache::default();
+    let (cold, _, _) = assemble(Some(&cache), "cold");
+    assert_eq!(runtimes(&cold), runtimes(&reference), "cold cached runtimes diverged");
+    let stats = cache.stats();
+    println!(
+        "scale runtime_cache entries={} approx_bytes={} hits={} misses={}",
+        stats.entries, stats.approx_bytes, stats.hits, stats.misses
+    );
+
+    let mut warm = Vec::new();
+    let mut warm_runtime = Vec::new();
+    let mut uncached = Vec::new();
+    let mut uncached_runtime = Vec::new();
+    for sample in 0..samples {
+        let (tree, total_ms, runtime_ms) = assemble(Some(&cache), &format!("warm-{sample}"));
+        assert_eq!(runtimes(&tree), runtimes(&reference), "warm cached runtimes diverged");
+        warm.push(total_ms);
+        warm_runtime.push(runtime_ms);
+        let (_, total_ms, runtime_ms) = assemble(None, &format!("uncached-{sample}"));
+        uncached.push(total_ms);
+        uncached_runtime.push(runtime_ms);
+    }
+    let p50 = |values: &mut Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        values[(values.len() * 50).div_ceil(100) - 1]
+    };
+    println!(
+        "scale runtime_cache samples={samples} assemble_ms p50 uncached={:.3} warm={:.3}; \
+         task_runtimes_ms p50 uncached={:.3} warm={:.3}",
+        p50(&mut uncached),
+        p50(&mut warm),
+        p50(&mut uncached_runtime),
+        p50(&mut warm_runtime)
+    );
+
+    // Writing N executions recomputes exactly the N items they belong to.
+    // Execution `i < 1818` belongs to task `4 * i`, so these items are distinct.
+    for count in [1usize, 10, 100] {
+        let conn = db.connect().unwrap();
+        for i in 0..count {
+            conn.execute(
+                "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+                params![format!("scale-exec-{i}"), format!("{}", 3 + count)],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let misses_before = cache.stats().misses;
+        let (tree, _, _) = assemble(Some(&cache), &format!("after-{count}-writes"));
+        let (reference, _, _) = assemble(None, &format!("uncached-after-{count}-writes"));
+        assert_eq!(
+            runtimes(&tree),
+            runtimes(&reference),
+            "{count} writes: cached runtimes diverged"
+        );
+        assert_eq!(cache.stats().misses - misses_before, count as u64, "{count} writes");
     }
 }
 

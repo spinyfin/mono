@@ -6,10 +6,14 @@ pub(super) struct DispatchWait {
     pub reason: Option<String>,
     pub not_before: Option<String>,
     pub blocker: Option<DispatchWaitBlocker>,
+    /// The projection consulted another work item's state (dependency gating
+    /// or a chain-hold blocker), which the item's own execution rows do not
+    /// version. The board runtime cache must not retain such a result.
+    pub reads_other_items: bool,
 }
 
 /// Project only pending execution state; never leak an old hold onto a live run.
-pub(super) fn for_execution(conn: &Connection, execution: Option<&WorkExecution>) -> Result<DispatchWait> {
+pub(super) fn for_execution(conn: &Connection, execution: Option<&WorkExecution>, now: i64) -> Result<DispatchWait> {
     let Some(execution) = execution else {
         return Ok(DispatchWait::default());
     };
@@ -24,6 +28,7 @@ pub(super) fn for_execution(conn: &Connection, execution: Option<&WorkExecution>
         // Reuse dispatch's revision-aware satisfaction rules, including same-PR sequencing.
         // A missing prerequisite row still gates; an empty set means nothing is gating, so
         // fall through to the recorded reason (or unknown) rather than invent a dependency.
+        wait.reads_other_items = true;
         if let Some(id) = deps::gating_prereqs_for(conn, &execution.work_item_id)?.first() {
             wait.reason = Some("waiting_dependency".into());
             wait.blocker = blocker_for(conn, id)?;
@@ -34,7 +39,7 @@ pub(super) fn for_execution(conn: &Connection, execution: Option<&WorkExecution>
         .dispatch_not_before
         .as_deref()
         .and_then(|raw| raw.parse::<i64>().ok())
-        .filter(|epoch| *epoch > boss_engine_utils::epoch_time::now_epoch_secs())
+        .filter(|epoch| *epoch > now)
     {
         wait.reason = Some("not_before".into());
         wait.not_before = Some(epoch.to_string());
@@ -50,6 +55,7 @@ pub(super) fn for_execution(conn: &Connection, execution: Option<&WorkExecution>
             |row| row.get(0),
         )?;
         if let Some(id) = blocker_id {
+            wait.reads_other_items = true;
             // A persisted chain hold is only current while its named writer/reviewer is live.
             // Do not carry its prose or link through the gap before the next scheduler pass.
             if blocker_is_live(conn, &id)? {
