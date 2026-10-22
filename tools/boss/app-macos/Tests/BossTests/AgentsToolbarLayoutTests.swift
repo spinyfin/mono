@@ -4,8 +4,8 @@ import SwiftUI
 import XCTest
 @testable import Boss
 
-/// Hosts the real `AgentsToolbar` in a detached `NSHostingView` (no window;
-/// see `BossCaptureTests`) to pin the fits-vs-scroll behaviour.
+/// Hosts the real `AgentsToolbar` in an unpresented window to pin the
+/// fits-vs-scroll behaviour against real layout geometry.
 @MainActor
 final class AgentsToolbarLayoutTests: XCTestCase {
     private func makeGrid() -> AgentsGridModel {
@@ -26,35 +26,68 @@ final class AgentsToolbarLayoutTests: XCTestCase {
         return grid
     }
 
-    private func host(width: CGFloat) -> NSHostingView<AgentsToolbar> {
-        let view = NSHostingView(rootView: AgentsToolbar(grid: makeGrid(), feedUnavailable: false))
-        view.frame = NSRect(x: 0, y: 0, width: width, height: 400)
-        view.layoutSubtreeIfNeeded()
-        return view
+    /// Retains both sides of AppKit's window/content-view relationship.
+    private struct Hosted {
+        let window: NSWindow
+        let hosting: NSHostingView<AgentsToolbar>
     }
 
-    private func overflowingScrollView(in view: NSView) -> NSScrollView? {
-        if let scroll = view as? NSScrollView,
-           let document = scroll.documentView,
-           document.bounds.width > scroll.contentView.bounds.width {
-            return scroll
+    /// Lays the toolbar out in a real, never-presented `NSWindow` (the
+    /// pattern from `MarkdownTableOverflowTests`): a bare `NSHostingView`
+    /// never materialises the horizontal `NSScrollView`.
+    private func host(width: CGFloat) -> Hosted {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: 400),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        let hosting = NSHostingView(rootView: AgentsToolbar(grid: makeGrid(), feedUnavailable: false))
+        hosting.frame = NSRect(x: 0, y: 0, width: width, height: 400)
+        window.contentView = hosting
+        for _ in 0..<12 {
+            hosting.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
         }
-        return view.subviews.lazy.compactMap { self.overflowingScrollView(in: $0) }.first
+        XCTAssertFalse(window.isVisible, "layout window must never be presented")
+        return Hosted(window: window, hosting: hosting)
     }
 
-    /// A detached hosting view does not materialise the horizontal
-    /// NSScrollView (the capture fixture's `--capture-scroll-end` covers
-    /// that), but it does expose the guarantee that controls never wrap:
-    /// even at a narrow width the toolbar stays one caption row tall.
-    func testNarrowWidthKeepsControlsOnOneLine() {
-        let narrow = host(width: 360).fittingSize.height
-        let wide = host(width: 1600).fittingSize.height
-        XCTAssertLessThan(narrow, 60)
-        XCTAssertEqual(narrow, wide, accuracy: 1)
+    private func scrollViews(in root: NSView) -> [NSScrollView] {
+        var found: [NSScrollView] = []
+        func walk(_ view: NSView) {
+            if let scroll = view as? NSScrollView { found.append(scroll) }
+            view.subviews.forEach(walk)
+        }
+        walk(root)
+        return found
     }
 
-    func testWideWidthFitsWithoutScrolling() {
-        let view = host(width: 1600)
-        XCTAssertNil(overflowingScrollView(in: view), "wide toolbar should not need to scroll")
+    /// At a narrow width the controls overflow into a horizontal scroll view
+    /// whose content is wider than its viewport, and scrolling to the limit
+    /// reveals the trailing edge.
+    func testNarrowWidthOverflowsIntoReachableHorizontalScroll() throws {
+        let hosted = host(width: 360)
+        let scroll = try XCTUnwrap(
+            scrollViews(in: hosted.hosting).first, "narrow toolbar should fall back to a scroll view")
+        let content = try XCTUnwrap(scroll.documentView)
+        let clip = scroll.contentView.bounds.width
+        XCTAssertGreaterThan(content.frame.width, clip + 1, "content should overflow the viewport")
+
+        let overhang = max(0, content.frame.width - clip)
+        scroll.contentView.scroll(to: NSPoint(x: overhang, y: scroll.contentView.bounds.minY))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        XCTAssertGreaterThanOrEqual(
+            scroll.documentVisibleRect.maxX, content.frame.width - 0.5,
+            "trailing edge must be reachable")
+    }
+
+    /// At a wide width everything fits on one line with no overflowing scroll
+    /// view, and the toolbar is a single caption row tall.
+    func testWideWidthFitsOnOneLineWithoutOverflow() {
+        let hosted = host(width: 1600)
+        for scroll in scrollViews(in: hosted.hosting) {
+            let content = scroll.documentView?.frame.width ?? 0
+            XCTAssertLessThanOrEqual(
+                content, scroll.contentView.bounds.width + 1, "wide toolbar should not overflow")
+        }
+        XCTAssertLessThan(hosted.hosting.fittingSize.height, 60)
     }
 }

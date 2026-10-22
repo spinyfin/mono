@@ -176,6 +176,7 @@ _SHARD1_SRCS = [
 ]
 
 _SHARD2_SRCS = [
+    "Tests/BossTests/AgentsToolbarLayoutTests.swift",
     "Tests/BossTests/ActiveProductsFilterTests.swift",
     "Tests/BossTests/ActivityLogTests.swift",
     "Tests/BossTests/AttentionGroupsListRaceTests.swift",
