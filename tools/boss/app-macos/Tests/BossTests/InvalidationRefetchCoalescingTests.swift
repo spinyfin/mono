@@ -249,6 +249,7 @@ final class InvalidationRefetchCoalescingTests: XCTestCase {
         openConsumers(model, ["task_1", "task_2"])
         recorder.reset()
 
+        model.applyEventForTest(invalidation(itemIDs: []))
         model.applyEventForTest(.resyncRequired)
         model.applyEventForTest(.resyncRequired)
 

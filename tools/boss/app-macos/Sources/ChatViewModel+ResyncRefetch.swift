@@ -48,6 +48,9 @@ struct ResyncRefetchGate: Equatable, Sendable {
     private(set) var streak = 0
     private(set) var lastFireAt: ContinuousClock.Instant?
     private(set) var nextAllowedAt: ContinuousClock.Instant?
+    /// The product refetch for the pending resync already joined the
+    /// coalesced burst, so the fire must not schedule a second one.
+    private(set) var productBurstJoined = false
 
     init(policy: ResyncRefetchPolicy = .standard) {
         self.policy = policy
@@ -79,10 +82,16 @@ struct ResyncRefetchGate: Equatable, Sendable {
         return max(policy.window, now.duration(to: nextAllowedAt))
     }
 
+    /// The pending resync's product refetch joined the coalesced burst.
+    mutating func noteProductBurstJoined() {
+        productBurstJoined = true
+    }
+
     /// The refetch set went out: clear the dirty flag and start the next
     /// backoff.
     mutating func noteFire(at now: ContinuousClock.Instant) {
         isDirty = false
+        productBurstJoined = false
         lastFireAt = now
         nextAllowedAt = now + currentBackoff
         streak += 1
@@ -92,6 +101,7 @@ struct ResyncRefetchGate: Equatable, Sendable {
     /// covers it.
     mutating func cancel() {
         isDirty = false
+        productBurstJoined = false
     }
 }
 
@@ -105,8 +115,18 @@ extension ChatViewModel {
     /// A resync arrived. Nothing is sent here; see [[fireResyncRefetch]].
     func handleResyncRequired() {
         let now = ContinuousClock.now
-        guard resyncRefetchGate.noteResync(at: now) else { return }
+        let armsTimer = resyncRefetchGate.noteResync(at: now)
         let delay = resyncRefetchGate.delay(at: now)
+        // Outside a backoff the product refetch joins the coalesced burst
+        // right away (every resync, so a burst that fires between two of
+        // them is followed by another), sharing a window with any
+        // invalidation already pending instead of starting one after it.
+        // During a backoff it joins when the gate fires.
+        if delay <= resyncRefetchGate.policy.window {
+            scheduleInvalidationRefetch(productID: currentSelectedProductID, includesAllOpenConsumers: true)
+            resyncRefetchGate.noteProductBurstJoined()
+        }
+        guard armsTimer else { return }
         pendingResyncRefetchTask?.cancel()
         pendingResyncRefetchTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
@@ -131,22 +151,35 @@ extension ChatViewModel {
     /// - `engine_health_result` and `git_hub_auth_state`.
     /// - comment invalidations: each open comment layer reloads once.
     ///
+    /// - driver quota: a cached read when a snapshot is loaded or a refresh
+    ///   is awaited, so a lost completion push can't leave the pane on
+    ///   "Checking…" with Refresh disabled.
+    /// - design docs: the open reader and async-viewer documents, whose
+    ///   revalidated bodies arrive as pushes.
+    ///
     /// `list_live_status_disabled_slots` is not here: the engine never
-    /// pushes it, so there is nothing to have lost. Nor are the other
-    /// uncorrelated pushes (design-doc revalidation results, driver quota
-    /// refreshes, probe replies): each is the one-shot follow-up to an
-    /// explicit user action, not topic state the app keeps current, and the
-    /// view that asked already offers its own retry.
+    /// pushes it, so there is nothing to have lost.
     func fireResyncRefetch() {
         pendingResyncRefetchTask = nil
         guard resyncRefetchGate.isDirty else { return }
+        let productJoined = resyncRefetchGate.productBurstJoined
         resyncRefetchGate.noteFire(at: .now)
         engine.sendListProducts()
         engine.sendListWorkerLiveStates()
         engine.sendGetEngineHealth()
         engine.sendGitHubAuthStatus()
         commentBridge.reloadOpenLayers()
-        scheduleInvalidationRefetch(productID: currentSelectedProductID, includesAllOpenConsumers: true)
+        if isRefreshingDriverQuota || !driverQuota.neverChecked {
+            engine.sendGetDriverQuotaUsage(refresh: false)
+        }
+        var docRefs: [DesignDocRef] = []
+        for ref in [selectedDesignDocRef, pendingAsyncViewerRef].compactMap({ $0 }) where !docRefs.contains(ref) {
+            docRefs.append(ref)
+        }
+        for ref in docRefs { engine.sendGetProductDesignDoc(ref: ref) }
+        if !productJoined {
+            scheduleInvalidationRefetch(productID: currentSelectedProductID, includesAllOpenConsumers: true)
+        }
     }
 
     /// Drop a pending resync refetch. A (re)connect re-reads all of it, and

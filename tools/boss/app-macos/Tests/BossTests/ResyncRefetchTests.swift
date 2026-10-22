@@ -183,6 +183,76 @@ final class ResyncRefetchTests: XCTestCase {
         XCTAssertEqual(recorder.executionFetches, ["task_1", "task_2"])
     }
 
+    // MARK: - Model: joining a pending burst
+
+    func testResyncMidWindowOfAnInvalidationSharesOneProductRefetch() async {
+        let (model, recorder) = makeModel()
+        model.refetchCoalescingPolicy = .init(window: .milliseconds(150), maxWait: .seconds(2))
+
+        model.applyEventForTest(.workInvalidated(topic: "work.product.prod_a", productId: "prod_a", itemIds: []))
+        try? await Task.sleep(for: .milliseconds(50))
+        model.applyEventForTest(.resyncRequired)
+        await waitForSet(model, recorder)
+        try? await Task.sleep(for: .milliseconds(400))
+
+        XCTAssertEqual(recorder.counts["get_work_tree"], 1, "invalidation and resync in one window cost one tree fetch")
+        XCTAssertEqual(recorder.counts["list_deferred_scope_attentions"], 1)
+        XCTAssertEqual(recorder.counts["list_products"], 1)
+    }
+
+    func testInvalidationAfterResyncSharesOneProductRefetch() async {
+        let (model, recorder) = makeModel()
+
+        model.applyEventForTest(.resyncRequired)
+        model.applyEventForTest(.workInvalidated(topic: "work.product.prod_a", productId: "prod_a", itemIds: []))
+        await waitForSet(model, recorder)
+
+        XCTAssertEqual(recorder.counts["get_work_tree"], 1)
+        XCTAssertEqual(recorder.counts["list_products"], 1)
+    }
+
+    // MARK: - Model: quota and design docs
+
+    func testLostQuotaCompletionIsRecoveredAndRefreshControlReenabled() async {
+        let (model, recorder) = makeModel()
+        model.refreshDriverQuota(force: true)
+        model.applyEventForTest(.driverQuotaUsageResult(snapshot: .empty))
+        XCTAssertTrue(model.isRefreshingDriverQuota, "the completion push is lost, so the pane stays on Checking")
+        recorder.reset()
+
+        model.applyEventForTest(.resyncRequired)
+        await waitForSet(model, recorder)
+
+        XCTAssertEqual(recorder.counts["get_driver_quota_usage"], 1)
+        XCTAssertEqual(recorder.sent.first { $0["type"] as? String == "get_driver_quota_usage" }?["refresh"] as? Bool, false)
+        model.applyEventForTest(.driverQuotaUsageResult(snapshot: DriverQuotaSnapshot(generatedAtEpochS: 1_700_000_000)))
+        XCTAssertFalse(model.isRefreshingDriverQuota, "the cached read recovers the refresh control")
+    }
+
+    func testQuotaIsNotReadWhenNothingUsesIt() async {
+        let (model, recorder) = makeModel()
+
+        model.applyEventForTest(.resyncRequired)
+        await waitForSet(model, recorder)
+
+        XCTAssertNil(recorder.counts["get_driver_quota_usage"])
+        XCTAssertNil(recorder.counts["get_product_design_doc"])
+    }
+
+    func testOpenDesignDocsAreRefetchedOnce() async {
+        let (model, recorder) = makeModel()
+        let ref = DesignDocRef(repoRemoteURL: "https://github.com/org/repo.git", path: "docs/a.md", gitRef: "main")
+        model.selectedDesignDocRef = ref
+        model.pendingAsyncViewerRef = ref
+        recorder.reset()
+
+        model.applyEventForTest(.resyncRequired)
+        model.applyEventForTest(.resyncRequired)
+        await waitForSet(model, recorder)
+
+        XCTAssertEqual(recorder.counts["get_product_design_doc"], 1, "the same doc open in two places is read once")
+    }
+
     // MARK: - Model: backoff and trailing edge
 
     func testSecondSetWaitsOutTheBackoffAndTrailingResyncIsNotLost() async {
