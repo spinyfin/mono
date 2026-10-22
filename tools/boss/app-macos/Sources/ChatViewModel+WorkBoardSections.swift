@@ -47,9 +47,10 @@ extension ChatViewModel {
         )
     }
 
-    /// Queued cards retain the existing oldest-question-first ordering for
-    /// items awaiting an operator answer, followed by other queued cards in
-    /// board order. The same collapsible section shape renders all three lanes.
+    /// Build Doing's Queued section. Cards awaiting an operator answer sort
+    /// first, oldest question first (`askedAt` ascending; missing or
+    /// unparseable timestamps last, ties by id); the remaining cards follow in
+    /// board order. Returns nil for empty input so the section is omitted.
     static func queuedSection(items: [WorkTask]) -> WorkBoardSection? {
         guard !items.isEmpty else { return nil }
         let sorted = items.filter(\.isAwaitingOperatorAnswer).sorted { lhs, rhs in
