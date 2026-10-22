@@ -1,25 +1,21 @@
 //! `FrontendRequest` handlers — Boothby state, pass history, manual run, and
-//! mode control (`boothby.md`, design task 3).
-//!
-//! Split out of `app.rs`, following the `automations.rs` precedent. See
+//! mode control (`boothby.md`). See
 //! [`super::Dispatch`] for the per-request context every handler receives.
 
 use super::*;
 
 pub(super) fn spawn_scheduler(server_state: &Arc<ServerState>) -> tokio::task::JoinHandle<()> {
-    // Boothby scheduler (boothby.md, design task 3): adaptive-sleep loop
+    // Boothby scheduler (boothby.md §"Activation model"): adaptive-sleep loop
     // over the cron `boothby.schedule` setting plus the event-trigger queue
-    // fed by `BoothbyEventSink` and the attention-creation hook. Every pass
-    // today reports `nothing_to_do` via `NothingToDoPassRunner` — the brief
-    // composer and session spawn (design tasks 4/5) aren't wired up yet —
-    // but the pass lifecycle, settings, RPCs, and event triggers are fully
-    // live, so `boss boothby run` / the mode RPCs already work end to end.
+    // fed by `BoothbyEventSink` and the attention-creation hook. Passes go
+    // through `PreflightedPassRunner`, which concludes `nothing_to_do`
+    // without a session whenever the preflight finds no candidates.
     crate::boothby_scheduler::spawn_loop(
         server_state.work_db.clone(),
         server_state.settings.clone(),
         server_state.boothby_events.clone(),
         server_state.boothby_kick.clone(),
-        Arc::new(crate::boothby_scheduler::NothingToDoPassRunner),
+        Arc::new(crate::boothby_scheduler::PreflightedPassRunner::production()),
         server_state.clone(),
     )
 }
@@ -132,7 +128,7 @@ pub(super) async fn handle_run_boothby_pass(ctx: Dispatch, req: FrontendRequest)
             tokio::spawn(async move {
                 crate::boothby_scheduler::run_and_finish_opened_pass(
                     &work_db,
-                    &crate::boothby_scheduler::NothingToDoPassRunner,
+                    &crate::boothby_scheduler::PreflightedPassRunner::production(),
                     server_state.as_ref(),
                     pass,
                     pass_timeout,

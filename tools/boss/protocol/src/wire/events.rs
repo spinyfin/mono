@@ -1711,7 +1711,7 @@ pub enum FrontendEvent {
         project: Option<Box<Project>>,
     },
 
-    // --- Boothby replies (boothby.md, design task 3) ---
+    // --- Boothby replies (boothby.md) ---
     /// Response to [`FrontendRequest::ListBoothbyPasses`].
     BoothbyPassesList {
         passes: Vec<BoothbyPass>,
@@ -1724,9 +1724,8 @@ pub enum FrontendEvent {
         last_pass: Option<BoothbyPass>,
     },
     /// Response to [`FrontendRequest::RunBoothbyPass`]: the pass row that was
-    /// opened. Today's placeholder pass runner (design tasks 4/5 not yet
-    /// wired) finishes essentially instantly, but this reply does not wait
-    /// for that — it confirms the pass opened, not that it finished.
+    /// opened. A pass that finds no candidates finishes essentially
+    /// instantly, but this reply does not wait for that — it confirms the pass opened, not that it finished.
     BoothbyPassStarted {
         pass: BoothbyPass,
     },

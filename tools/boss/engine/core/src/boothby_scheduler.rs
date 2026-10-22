@@ -11,16 +11,15 @@
 //! there is no separate mutable schedule row that could drift out of sync
 //! with reality.
 //!
-//! ## What this module does NOT do yet
+//! ## Pre-spawn short-circuit
 //!
-//! The brief composer (design task 4) and session spawn (task 5) are not
-//! wired up. [`NothingToDoPassRunner`] is the placeholder seam — precisely
-//! [`crate::automation_scheduler::LoggingTriageDispatcher`]'s role for
-//! automations — so every pass concludes `nothing_to_do` without spawning a
-//! session, which is exactly the design's pre-spawn short-circuit degenerate
-//! case (no candidates yet exist because nothing computes them yet). Once
-//! task 4/5 land, a real [`BoothbyPassRunner`] replaces this placeholder and
-//! the scheduler itself needs no changes.
+//! A pass first asks a [`BoothbyPreflight`] how many candidates exist; zero
+//! concludes `nothing_to_do` without spawning a session (design
+//! §"Pass lifecycle"). [`PreflightedPassRunner`] composes that check in front
+//! of the session runner. The pass-brief composer (design §"The pass brief")
+//! will supply the real preflight and the session runner the real spawn;
+//! until then [`NoCandidatesPreflight`] reports none, so every pass is
+//! `nothing_to_do`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,7 +68,7 @@ fn current_mode(settings: &SettingsStore) -> String {
 /// has run. Maps onto `boothby_passes.outcome`, minus `timed_out` (the
 /// scheduler itself detects that by racing the runner against
 /// `boothby.pass_timeout_secs`, so a runner never needs to self-report it)
-/// and `capped` (the executor's job, once task 2 lands).
+/// and `capped` (the guarded action executor's job).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoothbyRunOutcome {
     /// The pre-spawn short-circuit found no candidates; no session was
@@ -83,32 +82,73 @@ pub enum BoothbyRunOutcome {
 
 /// The pass-execution seam. The scheduler calls this once it has decided a
 /// pass should run (schedule due, event due, or a manual fire) and a
-/// `boothby_passes` row is already open. Implemented for real once the brief
-/// composer (task 4) and session spawn (task 5) land; [`NothingToDoPassRunner`]
-/// is the task-3 placeholder.
+/// `boothby_passes` row is already open.
 #[async_trait]
 pub trait BoothbyPassRunner: Send + Sync {
     async fn run_pass(&self, pass: &BoothbyPass) -> BoothbyRunOutcome;
 }
 
-/// Task-3 placeholder runner: the brief composer and session spawn are
-/// tasks 4/5. Until they land, every pass reports `nothing_to_do` — which is
-/// simply true today (no candidates are computed yet), not a faked result.
-/// Mirrors [`crate::automation_scheduler::LoggingTriageDispatcher`]'s role
-/// for automations.
+/// Cheap pre-spawn check: how many candidates does this pass have to act on?
+/// Zero means the pass concludes `nothing_to_do` and no session is spawned.
+#[async_trait]
+pub trait BoothbyPreflight: Send + Sync {
+    async fn candidate_count(&self, pass: &BoothbyPass) -> usize;
+}
+
+/// Preflight used until the pass-brief composer exists: nothing computes
+/// candidates yet, so none are reported.
 #[derive(Debug, Default)]
-pub struct NothingToDoPassRunner;
+pub struct NoCandidatesPreflight;
 
 #[async_trait]
-impl BoothbyPassRunner for NothingToDoPassRunner {
+impl BoothbyPreflight for NoCandidatesPreflight {
+    async fn candidate_count(&self, _pass: &BoothbyPass) -> usize {
+        0
+    }
+}
+
+/// Session runner used until session spawning exists. Never reached while
+/// the preflight reports no candidates; fails loudly if it is.
+#[derive(Debug, Default)]
+pub struct UnavailableSessionRunner;
+
+#[async_trait]
+impl BoothbyPassRunner for UnavailableSessionRunner {
+    async fn run_pass(&self, _pass: &BoothbyPass) -> BoothbyRunOutcome {
+        BoothbyRunOutcome::Failed {
+            detail: "boothby session runner is not available".to_owned(),
+        }
+    }
+}
+
+/// Runs the preflight first and only invokes the session runner when it
+/// found candidates — the pre-spawn `nothing_to_do` short-circuit.
+pub struct PreflightedPassRunner {
+    preflight: Arc<dyn BoothbyPreflight>,
+    session: Arc<dyn BoothbyPassRunner>,
+}
+
+impl PreflightedPassRunner {
+    pub fn new(preflight: Arc<dyn BoothbyPreflight>, session: Arc<dyn BoothbyPassRunner>) -> Self {
+        Self { preflight, session }
+    }
+
+    /// The production wiring: no candidates are computed yet, so every pass
+    /// short-circuits to `nothing_to_do`.
+    pub fn production() -> Self {
+        Self::new(Arc::new(NoCandidatesPreflight), Arc::new(UnavailableSessionRunner))
+    }
+}
+
+#[async_trait]
+impl BoothbyPassRunner for PreflightedPassRunner {
     async fn run_pass(&self, pass: &BoothbyPass) -> BoothbyRunOutcome {
-        tracing::debug!(
-            pass_id = %pass.id,
-            trigger = %pass.trigger,
-            "boothby: pass brief composer / session spawn not yet implemented \
-             (design tasks 4/5); reporting nothing_to_do",
-        );
-        BoothbyRunOutcome::NothingToDo
+        let candidates = self.preflight.candidate_count(pass).await;
+        if candidates == 0 {
+            tracing::debug!(pass_id = %pass.id, trigger = %pass.trigger, "boothby: no candidates; skipping session spawn");
+            return BoothbyRunOutcome::NothingToDo;
+        }
+        self.session.run_pass(pass).await
     }
 }
 
@@ -202,7 +242,7 @@ fn scheduled_next_due(work_db: &WorkDb, settings: &SettingsStore, _now: i64) -> 
 /// ordinary race with another caller, not a failure — or when the DB layer
 /// itself errors (logged). Split out from [`run_and_finish_pass`] so the RPC
 /// handler can reply as soon as the pass opens instead of blocking its
-/// caller for the whole pass (`boothby.md` design task 3; see
+/// caller for the whole pass (see
 /// `FrontendEvent::BoothbyPassStarted`'s doc comment for the contract this
 /// enables).
 pub async fn open_and_announce_pass(
@@ -300,7 +340,7 @@ pub async fn run_one_tick(
     // mid-pass) is force-closed before we consider firing a new one. With
     // today's synchronous runner this branch is unreachable outside a
     // crash — the tick that opens a pass also finishes it — but the check
-    // is cheap and becomes load-bearing once task 5 spawns a real session
+    // is cheap and becomes load-bearing once a real session is spawned
     // that can outlive an engine restart.
     if let Ok(Some(open)) = work_db.get_open_boothby_pass() {
         let started: i64 = open.started_at.parse().unwrap_or(now);
@@ -429,6 +469,47 @@ mod tests {
         BoothbyEventQueue::new(Arc::new(Notify::new()))
     }
 
+    struct CountPreflight(usize);
+
+    #[async_trait]
+    impl BoothbyPreflight for CountPreflight {
+        async fn candidate_count(&self, _pass: &BoothbyPass) -> usize {
+            self.0
+        }
+    }
+
+    struct CompletingSession;
+
+    #[async_trait]
+    impl BoothbyPassRunner for CompletingSession {
+        async fn run_pass(&self, _pass: &BoothbyPass) -> BoothbyRunOutcome {
+            BoothbyRunOutcome::Completed { summary: None }
+        }
+    }
+
+    fn pass_stub() -> BoothbyPass {
+        BoothbyPass::builder()
+            .id("p1")
+            .trigger("manual")
+            .started_at("0")
+            .build()
+    }
+
+    #[tokio::test]
+    async fn empty_preflight_skips_the_session() {
+        let runner = PreflightedPassRunner::new(Arc::new(CountPreflight(0)), Arc::new(CompletingSession));
+        assert_eq!(runner.run_pass(&pass_stub()).await, BoothbyRunOutcome::NothingToDo);
+    }
+
+    #[tokio::test]
+    async fn non_empty_preflight_runs_the_session() {
+        let runner = PreflightedPassRunner::new(Arc::new(CountPreflight(2)), Arc::new(CompletingSession));
+        assert_eq!(
+            runner.run_pass(&pass_stub()).await,
+            BoothbyRunOutcome::Completed { summary: None }
+        );
+    }
+
     #[tokio::test]
     async fn mode_off_short_circuits_the_tick() {
         let (_d, db) = open_db();
@@ -441,7 +522,7 @@ mod tests {
             &db,
             &settings,
             &events,
-            &NothingToDoPassRunner,
+            &PreflightedPassRunner::production(),
             &NoopBoothbyActivitySink,
             1_000,
         )
@@ -464,7 +545,7 @@ mod tests {
             &db,
             &settings,
             &events,
-            &NothingToDoPassRunner,
+            &PreflightedPassRunner::production(),
             &NoopBoothbyActivitySink,
             1_000,
         )
@@ -485,7 +566,7 @@ mod tests {
             &db,
             &settings,
             &events,
-            &NothingToDoPassRunner,
+            &PreflightedPassRunner::production(),
             &NoopBoothbyActivitySink,
             120,
         )
@@ -515,7 +596,7 @@ mod tests {
             &db,
             &settings,
             &events,
-            &NothingToDoPassRunner,
+            &PreflightedPassRunner::production(),
             &NoopBoothbyActivitySink,
             120,
         )
@@ -527,7 +608,7 @@ mod tests {
             &db,
             &settings,
             &events,
-            &NothingToDoPassRunner,
+            &PreflightedPassRunner::production(),
             &NoopBoothbyActivitySink,
             180,
         )
@@ -556,7 +637,7 @@ mod tests {
             &db,
             &settings,
             &events,
-            &NothingToDoPassRunner,
+            &PreflightedPassRunner::production(),
             &NoopBoothbyActivitySink,
             800,
         )
@@ -568,7 +649,7 @@ mod tests {
             &db,
             &settings,
             &events,
-            &NothingToDoPassRunner,
+            &PreflightedPassRunner::production(),
             &NoopBoothbyActivitySink,
             1_010,
         )
@@ -590,7 +671,7 @@ mod tests {
             &db,
             &settings,
             &events,
-            &NothingToDoPassRunner,
+            &PreflightedPassRunner::production(),
             &NoopBoothbyActivitySink,
             1_100, // well within the 900s default timeout
         )
@@ -613,7 +694,7 @@ mod tests {
             &db,
             &settings,
             &events,
-            &NothingToDoPassRunner,
+            &PreflightedPassRunner::production(),
             &NoopBoothbyActivitySink,
             1_200, // 200s later, past the 60s timeout
         )
@@ -632,7 +713,7 @@ mod tests {
         // path the RunBoothbyPass RPC handler uses.
         let outcome = run_and_finish_pass(
             &db,
-            &NothingToDoPassRunner,
+            &PreflightedPassRunner::production(),
             &NoopBoothbyActivitySink,
             boss_protocol::BOOTHBY_TRIGGER_MANUAL,
             1_000,

@@ -124,6 +124,12 @@ pub const TEXT_REGISTRY: &[TextSettingSpec] = &[
             timed_out.",
         default: "900",
     },
+    TextSettingSpec {
+        key: "boothby.max_actions_per_pass",
+        description: "Global cap on mutations Boothby may make in one pass, regardless of \
+            per-verb caps. Hitting it converts the remaining intended actions into proposals.",
+        default: "15",
+    },
 ];
 
 /// Static registry. Append here, read with `SettingsStore::is_enabled`.
@@ -739,6 +745,18 @@ mod tests {
         store.load().unwrap();
         assert_eq!(store.get_text("boothby.mode").as_deref(), Some("propose"));
         assert_eq!(store.get_text_i64("boothby.min_pass_gap_secs"), Some(900));
+        assert_eq!(store.get_text_i64("boothby.max_actions_per_pass"), Some(15));
+    }
+
+    #[test]
+    fn boothby_action_cap_persists() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        store.set_text("boothby.max_actions_per_pass", "7".to_owned()).unwrap();
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert_eq!(store2.get_text_i64("boothby.max_actions_per_pass"), Some(7));
     }
 
     #[test]
