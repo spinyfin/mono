@@ -1805,7 +1805,10 @@ mod tests {
 
     fn make_session_sink() -> Arc<SessionSink> {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
-        Arc::new(SessionSink::new(shutdown_tx))
+        Arc::new(SessionSink::new(
+            shutdown_tx,
+            crate::app::frontend_metrics::test_registry(),
+        ))
     }
 
     /// Stand up a `question`-classified comment already `answering`, with

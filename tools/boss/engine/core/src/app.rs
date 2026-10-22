@@ -91,6 +91,8 @@ mod github_auth;
 // can persist its auto-pause through the same `METADATA_KEY_DISPATCH_PAUSED*`
 // keys the human dispatch toggle uses. Individual items stay `pub(crate)`/
 // `pub(super)`; only the module path is widened.
+mod frontend_event_kind;
+pub(crate) mod frontend_metrics;
 pub(crate) mod handler_helpers;
 mod hosts;
 mod ideas;
@@ -2359,7 +2361,7 @@ async fn handle_frontend_connection(
     let mut reader = BufReader::new(read_half).lines();
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-    let sink = Arc::new(SessionSink::new(shutdown_tx));
+    let sink = Arc::new(SessionSink::new(shutdown_tx, server_state.metrics.clone()));
     server_state
         .topic_broker
         .register_session(&session_id, sink.clone())
@@ -2498,6 +2500,8 @@ async fn handle_frontend_connection(
         let decode_ms = crate::population_timing::elapsed_ms(decode_start);
         let request_id = envelope.request_id.clone();
         let request = envelope.payload;
+        let verb = variant_name(&request);
+        frontend_metrics::record_request(&server_state.metrics, &verb);
         if let FrontendRequest::RecreateCoordinator {
             expected_spawn_token, ..
         } = &request
@@ -2543,7 +2547,6 @@ async fn handle_frontend_connection(
             read_admission::ReadLane::Ordered => None,
         };
         let waiting_read = if let Some((admission, connection)) = read_lane {
-            let verb = variant_name(&request);
             match admission.enqueue_as(
                 connection,
                 Some(read_admission::Identity {

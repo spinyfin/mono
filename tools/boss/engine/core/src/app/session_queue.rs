@@ -369,6 +369,7 @@ struct SinkWakers {
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub(super) struct SessionSink {
+    metrics: Arc<boss_metrics::Registry>,
     #[builder(default = StdMutex::new(SessionQueue::new()))]
     pub(super) queue: StdMutex<SessionQueue>,
     #[builder(skip)]
@@ -397,8 +398,11 @@ pub(super) struct SessionSink {
 }
 
 impl SessionSink {
-    pub(super) fn new(shutdown_tx: oneshot::Sender<()>) -> Self {
-        Self::builder().shutdown(StdMutex::new(Some(shutdown_tx))).build()
+    pub(super) fn new(shutdown_tx: oneshot::Sender<()>, metrics: Arc<boss_metrics::Registry>) -> Self {
+        Self::builder()
+            .shutdown(StdMutex::new(Some(shutdown_tx)))
+            .metrics(metrics)
+            .build()
     }
 
     /// Stash a partial population-timing trace to be completed by the writer
@@ -420,6 +424,10 @@ impl SessionSink {
     }
 
     pub(super) fn enqueue(&self, mut env: FrontendEventEnvelope) -> EnqueueOutcome {
+        let push_kind = env
+            .request_id
+            .is_none()
+            .then(|| super::frontend_event_kind::kind(&env.payload));
         let mut reads = self.view_reads.lock().expect("view reads poisoned");
         if let Some(id) = env.request_id.clone() {
             if matches!(
@@ -444,6 +452,9 @@ impl SessionSink {
             env.request_id = Some(id);
         }
         let outcome = self.queue.lock().expect("session queue lock poisoned").enqueue(env);
+        if let Some(kind) = push_kind {
+            super::frontend_metrics::record_push(&self.metrics, kind, &outcome);
+        }
         match outcome {
             EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Degraded => {
                 self.wakers.writer.notify_one()

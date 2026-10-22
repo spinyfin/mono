@@ -217,6 +217,12 @@ async fn denied_verb_never_reaches_its_handler() {
     assert_eq!(parsed["request_id"], "req-1");
     assert_eq!(parsed["payload"]["type"], "worker_tier_denied");
     assert_eq!(parsed["payload"]["denial"]["verb"], "UpdateWorkItem");
+    assert_eq!(
+        server_state
+            .metrics
+            .counter_value("frontend_requests_total.updateworkitem"),
+        Some(1)
+    );
     assert_eq!(parsed["payload"]["denial"]["reason"], "mutating_taxonomy");
     assert!(
         parsed["payload"]["denial"]["use_instead"]

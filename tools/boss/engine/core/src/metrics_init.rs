@@ -71,6 +71,9 @@ pub fn init_all(registry: &Registry) {
     // dynamically on first use (the caller x bucket axis isn't a
     // compile-time-known set), so only the statics land here.
     crate::github_api_usage::register_metrics(registry);
+    // Frontend totals register at boot; bounded verb/kind/outcome breakdowns
+    // register dynamically on their first decoded request or push attempt.
+    crate::app::frontend_metrics::register_metrics(registry);
     // Work DB lock-contention rollup: timing-event / busy-failure counters
     // and the longest-hold-per-minute gauge.
     crate::work::lock_stats::register_metrics(registry);
@@ -91,7 +94,8 @@ mod tests {
         // value and merge silently into a wrong number. Adjacent-line edits
         // here conflict textually (or merge correctly) instead. Keep sorted.
         // Dynamically registered counters (answer-agent error kinds,
-        // `completion.mid_turn_reap.<source>.count`, github_api per-caller)
+        // `completion.mid_turn_reap.<source>.count`, github_api per-caller,
+        // frontend request verbs and push kind/outcomes)
         // are not registered by `init_all` and stay out of this list.
         assert_eq!(
             counter_names,
@@ -147,6 +151,8 @@ mod tests {
                 "external_tracker.tracked_label_attach_failed",
                 "external_tracker.tracked_label_attach_succeeded",
                 "external_tracker.unbound",
+                "frontend_pushes_total",
+                "frontend_requests_total",
                 "github_api.calls.total",
                 "github_api.calls.unattributed",
                 "github_api.calls.without_reading",

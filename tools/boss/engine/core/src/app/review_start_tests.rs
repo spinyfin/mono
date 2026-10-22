@@ -59,7 +59,10 @@ async fn request(
     metadata: anyhow::Result<serde_json::Value>,
 ) -> FrontendEvent {
     let (shutdown, _rx) = oneshot::channel();
-    let sink = Arc::new(SessionSink::new(shutdown));
+    let sink = Arc::new(SessionSink::new(
+        shutdown,
+        crate::app::frontend_metrics::test_registry(),
+    ));
     let ctx = Dispatch::builder()
         .server_state(state.clone())
         .work_db(state.work_db.clone())

@@ -10,7 +10,8 @@ private let appOpenLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: 
 @main
 struct BossMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var chatModel = ChatViewModel(paths: BossEnginePaths.production())
+    @StateObject private var chatModel = BossMetricsCapture.enabled
+        ? BossMetricsCapture.model : ChatViewModel(paths: BossEnginePaths.production())
 
     var body: some Scene {
         WindowGroup {
@@ -532,10 +533,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if BossRevealCapture.state != nil {
             BossRevealCapture.start(updateModel: updateModel)
         } else if let path = BossCaptureArgs.shared.captureTo {
-            BossWindowCapture.scheduleCapture(
-                to: path,
-                after: BossCaptureArgs.shared.captureAfter
-            )
+            if BossMetricsCapture.enabled {
+                BossMetricsCapture.schedule(to: path, after: BossCaptureArgs.shared.captureAfter)
+            } else {
+                BossWindowCapture.scheduleCapture(
+                    to: path,
+                    after: BossCaptureArgs.shared.captureAfter
+                )
+            }
         }
     }
 

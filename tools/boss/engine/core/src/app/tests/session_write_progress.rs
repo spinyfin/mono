@@ -15,7 +15,7 @@ fn fill_old_queue(sink: &SessionSink) {
 #[tokio::test(start_paused = true)]
 async fn progressing_large_frame_survives_old_full_queue() {
     let (tx, mut shutdown) = oneshot::channel();
-    let sink = Arc::new(SessionSink::new(tx));
+    let sink = Arc::new(SessionSink::new(tx, crate::app::frontend_metrics::test_registry()));
     let broker = TopicBroker::default();
     broker.register_session("progressing-writer", sink.clone()).await;
     let topics: Vec<String> = (0..8).map(|i| format!("updates.{i}")).collect();
@@ -68,7 +68,7 @@ async fn progressing_large_frame_survives_old_full_queue() {
 async fn non_reading_client_times_out_without_more_publishes_and_logs_envelopes() {
     let logs = crate::test_support::log_capture::install();
     let (tx, mut shutdown) = oneshot::channel();
-    let sink = SessionSink::new(tx);
+    let sink = SessionSink::new(tx, crate::app::frontend_metrics::test_registry());
     fill_old_queue(&sink);
     let (mut writer, _non_reader) = tokio::io::duplex(16);
     let line = serde_json::to_string(&response_envelope("blocked-response")).unwrap();
@@ -101,7 +101,7 @@ async fn non_reading_client_times_out_without_more_publishes_and_logs_envelopes(
 #[test]
 fn recent_write_progress_preserves_old_correlated_reply_under_pressure() {
     let (tx, mut shutdown) = oneshot::channel();
-    let sink = SessionSink::new(tx);
+    let sink = SessionSink::new(tx, crate::app::frontend_metrics::test_registry());
     {
         let mut q = sink.queue.lock().unwrap();
         assert_eq!(q.enqueue(response_envelope("pending-reply")), EnqueueOutcome::Enqueued);
@@ -127,7 +127,7 @@ fn recent_write_progress_preserves_old_correlated_reply_under_pressure() {
 #[test]
 fn old_write_progress_does_not_protect_stuck_client() {
     let (tx, _shutdown) = oneshot::channel();
-    let sink = SessionSink::new(tx);
+    let sink = SessionSink::new(tx, crate::app::frontend_metrics::test_registry());
     fill_old_queue(&sink);
     sink.queue.lock().unwrap().last_write_progress =
         Some(tokio::time::Instant::now() - std::time::Duration::from_millis(STUCK_CLIENT_AGE_MS + 100));
