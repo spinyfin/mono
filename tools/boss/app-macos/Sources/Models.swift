@@ -519,8 +519,8 @@ extension WorkTask {
     ///     has an open PR; the block is transient and in-flight. The card
     ///     shows the reason badge so the state is legible.
     ///   • `awaiting_operator_answer` with an open question
-    ///     (`isAwaitingOperatorAnswer`) → Doing's "Needs Attention"
-    ///     section: the task is work in progress waiting on an answer.
+    ///     (`isAwaitingOperatorAnswer`) → Doing's Queued
+    ///     section (no worker is live on it): the task is work in progress waiting on an answer.
     ///   • Everything else (dependency, nil, unknown) → Backlog: the item
     ///     can't start yet, so from the user's perspective it sits with
     ///     the not-yet-active pile.
@@ -587,7 +587,7 @@ extension WorkTask {
     /// `true` when a worker ended its run by asking the user a question
     /// and nobody has answered yet: the task is `blocked` for
     /// `awaiting_operator_answer` *and* the engine projected an open question
-    /// onto it. Routes the card into Doing's "Needs Attention" section
+    /// onto it. Routes the card into Doing's Queued section
     /// (`boardColumn`).
     ///
     /// Gated on `status`, for the same stale-scalar reason `WorkBlockedBadge`
@@ -595,7 +595,7 @@ extension WorkTask {
     /// route a card. Gated on the question too: a parked task with the
     /// reason but nothing to answer (an answer type this build cannot render,
     /// or a payload racing the question's withdrawal) stays a plain blocked
-    /// card in Backlog rather than a Needs Attention card with no buttons.
+    /// card in Backlog rather than a Queued card with no buttons.
     var isAwaitingOperatorAnswer: Bool {
         status == "blocked"
             && blockedReason == "awaiting_operator_answer"

@@ -110,7 +110,22 @@ fn dispatch_status_and_wait_reasons_never_invent_a_live_worker() {
                     rusqlite::params![status.as_str(), reason, execution.id],
                 )
                 .unwrap();
-            assert!(classify_doing_sections(&db, &[]).is_empty(), "{status:?}, {reason:?}");
+            // An adopted slot (no binding) makes the classifier read this
+            // execution row, so the status and wait reason are really loaded.
+            let mut adopted = worker(&task.id, ExecutionKind::ChoreImplementation, WorkerActivity::Terminated);
+            adopted.run_id = execution.id.clone();
+            adopted.work_item_id = None;
+            adopted.kind = None;
+            assert!(
+                classify_doing_sections(&db, std::slice::from_ref(&adopted)).is_empty(),
+                "{status:?}, {reason:?}: terminal slot is Queued"
+            );
+            adopted.activity = WorkerActivity::Working;
+            assert_eq!(
+                classify_doing_sections(&db, &[adopted])[&task.id],
+                DoingSection::Coding,
+                "{status:?}, {reason:?}: live slot is Coding"
+            );
         }
     }
     // A live slot remains authoritative even if bookkeeping is terminal.

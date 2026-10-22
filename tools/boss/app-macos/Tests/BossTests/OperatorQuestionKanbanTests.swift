@@ -323,34 +323,17 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertEqual(sections[0].items.count, 2, "each card must appear exactly once")
     }
 
-    func testBoardGroupMapsAwaitingTaskToNeedsAttention() {
+    func testBoardGroupIsNilForDoingCards() {
         let model = makeModel()
         let task = awaiting(id: "task_q")
         let active = makeTask(id: "task_active", status: "active", reason: nil, question: nil)
         model.choresByProductID = ["prod_test": [task, active]]
 
-        XCTAssertEqual(model.boardGroup(for: task), .needsAttention)
+        XCTAssertNil(model.boardGroup(for: task))
         XCTAssertNil(model.boardGroup(for: active))
     }
 
     // MARK: - Wire
-
-    /// The engine's `BoardGroup` has no Needs Attention member, so a drop on
-    /// the section must name only the column.
-    func testMoveRequestNeverSendsTheClientOnlyNeedsAttentionGroup() {
-        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
-        var sent: [[String: Any]] = []
-        client.outboundRecorder = { sent.append($0) }
-
-        client.sendMoveWorkItemOnBoard(id: "task_a", column: .doing, group: .needsAttention)
-        client.sendMoveWorkItemOnBoard(id: "task_a", column: .done, group: .merging)
-
-        let targets = sent.compactMap { $0["target"] as? [String: Any] }
-        XCTAssertEqual(targets.count, 2)
-        XCTAssertEqual(targets[0]["column"] as? String, "doing")
-        XCTAssertNil(targets[0]["group"])
-        XCTAssertEqual(targets[1]["group"] as? String, "merging")
-    }
 
     func testAnswerOperatorQuestionRequestEncoding() throws {
         let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
@@ -523,7 +506,7 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         var sent: [[String: Any]] = []
         model.engine.outboundRecorder = { sent.append($0) }
 
-        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: .needsAttention))
+        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: nil))
         XCTAssertTrue(sent.isEmpty)
         XCTAssertNil(model.optimisticColumnByTaskID[task.id])
         XCTAssertNil(model.pendingDragAdmissionCheck)
