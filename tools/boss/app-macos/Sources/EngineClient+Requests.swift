@@ -282,7 +282,7 @@ extension EngineClient {
     /// product-switch breakdowns can be grepped apart, and lets
     /// [[PopulationTiming]] record the send timestamp for the
     /// request→reply segment plus the per-product session issue count
-    /// (which surfaces the cold-start double-fetch).
+    /// (which surfaces duplicate fetches).
     func sendGetWorkTree(productId: String, flow: PopulationFlow) {
         // Propagate the app-side `fetch_seq` on the wire so the engine can
         // stamp it on its `engine-population-timing-*.jsonl` segments and the

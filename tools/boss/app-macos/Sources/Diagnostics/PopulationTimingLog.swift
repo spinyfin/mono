@@ -35,11 +35,11 @@ import os
 /// tag on every timing line so cold-start and product-switch breakdowns
 /// can be grepped apart.
 enum PopulationFlow: String, Sendable, Equatable {
-    /// App launch: the restored product's first population (`.connected`
-    /// and the redundant `.productsList` refetch of the same product).
+    /// App launch: the restored or auto-selected product's first population.
     case coldStart = "cold_start"
-    /// User selected a different product (`selectWorkProduct`), or the
-    /// initial product was auto-selected because none was persisted.
+    /// A restored connection refreshes the selected product using deltas.
+    case reconnect = "reconnect"
+    /// User selected a different product (`selectWorkProduct`).
     case productSwitch = "product_switch"
     /// A `WorkInvalidated` cache-bust triggered a full refetch of the
     /// currently-selected product.

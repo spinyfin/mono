@@ -1,10 +1,52 @@
 import Foundation
 
 /// Connection-lifecycle handling split out of `ChatViewModel.handle(_:)`:
-/// the `.resyncRequired` refetch path and the debounced "connection lost"
+/// initial/reconnect reads, the `.resyncRequired` path, and "connection lost"
 /// banner scheduling. See `showConnectionLostBanner` in `ChatViewModel.swift`
 /// for why the banner is debounced rather than tied directly to `isConnected`.
 extension ChatViewModel {
+    /// Restore the session and refresh only data not supplied by subscription.
+    func handleConnected() {
+        let flow: PopulationFlow = hasConnectedOnce ? .reconnect : .coldStart
+        UpdateLifecycle.recordStartup("engine-connected")
+        markConnected()
+        resetConnectionLostBanner()
+        if refreshUnsentActions() { showDisconnectedActionNotice() }
+        // A quota request in flight when the socket dropped will never be
+        // answered, so clear the pending flag rather than leaving the
+        // pane's Refresh button disabled for the rest of the session.
+        isRefreshingDriverQuota = false
+        engine.sendRegisterAppSession()
+        refreshWorkSubscriptions()
+        // Re-subscribe any open markdown viewers' comment topics and reload
+        // them; the engine dropped every subscription on the disconnect.
+        commentBridge.handleReconnected()
+        // Subscribe currently acknowledges topics only (engine app/subscriptions.rs).
+        // Publishers emit changes, not snapshots on subscribe, so all of these
+        // reads are required on reconnect too, including after an engine restart.
+        engine.sendListProducts()
+        engine.sendListWorkerLiveStates()
+        engine.sendListLiveStatusDisabledSlots()
+        // Pull the engine's configuration health on every (re)connect
+        // so the top-of-window banner reflects the *current* engine,
+        // not the one we attached to before a restart (#699).
+        engine.sendGetEngineHealth()
+        // Pull the current per-installation settings snapshot so
+        // Settings reflects the engine immediately after connecting
+        // rather than waiting until Settings is opened.
+        engine.sendGetSettings()
+        refreshOffsiteBackup()
+        // Pull the current GitHub OAuth auth state so the "GitHub
+        // account" settings subsection reflects a token persisted by a
+        // prior session (the engine restores it from the keychain at
+        // boot) without waiting for a device-flow transition.
+        engine.sendGitHubAuthStatus()
+        if let productID = currentSelectedProductID, engine.claimConnectTree(productId: productID) {
+            engine.sendGetWorkTree(productId: productID, flow: flow)
+        }
+        startBackgroundWorkPolling()
+    }
+
     /// Leave the initiating sheet or gesture intact when the retry queue is full.
     func canSubmitUserActions(_ count: Int = 1, describing action: String = "This action") -> Bool {
         guard engine.hasRoomForDisconnectedActions(count) else {

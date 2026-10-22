@@ -239,6 +239,7 @@ final class EngineClient: @unchecked Sendable {
                 self.reachableState.withLock { $0 = true }
                 self.reachedReady = true
                 self.socketIndex = 0
+                self.connectTreeClaims.withLock { $0.removeAll() }
                 // Ordered behind any previous connection's pending lines
                 // and `.disconnected`, so a fast reconnect cannot land
                 // `.connected` before the old connection's teardown.
@@ -351,12 +352,13 @@ final class EngineClient: @unchecked Sendable {
         let kind = (payload["type"] as? String) ?? "unknown"
         if queueIfDisconnected {
             Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
-            // Held as sorted-key JSON so the queue is Sendable and an
-            // identical newer request supersedes the queued one.
+            // Tree reads supersede by product even when fetch_seq changes;
+            // other reads preserve their existing exact-payload identity.
             if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
+                let treeProductID = kind == "get_work_tree" ? payload["product_id"] as? String : nil
                 queuedReads.withLock { state in
-                    state.removeAll { $0.data == data }
-                    state.append((envelopeRequestId, data))
+                    state.removeAll { treeProductID != nil ? $0.treeProductID == treeProductID : $0.data == data }
+                    state.append((envelopeRequestId, data, treeProductID))
                     if state.count > Self.maxQueuedReads { state.removeFirst(state.count - Self.maxQueuedReads) }
                 }
             } else {
@@ -493,7 +495,7 @@ final class EngineClient: @unchecked Sendable {
     private static let log = Logger(subsystem: "Boss", category: "EngineClient")
     private static let maxQueuedReads = 64
     private let queuedReads = OSAllocatedUnfairLock(
-        initialState: [(id: String, data: Data)]()
+        initialState: [(id: String, data: Data, treeProductID: String?)]()
     )
 
     /// Number of reads waiting for a connection. Test hook.
@@ -503,13 +505,29 @@ final class EngineClient: @unchecked Sendable {
         queuedReads.withLock { $0.contains { $0.id == requestId } }
     }
 
+    /// Products whose post-connect tree has been issued on the current
+    /// connection, by either the queue flush or the connect handler, so
+    /// whichever runs second does not send a duplicate.
+    private let connectTreeClaims = OSAllocatedUnfairLock(initialState: Set<String>())
+
+    /// True when the caller may send the connect-time tree for `productId`
+    /// (the queue flush has not already sent one on this connection).
+    func claimConnectTree(productId: String) -> Bool {
+        connectTreeClaims.withLock { $0.insert(productId).inserted }
+    }
+
+    func resetConnectTreeClaims() {
+        connectTreeClaims.withLock { $0.removeAll() }
+    }
+
     private func flushQueuedReads() {
-        let drained = queuedReads.withLock { state -> [(id: String, data: Data)] in
-            let copy = state
+        let drained = queuedReads.withLock { state -> [(id: String, data: Data, treeProductID: String?)] in
+            let copy = state.map { (id: $0.id, data: $0.data, treeProductID: $0.treeProductID) }
             state.removeAll()
             return copy
         }
         for item in drained {
+            if let productID = item.treeProductID, !claimConnectTree(productId: productID) { continue }
             guard let payload = (try? JSONSerialization.jsonObject(with: item.data)) as? [String: Any] else { continue }
             write(payload, envelopeRequestId: item.id)
         }
