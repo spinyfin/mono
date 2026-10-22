@@ -1,7 +1,7 @@
 import Foundation
 
 /// Connection-lifecycle handling split out of `ChatViewModel.handle(_:)`:
-/// initial/reconnect reads, the `.resyncRequired` path, and "connection lost"
+/// initial/reconnect reads and "connection lost"
 /// banner scheduling. See `showConnectionLostBanner` in `ChatViewModel.swift`
 /// for why the banner is debounced rather than tied directly to `isConnected`.
 extension ChatViewModel {
@@ -9,6 +9,8 @@ extension ChatViewModel {
     func handleConnected() {
         let flow: PopulationFlow = hasConnectedOnce ? .reconnect : .coldStart
         UpdateLifecycle.recordStartup("engine-connected")
+        // This burst re-reads everything a pending resync refetch would.
+        cancelPendingResyncRefetch()
         markConnected()
         resetConnectionLostBanner()
         if refreshUnsentActions() { showDisconnectedActionNotice() }
@@ -121,22 +123,6 @@ extension ChatViewModel {
         if discardingCoordinatorReset { clearCoordinatorReset() }
         refreshUnsentActions()
         showDisconnectedActionNotice()
-    }
-
-    /// The engine dropped pending invalidations for our session while
-    /// riding out a publish burst instead of disconnecting us (see
-    /// `EngineEvent.resyncRequired`). The socket never went down, so
-    /// there's no connection state to fix — just refetch whatever a
-    /// dropped invalidation could have covered, the same data a
-    /// `.workInvalidated` refresh would have pulled. That refetch joins the
-    /// product's coalesced burst; a dropped push can't name the items it
-    /// covered, so every open execution history is refreshed with it.
-    func handleResyncRequired() {
-        engine.sendListProducts()
-        engine.sendListWorkerLiveStates()
-        engine.sendListLiveStatusDisabledSlots()
-        commentBridge.reloadOpenLayers()
-        scheduleInvalidationRefetch(productID: currentSelectedProductID, includesAllOpenConsumers: true)
     }
 
     /// Clears the banner and supersedes any pending delayed reveal on a

@@ -140,15 +140,17 @@ extension ChatViewModel {
         }
     }
 
-    /// Test-only: suspend until every pending burst has fired, so an
-    /// assertion about what a trigger sent runs after it was sent. Returns
-    /// `false` if a burst was still pending after `timeout`.
+    /// Test-only: suspend until every pending burst, and the resync refetch
+    /// that feeds one, has fired, so an assertion about what a trigger sent
+    /// runs after it was sent. Returns `false` if one was still pending after
+    /// `timeout`.
     func waitForRefetchBurstsForTest(timeout: Duration = .seconds(5)) async -> Bool {
         let deadline = ContinuousClock.now + timeout
-        while !pendingWorkTreeRefetchTasks.isEmpty, ContinuousClock.now < deadline {
+        func settled() -> Bool { pendingWorkTreeRefetchTasks.isEmpty && pendingResyncRefetchTask == nil }
+        while !settled(), ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(5))
         }
-        return pendingWorkTreeRefetchTasks.isEmpty
+        return settled()
     }
 
     // MARK: - Executions consumers

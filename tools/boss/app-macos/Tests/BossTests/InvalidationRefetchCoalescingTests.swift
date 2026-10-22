@@ -251,9 +251,8 @@ final class InvalidationRefetchCoalescingTests: XCTestCase {
 
         model.applyEventForTest(.resyncRequired)
         model.applyEventForTest(.resyncRequired)
-        model.applyEventForTest(invalidation(itemIDs: []))
 
-        await waitForBurst(model, recorder)
+        await waitForBurst(model, recorder, verb: "list_executions")
 
         XCTAssertEqual(recorder.counts["get_work_tree"], 1)
         XCTAssertEqual(recorder.counts["list_deferred_scope_attentions"], 1)
@@ -340,6 +339,9 @@ final class InvalidationRefetchCoalescingTests: XCTestCase {
         model.isConnected = true
         model.engine.simulateConnectedForTesting = true
         model.refetchCoalescingPolicy = policy
+        model.resyncRefetchGate = ResyncRefetchGate(policy: .init(
+            window: policy.window, initialBackoff: .seconds(30), maxBackoff: .seconds(30), quietReset: .seconds(60)
+        ))
         let recorder = Recorder()
         model.outboundRecorder = { recorder.sent.append($0) }
         return (model, recorder)

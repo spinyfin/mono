@@ -83,8 +83,9 @@ final class PlannerRunTreeSummaryTests: XCTestCase {
         model.applyEventForTest(.workInvalidated(topic: "work.product.prod_1", productId: "prod_1", itemIds: []))
         model.applyEventForTest(.resyncRequired)
         model.applyEventForTest(.workItemsCreated(items: [.project(projects[0])]))
-        try? await Task.sleep(for: .milliseconds(150))
+        let settled = await model.waitForRefetchBurstsForTest()
 
+        XCTAssertTrue(settled, "the refetch burst never fired")
         XCTAssertTrue(requests.contains("get_work_tree"), "the tree refetch is what carries planner state")
         XCTAssertFalse(
             requests.contains("list_planner_runs"),

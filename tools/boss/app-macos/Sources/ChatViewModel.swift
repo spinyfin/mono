@@ -82,6 +82,10 @@ final class ChatViewModel: ObservableObject {
     /// when it fires, keyed by the same product id.
     var pendingRefetchBursts: [String: PendingRefetchBurst] = [:]
     var refetchCoalescingPolicy = RefetchCoalescingPolicy.standard
+    /// Coalescing and backoff of `resync_required`, and the timer for the one
+    /// refetch it has pending; see `ChatViewModel+ResyncRefetch.swift`.
+    var resyncRefetchGate = ResyncRefetchGate()
+    var pendingResyncRefetchTask: Task<Void, Never>?
     /// Views currently showing a task's execution history (card popover,
     /// transcript viewer), by task id, each identified by a per-view token.
     /// A task with no entry has no consumer: its history is not cached and
