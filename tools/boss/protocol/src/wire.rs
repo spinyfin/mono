@@ -1131,6 +1131,19 @@ pub enum FrontendRequest {
         estimate_usd: bool,
     },
 
+    /// Re-read a few cards of one product without assembling its board. The
+    /// reply ([`FrontendEvent::WorkRuntimePatch`]) carries each named card
+    /// and the other members of its revision chain (their derived flags
+    /// depend on each other), each projected as `GetWorkTree` projects it,
+    /// plus its `TaskRuntime`, all from one database snapshot. Ids that are
+    /// not live cards of the product (deleted, archived, moved to another
+    /// product) come back in `absent` rather than as an error. Backs the
+    /// app's handling of a runtime-class [`InvalidationClass`] push.
+    GetWorkRuntimePatch {
+        product_id: String,
+        item_ids: Vec<String>,
+    },
+
     GetWorkTree {
         product_id: String,
         /// Opt in to session-local snapshot/delta replies.
@@ -2874,6 +2887,9 @@ pub enum FrontendRequest {
 mod events;
 pub use events::FrontendEvent;
 
+mod invalidation;
+pub use invalidation::{InvalidationClass, WorkRuntimePatchItem};
+
 // Feature-flag / setting snapshots and workspace / worker pool summary
 // rows live in the `snapshot_wire` submodule (extracted to keep this file
 // under the size limit) and are re-exported so external
@@ -2891,6 +2907,10 @@ pub enum TopicEventPayload {
         reason: String,
         product_id: Option<String>,
         item_ids: Vec<String>,
+        /// How much of the board the change can have touched. Absent on the
+        /// wire means [`InvalidationClass::Structural`].
+        #[serde(default)]
+        class: InvalidationClass,
     },
     ExecutionInvalidated {
         reason: String,
