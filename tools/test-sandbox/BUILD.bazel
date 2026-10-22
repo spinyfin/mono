@@ -81,6 +81,20 @@ sh_test(
     data = [":test_filter_fixture"],
 )
 
+# Scale regression for the same wrapper's sharding path. Drives the wrapper
+# *template* against a fake libtest binary that enumerates 20,000 tests,
+# asserts the exact `index % shards` partition, and bounds the CPU the wrapper
+# spends before exec'ing the shard: the bash-loop partition it replaced cost
+# ~0.2 ms per enumerated test per shard on macOS bash 3.2 (~1.2 s per shard
+# for the engine's 6,400-test suite, paid on every run).
+sh_test(
+    name = "test_wrapper_scale_test",
+    size = "small",
+    srcs = ["test_wrapper_scale_test.sh"],
+    data = ["@rules_rust//rust/private:test_wrapper.sh"],
+    env = {"WRAPPER_TEMPLATE": "$(rlocationpath @rules_rust//rust/private:test_wrapper.sh)"},
+)
+
 sh_test(
     name = "linux_policy_source_test",
     size = "small",
