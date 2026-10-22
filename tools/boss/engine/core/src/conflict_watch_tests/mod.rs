@@ -11,5 +11,6 @@ mod rearm;
 mod resolution;
 mod retire;
 mod revision;
+mod stale_revision;
 mod supersession;
 mod trunk_coordination;
