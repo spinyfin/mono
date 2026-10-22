@@ -28,7 +28,7 @@ use super::ProgressReporter;
 ///
 /// Chosen from measurement: see `tools/checkleft/docs/slow-check-threshold.md`
 /// for the observed peaks and the margin applied.
-pub const DEFAULT_SLOW_CHECK_THRESHOLD: Duration = Duration::from_secs(300);
+pub const DEFAULT_SLOW_CHECK_THRESHOLD: Duration = Duration::from_secs(600);
 
 /// How often the watcher thread polls the monitor.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -470,34 +470,75 @@ mod tests {
 
     #[test]
     fn finish_cannot_overtake_a_still_running_line_already_being_delivered() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
         let inner = Arc::new(RecordingReporter::default());
         let printed: Arc<Mutex<Vec<String>>> = Arc::default();
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let tx = Mutex::new(tx);
-        // The first delivery announces itself, then lingers; a finish() issued
-        // meanwhile must wait for it instead of printing first.
+        let (began_tx, began_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let began_tx = Mutex::new(began_tx);
+        let release_rx = Mutex::new(release_rx);
+        let gated = AtomicBool::new(false);
+        // Only the first delivery (the "still running" line) is gated: it
+        // announces itself, then blocks until released. Later deliveries pass
+        // straight through, so if finish() is not serialized behind the gated
+        // delivery it appends its line while the gate is still held.
         let sink: SlowCheckSink = {
             let printed = Arc::clone(&printed);
             Arc::new(move |lines| {
-                let first = printed.lock().unwrap().is_empty();
-                if first {
-                    let _ = tx.lock().unwrap().send(());
-                    std::thread::sleep(Duration::from_millis(150));
+                if !gated.swap(true, Ordering::SeqCst) {
+                    began_tx.lock().unwrap().send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("gate released");
                 }
                 printed.lock().unwrap().extend(lines);
             })
         };
-        let reporter =
-            SlowCheckReporter::with_poll_interval(inner, Duration::from_millis(10), Duration::from_millis(5), sink);
+        let reporter = Arc::new(SlowCheckReporter::with_poll_interval(
+            inner,
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+            sink,
+        ));
         reporter.start("lint");
-        rx.recv_timeout(Duration::from_secs(10))
+        began_rx
+            .recv_timeout(Duration::from_secs(10))
             .expect("slow line delivery began");
-        reporter.finish("lint", 0, Duration::from_millis(1));
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let finisher = {
+            let reporter = Arc::clone(&reporter);
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                reporter.finish("lint", 0, Duration::from_millis(1));
+                finished.store(true, Ordering::SeqCst);
+            })
+        };
+        // While the gate is held finish() must neither deliver nor return.
+        // Without serialization it completes within microseconds, so this
+        // window only needs to be long enough to catch that.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            assert!(
+                !finished.load(Ordering::SeqCst),
+                "finish() completed while the earlier line was still being delivered"
+            );
+            assert!(printed.lock().unwrap().is_empty(), "{:?}", printed.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        release_tx.send(()).unwrap();
+        finisher.join().unwrap();
         drop(reporter);
 
         let lines = printed.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].starts_with("checks: still running lint"), "{lines:?}");
-        assert!(lines.last().unwrap().starts_with("checks: lint finished"), "{lines:?}");
+        assert!(lines[1].starts_with("checks: lint finished"), "{lines:?}");
     }
 
     #[test]

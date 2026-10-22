@@ -18,6 +18,10 @@ The incident that motivated this (a `checks` job silent for 5+ minutes) is on th
 
 ## Choice
 
-300s: above every healthy CI run except the single 335s outlier and the second-slowest (283s) with margin, about 3.4x the worst local single-check peak (87s) and 8x the typical cold peak (36s). Local runs never print it. In CI it would have fired on 1 of the 44 sampled healthy runs (the 335s one), and on a real hang it reports at 5 minutes and again at 10, which is the incident's scale. An earlier 180s choice would have fired on 2 of 44 healthy CI runs, so it was raised.
+600s. The only CI evidence is the whole-run bound above (max 335s across 44 sampled healthy runs), so the threshold is set clearly above that bound rather than inside it: 600s is about 1.8x the 335s maximum and 2.1x the second-slowest run (283s), and about 7x the worst local single-check peak (87s). Because a single check never exceeds the whole-run time, no sampled healthy CI run could have printed a slow-check line at this threshold. Local runs never print it. On a real hang it reports at 10 minutes and again at 20.
 
-Re-measure and revisit if checks get materially slower, or once CI logs carry per-check timings (then the threshold can be set from the per-check peak instead of the whole-run bound).
+Uncertainty: the bound is a sample of 44 runs, so a future healthy run slower than 600s could still print the line; the line is informational and nothing is killed. The cost of choosing above the bound is that a hang is first reported later (10 minutes, not the 5+ minutes of the incident that motivated this).
+
+## Deferred: per-check CI timings
+
+The logs carry no per-check durations, so the threshold cannot yet be set from the per-check peak in CI. Gathering them needs a CI-side change (opt-in per-check timing output in the `checks` job) that is outside this change. Until then 600s over the whole-run bound is the justified margin; once per-check CI timings exist, it should be re-derived from their peak.
