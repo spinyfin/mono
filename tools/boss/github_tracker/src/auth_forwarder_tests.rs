@@ -4,8 +4,8 @@
 //! and no org the probe can resolve, the loop used to probe and broadcast on
 //! every wake-up, and its own `update_org_state` write woke it again — a hot
 //! loop (~1,400 pushes/s measured on an isolated engine). The tests run on
-//! tokio's paused clock and advance it a long way, so a timer-driven re-probe
-//! would show up as an extra probe just as a spin would.
+//! tokio's paused clock after any real HTTP completes, then advance it a long
+//! way so a timer-driven re-probe shows up as an extra probe just as a spin would.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -80,6 +80,7 @@ struct Harness {
     controller: Arc<GitHubAuthController>,
     store: Arc<KeychainTokenStore>,
     probes: Arc<AtomicUsize>,
+    probe_completed: Arc<tokio::sync::Notify>,
     broadcasts: Arc<std::sync::Mutex<Vec<GitHubAuthStateDto>>>,
 }
 
@@ -94,6 +95,7 @@ impl Harness {
         assert!(controller.restore_from_store(), "token should restore");
 
         let probes = Arc::new(AtomicUsize::new(0));
+        let probe_completed = Arc::new(tokio::sync::Notify::new());
         let broadcasts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::new(sink);
         let flow = controller.device_flow();
@@ -102,6 +104,7 @@ impl Harness {
         // Subscribed after the restore, as the engine does.
         let forwarder_rx = controller.subscribe();
         let probe_count = Arc::clone(&probes);
+        let completed = Arc::clone(&probe_completed);
         let sent = Arc::clone(&broadcasts);
         tokio::spawn(async move {
             run_auth_forwarder(
@@ -111,7 +114,12 @@ impl Harness {
                     probe_count.fetch_add(1, Ordering::SeqCst);
                     let sink = Arc::clone(&sink);
                     let flow = Arc::clone(&flow);
-                    async move { probe_and_record_org_state(sink.as_ref(), flow.as_ref(), &token).await }
+                    let completed = Arc::clone(&completed);
+                    async move {
+                        let state = probe_and_record_org_state(sink.as_ref(), flow.as_ref(), &token).await;
+                        completed.notify_one();
+                        state
+                    }
                 },
                 |dto| {
                     sent.lock().unwrap().push(dto);
@@ -125,6 +133,7 @@ impl Harness {
             controller,
             store,
             probes,
+            probe_completed,
             broadcasts,
         }
     }
@@ -177,7 +186,7 @@ async fn no_github_tracked_product_probes_and_broadcasts_once() {
     assert_eq!(harness.broadcasts(), vec![authorized(OrgAuthState::Unknown)]);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn every_org_probe_failing_probes_and_broadcasts_once() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -201,6 +210,13 @@ async fn every_org_probe_failing_probes_and_broadcasts_once() {
         },
     );
 
+    // Real socket I/O must finish before pausing/advancing Tokio time: a
+    // fixed number of yields can expire before wiremock receives the request,
+    // and paused time can auto-advance while socket I/O is still pending.
+    tokio::time::timeout(Duration::from_secs(30), harness.probe_completed.notified())
+        .await
+        .expect("org probe should complete");
+    tokio::time::pause();
     settle_over_long_window().await;
 
     assert_eq!(harness.probes(), 1, "exactly one probe");
