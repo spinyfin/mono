@@ -2576,6 +2576,9 @@ impl ExecutionCoordinator {
                 "reason": attention_kind,
                 "pre_start_failure_count": execution.pre_start_failure_count,
                 "will_retry": will_retry,
+                "decision": if will_retry { "retry" } else { "permanent" },
+                "attempt": execution.pre_start_failure_count,
+                "attention_kind": attention_kind,
                 "retry_delay_secs": retry_delay_secs,
             })))
             .await;

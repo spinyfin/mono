@@ -124,6 +124,74 @@ async fn checkout_of_predecessor_publication_cannot_hide_unpublished_work() {
     assert_eq!(recovery::snapshot_pointers(&LocalJj, &record).await.unwrap(), before);
 }
 
+/// A read-only review inherits nothing from the reviewer before it: the same
+/// damaged record that blocks an implementation kind (above) is not even
+/// consulted, so the review dispatches on the PR's current head, the
+/// pointers are not moved and nothing is retired or filed. This is the
+/// mono#3201 shape: sixteen reviews died in pre-start recovery against one
+/// predecessor record whose preserved changes the rewritten PR no longer
+/// carried under their change ids.
+#[tokio::test]
+async fn read_only_review_ignores_a_damaged_predecessor_record() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let (db, prior, mut next) = super::blocked_workspace::blocked_pair(&path);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'pr_review' WHERE id IN (?1, ?2)",
+            rusqlite::params![prior.id, next.id],
+        )
+        .unwrap();
+    next.kind = ExecutionKind::PrReview;
+    let repo = JjRepo::new(dir.path());
+    let record = recovery::create(&LocalJj, &repo.worker, &prior.id, "local")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    std::fs::write(repo.worker.join("published.txt"), "published").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "Published"]);
+    JjRepo::run(&repo.worker, &["bookmark", "set", "pr/99", "-r", "@"]);
+    JjRepo::run(&repo.repo, &["new", &record.base(), "-m", "Unpublished publication"]);
+    std::fs::write(repo.repo.join("unpublished.txt"), "unique work").unwrap();
+    JjRepo::run(
+        &repo.repo,
+        &["bookmark", "set", &record.publication(), "-r", "@", "--allow-backwards"],
+    );
+    let before = recovery::snapshot_pointers(&LocalJj, &record).await.unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        workspace_root: Some(dir.path().to_path_buf()),
+        real_bookmarks: true,
+        goto_reset_bookmark: Some(record.publication()),
+        ..Default::default()
+    });
+    let coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube,
+        Arc::new(FakeExecutionRunner::default()),
+    );
+    let lease = CubeWorkspaceLease {
+        dirty_verified: Some(false),
+        lease_id: "lease".into(),
+        workspace_id: "replacement".into(),
+        workspace_path: repo.replacement.clone(),
+    };
+    assert!(db.recovery_predecessor(&next).unwrap().is_none());
+    let recovered = coordinator
+        .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter, "mono", Some(99), Some(99))
+        .await
+        .unwrap();
+    assert!(recovered.is_none(), "{recovered:?}");
+    assert_eq!(recovery::snapshot_pointers(&LocalJj, &record).await.unwrap(), before);
+    assert!(
+        db.execution_bookmark_optional(&prior.id).unwrap().is_some(),
+        "not retired"
+    );
+    assert!(db.list_attention_items(&prior.id).unwrap().is_empty());
+    assert!(db.execution_restore_report(&next.id).unwrap().is_none());
+}
+
 #[tokio::test]
 async fn closed_pr_does_not_prevent_retiring_a_missing_baseline() {
     let dir = tempdir().unwrap();

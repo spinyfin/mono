@@ -364,7 +364,22 @@ impl WorkDb {
 
     /// Resolve the predecessor by recorded execution identity alone. Workspace
     /// preferences, lease ownership, and filesystem existence are irrelevant.
+    ///
+    /// A read-only review kind ([`boss_protocol::ExecutionKind::is_read_only_review`]) never
+    /// has a recovery predecessor. A reviewer never writes to the PR branch,
+    /// so an earlier reviewer of the same item has no unpublished work for it
+    /// to inherit; the only effects inheriting that record could have are to
+    /// pin the review to the record's host, to reposition it on the head the
+    /// earlier reviewer looked at instead of the PR's current head, and to
+    /// fail it before start whenever that record's pointers are damaged, as
+    /// happens when the PR's history is rewritten after a review (mono#3201,
+    /// sixteen reviews dead in pre-start recovery with the head unreviewed).
+    /// Its own record, when a self-retry has one, is still consulted by
+    /// dispatch; only inheritance is ruled out here.
     pub(crate) fn recovery_predecessor(&self, execution: &WorkExecution) -> Result<Option<WorkExecution>> {
+        if execution.kind.is_read_only_review() {
+            return Ok(None);
+        }
         let conn = self.connect()?;
         let id: Option<String> = conn
             .query_row(

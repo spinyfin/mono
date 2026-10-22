@@ -66,6 +66,7 @@ fn review_badge_labels_and_icons_cover_every_state() {
         reviewed_sha: Some("abcdef12345".into()),
         verdict: Some(("completed_with_findings".into(), "0".into(), 2)),
         revision: None,
+        failed_to_start: None,
     };
     for (state, label, icon) in [
         ("not_reviewed", "Not reviewed: latest commit", "questionmark.circle"),
@@ -101,6 +102,7 @@ fn review_badge_head_moved_preserves_findings_and_revision_history() {
         reviewed_sha: Some("oldhead456".into()),
         verdict: Some(("completed_with_findings".into(), "0".into(), 2)),
         revision: Some(("Fix review findings".into(), "active".into(), false)),
+        failed_to_start: None,
     };
     let badge = badge_presentation("not_reviewed", None, Some(&history), "card");
     assert_eq!(badge.label, "Not reviewed: latest commit");
@@ -132,6 +134,7 @@ fn review_badge_missing_history_is_explicit() {
         reviewed_sha: None,
         verdict: None,
         revision: None,
+        failed_to_start: None,
     };
     assert!(
         badge_presentation("not_reviewed", None, Some(&history), "card")
@@ -455,4 +458,51 @@ fn badge_history_and_current_heads_use_the_work_item_index() {
         histories_ms < 5_000.0,
         "fetch_badge_histories for {PLAN_OWNERS} owners took {histories_ms:.1} ms; expected well under 1 s on this fixture"
     );
+}
+
+/// An unreviewed head whose last automatic review batch died before any
+/// reviewer started is not "not yet": the label and icon say so, the
+/// tooltip carries the pre-start error, and a very long error is cut.
+#[test]
+fn review_badge_distinguishes_a_head_whose_reviewers_failed_to_start() {
+    let long_error = "preserved work of execution exec_x is not contained in PR head pr/3201: ".repeat(8);
+    let history = ReviewBadgeHistory {
+        verdict_payload: None,
+        revision_description: None,
+        is_findings_revision: false,
+        head: Some("eecbba235e9".into()),
+        reviewed_sha: Some("fc68c6bfeab".into()),
+        verdict: None,
+        revision: None,
+        failed_to_start: Some((2, Some(long_error.clone()))),
+    };
+    let badge = badge_presentation("not_reviewed", None, Some(&history), "card");
+    assert_eq!(badge.label, "AI review failed to start");
+    assert_eq!(badge.system_image, "exclamationmark.triangle");
+    assert!(badge.tooltip.contains("generation 2"), "{}", badge.tooltip);
+    assert!(
+        badge.tooltip.contains("will not schedule another review"),
+        "{}",
+        badge.tooltip
+    );
+    assert!(
+        badge.tooltip.contains("Last error: preserved work"),
+        "{}",
+        badge.tooltip
+    );
+    assert!(
+        badge.tooltip.contains('…') && !badge.tooltip.contains(&long_error),
+        "{}",
+        badge.tooltip
+    );
+    assert!(
+        badge.tooltip.contains("Current head eecbba2 differs"),
+        "{}",
+        badge.tooltip
+    );
+    // Any other state is presented as before.
+    let badge = badge_presentation("reviewing", None, Some(&history), "card");
+    assert_eq!(badge.label, "AI reviewing…");
+    let badge = badge_presentation("not_reviewed", None, None, "card");
+    assert_eq!(badge.label, "Not reviewed: latest commit");
 }

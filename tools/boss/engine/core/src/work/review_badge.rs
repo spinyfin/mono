@@ -129,10 +129,17 @@ pub(super) fn fetch_badge_histories(
                     .get::<_, Option<String>>(6)?
                     .map(|name| Ok::<_, rusqlite::Error>((name, row.get::<_, String>(7)?, row.get::<_, bool>(8)?)))
                     .transpose()?,
+                failed_to_start: None,
             },
         ))
     })?;
-    Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    let mut history = rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+    for (card, failed_to_start) in failed_to_start_badges(conn, &ids)? {
+        if let Some(history) = history.get_mut(&card) {
+            history.failed_to_start = Some(failed_to_start);
+        }
+    }
+    Ok(history)
 }
 
 /// Cards that carry a review badge: in Review with a resolved review state.
@@ -171,6 +178,50 @@ pub(super) fn apply_review_badges<'h>(
     Ok(())
 }
 
+/// Cards whose current PR head will not be reviewed without a human because
+/// its reviewers never started: the newest pre-merge batch for the owner's
+/// root targets the observed head, `failed` without a consolidated verdict,
+/// at or past the automatic generation cap, and no member execution of it
+/// ever reached `started_at`. Returns `(card, (generation, last pre-start
+/// error))`. A batch at a superseded head drops out on its own, since the
+/// new head gets a fresh generation-1 batch; so does a later explicit batch.
+fn failed_to_start_badges(conn: &Connection, ids: &[String]) -> Result<Vec<(String, (i64, Option<String>))>> {
+    let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+    let family = review_family_cte(&placeholders);
+    let sql = format!(
+        "{family}
+         SELECT o.card, b.generation,
+                (SELECT we.last_error FROM pr_review_batch_members m
+                 JOIN work_executions we ON we.id = m.execution_id
+                 WHERE m.batch_id = b.id AND m.status = 'failed' AND we.last_error IS NOT NULL
+                 ORDER BY m.terminal_at DESC, m.attempt DESC, m.id DESC LIMIT 1)
+         FROM owners o JOIN tasks root ON root.id = o.id
+         JOIN pr_review_batches b ON b.id = (
+             SELECT latest.id FROM pr_review_batches latest
+             WHERE latest.cycle_root_id = root.id AND latest.phase = 'pre_merge'
+             ORDER BY latest.created_at DESC, latest.generation DESC, latest.id DESC LIMIT 1
+         )
+         WHERE b.status = 'failed'
+           AND b.target_sha = NULLIF(root.pr_head_sha, '')
+           AND b.generation >= {cap}
+           AND NOT EXISTS (SELECT 1 FROM pr_review_verdicts v
+                           WHERE v.batch_id = b.id AND v.gate_outcome != '{stale_head}')
+           AND NOT EXISTS (SELECT 1 FROM pr_review_batch_members m
+                           JOIN work_executions we ON we.id = m.execution_id
+                           WHERE m.batch_id = b.id AND we.started_at IS NOT NULL)",
+        cap = super::review_batches::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS,
+        stale_head = super::review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?),
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 fn findings_markdown(history: &ReviewBadgeHistory) -> Result<Option<String>> {
     if let Some(payload) = &history.verdict_payload {
         let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(payload)?;
@@ -203,6 +254,32 @@ pub(crate) struct ReviewBadgeHistory {
     reviewed_sha: Option<String>,
     verdict: Option<(String, String, i64)>,
     revision: Option<(String, String, bool)>,
+    /// `(generation, last pre-start error)` when the current head's last
+    /// automatic review batch failed because no reviewer ever started; see
+    /// [`failed_to_start_badges`].
+    failed_to_start: Option<(i64, Option<String>)>,
+}
+
+/// Longest `last_error` excerpt shown in a badge tooltip. Recovery errors
+/// name every commit involved and run to many hundreds of characters; the
+/// attention item carries them in full.
+const FAILED_TO_START_ERROR_CHARS: usize = 240;
+
+fn failed_to_start_explanation(generation: i64, last_error: Option<&str>) -> String {
+    let mut text = format!(
+        "Automated review of the current PR head failed to start: every reviewer in the last \
+         automatic review batch (generation {generation}) failed before a review session began, \
+         and the engine will not schedule another review of this head on its own. Fix the \
+         dispatch problem, then start a review explicitly or push a new head."
+    );
+    if let Some(error) = last_error {
+        let mut excerpt: String = error.chars().take(FAILED_TO_START_ERROR_CHARS).collect();
+        if excerpt.len() < error.len() {
+            excerpt.push('…');
+        }
+        text.push_str(&format!("\nLast error: {excerpt}"));
+    }
+    text
 }
 
 impl ReviewBadgeHistory {
@@ -225,44 +302,61 @@ fn badge_presentation(
 ) -> AiReviewBadge {
     let findings = history.and_then(|h| h.verdict.as_ref()).map(|v| v.2);
     let consolidating = stage.and_then(|stage| stage.parse().ok()) == Some(ReviewStage::Consolidation);
-    let (label, icon, explanation) = match state {
+    let failed_to_start = history.and_then(|h| h.failed_to_start.as_ref());
+    let (label, icon, explanation): (String, &str, String) = match state {
         AI_REVIEW_STATE_REVIEWING if consolidating => (
             "Consolidating review findings".into(),
             "arrow.triangle.merge",
-            "The reviewers have finished on this head; one agent is consolidating their findings into a single review.",
+            "The reviewers have finished on this head; one agent is consolidating their findings into a single review.".into(),
         ),
-        AI_REVIEW_STATE_REVIEWING => ("AI reviewing…".into(), "brain", "An AI review pass is running."),
-        AI_REVIEW_STATE_REVIEW_QUEUED => ("AI review queued".into(), "clock", "Waiting for a review-pool slot."),
+        AI_REVIEW_STATE_REVIEWING => ("AI reviewing…".into(), "brain", "An AI review pass is running.".into()),
+        AI_REVIEW_STATE_REVIEW_QUEUED => (
+            "AI review queued".into(),
+            "clock",
+            "Waiting for a review-pool slot.".into(),
+        ),
         AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS => (
             findings.map_or_else(|| "AI review: findings".into(), |n| format!("AI review: {n} findings")),
             "exclamationmark.circle.fill",
-            "AI review found issues on the current PR head.",
+            "AI review found issues on the current PR head.".into(),
         ),
         AI_REVIEW_STATE_REVIEWED_ALL_CLEAR => (
             "AI review: clean".into(),
             "checkmark.seal.fill",
-            "AI review passed for the current PR head. Required CI checks passed and no revisions are pending.",
+            "AI review passed for the current PR head. Required CI checks passed and no revisions are pending.".into(),
         ),
         AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING => (
             "AI review: clean".into(),
             "checkmark.seal.fill",
-            "AI review passed for the current PR head. CI, mergeability, or work in progress still prevent readiness.",
+            "AI review passed for the current PR head. CI, mergeability, or work in progress still prevent readiness."
+                .into(),
         ),
         AI_REVIEW_STATE_REVIEW_NOT_REQUIRED => (
             "AI review not required".into(),
             "minus.circle",
-            "This kind of work item does not require AI review.",
+            "This kind of work item does not require AI review.".into(),
         ),
+        // The head is unreviewed and will stay so: the reviewers could not
+        // start and the automatic generations are spent. Distinct from the
+        // ordinary "not yet" so the card does not read as merely waiting.
+        _ if failed_to_start.is_some() => {
+            let (generation, last_error) = failed_to_start.expect("checked");
+            (
+                "AI review failed to start".into(),
+                "exclamationmark.triangle",
+                failed_to_start_explanation(*generation, last_error.as_deref()),
+            )
+        }
         _ => (
             "Not reviewed: latest commit".into(),
             "questionmark.circle",
-            "The current PR head has no completed AI review, or its head is not yet known.",
+            "The current PR head has no completed AI review, or its head is not yet known.".into(),
         ),
     };
     let mut badge = AiReviewBadge {
         label,
         system_image: icon.into(),
-        tooltip: explanation.into(),
+        tooltip: explanation.clone(),
         findings_markdown: None,
     };
     let Some(history) = history else { return badge };
@@ -320,7 +414,7 @@ fn badge_presentation(
                 .push_str(" Findings addressed; the fix has not been AI-reviewed.");
             if history.head.is_some() && history.head == history.reviewed_sha {
                 badge.tooltip = badge.tooltip.replacen(
-                    explanation,
+                    explanation.as_str(),
                     "The findings revision delivered without a new commit. No subsequent AI review is recorded.",
                     1,
                 );

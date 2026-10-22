@@ -797,6 +797,113 @@ pub enum RetryDeadReviewBatchMember {
     BatchFailed,
 }
 
+/// A failed leaf whose latest attempt never reached a review session: the
+/// member's execution has no `started_at`, so it died in pre-start dispatch
+/// (workspace lease, bookmark recovery, change create, spawn) and
+/// `last_error` holds the engine's reason.
+struct NeverStartedLeaf {
+    role: ReviewBatchMemberRole,
+    attempt: i64,
+    last_error: Option<String>,
+}
+
+/// `(leaves whose latest attempt failed, those among them that never
+/// started)`, over the leaf roles the batch actually has.
+fn failed_leaves(tx: &Transaction<'_>, members: &[ReviewBatchMember]) -> Result<(usize, Vec<NeverStartedLeaf>)> {
+    let mut failed = 0usize;
+    let mut never_started = Vec::new();
+    for role in LEAF_REVIEWER_ROLES {
+        let Some(member) = latest_attempt_for_role(members, role) else {
+            continue;
+        };
+        if member.status != ReviewBatchMemberStatus::Failed {
+            continue;
+        }
+        failed += 1;
+        let Some(execution_id) = member.execution_id.as_deref() else {
+            continue;
+        };
+        if let Some(execution) = query_execution(tx, execution_id)?
+            && execution.started_at.is_none()
+        {
+            never_started.push(NeverStartedLeaf {
+                role,
+                attempt: member.attempt,
+                last_error: execution.last_error,
+            });
+        }
+    }
+    Ok((failed, never_started))
+}
+
+/// Title and body of the `pr_review_quorum_failed` attention for a batch
+/// whose leaves settled with fewer than two reports. Two facts the plain
+/// "insufficient quorum" wording hid are spelled out when they hold:
+///
+/// - every failed reviewer died before a review session began (a dispatch
+///   problem, not a verdict), with each role's last pre-start error; and
+/// - this batch is the last generation the engine mints on its own for
+///   this head ([`MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS`]), so nothing
+///   will review the head again without a human.
+///
+/// The second fact is also what the card's review badge keys off
+/// (`review_badge::failed_to_start_badges`), so the item carries the state
+/// rather than only the attention list.
+fn insufficient_quorum_attention(
+    tx: &Transaction<'_>,
+    batch: &ReviewBatch,
+    members: &[ReviewBatchMember],
+) -> Result<(String, String)> {
+    let (failed, never_started) = failed_leaves(tx, members)?;
+    let none_started = failed > 0 && never_started.len() == failed;
+    let mut title = "Automated reviewer: insufficient quorum".to_owned();
+    let mut body = format!(
+        "Fewer than two independent reviewers reported for {} (batch `{}`) — the remaining \
+         role(s) exhausted their retry without submitting a report. The review cannot \
+         produce a consolidated verdict without at least two independent reports.",
+        batch.pr_url, batch.id,
+    );
+    if none_started {
+        title.push_str(" (reviewers never started)");
+        body.push_str(
+            "\n\nNone of the failed reviewers reached a review session: every attempt failed \
+             before start (workspace lease, recovery positioning, change create or spawn), so \
+             this is a dispatch problem, not a finding about the PR. Last pre-start error per role:\n",
+        );
+        for leaf in &never_started {
+            body.push_str(&format!(
+                "- `{}` attempt {}: {}\n",
+                leaf.role.as_str(),
+                leaf.attempt,
+                leaf.last_error.as_deref().unwrap_or("(no error recorded)"),
+            ));
+        }
+    }
+    if batch.phase == ReviewBatchPhase::PreMerge {
+        if batch.generation >= MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS {
+            body.push_str(&format!(
+                "\n\nThis was generation {} of the {MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS} review \
+                 batches the engine mints on its own for one head: it will not schedule another \
+                 review of head `{}`. The card's review badge shows the head as {} until a review \
+                 is started explicitly (`bossctl review start`) or a new head is pushed.",
+                batch.generation,
+                batch.target_sha,
+                if none_started {
+                    "\"AI review failed to start\""
+                } else {
+                    "not reviewed"
+                },
+            ));
+        } else {
+            body.push_str(
+                "\n\nIf the PR is still open and this head is still current, the deferred-admission \
+                 sweep re-admits one replacement batch for it on its own.",
+            );
+        }
+    }
+    Ok((title, body))
+}
+
 /// Stamp a batch `failed` and file the shared `pr_review_quorum_failed`
 /// attention. Used by every terminal-failure destination of the quorum
 /// machine (insufficient leaf reports, exhausted supervisor, moved head)
@@ -1080,19 +1187,8 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 )?;
                 Ok(ReviewBatchQuorumOutcome::SupervisorDispatched)
             } else {
-                fail_review_batch_with_attention(
-                    tx,
-                    &batch,
-                    &now,
-                    "Automated reviewer: insufficient quorum",
-                    format!(
-                        "Fewer than two independent reviewers reported for {} \
-                         (batch `{batch_id}`) — the remaining role(s) exhausted their retry \
-                         without submitting a report. The review cannot produce a consolidated \
-                         verdict without at least two independent reports.",
-                        batch.pr_url,
-                    ),
-                )?;
+                let (title, body) = insufficient_quorum_attention(tx, &batch, &members)?;
+                fail_review_batch_with_attention(tx, &batch, &now, &title, body)?;
                 Ok(ReviewBatchQuorumOutcome::InsufficientQuorum)
             }
         }
