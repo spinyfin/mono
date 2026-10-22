@@ -1516,10 +1516,6 @@ pub(crate) async fn sweep_one(
                         outcome,
                     )
                     .await;
-                    // The PR no longer conflicts: close any merge-conflict
-                    // revision whose attempt ended before it could be retired
-                    // (the signal-driven retire above never sees those).
-                    conflict_watch::retire_moot_conflict_revisions(work_db, candidate, &probe_result.labels);
                     // CI-side detect: a `Failing` rollup still needs
                     // its own fan-out regardless of what the side-table
                     // says, because the chore is currently `in_review`
@@ -1590,7 +1586,8 @@ pub(crate) async fn sweep_one(
     // the columns stay fresh even when no status transition fired.
     // Merged / closed-unmerged probes are skipped — the row will
     // transition away from `in_review` and the indicators become moot.
-    if matches!(probe_result.state, PrLifecycleState::Open(_)) {
+    if let PrLifecycleState::Open(open) = &probe_result.state {
+        retire_moot_revisions(work_db, publisher, candidate, &probe_result, open).await;
         update_pr_poll_state(
             work_db,
             publisher,
@@ -1967,14 +1964,37 @@ pub(crate) async fn dispatch_ci_axis(
         }
         ci_watch::on_ci_in_flight(work_db, publisher, candidate, probe_result).await;
     }
-    // CI is green on the current head. Close any engine-created CI-fix
-    // revision whose spawning attempt already ended: `on_ci_resolved` only
-    // runs while the parent still carries a blocking signal and only sees the
-    // active attempt, so without this a revision parked after its attempt
-    // ended (e.g. `retriggered`) keeps the parent in Review > Blocked on a
-    // green PR indefinitely.
-    if matches!(ci, OpenPrCiStatus::Clean) {
-        ci_watch::retire_moot_ci_fix_revisions(work_db, candidate, &probe_result.labels);
+}
+
+/// Close engine-created conflict / CI-fix revisions made moot by the probe.
+///
+/// `on_resolved` / `on_ci_resolved` only run while the parent still carries a
+/// blocking signal and only see the *active* attempt, so a revision parked
+/// after its attempt ended (e.g. `retriggered`, `failed`) keeps the parent in
+/// Review > Blocked on a PR that has since recovered. Runs once per open
+/// probe, outside the mergeability routing, so a PR that is both conflicting
+/// and CI-green still has its stale CI-fix revision closed. The conflict-side
+/// sweep needs a definitive `Clean` mergeability; `Unknown` and `Conflict`
+/// leave conflict revisions alone. Publishes a work-item invalidation when
+/// anything was archived, since neither retire path notifies the board.
+async fn retire_moot_revisions(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    probe_result: &PrLifecycleProbe,
+    open: &OpenPrStatus,
+) {
+    let mut closed = 0;
+    if open.mergeability == OpenPrMergeability::Clean {
+        closed += conflict_watch::retire_moot_conflict_revisions(work_db, candidate, &probe_result.labels);
+    }
+    if matches!(open.ci, OpenPrCiStatus::Clean) {
+        closed += ci_watch::retire_moot_ci_fix_revisions(work_db, candidate, &probe_result.labels);
+    }
+    if closed > 0 {
+        publisher
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "moot_revisions_closed")
+            .await;
     }
 }
 

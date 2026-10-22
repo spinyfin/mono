@@ -97,20 +97,13 @@ async fn head_moved_then_green_closes_revision_of_the_old_head() {
         .unwrap();
     park_blocked(&db, &revision);
 
-    // The PR head moves to `head-2`, which is green. The merge poller feeds
-    // this through `dispatch_ci_axis`; no attempt is active for either head.
-    let pub_ = RecordingPublisher::default();
-    let mut outcome = crate::merge_poller::SweepOutcome::default();
-    crate::merge_poller::dispatch_ci_axis(
-        &db,
-        &pub_,
-        &candidate(&product, &chore, pr),
-        &probe(pr, "head-2"),
-        &OpenPrCiStatus::Clean,
-        &mut outcome,
-    )
-    .await;
-
+    // The PR head moves to `head-2`, which is green; no attempt is active for
+    // either head. The merge poller runs this sweep on every green probe
+    // (see `merge_poller::tests::stale_revision_sweep_tests`).
+    assert_eq!(
+        retire_moot_ci_fix_revisions(&db, &candidate(&product, &chore, pr), &[]),
+        1
+    );
     assert_closed(&db, &revision);
 }
 
