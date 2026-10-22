@@ -279,6 +279,23 @@ mod tests {
     }
 
     #[test]
+    fn default_stays_quiet_above_sampled_healthy_ci_bound() {
+        // Build 21682's whole-run duration bounds every check in the sample.
+        // Keep at least 50% headroom even if one check occupied that whole run.
+        let healthy_bound = Duration::from_secs(335);
+        let with_margin = healthy_bound.mul_f64(1.5);
+        let base = Instant::now();
+        let mut monitor = SlowCheckMonitor::new(DEFAULT_SLOW_CHECK_THRESHOLD);
+        monitor.start("healthy", base);
+        assert!(monitor.poll(base + healthy_bound).is_empty());
+        assert!(monitor.poll(base + with_margin).is_empty());
+        assert_eq!(monitor.finish("healthy", base + with_margin), None);
+
+        monitor.start("stalled", base);
+        assert_eq!(monitor.poll(base + DEFAULT_SLOW_CHECK_THRESHOLD).len(), 1);
+    }
+
+    #[test]
     fn silent_below_threshold_and_on_fast_finish() {
         let base = Instant::now();
         let mut monitor = SlowCheckMonitor::new(T);

@@ -18,9 +18,11 @@ The incident that motivated this (a `checks` job silent for 5+ minutes) is on th
 
 ## Choice
 
-600s. The only CI evidence is the whole-run bound above (max 335s across 44 sampled healthy runs), so the threshold is set clearly above that bound rather than inside it: 600s is about 1.8x the 335s maximum and 2.1x the second-slowest run (283s), and about 7x the worst local single-check peak (87s). Because a single check never exceeds the whole-run time, no sampled healthy CI run could have printed a slow-check line at this threshold. Local runs never print it. On a real hang it reports at 10 minutes and again at 20.
+600s. The only CI evidence is the whole-run bound above (max 335s across 44 sampled healthy runs), so the threshold is set clearly above that bound rather than inside it: 600s is about 1.8x the 335s maximum and 2.1x the second-slowest run (283s), and about 7x the worst local single-check peak (87s). Because a single check never exceeds the whole-run time, no sampled healthy CI run could have printed a slow-check line at this threshold. None of the measured local runs could have printed it. On a real hang it reports at 10 minutes and again at 20.
 
 Uncertainty: the bound is a sample of 44 runs, so a future healthy run slower than 600s could still print the line; the line is informational and nothing is killed. The cost of choosing above the bound is that a hang is first reported later (10 minutes, not the 5+ minutes of the incident that motivated this).
+
+The injected-clock regression test `default_stays_quiet_above_sampled_healthy_ci_bound` checks silence through the 335s bound plus 50% headroom (502.5s), silent completion, and reporting at the configured threshold. It guards against reducing the default into the sampled healthy range without relying on real-time sleeps.
 
 ## Deferred: per-check CI timings
 
