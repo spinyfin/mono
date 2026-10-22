@@ -9,7 +9,7 @@
 //!   validate token, probe org/SSO state.
 //! - [`GitHubAuthState`] — engine-internal state enum (carries the private
 //!   `device_code`; converts to [`GitHubAuthStateDto`] for the wire).
-//! - [`GitHubAuthController`] — state machine driver that T-4 uses from
+//! - [`GitHubAuthController`] — state machine driver that the engine uses from
 //!   `app.rs` to handle `GitHubAuthStart/Cancel/Disconnect/Status` RPCs.
 
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ use crate::github::GitHubConfig;
 // ── Client-id + GitHub endpoint constants ────────────────────────────────────
 
 /// Production spinyfin OAuth App client_id (non-secret; device flow does not
-/// require a client secret).  Recorded canonically on T-0/T767.
+/// require a client secret).
 pub const CLIENT_ID: &str = "Ov23li9VOztDIjoOA7eW";
 
 // Pre-encoded form values (no external urlencode dep needed).
@@ -386,7 +386,7 @@ impl DeviceFlow {
     /// - network/parse error → `Unknown`
     ///
     /// If `org` is `None`, returns `Unknown` (caller must supply the org from
-    /// the bound product's tracker config; T-4 is responsible for this).
+    /// the bound product's tracker config).
     pub async fn probe_org_state(&self, token: &str, org: Option<&str>) -> OrgAuthState {
         let Some(org) = org else {
             return OrgAuthState::Unknown;
@@ -472,7 +472,7 @@ pub enum GitHubAuthState {
         expires_at: i64,
         interval_secs: u64,
     },
-    /// Token obtained, validated, and (after T-3) stored in keychain.
+    /// Token obtained, validated, and stored in keychain.
     Authorized {
         record: TokenRecord,
         org_state: OrgAuthState,
@@ -530,7 +530,7 @@ impl GitHubAuthState {
 
 // ── GitHubAuthController ──────────────────────────────────────────────────────
 
-/// State machine controller that T-4 (`app.rs`) uses to handle
+/// State machine controller that the engine uses to handle
 /// `GitHubAuthStart / Cancel / Disconnect / Status` RPCs.
 ///
 /// # Concurrency model
@@ -563,7 +563,7 @@ impl GitHubAuthController {
     /// Create a controller backed by a durable [`KeychainTokenStore`].  The
     /// captured token is persisted on `Authorized` (before the state is
     /// broadcast, so a sync that fires immediately afterward finds it) and
-    /// deleted on `disconnect`.  This is the production constructor T-4 uses
+    /// deleted on `disconnect`.  This is the production constructor the engine uses
     /// from `app.rs`.
     pub fn with_store(flow: DeviceFlow, store: Arc<KeychainTokenStore>) -> (Self, watch::Receiver<GitHubAuthState>) {
         Self::build(flow, Some(store))
@@ -580,7 +580,7 @@ impl GitHubAuthController {
         (ctrl, rx)
     }
 
-    /// Handle to the underlying [`DeviceFlow`].  T-4's orchestrator uses this
+    /// Handle to the underlying [`DeviceFlow`]. The engine uses this
     /// to run the org/SSO probe ([`probe_and_record_org_state`]) with the
     /// engine's shared HTTP client rather than standing up a second one.
     pub fn device_flow(&self) -> Arc<DeviceFlow> {
@@ -631,8 +631,8 @@ impl GitHubAuthController {
     /// Begin the device-flow.  Cancels any in-progress flow, transitions to
     /// `RequestingCode`, then spawns a task that drives the full flow.
     ///
-    /// State updates are broadcast on the watch channel; T-4 listens and
-    /// forwards them as `FrontendEvent::GitHubAuthState` events.
+    /// State updates are broadcast on the watch channel; the engine's auth forwarder listens and
+    /// forwards distinct states as `FrontendEvent::GitHubAuthState` events.
     pub async fn start_flow(&self) {
         // Cancel any running flow.
         self.signal_cancel().await;
@@ -702,8 +702,8 @@ impl GitHubAuthController {
                              token held in memory only"
                         );
                     }
-                    // Org state is Unknown here; T-4's orchestrator runs the
-                    // org/SSO probe and calls `update_org_state` to resolve it.
+                    // Org state is Unknown here; the auth forwarder requests a probe
+                    // through the shared worker, which records it with `update_org_state`.
                     GitHubAuthState::Authorized {
                         record,
                         org_state: OrgAuthState::Unknown,
@@ -745,15 +745,17 @@ impl GitHubAuthController {
 
     /// Update the `org_state` sub-field of an `Authorized` state.
     /// The engine calls this after running [`DeviceFlow::probe_org_state`].
+    /// Ignore results from a token that is no longer authorized.
     ///
     /// Receivers are woken only when the stored org state actually changes. A
     /// probe that re-resolves to the value already held (an `Unknown` probe
     /// over an `Unknown` state, say) must not look like a transition: a
     /// watcher that probes on wake-up would otherwise be woken by its own
     /// write and spin.
-    pub fn update_org_state(&self, org_state: OrgAuthState) {
+    pub fn update_org_state(&self, token: &str, org_state: OrgAuthState) {
         self.state_tx.send_if_modified(|s| {
-            if let GitHubAuthState::Authorized { org_state: os, .. } = s
+            if let GitHubAuthState::Authorized { record, org_state: os } = s
+                && record.token == token
                 && *os != org_state
             {
                 *os = org_state;
@@ -772,7 +774,7 @@ impl GitHubAuthController {
     }
 }
 
-// ── Org/SSO probe orchestration (T-4) ─────────────────────────────────────────
+// ── Org/SSO probe orchestration ─────────────────────────────────────────
 
 /// Attention-item kind raised when the OAuth App is not yet approved for a
 /// GitHub-bound product's org.
@@ -1722,7 +1724,7 @@ mod tests {
             org_state: OrgAuthState::Unknown,
         });
 
-        ctrl.update_org_state(OrgAuthState::Ok);
+        ctrl.update_org_state("tok", OrgAuthState::Ok);
 
         let state = ctrl.current_state();
         assert!(
@@ -1744,7 +1746,7 @@ mod tests {
         let (ctrl, mut rx) = GitHubAuthController::new(flow);
 
         // Not authorized: nothing to update, nothing to wake.
-        ctrl.update_org_state(OrgAuthState::Ok);
+        ctrl.update_org_state("tok", OrgAuthState::Ok);
         assert!(
             !rx.has_changed().unwrap(),
             "update on a non-Authorized state woke receivers"
@@ -1761,22 +1763,35 @@ mod tests {
         });
         rx.borrow_and_update();
 
+        ctrl.update_org_state("old-token", OrgAuthState::Ok);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "stale token changed the current authorization"
+        );
+        assert!(matches!(
+            ctrl.current_state(),
+            GitHubAuthState::Authorized {
+                org_state: OrgAuthState::Unknown,
+                ..
+            }
+        ));
+
         // Identical value: the stored state is unchanged, so no wake.
-        ctrl.update_org_state(OrgAuthState::Unknown);
+        ctrl.update_org_state("tok", OrgAuthState::Unknown);
         assert!(!rx.has_changed().unwrap(), "identical org state woke receivers");
 
         // A real change wakes exactly once, and repeating it does not wake again.
-        ctrl.update_org_state(OrgAuthState::Ok);
+        ctrl.update_org_state("tok", OrgAuthState::Ok);
         assert!(rx.has_changed().unwrap(), "changed org state did not wake receivers");
         rx.borrow_and_update();
-        ctrl.update_org_state(OrgAuthState::Ok);
+        ctrl.update_org_state("tok", OrgAuthState::Ok);
         assert!(
             !rx.has_changed().unwrap(),
             "repeating the same org state woke receivers"
         );
     }
 
-    // ── Keychain wiring (T-4) tests ──────────────────────────────────────────
+    // ── Keychain wiring tests ──────────────────────────────────────────
 
     async fn mount_full_flow(server: &MockServer, token: &str, login: &str, scopes: &str) {
         Mock::given(method("POST"))

@@ -105,13 +105,16 @@ impl Harness {
         let sent = Arc::clone(&broadcasts);
         tokio::spawn(async move {
             run_auth_forwarder(
-                &forwarder_controller,
                 forwarder_rx,
                 |token| {
                     probe_count.fetch_add(1, Ordering::SeqCst);
                     let sink = Arc::clone(&sink);
                     let flow = Arc::clone(&flow);
-                    async move { probe_and_record_org_state(sink.as_ref(), flow.as_ref(), &token).await }
+                    let controller = forwarder_controller.clone();
+                    async move {
+                        let resolved = probe_and_record_org_state(sink.as_ref(), flow.as_ref(), &token).await;
+                        controller.update_org_state(&token, resolved);
+                    }
                 },
                 |dto| {
                     sent.lock().unwrap().push(dto);
@@ -243,14 +246,16 @@ async fn real_transitions_still_broadcast_and_a_fresh_unknown_authorization_prob
 
     // An out-of-band recheck resolving the org state is a real change: one
     // broadcast, and no probe (the forwarder does not probe on its behalf).
-    harness.controller.update_org_state(OrgAuthState::Ok);
+    harness.controller.update_org_state(&record().token, OrgAuthState::Ok);
     settle_over_long_window().await;
     assert_eq!((harness.probes(), harness.broadcasts().len()), (1, 2));
     assert_eq!(harness.broadcasts()[1], authorized(OrgAuthState::Ok));
 
     // A recheck that lands back on `Unknown` (offline, say) is also a change
     // worth broadcasting, but is still not a reason for the forwarder to probe.
-    harness.controller.update_org_state(OrgAuthState::Unknown);
+    harness
+        .controller
+        .update_org_state(&record().token, OrgAuthState::Unknown);
     settle_over_long_window().await;
     assert_eq!((harness.probes(), harness.broadcasts().len()), (1, 3));
 

@@ -335,11 +335,10 @@ fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::J
         let probe_state = server_state.clone();
         let broadcast_state = server_state.clone();
         run_auth_forwarder(
-            &controller,
             rx,
             |token| {
                 let server_state = probe_state.clone();
-                async move { github_auth::probe_org_state(&server_state, &token).await }
+                async move { github_auth::spawn_org_recheck(server_state, token) }
             },
             |dto| {
                 let server_state = broadcast_state.clone();
