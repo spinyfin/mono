@@ -18,19 +18,19 @@ The design requires a provisioning choice with authenticated secret delivery and
 
 **GCE is an optional provider, not the initial Linux requirement.** Its mapping and illustrative fixtures below remain a cloud comparison. GCE credentials, Secret Manager and VM identity must not be dependencies of self-hosted enrollment. No cloud purchase is justified by this report.
 
-This deliberately generalizes the design's “cloud API plus cloud-init for Linux” to an authenticated management agent on existing Linux machines, or a cloud API for cloud machines. It preserves investigation §§2.2, 2.6 and 2.7's trust and unattended installation requirements. The implementation inputs at the end incorporate that change; no manual spoke-install path is introduced.
+This report and the updated parent design supersede the earlier “cloud API plus cloud-init for Linux” requirement with an authenticated management agent on existing Linux machines, or a cloud API for cloud machines. They preserve investigation §§2.2, 2.6 and 2.7's trust and unattended installation requirements; no manual spoke-install path is introduced.
 
 ## Cost basis
 
-The operator's experience favors self-hosting for sustained worker compute. The cited repository runbooks document existing home hardware and a working GCE path, but do not establish comparable cost per worker. Choose the requested local fleet without inventing a cloud break-even result.
+Self-hosting first is the operator's decision, based on prior CI cost analysis, as recorded in the review brief for [PR #3257](https://github.com/spinyfin/mono/pull/3257). This report adopts that decision; it does not reproduce the analysis or claim a newly measured break-even point. The cited repository runbooks document existing home hardware and a working GCE path, but do not establish comparable cost per worker.
 
-Before choosing cloud capacity, compare equivalent measured throughput, RAM and disk capacity rather than nominal vCPUs:
+For an optional re-check when considering cloud burst capacity, compare equivalent measured throughput, RAM and disk capacity rather than nominal vCPUs:
 
 - Local monthly cost: measured average watts × active hours / 1000 × electricity tariff, plus incremental storage, maintenance and management-server cost. For new hardware add amortized purchase cost; distinguish this from already-owned capacity.
 - Cloud monthly cost: instance rate × billed hours, disks, snapshots, egress, IP and secret-service charges, using actual region, discounts and idle shutdown policy.
 - Divide each by completed representative worker tasks, accounting for cache behavior, contention, administration effort and local power/fiber availability.
 
-No prices or workload measurements were collected here. This is the required comparison before adopting cloud capacity, not a claim that GCE is cheaper. Bursty demand or an independent failure domain may justify it; selecting a provider per host/job keeps that option open.
+No new prices or workload measurements were collected here. The formula supports a future cloud-burst decision; it does not gate the already-selected self-hosted path or claim that GCE is cheaper. Bursty demand or an independent failure domain may justify cloud capacity; selecting a provider per host/job keeps that option open.
 
 ## What the fleet actually is (evidence from authorized documentation)
 
@@ -117,7 +117,7 @@ The design's hub job contract is `CreateHost(platform, machine_selector, release
 | Instance `TERMINATED` / `STOPPING` unexpectedly                                                                                                          | any → `ProviderStopped` (retryable: `instances.start`)                                              |
 | Spoke `Hello` received, preflight reports `failed_preflights`                                                                                            | `connected` → `PreflightFailed{names}` (host visible, unschedulable)                                |
 
-**cloud-init payload shape (versioned, no secrets).**
+**cloud-init payload shape (versioned, no secrets; `runcmd` is pseudocode, not executable shell).** The ordered operations specify the verifier the payload must carry; they are not names of existing installed commands.
 
 ```yaml
 #cloud-config
@@ -142,14 +142,20 @@ write_files:
        "enroll_secret_ref":"projects/example-project/secrets/boss-enroll-job_01J9…/versions/latest",
        "guest_attr_namespace":"boss"}
 runcmd:
-  - [
-      sh,
-      -c,
-      "curl -fsS -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/attributes/boss-bootstrap-url' | xargs -I{} sh -c 'curl -fsSL {} -o /usr/local/sbin/boss-bootstrap && chmod 0755 /usr/local/sbin/boss-bootstrap' && /usr/local/sbin/boss-bootstrap --config /etc/boss-spoke/bootstrap.json",
-    ]
+  - |
+    PSEUDOCODE (abort on any failed requirement):
+    config := read /etc/boss-spoke/bootstrap.json
+    manifest_bytes, detached_signature := fetch over HTTPS from approved release origin
+    require Ed25519 signature valid over exact manifest_bytes using config.release_verify_key_ed25519
+    manifest := parse verified manifest_bytes
+    require manifest release == approved release and platform == this host's OS/architecture
+    bootstrap_bytes := fetch manifest's bootstrap asset over HTTPS from approved origin
+    require SHA256(bootstrap_bytes) == bootstrap digest in verified manifest
+    atomically install those verified bytes at /usr/local/sbin/boss-bootstrap, root-owned mode 0755
+    execute /usr/local/sbin/boss-bootstrap --config /etc/boss-spoke/bootstrap.json
 ```
 
-The bootstrap script itself is a release asset fetched over HTTPS and verified against the same manifest signature before execution; `runcmd` is deliberately minimal so the payload rarely changes. Python PTY support (`fcntl`, `pty`, `termios`) is preflighted by the installer as `boss-worker`, per the design.
+The bootstrap script itself is a release asset covered by the signed manifest. Signature verification precedes manifest parsing, and digest verification precedes installing or executing the downloaded bytes. The verifier and pinned key must arrive through the authenticated provisioning payload or trusted base image, never from the unverified bootstrap. Python PTY support (`fcntl`, `pty`, `termios`) is preflighted by the installer as `boss-worker`, per the design.
 
 ### Initial Linux and macOS: Fleet Free
 
@@ -163,17 +169,19 @@ The bootstrap script itself is a release asset fetched over HTTPS and verified a
 
 **Linux mapping.** Apply the table below to `CreateHost(linux, ...)` using the Fleet inventory's Linux platform value for the selected distribution (for example `ubuntu`), stored host id/UUID, and an enrolled agent with scripts enabled. A root bootstrap hands off to systemd, creates `boss-worker` with home `/var/lib/boss-worker`, verifies the Linux package and runs enrollment/preflight as that user. Probe via the same execution-id result API; cancel stops only this job's bootstrap and Boss service, never deletes or resets the physical host. Preserve worker data and existing journals on recovery. Retry reuses the selected machine and pending host identity. No GCE metadata token, cloud-init or VM operation is involved.
 
-The macOS form below uses launchd. Both platforms use the same job-bound secret delivery and run/result protocol.
+Both platforms use the same job-bound secret delivery and run/result protocol. Persist `expected_platform` from the requested, supported OS/distribution: `darwin` for macOS and `ubuntu` for the initial Ubuntu Linux fixture. Other Linux distributions require an explicit supported Fleet platform mapping; do not accept any non-`darwin` value as Linux. Linux hands off to systemd; macOS uses launchd.
 
-| Contract operation                                  | Fleet realization                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Identity / idempotency                                                                                                                                                                                                               |
-| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `CreateHost(macos, selector, release, boss-worker)` | Resolve `selector` (`{hardware_uuid}` or `{hardware_serial}` or `{fleet_host_id}`) via `GET /api/v1/fleet/hosts/identifier/{identifier}`; require `platform == "darwin"`, `status == "online"`, `scripts_enabled == true`, `orbit_version` non-null. Store `(fleet_host_id, uuid, hardware_serial)` as provider identity. Submit the bootstrap as `POST /api/v1/fleet/scripts/run` with `host_id` and `script_contents` (< 10,000 characters: a stub that fetches and verifies the signed installer, using the same signed-release policy as the Linux installer). Response `execution_id` is the provider job handle. | A job stores the first `execution_id`; a retried `CreateHost` for the same job never issues a second run while the first is `exit_code: null` and `host_timeout: false`.                                                             |
-| `DeliverSecret(job_id, expiry, secret)`             | `PUT /api/v1/fleet/spec/secret_variables` with `{"secrets":[{"name":"FLEET_SECRET_BOSS_ENROLL_{JOB}","value":"<token>"}]}` **before** the run; the script references `$FLEET_SECRET_BOSS_ENROLL_{JOB}` and Fleet expands it at delivery to `fleetd`, which executes as root; the script writes it to an owner-only file for `boss-worker` and `boss-spoke enroll` deletes it. After `enrolled` or expiry, the hub overwrites the variable's value with a random placeholder (Fleet refuses to delete a variable still referenced by a stored script, so overwrite is the reliable invalidation).                       | Fleet masks `$FLEET_SECRET_*` in UI/API views and stores values encrypted; the enrollment token is additionally single-use and 15-minute-bounded. The variable name embeds the job id, so a retry overwrites rather than duplicates. |
-| `Inspect(job_id)`                                   | `GET /api/v1/fleet/scripts/results/{execution_id}` → `exit_code` (`null` = pending), `output`, `host_timeout`, `runtime`, `message`. The installer prints a final machine-readable line `BOSS_STAGE=<stage> BOSS_ERROR=<code>` and exits with a stage-specific code. For post-install stages the hub runs a second, read-only probe script (`boss-spoke status --json`) and reads its `output`; `connected` onward comes from the hub stream manager. Host liveness: `GET /hosts/{id}` `status` / `seen_time`.                                                                                                         | Results are addressed by `execution_id`, never by "latest activity". Output is bounded by Fleet, so the installer keeps its structured line last.                                                                                    |
-| `Retry(job_id)`                                     | Stage-resume by re-running the idempotent installer on the **same** `fleet_host_id`; a new `execution_id` is recorded against the same job. `enrolled` failures re-deliver by overwriting the same variable. Fleet's default script timeout (5 min) means the stub must hand off long work (package download, install, enrollment) to a `launchd` job and return; Fleet's `script_execution_timeout` agent option can raise the limit, but the adapter must not depend on it.                                                                                                                                          | Retry never changes `host_id`; the hub compares the enrolment's reported hardware UUID with the stored one.                                                                                                                          |
-| `Cancel(job_id)`                                    | Overwrite the secret variable; run a short cleanup script (`launchctl bootout system/com.spinyfin.boss-spoke`, remove owner-only state) with its own `execution_id`; mark the pending `hosts` row cancelled. Fleet offers no "cancel a pending script", so a cancelled job that later reports `exit_code` is ignored by stage machine design.                                                                                                                                                                                                                                                                          | Cleanup is idempotent on the host.                                                                                                                                                                                                   |
+| Contract operation                                     | Fleet realization                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Identity / idempotency                                                                                                                                                                                                               |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `CreateHost(platform, selector, release, boss-worker)` | Resolve `selector` (`{hardware_uuid}` or `{hardware_serial}`) via `GET /api/v1/fleet/hosts/identifier/{identifier}`, or `{fleet_host_id}` via `GET /api/v1/fleet/hosts/{id}`; require `platform == expected_platform`, `status == "online"`, `scripts_enabled == true`, `orbit_version` non-null. Store `(fleet_host_id, uuid, hardware_serial)` as provider identity. Submit the bootstrap as `POST /api/v1/fleet/scripts/run` with `host_id` and `script_contents` (< 10,000 characters: a stub that fetches and verifies the signed installer, using the same signed-release policy as the Linux installer). Response `execution_id` is the provider job handle. | A job stores the first `execution_id`; a retried `CreateHost` for the same job never issues a second run while the first is `exit_code: null` and `host_timeout: false`.                                                             |
+| `DeliverSecret(job_id, expiry, secret)`                | `PUT /api/v1/fleet/spec/secret_variables` with `{"secrets":[{"name":"FLEET_SECRET_BOSS_ENROLL_{JOB}","value":"<token>"}]}` **before** the run; the script references `$FLEET_SECRET_BOSS_ENROLL_{JOB}` and Fleet expands it at delivery to `fleetd`, which executes as root; the script writes it to an owner-only file for `boss-worker` and `boss-spoke enroll` deletes it. After `enrolled` or expiry, the hub overwrites the variable's value with a random placeholder (Fleet refuses to delete a variable still referenced by a stored script, so overwrite is the reliable invalidation).                                                                    | Fleet masks `$FLEET_SECRET_*` in UI/API views and stores values encrypted; the enrollment token is additionally single-use and 15-minute-bounded. The variable name embeds the job id, so a retry overwrites rather than duplicates. |
+| `Inspect(job_id)`                                      | `GET /api/v1/fleet/scripts/results/{execution_id}` → `exit_code` (`null` = pending), `output`, `host_timeout`, `runtime`, `message`. The installer prints a final machine-readable line `BOSS_STAGE=<stage> BOSS_ERROR=<code>` and exits with a stage-specific code. For post-install stages the hub runs a second, read-only probe script (`boss-spoke status --json`) and reads its `output`; `connected` onward comes from the hub stream manager. Host liveness: `GET /hosts/{id}` `status` / `seen_time`.                                                                                                                                                      | Results are addressed by `execution_id`, never by "latest activity". Output is bounded by Fleet, so the installer keeps its structured line last.                                                                                    |
+| `Retry(job_id)`                                        | Stage-resume by re-running the idempotent installer on the **same** `fleet_host_id`; a new `execution_id` is recorded against the same job. `enrolled` failures re-deliver by overwriting the same variable. Fleet's default script timeout (5 min) means the stub must hand off long work (package download, install, enrollment) to a job-specific systemd unit (Linux) or `launchd` job (macOS) and return; Fleet's `script_execution_timeout` agent option can raise the limit, but the adapter must not depend on it.                                                                                                                                          | Retry never changes `host_id`; the hub compares the enrolment's reported hardware UUID with the stored one.                                                                                                                          |
+| `Cancel(job_id)`                                       | Overwrite the secret variable; run a short cleanup script (stop the job-specific systemd bootstrap unit and `boss-spoke.service` on Linux, or boot out the corresponding launchd jobs on macOS; remove only that job's temporary token, preserving journals and worker data) with its own `execution_id`; mark the pending `hosts` row cancelled. Fleet offers no "cancel a pending script", so a cancelled job that later reports `exit_code` is ignored by stage machine design.                                                                                                                                                                                  | Cleanup is idempotent on the host.                                                                                                                                                                                                   |
 
 **Machine identity at enrollment.** Bind the job to the Fleet host id and UUID captured from inventory. A reported hardware UUID is a consistency check, not cryptographic proof: a root process can spoof it. Authorization depends on the authenticated management channel delivering a single-use job-bound token to the selected host, and on the hub atomically binding its consumption to that host's generated key. Do not claim the UUID prevents use of a stolen token.
+
+**Linux identity source.** On the initial x86 NUC/Beelink hosts, the root installer reads SMBIOS/DMI `/sys/class/dmi/id/product_uuid`, trims whitespace and normalizes UUID case before passing the captured value in the enrollment request for comparison with the stored Fleet `host.uuid`. Fleet populates that field from osquery's `system_info.uuid`; osquery normally obtains it from DMI on Linux but can retain or generate an identifier when the hardware value is unavailable or a placeholder. Therefore verify the three-way DMI/osquery/Fleet match during qualification; reject missing, placeholder, duplicated or mismatched values as `IdentityMismatch`, rather than substituting hostname, serial, `/etc/machine-id` or a new UUID silently. Other identity sources require an explicit provider mapping. DMI is spoofable by root/firmware or a VM administrator, and is not an attestation or protection against token theft. [Fleet inventory ingestion](https://github.com/fleetdm/fleet/blob/main/server/service/osquery_utils/queries.go), [osquery system_info](https://github.com/osquery/osquery/blob/master/osquery/tables/system/linux/system_info.cpp), [osquery UUID selection](https://github.com/osquery/osquery/blob/master/osquery/core/system.cpp).
 
 **Secret-delivery acceptance gate.** Prove secret-variable API access on Free, substitution into an owner-only file, redacted script/result/UI views, and invalidation after consumption, cancellation or expiry. Root on the selected host can access the value, within the installer trust model. If any gate fails, this mapping is not qualified. A UUID and job id sent over server-authenticated TLS do not authenticate a client; the previously suggested one-time-fetch fallback is therefore not a safe substitute. An alternative needs an independently authenticated delivery channel and review, not a config switch.
 
@@ -181,14 +189,14 @@ The macOS form below uses launchd. Both platforms use the same job-bound secret 
 
 | Observed provider state                                                                                                                                     | Job stage / typed error                                                                                  |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `hosts/identifier` 404, or `platform != darwin`                                                                                                             | `requested` → `MachineNotFound` / `WrongPlatform` (terminal)                                             |
+| Host lookup 404, or `platform != expected_platform` (`darwin` for macOS, `ubuntu` for initial Linux)                                                        | `requested` → `MachineNotFound` / `WrongPlatform` (terminal)                                             |
 | `scripts_enabled` false/null, or `orbit_version` null                                                                                                       | `requested` → `ManagementAgentNotReady` (operator action: rebuild `fleetd` package with scripts enabled) |
 | `status` `offline` / `mia` / `missing`                                                                                                                      | `requested` or `installed` → `HostOffline` (retryable; Fleet runs the script at next check-in)           |
 | `scripts/run` 4xx: variable missing in `script_contents` (Fleet validates references)                                                                       | `requested` → `SecretDelivery` (retry re-PUTs the variable)                                              |
 | Result `host_timeout: true`                                                                                                                                 | stage of the last `BOSS_STAGE` line, error `BootstrapTimeout` (retry; stub must have handed off)         |
 | Result `exit_code` ∈ installer stage codes with `BOSS_ERROR` ∈ `{manifest_sig, digest_mismatch, platform_mismatch, version_not_approved, origin_not_https}` | `requested` → `PackageVerification` (terminal)                                                           |
 | `BOSS_STAGE=installed`, no `enrolled` before token expiry                                                                                                   | `installed` → `EnrollmentExpired` (retry re-delivers)                                                    |
-| Enrollment hardware UUID ≠ stored Fleet `uuid`                                                                                                              | `installed` → `IdentityMismatch` (terminal; `Cancel`)                                                    |
+| Missing/unsupported machine UUID source, ambiguous identity, or normalized enrollment UUID ≠ stored Fleet `uuid`                                            | `installed` → `IdentityMismatch` (terminal; `Cancel`)                                                    |
 | Spoke `Hello`, preflight `failed_preflights` non-empty                                                                                                      | `connected` → `PreflightFailed{names}`                                                                   |
 
 **Non-selected MDM-command comparison (not required or assumed free).** Where a Mac is also Apple-MDM-enrolled in Fleet, `POST /api/v1/fleet/commands/run` with a base64 `InstallEnterpriseApplication` plist (`ManifestURL` on the approved HTTPS origin, `PinningRevocationCheckRequired` true, pinning certs set) can replace the stub's download step. Because macOS acknowledges before installing and reports no install errors over MDM, the stage machine must still obtain `installed` from the probe script, never from `commands/results` `status: Acknowledged`.
@@ -370,7 +378,7 @@ Verifier inputs: JWKS `https://www.googleapis.com/oauth2/v3/certs`, `alg` RS256,
 }
 ```
 
-### Fleet: host identity resolution
+### Fleet macOS: host identity resolution
 
 ```json
 {
@@ -399,7 +407,7 @@ Verifier inputs: JWKS `https://www.googleapis.com/oauth2/v3/certs`, `alg` RS256,
 }
 ```
 
-### Fleet: secret delivery, job submission and inspection
+### Fleet macOS: secret delivery, job submission and inspection
 
 ```json
 {
@@ -497,6 +505,165 @@ Verifier inputs: JWKS `https://www.googleapis.com/oauth2/v3/certs`, `alg` RS256,
 }
 ```
 
+### Fleet Linux: host identity resolution
+
+This Ubuntu/x86 fixture selects an already enrolled physical host. The root-read DMI value `A2064CEF-1234-4567-AFB9-283E3C1D487E` and osquery `system_info.uuid` must normalize to the returned UUID; the hardware model and serial are illustrative, not a claim about a particular operator machine.
+
+```json
+{
+  "request": {
+    "method": "GET",
+    "url": "https://fleet.example.invalid/api/v1/fleet/hosts/identifier/a2064cef-1234-4567-afb9-283e3c1d487e",
+    "headers": { "Authorization": "Bearer <api-only user token>" }
+  },
+  "response_subset": {
+    "host": {
+      "id": 44,
+      "uuid": "a2064cef-1234-4567-afb9-283e3c1d487e",
+      "hardware_serial": "NUC-SANITIZED-01",
+      "hardware_model": "NUC11PAHi7",
+      "platform": "ubuntu",
+      "os_version": "Ubuntu 24.04.3 LTS",
+      "status": "online",
+      "seen_time": "2026-10-22T17:00:41Z",
+      "orbit_version": "1.52.0",
+      "osquery_version": "5.20.0",
+      "scripts_enabled": true
+    }
+  },
+  "expected_job_identity": {
+    "provider": "fleet",
+    "fleet_host_id": 44,
+    "uuid": "a2064cef-1234-4567-afb9-283e3c1d487e",
+    "expected_platform": "ubuntu"
+  },
+  "negative_variants": [
+    { "platform": "darwin", "expected_error": "WrongPlatform" },
+    { "scripts_enabled": false, "expected_error": "ManagementAgentNotReady" },
+    { "status": "offline", "expected_error": "HostOffline" },
+    {
+      "dmi_product_uuid": "00000000-0000-0000-0000-000000000000",
+      "expected_error": "IdentityMismatch"
+    }
+  ]
+}
+```
+
+### Fleet Linux: secret delivery, systemd handoff and inspection
+
+The JSON is a request/response fixture; `script_contents` is **non-executable installer pseudocode** at the uppercase `FETCH`, `VERIFY` and `INSTALL` steps. These steps run in order and fail closed; they do not assume an existing Boss installer on the fresh host. The verifier comes from the authenticated management payload, not the unverified download. `INSTALL` creates the dedicated account/home and root-owned bootstrap/config; the systemd bootstrap downloads and verifies the larger spoke package under the same signature/digest policy, installs it and enrolls as `boss-worker`, removes the token and starts `boss-spoke.service` with `User=boss-worker`. Its unit uses the same private home/state and service environment for preflight.
+
+The hub renders enrollment tokens as exactly 64 hexadecimal characters and validates that encoding before secret submission, so Fleet's textual substitution cannot introduce shell syntax. The root stub uses a shell builtin to write the substituted value with `umask 077`, then transfers the `0600` file to `boss-worker`; no token enters a child process's argv or the systemd unit definition. The unit/config contain only file paths and public job/trust metadata. Both the script/result masking and host-side file handling still require the Free-edition acceptance test.
+
+```json
+{
+  "deliver_secret": {
+    "method": "PUT",
+    "url": "https://fleet.example.invalid/api/v1/fleet/spec/secret_variables",
+    "body": {
+      "secrets": [
+        {
+          "name": "FLEET_SECRET_BOSS_ENROLL_JOB_01J9L",
+          "value": "<64 hexadecimal characters; sanitized>"
+        }
+      ]
+    },
+    "response_status": 200
+  },
+  "create_host_run": {
+    "method": "POST",
+    "url": "https://fleet.example.invalid/api/v1/fleet/scripts/run",
+    "body": {
+      "host_id": 44,
+      "script_contents": "#!/bin/bash\n# boss-bootstrap-stub/1 job_01j9l; NON-EXECUTABLE PSEUDOCODE at uppercase steps\nset -euo pipefail\numask 077\nMANIFEST_URL='https://github.com/spinyfin/mono/releases/download/release-v1.2.3/boss-spoke-linux-amd64.manifest.json'\nVERIFY_KEY='MCowBQYDK2VwAyEA…'\nFETCH manifest bytes and detached signature from MANIFEST_URL over approved HTTPS using payload-pinned VERIFY_KEY\nVERIFY Ed25519 signature over exact bytes BEFORE parsing manifest\nVERIFY approved release and linux-amd64 platform\nFETCH bootstrap from approved HTTPS origin\nVERIFY bootstrap SHA256 against verified manifest BEFORE execution\nINSTALL verified bootstrap; create boss-worker with home /var/lib/boss-worker and private state; write public job/trust config to /etc/boss-spoke/bootstrap-job_01j9l.json\ninstall -d -o boss-worker -g boss-worker -m 0700 /var/lib/boss-worker/.boss-spoke/bootstrap/job_01j9l\nprintf '%s' '$FLEET_SECRET_BOSS_ENROLL_JOB_01J9L' > /var/lib/boss-worker/.boss-spoke/bootstrap/job_01j9l/enroll.token\nchown boss-worker:boss-worker /var/lib/boss-worker/.boss-spoke/bootstrap/job_01j9l/enroll.token\nchmod 0600 /var/lib/boss-worker/.boss-spoke/bootstrap/job_01j9l/enroll.token\nsystemd-run --unit=boss-bootstrap-job_01j9l --property=Type=exec --property=UMask=0077 /usr/local/sbin/boss-bootstrap --config /etc/boss-spoke/bootstrap-job_01j9l.json --worker-user boss-worker --enrollment-token-file /var/lib/boss-worker/.boss-spoke/bootstrap/job_01j9l/enroll.token\necho 'BOSS_STAGE=requested BOSS_ERROR=none BOSS_HANDOFF=systemd'\n"
+    },
+    "response": {
+      "host_id": 44,
+      "execution_id": "e797d6c6-3aae-41ee-be56-0242ac120044"
+    },
+    "response_status": 202
+  },
+  "inspect_pending": {
+    "method": "GET",
+    "url": "https://fleet.example.invalid/api/v1/fleet/scripts/results/e797d6c6-3aae-41ee-be56-0242ac120044",
+    "response_subset": {
+      "host_id": 44,
+      "execution_id": "e797d6c6-3aae-41ee-be56-0242ac120044",
+      "exit_code": null,
+      "output": "",
+      "host_timeout": false
+    }
+  },
+  "inspect_handoff": {
+    "method": "GET",
+    "url": "https://fleet.example.invalid/api/v1/fleet/scripts/results/e797d6c6-3aae-41ee-be56-0242ac120044",
+    "response_subset": {
+      "host_id": 44,
+      "execution_id": "e797d6c6-3aae-41ee-be56-0242ac120044",
+      "exit_code": 0,
+      "output": "BOSS_STAGE=requested BOSS_ERROR=none BOSS_HANDOFF=systemd",
+      "host_timeout": false,
+      "runtime": 9
+    }
+  },
+  "inspect_failure_variants": [
+    {
+      "exit_code": 12,
+      "output": "BOSS_STAGE=requested BOSS_ERROR=manifest_sig",
+      "host_timeout": false
+    },
+    {
+      "exit_code": 13,
+      "output": "BOSS_STAGE=requested BOSS_ERROR=digest_mismatch",
+      "host_timeout": false
+    },
+    {
+      "exit_code": -1,
+      "output": "",
+      "host_timeout": true
+    }
+  ],
+  "probe_run": {
+    "method": "POST",
+    "url": "https://fleet.example.invalid/api/v1/fleet/scripts/run",
+    "body": {
+      "host_id": 44,
+      "script_contents": "#!/bin/sh\nset -eu\nsystemctl show boss-spoke.service --property=User,Group,ActiveState\nexec runuser -u boss-worker -- env HOME=/var/lib/boss-worker /usr/local/bin/boss-spoke status --json\n"
+    },
+    "response": {
+      "host_id": 44,
+      "execution_id": "f797d6c6-3aae-41ee-be56-0242ac120044"
+    },
+    "response_status": 202
+  },
+  "inspect_probe": {
+    "method": "GET",
+    "url": "https://fleet.example.invalid/api/v1/fleet/scripts/results/f797d6c6-3aae-41ee-be56-0242ac120044",
+    "response_subset": {
+      "host_id": 44,
+      "execution_id": "f797d6c6-3aae-41ee-be56-0242ac120044",
+      "exit_code": 0,
+      "host_timeout": false,
+      "output": "User=boss-worker\nGroup=boss-worker\nActiveState=active\n{\"stage\":\"enrolled\",\"host_id\":\"host_01j9l\",\"spoke_version\":\"1.2.3\",\"cert_not_after\":\"2026-11-21T17:03:00Z\"}"
+    }
+  },
+  "invalidate_secret_after_enrolled": {
+    "method": "PUT",
+    "url": "https://fleet.example.invalid/api/v1/fleet/spec/secret_variables",
+    "body": {
+      "secrets": [
+        {
+          "name": "FLEET_SECRET_BOSS_ENROLL_JOB_01J9L",
+          "value": "consumed-<random>"
+        }
+      ]
+    }
+  }
+}
+```
+
+Handoff exit zero only confirms submission to systemd; it does not establish installation/enrollment/readiness. The probe's JSON is the proposed Boss status contract, separate from Fleet's result envelope. Assert `installed` then `enrolled` via successive probes; the hub alone records `connected → preflight_passed → ready` from authenticated stream/preflight observations. A connected Linux host reporting `failed_preflights: ["python3_pty"]` must stay unschedulable with `PreflightFailed{python3_pty}` even if the Fleet script succeeded.
+
 ### Fleet: non-selected MDM install command comparison
 
 ```json
@@ -556,7 +723,7 @@ The initial Fleet procedure and optional GCE procedure are to be executed by the
 
 ### Initial self-hosted Linux and macOS (Fleet Free)
 
-1. **Preconditions recorded:** an unlicensed Free server outside any Premium trial, Linux and macOS agent enrollment, Tailscale/private hub and management-server reachability, Fleet server version (`GET /api/v1/fleet/version`), tier, API-only user role, `fleetd` package build flags (signed, notarized, scripts enabled), and for each Mac the `hosts/identifier` subset fixture (uuid, serial, `scripts_enabled: true`). Record whether Apple MDM is enrolled; it must not be required for the pass.
+1. **Preconditions recorded:** an unlicensed Free server outside any Premium trial, Linux and macOS agent enrollment, Tailscale/private hub and management-server reachability, Fleet server version (`GET /api/v1/fleet/version`), tier, API-only user role, `fleetd` package build flags (signed, notarized, scripts enabled), and for each platform the `hosts/identifier` subset fixture (uuid, serial, expected platform, `scripts_enabled: true`). Signing/notarization applies to the Mac package; record the Linux package version and systemd environment separately. Record whether Apple MDM is enrolled; it must not be required for the pass.
 2. **Secret handling proof (gate):** deliver a known test variable, run a script that writes it to a `0600` file and prints `ok` → assert `GET /scripts/results` returns `script_contents` with the variable _name_ and `output` without the value; assert the Fleet UI script-result view shows no value. Include secret creation and invalidation API calls; if any operation needs Premium or exposes the value, acceptance fails. Do not enable the adapter or substitute a UUID-only fetch.
 3. **Create:** `CreateHost(macos, {hardware_uuid})` → `execution_id` stored; result `exit_code 0` with `BOSS_HANDOFF=launchd` within the 5-minute Fleet timeout; `launchctl print system/com.spinyfin.boss-bootstrap` exists (reported through the probe script).
 4. **Idempotency:** second `CreateHost` while the first is pending → no second `scripts/run` call (hub audit log).
@@ -569,7 +736,7 @@ The initial Fleet procedure and optional GCE procedure are to be executed by the
 11. **Ready end-to-end:** one real task runs on the Mac spoke and publishes a PR.
 12. **Optional MDM comparison (separate entitlement check, not a Free dependency):** `commands/run` `InstallEnterpriseApplication` returns `Acknowledged`; the report must show `installed` came from the probe, not the command status.
 
-13. **Linux parity:** repeat creation, signature/digest rejection, expired-token replacement, interrupted-install retry, cancellation and a real worker task on a managed home Linux host over Tailscale. Assert systemd service ownership, private state, as-user tool/credential preflight and no cloud API calls. With the spoke stopped, recover through Fleet alone. Cancellation must not delete the host, wipe journals or touch unrelated services.
+13. **Linux parity:** use the [Fleet Linux identity fixture](#fleet-linux-host-identity-resolution) and [secret/handoff/inspection fixtures](#fleet-linux-secret-delivery-systemd-handoff-and-inspection) on a managed home Ubuntu host over Tailscale. Record the DMI, osquery and Fleet UUID comparison, `platform: ubuntu`, `scripts_enabled: true`, and rejection of a wrong-platform host and a mismatched/placeholder UUID. Repeat the Free secret gate on Linux, checking the substituted file's `boss-worker` ownership and `0600` mode without printing its contents, result/UI masking and deletion/invalidation. Record the systemd handoff execution id separately from the probe execution id; handoff success alone must leave the host unschedulable. Prove `installed → enrolled` by probes and `connected → preflight_passed → ready` at the hub; inject a missing Python PTY module or worker credential and require `PreflightFailed`. Repeat signature/digest rejection, expired-token replacement, interrupted-install retry, cancellation and a real worker task publishing a PR. Assert systemd service ownership, private state, as-user preflight in the installed service environment and no cloud API calls. With the spoke stopped, recover through Fleet alone. Cancellation must stop only the selected job's bootstrap/Boss service and remove its token, never delete the host, wipe journals or touch unrelated services. Save sanitized requests/results and hub stage history alongside the report.
 14. **Provider independence:** contract tests select Fleet/Linux and Fleet/macOS without GCE credentials. A fake cloud provider uses the same stages while retaining its own identity. Do not require a paid cloud deployment to pass initial local-host acceptance.
 
 ## Risks and evidence limits
@@ -586,7 +753,7 @@ The initial Fleet procedure and optional GCE procedure are to be executed by the
 These are changes to the design's existing implementation entries, not claims that this investigation implements or deploys them.
 
 1. **Hub managed provisioning jobs:** provider selection independent of OS; provider-scoped identity, shared stages and typed errors; tests for existing-machine and cloud-machine semantics. Reuse repository HTTP/retry infrastructure.
-2. **Managed Linux host provisioning:** target managed self-hosted Linux first using Fleet script run/results, systemd bootstrap and as-user preflight over the private network. Treat GCE as an optional adapter, not a dependency. Reflect this in the design entry's cloud-only wording.
+2. **Managed Linux host provisioning:** target managed self-hosted Linux first using Fleet script run/results, systemd bootstrap and as-user preflight over the private network. Treat GCE as an optional adapter, not a dependency. The parent design's contract and implementation entry now use this self-hosting-first wording.
 3. **Managed macOS host provisioning:** Free script path, launchd hand-off, result probes and explicit free-edition secret/permission tests; no Premium package deployment or UUID-only fetch fallback.
 4. **Signed spoke packages and services:** publish both platform installers with the signed manifests already required by the design. Shared Fleet job logic stays independent of platform-specific service setup.
 
