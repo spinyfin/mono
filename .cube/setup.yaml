@@ -4,6 +4,11 @@
 # tools/cube/src/setup.rs). Steps run through `sh -c` with cwd = the
 # workspace root; a step that exits non-zero fails the lease, so every step
 # must be safe to run on any host cube provisions a mono workspace on.
+#
+# `cleanup` below is different: it is not run on lease. cube runs it against a
+# *free* workspace when free disk space falls below its low-water mark, least
+# recently used workspace first, and guarantees nothing leases the workspace
+# while it runs. See tools/cube/src/app/cleanup.rs.
 version: 1
 steps:
   # Materialize a placeholder GhosttyKit.xcframework so Bazel *analysis* of
@@ -21,3 +26,13 @@ steps:
   - id: ghosttykit-spm-stub
     command: bash tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
     run_when: always
+
+# Give back the disk a free workspace is holding outside its checkout: its
+# Bazel output base (10-16 GiB once fully built; nothing else ever reclaims it).
+# All of the Bazel-specific logic lives in the script, not in cube. It exits 75
+# ("busy") if a Bazel command is running in the workspace, and never touches the
+# shared repository cache or any other workspace's output base. The script is
+# addressed through CUBE_CLEANUP_ROOT (the checkout this file was read from)
+# because a free workspace can sit on a revision that predates the script.
+cleanup:
+  command: bash "$CUBE_CLEANUP_ROOT/.cube/cleanup-bazel-output-base.sh"

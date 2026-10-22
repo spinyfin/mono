@@ -263,18 +263,34 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         workspace: Option<String>,
     },
-    /// Forget consumed boss/exec_* bookmarks from workspace pools.
+    /// Forget consumed boss/exec_* bookmarks from workspace pools, recycle
+    /// long-unhealthy workspaces, and clean workspaces under disk pressure.
     ///
     /// A bookmark is "consumed" when its tip is reachable from `main`
     /// (i.e. its PR has merged). Without `--workspace`, iterates every
     /// workspace in the pool; leased workspaces are skipped.
+    ///
+    /// Also runs the repo-declared workspace cleanup (the `cleanup:` command
+    /// in a repo's `.cube/setup.yaml`) when free space on a workspace's volume
+    /// is below the low-water mark (`[pool] min-free-bytes` /
+    /// `min-free-percent`): it cleans free workspaces least recently used
+    /// first, one at a time, until free space clears the high-water mark
+    /// (the floor plus `[pool] cleanup-headroom-bytes`). Nothing is cleaned
+    /// above the low-water mark. With `--dry-run` it lists the workspaces it
+    /// would clean, in order, and changes nothing.
     Gc {
         /// Only process this workspace id.
         #[arg(long)]
         workspace: Option<String>,
-        /// List what would be forgotten without doing it.
+        /// List what would be forgotten and cleaned without doing it.
         #[arg(long)]
         dry_run: bool,
+        /// Lift the `failed` cleanup mark from workspaces (all, or just
+        /// `--workspace`) before the cleanup pass, returning them to the pool.
+        /// Use it for a workspace whose cleanup keeps failing and should go
+        /// back to the pool as it is. Ignored with `--dry-run`.
+        #[arg(long)]
+        clear_failed_cleanup: bool,
     },
     /// Position the working copy on the head of a PR branch.
     ///
@@ -1144,7 +1160,7 @@ mod tests {
         let cli = Cli::parse_from(["cube", "workspace", "gc"]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Gc { workspace, dry_run },
+                command: WorkspaceCommand::Gc { workspace, dry_run, .. },
             } => {
                 assert!(workspace.is_none());
                 assert!(!dry_run);
@@ -1158,7 +1174,7 @@ mod tests {
         let cli = Cli::parse_from(["cube", "workspace", "gc", "--workspace", "mono-agent-001", "--dry-run"]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Gc { workspace, dry_run },
+                command: WorkspaceCommand::Gc { workspace, dry_run, .. },
             } => {
                 assert_eq!(workspace.as_deref(), Some("mono-agent-001"));
                 assert!(dry_run);

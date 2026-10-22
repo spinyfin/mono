@@ -20,9 +20,10 @@ use crate::app::bazel_output_base::{
     BazelUserRootCache, CleanupOutcome, cleanup_output_base_for_workspace, discover_bazel_user_root,
     sweep_orphaned_output_bases,
 };
+use crate::app::cleanup::{CleanupOptions, CleanupTrigger, run_cleanup_pass};
 use crate::app::display::{
-    effective_state_display, format_age, format_retention_summary, format_workspace_list, human_workspace_detail,
-    retention_summary,
+    cleanup_marks_by_workspace, effective_state_display, format_age, format_retention_summary, format_workspace_list,
+    human_workspace_detail, retention_summary,
 };
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::excludes::ensure_boss_infra_excluded;
@@ -521,6 +522,7 @@ pub(super) fn run_workspace(
             let effective_free = store.list_workspaces_filtered(&WorkspaceListFilter {
                 repo: Some(&repo),
                 effective_state: Some(EffectiveState::Free),
+                exclude_cleanup_marked: true,
                 ..Default::default()
             })?;
 
@@ -532,11 +534,13 @@ pub(super) fn run_workspace(
                 let mut d = store.list_workspaces_filtered(&WorkspaceListFilter {
                     repo: Some(&repo),
                     effective_state: Some(EffectiveState::FreeDirty),
+                    exclude_cleanup_marked: true,
                     ..Default::default()
                 })?;
                 let mut c = store.list_workspaces_filtered(&WorkspaceListFilter {
                     repo: Some(&repo),
                     effective_state: Some(EffectiveState::FreeConflicted),
+                    exclude_cleanup_marked: true,
                     ..Default::default()
                 })?;
                 d.append(&mut c);
@@ -963,9 +967,10 @@ pub(super) fn run_workspace(
                 }
             }
 
-            let (mut workspace, mut was_auto_created, repair_bookmarks) = if let Some(ws_id) = chosen_id {
-                // Claim the specific workspace we health-checked.
-                let ws = store
+            // A claim can still be refused (a cleanup began on the row after
+            // the scan listed it); that is a reason to provision, not an error.
+            let claimed_chosen = match chosen_id {
+                Some(ws_id) => store
                     .claim_specific_workspace(
                         &repo,
                         &ws_id,
@@ -975,7 +980,10 @@ pub(super) fn run_workspace(
                         leased_at_epoch_s,
                         lease_expires_at,
                     )?
-                    .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?;
+                    .map(|ws| (ws, ws_id)),
+                None => None,
+            };
+            let (mut workspace, mut was_auto_created, repair_bookmarks) = if let Some((ws, ws_id)) = claimed_chosen {
                 let bookmarks = conflicted_candidate
                     .filter(|(id, _)| *id == ws_id)
                     .map(|(_, b)| b)
@@ -1718,9 +1726,10 @@ pub(super) fn run_workspace(
                 records.clone()
             };
             let ttl_secs = config::load_config().unwrap_or_default().unhealthy_gc.max_age_secs();
-            let retention = retention_summary(&retention_source, now, ttl_secs);
+            let cleanup_marks = cleanup_marks_by_workspace(&store, repo.as_deref())?;
+            let retention = retention_summary(&retention_source, &cleanup_marks, now, ttl_secs);
 
-            let mut message = format_workspace_list(&records, now);
+            let mut message = format_workspace_list(&records, &cleanup_marks, now);
             if let Some(block) = format_retention_summary(&retention) {
                 message.push_str(&block);
             }
@@ -2003,7 +2012,16 @@ pub(super) fn run_workspace(
                 }),
             )
         }
-        WorkspaceCommand::Gc { workspace, dry_run } => {
+        WorkspaceCommand::Gc {
+            workspace,
+            dry_run,
+            clear_failed_cleanup,
+        } => {
+            let cleanup_marks_cleared = if clear_failed_cleanup && !dry_run {
+                store.clear_failed_cleanup_marks(workspace.as_deref())?
+            } else {
+                0
+            };
             let records = store.list_workspaces_filtered(&WorkspaceListFilter {
                 workspace_id: workspace.as_deref(),
                 ..Default::default()
@@ -2077,24 +2095,54 @@ pub(super) fn run_workspace(
                 0
             };
 
+            // Repo-declared workspace cleanup: the same disk-pressure-driven
+            // pass the periodic GC runs, unbounded. With `--dry-run` it lists
+            // the workspaces it would clean, least recently used first, and
+            // changes nothing.
+            let cleanup = run_cleanup_pass(
+                runner,
+                &store,
+                database_path,
+                &CleanupOptions {
+                    repo: None,
+                    workspace: workspace.as_deref(),
+                    trigger: CleanupTrigger::Manual,
+                    dry_run,
+                    deadline: None,
+                },
+            );
+
             let total_forgotten: usize = results.iter().map(|r| r.bookmarks_forgotten.len()).sum();
             let message = if dry_run {
                 format!(
-                    "{} workspace(s): {} bookmark(s) would be forgotten (dry-run).",
-                    results.len(),
-                    total_forgotten
-                )
-            } else {
-                format!(
-                    "{} workspace(s): {} bookmark(s) forgotten, {} unhealthy workspace(s) recycled.",
+                    "{} workspace(s): {} bookmark(s) would be forgotten (dry-run). {}",
                     results.len(),
                     total_forgotten,
-                    unhealthy_recycled
+                    cleanup.summary(),
+                )
+            } else {
+                let cleared = if clear_failed_cleanup {
+                    format!(" {cleanup_marks_cleared} failed cleanup mark(s) cleared;")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{} workspace(s): {} bookmark(s) forgotten, {} unhealthy workspace(s) recycled;{cleared} \
+                     workspace cleanup: {}.",
+                    results.len(),
+                    total_forgotten,
+                    unhealthy_recycled,
+                    cleanup.summary(),
                 )
             };
             RunResult::new(
                 message,
-                json!({ "results": results, "unhealthy_recycled": unhealthy_recycled }),
+                json!({
+                    "results": results,
+                    "unhealthy_recycled": unhealthy_recycled,
+                    "cleanup_marks_cleared": cleanup_marks_cleared,
+                    "workspace_cleanup": cleanup,
+                }),
             )
         }
         WorkspaceCommand::Goto {

@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../.."
 
 [dependencies]
+process-runner = { path = "../../../lib/rust/process_runner" }
 async-trait = { workspace = true }
 libc = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util"] }

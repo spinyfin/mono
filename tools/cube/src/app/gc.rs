@@ -12,6 +12,9 @@ use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 use crate::{audit, config, paths};
 
+use crate::app::cleanup::{
+    CleanupOptions, CleanupTrigger, any_cleanup_awaiting_retry, any_volume_below_low_water, run_cleanup_pass,
+};
 use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
@@ -75,6 +78,15 @@ pub(super) const POOL_GC_BACKLOG_RETRY_SECS: i64 = 5 * 60;
 /// the interval while the previous pass demonstrated it could act on one; a
 /// pass that came up empty falls back to [`AUTO_GC_INTERVAL_SECS`].
 pub(super) const POOL_GC_TRIM_PROGRESS_KEY: &str = "last_pool_gc_trim_made_progress";
+
+/// The same signal for repo-declared workspace cleanup: `1` if the last pass
+/// cleaned something or stopped early at its deadline, `0` if it walked every
+/// eligible workspace and could clean none (all busy, all failing). Free-space
+/// pressure and failed-cleanup marks only shorten the GC interval while the
+/// previous pass showed it could act on them, so a volume that stays low with
+/// nothing cleanable — or a cleanup command that keeps failing — does not pin
+/// the throttle at [`POOL_GC_BACKLOG_RETRY_SECS`].
+pub(super) const POOL_GC_CLEANUP_PROGRESS_KEY: &str = "last_pool_gc_cleanup_made_progress";
 
 /// List and optionally forget consumed `boss/exec_*` bookmarks and
 /// unreferenced `pr/<n>` bookmarks in a workspace.
@@ -363,8 +375,13 @@ pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Pa
         // POOL_GC_TRIM_PROGRESS_KEY for the steady state this rules out.
         // Every check here is DB-only.
         let trim_made_progress = store.get_pool_metadata_i(POOL_GC_TRIM_PROGRESS_KEY)?.unwrap_or(1) != 0;
+        // Low free space (or a cleanup waiting on retry) is backlog too — the
+        // volume cannot wait a day — but, like the surplus, only while the last
+        // cleanup pass demonstrated it could act.
+        let cleanup_made_progress = store.get_pool_metadata_i(POOL_GC_CLEANUP_PROGRESS_KEY)?.unwrap_or(1) != 0;
         let has_backlog = pool_gc_has_aged_unhealthy_backlog(store, now_epoch_s).unwrap_or(true)
-            || (trim_made_progress && has_free_workspace_surplus(store));
+            || (trim_made_progress && has_free_workspace_surplus(store))
+            || (cleanup_made_progress && (any_volume_below_low_water(store) || any_cleanup_awaiting_retry(store)));
         let interval = if has_backlog {
             POOL_GC_BACKLOG_RETRY_SECS
         } else {
@@ -439,6 +456,30 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
             );
         }
     }
+
+    // Repo-declared workspace cleanup runs next, for the same reason
+    // compaction goes first: it is a disk-returning pass, and the passes below
+    // reclaim no bytes. It only does anything when free space is below the
+    // low-water mark (or to finish a cleanup that failed earlier), so on a
+    // healthy volume this is one `statvfs` per repo.
+    let cleanup = run_cleanup_pass(
+        &runner,
+        &store,
+        database_path.as_deref(),
+        &CleanupOptions {
+            repo: None,
+            workspace: None,
+            trigger: CleanupTrigger::Periodic,
+            dry_run: false,
+            deadline: Some(deadline),
+        },
+    );
+    if !cleanup.cleaned.is_empty() || !cleanup.failed.is_empty() {
+        eprintln!("cube: auto gc: workspace cleanup: {}", cleanup.summary());
+    }
+    let _ = store
+        .set_pool_metadata_i(POOL_GC_CLEANUP_PROGRESS_KEY, i64::from(cleanup.made_progress()))
+        .map_err(|e| eprintln!("cube: auto gc: failed to record the cleanup outcome: {e}"));
 
     if Instant::now() >= deadline {
         eprintln!("cube: auto gc: time budget exhausted after compaction, deferring the rest to the next pass");

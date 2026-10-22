@@ -170,6 +170,27 @@ pub const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// it: on the 1.8 TiB volume that filled to exhaustion, 2% is ~36 GiB.
 pub const DEFAULT_MIN_FREE_PERCENT: u64 = 2;
 
+/// How far above the free-space floor a repo-declared workspace cleanup
+/// tries to get the volume before it stops.
+///
+/// The floor ([`DEFAULT_MIN_FREE_BYTES`] / [`DEFAULT_MIN_FREE_PERCENT`]) is
+/// the low-water mark: cleanup only starts below it. This is the margin to the
+/// high-water mark it stops at. Keeping workspaces warm is what the pool is
+/// for, so the margin is deliberately modest — about one fully built mono
+/// workspace's out-of-tree build state, so a single episode cleans one or two
+/// workspaces rather than wiping the pool.
+///
+/// 16 GiB is sized off the measurement, not a guess. On 2026-10-21, across the
+/// 50 mono output bases on the host that had been built at all (over 1 GiB),
+/// the median was 9.7 GiB, nine in ten were at or under 14.7 GiB, and the
+/// largest was 16.5 GiB; a base reached 9.8 GiB within about twelve minutes of
+/// its workspace's first build. So one cleaned workspace returns about 10 GiB
+/// and one margin of 16 GiB means a typical episode cleans one or two
+/// workspaces. A margin well below that would stop cleanup while the next
+/// build is already refilling the volume; one well above it would cold-start
+/// several warm workspaces to buy headroom that one build spends in minutes.
+pub const DEFAULT_CLEANUP_HEADROOM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Directory names, relative to a workspace root, treated as regenerable
 /// build output and reclaimed by compaction.
 ///
@@ -240,6 +261,10 @@ pub struct PoolConfig {
     /// Proportional free-space floor. See [`DEFAULT_MIN_FREE_PERCENT`].
     #[serde(rename = "min-free-percent")]
     pub min_free_percent: Option<u64>,
+    /// Margin above the free-space floor that workspace cleanup stops at. See
+    /// [`DEFAULT_CLEANUP_HEADROOM_BYTES`].
+    #[serde(rename = "cleanup-headroom-bytes")]
+    pub cleanup_headroom_bytes: Option<u64>,
 }
 
 impl PoolConfig {
@@ -289,6 +314,18 @@ impl PoolConfig {
             .unwrap_or(DEFAULT_MIN_FREE_PERCENT);
         let proportional = total_bytes / 100 * percent.min(100);
         absolute.max(proportional)
+    }
+}
+
+impl PoolConfig {
+    /// The mark a repo-declared workspace cleanup stops at once it has started:
+    /// the free-space floor (its low-water mark) plus
+    /// [`DEFAULT_CLEANUP_HEADROOM_BYTES`] of margin.
+    pub fn cleanup_high_water_bytes(&self, total_bytes: u64) -> u64 {
+        let headroom = env_u64("CUBE_POOL_CLEANUP_HEADROOM_BYTES")
+            .or(self.cleanup_headroom_bytes)
+            .unwrap_or(DEFAULT_CLEANUP_HEADROOM_BYTES);
+        self.free_space_floor_bytes(total_bytes).saturating_add(headroom)
     }
 }
 
@@ -468,6 +505,24 @@ mod tests {
     fn free_space_floor_honours_explicit_config() {
         let cfg: CubeConfig = toml::from_str("[pool]\nmin-free-bytes = 1024\nmin-free-percent = 0\n").expect("parse");
         assert_eq!(cfg.pool.free_space_floor_bytes(1_000_000), 1024);
+    }
+
+    #[test]
+    fn cleanup_stops_a_modest_margin_above_the_floor() {
+        let pool = PoolConfig::default();
+        let total = 1_800 * 1024 * 1024 * 1024_u64;
+        assert_eq!(
+            pool.cleanup_high_water_bytes(total),
+            pool.free_space_floor_bytes(total) + DEFAULT_CLEANUP_HEADROOM_BYTES,
+        );
+    }
+
+    #[test]
+    fn cleanup_headroom_is_configurable() {
+        let cfg: CubeConfig =
+            toml::from_str("[pool]\nmin-free-bytes = 1000\nmin-free-percent = 0\ncleanup-headroom-bytes = 500\n")
+                .expect("parse");
+        assert_eq!(cfg.pool.cleanup_high_water_bytes(1_000_000), 1_500);
     }
 
     #[test]

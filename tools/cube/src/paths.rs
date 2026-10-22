@@ -28,6 +28,17 @@ pub fn repo_lock_path_in(data_dir: &std::path::Path, repo: &str) -> PathBuf {
     data_dir.join("locks").join(format!("{repo}.lock"))
 }
 
+/// The lock that serializes workspace cleanup passes across every entry point.
+/// Separate from the per-repo lease lock: a pass holds it for the whole
+/// command, and leases must never wait on that.
+pub fn cleanup_lock_path_in(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("locks").join("workspace-cleanup.lock")
+}
+
+pub fn cleanup_lock_path() -> Result<PathBuf, CubeError> {
+    Ok(cleanup_lock_path_in(&data_dir()?))
+}
+
 pub fn audit_dir() -> Result<PathBuf, CubeError> {
     Ok(audit_dir_in(&data_dir()?))
 }

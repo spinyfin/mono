@@ -56,6 +56,13 @@ pub(super) fn repo_lock_path(repo: &str, database_path: Option<&Path>) -> Result
     }
 }
 
+pub(super) fn cleanup_lock_path(database_path: Option<&Path>) -> Result<PathBuf> {
+    match database_path.and_then(Path::parent) {
+        Some(parent) => Ok(paths::cleanup_lock_path_in(parent)),
+        None => paths::cleanup_lock_path(),
+    }
+}
+
 pub(super) fn current_epoch_s() -> Result<i64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
