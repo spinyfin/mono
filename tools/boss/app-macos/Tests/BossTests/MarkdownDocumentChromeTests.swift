@@ -785,6 +785,92 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         )
     }
 
+    /// The findings addendum must size to its content: two findings take a
+    /// few lines, the 200-point cap only ever caps a long list, and
+    /// collapsing the disclosure gives the height back. The probe
+    /// hosts the header on top of a flexible sibling in a window far taller
+    /// than the header, as the viewer does.
+    func testReviewGuideViewerHeaderFindingsPanelFitsItsContent() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var task = Self.makeReviewGuideTestTask(id: "task_1")
+        task.reviewGuideLifecycle = "ready"
+        task.reviewGuideReadableVersionId = "prgv_1"
+        model.taskIndexByID = [task.id: task]
+        model.pendingReviewGuideVersionId = "prgv_1"
+        model.pendingReviewGuideRootTaskId = task.id
+        model.asyncMarkdownViewerVM.state = .loaded(
+            title: "Review guide",
+            markdown: "# Guide",
+            artifact: .reviewGuide(seriesID: "prgs_1", versionID: "prgv_1")
+        )
+
+        func headerHeight(findings: ReviewGuideFindings?, expanded: Bool) -> CGFloat {
+            model.reviewGuideFindingsBySeriesID["prgs_1"] = findings
+            let probe = HeightProbe()
+            let view = VStack(spacing: 0) {
+                ReviewGuideViewerHeader(
+                    chatModel: model,
+                    rootTaskId: task.id,
+                    generatedAt: "2026-09-16T00:00:00Z",
+                    findingsInitiallyExpanded: expanded
+                )
+                .onGeometryChange(for: CGFloat.self, of: \.size.height) { probe.height = $0 }
+                Color.clear
+            }
+            let hosting = NSHostingView(rootView: view)
+            hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 800)
+            let window = NSWindow(
+                contentRect: hosting.frame, styleMask: [.titled], backing: .buffered, defer: false
+            )
+            window.contentView = hosting
+            hosting.layoutSubtreeIfNeeded()
+            // Let the content measurement feed back into the frame.
+            let deadline = Date(timeIntervalSinceNow: 2)
+            var settled: CGFloat? = nil
+            while Date() < deadline {
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+                if let height = probe.height, height == settled { break }
+                settled = probe.height
+            }
+            withExtendedLifetime(window) {}
+            return probe.height ?? 0
+        }
+
+        let two = ReviewGuideFindings(
+            statusText: "2 findings: 0 fixed on PR, 0 in progress, 2 open",
+            addendumMarkdown: "- [high] Unchecked index\n- [low] Missing test"
+        )
+        let fifteen = ReviewGuideFindings(
+            statusText: "15 findings: 0 fixed on PR, 0 in progress, 15 open",
+            addendumMarkdown: (1...15).map { "- [medium] Finding number \($0)" }.joined(separator: "\n")
+        )
+
+        let bare = headerHeight(findings: nil, expanded: true)
+        let twoExpanded = headerHeight(findings: two, expanded: true)
+        let twoCollapsed = headerHeight(findings: two, expanded: false)
+        let fifteenExpanded = headerHeight(findings: fifteen, expanded: true)
+        XCTAssertGreaterThan(bare, 0)
+
+        // Status line + disclosure row + two one-line bullets: well under
+        // the cap.
+        XCTAssertLessThan(
+            twoExpanded - bare, 120,
+            "two findings must not reserve the height cap (bare=\(bare) expanded=\(twoExpanded))"
+        )
+        XCTAssertGreaterThan(twoExpanded, twoCollapsed, "expanding the addendum must grow the panel")
+        XCTAssertLessThan(
+            twoCollapsed - bare, 60,
+            "collapsed addendum is one status line and one disclosure row (bare=\(bare) collapsed=\(twoCollapsed))"
+        )
+        // Fifteen bullets overflow the cap: the list scrolls at the cap
+        // rather than growing past it, and the cap is still a ceiling only.
+        XCTAssertGreaterThan(fifteenExpanded - twoExpanded, 80, "a longer list must grow the panel up to the cap")
+        XCTAssertLessThanOrEqual(
+            fifteenExpanded - twoCollapsed, ReviewGuideFindingsAddendumList.maxHeight + 8,
+            "the list must stop growing at the cap (collapsed=\(twoCollapsed) fifteen=\(fifteenExpanded))"
+        )
+    }
+
     /// Minimal Review-lane `WorkTask` with a resolved PR URL, for
     /// `ReviewGuideViewerHeader` hosting tests above.
     private static func makeReviewGuideTestTask(id: String) -> WorkTask {
@@ -826,4 +912,10 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         }
         return parts.joined()
     }
+}
+
+/// Captures a hosted view's laid-out height for the findings-panel test.
+@MainActor
+private final class HeightProbe {
+    var height: CGFloat?
 }

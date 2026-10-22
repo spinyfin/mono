@@ -27,6 +27,10 @@ enum BossRevealCapture {
             BossOperatorQuestionCapture.start(path: path)
             return
         }
+        if state == "review-guide" {
+            BossReviewGuideCapture.start(path: path)
+            return
+        }
         let model = ChatViewModel(paths: BossEnginePaths.production())
         let now = ISO8601DateFormatter().string(from: Date())
         let product = WorkProduct(
