@@ -9,13 +9,21 @@ use super::support::{
 use clap::Parser;
 use tempfile::TempDir;
 
+use crate::app::errors::CubeError;
 use crate::cli::Cli;
 use crate::metadata::{WorkspaceCandidate, WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::store::{Store, WorkspaceListFilter};
 
 use crate::app::dispatch::run_with_dependencies;
-use crate::app::lease_reclaim::{order_reclaim_candidates, unhealthy_breakdown};
+use crate::app::lease_reclaim::{
+    LEASE_RECLAIM_MIN_UNHEALTHY_SECS, ReclaimLimits, lease_reclaim_cursor_key, order_reclaim_candidates,
+    reclaim_unhealthy_workspace_for_lease, unhealthy_breakdown,
+};
 use crate::app::salvage::{SALVAGE_LOG_TEMPLATE, list_salvage_records, salvage_log_limit_arg, salvage_revset};
+
+fn now_s() -> i64 {
+    crate::app::util::current_epoch_s().expect("clock")
+}
 
 const PRESERVED: &str = "unpushed_work_preserved";
 
@@ -53,6 +61,10 @@ fn seed_unhealthy_pool(
             rusqlite::params![release_reason, id],
         )
         .expect("release reason");
+        // Unhealthy for a day: well past the reclaim's grace window.
+        store
+            .set_workspace_unhealthy_since("mono", id, now_s() - 86_400)
+            .unwrap();
     }
     (workspace_root, paths)
 }
@@ -156,10 +168,9 @@ fn pool_size(database_path: &std::path::Path) -> usize {
         .len()
 }
 
-/// The 2026-10-20/21 shape: the only free workspace was released with its
-/// unpushed `@` preserved, so every lease used to step around it and mint.
-/// Now the lease salvages that work and reuses the workspace — the pool does
-/// not grow.
+/// The only free workspace was released with its unpushed `@` preserved. The
+/// lease salvages that work and reuses the workspace — the pool does not
+/// grow.
 #[test]
 fn lease_salvages_and_reuses_a_dirty_free_workspace_instead_of_minting() {
     let (tempdir, database_path) = with_database_path();
@@ -359,8 +370,10 @@ fn lease_mints_and_explains_itself_when_the_salvage_fails() {
     assert_eq!(p["effective_free"], 0);
     assert_eq!(p["cached_unhealthy"], 1);
     assert_eq!(p["unhealthy_breakdown"]["dirty/unpushed_work_preserved"], 1);
-    assert_eq!(p["rejected"][0]["workspace_id"], "mono-agent-001");
-    assert_eq!(p["rejected"][0]["reason"], "dirty_working_copy");
+    assert_eq!(p["path"], "no_eligible_free");
+    assert_eq!(p["free_workspaces"][0]["workspace_id"], "mono-agent-001");
+    assert_eq!(p["free_workspaces"][0]["reason"], "salvage_failed");
+    assert_eq!(p["free_workspaces"][0]["scan_probe"], "dirty_working_copy");
     assert_eq!(p["reclaim"]["available"], 1);
     assert_eq!(p["reclaim"]["scanned"], 1);
     assert_eq!(p["reclaim"]["rejected"][0]["workspace_id"], "mono-agent-001");
@@ -396,6 +409,8 @@ fn lease_reclaim_honours_exclude() {
         .collect();
     assert_eq!(provisioned.len(), 1);
     assert_eq!(provisioned[0]["reclaim"]["available"], 0);
+    assert_eq!(provisioned[0]["free_workspaces"][0]["workspace_id"], "mono-agent-001");
+    assert_eq!(provisioned[0]["free_workspaces"][0]["reason"], "excluded");
 }
 
 /// Bookmarks are store-wide, so one conflicted `pr/<n>` marks every free
@@ -446,6 +461,377 @@ fn repairing_a_conflicted_bookmark_clears_the_cached_conflict_of_sibling_workspa
     assert_eq!(cleared[0]["repaired_in"], "mono-agent-001");
     assert_eq!(cleared[0]["cleared"], 1);
     assert_eq!(cleared[0]["bookmarks"][0], "pr/3226");
+}
+
+/// The fetch, head read and unpushed probe of a reclaim attempt that finds
+/// unpushed work, followed by a salvage log that comes back empty — a capture
+/// that cannot be proven complete — so the workspace is left as it was.
+fn refusal_commands_for(ws_path: &std::path::Path) -> Vec<ExpectedCommand> {
+    let mut v = vec![
+        ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+        head_status_command(
+            ws_path,
+            &head_status_output("abcd1234", false, "boss/exec_local", "boss/exec_local", ""),
+        ),
+        unpushed_probe_command(ws_path, "abcd1234\t6e6b90bc\n"),
+    ];
+    v.extend(salvage_commands_for(ws_path, "", &[]));
+    v
+}
+
+/// A cached-dirty workspace is not reclaimable until it has been unhealthy
+/// for the grace window: the engine redispatches an orphaned worker onto its
+/// own workspace, and an unrelated lease must not reset it first.
+#[test]
+fn lease_does_not_reclaim_a_dirty_workspace_inside_the_grace_window() {
+    let (tempdir, database_path) = with_database_path();
+    let (root, paths) = seed_unhealthy_pool(
+        &tempdir,
+        &database_path,
+        &["mono-agent-001"],
+        WorkspaceHealth::Dirty,
+        "expired",
+    );
+    Store::open_at(&database_path)
+        .unwrap()
+        .set_workspace_unhealthy_since(
+            "mono",
+            "mono-agent-001",
+            now_s() - (LEASE_RECLAIM_MIN_UNHEALTHY_SECS - 120),
+        )
+        .unwrap();
+
+    // The scan's revalidation re-probe, then straight to the mint: no fetch,
+    // no salvage against the just-expired tree.
+    let mut script = vec![scan_status_command(&paths[0], jj_status_dirty())];
+    script.extend(mint_commands_for(&root, "mono-agent-002"));
+    let runner = FakeRunner::new(script);
+    let result = lease_mono(&database_path, &runner, &[]);
+    runner.assert_exhausted();
+
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-002");
+    assert_eq!(
+        row(&database_path, "mono-agent-001").health_status,
+        Some(WorkspaceHealth::Dirty)
+    );
+    assert!(
+        list_salvage_records(Some(&database_path), None, None)
+            .unwrap()
+            .is_empty()
+    );
+    let events = audit_events(&tempdir);
+    let provisioned = events
+        .iter()
+        .find(|e| e["event"] == "workspace.provisioned_no_eligible_free")
+        .expect("provisioning explained");
+    assert_eq!(provisioned["free_workspaces"][0]["reason"], "within_grace");
+    assert_eq!(provisioned["reclaim"]["available"], 0);
+}
+
+/// A lease that expires in the very call that wants a workspace is never
+/// salvaged-then-refused: the reset guard would refuse its non-empty `@`
+/// (the holder may be alive), quarantine it, and mint anyway. It is left
+/// alone, untouched and not quarantined, and the mint says why.
+#[test]
+fn lease_does_not_reclaim_a_workspace_whose_lease_expired_in_this_call() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    seed_mono_repo(&workspace_root, &database_path);
+    let path = workspace_root.join("mono-agent-001");
+    std::fs::create_dir_all(path.join(".jj")).unwrap();
+    {
+        let mut store = Store::open_at(&database_path).unwrap();
+        store
+            .sync_workspaces(
+                "mono",
+                &[WorkspaceCandidate {
+                    workspace_id: "mono-agent-001".to_string(),
+                    workspace_path: path.clone(),
+                }],
+            )
+            .unwrap();
+        let now = now_s();
+        store
+            .claim_specific_workspace(
+                "mono",
+                "mono-agent-001",
+                "dead-worker",
+                "old task",
+                "old-lease",
+                now - 90_000,
+                Some(now - 10),
+            )
+            .unwrap()
+            .expect("claim");
+    }
+
+    // The sweep frees the row; the scan probes it and finds a dirty tree.
+    // Nothing else touches it.
+    let mut script = vec![scan_status_command(&path, jj_status_dirty())];
+    script.extend(mint_commands_for(&workspace_root, "mono-agent-002"));
+    let runner = FakeRunner::new(script);
+    let result = lease_mono(&database_path, &runner, &[]);
+    runner.assert_exhausted();
+
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-002");
+    let retained = row(&database_path, "mono-agent-001");
+    assert_eq!(retained.state, WorkspaceState::Free);
+    assert_eq!(
+        retained.health_status,
+        Some(WorkspaceHealth::Dirty),
+        "dirty and retained, not quarantined"
+    );
+    assert!(
+        list_salvage_records(Some(&database_path), None, None)
+            .unwrap()
+            .is_empty(),
+        "no salvage record for a tree that was never reclaimed"
+    );
+    let events = audit_events(&tempdir);
+    assert!(!events.iter().any(|e| e["event"] == "workspace.lease_reclaimed"));
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["event"] == "workspace.dirty_reclaim_quarantined")
+    );
+    let provisioned = events
+        .iter()
+        .find(|e| e["event"] == "workspace.provisioned_no_eligible_free")
+        .expect("provisioning explained");
+    assert_eq!(provisioned["free_workspaces"][0]["workspace_id"], "mono-agent-001");
+    assert_eq!(provisioned["free_workspaces"][0]["reason"], "lease_expired_this_call");
+    assert_eq!(provisioned["free_workspaces"][0]["scan_probe"], "dirty_working_copy");
+}
+
+/// If the lease fails after the reclaim cleared the row — here the
+/// post-claim fetch — the salvage record is discarded and the cached dirty
+/// verdict (with its original clock) is restored, so the next lease neither
+/// re-probes a healthy-looking row nor writes a duplicate record.
+#[test]
+fn failed_lease_setup_after_a_reclaim_discards_the_salvage_and_restores_health() {
+    let (tempdir, database_path) = with_database_path();
+    let (_root, paths) = seed_unhealthy_pool(
+        &tempdir,
+        &database_path,
+        &["mono-agent-001"],
+        WorkspaceHealth::Dirty,
+        PRESERVED,
+    );
+    let ws_path = &paths[0];
+    let since_before = row(&database_path, "mono-agent-001").unhealthy_since_epoch_s;
+
+    let mut script = vec![
+        scan_status_command(ws_path, jj_status_dirty()),
+        ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+        head_status_command(
+            ws_path,
+            &head_status_output("abcd1234", false, "boss/exec_local", "boss/exec_local", ""),
+        ),
+        unpushed_probe_command(ws_path, "abcd1234\t6e6b90bc\n"),
+    ];
+    script.extend(salvage_commands_for(
+        ws_path,
+        "abcd1234\t6e6b90bc\thalf-finished refactor\n",
+        &[("6e6b90bc", "diff --git a/x b/x\n+one\n")],
+    ));
+    // The claim's own fetch fails, for a reason that is not transient.
+    script.push(ExpectedCommand {
+        cwd: ws_path.clone(),
+        program: "jj".to_string(),
+        args: vec!["git".to_string(), "fetch".to_string()],
+        result: Err(CubeError::CommandFailed {
+            program: "jj".to_string(),
+            args: vec!["git".to_string(), "fetch".to_string()],
+            status: Some(1),
+            stderr: "repository not found".to_string(),
+        }),
+        creates_dir: None,
+        duration: std::time::Duration::ZERO,
+    });
+    let runner = FakeRunner::new(script);
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "incoming"]),
+        Some(&database_path),
+        &runner,
+    );
+    runner.assert_exhausted();
+    assert!(result.is_err(), "the lease fails");
+
+    let restored = row(&database_path, "mono-agent-001");
+    assert_eq!(restored.state, WorkspaceState::Free);
+    assert_eq!(restored.health_status, Some(WorkspaceHealth::Dirty));
+    assert_eq!(restored.unhealthy_since_epoch_s, since_before, "original clock kept");
+    assert!(
+        list_salvage_records(Some(&database_path), None, None)
+            .unwrap()
+            .is_empty(),
+        "the salvage record of a reclaim that did not happen must be discarded"
+    );
+    let events = audit_events(&tempdir);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == "workspace.lease_reclaim_salvage_discarded")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == "workspace.lease_reclaim_rolled_back")
+    );
+}
+
+/// Rows that fail every time must not hide a salvageable one behind the
+/// probe cap: the starting point rotates across leases, so the fourth
+/// candidate is reached on the second lease.
+#[test]
+fn rows_that_always_fail_do_not_starve_a_later_salvageable_candidate() {
+    let (tempdir, database_path) = with_database_path();
+    let ids = ["mono-agent-001", "mono-agent-002", "mono-agent-003", "mono-agent-004"];
+    let (root, paths) = seed_unhealthy_pool(&tempdir, &database_path, &ids, WorkspaceHealth::Dirty, PRESERVED);
+    {
+        // Distinct ages fix the reclaim order: 001 oldest ... 004 newest.
+        let store = Store::open_at(&database_path).unwrap();
+        let base = now_s() - 86_400;
+        for (offset, id) in ids.iter().enumerate() {
+            store
+                .set_workspace_unhealthy_since("mono", id, base + offset as i64)
+                .unwrap();
+        }
+    }
+
+    // Lease 1: the scan's window re-probes 001..003; the reclaim tries the
+    // same three, cannot salvage any, and mints.
+    let mut first: Vec<ExpectedCommand> = paths[0..3]
+        .iter()
+        .map(|p| scan_status_command(p, jj_status_dirty()))
+        .collect();
+    for p in &paths[0..3] {
+        first.extend(refusal_commands_for(p));
+    }
+    first.extend(mint_commands_for(&root, "mono-agent-005"));
+    let runner = FakeRunner::new(first);
+    let result = lease_mono(&database_path, &runner, &[]);
+    runner.assert_exhausted();
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-005");
+    assert_eq!(
+        Store::open_at(&database_path)
+            .unwrap()
+            .get_pool_metadata_i(&lease_reclaim_cursor_key("mono"))
+            .unwrap(),
+        Some(3),
+        "the cursor moves past the three that failed"
+    );
+
+    // Lease 2: the window now covers 004, 001, 002; the reclaim starts at 004,
+    // which is reusable.
+    let mut second: Vec<ExpectedCommand> = [&paths[3], &paths[0], &paths[1]]
+        .iter()
+        .map(|p| scan_status_command(p, jj_status_dirty()))
+        .collect();
+    second.extend([
+        ExpectedCommand::ok(paths[3].clone(), "jj", &["git", "fetch"], ""),
+        head_status_command(&paths[3], &head_status_output("abcd1234", true, "main", "main", "main")),
+    ]);
+    second.extend(claim_reset_commands_for(&paths[3], "def5678"));
+    let runner = FakeRunner::new(second);
+    let result = lease_mono(&database_path, &runner, &[]);
+    runner.assert_exhausted();
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
+    assert_eq!(pool_size(&database_path), 5, "the second lease must not mint");
+}
+
+/// The reclaim's own `jj status` runs under the remaining reclaim budget, not
+/// the 120s network timeout, so one slow workspace cannot hold the repo lock.
+#[test]
+fn reclaim_health_probe_is_bounded_by_the_reclaim_budget() {
+    let (tempdir, database_path) = with_database_path();
+    let (_root, paths) = seed_unhealthy_pool(
+        &tempdir,
+        &database_path,
+        &["mono-agent-001"],
+        WorkspaceHealth::Dirty,
+        PRESERVED,
+    );
+    let ws_path = &paths[0];
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(ws_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
+        // The probe's fetch fails, so the candidate is skipped.
+        ExpectedCommand {
+            cwd: ws_path.clone(),
+            program: "jj".to_string(),
+            args: vec!["git".to_string(), "fetch".to_string()],
+            result: Err(CubeError::CommandFailed {
+                program: "jj".to_string(),
+                args: vec!["git".to_string(), "fetch".to_string()],
+                status: Some(1),
+                stderr: "repository not found".to_string(),
+            }),
+            creates_dir: None,
+            duration: std::time::Duration::ZERO,
+        },
+    ]);
+    let store = Store::open_at(&database_path).unwrap();
+    let budget = std::time::Duration::from_secs(10);
+    let (reclaimed, report) = reclaim_unhealthy_workspace_for_lease(
+        &runner,
+        &store,
+        Some(&database_path),
+        "mono",
+        "main",
+        &Default::default(),
+        &ReclaimLimits {
+            exclude: &[],
+            expired_this_call: &[],
+            now_epoch_s: now_s(),
+            deadline: Some(std::time::Instant::now() + budget),
+        },
+    )
+    .unwrap();
+    runner.assert_exhausted();
+
+    let timeouts = runner.observed_timeouts();
+    assert!(
+        timeouts[0] <= budget,
+        "the health probe must be bounded by the reclaim budget: {:?}",
+        timeouts[0]
+    );
+    assert!(reclaimed.is_none());
+    assert_eq!(report.rejected[0].reason, "probe_error");
+}
+
+/// A reclaim whose deadline has passed attempts nothing and says so for each
+/// candidate it never reached.
+#[test]
+fn reclaim_past_its_deadline_attempts_nothing_and_says_so() {
+    let (tempdir, database_path) = with_database_path();
+    seed_unhealthy_pool(
+        &tempdir,
+        &database_path,
+        &["mono-agent-001"],
+        WorkspaceHealth::Dirty,
+        PRESERVED,
+    );
+    let runner = FakeRunner::new(vec![]);
+    let store = Store::open_at(&database_path).unwrap();
+    let (reclaimed, report) = reclaim_unhealthy_workspace_for_lease(
+        &runner,
+        &store,
+        Some(&database_path),
+        "mono",
+        "main",
+        &Default::default(),
+        &ReclaimLimits {
+            exclude: &[],
+            expired_this_call: &[],
+            now_epoch_s: now_s(),
+            deadline: Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+        },
+    )
+    .unwrap();
+    runner.assert_exhausted();
+    assert!(reclaimed.is_none());
+    assert!(report.timed_out);
+    assert_eq!(report.rejected[0].reason, "not_attempted_deadline");
 }
 
 fn record(id: &str, health: Option<WorkspaceHealth>, since: Option<i64>) -> WorkspaceRecord {

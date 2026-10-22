@@ -627,6 +627,42 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Put a free workspace back to the cached unhealthy state it held before
+    /// a lease-time reclaim cleared it, clock included.
+    ///
+    /// The reclaim clears health when it hands a workspace to a lease; if that
+    /// lease then fails before the workspace is reset, the row is still
+    /// exactly as unhealthy as it was, and a NULL verdict would have the next
+    /// lease re-probe and re-salvage it. Only touches a row that is free.
+    pub fn restore_workspace_unhealthy_state(
+        &self,
+        repo: &str,
+        workspace_id: &str,
+        health: WorkspaceHealth,
+        unhealthy_since_epoch_s: Option<i64>,
+    ) -> Result<bool, CubeError> {
+        let updated = self
+            .connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    health_status = ?3,
+                    unhealthy_since_epoch_s = ?4
+                WHERE repo = ?1 AND workspace_id = ?2 AND state = ?5
+                "#,
+                params![
+                    repo,
+                    workspace_id,
+                    health.as_str(),
+                    unhealthy_since_epoch_s,
+                    WorkspaceState::Free.as_str()
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(updated > 0)
+    }
+
     /// Forget the cached `conflicted` verdict of every free workspace in
     /// `repo`, returning how many rows that touched.
     ///

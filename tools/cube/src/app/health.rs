@@ -7,10 +7,10 @@ use std::time::Instant;
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::{audit, reuse_guard};
 
-use crate::app::errors::Result;
+use crate::app::errors::{CubeError, Result};
 use crate::app::jj::{
-    jj_needs_colocate_init, jj_update_stale_recovery_kind, network_cmd_timeout, run_jj, run_jj_network_within,
-    run_jj_within,
+    budgeted_timeout, jj_needs_colocate_init, jj_update_stale_recovery_kind, network_cmd_timeout, run_jj,
+    run_jj_network_within, run_jj_within,
 };
 
 /// Outcome of a pre-lease health check on a free workspace.
@@ -55,6 +55,19 @@ pub(super) fn check_workspace_health(
     database_path: Option<&Path>,
     workspace_path: &Path,
 ) -> Result<WorkspaceHealthOutcome> {
+    check_workspace_health_within(runner, database_path, workspace_path, None)
+}
+
+/// [`check_workspace_health`] under a caller's wall-clock `deadline`: each
+/// `jj status` (and its colocate-init retry) is bounded by whatever the
+/// deadline has left, and a deadline that has already passed yields
+/// [`CubeError::DeadlineExceeded`] without spawning anything.
+pub(super) fn check_workspace_health_within(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    deadline: Option<Instant>,
+) -> Result<WorkspaceHealthOutcome> {
     // Detect broken-empty workspaces by checking the directory state
     // directly rather than waiting for jj to report an error. A workspace
     // with neither .jj/ nor .git/ cannot be used or healed without a
@@ -74,7 +87,13 @@ pub(super) fn check_workspace_health(
     // stale-working-copy error before run_jj would transparently recover it.
     // This makes StaleWorkingCopy a first-class outcome the lease handler can
     // audit and drive, rather than a transparent retry inside run_jj.
-    let output = match runner.run_with_timeout(&status_invocation, network_cmd_timeout()) {
+    let Some(timeout) = budgeted_timeout(deadline, network_cmd_timeout()) else {
+        return Err(CubeError::DeadlineExceeded {
+            program: status_invocation.program.clone(),
+            args: status_invocation.args.clone(),
+        });
+    };
+    let output = match runner.run_with_timeout(&status_invocation, timeout) {
         Ok(out) => out,
         Err(err) => {
             // Stale working copy: surface as StaleWorkingCopy so the lease
@@ -97,7 +116,10 @@ pub(super) fn check_workspace_health(
                     program = status_invocation.program,
                     args = status_invocation.args,
                 );
-                match runner.run_with_timeout(&status_invocation, network_cmd_timeout()) {
+                let Some(retry_timeout) = budgeted_timeout(deadline, network_cmd_timeout()) else {
+                    return Err(err);
+                };
+                match runner.run_with_timeout(&status_invocation, retry_timeout) {
                     Ok(out) => out,
                     Err(_) => return Err(err),
                 }

@@ -1,7 +1,7 @@
 use super::support::{
     ExpectedCommand, FakeRunner, head_status_command, head_status_output, init_repo_with_branch, jj_status_clean,
-    jj_status_conflicted, jj_status_dirty, lease_runner_for, mono_source_path, reclaim_refusal_commands,
-    reclaim_refusals_for, seed_mono_repo, unpushed_probe_command, with_database_path,
+    jj_status_conflicted, jj_status_dirty, lease_runner_for, mono_source_path, seed_mono_repo, unpushed_probe_command,
+    with_database_path,
 };
 use clap::Parser;
 use tempfile::TempDir;
@@ -1489,18 +1489,13 @@ fn workspace_lease_all_dirty_auto_creates_fresh_workspace() {
 
     seed_mono_repo(&workspace_root, &database_path);
 
-    // After health-checking 003 and 007 as dirty, the lease tries to reclaim
-    // each (salvage-then-reuse); neither can be salvaged here, so it falls
+    // After health-checking 003 and 007 as dirty, the lease path falls
     // through to auto_create_workspace which clones a new workspace.
     let new_path = workspace_root.join("mono-agent-008");
     let staging = workspace_root.join(".incoming-mono-agent-008");
-    let mut commands = vec![
+    let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(path_003.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
         ExpectedCommand::ok(path_007.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
-    ];
-    commands.extend(reclaim_refusal_commands(&path_003, true));
-    commands.extend(reclaim_refusal_commands(&path_007, true));
-    commands.extend(vec![
         ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
         ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
         ExpectedCommand::ok(
@@ -1523,7 +1518,6 @@ fn workspace_lease_all_dirty_auto_creates_fresh_workspace() {
             "abc1234",
         ),
     ]);
-    let runner = FakeRunner::new(commands);
 
     let result = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "all dirty"]),
@@ -1855,9 +1849,6 @@ fn workspace_lease_trusts_cached_dirty_health_instead_of_reprobing_the_pool() {
             )
         })
         .collect();
-    // The reclaim then tries the three oldest cached-dirty rows and cannot
-    // salvage any of them — still not a walk of the whole pool.
-    commands.extend(reclaim_refusals_for(&workspace_root, &ids, true));
     commands.extend(auto_create_commands(&workspace_root, "mono-agent-011", "fresh011"));
     let runner = FakeRunner::new(commands);
 
@@ -1901,15 +1892,9 @@ fn workspace_lease_revalidation_window_rotates_across_leases() {
     };
 
     // Lease 1 probes ids[0..3], lease 2 probes ids[3..6] — no overlap.
-    // Each lease also tries to reclaim the three oldest cached-dirty rows
-    // (ids[0..3] both times — the reclaim is ordered by age, not rotated) and
-    // cannot salvage them, so both leases provision. The second lease's scan
-    // did not probe ids[0..3], so its reclaim status-checks them itself.
     let mut commands: Vec<ExpectedCommand> = ids[0..3].iter().map(dirty_probe).collect();
-    commands.extend(reclaim_refusals_for(&workspace_root, &ids, true));
     commands.extend(auto_create_commands(&workspace_root, "mono-agent-010", "fresh010"));
     commands.extend(ids[3..6].iter().map(dirty_probe));
-    commands.extend(reclaim_refusals_for(&workspace_root, &ids, false));
     commands.extend(auto_create_commands(&workspace_root, "mono-agent-011", "fresh011"));
     let runner = FakeRunner::new(commands);
 
@@ -1965,9 +1950,6 @@ fn workspace_lease_health_scan_stops_at_the_probe_cap() {
             )
         })
         .collect();
-    // The eight the scan marked dirty are now reclaim candidates; the three
-    // oldest are tried and cannot be salvaged.
-    commands.extend(reclaim_refusals_for(&workspace_root, &ids, true));
     commands.extend(auto_create_commands(&workspace_root, "mono-agent-013", "fresh013"));
     let runner = FakeRunner::new(commands);
 
@@ -2217,7 +2199,6 @@ fn lease_leaves_the_revalidation_cursor_alone_when_a_clean_candidate_ends_the_sc
         )
     };
     let mut second_commands: Vec<ExpectedCommand> = dirty_ids[0..3].iter().map(dirty_probe).collect();
-    second_commands.extend(reclaim_refusals_for(&workspace_root, &dirty_ids, true));
     second_commands.extend(auto_create_commands(&workspace_root, "mono-agent-091", "fresh091"));
     let second = FakeRunner::new(second_commands);
     run_with_dependencies(
@@ -2277,9 +2258,6 @@ fn lease_does_not_skip_unprobed_window_entries_when_the_probe_cap_is_exhausted()
             store
                 .update_workspace_health("mono", id, WorkspaceHealth::Dirty)
                 .unwrap();
-            // Older than anything the scan below will mark, so the reclaim's
-            // oldest-first order is fixed rather than a wall-clock coin toss.
-            store.set_workspace_unhealthy_since("mono", id, 1_000_000).unwrap();
         }
     }
 
@@ -2295,10 +2273,6 @@ fn lease_does_not_skip_unprobed_window_entries_when_the_probe_cap_is_exhausted()
             )
         })
         .collect();
-    // The reclaim tries the three longest-unhealthy rows — the cached ones,
-    // which this scan never reached, so it status-checks them itself — and
-    // cannot salvage them.
-    commands.extend(reclaim_refusals_for(&workspace_root, &cached_ids, false));
     commands.extend(auto_create_commands(&workspace_root, "mono-agent-025", "fresh025"));
     let runner = FakeRunner::new(commands);
 

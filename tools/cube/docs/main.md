@@ -481,12 +481,20 @@ opens:
    store), and the non-empty `@` stays a visible head in the shared store —
    in practice pinned by the Boss engine's `boss-recovery/exec_*` bookmark.
    This is the retention GC's reclaim, run on demand instead of a day later;
-   a workspace that cannot be salvaged is left exactly as it was;
+   a workspace that cannot be salvaged is left exactly as it was. Only rows
+   unhealthy for at least 15 minutes qualify (so an orphaned worker's
+   workspace survives long enough for the engine's resume-in-place
+   redispatch), a row whose lease expired in the same call never does, the
+   probes are bounded by a 10s budget and rotate across leases through a
+   persisted cursor so rows that always fail cannot starve the rest, and a
+   lease that fails after the claim restores the row's cached health and
+   discards the salvage record;
 5. only then a fresh workspace.
 
 Every mint through door 5 is audited as `workspace.provisioned_no_eligible_free`
-with the free workspaces the lease looked at and why each was rejected, the
-pool's cached-unhealthy set broken down by health and release reason, and the
+with every free workspace the lease did not use and the reason (excluded,
+skipped probe, filtered or failed reclaim, not reached because of the probe
+cap or deadline, guard refusal), the pool's cached-unhealthy set broken down by health and release reason, and the
 reclaim scan's own report. A pool that grows while `cube workspace list` shows
 free rows is diagnosed from that event, not reconstructed from creation
 timestamps.

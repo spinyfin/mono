@@ -1,7 +1,4 @@
-use super::support::{
-    ExpectedCommand, FakeRunner, audit_events, jj_status_dirty, reclaim_refusal_commands, seed_mono_repo,
-    with_database_path,
-};
+use super::support::{ExpectedCommand, FakeRunner, audit_events, jj_status_dirty, seed_mono_repo, with_database_path};
 use clap::Parser;
 
 use crate::cli::Cli;
@@ -718,19 +715,12 @@ fn workspace_lease_gcs_broken_empty_and_keeps_dirty_then_auto_creates() {
     seed_mono_repo(&workspace_root, &database_path);
 
     // Health check visits 003 (dirty `status`) then 027 (broken-empty, no
-    // jj call). The reclaim tries 003 and cannot salvage it. The husk is
-    // GC'd; `next_workspace_id` over the surviving dirty 003 yields
-    // mono-agent-004 for the fresh clone.
+    // jj call). The husk is GC'd; `next_workspace_id` over the surviving
+    // dirty 003 yields mono-agent-004 for the fresh clone.
     let new_path = workspace_root.join("mono-agent-004");
     let staging = workspace_root.join(".incoming-mono-agent-004");
-    let mut commands = vec![ExpectedCommand::ok(
-        dirty_path.clone(),
-        "jj",
-        &["status", "--no-pager"],
-        jj_status_dirty(),
-    )];
-    commands.extend(reclaim_refusal_commands(&dirty_path, true));
-    commands.extend(vec![
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(dirty_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
         ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
         ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
         ExpectedCommand::ok(
@@ -753,7 +743,6 @@ fn workspace_lease_gcs_broken_empty_and_keeps_dirty_then_auto_creates() {
             "abc1234",
         ),
     ]);
-    let runner = FakeRunner::new(commands);
 
     let result = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "dirty plus husk"]),
