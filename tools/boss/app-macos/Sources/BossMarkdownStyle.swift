@@ -190,8 +190,8 @@ enum MarkdownEditorialMetrics {
 
     /// The one leading value prose and lists share. Lines inside a list item
     /// are laid out by the paragraph style, so they inherit this directly;
-    /// `listItemGap` derives the between-item gap from it so the two can never
-    /// drift apart again.
+    /// `listItemGap` derives the between-item gap from it so the two stay in
+    /// lockstep.
     static func bodyLeading(editorial: Bool) -> CGFloat {
         editorial ? editorialBodyLeading : compactBodyLeading
     }
@@ -375,7 +375,14 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
     func makeBody(configuration: Configuration) -> some View {
         if editorial {
             configuration.label
-                // Keep fontScale innermost (applied first) so it reads the
+                // The leading shared with lists — see
+                // `MarkdownEditorialMetrics.bodyLeading` for the derivation.
+                // Innermost, so it resolves against this paragraph's own
+                // scaled body font (set by the modifiers below) and a
+                // paragraph inside a list row gets the same points as prose,
+                // whatever font the surrounding row sets.
+                .textual.lineSpacing(.fontScaled(MarkdownEditorialMetrics.bodyLeading(editorial: true)))
+                // Keep fontScale next (applied first) (applied first) so it reads the
                 // sans font set by the `.font` call below it in the chain
                 // and scales *that*, mirroring BossHeadingStyle.headingLabel.
                 // Reversing this order lets the later `.font` win instead,
@@ -383,9 +390,6 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
                 .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
                 .font(.system(.body, design: .default))
                 .foregroundStyle(BossMarkdownPalette.ink)
-                // The leading shared with lists — see
-                // `MarkdownEditorialMetrics.bodyLeading` for the derivation.
-                .textual.lineSpacing(.fontScaled(MarkdownEditorialMetrics.bodyLeading(editorial: true)))
                 .textual.blockSpacing(.fontScaled(top: 0, bottom: 1))
                 .proseMeasureClamped()
         } else {
