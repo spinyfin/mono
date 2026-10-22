@@ -39,6 +39,7 @@ struct CapturedSpawn {
 /// and cannot see the ancestor `cfg(test)`.
 #[cfg(test)]
 struct CapturingSpawner {
+    pending_run_id: StdMutex<String>,
     registry: WorkerRegistry,
     live_states: LiveWorkerStateRegistry,
     last: StdMutex<Option<CapturedSpawn>>,
@@ -74,6 +75,7 @@ struct CapturingSpawner {
 impl CapturingSpawner {
     fn new() -> Self {
         Self {
+            pending_run_id: StdMutex::new(String::new()),
             registry: WorkerRegistry::new(),
             live_states: LiveWorkerStateRegistry::new(),
             last: StdMutex::new(None),
@@ -167,9 +169,10 @@ impl CommandRunner for CapturingSpawner {
                     initial_input: args.last().unwrap().clone(),
                 });
                 if self.hook_before_registration.load(std::sync::atomic::Ordering::SeqCst) {
-                    self.live_states.record_hook_event_kind("exec-test-1", "SessionStart");
+                    let run_id = self.pending_run_id.lock().unwrap().clone();
+                    self.live_states.record_hook_event_kind(&run_id, "SessionStart");
                     self.live_states
-                        .record_driver_signal("exec-test-1", crate::live_worker_state::DriverSignalKind::HookEvent);
+                        .record_driver_signal(&run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
                 }
                 ""
             }
@@ -234,7 +237,8 @@ impl CommandRunner for CapturingSpawner {
 }
 
 impl crate::spawn_flow::TmuxSpawnStore for CapturingSpawner {
-    fn record_tmux_spawn_intent(&self, _: &str, _: &str, _: &str, _: &str) -> Result<bool> {
+    fn record_tmux_spawn_intent(&self, execution_id: &str, _: &str, _: &str, _: &str) -> Result<bool> {
+        *self.pending_run_id.lock().unwrap() = execution_id.to_owned();
         Ok(true)
     }
     fn record_tmux_session_created(&self, _: &str, _: &str, _: i64, _: &str, _: &str) -> Result<bool> {
@@ -259,9 +263,32 @@ fn bind_runner(
     );
 }
 
+fn sample_execution_id(workspace: &Path) -> String {
+    format!(
+        "exec-test-1-{}",
+        workspace.file_name().unwrap().to_str().unwrap().trim_start_matches('.')
+    )
+}
+
 fn sample_execution(workspace_path: &Path) -> WorkExecution {
+    // Claude now records its private input home on the execution. Keep this
+    // fixture backed by a real row, as production spawn always is.
+    let db = WorkDb::open(workspace_path.join("state.db")).unwrap();
+    if db.get_execution(&sample_execution_id(workspace_path)).is_err() {
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "pane spawn fixture");
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+                 VALUES (?1, ?2, 'chore_implementation', 'running', 'git@example.com:foo.git', '1')",
+                rusqlite::params![&sample_execution_id(workspace_path), chore.id],
+            )
+            .unwrap();
+    }
+
     WorkExecution::builder()
-        .id("exec-test-1")
+        .id(sample_execution_id(workspace_path))
         .work_item_id("task-1")
         .kind(ExecutionKind::ChoreImplementation)
         .status(ExecutionStatus::Running)
@@ -403,7 +430,10 @@ async fn writes_initial_prompt_to_workspace_dot_claude() {
     // Spot-check: the prompt should mention the work item title and
     // execution id so the worker actually has its task in hand.
     assert!(prompt.contains("Improve top header"), "prompt missing work item name");
-    assert!(prompt.contains("exec-test-1"), "prompt missing execution id");
+    assert!(
+        prompt.contains(&sample_execution_id(workspace.path())),
+        "prompt missing execution id"
+    );
     assert!(
         prompt.contains("## Summary"),
         "prompt missing required output section header"
@@ -453,8 +483,11 @@ async fn implementation_prompt_dictates_engine_supplied_branch_name() {
     let workspace = TempDir::new().unwrap();
     let _spawner = run_once(&workspace, None).await.unwrap();
     let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
-    let expected_branch =
-        crate::completion::expected_branch_name("exec-test-1", &boss_protocol::BranchNaming::BossExecPrefix, None);
+    let expected_branch = crate::completion::expected_branch_name(
+        &sample_execution_id(workspace.path()),
+        &boss_protocol::BranchNaming::BossExecPrefix,
+        None,
+    );
     assert!(
         prompt.contains(&expected_branch),
         "prompt must name the engine-supplied branch `{expected_branch}`, got: {prompt}",
@@ -473,7 +506,7 @@ async fn spawn_attaches_a_viewer_after_launching_tmux() {
     assert_eq!(
         spawner
             .registry
-            .pane_for_run("exec-test-1")
+            .pane_for_run(&sample_execution_id(workspace.path()))
             .unwrap()
             .tmux_session_name
             .as_deref(),
@@ -510,8 +543,8 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // worker just sits at the bash prompt forever (as it did before
     // #174).
     assert!(
-        script.contains(".claude/initial-prompt.txt"),
-        "expected the initial-input script to read from the prompt file, got: {script:?}",
+        script.contains("python3 .claude/initial-prompt.py claude ") && !script.contains("$(cat"),
+        "expected private terminal delivery without prompt expansion, got: {script:?}",
     );
     // The first shell line re-prepends BOSS_BIN_DIR to PATH (so the
     // bundled `cube`/`boss` win over any `~/bin` repobin shim the
@@ -522,7 +555,7 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // construction site.
     assert!(
         script.starts_with(&format!(
-            "{}{}unset ANTHROPIC_API_KEY; {}claude",
+            "{}{}unset ANTHROPIC_API_KEY; {}python3 .claude/initial-prompt.py claude",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             boss_engine_worker_bin::environment::shell_environment_clause(
@@ -704,7 +737,7 @@ async fn untagged_row_spawn_matches_engine_default() {
     assert_eq!(
         script,
         format!(
-            "{}{}unset ANTHROPIC_API_KEY; {}claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+            "{}{}unset ANTHROPIC_API_KEY; {}python3 .claude/initial-prompt.py claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}'\n",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             boss_engine_worker_bin::environment::shell_environment_clause(
@@ -1457,7 +1490,7 @@ async fn run_execution_stamps_work_item_binding_on_live_state() {
     );
     assert_eq!(
         state.execution_id.as_deref(),
-        Some("exec-test-1"),
+        Some(sample_execution_id(workspace.path()).as_str()),
         "execution_id should match the WorkExecution row id"
     );
     assert_eq!(
@@ -2283,7 +2316,10 @@ async fn spawn_confirmation_timeout_reaps_the_pane_and_fails_the_spawn() {
     let msg = err.to_string();
     assert!(msg.contains("composer never became ready"), "{msg}");
     assert!(msg.contains("failed spawn"), "{msg}");
-    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+    assert_eq!(
+        spawner.reaped_run_ids(),
+        vec![spawner.pending_run_id.lock().unwrap().clone()]
+    );
 }
 
 #[tokio::test]
@@ -2312,7 +2348,10 @@ async fn spawn_confirmation_ready_chrome_without_a_hook_fails_turn_start_and_rea
     let msg = err.to_string();
     assert!(msg.contains("no driver hook or session event"), "{msg}");
     assert!(msg.contains("failed spawn"), "{msg}");
-    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+    assert_eq!(
+        spawner.reaped_run_ids(),
+        vec![spawner.pending_run_id.lock().unwrap().clone()]
+    );
 }
 
 #[tokio::test]
@@ -2499,7 +2538,10 @@ async fn spawn_confirmation_finds_banner_that_only_exists_in_scrollback() {
     let (result, spawner) = confirm_with_history_only("Claude Code 2.1.283\n").await;
     let msg = result.expect_err("no hook, so turn start must fail").to_string();
     assert!(msg.contains("no driver hook or session event"), "{msg}");
-    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+    assert_eq!(
+        spawner.reaped_run_ids(),
+        vec![spawner.pending_run_id.lock().unwrap().clone()]
+    );
     // Banner is absent from the visible screen, so only the history read can
     // have supplied it; removing the fallback leaves composer never ready.
     let log = spawner.capture_log.lock().unwrap().clone();
@@ -2513,7 +2555,10 @@ async fn spawn_confirmation_scrollback_without_a_marker_still_fails() {
         .expect_err("shell/error scrollback is not driver evidence")
         .to_string();
     assert!(msg.contains("composer never became ready"), "{msg}");
-    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+    assert_eq!(
+        spawner.reaped_run_ids(),
+        vec![spawner.pending_run_id.lock().unwrap().clone()]
+    );
 }
 
 #[tokio::test]
@@ -2545,7 +2590,10 @@ async fn spawn_confirmation_passes_on_a_hook_delivered_before_registration() {
         .expect("a pre-registration hook must count as driver evidence");
     assert!(spawner.reaped_run_ids().is_empty());
     assert_eq!(
-        spawner.live_states.first_hook_event_for_run("exec-test-1").as_deref(),
+        spawner
+            .live_states
+            .first_hook_event_for_run(&sample_execution_id(workspace.path()))
+            .as_deref(),
         Some("SessionStart")
     );
 }

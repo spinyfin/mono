@@ -1087,11 +1087,6 @@ pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
         run_id: _,
     } = request;
 
-    let prompt_cat = format!(
-        "\"$(cat {}/{})\"",
-        CODEX_DESCRIPTOR.config_dir, CODEX_DESCRIPTOR.initial_prompt_filename,
-    );
-
     // Sandbox policy is fully supplied by PermissionArtifacts::extra_args.
     // In particular, reviewers intentionally receive no `--sandbox` flag: the
     // sandbox required a `--cd` into engine scratch to permit its one report
@@ -1111,10 +1106,8 @@ pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
         cmd.push_str(" -c model_reasoning_effort=");
         cmd.push_str(&shell_quote(e));
     }
-    cmd.push(' ');
-    cmd.push_str(&prompt_cat);
     cmd.push('\n');
-    cmd
+    super::initial_prompt::launcher_command(CODEX_DESCRIPTOR.config_dir, &cmd)
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,6 +1591,19 @@ impl AgentDriver for CodexDriver {
         ])
     }
 
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        // Recorded from the isolated Codex 0.161.0 onboarding picker.
+        [
+            "Sign in with ChatGPT",
+            "Sign in with Device Code",
+            "Provide your own API key",
+            "Sign in from another device",
+            "Complete sign-in in your browser",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         // Measured Codex TUI chrome; see `codex/pane_monitor.rs` for the
         // literals, their stability evidence, and why the startup banner
@@ -1670,9 +1676,7 @@ impl AgentDriver for CodexDriver {
         // with the Claude path's shared template.
         let config_dir = workspace.join(CODEX_DESCRIPTOR.config_dir);
         fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
-        let prompt_path = config_dir.join(CODEX_DESCRIPTOR.initial_prompt_filename);
-        fs::write(&prompt_path, prompt_text)
-            .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
+        super::initial_prompt::provision(&config_dir, &codex_home, prompt_text, self)?;
         let gitignore_path = config_dir.join(".gitignore");
         fs::write(&gitignore_path, CODEX_DIR_GITIGNORE)
             .with_context(|| format!("writing gitignore to {}", gitignore_path.display()))?;

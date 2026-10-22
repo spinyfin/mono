@@ -20,6 +20,7 @@ use boss_protocol::{
     WorkerEvent,
 };
 
+pub mod initial_prompt;
 pub mod transcript_store;
 
 /// `large`/`max`-effort worker-prompt addendum, shared verbatim across every
@@ -1788,7 +1789,7 @@ pub struct SpawnPlan {
     /// `command` runs.
     pub env: Vec<EnvDirective>,
     /// The command line to run after `env` has been applied (e.g.
-    /// `claude --model … "$(cat …)"\n`).
+    /// `python3 .claude/initial-prompt.py claude --model …\n`).
     pub command: String,
 }
 
@@ -1835,6 +1836,14 @@ pub trait AgentDriver: Send + Sync {
     /// with their own markers.
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         None
+    }
+
+    /// Extra screen text that means this driver is still starting (onboarding,
+    /// sign-in, connecting splash), so the initial-brief launcher holds
+    /// delivery. Launcher-only: unlike `pane_monitor_spec().starting_markers`
+    /// these never feed the pane monitor. Each driver owns its own strings.
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        Vec::new()
     }
 
     // ── WorkspaceProvisioning capability ────────────────────────────────────

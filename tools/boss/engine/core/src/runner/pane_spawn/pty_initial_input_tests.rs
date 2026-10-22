@@ -6,9 +6,8 @@
 //! full structural `--deny` rule set).
 
 use super::{
-    ExecArgLimits, MAX_CANON_LINE_BYTES, check_arg_max_budget, check_initial_input_length,
-    check_launch_command_arg_max, check_launch_command_arg_max_for_bytes, estimated_launch_argv_bytes, local_arg_max,
-    path_prepend_clause, render_env_directive, write_initial_input_script,
+    MAX_CANON_LINE_BYTES, check_arg_max_budget, check_initial_input_length, check_launch_command_arg_max,
+    local_arg_max, path_prepend_clause, render_env_directive, write_initial_input_script,
 };
 use crate::driver::{
     AgentDriver, ClaudeDriver, CodexDriver, EnvDirective, GrokDriver, PermissionInput, SpawnRequest, WorkerKind,
@@ -266,12 +265,8 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
 }
 
 // ---------------------------------------------------------------------------
-// ARG_MAX preflight (`check_launch_command_arg_max`): each driver embeds its
-// initial prompt into the CLI's own argv via `"$(cat <file>)"` command
-// substitution, expanded when the pane's shell sources
-// `write_initial_input_script`'s output — unlike the MAX_CANON guard above,
-// which bounds what gets *typed*, this bounds what the kernel accepts at
-// the driver CLI's own `execve()`, after that expansion.
+// ARG_MAX preflight (`check_launch_command_arg_max`): the brief travels over
+// the launcher's PTY, so the exec budget covers only the driver's flags.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -289,133 +284,25 @@ fn check_arg_max_budget_environment_can_push_a_fitting_argv_over_the_limit() {
 }
 
 #[test]
-fn estimated_launch_argv_bytes_substitutes_the_real_prompt_files_size_for_the_placeholder() {
-    let workspace = TempDir::new().unwrap();
-    std::fs::create_dir_all(workspace.path().join(".claude")).unwrap();
-    let prompt = "y".repeat(12_345);
-    std::fs::write(workspace.path().join(".claude").join("initial-prompt.txt"), &prompt).unwrap();
-
-    let command = "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n";
-    let placeholder_len = "\"$(cat .claude/initial-prompt.txt)\"".len();
-    let bytes = estimated_launch_argv_bytes(command, workspace.path(), ".claude", "initial-prompt.txt").unwrap();
-
-    assert_eq!(bytes, command.len() - placeholder_len + prompt.len());
-}
-
-#[test]
-fn estimated_launch_argv_bytes_errors_when_the_prompt_file_is_missing() {
-    let workspace = TempDir::new().unwrap();
-    let command = "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n";
-    let err = estimated_launch_argv_bytes(command, workspace.path(), ".claude", "initial-prompt.txt")
-        .expect_err("must fail, not silently proceed with an unknown size");
-    assert!(err.to_string().contains("initial-prompt.txt"), "{err}");
-}
-
-/// End-to-end against this host's real `ARG_MAX`: a ~600 KB prompt, the
-/// size of the largest review-guide prompts, must still fit comfortably
-/// under this host's ARG_MAX. Regressing the estimate back to counting
-/// every argv byte as if it needed its own pointer (rather than one
-/// pointer per shell argument) would wrongly reject this.
-#[test]
-fn check_launch_command_arg_max_passes_for_a_600kb_prompt_on_this_host() {
-    let workspace = TempDir::new().unwrap();
-    std::fs::create_dir_all(workspace.path().join(".codex")).unwrap();
-    std::fs::write(
-        workspace.path().join(".codex").join("initial-prompt.txt"),
-        "z".repeat(600_000),
-    )
-    .unwrap();
-
-    let command = "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
-    let result = check_launch_command_arg_max(command, "codex", workspace.path(), ".codex", "initial-prompt.txt");
-    if crate::runner::spawn_launch_limits::local_max_arg_strlen().is_some_and(|limit| 600_000 > limit) {
-        let err = result.expect_err("Linux MAX_ARG_STRLEN must refuse a 600KB single argument");
-        let msg = err.to_string();
-        assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
-        return;
-    }
-    result.expect("a ~600KB prompt must fit under this host's real ARG_MAX");
-}
-
-/// A prompt sized to exceed this host's real, measured `ARG_MAX` must be
-/// refused before spawn — not left to fail silently inside the pane's
-/// sourced script as `execve`'s `E2BIG`.
-#[test]
-fn check_launch_command_arg_max_fails_for_a_prompt_over_this_hosts_real_arg_max() {
-    let workspace = TempDir::new().unwrap();
-    std::fs::create_dir_all(workspace.path().join(".grok")).unwrap();
+fn check_launch_command_arg_max_fails_for_a_command_over_this_hosts_real_arg_max() {
     let arg_max = local_arg_max().unwrap();
-    std::fs::write(
-        workspace.path().join(".grok").join("initial-prompt.txt"),
-        "w".repeat(arg_max + 4096),
-    )
-    .unwrap();
-
-    let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
-    let err = check_launch_command_arg_max(command, "grok", workspace.path(), ".grok", "initial-prompt.txt")
-        .expect_err("must fail, not silently proceed with a doomed exec");
-    let msg = err.to_string();
-    assert!(msg.contains("grok"), "error must name the driver: {msg}");
-    assert!(msg.contains("ARG_MAX"), "{msg}");
-}
-
-// ---------------------------------------------------------------------------
-// `check_launch_command_arg_max_for_bytes`: the same preflight for the
-// remote spawn path (`host_adapter.rs`), which ships the initial prompt to
-// a remote host over SSH from an in-memory `String` rather than a
-// workspace-relative file this process can `stat` — so it takes the
-// prompt's byte length directly instead of reading it off disk.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn check_launch_command_arg_max_for_bytes_passes_for_a_600kb_prompt_on_this_host() {
-    let command = "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
-    let result = check_launch_command_arg_max_for_bytes(
-        command,
-        "codex",
-        ".codex",
-        "initial-prompt.txt",
-        600_000,
-        ExecArgLimits::local().unwrap(),
-    );
-    if crate::runner::spawn_launch_limits::local_max_arg_strlen().is_some_and(|limit| 600_000 > limit) {
-        let err = result.expect_err("Linux MAX_ARG_STRLEN must refuse a 600KB single argument");
-        let msg = err.to_string();
-        assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
-        return;
-    }
-    result.expect("a ~600KB prompt must fit under this host's real ARG_MAX");
-}
-
-#[test]
-fn check_launch_command_arg_max_for_bytes_fails_for_a_prompt_over_this_hosts_real_arg_max() {
-    let arg_max = local_arg_max().unwrap();
-    let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
-    let err = check_launch_command_arg_max_for_bytes(
-        command,
-        "grok",
+    let command = crate::driver::initial_prompt::launcher_command(
         ".grok",
-        "initial-prompt.txt",
-        arg_max + 4096,
-        ExecArgLimits::local().unwrap(),
-    )
-    .expect_err("must fail, not silently proceed with a doomed remote exec");
+        &format!("grok --model 'grok-4.6' --settings '{}'", "w".repeat(arg_max + 4096)),
+    );
+    let err =
+        check_launch_command_arg_max(&command, "grok").expect_err("must fail, not silently proceed with a doomed exec");
     let msg = err.to_string();
     assert!(msg.contains("grok"), "error must name the driver: {msg}");
-    assert!(msg.contains("ARG_MAX"), "{msg}");
+    assert!(msg.contains("ARG_MAX") || msg.contains("MAX_ARG_STRLEN"), "{msg}");
 }
 
 /// Rename the driver binary in a real `spawn_invocation` command so the
 /// hermetic sandbox can exec the stub (it denies `claude` / `codex` by name).
 fn rename_driver_binary(command: &str, from: &str, to: &str) -> String {
-    let Some(rest) = command.strip_prefix(from) else {
-        panic!("spawn_invocation command must start with {from:?}, got {command:?}");
-    };
-    assert!(
-        rest.starts_with(' ') || rest.starts_with('\t'),
-        "driver binary must be a whole first word in spawn_invocation, got {command:?}"
-    );
-    format!("{to}{rest}")
+    let needle = format!("initial-prompt.py {from} ");
+    assert!(command.contains(&needle), "missing terminal launcher: {command}");
+    command.replacen(&needle, &format!("initial-prompt.py {to} "), 1)
 }
 
 fn write_driver_stub(stub_dir: &std::path::Path) {
@@ -423,12 +310,25 @@ fn write_driver_stub(stub_dir: &std::path::Path) {
     let stub_path = stub_dir.join("boss-driver-stub");
     std::fs::write(
         &stub_path,
-        r#"#!/bin/sh
-eval "last=\${$#}"
-printf '%s' "${#last}" > "$BOSS_STUB_RECORD/last_argv_len"
-printf '%s' "$last" > "$BOSS_STUB_RECORD/last_argv"
-printf '%s\n' "$BOSS_STUB_CHROME"
-: > "$BOSS_STUB_RECORD/turn_started"
+        r#"#!/usr/bin/env python3
+import json, os, sys, tty
+from pathlib import Path
+record = Path(os.environ['BOSS_STUB_RECORD'])
+(record / 'argv').write_text(json.dumps(sys.argv))
+(record / 'environment').write_text(json.dumps(dict(os.environ)))
+tty.setraw(0)
+os.write(1, b'\x1b[6n')
+response = b''
+while not response.endswith(b'R'):
+    response += os.read(0, 4096)
+assert response == b'\x1b[1;1R', response
+os.write(1, b'\x1b[?2004h' + os.environ['BOSS_STUB_CHROME'].encode())
+data = b''
+while not data.endswith(b'\x1b[201~\r'):
+    data += os.read(0, 65536)
+assert data.startswith(b'\x1b[200~'), data[:40]
+(record / 'received').write_bytes(data[6:-7])
+(record / 'turn_started').touch()
 "#,
     )
     .unwrap();
@@ -439,57 +339,55 @@ printf '%s\n' "$BOSS_STUB_CHROME"
     }
 }
 
-fn grok_spawn_plan_for_delivery_test(run_id: &str, workspace_path: &std::path::Path) -> crate::driver::SpawnPlan {
-    use crate::driver::grok::{
-        GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV, GROK_SKIP_POSTURE_ASSERT_ENV, grok_home_for_run,
-    };
-    let _lock = GROK_HOMES_ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let prior_homes_env = std::env::var_os(GROK_HOMES_ROOT_ENV);
-    let prior_skip_env = std::env::var_os(GROK_SKIP_POSTURE_ASSERT_ENV);
-    let homes_root = TempDir::new().unwrap();
-    // SAFETY: serialised by `_lock`, restored before this helper returns.
-    unsafe {
-        std::env::set_var(GROK_HOMES_ROOT_ENV, homes_root.path());
-        std::env::set_var(GROK_SKIP_POSTURE_ASSERT_ENV, "1");
+struct DeliveryEnvironment {
+    prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl Drop for DeliveryEnvironment {
+    fn drop(&mut self) {
+        for (key, value) in &self.prior {
+            // SAFETY: the caller holds the Grok environment lock until drop.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
-    let grok_home = grok_home_for_run(run_id).unwrap();
-    std::fs::create_dir_all(&grok_home).unwrap();
-    std::fs::write(
-        grok_home.join("boss-session-id"),
-        "11111111-2222-4333-8444-555555555555\n",
-    )
-    .unwrap();
-    std::fs::write(
-        grok_home.join("boss-workspace-path"),
-        format!("{}\n", workspace_path.display()),
-    )
-    .unwrap();
-    let plan = GrokDriver::default().spawn_invocation(SpawnRequest {
-        model: "grok-4.6",
-        effort: Some("high"),
-        settings_path: None,
-        non_opus_auto_mode: false,
-        permission_mode_override: None,
-        run_id: Some(run_id),
-    });
-    match prior_homes_env {
-        Some(v) => unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, v) },
-        None => unsafe { std::env::remove_var(GROK_HOMES_ROOT_ENV) },
+}
+
+#[test]
+fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
+    use crate::driver::{grok, test_support};
+    let root = TempDir::new().unwrap();
+    let auth = root.path().join("auth.json");
+    std::fs::write(&auth, r#"{"OPENAI_API_KEY":"test-key"}"#).unwrap();
+    let _codex = test_support::codex_auth_source_override(&root.path().join("codex"), &auth);
+    let _grok = test_support::grok_homes_override(&root.path().join("grok"));
+    let _transcripts = test_support::transcript_store_override(&root.path().join("transcripts"));
+    let mut environment = DeliveryEnvironment { prior: Vec::new() };
+    for (key, value) in [
+        (grok::GROK_AUTH_SOURCE_ENV, auth.as_os_str()),
+        (grok::GROK_SKIP_POSTURE_ASSERT_ENV, std::ffi::OsStr::new("1")),
+    ] {
+        environment.prior.push((key, std::env::var_os(key)));
+        // SAFETY: `_grok` holds the shared environment lock through block_on.
+        unsafe { std::env::set_var(key, value) };
     }
-    match prior_skip_env {
-        Some(v) => unsafe { std::env::set_var(GROK_SKIP_POSTURE_ASSERT_ENV, v) },
-        None => unsafe { std::env::remove_var(GROK_SKIP_POSTURE_ASSERT_ENV) },
-    }
-    plan
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(per_driver_delivery_body());
 }
 
 /// Small and ~600 KB prompts, per driver: take the real `spawn_invocation`
 /// command, rewrite the binary to a stub the sandbox can exec, write the
 /// actual `.boss/initial-input.sh`, source it from `/bin/sh`, and assert
-/// the stub received the prompt intact as a single argument and emitted
+/// the stub received the prompt intact through terminal stdin and emitted
 /// the turn-start signal confirmation consumes.
-#[tokio::test]
-async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
+async fn per_driver_delivery_body() {
     use crate::runner::spawn_confirmation::{confirm_spawn_started, pane_shows_driver_ready};
     use std::time::Duration;
 
@@ -561,17 +459,31 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
     ];
 
     for case in cases {
-        for prompt_bytes in [20_000usize, 600_000] {
+        for prompt_bytes in [20_000usize, 600_000, local_arg_max().unwrap() + 4096] {
             let workspace = TempDir::new().unwrap();
             let run_id = format!("run-{}-{prompt_bytes}", case.driver_name);
-            let mut plan = if case.driver_name == "grok" {
-                grok_spawn_plan_for_delivery_test(&run_id, workspace.path())
-            } else {
-                (case.spawn)(&run_id)
-            };
-            std::fs::create_dir_all(workspace.path().join(case.config_dir)).unwrap();
-            let prompt = "p".repeat(prompt_bytes);
-            std::fs::write(workspace.path().join(case.config_dir).join(case.filename), &prompt).unwrap();
+            let sentinel = "BRIEF_SENTINEL_PRIVATE_INITIAL_INPUT";
+            let prompt = format!(
+                "{sentinel}\n{}\nquotes: '\" $() `command` 雪\n\n",
+                "p".repeat(prompt_bytes)
+            );
+            let driver = crate::driver::DriverRegistry::default()
+                .require(case.driver_name)
+                .unwrap();
+            let config_dir = workspace.path().join(case.config_dir);
+            driver
+                .provision_workspace(workspace.path(), &prompt, &run_id)
+                .await
+                .unwrap();
+            assert!(
+                std::fs::symlink_metadata(config_dir.join(case.filename))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            let mut plan = (case.spawn)(&run_id);
+            assert!(!plan.command.contains(sentinel));
+            assert!(!plan.command.contains("$(cat"));
 
             plan.command = rename_driver_binary(&plan.command, case.binary, "boss-driver-stub");
             let env_prefix: String = plan.env.iter().map(render_env_directive).collect();
@@ -585,20 +497,7 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
             check_initial_input_length(&typed, case.driver_name).unwrap();
             assert_eq!(typed, ". .boss/initial-input.sh\n");
 
-            let preflight = check_launch_command_arg_max(
-                &plan.command,
-                case.driver_name,
-                workspace.path(),
-                case.config_dir,
-                case.filename,
-            );
-            if crate::runner::spawn_launch_limits::local_max_arg_strlen().is_some_and(|limit| prompt_bytes > limit) {
-                let err = preflight.expect_err("over MAX_ARG_STRLEN must refuse before spawn");
-                let msg = err.to_string();
-                assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
-                assert!(msg.contains(case.driver_name), "{msg}");
-                continue;
-            }
+            let preflight = check_launch_command_arg_max(&plan.command, case.driver_name);
             preflight.unwrap_or_else(|err| {
                 panic!(
                     "{} {}-byte prompt must pass this host's preflight: {err}",
@@ -610,7 +509,7 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
             write_driver_stub(stub_root.path());
             let record_dir = stub_root.path().join("record");
             std::fs::create_dir_all(&record_dir).unwrap();
-            let path = format!("{}:/usr/bin:/bin", stub_root.path().display());
+            let path = format!("{}:{}", stub_root.path().display(), std::env::var("PATH").unwrap());
             let output = std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(". .boss/initial-input.sh")
@@ -631,22 +530,15 @@ async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
                 String::from_utf8_lossy(&output.stderr)
             );
 
-            let last_len: usize = std::fs::read_to_string(record_dir.join("last_argv_len"))
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "{} stub did not record last argv length: {err}; stderr={}",
-                        case.driver_name,
-                        String::from_utf8_lossy(&output.stderr)
-                    )
-                })
-                .parse()
-                .unwrap();
-            assert_eq!(
-                last_len, prompt_bytes,
-                "{} stub must receive the prompt as one argv element",
-                case.driver_name
-            );
-            let received = std::fs::read_to_string(record_dir.join("last_argv")).unwrap();
+            for surface in ["argv", "environment"] {
+                let observed = std::fs::read_to_string(record_dir.join(surface)).unwrap();
+                assert!(
+                    !observed.contains(sentinel),
+                    "{} leaked brief in {surface}",
+                    case.driver_name
+                );
+            }
+            let received = std::fs::read_to_string(record_dir.join("received")).unwrap();
             assert_eq!(
                 received, prompt,
                 "{} stub must receive the prompt intact",

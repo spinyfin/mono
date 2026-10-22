@@ -206,14 +206,11 @@ mod apply_permission_extra_args_tests {
             "extras must land on the single typed line, not add a second: {merged}"
         );
         assert!(
-            merged.contains("\"$(cat .grok/initial-prompt.txt)\""),
-            "prompt substitution must survive composition: {merged}"
+            merged.contains(".grok/initial-prompt.py"),
+            "private input launcher must survive composition: {merged}"
         );
         // Newline-fallback: extras land right before the trailing '\n' —
-        // i.e. AFTER everything else, including the positional prompt
-        // substitution — confirmed safe by the work item's own CLI
-        // characterisation (flags placed after the positional prompt
-        // parse fine for the installed grok CLI).
+        // after the other driver flags. The launcher forwards them verbatim.
         assert!(
             merged.trim_end().ends_with("'--deny' 'Bash(rm -rf *)'"),
             "extras must be appended after the rest of the command, not interleaved: {merged}"
@@ -497,10 +494,7 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
 
 use super::spawn_launch_limits::check_launch_command_arg_max;
 #[cfg(test)]
-pub(crate) use super::spawn_launch_limits::{
-    ExecArgLimits, check_arg_max_budget, check_launch_command_arg_max_for_bytes, estimated_launch_argv_bytes,
-    local_arg_max,
-};
+pub(crate) use super::spawn_launch_limits::{check_arg_max_budget, local_arg_max};
 
 /// Materialize the per-workspace launcher directory and return it, so the
 /// caller can put it on the worker's `PATH`.
@@ -727,14 +721,9 @@ impl ExecutionRunner for PaneSpawnRunner {
             )
         })?;
 
-        // Compose the worker prompt and stash it on disk so the
-        // tmux pane can `claude "$(cat .claude/initial-prompt.txt)"`
-        // — Claude Code's positional arg is treated as the first user
-        // message, which gets the worker working without us having to
-        // wait for a "Claude is ready" signal and then type into the pane.
-        // Going through a file (rather than embedding the prompt in
-        // the typed command) avoids shell quoting hell on multi-line,
-        // backtick-bearing markdown.
+        // Compose the worker prompt and store it privately. The terminal
+        // launcher reads the file and delivers it through the driver's stdin
+        // after readiness, independently of the engine's lifetime.
         //
         // Prompt composition + effort/model resolution live in the
         // shared `compose_worker_spawn` so the SSH-remote adapter
@@ -830,7 +819,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // Write the initial prompt (and gitignore + pre-trust) via the driver's
         // WorkspaceProvisioning capability. The driver's config_dir and
         // initial_prompt_filename (e.g. `.claude/initial-prompt.txt`) determine
-        // the exact path the spawn_invocation `$(cat ...)` reads from.
+        // the workspace reference the terminal launcher reads from.
         // Any opaque out-of-workspace runtime state the driver returns
         // (future Codex: Boss-owned CODEX_HOME / archive root) is persisted
         // on the execution so every teardown path can hand it back after
@@ -1081,13 +1070,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // driver default flags rather than being ignored.
         spawn_plan.command =
             crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
-        check_launch_command_arg_max(
-            &spawn_plan.command,
-            driver.descriptor().name,
-            workspace_path,
-            driver.descriptor().config_dir,
-            driver.descriptor().initial_prompt_filename,
-        )?;
+        check_launch_command_arg_max(&spawn_plan.command, driver.descriptor().name)?;
         // The per-workspace launcher dir goes on *after* the BOSS_BIN_DIR
         // prepend so it ends up ahead of it. Its `boss` is pinned to an
         // absolute path, which is the only form that survives a login

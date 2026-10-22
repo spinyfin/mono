@@ -390,10 +390,16 @@ async fn handoff_write_through_the_handler_replaces_the_coordinator() {
     .unwrap();
     assert!(brief.contains("- fresh facts"), "{brief}");
     assert!(
-        runner.calls().iter().any(|c| c
+        runner
+            .calls()
             .iter()
-            .any(|a| a.contains(crate::coordinator_handoff::START_BRIEF_FILENAME))),
+            .any(|c| c.iter().any(|a| a.contains("coordinator-input'/initial-prompt.py"))),
         "the new session must be launched with the brief as its initial prompt"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(session_dir.join(".claude/coordinator-input/initial-prompt.txt")).unwrap(),
+        brief,
     );
 
     // The app acknowledging the viewer completes the reset, with no error.

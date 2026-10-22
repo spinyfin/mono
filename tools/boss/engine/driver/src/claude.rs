@@ -783,6 +783,12 @@ impl AgentDriver for ClaudeDriver {
         true
     }
 
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        ["Choose the text style", "Sign in with", "Sign in to"]
+            .map(String::from)
+            .to_vec()
+    }
+
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         // Exact reproduction of the pre-spec literals in
         // `GhosttyTerminalView.makeClaudeSnapshot` / the tracker's
@@ -798,6 +804,8 @@ impl AgentDriver for ClaudeDriver {
                 "Claude Code".into(),
                 "auto mode on".into(),
                 "bypass permissions on".into(),
+                // Footer under the forced dontAsk mode (answer agent).
+                "don't ask on".into(),
                 "/effort".into(),
             ],
             busy_markers: vec!["esc to interrupt".into()],
@@ -832,8 +840,8 @@ impl AgentDriver for ClaudeDriver {
         // has the right channel: stop and summarize (a real Stop boundary).
         // Equals form (`--disallowedTools=AskUserQuestion`), not the
         // space-separated variadic form: the CLI takes `<tools...>` until the
-        // next `--` token, so a later move of this push in front of the
-        // positional prompt would swallow the prompt as a second tool name.
+        // next option, so a space-separated value would swallow any
+        // positional argument appended after it as a second tool name.
         cmd.push_str(" --disallowedTools=AskUserQuestion");
         if let Some(mode) = permission_mode_override {
             // Forced mode (e.g. `dontAsk` for the capability-restricted answer
@@ -854,12 +862,8 @@ impl AgentDriver for ClaudeDriver {
             // single quote, so naive single-quoting is sufficient.
             cmd.push_str(&format!(" --settings '{}'", settings.display()));
         }
-        // Use the descriptor's config_dir and initial_prompt_filename so this
-        // stays in sync with provision_workspace's write location.
-        cmd.push_str(&format!(
-            " \"$(cat {}/{})\"\n",
-            CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
-        ));
+        cmd.push('\n');
+        let cmd = super::initial_prompt::launcher_command(CLAUDE_DESCRIPTOR.config_dir, &cmd);
         SpawnPlan {
             // Claude must authenticate via OAuth credentials
             // (~/.claude/.credentials.json), not a stray ANTHROPIC_API_KEY
@@ -877,7 +881,10 @@ impl AgentDriver for ClaudeDriver {
     /// prompt. Specifically:
     ///
     /// - Creates `<workspace>/<config_dir>/` (`.claude/`)
-    /// - Writes the initial prompt to `<config_dir>/<initial_prompt_filename>`
+    /// - Writes the initial prompt into a private per-run input home (recorded
+    ///   as `initial_prompt_home` runtime state for retention) and links
+    ///   `<config_dir>/<initial_prompt_filename>` to it, with the PTY launcher
+    ///   and its readiness config alongside
     /// - Writes a catch-all `.gitignore` so engine-injected files never appear
     ///   in `jj status` / `git status`
     /// - Pre-seeds `~/.claude.json` so the folder-trust dialog does not block
@@ -886,14 +893,20 @@ impl AgentDriver for ClaudeDriver {
         &self,
         workspace: &Path,
         prompt_text: &str,
-        _run_id: &str,
+        run_id: &str,
     ) -> anyhow::Result<Option<super::DriverRuntimeState>> {
         let config_dir = workspace.join(CLAUDE_DESCRIPTOR.config_dir);
         std::fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
 
-        let prompt_path = config_dir.join(CLAUDE_DESCRIPTOR.initial_prompt_filename);
-        std::fs::write(&prompt_path, prompt_text)
-            .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
+        anyhow::ensure!(
+            !run_id.is_empty()
+                && run_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "invalid worker run id"
+        );
+        let prompt_home = super::codex::codex_home_for_run(&format!("claude-{run_id}"))?;
+        super::initial_prompt::provision(&config_dir, &prompt_home, prompt_text, self)?;
 
         let gitignore_path = config_dir.join(".gitignore");
         std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)
@@ -904,19 +917,14 @@ impl AgentDriver for ClaudeDriver {
         // swallowed by pre_trust_workspace.
         pre_trust_workspace(workspace);
 
-        // Claude creates no per-run state outside the cube workspace, so
-        // there is nothing for teardown (or a future retention sweep) to
-        // clean up. A Codex driver would return its Boss-owned CODEX_HOME
-        // (or archive root) here instead.
-        Ok(None)
+        // Record the private input home for the existing restart-safe home
+        // retention sweep; the workspace link does not own these bytes.
+        Ok(Some(super::DriverRuntimeState::new(serde_json::json!({
+            (crate::initial_prompt::INITIAL_PROMPT_HOME_KEY): prompt_home,
+        }))))
     }
 
-    /// No-op: Claude needs no teardown. It creates no per-run state outside
-    /// the cube workspace — the `.claude/` config dir `provision_workspace`
-    /// writes lives inside the workspace, which cube owns and tears down
-    /// itself. `runtime_state` is expected to be `None` for Claude and is
-    /// ignored; we deliberately do not invent a cleanup target from the
-    /// engine environment or by scanning a shared provider home.
+    /// The recorded private input home is reclaimed by per-run retention.
     async fn teardown_workspace(
         &self,
         _workspace: Option<&Path>,
@@ -1543,7 +1551,13 @@ mod tests {
             .expect("ClaudeDriver supplies pane-monitor markers");
         assert_eq!(
             spec.agent_markers,
-            vec!["Claude Code", "auto mode on", "bypass permissions on", "/effort"]
+            vec![
+                "Claude Code",
+                "auto mode on",
+                "bypass permissions on",
+                "don't ask on",
+                "/effort"
+            ]
         );
         assert_eq!(spec.busy_markers, vec!["esc to interrupt"]);
         assert_eq!(
@@ -2085,21 +2099,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn provision_workspace_writes_prompt_gitignore_and_pretrust() {
+    #[test]
+    fn provision_workspace_writes_prompt_gitignore_and_pretrust() {
         // Redirect this thread's trust store without changing process HOME.
         let workspace = TempDir::new().unwrap();
         let fake_home = TempDir::new().unwrap();
         let _config = claude_config_override(&fake_home.path().join(".claude.json"));
 
-        let driver = ClaudeDriver;
-        let runtime_state = driver
-            .provision_workspace(workspace.path(), "hello prompt", "run-1")
-            .await
+        let _homes = crate::test_support::codex_homes_override(&fake_home.path().join("homes"));
+        let runtime_state = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ClaudeDriver.provision_workspace(workspace.path(), "hello prompt", "run-1"))
             .unwrap();
         assert!(
-            runtime_state.is_none(),
-            "Claude creates no out-of-workspace runtime state"
+            runtime_state.is_some(),
+            "Claude records its private input home for retention"
         );
 
         // Prompt file at the descriptor-derived path.
@@ -2168,10 +2184,7 @@ mod tests {
     #[test]
     fn spawn_invocation_uses_descriptor_paths() {
         let plan = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
-        let expected_cat = format!(
-            "\"$(cat {}/{})\"\n",
-            CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
-        );
+        let expected_cat = format!("python3 {}/initial-prompt.py", CLAUDE_DESCRIPTOR.config_dir);
         assert!(
             plan.command.contains(&expected_cat),
             "spawn invocation must read from descriptor paths; got: {}",

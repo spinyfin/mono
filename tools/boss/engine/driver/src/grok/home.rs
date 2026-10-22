@@ -508,8 +508,7 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
     // rules from the repo root AGENTS.md, never `.grok/AGENTS.md`).
     let config_dir = workspace.join(".grok");
     fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
-    fs::write(config_dir.join("initial-prompt.txt"), prompt_text)
-        .with_context(|| format!("writing initial prompt to {}/initial-prompt.txt", config_dir.display()))?;
+    crate::initial_prompt::provision(&config_dir, &grok_home, prompt_text, &super::GrokDriver::default())?;
     fs::write(config_dir.join(".gitignore"), "*\n")
         .with_context(|| format!("writing gitignore under {}", config_dir.display()))?;
 

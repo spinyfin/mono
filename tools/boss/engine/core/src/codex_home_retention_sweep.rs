@@ -1,4 +1,4 @@
-//! Periodic reclaim of Boss-owned per-run Codex homes past retention policy.
+//! Periodic reclaim of Boss-owned Codex and Claude input homes past retention policy.
 //!
 //! Loads recorded roots exclusively from
 //! `work_executions.driver_runtime_state` (see
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use boss_engine_codex_rollout_retention as retention;
-use boss_engine_driver::codex::{CodexRuntimeState, assert_codex_home_safe_to_delete};
+use boss_engine_driver::codex::assert_codex_home_safe_to_delete;
 
 use crate::work::WorkDb;
 
@@ -104,17 +104,9 @@ pub async fn run_one_pass_with_policy(
         let Some(state) = execution.driver_runtime_state.as_ref() else {
             continue;
         };
-        let runtime = match CodexRuntimeState::from_driver_runtime_state(state) {
-            Ok(r) => r,
-            Err(_) => {
-                // Not a Codex payload (or corrupt) — other drivers may
-                // eventually store their own shape here. Skip silently.
-                continue;
-            }
-        };
-        if runtime.codex_home.as_os_str().is_empty() {
+        let Some(home) = boss_engine_driver::initial_prompt::owned_home_from_runtime_state(state) else {
             continue;
-        }
+        };
         let age_anchor_epoch = execution
             .finished_epoch()
             .or_else(|| execution.created_epoch())
@@ -123,9 +115,9 @@ pub async fn run_one_pass_with_policy(
         // recorded home (e.g. re-dispatch after partial provision) stay
         // protected until they finish.
         let is_live = !execution.status.is_terminal();
-        let size_bytes = retention::directory_size_bytes(&runtime.codex_home);
+        let size_bytes = retention::directory_size_bytes(&home);
         homes.push(retention::OwnedCodexHome {
-            path: runtime.codex_home,
+            path: home,
             execution_id: execution.id.clone(),
             is_live,
             age_anchor_epoch,
@@ -266,6 +258,24 @@ mod tests {
         seed_execution_with_home(&db, &live_item, "running", now - 40 * 24 * 60 * 60, &live_home);
         seed_execution_with_home(&db, &recent_item, "completed", now - 60, &recent_home);
 
+        let mut claude_homes = Vec::new();
+        for (name, status) in [("claude-old", "completed"), ("claude-live", "running")] {
+            let workspace = tempfile::tempdir().unwrap();
+            let runtime = crate::driver::AgentDriver::provision_workspace(
+                &crate::driver::ClaudeDriver,
+                workspace.path(),
+                "private retained brief",
+                name,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let home = PathBuf::from(runtime.as_value()["initial_prompt_home"].as_str().unwrap());
+            let id = seed_execution_with_home(&db, &chore(name), status, now - 40 * 24 * 60 * 60, &home);
+            db.set_driver_runtime_state(&id, Some(&runtime)).unwrap();
+            claude_homes.push(home);
+        }
+
         // An unrecorded home under the root must never be touched.
         let orphan = homes_root.join("orphan-unrecorded");
         std::fs::create_dir_all(&orphan).unwrap();
@@ -278,29 +288,35 @@ mod tests {
         let listed = db.list_executions_with_driver_runtime_state().unwrap();
         assert_eq!(
             listed.len(),
-            3,
-            "three executions should carry recorded runtime state; got {listed:?}"
+            5,
+            "five executions should carry recorded runtime state; got {listed:?}"
         );
 
         let policy = retention::CodexHomeRetentionPolicy::new(Duration::from_secs(14 * 24 * 60 * 60), u64::MAX);
         let outcome = run_one_pass_with_policy(&db, &policy, false).await;
         assert_eq!(outcome.errors, 0, "reclaim errors should be empty: {outcome:?}");
         assert_eq!(
-            outcome.deleted, 1,
-            "only the old terminal home is reclaimed: {outcome:?}"
+            outcome.deleted, 2,
+            "only the old terminal homes are reclaimed: {outcome:?}"
         );
-        assert_eq!(outcome.skipped_live, 1, "{outcome:?}");
+        assert_eq!(outcome.skipped_live, 2, "{outcome:?}");
         assert!(!old_home.exists(), "old terminal home must be gone");
         assert!(live_home.join("marker").is_file(), "live home must survive");
         assert!(recent_home.join("marker").is_file(), "recent terminal home kept");
         assert!(orphan.join("marker").is_file(), "unrecorded root must never be deleted");
 
+        assert!(!claude_homes[0].exists(), "old Claude input must be reclaimed");
+        assert_eq!(
+            std::fs::read_to_string(claude_homes[1].join("initial-prompt.txt")).unwrap(),
+            "private retained brief"
+        );
+
         // Idempotent second pass.
         let outcome2 = run_one_pass_with_policy(&db, &policy, false).await;
         assert_eq!(outcome2.errors, 0, "{outcome2:?}");
         assert_eq!(
-            outcome2.deleted, 1,
-            "already-gone path still counts as reclaimed: {outcome2:?}"
+            outcome2.deleted, 2,
+            "already-gone paths still counts as reclaimed: {outcome2:?}"
         );
     }
 

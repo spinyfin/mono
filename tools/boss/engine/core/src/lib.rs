@@ -154,6 +154,7 @@ pub mod proposal_channel_error;
 pub mod proposal_expiry_sweep;
 pub mod protocol;
 pub(crate) mod reconcile_audit;
+pub mod remote_input_lifecycle;
 pub mod remote_lease_reconcile;
 pub mod remote_reattach;
 pub mod remote_transcript;

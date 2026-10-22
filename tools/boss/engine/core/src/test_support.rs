@@ -955,12 +955,28 @@ macro_rules! stub_host_adapter {
 
     // ── release_workspace ───────────────────────────────────────────────────
     (@munch $ty:ty [$($acc:tt)*] @release_workspace async fn release_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @heartbeat_lease $($rest)*);
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @probe_initial_input_alive $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @release_workspace $($rest:tt)*) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*
             async fn release_workspace(&self, _lease_id: &str) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @heartbeat_lease $($rest)*);
+        ] @probe_initial_input_alive $($rest)*);
+    };
+
+    // ── probe_initial_input_alive (trait default unless overridden) ────────
+    (@munch $ty:ty [$($acc:tt)*] @probe_initial_input_alive async fn probe_initial_input_alive $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn probe_initial_input_alive $a -> $r $b] @cleanup_initial_input $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @probe_initial_input_alive $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @cleanup_initial_input $($rest)*);
+    };
+
+    // ── cleanup_initial_input (trait default unless overridden) ────────────
+    (@munch $ty:ty [$($acc:tt)*] @cleanup_initial_input async fn cleanup_initial_input $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn cleanup_initial_input $a -> $r $b] @heartbeat_lease $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @cleanup_initial_input $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @heartbeat_lease $($rest)*);
     };
 
     // ── heartbeat_lease ─────────────────────────────────────────────────────

@@ -293,12 +293,12 @@ pub const CODEX_FORBIDDEN_LONG_FLAGS: &[&str] = &["--color", "--skip-git-repo-ch
 pub fn codex_reference_command() -> String {
     // Required flags come from the shared constants so the double cannot
     // drift from the contract the pin tests enforce.
-    let mut cmd = String::from("codex");
+    let mut cmd = String::from("python3 .codex/initial-prompt.py codex");
     for flag in CODEX_REQUIRED_FLAGS {
         cmd.push(' ');
         cmd.push_str(flag);
     }
-    cmd.push_str(" --sandbox danger-full-access \"$(cat .codex/initial-prompt.txt)\"\n");
+    cmd.push_str(" --sandbox danger-full-access\n");
     cmd
 }
 

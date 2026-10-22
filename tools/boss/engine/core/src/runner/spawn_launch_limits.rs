@@ -1,14 +1,14 @@
 //! Exec-time argv budget preflight for worker spawn.
 //!
-//! Every driver embeds its initial prompt into the CLI's own argv via a
-//! `"$(cat <config_dir>/<initial_prompt_filename>)"` command substitution.
+//! Initial briefs travel through the terminal launcher's PTY, outside argv, so
+//! a driver command is only its static flags. Budget those flags and the
+//! environment against the host's exec limits.
 //! Past `ARG_MAX` — or, on Linux, past the per-argument `MAX_ARG_STRLEN`
 //! cap — the shell's `exec` fails with `E2BIG` inside the sourced pane
 //! script, invisible to the engine. This module estimates the expanded
 //! argv and refuses the spawn before that happens.
 
-use anyhow::{Context, Result, anyhow};
-use std::path::Path;
+use anyhow::{Result, anyhow};
 
 /// Extra slop applied on top of [`environment_bytes`]'s already-conservative
 /// estimate, as a fixed fraction of it, to absorb the gap between the
@@ -134,74 +134,24 @@ pub(crate) fn environment_bytes() -> usize {
     )
 }
 
-/// Estimate the exec-time argv byte count for `command` once its
-/// `"$(cat <config_dir>/<initial_prompt_filename>)"` substitution is
-/// replaced by the real prompt file's bytes.
-pub(crate) fn estimated_launch_argv_bytes(
-    command: &str,
-    workspace_path: &Path,
-    config_dir: &str,
-    initial_prompt_filename: &str,
-) -> Result<usize> {
-    let prompt_path = workspace_path.join(config_dir).join(initial_prompt_filename);
-    let prompt_bytes = std::fs::metadata(&prompt_path)
-        .with_context(|| format!("reading size of initial prompt at {}", prompt_path.display()))?
-        .len() as usize;
-    Ok(substitute_prompt_bytes(
-        command,
-        config_dir,
-        initial_prompt_filename,
-        prompt_bytes,
-    ))
+/// Fail loudly, before the pane ever runs the launcher, when the driver
+/// command's flags (the brief is not among them) would exceed this host's
+/// exec limits at `execve()`.
+pub(crate) fn check_launch_command_arg_max(command: &str, driver_name: &str) -> Result<()> {
+    check_launch_command_arg_max_with_limits(command, driver_name, ExecArgLimits::local()?)
 }
 
-/// Shared placeholder-substitution arithmetic behind
-/// [`estimated_launch_argv_bytes`] and [`check_launch_command_arg_max_for_bytes`].
-pub(crate) fn substitute_prompt_bytes(
-    command: &str,
-    config_dir: &str,
-    initial_prompt_filename: &str,
-    prompt_bytes: usize,
-) -> usize {
-    let placeholder = format!("\"$(cat {config_dir}/{initial_prompt_filename})\"");
-    let static_bytes = command.len().saturating_sub(placeholder.len());
-    static_bytes.saturating_add(prompt_bytes)
-}
-
-/// Fail loudly, before ever typing the pane's initial input, when the
-/// argv-embedded initial prompt would exceed this host's exec limits at
-/// the driver CLI's `execve()`.
-pub(crate) fn check_launch_command_arg_max(
+/// Same preflight as [`check_launch_command_arg_max`], against the **target**
+/// host's exec limits (the remote spawn path).
+pub(crate) fn check_launch_command_arg_max_with_limits(
     command: &str,
     driver_name: &str,
-    workspace_path: &Path,
-    config_dir: &str,
-    initial_prompt_filename: &str,
-) -> Result<()> {
-    let argv_bytes = estimated_launch_argv_bytes(command, workspace_path, config_dir, initial_prompt_filename)?;
-    let prompt_path = workspace_path.join(config_dir).join(initial_prompt_filename);
-    let prompt_bytes = std::fs::metadata(&prompt_path)
-        .with_context(|| format!("reading size of initial prompt at {}", prompt_path.display()))?
-        .len() as usize;
-    check_exec_arg_limits(argv_bytes, prompt_bytes, &ExecArgLimits::local()?, driver_name)
-}
-
-/// Same preflight as [`check_launch_command_arg_max`], for callers that
-/// already know the initial prompt's byte length in-process (the remote
-/// spawn path) and the **target** host's exec limits.
-pub(crate) fn check_launch_command_arg_max_for_bytes(
-    command: &str,
-    driver_name: &str,
-    config_dir: &str,
-    initial_prompt_filename: &str,
-    prompt_bytes: usize,
     limits: ExecArgLimits,
 ) -> Result<()> {
-    let argv_bytes = substitute_prompt_bytes(command, config_dir, initial_prompt_filename, prompt_bytes);
-    check_exec_arg_limits(argv_bytes, prompt_bytes, &limits, driver_name)
+    check_exec_arg_limits(command.len(), command.len(), &limits, driver_name)
 }
 
-/// The pure budget check behind [`check_launch_command_arg_max`], factored
+/// The pure budget check behind [`check_launch_command_arg_max_with_limits`], factored
 /// out so tests can exercise the arithmetic against fixed inputs.
 #[cfg(test)]
 pub(crate) fn check_arg_max_budget(
@@ -232,20 +182,19 @@ pub(crate) fn check_exec_arg_limits(
         && largest_arg_bytes > limit
     {
         return Err(anyhow!(
-            "refusing to spawn {driver_name} worker: initial prompt is {largest_arg_bytes} bytes, over this \
+            "refusing to spawn {driver_name} worker: launch command is {largest_arg_bytes} bytes, over this \
              host's per-argument MAX_ARG_STRLEN {limit} bytes; execve would fail with E2BIG on a single \
              argv element even when the aggregate ARG_MAX budget still has room"
         ));
     }
-    // 4096 bytes of slop for shell-syntax overhead (quotes, `$()`, spaces)
+    // 4096 bytes of slop for shell-syntax overhead (quotes, spaces)
     // this estimate does not model, plus the exec kernel's own bookkeeping.
     let total = argv_bytes.saturating_add(limits.environment_bytes).saturating_add(4096);
     if total > limits.arg_max {
         return Err(anyhow!(
-            "refusing to spawn {driver_name} worker: estimated launch argv {argv_bytes} bytes (initial \
-             prompt embedded via command substitution) + environment {} bytes + 4096 \
-             estimation-slop bytes = {total} bytes exceeds this host's ARG_MAX {} bytes; the \
-             initial prompt is too large to deliver via argv on this host",
+            "refusing to spawn {driver_name} worker: estimated launch argv {argv_bytes} bytes + \
+             environment {} bytes + 4096 estimation-slop bytes = {total} bytes exceeds this \
+             host's ARG_MAX {} bytes",
             limits.environment_bytes,
             limits.arg_max
         ));
@@ -285,94 +234,57 @@ mod tests {
         assert!(parse_remote_exec_arg_limits_line("Linux 0 4096").is_none());
     }
 
+    /// A real launcher command for `driver`, padded with `flag_bytes` of settings.
+    fn launcher(driver: &str, flag_bytes: usize) -> String {
+        crate::driver::initial_prompt::launcher_command(
+            ".claude",
+            &format!("{driver} --model opus --settings '{}'", "x".repeat(flag_bytes)),
+        )
+    }
+
     #[test]
-    fn six_hundred_kb_prompt_passes_darwin_style_limits() {
-        let command =
-            "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
+    fn real_launcher_command_passes_this_hosts_limits() {
+        check_launch_command_arg_max(&launcher("claude", 0), "claude").unwrap();
+    }
+
+    #[test]
+    fn launcher_command_has_the_same_size_for_any_brief() {
+        // The brief is delivered over the PTY, so it cannot change argv size.
+        let command = launcher("claude", 0);
+        check_launch_command_arg_max_with_limits(&command, "claude", ExecArgLimits::fail_closed_remote()).unwrap();
+    }
+
+    #[test]
+    fn linux_per_argument_cap_refuses_an_oversized_flag() {
+        let limits = ExecArgLimits {
+            arg_max: 2_097_152,
+            environment_bytes: 32_768,
+            max_arg_strlen: Some(131_072),
+        };
+        let err = check_launch_command_arg_max_with_limits(&launcher("codex", 200_000), "codex", limits)
+            .expect_err("Linux MAX_ARG_STRLEN must refuse a 200KB single argument");
+        let msg = err.to_string();
+        assert!(msg.contains("codex"), "{msg}");
+        assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
+        assert!(msg.contains("131072"), "{msg}");
+    }
+
+    #[test]
+    fn darwin_style_limits_have_no_per_argument_cap() {
         let limits = ExecArgLimits {
             arg_max: 1_048_576,
             environment_bytes: 32_768,
             max_arg_strlen: None,
         };
-        check_launch_command_arg_max_for_bytes(command, "codex", ".codex", "initial-prompt.txt", 600_000, limits)
-            .expect("a ~600KB prompt fits Darwin ARG_MAX when there is no per-arg cap");
+        check_launch_command_arg_max_with_limits(&launcher("codex", 600_000), "codex", limits)
+            .expect("a 600KB command fits Darwin ARG_MAX when there is no per-arg cap");
     }
 
     #[test]
-    fn six_hundred_kb_prompt_fails_linux_max_arg_strlen_even_when_arg_max_has_room() {
-        let command =
-            "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
-        let limits = ExecArgLimits {
-            arg_max: 2_097_152,
-            environment_bytes: 32_768,
-            max_arg_strlen: Some(131_072),
-        };
-        let err =
-            check_launch_command_arg_max_for_bytes(command, "codex", ".codex", "initial-prompt.txt", 600_000, limits)
-                .expect_err("Linux MAX_ARG_STRLEN must refuse a 600KB single argument");
-        let msg = err.to_string();
-        assert!(msg.contains("codex"), "{msg}");
-        assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
-        assert!(
-            msg.contains("131072") || msg.contains("131_072") || msg.contains("128"),
-            "{msg}"
-        );
-    }
-
-    #[test]
-    fn one_hundred_kb_prompt_passes_linux_max_arg_strlen() {
-        let command = "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n";
-        let limits = ExecArgLimits {
-            arg_max: 2_097_152,
-            environment_bytes: 32_768,
-            max_arg_strlen: Some(131_072),
-        };
-        check_launch_command_arg_max_for_bytes(command, "claude", ".claude", "initial-prompt.txt", 100_000, limits)
-            .expect("100KB is under Linux MAX_ARG_STRLEN");
-    }
-
-    #[test]
-    fn fail_closed_remote_limits_accept_a_small_prompt() {
-        let command = "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n";
-        check_launch_command_arg_max_for_bytes(
-            command,
-            "claude",
-            ".claude",
-            "initial-prompt.txt",
-            50_000,
-            ExecArgLimits::fail_closed_remote(),
-        )
-        .expect("a ~50KB prompt must pass fail-closed remote limits");
-    }
-
-    #[test]
-    fn fail_closed_remote_limits_refuse_a_200kb_prompt_on_max_arg_strlen() {
-        let command =
-            "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
-        let err = check_launch_command_arg_max_for_bytes(
-            command,
-            "codex",
-            ".codex",
-            "initial-prompt.txt",
-            200_000,
-            ExecArgLimits::fail_closed_remote(),
-        )
-        .expect_err("200KB exceeds fail-closed MAX_ARG_STRLEN");
-        let msg = err.to_string();
-        assert!(msg.contains("codex"), "{msg}");
-        assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
-        assert!(!msg.contains("exceeds this host's ARG_MAX"), "{msg}");
-    }
-
-    #[test]
-    fn fail_closed_remote_limits_refuse_a_600kb_prompt() {
-        let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
-        let err = check_launch_command_arg_max_for_bytes(
-            command,
+    fn fail_closed_remote_limits_refuse_an_oversized_flag_on_max_arg_strlen() {
+        let err = check_launch_command_arg_max_with_limits(
+            &launcher("grok", 600_000),
             "grok",
-            ".grok",
-            "initial-prompt.txt",
-            600_000,
             ExecArgLimits::fail_closed_remote(),
         )
         .expect_err("unprobeable remotes must fail closed on MAX_ARG_STRLEN");
@@ -380,5 +292,17 @@ mod tests {
         assert!(msg.contains("grok"), "{msg}");
         assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
         assert!(!msg.contains("exceeds this host's ARG_MAX"), "{msg}");
+    }
+
+    #[test]
+    fn aggregate_arg_max_refuses_a_command_over_the_host_budget() {
+        let limits = ExecArgLimits {
+            arg_max: 100_000,
+            environment_bytes: 32_768,
+            max_arg_strlen: None,
+        };
+        let err = check_launch_command_arg_max_with_limits(&launcher("claude", 90_000), "claude", limits)
+            .expect_err("aggregate budget must be enforced");
+        assert!(err.to_string().contains("ARG_MAX 100000 bytes"), "{err}");
     }
 }

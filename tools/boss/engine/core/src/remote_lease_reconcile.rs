@@ -124,6 +124,10 @@ pub async fn reconcile_remote_leases(
 ) -> RemoteLeaseReconcileOutcome {
     let mut outcome = RemoteLeaseReconcileOutcome::default();
 
+    // Staged briefs whose launch failed or was interrupted before a remote pid
+    // was recorded; nothing else in this pass can find them.
+    crate::remote_input_lifecycle::retry_pending(work_db, provider).await;
+
     // Terminal remote executions that still hold a persona or cube lease
     // (cancelled while the worker ran, or a crash between terminalization
     // and cleanup). A terminal status is not proof the process exited, so
@@ -298,6 +302,13 @@ async fn reap_dead_remote_execution(
         if execution.status.is_terminal() {
             release_dead_remote_slot_and_persona(work_db, pane_releaser, &execution.id).await;
         }
+        return false;
+    }
+
+    if let Some(workspace) = execution.workspace_path.as_deref()
+        && let Err(error) = adapter.cleanup_initial_input(workspace, &execution.id).await
+    {
+        tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
         return false;
     }
 
@@ -513,6 +524,12 @@ async fn release_terminal_remote_resources(
     let Ok(execution) = work_db.get_execution(&handle.execution_id) else {
         return;
     };
+    if let Some(workspace) = execution.workspace_path.as_deref()
+        && let Err(error) = adapter.cleanup_initial_input(workspace, &execution.id).await
+    {
+        tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
+        return;
+    }
     let Some(lease_id) = execution.cube_lease_id.as_deref() else {
         return;
     };

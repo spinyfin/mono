@@ -1,14 +1,14 @@
 //! Bounded spawn-time confirmation that the worker driver actually started.
 //!
 //! After the pane's initial input is delivered (today: a login-shell `-c`
-//! that sources `.boss/initial-input.sh` and execs the CLI with the prompt
-//! already in argv), the engine waits for two independent pieces of
+//! that sources `.boss/initial-input.sh` and runs the private terminal
+//! launcher), the engine waits for two independent pieces of
 //! evidence before treating the spawn as successful:
 //!
 //! 1. **Composer readiness** — driver-specific PTY evidence that the CLI
 //!    is actually up (`PaneMonitorSpec` agent markers), or a fresh driver signal.
-//!    For argv delivery this is the analog of "the composer can accept
-//!    input": the CLI has exec'd and rendered its surface, which is what
+//!    The launcher delivers the brief once the composer can accept
+//!    input: the CLI has exec'd and rendered its surface, which is what
 //!    proves the sourced script did not die at `execve()`. A driver hook
 //!    or persisted `transcript_path` is strictly stronger than a scraped
 //!    pane marker, so turn-start evidence also satisfies this wait.

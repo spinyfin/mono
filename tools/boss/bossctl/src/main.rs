@@ -2063,7 +2063,7 @@ fn executions_prune(
             "{}",
             serde_json::json!({
                 "deleted": outcome.deleted,
-                "codex_homes_reclaimed": outcome.codex_homes_reclaimed,
+                "driver_homes_reclaimed": outcome.driver_homes_reclaimed,
                 "dry_run": dry_run,
                 "older_than_days": older_than_days,
                 "keep_per_work_item": keep_per_work_item,
@@ -2076,8 +2076,8 @@ fn executions_prune(
         );
     } else {
         println!(
-            "deleted {} terminal execution row(s) older than {}d (kept {} most recent per work item); reclaimed {} Codex home(s)",
-            outcome.deleted, older_than_days, keep_per_work_item, outcome.codex_homes_reclaimed
+            "deleted {} terminal execution row(s) older than {}d (kept {} most recent per work item); reclaimed {} driver home(s)",
+            outcome.deleted, older_than_days, keep_per_work_item, outcome.driver_homes_reclaimed
         );
     }
     Ok(())
