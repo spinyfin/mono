@@ -1,0 +1,30 @@
+[package]
+name = "boss-protocol-spoke"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+boss-protocol = { path = "../protocol" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# The library itself reaches prost and tonic only through the generated crate;
+# its tests (and later consumers) name them directly. The toolchain in
+# //third_party/prost also resolves its runtime from these entries.
+[dev-dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true }
+x509-parser = "0.18.1"
+
+# Code generation plugins. protocol-spoke has no build script: Bazel runs these
+# two binaries as protoc plugins (see BUILD.bazel). They are declared here so
+# crate_universe resolves the generator from the same Cargo.lock as the prost
+# and tonic runtime above, which keeps the two versions coherent by construction.
+[build-dependencies]
+protoc-gen-prost = "=0.4.0"
+protoc-gen-tonic = "=0.4.1"

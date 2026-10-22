@@ -33,6 +33,25 @@ single_version_override(
     version = "0.70.0",
 )
 
+bazel_dep(name = "rules_rust_prost", version = "0.70.0")
+
+# rules_rust_prost 0.70.0 assumes rustc_compile_action returns a list of
+# providers, but the rules_rust patch above (the test-wrapper backport) makes
+# it return a dict, so every proto aspect failed analysis with "Couldn't find
+# a CrateInfo in the list of providers". The patch normalises both shapes.
+single_version_override(
+    module_name = "rules_rust_prost",
+    patch_strip = 1,
+    patches = ["//third_party/patches:rules_rust_prost-0.70.0-providers-dict.patch"],
+    version = "0.70.0",
+)
+
+# Protobuf toolchain for //tools/boss/protocol-spoke. protobuf was already in
+# the resolved graph transitively at this version; declare it so the protoc
+# the spoke schema is compiled with is pinned here and not by whichever
+# dependency happens to request the highest version.
+bazel_dep(name = "protobuf", version = "34.0.bcr.1")
+bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "rules_shell", version = "0.8.0")
 bazel_dep(name = "apple_support", version = "2.2.0", repo_name = "build_bazel_apple_support")
 bazel_dep(name = "rules_swift", version = "3.5.0", repo_name = "build_bazel_rules_swift")
@@ -230,6 +249,11 @@ register_toolchains(
 
 register_toolchains("@rust_toolchains//:all")
 
+# prost/tonic codegen toolchain for //tools/boss/protocol-spoke: generator plugins
+# and runtime crates both come from mono_crates (see that package's README).
+# Registered by the root module, so it wins over rules_rust_prost's default.
+register_toolchains("//third_party/prost:prost_toolchain")
+
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.annotation(
     # SQLITE_DEFAULT_MEMSTATUS=0 removes SQLite's process-global malloc
@@ -254,6 +278,21 @@ crate.annotation(
     crate = "rusqlite",
     patch_args = ["-p1"],
     patches = ["//third_party/patches:rusqlite-0.37.0-call-observer.patch"],
+    repositories = ["mono_crates"],
+)
+
+# protoc plugins that generate the boss.spoke.v1 Rust types and tonic services
+# (//tools/boss/protocol-spoke). They are resolved from the same Cargo.lock as
+# the prost/tonic runtime crates so the generator and the runtime cannot drift
+# apart; see tools/boss/protocol-spoke/README.md.
+crate.annotation(
+    crate = "protoc-gen-prost",
+    gen_binaries = ["protoc-gen-prost"],
+    repositories = ["mono_crates"],
+)
+crate.annotation(
+    crate = "protoc-gen-tonic",
+    gen_binaries = ["protoc-gen-tonic"],
     repositories = ["mono_crates"],
 )
 crate.from_cargo(
@@ -361,6 +400,44 @@ register_toolchains(
     "//tools/checkleft/wasm:wasm_tools_aarch64_macos_toolchain",
     "//tools/checkleft/wasm:wasm_tools_x86_64_linux_toolchain",
     "//tools/checkleft/wasm:wasm_tools_aarch64_linux_toolchain",
+)
+
+# Pinned buf CLI for the boss.spoke.v1 breaking-change check
+# (//tools/boss/protocol-spoke:proto_breaking_test). buf compiles the checked-in
+# baseline and the live schema itself, so the check needs no protoc and no
+# network at test time. To bump: change the version in all three URLs, take the
+# per-platform digests from the release's sha256.txt, and re-run the test.
+# Releases are pinned at least a few weeks after publication.
+_BUF_BUILD = """
+filegroup(
+    name = "buf",
+    srcs = ["bin/buf"],
+    visibility = ["@mono//tools/boss/protocol-spoke:__pkg__"],
+)
+"""
+
+http_archive(
+    name = "buf_aarch64_macos",
+    build_file_content = _BUF_BUILD,
+    sha256 = "7eb1b167b729815b470e88d85cc1dbcb5d16bfbe73af248c9ed20cfbc4de060b",
+    strip_prefix = "buf",
+    urls = ["https://github.com/bufbuild/buf/releases/download/v1.73.0/buf-Darwin-arm64.tar.gz"],
+)
+
+http_archive(
+    name = "buf_x86_64_linux",
+    build_file_content = _BUF_BUILD,
+    sha256 = "f8092c1be08d5606a8d22b4ae0e4079dd690154cebb4894dc5e24a5046093aff",
+    strip_prefix = "buf",
+    urls = ["https://github.com/bufbuild/buf/releases/download/v1.73.0/buf-Linux-x86_64.tar.gz"],
+)
+
+http_archive(
+    name = "buf_aarch64_linux",
+    build_file_content = _BUF_BUILD,
+    sha256 = "e928fa64061ddb5144d93df30fe48f3451231b0e77ea5ade684cb7b53037cc66",
+    strip_prefix = "buf",
+    urls = ["https://github.com/bufbuild/buf/releases/download/v1.73.0/buf-Linux-aarch64.tar.gz"],
 )
 
 # Full ghostty commit for SwiftPM bootstrap (tools/boss/app-macos/scripts/bootstrap-ghosttykit.sh

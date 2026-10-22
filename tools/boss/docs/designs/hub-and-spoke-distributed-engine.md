@@ -50,6 +50,8 @@ Actual Bazel invocations on 2026-10-21, with ordinary caches enabled:
 
 **Prost generation and compilation with this repository's pinned toolchain remain unverified.** The run explicitly forbids prototypes and build-file changes and permits explicitly scoping an open question. Therefore the protocol PR owns adding the module/dependencies and the successful real Bazel generation, build, round-trip and gRPC tests before dependent implementation lands. The failed invocation above establishes a missing dependency declaration, not an incompatibility or a successful prost verification. No temporary prototype was made. This is the only build-evidence gap carried from the design into implementation.
 
+**Status update (2026-10-22): the toolchain gate is verified.** The protocol task built and tested the generation path under Bazel with the pinned toolchain (`rules_rust` 0.70.0, Rust 1.99.0, Bazel 9.1.0, protobuf 34.0.bcr.1). Two findings changed the sketch above. `rules_rust_prost` 0.70.0 fails analysis next to this repo's `rules_rust` patch (the test-wrapper backport returns a dict of providers where the prost rules expect a list), so it carries a small repo patch. And its bundled prost/tonic/tokio would put a second tokio in the graph, so the repo registers its own prost toolchain in which the runtime crates and both protoc plugins resolve from the one `Cargo.lock`, with a test that fails if the generator and runtime drift apart. The pins, the compatibility gate and the reasons are recorded in [`tools/boss/protocol-spoke/README.md`](../../protocol-spoke/README.md).
+
 ## Alternatives considered
 
 These retain the investigation's decision (§3.1); they do not reopen its baseline study.
@@ -419,7 +421,7 @@ Board scale follows §2.4 independently: measure invalidation sources first, cac
 
 ## Risks / open questions
 
-- **Toolchain gate:** prost/prost-build generation is not proven by the existing library build. The protocol task must land successful Bazel/CI evidence before consumers; fixing this requires implementation files prohibited in this design run.
+- **Toolchain gate:** prost/prost-build generation is not proven by the existing library build. The protocol task must land successful Bazel/CI evidence before consumers; fixing this requires implementation files prohibited in this design run. _Resolved by the protocol task; see the status update under "Basis and verification boundary". Consumers still wait for that task's CI run on the supported platforms._
 - **Provisioning discovery:** no provider identity or secret-delivery contract is recorded in the source. The dedicated discovery entry must produce a concrete managed macOS and Linux path with documented API/identity constraints. An untrusted bootstrap URL or manual shell install cannot satisfy that task.
 - **Bounded autonomy:** disk exhaustion, lost source files and revoked/expired identity can prevent delivery. Preserve evidence and expose gaps; do not describe bounded journals as an unconditional no-loss guarantee.
 - **Non-transactional effects:** tmux input and some cube operations cannot share the journal transaction. Conservative uncertainty may need operator reconciliation; it is preferable to duplicate input or execution. This is a defined outcome, not a promised exactly-once effect.
