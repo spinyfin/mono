@@ -125,21 +125,21 @@ impl Contracts {
                 peer: (welcome.epoch, welcome.epoch),
             });
         }
-        // The hub chose one revision per feature; confirm each is one we speak.
-        let selection = self.select_features(welcome.epoch, &welcome.features)?;
-        if selection.features.len()
-            != welcome
-                .features
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<BTreeSet<_>>()
-                .len()
+        // The hub chose exactly one revision per feature (validate rejects
+        // repeated names); every pair must be one this build speaks exactly,
+        // not merely a name it knows at some other revision.
+        let local: BTreeSet<(&str, u32)> = self.features.iter().map(|f| (f.name.as_str(), f.revision)).collect();
+        if !welcome
+            .features
+            .iter()
+            .all(|f| local.contains(&(f.name.as_str(), f.revision)))
         {
             return Err(Rejection::InvalidHello(ValidationError::Invalid {
                 field: "welcome.features",
                 reason: "selects a feature revision this build does not speak",
             }));
         }
+        let selection = self.select_features(welcome.epoch, &welcome.features)?;
         Ok(selection)
     }
 
@@ -401,5 +401,32 @@ mod tests {
         let mut partial = required_at(1);
         partial.pop();
         assert!(local.confirm(&welcome(1, partial)).is_err(), "required feature dropped");
+    }
+
+    #[test]
+    fn a_welcome_naming_a_feature_twice_is_refused() {
+        let mut local = Contracts::first_release();
+        local.features.push(rev(feature::EXECUTION, 2));
+
+        let mut two_supported = required_at(1);
+        two_supported.push(rev(feature::EXECUTION, 2));
+        assert!(
+            local.confirm(&welcome(1, two_supported)).is_err(),
+            "two supported revisions of one feature"
+        );
+
+        let mut one_unsupported = required_at(1);
+        one_unsupported.push(rev(feature::ARTIFACT, 9));
+        assert!(
+            local.confirm(&welcome(1, one_unsupported)).is_err(),
+            "a supported and an unsupported revision of one feature"
+        );
+
+        let mut exact_duplicate = required_at(1);
+        exact_duplicate.push(rev(feature::EXECUTION, 1));
+        assert!(
+            local.confirm(&welcome(1, exact_duplicate)).is_err(),
+            "the same entry twice"
+        );
     }
 }

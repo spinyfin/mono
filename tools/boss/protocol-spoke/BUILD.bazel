@@ -22,8 +22,10 @@ rust_prost_library(
     proto = ":spoke_v1_proto",
 )
 
-# Only the crates the design names as consumers of the wire types see this
-# target; widen it when one of them actually lands.
+# No consumer exists yet, so this is package-private. Each design-named
+# consumer (engine/core, engine/spoke, engine/spoke-journal,
+# engine/spoke-stream) is added to `visibility` in the PR that makes it depend
+# on this crate.
 rust_library(
     name = "protocol-spoke",
     srcs = glob(["src/**/*.rs"]),
@@ -31,12 +33,6 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = [
-        "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/spoke:__pkg__",
-        "//tools/boss/engine/spoke-journal:__pkg__",
-        "//tools/boss/engine/spoke-stream:__pkg__",
-    ],
     deps = [
         ":spoke_v1_rust_proto",
         "//tools/boss/protocol",
@@ -152,13 +148,25 @@ config_setting(
     ],
 )
 
-alias(
+_BUF_COMPATIBLE = select({
+    ":linux_arm64": [],
+    ":linux_x86_64": [],
+    ":macos_arm64": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
+# A filegroup rather than an alias so it can carry target_compatible_with:
+# on a platform without a pinned buf, `//...` skips it (and its dependents)
+# as incompatible instead of failing analysis.
+filegroup(
     name = "buf",
-    actual = select({
-        ":linux_arm64": "@buf_aarch64_linux//:buf",
-        ":linux_x86_64": "@buf_x86_64_linux//:buf",
-        ":macos_arm64": "@buf_aarch64_macos//:buf",
+    srcs = select({
+        ":linux_arm64": ["@buf_aarch64_linux//:buf"],
+        ":linux_x86_64": ["@buf_x86_64_linux//:buf"],
+        ":macos_arm64": ["@buf_aarch64_macos//:buf"],
+        "//conditions:default": [],
     }),
+    target_compatible_with = _BUF_COMPATIBLE,
 )
 
 _PROTO_ROOT = "tools/boss/protocol-spoke/proto"
@@ -191,12 +199,7 @@ sh_test(
         ["compat/merge_base/**/*.proto"],
         allow_empty = True,
     ),
-    target_compatible_with = select({
-        ":linux_arm64": [],
-        ":linux_x86_64": [],
-        ":macos_arm64": [],
-        "//conditions:default": ["@platforms//:incompatible"],
-    }),
+    target_compatible_with = _BUF_COMPATIBLE,
 )
 
 # `bazel run //tools/boss/protocol-spoke:update_baseline` records a backward
@@ -211,4 +214,5 @@ sh_binary(
         _BASELINE_ROOT,
     ],
     data = _COMPAT_DATA,
+    target_compatible_with = _BUF_COMPATIBLE,
 )

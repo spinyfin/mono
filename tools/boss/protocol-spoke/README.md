@@ -181,4 +181,5 @@ test sandbox. Loopback TCP is allowed there, so the mTLS test is an ordinary
 | `proto_breaking_test`      | The compatibility gate above.                                                                                                                                         |
 
 `buf` is pinned for macOS arm64 and Linux x86_64/arm64; on any other platform
-`proto_breaking_test` is skipped as incompatible rather than failing analysis.
+`proto_breaking_test`, `update_baseline` and the `buf` target are skipped as
+incompatible rather than failing analysis.

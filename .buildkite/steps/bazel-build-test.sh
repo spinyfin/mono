@@ -16,9 +16,8 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [spoke-proto] staging merge-base schema baseline"
-# Best effort: the checked-in baseline is enforced either way.
-"$(dirname "${BASH_SOURCE[0]}")/stage-spoke-proto-merge-base.sh" ||
-  echo "[spoke-proto] WARNING: staging failed; checking the checked-in baseline only" >&2
+# Fail closed: see the script header.
+"$(dirname "${BASH_SOURCE[0]}")/stage-spoke-proto-merge-base.sh"
 
 echo "--- [bazel-build] building"
 

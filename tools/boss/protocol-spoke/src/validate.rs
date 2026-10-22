@@ -228,7 +228,17 @@ impl Validate for v1::Welcome {
         nonzero("welcome.connection_generation", self.connection_generation)?;
         required("welcome.received_records", &self.received_records)?.validate()?;
         nonempty("welcome.command_journal_id", &self.command_journal_id)?;
-        self.features.iter().try_for_each(Validate::validate)
+        self.features.iter().try_for_each(Validate::validate)?;
+        // Unlike Hello, which offers every revision it speaks, Welcome is the
+        // hub's single choice: one revision per feature name.
+        let mut names = std::collections::BTreeSet::new();
+        if !self.features.iter().all(|f| names.insert(f.name.as_str())) {
+            return Err(ValidationError::Invalid {
+                field: "welcome.features",
+                reason: "names a feature more than once; a welcome selects one revision per feature",
+            });
+        }
+        Ok(())
     }
 }
 
