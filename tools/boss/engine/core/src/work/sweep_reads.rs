@@ -1,19 +1,7 @@
 //! Narrow task / execution reads for the engine's periodic sweeps.
 //!
-//! Every sweep that runs once a minute over the live worker slots used to
-//! reach for [`WorkDb::get_work_item`] and then read one field off the
-//! result. That single-item path builds the full `Task` projection —
-//! including the AI-review badge, a recursive revision-family CTE with a
-//! `ROW_NUMBER` window over `pr_review_verdicts` — so a sweep that wanted
-//! `effort_level` or `status` was paying for the whole kanban card, once per
-//! slot per pass. On the 2026-10-21 engine sample that projection alone was
-//! ~48% of the engine's non-idle CPU between bursts.
-//!
-//! The reads here return exactly the columns a sweep consumes, batched per
-//! pass where the caller has the whole id set up front. They apply the same
-//! row-visibility rule as `get_work_item` (live rows, plus archived rows even
-//! when tombstoned — see [`VISIBLE_TASK_PREDICATE`]) so a caller switching
-//! from the full read sees the same rows, just fewer columns.
+//! Reads return only the columns each sweep consumes, batched per pass,
+//! with the same row visibility as `get_work_item`.
 
 use super::*;
 
@@ -86,13 +74,7 @@ impl WorkDb {
     /// `effort_level` for every visible task/chore in `ids`, in one query
     /// per 500 ids. Ids with no visible row, or whose effort column is
     /// `NULL` / empty (never classified), are absent from the result. A
-    /// row carrying an out-of-set effort value is engine-side data
-    /// corruption, surfaced as an error the same way the full `Task`
-    /// mapper surfaces it rather than silently dropped.
-    ///
-    /// The envelope watchdog's per-pass replacement for one
-    /// [`Self::get_work_item`] per live slot: it needs nothing but the
-    /// effort class to pick an envelope.
+    /// corrupt row is logged and skipped so other slots retain enforcement.
     pub fn task_effort_levels(&self, ids: &[String]) -> Result<HashMap<String, EffortLevel>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
@@ -111,14 +93,15 @@ impl WorkDb {
             },
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        raw.into_iter()
-            .map(|(id, effort)| {
-                let level = effort
-                    .parse::<EffortLevel>()
-                    .map_err(|err| anyhow::anyhow!("task {id} has a corrupt effort_level column: {err}"))?;
-                Ok((id, level))
+        Ok(raw.into_iter()
+            .filter_map(|(id, effort)| match effort.parse::<EffortLevel>() {
+                Ok(level) => Some((id, level)),
+                Err(error) => {
+                    tracing::warn!(task_id = %id, %error, "corrupt effort_level; skipping this task's envelope");
+                    None
+                }
             })
-            .collect()
+            .collect())
     }
 
     /// Single-id form of [`Self::task_effort_levels`] for the timer-driven
@@ -135,9 +118,7 @@ impl WorkDb {
     /// visible row are absent from the result; the caller decides whether
     /// that means "gone" (see [`Self::work_item_row_missing`]) or "unknown".
     ///
-    /// The terminal-work sweep's per-pass replacement for one
-    /// [`Self::is_bound_work_item_closed`] (which was one full
-    /// [`Self::get_work_item`]) per live slot.
+    /// Supplies the terminal-work sweep with one status per live slot.
     pub fn task_closed_states(&self, ids: &[String]) -> Result<HashMap<String, bool>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
@@ -212,8 +193,7 @@ impl WorkDb {
     /// a recorded shell pid within `max_age_secs` — the pane-death sweep's
     /// restart-robust candidate set for a worker that outlived the state the
     /// engine recorded for it. Returns only the id / work item / status
-    /// triple the sweep consumes; the full-row predecessor mapped every
-    /// `work_executions` column for each candidate once a minute.
+    /// triple the sweep consumes.
     ///
     /// The latest-run, local-host, and `COALESCE(finished_at, created_at)`
     /// predicates deliberately match

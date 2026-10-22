@@ -1368,9 +1368,32 @@ async fn idle_polls_publish_telemetry_without_revalidating_the_root() {
         "an idle poll performed a root revalidation"
     );
     assert_eq!(registry.gauge_value("agent_jsonl_stream.items_per_pass"), Some(0));
-    assert!(registry.gauge_value("agent_jsonl_stream.tick_interval_ms").unwrap() >= 0);
+    assert_eq!(registry.gauge_value("agent_jsonl_stream.tick_interval_ms"), None);
 
     cancel_tx.send(StreamHalt::Cancel).unwrap();
     reader.read_to_end(&mut observed).await.unwrap();
     tail.await.unwrap().unwrap();
+}
+
+#[test]
+fn interleaved_tail_polls_do_not_charge_other_streams_or_discovery() {
+    let first = tail_fixture("thread-first-count");
+    let second = tail_fixture("thread-second-count");
+    let mut root_a = first.prepared.root.clone();
+    let mut root_b = second.prepared.root.clone();
+    root_a.isolate_revalidation_count();
+    root_b.isolate_revalidation_count();
+    let registry = Arc::new(crate::metrics::Registry::new());
+    crate::sweep_metrics::register_metrics(&registry);
+    let telemetry = StreamTelemetry::new(registry.clone());
+    let idle = telemetry.begin_poll(&root_a);
+    let active = telemetry.begin_poll(&root_b);
+    root_b.revalidate().unwrap();
+    first.prepared.root.revalidate().unwrap();
+    telemetry.finish_poll(&root_b, active);
+    assert_eq!(registry.counter_value("agent_jsonl_stream.root_revalidations"), Some(1));
+    telemetry.finish_poll(&root_a, idle);
+    assert_eq!(registry.counter_value("agent_jsonl_stream.root_revalidations"), Some(1));
+    assert_eq!(registry.gauge_value("agent_jsonl_stream.items_per_pass"), Some(0));
+    assert_eq!(registry.counter_value("agent_jsonl_stream.passes"), Some(2));
 }

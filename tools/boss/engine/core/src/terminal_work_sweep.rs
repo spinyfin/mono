@@ -299,8 +299,7 @@ struct GatheredCandidates {
 /// The synchronous half of a pass: inspect every live slot, decide whether
 /// it is a reap candidate, and collect the candidates. All DB work happens
 /// here — one execution point-read per slot plus ONE batched status read
-/// for every bound task (see `work/sweep_reads.rs`), instead of the full
-/// work-item projection the per-slot closedness check used to build. No
+/// for every bound task (see `work/sweep_reads.rs`). No
 /// awaits, so [`spawn_loop`] can run it on the blocking pool.
 fn gather_reap_candidates(
     work_db: &WorkDb,

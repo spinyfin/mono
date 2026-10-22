@@ -1,25 +1,8 @@
 //! Per-pass telemetry for the engine's background sweeps.
 //!
-//! Each sweep that showed up in the 2026-10-21 CPU sample (the envelope
-//! watchdog, the terminal-work reconciler, the agent-JSONL tail poll, and
-//! the execution-bookmark pointer snapshot/restore around mechanical and
-//! speculative rebases) publishes the same three gauges plus a pass
-//! counter through the existing metrics [`Registry`]:
-//!
-//! - `<sweep>.pass_duration_ms` — wall-clock of the most recent pass.
-//! - `<sweep>.items_per_pass` — how many rows / slots / files the most
-//!   recent pass touched (what the pass cost scales with).
-//! - `<sweep>.tick_interval_ms` — observed gap between the starts of the
-//!   two most recent passes, so a sweep that is ticking faster than its
-//!   configured interval (or a poll loop that is spinning) is visible
-//!   without a profiler.
-//! - `<sweep>.passes` — monotonic pass count; its rate is the tick rate.
-//!
-//! These answer "what does each pass cost, how often does it run, and how
-//! much work does it do" for an operator reading `bossctl metrics list`,
-//! which is what the sample-driven investigation had to reconstruct by
-//! hand. The values are observations, not budgets: nothing here changes a
-//! sweep's behaviour.
+//! Duration, item counts and pass counts describe the work performed.
+//! Periodic singleton sweeps also report the interval between pass starts.
+//! Concurrent tails and rebase operations do not have a shared cadence.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -78,11 +61,6 @@ crate::register_gauge!(
     "agent_jsonl_stream.items_per_pass",
     "JSONL-root revalidations (lstat + canonicalize) the most recent tail poll iteration performed.",
 );
-crate::register_gauge!(
-    AGENT_JSONL_STREAM_TICK_INTERVAL_MS,
-    "agent_jsonl_stream.tick_interval_ms",
-    "Milliseconds between the starts of the two most recent tail poll iterations of the same stream.",
-);
 crate::register_counter!(
     AGENT_JSONL_STREAM_PASSES,
     "agent_jsonl_stream.passes",
@@ -104,11 +82,6 @@ crate::register_gauge!(
     "execution_bookmark_pointers.items_per_pass",
     "Recovery-bookmark records the most recent pointer snapshot or restore covered.",
 );
-crate::register_gauge!(
-    EXECUTION_BOOKMARK_POINTERS_TICK_INTERVAL_MS,
-    "execution_bookmark_pointers.tick_interval_ms",
-    "Milliseconds between the starts of the two most recent pointer snapshot/restore passes.",
-);
 crate::register_counter!(
     EXECUTION_BOOKMARK_POINTERS_PASSES,
     "execution_bookmark_pointers.passes",
@@ -120,10 +93,33 @@ crate::register_counter!(
     "Total `jj` child processes spawned by recovery-pointer snapshot and restore passes since engine start.",
 );
 
+crate::register_gauge!(
+    DEAD_PANE_TERMINAL_PASS_DURATION_MS,
+    "dead_pane_terminal.pass_duration_ms",
+    "Wall-clock milliseconds of the most recent terminal execution scan and process probes.",
+);
+crate::register_gauge!(
+    DEAD_PANE_TERMINAL_ITEMS_PER_PASS,
+    "dead_pane_terminal.items_per_pass",
+    "Recent terminal execution rows probed by the most recent scan.",
+);
+crate::register_counter!(
+    DEAD_PANE_TERMINAL_PASSES,
+    "dead_pane_terminal.passes",
+    "Total terminal execution scans since engine start.",
+);
+pub(crate) static DEAD_PANE_TERMINAL: SweepTicker = SweepTicker::new(
+    &DEAD_PANE_TERMINAL_PASS_DURATION_MS,
+    &DEAD_PANE_TERMINAL_ITEMS_PER_PASS,
+    None,
+    &DEAD_PANE_TERMINAL_PASSES,
+);
+
 /// Register every handle this module declares. Called from
 /// [`crate::metrics_init::init_all`] at engine startup.
 pub fn register_metrics(registry: &Registry) {
     for ticker in [
+        &DEAD_PANE_TERMINAL,
         &ENVELOPE_WATCH,
         &TERMINAL_WORK_SWEEP,
         &AGENT_JSONL_STREAM,
@@ -131,7 +127,9 @@ pub fn register_metrics(registry: &Registry) {
     ] {
         registry.register_gauge(ticker.pass_duration_ms);
         registry.register_gauge(ticker.items_per_pass);
-        registry.register_gauge(ticker.tick_interval_ms);
+        if let Some(interval) = ticker.tick_interval_ms {
+            registry.register_gauge(interval);
+        }
         registry.register_counter(ticker.passes);
     }
     registry.register_counter(&AGENT_JSONL_STREAM_ROOT_REVALIDATIONS);
@@ -144,7 +142,7 @@ pub fn register_metrics(registry: &Registry) {
 pub(crate) struct SweepTicker {
     pass_duration_ms: &'static GaugeHandle,
     items_per_pass: &'static GaugeHandle,
-    tick_interval_ms: &'static GaugeHandle,
+    tick_interval_ms: Option<&'static GaugeHandle>,
     passes: &'static CounterHandle,
     last_pass_started: Mutex<Option<Instant>>,
 }
@@ -153,7 +151,7 @@ impl SweepTicker {
     const fn new(
         pass_duration_ms: &'static GaugeHandle,
         items_per_pass: &'static GaugeHandle,
-        tick_interval_ms: &'static GaugeHandle,
+        tick_interval_ms: Option<&'static GaugeHandle>,
         passes: &'static CounterHandle,
     ) -> Self {
         Self {
@@ -170,15 +168,15 @@ impl SweepTicker {
     /// [`PassTimer::finish`] records duration and item count.
     pub(crate) fn begin(&'static self, registry: &Registry) -> PassTimer {
         let now = Instant::now();
-        let previous = {
+        let previous = if self.tick_interval_ms.is_some() {
             let mut last = self
                 .last_pass_started
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             last.replace(now)
-        };
-        if let Some(previous) = previous {
-            self.tick_interval_ms
+        } else { None };
+        if let (Some(previous), Some(interval)) = (previous, self.tick_interval_ms) {
+            interval
                 .set(registry, saturating_ms(now.duration_since(previous)));
         }
         PassTimer {
@@ -214,25 +212,25 @@ fn saturating_ms(duration: std::time::Duration) -> i64 {
 pub(crate) static ENVELOPE_WATCH: SweepTicker = SweepTicker::new(
     &ENVELOPE_WATCH_PASS_DURATION_MS,
     &ENVELOPE_WATCH_ITEMS_PER_PASS,
-    &ENVELOPE_WATCH_TICK_INTERVAL_MS,
+    Some(&ENVELOPE_WATCH_TICK_INTERVAL_MS),
     &ENVELOPE_WATCH_PASSES,
 );
 pub(crate) static TERMINAL_WORK_SWEEP: SweepTicker = SweepTicker::new(
     &TERMINAL_WORK_SWEEP_PASS_DURATION_MS,
     &TERMINAL_WORK_SWEEP_ITEMS_PER_PASS,
-    &TERMINAL_WORK_SWEEP_TICK_INTERVAL_MS,
+    Some(&TERMINAL_WORK_SWEEP_TICK_INTERVAL_MS),
     &TERMINAL_WORK_SWEEP_PASSES,
 );
 pub(crate) static AGENT_JSONL_STREAM: SweepTicker = SweepTicker::new(
     &AGENT_JSONL_STREAM_PASS_DURATION_MS,
     &AGENT_JSONL_STREAM_ITEMS_PER_PASS,
-    &AGENT_JSONL_STREAM_TICK_INTERVAL_MS,
+    None,
     &AGENT_JSONL_STREAM_PASSES,
 );
 pub(crate) static EXECUTION_BOOKMARK_POINTERS: SweepTicker = SweepTicker::new(
     &EXECUTION_BOOKMARK_POINTERS_PASS_DURATION_MS,
     &EXECUTION_BOOKMARK_POINTERS_ITEMS_PER_PASS,
-    &EXECUTION_BOOKMARK_POINTERS_TICK_INTERVAL_MS,
+    None,
     &EXECUTION_BOOKMARK_POINTERS_PASSES,
 );
 
@@ -266,7 +264,7 @@ mod tests {
         for name in [
             "envelope_watch.pass_duration_ms",
             "terminal_work_sweep.items_per_pass",
-            "agent_jsonl_stream.tick_interval_ms",
+            "agent_jsonl_stream.items_per_pass",
             "execution_bookmark_pointers.pass_duration_ms",
         ] {
             assert_eq!(registry.gauge_value(name), Some(0), "{name}");

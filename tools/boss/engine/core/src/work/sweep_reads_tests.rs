@@ -337,3 +337,16 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
         single_elapsed / ROOTS as u32,
     );
 }
+
+#[test]
+fn corrupt_effort_does_not_disable_other_slots() {
+    let (_dir, db) = open_db();
+    let product = create_product(&db);
+    let valid = create_active_chore(&db, &product, "valid");
+    let corrupt = create_active_chore(&db, &product, "corrupt");
+    set_effort(&db, &valid, EffortLevel::Small);
+    db.connect().unwrap().execute("UPDATE tasks SET effort_level = 'invalid' WHERE id = ?1", params![corrupt]).unwrap();
+    let efforts = db.task_effort_levels(&[valid.clone(), corrupt.clone()]).unwrap();
+    assert_eq!(efforts.get(&valid), Some(&EffortLevel::Small));
+    assert!(!efforts.contains_key(&corrupt));
+}

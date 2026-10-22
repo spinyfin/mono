@@ -1272,20 +1272,20 @@ impl StreamTelemetry {
     /// Bracket one poll iteration. Returns the pass timer plus the
     /// root-revalidation count at iteration start, so
     /// [`Self::finish_poll`] can record how many the iteration performed.
-    fn begin_poll(&self) -> Option<(crate::sweep_metrics::PassTimer, u64)> {
+    fn begin_poll(&self, root: &crate::agent_jsonl_discovery::VerifiedRoot) -> Option<(crate::sweep_metrics::PassTimer, u64)> {
         let registry = self.registry.as_deref()?;
         Some((
             crate::sweep_metrics::AGENT_JSONL_STREAM.begin(registry),
-            crate::agent_jsonl_discovery::root_revalidation_count(),
+            root.revalidation_count(),
         ))
     }
 
-    fn finish_poll(&self, poll: Option<(crate::sweep_metrics::PassTimer, u64)>) {
+    fn finish_poll(&self, root: &crate::agent_jsonl_discovery::VerifiedRoot, poll: Option<(crate::sweep_metrics::PassTimer, u64)>) {
         let (Some(registry), Some((timer, revalidations_before))) = (self.registry.as_deref(), poll) else {
             return;
         };
         let revalidations =
-            crate::agent_jsonl_discovery::root_revalidation_count().saturating_sub(revalidations_before);
+            root.revalidation_count().saturating_sub(revalidations_before);
         crate::sweep_metrics::AGENT_JSONL_STREAM_ROOT_REVALIDATIONS.inc_by(registry, revalidations);
         timer.finish(registry, usize::try_from(revalidations).unwrap_or(usize::MAX));
     }
@@ -1342,6 +1342,8 @@ where
         mut file,
         identity: mut opened_identity,
     } = candidate;
+    let mut prepared = prepared;
+    prepared.root.isolate_revalidation_count();
     let mut offset = start_offset;
     let mut buffer = vec![0u8; FILE_CHUNK_BYTES];
 
@@ -1349,7 +1351,7 @@ where
         if *halt.borrow() == StreamHalt::Cancel {
             return Ok(());
         }
-        let poll = telemetry.begin_poll();
+        let poll = telemetry.begin_poll(&prepared.root);
 
         // The idle poll — nothing new on the descriptor, every 50ms per live
         // worker — costs one fstat and one lstat. Every pathname-level
@@ -1357,15 +1359,13 @@ where
         // directory, then the descriptor-vs-path identity re-walk) runs
         // only on the iterations that are about to publish bytes or a
         // delimiter, where it is what keeps a rename after validation from
-        // substituting a second file's bytes. The 2026-10-21 engine sample
-        // attributed ~15% of non-idle CPU to those re-walks on idle polls.
+        // substituting a second file's bytes.
         before_descriptor_read(&path)?;
         let opened_metadata = file
             .metadata()
             .map_err(|err| format!("metadata {}: {err}", path.display()))?;
         let size = opened_metadata.len();
         if size < offset {
-            prepared.root.revalidate()?;
             validate_descriptor_before_publish(&prepared, &path, &file, opened_identity)?;
             // Revalidate the restarted logical stream on this exact
             // descriptor before publishing either its prefix or a delimiter.
@@ -1375,7 +1375,7 @@ where
             record_delimiter(&map, 0, opened_identity)?;
             write_or_halt(&mut writer, b"\n", &mut halt).await?;
             offset = 0;
-            telemetry.finish_poll(poll);
+            telemetry.finish_poll(&prepared.root, poll);
             continue;
         }
         if size > offset {
@@ -1383,7 +1383,6 @@ where
             // by validate_candidate before consulting the pathname again. A
             // rename after validation cannot substitute bytes from a second
             // file: this runs before the read, and again after it below.
-            prepared.root.revalidate()?;
             validate_descriptor_before_publish(&prepared, &path, &file, opened_identity)?;
             file.seek(SeekFrom::Start(offset))
                 .map_err(|err| format!("seek {}: {err}", path.display()))?;
@@ -1410,7 +1409,7 @@ where
                 record_bytes(&map, offset, count as u64, opened_identity)?;
                 offset += count as u64;
                 write_or_halt(&mut writer, &buffer[..count], &mut halt).await?;
-                telemetry.finish_poll(poll);
+                telemetry.finish_poll(&prepared.root, poll);
                 continue;
             }
         }
@@ -1418,7 +1417,7 @@ where
         let path_metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                telemetry.finish_poll(poll);
+                telemetry.finish_poll(&prepared.root, poll);
                 tokio::select! {
                     _ = tokio::time::sleep(FILE_POLL) => continue,
                     changed = halt.changed() => {
@@ -1461,10 +1460,10 @@ where
             file = rotated.file;
             opened_identity = rotated.identity;
             offset = 0;
-            telemetry.finish_poll(poll);
+            telemetry.finish_poll(&prepared.root, poll);
             continue;
         }
-        telemetry.finish_poll(poll);
+        telemetry.finish_poll(&prepared.root, poll);
         tokio::select! {
             _ = tokio::time::sleep(FILE_POLL) => {}
             changed = halt.changed() => {

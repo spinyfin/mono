@@ -3,14 +3,9 @@
 //!
 //! ## What it guards against
 //!
-//! T298 ("Full national rolling-points PDF detail parse") ran well over an
-//! hour in a single worker session — a multi-table parse plus a seed path
-//! plus an all-lists validation sweep, shipped as one task. Two upstream
-//! guardrails now push breakdowns to arrive pre-split (the design-worker
-//! sizing contract) and reject monolithic proposals at plan time (the planner
-//! decomposition gate). This watchdog catches the briefs that slip past both:
-//! a *live* execution whose wall-clock has already blown past the envelope its
-//! effort class implies is very likely an under-decomposed row.
+//! A live execution whose wall-clock exceeds its effort-class envelope
+//! may need further decomposition. The watchdog complements the planner's
+//! decomposition gate and the design-worker sizing contract.
 //!
 //! ## Signal only — never interrupt
 //!
@@ -32,11 +27,7 @@
 //!
 //! Every pass an execution is observed over its envelope, the sweep also emits
 //! a structured `envelope-calibration` log line (actual duration vs the row's
-//! effort class) — the "simple audit log" the brief asks for, so the
-//! effort-heuristic and planner-sizing thresholds can be tuned against
-//! observed reality. (Per-execution *token* accounting has no source in the
-//! worker-session pipeline today; duration is the cost signal T298 showed
-//! dominates — ~42% of that run was model thinking time, not builds.)
+//! effort class), so sizing thresholds can be tuned against observed duration.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -50,10 +41,8 @@ use boss_timer_wheel::TimerWheel;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
 
-/// Default per-effort duration envelopes (seconds). Calibrated for opus/xhigh
-/// thinking time on the larger rows — the T298 analysis showed model
-/// thinking, not builds, dominates wall-clock, so these are generous. An
-/// execution still under its envelope is healthy; over it is the signal.
+/// Default per-effort duration envelopes (seconds), allowing for model
+/// thinking time as well as builds. Overruns produce a signal.
 ///
 /// `Max` deliberately has no envelope: it is the human-only "maximum
 /// reasoning depth regardless of scope" override, so a long run there is
@@ -171,10 +160,7 @@ impl crate::sweep_loop::SweepOutcome for EnvelopeSweepOutcome {
 /// once immediately on boot (so a run that overran before an engine restart is
 /// re-signalled at boot without waiting for the first interval).
 ///
-/// Each pass runs on the blocking pool: it is synchronous SQLite work, and
-/// running it inline on an async worker thread stalled every other task on
-/// that thread for the duration of the pass (visible on the 2026-10-21
-/// engine sample as multi-thread scheduler frames under the sweep).
+/// Each pass runs its synchronous SQLite work on the blocking pool.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
@@ -207,9 +193,7 @@ pub fn spawn_loop(
 /// deterministic tests.
 ///
 /// The pass is two-phase so its DB cost is one execution point-read per
-/// live slot plus ONE batched effort-level read for the whole pass, instead
-/// of the full work-item projection (revision chain, AI-review badge, …)
-/// per slot it used to build just to read `effort_level`.
+/// live slot plus one batched effort-level read for the whole pass.
 pub fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
@@ -297,7 +281,7 @@ fn load_slot<'a>(
     lookup_context: &str,
 ) -> Result<LoadedSlot<'a>, SlotOutcome> {
     // Only actively-working slots count toward the work-time envelope. A
-    // slot waiting for human input or idle is blocked on the operator,
+    // slot waiting for human input or idle is not consuming its compute envelope,
     // not overrunning on compute; `Spawning` has no `started_at` yet. A
     // long foreground build keeps the slot `Working`, and that time
     // legitimately counts against the envelope — so, unlike the stale
@@ -312,7 +296,7 @@ fn load_slot<'a>(
 
 /// One batched effort-level read for every work item a pass will evaluate.
 /// A failed batch degrades every slot to "no envelope" for this pass —
-/// the same answer the per-slot read used to give on a lookup error — and
+/// the safe response to a lookup error — and
 /// is logged once rather than once per slot.
 fn prefetch_efforts<'a>(
     work_db: &WorkDb,
@@ -469,7 +453,7 @@ pub fn spawn_timer_subscriber(
             // otherwise deadlines would grow unbounded for the process
             // lifetime once scheduling runs continuously.
             let mut scheduled_ids: HashSet<String> = HashSet::new();
-            reconcile_envelope_deadlines(&work_db, &live_states, &timer_wheel, &thresholds, &mut scheduled_ids);
+            scheduled_ids = reconcile_on_blocking_pool(&work_db, &live_states, &timer_wheel, thresholds, scheduled_ids).await;
 
             let mut reconcile_tick = tokio::time::interval(reconcile_interval);
             reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -486,15 +470,44 @@ pub fn spawn_timer_subscriber(
                             continue;
                         };
                         scheduled_ids.remove(&deadline_id);
-                        handle_timer_deadline(&work_db, &live_states, &thresholds, &deadline_id);
+                        let db = Arc::clone(&work_db);
+                        let states = Arc::clone(&live_states);
+                        if let Err(error) = crate::work::db_diagnostics::spawn_blocking(move || {
+                            handle_timer_deadline(&db, &states, &thresholds, &deadline_id);
+                        }).await {
+                            tracing::error!(?error, "envelope-watch: timer evaluation did not complete");
+                        }
                     }
                     _ = reconcile_tick.tick() => {
-                        reconcile_envelope_deadlines(&work_db, &live_states, &timer_wheel, &thresholds, &mut scheduled_ids);
+                        scheduled_ids = reconcile_on_blocking_pool(&work_db, &live_states, &timer_wheel, thresholds, scheduled_ids).await;
                     }
                 }
             }
         }
     })
+}
+
+async fn reconcile_on_blocking_pool(
+    work_db: &Arc<WorkDb>,
+    live_states: &Arc<LiveWorkerStateRegistry>,
+    timer_wheel: &Arc<TimerWheel>,
+    thresholds: EnvelopeThresholds,
+    scheduled_ids: HashSet<String>,
+) -> HashSet<String> {
+    let db = Arc::clone(work_db);
+    let states = Arc::clone(live_states);
+    let wheel = Arc::clone(timer_wheel);
+    let mut next_ids = scheduled_ids.clone();
+    match crate::work::db_diagnostics::spawn_blocking(move || {
+        reconcile_envelope_deadlines(&db, &states, &wheel, &thresholds, &mut next_ids);
+        next_ids
+    }).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(?error, "envelope-watch: deadline reconciliation did not complete");
+            scheduled_ids
+        }
+    }
 }
 
 /// Reconcile the timer-wheel against currently-live worker state: schedule a
