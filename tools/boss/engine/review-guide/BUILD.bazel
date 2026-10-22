@@ -15,6 +15,7 @@ rust_library(
     ],
     deps = [
         "//tools/boss/engine/pr-review-sources",
+        "//tools/boss/engine/pr-template",
     ] + all_crate_deps(normal = True),
 )
 
@@ -29,6 +30,7 @@ rust_test(
     ),
     deps = [
         "//tools/boss/engine/pr-review-sources",
+        "//tools/boss/engine/pr-template",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

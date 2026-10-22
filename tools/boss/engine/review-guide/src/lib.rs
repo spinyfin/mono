@@ -16,6 +16,8 @@
 
 use std::fmt;
 
+use boss_pr_template::{HeadingToken, parse_all_headings};
+
 mod update {
     //! Versioned incremental update contract, composed with the pinned guide contract.
     use crate::{PromptMetadata, render_prompt};
@@ -40,18 +42,16 @@ Immediately after the title, include a short, nonempty section headed exactly `#
     /// Updates add a sixth section before the five main sections. Check its position
     /// and content as well as existence; a mention in prose is not a section.
     pub fn validate_update_section(raw: &str) -> Result<(), &'static str> {
-        let sections: Vec<_> = super::markdown_lines(raw)
-            .filter(|(line, in_code)| !in_code && line.starts_with("## "))
-            .map(|(line, _)| line)
-            .collect();
-        let heading = "## Changed since the previous version";
-        if sections.first().copied() != Some(heading) || sections.len() < 6 {
+        let headings = super::parse_all_headings(raw);
+        let sections: Vec<_> = headings.iter().filter(|heading| heading.level == 2).collect();
+        if sections.first().map(|heading| heading.title.as_str()) != Some("Changed since the previous version")
+            || sections.len() < 6
+        {
             return Err(
                 "updated guide must begin with Changed since the previous version, followed by the five main sections including Evidence",
             );
         }
-        let content = raw.split_once(heading).map(|(_, rest)| rest).unwrap_or("");
-        if content.split("\n## ").next().unwrap_or("").trim().is_empty() {
+        if super::section_body(raw, &headings, sections[0]).trim().is_empty() {
             return Err("Changed since the previous version must describe the changes");
         }
         super::validate_evidence_section(raw)
@@ -77,6 +77,16 @@ Immediately after the title, include a short, nonempty section headed exactly `#
             let valid = "# Guide\n\n## Changed since the previous version\nFixed retry limits.\n## Problem\n## Fix\n## Walkthrough\n## Tests\n## Evidence\nNo validation results reported; no screenshots registered.";
             assert!(validate_update_section(valid).is_ok());
             assert!(validate_update_section(&valid.replace("Fixed retry limits.", "")).is_err());
+            assert!(validate_update_section(&valid.replace("Fixed retry limits.", "# Another title")).is_err());
+            assert!(validate_update_section(&valid.replace("## Changed since", "    ## Changed since")).is_err());
+            assert!(
+                validate_update_section(&valid.replace("Fixed retry limits.", "### Details\nFixed retry limits."))
+                    .is_ok()
+            );
+            assert!(
+                validate_update_section(&valid.replace("Fixed retry limits.", "```text\n## Output\npassed\n```"))
+                    .is_ok()
+            );
             assert!(
                 validate_update_section(&valid.replace("## Changed since the previous version", "## Changes")).is_err()
             );
@@ -310,14 +320,10 @@ impl fmt::Display for GuideValidationIssue {
 pub const MIN_SECTION_HEADINGS: usize = 5;
 
 fn validate_evidence_section(raw: &str) -> Result<(), &'static str> {
-    let mut lines = markdown_lines(raw).skip_while(|(line, in_code)| *in_code || line.trim() != "## Evidence");
-    if lines.next().is_some()
-        && lines
-            .take_while(|(line, in_code)| {
-                *in_code || (!line.trim_start().starts_with("# ") && !line.trim_start().starts_with("## "))
-            })
-            .any(|(line, _)| !line.trim().is_empty())
-    {
+    let headings = parse_all_headings(raw);
+    if headings.iter().any(|heading| {
+        heading.level == 2 && heading.title == "Evidence" && !section_body(raw, &headings, heading).trim().is_empty()
+    }) {
         Ok(())
     } else {
         Err("the guide must contain a nonempty `## Evidence` section")
@@ -359,16 +365,16 @@ pub fn validate_guide_output_with_resolver(
         return Err(vec![GuideValidationIssue::Empty]);
     }
 
-    let headings = markdown_headings(trimmed);
-    if !headings.iter().any(|(level, _)| *level == 1) {
+    let headings = parse_all_headings(raw);
+    if !headings.iter().any(|heading| heading.level == 1) {
         issues.push(GuideValidationIssue::MissingTitle);
     }
-    let section_count = headings.iter().filter(|(level, _)| *level == 2).count();
+    let section_count = headings.iter().filter(|heading| heading.level == 2).count();
     if section_count < MIN_SECTION_HEADINGS {
         issues.push(GuideValidationIssue::TooFewSections { found: section_count });
     }
 
-    if validate_evidence_section(trimmed).is_err() {
+    if validate_evidence_section(raw).is_err() {
         issues.push(GuideValidationIssue::MissingEvidence);
     }
 
@@ -387,45 +393,16 @@ pub fn validate_guide_output_with_resolver(
     }
 }
 
-/// `(level, text)` for every Markdown ATX heading (`# ` through `###### `)
-/// at the start of a line outside fenced code.
-fn markdown_headings(text: &str) -> Vec<(u8, &str)> {
-    markdown_lines(text)
-        .filter(|(_, in_code)| !in_code)
-        .filter_map(|(line, _)| {
-            let trimmed_start = line.trim_start();
-            let hashes = trimmed_start.chars().take_while(|c| *c == '#').count();
-            if hashes == 0 || hashes > 6 {
-                return None;
-            }
-            let rest = &trimmed_start[hashes..];
-            if !rest.starts_with(' ') && !rest.is_empty() {
-                return None;
-            }
-            Some((hashes as u8, rest.trim()))
-        })
-        .collect()
-}
-
-/// Keep code snippets from satisfying required prose headings. Retain the
-/// lines themselves so a section can still contain command/output fences.
-fn markdown_lines(text: &str) -> impl Iterator<Item = (&str, bool)> {
-    let mut fence: Option<(char, usize)> = None;
-    text.lines().map(move |line| {
-        let trimmed = line.trim_start();
-        let in_code = fence.is_some();
-        if let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
-            let count = trimmed.chars().take_while(|c| *c == marker).count();
-            match fence {
-                Some((open, length)) if marker == open && count >= length && trimmed[count..].trim().is_empty() => {
-                    fence = None;
-                }
-                None if count >= 3 => fence = Some((marker, count)),
-                _ => {}
-            }
-        }
-        (line, in_code || fence.is_some())
-    })
+/// A section includes nested headings and ends at the next peer or ancestor.
+fn section_body<'a>(raw: &'a str, headings: &[HeadingToken], heading: &HeadingToken) -> &'a str {
+    let start = raw[heading.start..]
+        .find('\n')
+        .map_or(raw.len(), |offset| heading.start + offset + 1);
+    let end = headings
+        .iter()
+        .find(|next| next.start > heading.start && next.level <= heading.level)
+        .map_or(raw.len(), |next| next.start);
+    &raw[start..end]
 }
 
 /// Every `https://github.com/...` href inside a Markdown link or bare
@@ -673,7 +650,9 @@ mod tests {
         for body in [
             format!("{without_evidence}## Notes\nUnrelated text."),
             format!("{without_evidence}## Evidence\n\n## Notes\nUnrelated text."),
+            format!("{without_evidence}## Evidence\n\n# Appendix\nUnrelated text."),
             format!("{without_evidence}## Evidence\n\n"),
+            format!("{without_evidence}    ## Evidence\n    Example only."),
             format!("{without_evidence}```markdown\n## Evidence\nExample only.\n```"),
             format!("{without_evidence}~~~markdown\n## Evidence\nExample only.\n~~~"),
         ] {

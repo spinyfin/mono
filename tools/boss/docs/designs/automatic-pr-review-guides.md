@@ -211,6 +211,8 @@ If the PR merges/closes before feedback submission or dispatch, keep the comment
 
 Use the following exact template as `review-guide-v8`, stored in the implementation crate with a content hash. Substitute only the metadata placeholders; supply the comparison manifest separately, and direct the model to read full file content and diffs itself from its pinned read-only workspace rather than embedding them. The evaluated baseline was the original four-section request through the worked-example paragraph. Version 8 adds the required Evidence section; this addition still needs live sampling. The remainder is the brief's unevaluated production addition, which the rollout validates. Revision-agent instructions above are a separate template.
 
+The engine also appends a `### Registered screenshots` manifest, resolved through the capture’s root across the full revision chain. It contains metadata only: attachment ID, caption, pixel dimensions, and image availability, with no URLs. Reclaimed images remain listed as unavailable; captions do not establish that the model inspected the images.
+
 ```text
 I want you to provide me a guided summary of the changes in {{PR_URL}}. The summary should break down as:
 
@@ -251,6 +253,8 @@ Submit the finished Markdown guide using `"$BOSS_BIN" propose review-guide --bod
 Template SHA-256 (UTF-8, excluding the fence and terminal newline): `6f5defccfc20ce0477b75d1eab2f173179633618091ad3508ab470f89bf388a3`.
 
 ### Diagnostics
+
+Structural validation requires a nonempty `## Evidence` section for initial guides as well as updates. Heading counts and section boundaries use the shared fence-aware Markdown tokenizer, so headings inside fenced or four-space-indented code cannot satisfy the requirement.
 
 Expose attempts through the existing execution/diagnostic surfaces, joined to series and source comparison. Record event-observed/queued/source-start/source-ready/model-start/model-end/validated/published times, queue time, source time, generation time, and total creation-or-update-to-publication time. If original creation time is unknown during catch-up, label latency from the catch-up observation; do not report it as creation latency. Separately measure click-to-render through the existing viewer timing instrumentation.
 

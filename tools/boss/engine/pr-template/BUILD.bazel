@@ -11,6 +11,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/pr-review:__pkg__",
+        "//tools/boss/engine/review-guide:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
 )

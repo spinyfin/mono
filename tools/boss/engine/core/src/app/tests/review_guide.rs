@@ -250,6 +250,11 @@ async fn guide_evidence_prompt_includes_root_and_revision_screenshots_without_ur
         .unwrap();
     let root_image = f.screenshot(&f.root, "Wide layout before the fix");
     let revision_image = f.screenshot(&revision, "Wide layout after the fix");
+    assert_eq!(
+        db.mark_attachments_reclaimed(std::slice::from_ref(&root_image))
+            .unwrap(),
+        1
+    );
     let unrelated = create_active_chore(db, &product, "Another change");
     let unrelated_image = f.screenshot(&unrelated, "Unrelated evidence");
     let attempt = f.generate("screenshots", false).await;
@@ -263,15 +268,15 @@ async fn guide_evidence_prompt_includes_root_and_revision_screenshots_without_ur
         .unwrap();
     let rows = manifest.as_array().unwrap();
     assert_eq!(rows.len(), 2);
-    for (id, caption) in [
-        (&root_image, "Wide layout before the fix"),
-        (&revision_image, "Wide layout after the fix"),
+    for (id, caption, available) in [
+        (&root_image, "Wide layout before the fix", false),
+        (&revision_image, "Wide layout after the fix", true),
     ] {
         let row = rows.iter().find(|row| row["id"] == *id).unwrap();
         assert_eq!(row["caption"], caption);
         assert_eq!(row["pixel_width"], 800);
         assert_eq!(row["pixel_height"], 600);
-        assert_eq!(row["image_available"], true);
+        assert_eq!(row["image_available"], available);
         assert_eq!(row.as_object().unwrap().len(), 5);
     }
     for absent in [
