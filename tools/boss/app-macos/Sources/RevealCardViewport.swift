@@ -22,6 +22,9 @@ struct RevealCardViewport: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { NSView() }
 
     func updateNSView(_ view: NSView, context: Context) {
+        if BossRevealCapture.viewportTargetID == cardID {
+            BossRevealCapture.targetViewport = view
+        }
         guard context.coordinator.generation != generation else { return }
         context.coordinator.generation = generation
         context.coordinator.poll?.cancel()
@@ -33,18 +36,7 @@ struct RevealCardViewport: NSViewRepresentable {
                 guard let view, let model,
                       model.revealGeneration == generation,
                       model.revealScrollTarget == cardID else { return }
-                guard let window = view.window, !window.isMiniaturized,
-                      window.isVisible || BossCaptureArgs.shared.isCaptureMode,
-                      !view.isHiddenOrHasHiddenAncestor,
-                      view.bounds.width > 1, view.bounds.height > 1 else { continue }
-                guard let board = model.revealBoardViewport, board.window === window else { continue }
-                let card = view.convert(view.bounds, to: nil)
-                let visible = view.convert(view.visibleRect, to: nil)
-                    .intersection(board.convert(board.visibleRect, to: nil))
-                // A card can be taller than the viewport. Its center and a
-                // substantial strip must be visible; a clipped sliver is not
-                // enough to claim the card was revealed.
-                guard Self.isVisible(card: card, clippedTo: visible) else { continue }
+                guard Self.isVisible(view: view, board: model.revealBoardViewport) else { continue }
                 model.confirmReveal(cardID: cardID, generation: generation)
                 return
             }
@@ -52,6 +44,20 @@ struct RevealCardViewport: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// Read live geometry, rather than a cached reveal-time visibility result.
+    static func isVisible(view: NSView, board: NSView?) -> Bool {
+        guard let window = view.window, !window.isMiniaturized,
+              window.isVisible || BossCaptureArgs.shared.isCaptureMode,
+              !view.isHiddenOrHasHiddenAncestor,
+              view.bounds.width > 1, view.bounds.height > 1,
+              let board, board.window === window else { return false }
+        let card = view.convert(view.bounds, to: nil)
+        let visible = view.convert(view.visibleRect, to: nil)
+            .intersection(board.convert(board.visibleRect, to: nil))
+        // Oversized cards must have their center and a substantial strip visible.
+        return isVisible(card: card, clippedTo: visible)
+    }
 
     static func isVisible(card: NSRect, clippedTo viewport: NSRect) -> Bool {
         let visible = card.intersection(viewport)

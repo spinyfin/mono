@@ -23,11 +23,15 @@ import UpdateCore
 ///   `--capture-reveal-refresh-touch-target` (bump the revealed card, which
 ///   moves it to the top of Review ▸ Pending) or
 ///   `--capture-reveal-refresh-touch-index=<index>` (bump one chosen card).
+/// - `--capture-reveal-collapsed` starts with collapsible sections closed;
+///   fails if the target does not belong to a collapsible section.
 /// - `--capture-dump-scroll` prints every scroll view's visible rect and
 ///   document size every half second and at capture time.
 @MainActor
 enum BossRevealCapture {
     private static var window: NSWindow?
+    static private(set) var viewportTargetID: String?
+    static weak var targetViewport: NSView?
     static var state: String? {
         guard BossCaptureArgs.shared.isCaptureMode, BossEnginePaths.isIsolatedInstance else { return nil }
         return CommandLine.arguments.first { $0.hasPrefix("--capture-reveal-state=") }
@@ -119,10 +123,18 @@ enum BossRevealCapture {
             product: product, projects: [], tasks: [], chores: rows,
             taskRuntimes: runtimes, dependencies: [], ideas: []
         ))
+        viewportTargetID = targetID
+        targetViewport = nil
+        let collapsed = CommandLine.arguments.contains("--capture-reveal-collapsed")
+        let sections = WorkBoardColumnKey.allCases.flatMap { model.workSections(in: $0) }
+        if collapsed && !sections.contains(where: { $0.isCollapsible && $0.items.contains { $0.id == targetID } }) {
+            fputs("collapsed reveal fixture requires a target in a collapsible section\n", stderr)
+            exit(1)
+        }
         for column in WorkBoardColumnKey.allCases {
             for section in model.workSections(in: column) where section.isCollapsible {
                 BossDefaults.store.set(
-                    section.defaultExpanded,
+                    collapsed ? section.defaultExpanded : false,
                     forKey: WorkBoardSectionCollapse.storageKey(sectionID: section.id)
                 )
             }
@@ -138,7 +150,7 @@ enum BossRevealCapture {
             .environmentObject(model).environmentObject(updateModel))
         window = captureWindow
         captureWindow.contentView?.layoutSubtreeIfNeeded()
-        // Let the real board mount with its target section collapsed first.
+        // Let the real board mount, including the optional collapsed target section.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             model.revealWorkCard(targetID, productID: product.id) { result in
                 switch result {
@@ -157,8 +169,8 @@ enum BossRevealCapture {
                     for i in 0..<refreshes {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4 + Double(i) * 0.4) {
                             var refreshed = rows
-                            let stamp = ISO8601DateFormatter().string(from: Date())
-                            if touch {
+                            let stamp = ISO8601DateFormatter().string(from: Date().addingTimeInterval(Double(i + 1)))
+                            if touch && (!touchTarget || i > 0) {
                                 // Mimic activity on a few other PRs so Pending's
                                 // recency order changes around the target.
                                 for j in stride(from: i, to: refreshed.count, by: 7) where refreshed[j].id != targetID {
@@ -177,6 +189,7 @@ enum BossRevealCapture {
                                 // the top of Pending.
                                 refreshed[index].updatedAt = stamp
                             }
+                            rows = refreshed
                             print("applying simulated work-tree refresh \(i + 1) touch=\(touch)")
                             model.applyEventForTest(.workTree(
                                 product: product, projects: [], tasks: [], chores: refreshed,
@@ -184,17 +197,26 @@ enum BossRevealCapture {
                             ))
                         }
                     }
+                    // Wait for every refresh plus layout, even with the default settle argument.
+                    let captureDelay = max(settle, Double(refreshes) * 0.4 + 0.5)
                     let t0 = Date()
                     @MainActor func tick() {
                         BossWindowCapture.dumpScrollOffsets(
                             in: captureWindow.contentView,
                             label: String(format: "t+%.1fs", Date().timeIntervalSince(t0)))
-                        if Date().timeIntervalSince(t0) < settle - 0.4 {
+                        if Date().timeIntervalSince(t0) < captureDelay - 0.4 {
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { tick() }
                         }
                     }
                     tick()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + settle) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + captureDelay) {
+                        captureWindow.contentView?.layoutSubtreeIfNeeded()
+                        guard let probe = targetViewport,
+                              RevealCardViewport.isVisible(view: probe, board: model.revealBoardViewport) else {
+                            fputs("revealed card left the viewport after refreshes: \(targetID)\n", stderr)
+                            exit(1)
+                        }
+                        print("verified \(targetID) remains visible after \(refreshes) refreshes")
                         do {
                             try BossWindowCapture.captureWindow(captureWindow, to: path)
                             NSApp.terminate(nil)
