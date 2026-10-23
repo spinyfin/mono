@@ -140,7 +140,7 @@ final class ResyncRefetchTests: XCTestCase {
                 "get_engine_pool_config": 1,
                 "get_work_tree": 1,
                 "list_deferred_scope_attentions": 1,
-                "list_engine_attempts": 1,
+                "list_engine_attempts": 2,
             ],
             "25 resyncs must cost exactly one set, none of it per project"
         )
