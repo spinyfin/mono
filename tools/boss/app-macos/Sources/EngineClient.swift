@@ -279,6 +279,11 @@ final class EngineClient: @unchecked Sendable {
     /// no behaviour change.
     var outboundRecorder: (([String: Any]) -> Void)?
 
+    /// Called with the product id each time a `get_work_tree` is issued, from
+    /// whichever thread issued it. `ChatViewModel` uses it to order tree reads
+    /// against runtime patches (`BoardReadFence`); it is set once at start-up.
+    var onWorkTreeRequested: ((String) -> Void)?
+
     /// Test-only: report sends as accepted without a socket, so view-model
     /// tests can exercise the connected path.
     var simulateConnectedForTesting = false
@@ -774,7 +779,12 @@ final class EngineClient: @unchecked Sendable {
             if eventType == "work_invalidated" {
                 let productId = eventPayload["product_id"] as? String
                 let itemIds = eventPayload["item_ids"] as? [String] ?? []
-                emit(.workInvalidated(topic: topic, productId: productId, itemIds: itemIds))
+                emit(.workInvalidated(
+                    topic: topic,
+                    productId: productId,
+                    itemIds: itemIds,
+                    invalidationClass: InvalidationClass(wire: eventPayload["class"] as? String)
+                ))
             } else if eventType == "resync_required" {
                 emit(.resyncRequired)
             }
@@ -838,6 +848,30 @@ final class EngineClient: @unchecked Sendable {
                 attentionMembers: (payload["attention_members"] as? [[String: Any]] ?? []).compactMap(parseAttention),
                 plannerRuns: (payload["planner_runs"] as? [[String: Any]] ?? [])
                     .compactMap { decodeWire(PlannerRunSummary.self, from: $0) }
+            ))
+        case "work_runtime_patch":
+            guard let productId = payload["product_id"] as? String else {
+                emit(.error(message: "received invalid work runtime patch from engine"))
+                break
+            }
+            var cards: [WorkRuntimePatchCard] = []
+            var isComplete = true
+            for entry in payload["items"] as? [[String: Any]] ?? [] {
+                if let itemPayload = entry["item"] as? [String: Any],
+                   let item = parseWorkItem(itemPayload),
+                   let runtimePayload = entry["runtime"] as? [String: Any],
+                   let runtime = parseTaskRuntime(runtimePayload)
+                {
+                    cards.append(WorkRuntimePatchCard(item: item, runtime: runtime))
+                } else {
+                    isComplete = false
+                }
+            }
+            emit(.workRuntimePatch(
+                productId: productId,
+                cards: cards,
+                absent: payload["absent"] as? [String] ?? [],
+                isComplete: isComplete
             ))
         case "work_item_created":
             guard let itemPayload = payload["item"] as? [String: Any],

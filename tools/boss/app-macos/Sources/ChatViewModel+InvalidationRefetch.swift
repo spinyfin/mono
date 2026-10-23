@@ -15,12 +15,22 @@ struct RefetchScope: OptionSet, Sendable {
     static let executions = RefetchScope(rawValue: 1 << 2)
     /// The event-triggered `list_engine_attempts` background-work poll.
     static let backgroundWork = RefetchScope(rawValue: 1 << 3)
+    /// `get_work_runtime_patch` for the invalidated cards, in place of the
+    /// tree. Only a burst with no `.tree` in it sends one; see
+    /// `ChatViewModel+RuntimePatch.swift`.
+    static let runtimePatch = RefetchScope(rawValue: 1 << 4)
 
     /// A reorder, delete or planner action: only the board moved.
     static let treeOnly: RefetchScope = [.tree]
     /// A `work_invalidated` push for the product on screen: anything it
     /// could have covered.
     static let invalidation: RefetchScope = [.tree, .deferredScope, .executions, .backgroundWork]
+    /// A runtime-class `work_invalidated` push for the product on screen: the
+    /// named cards' runtime changed and nothing about the board's shape, so
+    /// the board is not re-read. The side lists a structural push also fetches
+    /// are left out because no runtime-class writer touches them: the
+    /// deferred-scope list changes only when a run ends, which is structural.
+    static let runtimeInvalidation: RefetchScope = [.runtimePatch, .executions, .backgroundWork]
     /// A `work_invalidated` push for a product that is not on screen: only
     /// the lazily loaded data that is not tied to the board.
     static let offBoard: RefetchScope = [.executions, .backgroundWork]
@@ -72,15 +82,23 @@ extension ChatViewModel {
     /// changed under you": a `work_invalidated` push, or a `resync_required`
     /// that says pushes were dropped (`includesAllOpenConsumers`). Pass the
     /// product the invalidation belongs to, or `nil` when it names none.
+    ///
+    /// A push classed `.runtime` that names the cards it changed joins the
+    /// burst as a patch request. Anything else on the board — a structural
+    /// push, a push that names nothing, a dropped one — is a whole-board
+    /// read, and one such trigger makes the whole burst one: the burst sends
+    /// its union, so a runtime push can never hide a structural one.
     func scheduleInvalidationRefetch(
         productID: String?,
         itemIDs: [String] = [],
-        includesAllOpenConsumers: Bool = false
+        includesAllOpenConsumers: Bool = false,
+        invalidationClass: InvalidationClass = .structural
     ) {
         let onBoard = productID != nil && productID == currentSelectedProductID
+        let patchable = onBoard && invalidationClass == .runtime && !itemIDs.isEmpty && !includesAllOpenConsumers
         scheduleRefetch(
             productID: productID ?? Self.unscopedRefetchKey,
-            scope: onBoard ? .invalidation : .offBoard,
+            scope: patchable ? .runtimeInvalidation : onBoard ? .invalidation : .offBoard,
             flow: .invalidationRefetch,
             itemIDs: itemIDs,
             includesAllOpenConsumers: includesAllOpenConsumers
@@ -121,6 +139,10 @@ extension ChatViewModel {
         guard let burst = pendingRefetchBursts.removeValue(forKey: productID) else { return }
         if burst.scope.contains(.tree) {
             engine.sendGetWorkTree(productId: productID, flow: burst.flow)
+        } else if burst.scope.contains(.runtimePatch), productID == currentSelectedProductID {
+            // The user may have switched products since the trigger; the
+            // switch fetched the new product's tree itself.
+            requestRuntimePatch(productID: productID, itemIDs: burst.itemIDs)
         }
         // The user may have switched products since the trigger; the switch
         // fetched the new product's list itself.

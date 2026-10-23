@@ -1,5 +1,30 @@
 import Foundation
 
+/// How much of a product's board one `work_invalidated` push can have
+/// changed. Mirrors `boss_protocol::InvalidationClass`; the engine chooses it
+/// where it publishes.
+enum InvalidationClass: Equatable, Sendable {
+    /// A card may have been added, removed, moved or re-wired, or the writer
+    /// does not say otherwise: re-read the whole board. This is also what a
+    /// push without a class (an older engine) and an unknown class mean.
+    case structural
+    /// Only runtime fields of the named cards changed (dispatch wait, PR poll
+    /// state, merge-queue position, doc pointer): the named cards can be
+    /// re-read alone.
+    case runtime
+
+    init(wire: String?) {
+        self = wire == "runtime" ? .runtime : .structural
+    }
+}
+
+/// One card of a `work_runtime_patch` reply, with the runtime the board tree
+/// would have carried for it.
+struct WorkRuntimePatchCard {
+    let item: WorkItemPayload
+    let runtime: WorkTaskRuntime
+}
+
 enum EngineEvent {
     case connected
     case disconnected
@@ -11,7 +36,13 @@ enum EngineEvent {
     /// `ChatViewModel+ResyncRefetch.swift`), silently, with no
     /// connection-lost UI.
     case resyncRequired
-    case workInvalidated(topic: String, productId: String?, itemIds: [String])
+    case workInvalidated(topic: String, productId: String?, itemIds: [String], invalidationClass: InvalidationClass = .structural)
+    /// Reply to `get_work_runtime_patch`: the named cards, and the rest of
+    /// each one's revision chain, re-read without a board assembly. `absent`
+    /// lists requested ids that are no longer live cards of the product.
+    /// `isComplete` is false when a card in the reply could not be decoded:
+    /// the consumer must not trust such a patch.
+    case workRuntimePatch(productId: String, cards: [WorkRuntimePatchCard], absent: [String], isComplete: Bool)
     case appSessionRegistered
     case engineRequest(requestId: String, request: EngineRequestKind)
     case productsList(products: [WorkProduct])

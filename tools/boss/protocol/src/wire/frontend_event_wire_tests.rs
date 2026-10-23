@@ -2520,6 +2520,15 @@ fn work_invalidated_without_a_class_decodes_as_structural() {
 }
 
 #[test]
+fn merging_invalidation_classes_lets_structural_win() {
+    use InvalidationClass::{Runtime, Structural};
+    assert_eq!(Runtime.merge(Runtime), Runtime);
+    assert_eq!(Runtime.merge(Structural), Structural);
+    assert_eq!(Structural.merge(Runtime), Structural);
+    assert_eq!(Structural.merge(Structural), Structural);
+}
+
+#[test]
 fn get_work_runtime_patch_request_pins_wire_names() {
     let v = serde_json::to_value(FrontendRequest::GetWorkRuntimePatch {
         product_id: "prod_1".into(),

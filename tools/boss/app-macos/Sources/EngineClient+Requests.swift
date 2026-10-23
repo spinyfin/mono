@@ -296,12 +296,24 @@ extension EngineClient {
         // stamp it on its `engine-population-timing-*.jsonl` segments and the
         // two sides join on `(product_id, fetch_seq)`.
         let fetchSeq = PopulationTiming.shared.fetchIssued(productId: productId, flow: flow)
+        onWorkTreeRequested?(productId)
         sendLine([
             "type": "get_work_tree",
             "delta": true,
             "product_id": productId,
             "fetch_seq": fetchSeq,
         ], queueIfDisconnected: true)
+    }
+
+    /// Re-read a few cards of `productId` (and their revision chains) without
+    /// the engine assembling the board: the answer to a runtime-class
+    /// `work_invalidated` push. Replies with `work_runtime_patch`.
+    func sendGetWorkRuntimePatch(productId: String, itemIds: [String]) {
+        sendLine([
+            "type": "get_work_runtime_patch",
+            "product_id": productId,
+            "item_ids": itemIds,
+        ])
     }
 
     /// Accept an open `deferred_scope` attention item without filing a

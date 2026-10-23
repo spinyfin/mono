@@ -2888,7 +2888,7 @@ mod events;
 pub use events::FrontendEvent;
 
 mod invalidation;
-pub use invalidation::{InvalidationClass, WorkRuntimePatchItem};
+pub use invalidation::{InvalidationClass, MAX_RUNTIME_PATCH_ITEMS, WorkRuntimePatchItem};
 
 // Feature-flag / setting snapshots and workspace / worker pool summary
 // rows live in the `snapshot_wire` submodule (extracted to keep this file
