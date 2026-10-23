@@ -1019,12 +1019,23 @@ impl LiveWorkerStateRegistry {
     /// or `None` if no driver-originated event has been recorded (and none
     /// was restored on re-adoption).
     pub fn semantic_progress_for_slot(&self, slot_id: u8) -> Option<SemanticProgressCheckpoint> {
-        self.capture_semantic_progress(slot_id)
+        self.capture_semantic_progress(slot_id, None)
     }
 
-    fn capture_semantic_progress(&self, slot_id: u8) -> Option<SemanticProgressCheckpoint> {
+    /// Clone the slot's checkpoint under one brief registry lock. With
+    /// `expect_run_id`, a slot that now belongs to a different run (released
+    /// and re-leased since the caller applied its event) yields `None`
+    /// rather than the new occupant's state.
+    fn capture_semantic_progress(
+        &self,
+        slot_id: u8,
+        expect_run_id: Option<&str>,
+    ) -> Option<SemanticProgressCheckpoint> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard.get(&slot_id).and_then(|entry| {
+            if expect_run_id.is_some_and(|run_id| entry.state.run_id != run_id) {
+                return None;
+            }
             Some(SemanticProgressCheckpoint {
                 progress_at: entry.meta.semantic_progress_at.clone()?,
                 tool_condition: entry.meta.semantic_tool_condition,
@@ -1040,13 +1051,18 @@ impl LiveWorkerStateRegistry {
     /// database connection, whose holders (dispatch's live-run check) in
     /// turn take the registry mutex. Do not re-enter this method from
     /// `consume`.
+    ///
+    /// The checkpoint is captured only while `slot_id` still belongs to
+    /// `run_id`; otherwise `consume` sees `None` so one run's state is never
+    /// written to another run's row.
     pub fn with_semantic_progress<R>(
         &self,
         slot_id: u8,
+        run_id: &str,
         consume: impl FnOnce(Option<SemanticProgressCheckpoint>) -> R,
     ) -> R {
         let _persist = self.serial.persist.lock().unwrap_or_else(|e| e.into_inner());
-        let checkpoint = self.capture_semantic_progress(slot_id);
+        let checkpoint = self.capture_semantic_progress(slot_id, Some(run_id));
         consume(checkpoint)
     }
 
