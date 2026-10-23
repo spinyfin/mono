@@ -128,8 +128,8 @@ extension ChatViewModel {
                 itemIDs: itemIDs,
                 invalidationClass: invalidationClass
             )
-        case .workRuntimePatch(let productId, let cards, let absent, let isComplete):
-            handleWorkRuntimePatch(productID: productId, cards: cards, absent: absent, isComplete: isComplete)
+        case .workRuntimePatch(let productId, let cards, let absent, let isComplete, let requestID, let revision):
+            handleWorkRuntimePatch(productID: productId, cards: cards, absent: absent, isComplete: isComplete, requestID: requestID, revision: revision)
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
             let activeIDs = Set(activeProducts.map(\.id))
@@ -153,7 +153,8 @@ extension ChatViewModel {
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
             projectsByProductID[productId] = projects.sorted(by: projectSort)
-        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas, let attentionItems, let attentionGroups, let attentionMembers, let plannerRuns):
+        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas, let attentionItems, let attentionGroups, let attentionMembers, let plannerRuns, let requestID, let revision):
+            guard acceptWorkTree(productID: product.id, requestID: requestID, revision: revision) else { return }
             applyWorkTree(
                 product: product,
                 projects: projects,
@@ -171,7 +172,8 @@ extension ChatViewModel {
             handleCreatedWorkItem(item)
         case .workItemsCreated(let items):
             handleCreatedWorkItemsBatch(items)
-        case .workItemUpdated(let item):
+        case .workItemUpdated(let item, let revision):
+            noteBoardRevision(revision, item: item)
             handleUpdatedWorkItem(item)
         case .projectTasksReordered(let projectId, _):
             if let productID = project(withID: projectId)?.productID {
@@ -188,9 +190,7 @@ extension ChatViewModel {
         case .operatorQuestionError(let message, let requestId):
             handleOperatorQuestionError(message: message, requestId: requestId)
         case .workError(let message, let requestId):
-            // The error names no request: a patch in flight may be the one that
-            // failed, and nothing else would re-read its cards.
-            failInFlightRuntimePatches()
+            failBoardRead(requestID: requestId)
             if settleOffsiteBackupError(message, requestID: requestId) { return }
             // An error carrying the answer's own request id is not ambiguous:
             // settle it onto that card without blaming any other request.

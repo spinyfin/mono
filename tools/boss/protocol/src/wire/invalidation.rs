@@ -1,6 +1,5 @@
 //! Typed work-board invalidation classes and the runtime patch that answers a
-//! runtime-class one (hub-and-spoke design §2.4). Split out of `wire.rs` to
-//! keep it under the repo's file-size check (CHECKS.yaml `file/size`).
+//! runtime-class invalidation (hub-and-spoke design §2.4).
 
 use super::*;
 
@@ -15,17 +14,18 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvalidationClass {
-    /// Membership, lanes, projects, dependencies, attentions or deletion may
-    /// have changed, or the writer is not known to be one-card. Consumers
-    /// re-read the whole product board. This is the wire default, so a push
-    /// from an engine that predates the field is handled as it always was.
-    #[default]
-    Structural,
     /// Only runtime fields of the named cards changed (dispatch wait, PR poll
     /// state, merge-queue position, doc pointer): no card was added,
     /// removed, re-parented or re-statused, and no dependency edge moved.
     /// Consumers may re-read just the named cards.
     Runtime,
+    /// Membership, lanes, projects, dependencies, attentions or deletion may
+    /// have changed, or the writer is not known to be one-card. Consumers
+    /// re-read the whole product board. This is the wire default, so a push
+    /// from an engine that predates the field is handled as it always was.
+    #[default]
+    #[serde(other)]
+    Structural,
 }
 
 /// The most cards one runtime-class push (or one runtime-only burst of them)

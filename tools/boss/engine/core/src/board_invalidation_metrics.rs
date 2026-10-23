@@ -1,12 +1,8 @@
 //! Counters for board invalidation traffic and the work it causes
 //! (hub-and-spoke design §2.4).
 //!
-//! The `work invalidation fanout` tracing record says what was published, but
-//! it is a log line: nothing counted pushes by kind, and nothing counted the
-//! product-wide assemblies they cause. These counters make the runtime versus
-//! structural split measurable on a live engine and in the invalidation
-//! fixture: pushes by `(source, class)`, full board assemblies, and runtime
-//! patches served.
+//! Measures pushes by source and class, full board assemblies, and runtime
+//! patches served, both on a live engine and in invalidation fixtures.
 //!
 //! Names are keyed by source and class, so they are registered on first use
 //! ([`Registry::counter_inc_by_dynamic`]) rather than as static handles;
@@ -65,11 +61,13 @@ pub fn record_runtime_patch(registry: &Registry, cards: usize) {
 }
 
 /// Pushes recorded for `(source, class)`, or zero.
+#[cfg(test)]
 pub fn pushes(registry: &Registry, source: &str, class: InvalidationClass) -> u64 {
     registry.counter_value(&push_counter(source, class)).unwrap_or(0)
 }
 
 /// Pushes recorded for `class` across every source, or zero.
+#[cfg(test)]
 pub fn pushes_of_class(registry: &Registry, class: InvalidationClass) -> u64 {
     [SOURCE_MUTATION, SOURCE_BATCH_MUTATION, SOURCE_EXECUTION]
         .into_iter()
@@ -77,10 +75,12 @@ pub fn pushes_of_class(registry: &Registry, class: InvalidationClass) -> u64 {
         .sum()
 }
 
+#[cfg(test)]
 pub fn full_assemblies(registry: &Registry) -> u64 {
     registry.counter_value(FULL_ASSEMBLIES).unwrap_or(0)
 }
 
+#[cfg(test)]
 pub fn runtime_patches(registry: &Registry) -> u64 {
     registry.counter_value(RUNTIME_PATCHES).unwrap_or(0)
 }

@@ -1,43 +1,21 @@
 import Foundation
 
-/// Ordering state for the board reads one product has outstanding: the
-/// whole-board `get_work_tree` and the few-card `get_work_runtime_patch`.
-///
-/// The two are served concurrently and the patch is far cheaper, so without
-/// an order a slow tree that started before a write could land after the
-/// patch that carries it and put the older card back. Two rules prevent that,
-/// and neither depends on the engine's reply order:
-///
-/// - a patch is never sent while a tree is outstanding for the product, and a
-///   tree request supersedes a patch already in flight (its reply is
-///   dropped; the tree started later, so it reads at least as much);
-/// - at most one patch is in flight per product. Ids that arrive meanwhile
-///   wait, and go out together when its reply lands.
-///
-/// A request whose reply never comes (an error carries no request id) must
-/// not wedge the product, so an outstanding request older than
-/// `staleAfter` is treated as lost.
+/// Request identities and snapshot watermark for one product's board.
+/// Expired reads are retired individually; their late replies cannot mutate state.
 struct BoardReadFence {
     static let staleAfter: Duration = .seconds(30)
-
-    /// `get_work_tree` requests sent and not yet answered.
-    var treeRequestsOutstanding = 0
-    var lastTreeRequestAt: ContinuousClock.Instant?
-    var patchInFlight = false
+    var trees: [String: ContinuousClock.Instant] = [:]
+    var patchRequestID: String?
     var patchSentAt: ContinuousClock.Instant?
-    /// A tree was requested after the patch in flight was; drop its reply.
     var patchSuperseded = false
-    /// Cards that asked for a patch while one was in flight.
     var queuedPatchItemIDs: Set<String> = []
+    var revision: UInt64 = 0
 
-    func hasTreeOutstanding(now: ContinuousClock.Instant) -> Bool {
-        guard treeRequestsOutstanding > 0, let last = lastTreeRequestAt else { return false }
-        return last.duration(to: now) < Self.staleAfter
-    }
-
-    func hasPatchOutstanding(now: ContinuousClock.Instant) -> Bool {
-        guard patchInFlight, let sent = patchSentAt else { return false }
-        return sent.duration(to: now) < Self.staleAfter
+    mutating func expire(now: ContinuousClock.Instant = .now) {
+        trees = trees.filter { $0.value.duration(to: now) < Self.staleAfter }
+        if let sent = patchSentAt, sent.duration(to: now) >= Self.staleAfter {
+            patchRequestID = nil
+        }
     }
 }
 
@@ -58,30 +36,50 @@ extension ChatViewModel {
 
     /// Hear every `get_work_tree` the client sends, wherever it is sent from.
     func bindBoardReadObserver() {
-        engine.onWorkTreeRequested = { [weak self] productID in
+        engine.onWorkTreeRequested = { [weak self] productID, requestID in
             if Thread.isMainThread {
-                MainActor.assumeIsolated { self?.noteWorkTreeRequested(productID: productID) }
+                MainActor.assumeIsolated { self?.noteWorkTreeRequested(productID: productID, requestID: requestID) }
             } else {
-                Task { @MainActor in self?.noteWorkTreeRequested(productID: productID) }
+                Task { @MainActor in self?.noteWorkTreeRequested(productID: productID, requestID: requestID) }
             }
         }
     }
 
-    func noteWorkTreeRequested(productID: String) {
+    func noteWorkTreeRequested(productID: String, requestID: String) {
         var fence = boardReadFences[productID] ?? BoardReadFence()
-        fence.treeRequestsOutstanding += 1
-        fence.lastTreeRequestAt = .now
-        if fence.patchInFlight {
-            fence.patchSuperseded = true
-        }
-        // The tree reads every card, so it covers whatever was waiting.
+        fence.expire()
+        fence.trees[requestID] = .now
+        if fence.patchRequestID != nil { fence.patchSuperseded = true }
         fence.queuedPatchItemIDs.removeAll()
         boardReadFences[productID] = fence
     }
 
-    func noteWorkTreeApplied(productID: String) {
-        guard var fence = boardReadFences[productID], fence.treeRequestsOutstanding > 0 else { return }
-        fence.treeRequestsOutstanding -= 1
+    func acceptWorkTree(productID: String, requestID: String?, revision: UInt64?) -> Bool {
+        var fence = boardReadFences[productID] ?? BoardReadFence()
+        let known = requestID.map { fence.trees.removeValue(forKey: $0) != nil } ?? true
+        let fresh = revision.map { $0 >= fence.revision } ?? true
+        if known && fresh { fence.revision = revision ?? fence.revision }
+        boardReadFences[productID] = fence
+        if known && !fresh && productID == currentSelectedProductID {
+            refetchBoard(productID: productID)
+        }
+        return known && fresh
+    }
+
+    func noteBoardRevision(_ revision: UInt64?, item: WorkItemPayload) {
+        let productID: String
+        switch item {
+        case .product(let product): productID = product.id
+        case .project(let project): productID = project.productID
+        case .task(let task), .chore(let task): productID = task.productID
+        }
+        noteBoardRevision(revision, productID: productID)
+    }
+
+    func noteBoardRevision(_ revision: UInt64?, productID: String) {
+        guard let revision else { return }
+        var fence = boardReadFences[productID] ?? BoardReadFence()
+        fence.revision = max(fence.revision, revision)
         boardReadFences[productID] = fence
     }
 
@@ -91,16 +89,18 @@ extension ChatViewModel {
         boardReadFences.removeAll()
     }
 
-    /// An error reply carries no request id. If a patch was in flight it may
-    /// be the one that failed, and nothing else would ever re-read its cards.
-    func failInFlightRuntimePatches() {
-        for (productID, fence) in boardReadFences where fence.patchInFlight {
-            var failed = fence
-            failed.patchInFlight = false
-            failed.patchSuperseded = false
-            failed.queuedPatchItemIDs.removeAll()
-            boardReadFences[productID] = failed
-            if productID == currentSelectedProductID {
+    /// Settle only the read named by the error envelope.
+    func failBoardRead(requestID: String?) {
+        guard let requestID else { return }
+        for (productID, var fence) in boardReadFences {
+            fence.trees.removeValue(forKey: requestID)
+            let patchFailed = fence.patchRequestID == requestID
+            if patchFailed {
+                fence.patchRequestID = nil
+                fence.queuedPatchItemIDs.removeAll()
+            }
+            boardReadFences[productID] = fence
+            if patchFailed && productID == currentSelectedProductID {
                 refetchBoard(productID: productID)
             }
         }
@@ -122,20 +122,23 @@ extension ChatViewModel {
         guard !itemIDs.isEmpty else { return }
         var fence = boardReadFences[productID] ?? BoardReadFence()
         let now = ContinuousClock.now
-        if itemIDs.count > Self.maxRuntimePatchItems || fence.hasTreeOutstanding(now: now) {
+        fence.expire(now: now)
+        boardReadFences[productID] = fence
+        if itemIDs.count > Self.maxRuntimePatchItems || !fence.trees.isEmpty {
             refetchBoard(productID: productID)
             return
         }
-        if fence.hasPatchOutstanding(now: now) {
+        if fence.patchRequestID != nil {
             fence.queuedPatchItemIDs.formUnion(itemIDs)
             boardReadFences[productID] = fence
             return
         }
-        fence.patchInFlight = true
         fence.patchSentAt = now
         fence.patchSuperseded = false
+        let ids = itemIDs.union(fence.queuedPatchItemIDs)
+        fence.queuedPatchItemIDs.removeAll()
+        fence.patchRequestID = engine.sendGetWorkRuntimePatch(productId: productID, itemIds: ids.sorted())
         boardReadFences[productID] = fence
-        engine.sendGetWorkRuntimePatch(productId: productID, itemIds: itemIDs.sorted())
     }
 
     /// Reception of a `work_runtime_patch` reply.
@@ -143,32 +146,36 @@ extension ChatViewModel {
         productID: String,
         cards: [WorkRuntimePatchCard],
         absent: [String],
-        isComplete: Bool
+        isComplete: Bool,
+        requestID: String?,
+        revision: UInt64?
     ) {
-        guard var fence = boardReadFences[productID], fence.patchInFlight else {
-            // Nothing is waiting for this: its request outlived a reset or its
-            // staleness window, so its place in the order is unknown.
-            if productID == currentSelectedProductID { refetchBoard(productID: productID) }
-            return
-        }
+        guard var fence = boardReadFences[productID] else { return }
+        guard let requestID, fence.patchRequestID == requestID else { return }
         let superseded = fence.patchSuperseded
         let queued = fence.queuedPatchItemIDs
-        fence.patchInFlight = false
+        fence.patchRequestID = nil
         fence.patchSuperseded = false
         fence.queuedPatchItemIDs.removeAll()
         boardReadFences[productID] = fence
 
         // A tree requested after the patch will read at least what it read;
         // a product that is no longer on screen is refetched when selected.
-        guard !superseded, productID == currentSelectedProductID else { return }
+        guard productID == currentSelectedProductID else { return }
+        if superseded {
+            requestRuntimePatch(productID: productID, itemIDs: queued)
+            return
+        }
 
-        guard isComplete,
+        guard revision.map({ $0 >= fence.revision }) ?? true,
+              isComplete,
               absent.allSatisfy({ task(withID: $0) == nil }),
               applyRuntimePatch(productID: productID, cards: cards)
         else {
             refetchBoard(productID: productID)
             return
         }
+        noteBoardRevision(revision, productID: productID)
         if !queued.isEmpty {
             requestRuntimePatch(productID: productID, itemIDs: queued)
         }

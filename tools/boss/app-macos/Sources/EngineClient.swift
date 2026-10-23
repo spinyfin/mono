@@ -282,7 +282,7 @@ final class EngineClient: @unchecked Sendable {
     /// Called with the product id each time a `get_work_tree` is issued, from
     /// whichever thread issued it. `ChatViewModel` uses it to order tree reads
     /// against runtime patches (`BoardReadFence`); it is set once at start-up.
-    var onWorkTreeRequested: ((String) -> Void)?
+    var onWorkTreeRequested: ((String, String) -> Void)?
 
     /// Test-only: report sends as accepted without a socket, so view-model
     /// tests can exercise the connected path.
@@ -741,9 +741,10 @@ final class EngineClient: @unchecked Sendable {
         if type == "work_tree_update" {
             guard let update = payload["update"] as? [String: Any],
                   let tree = workTreeCache.apply(update) else {
+                emit(.workError(message: "received invalid work tree update", requestId: envelope["request_id"] as? String))
                 if let update = payload["update"] as? [String: Any],
                    let productID = update["product_id"] as? String {
-                    sendLine(["type": "get_work_tree", "product_id": productID, "delta": false])
+                    sendGetWorkTree(productId: productID, flow: .itemRefetch, delta: false)
                 }
                 return
             }
@@ -799,7 +800,7 @@ final class EngineClient: @unchecked Sendable {
             guard let productPayload = payload["product"] as? [String: Any],
                   let product = parseProduct(productPayload)
             else {
-                emit(.error(message:"received invalid work tree payload from engine"))
+                emit(.workError(message: "received invalid work tree payload from engine", requestId: envelopeRequestId))
                 break
             }
             let projects = (payload["projects"] as? [[String: Any]] ?? []).compactMap(parseProject)
@@ -847,11 +848,12 @@ final class EngineClient: @unchecked Sendable {
                 attentionGroups: (payload["attention_groups"] as? [[String: Any]] ?? []).compactMap(parseAttentionGroup),
                 attentionMembers: (payload["attention_members"] as? [[String: Any]] ?? []).compactMap(parseAttention),
                 plannerRuns: (payload["planner_runs"] as? [[String: Any]] ?? [])
-                    .compactMap { decodeWire(PlannerRunSummary.self, from: $0) }
+                    .compactMap { decodeWire(PlannerRunSummary.self, from: $0) },
+                requestId: envelopeRequestId, revision: envelope["revision"] as? UInt64
             ))
         case "work_runtime_patch":
             guard let productId = payload["product_id"] as? String else {
-                emit(.error(message: "received invalid work runtime patch from engine"))
+                emit(.workError(message: "received invalid work runtime patch from engine", requestId: envelopeRequestId))
                 break
             }
             var cards: [WorkRuntimePatchCard] = []
@@ -871,7 +873,8 @@ final class EngineClient: @unchecked Sendable {
                 productId: productId,
                 cards: cards,
                 absent: payload["absent"] as? [String] ?? [],
-                isComplete: isComplete
+                isComplete: isComplete,
+                requestId: envelopeRequestId, revision: envelope["revision"] as? UInt64
             ))
         case "work_item_created":
             guard let itemPayload = payload["item"] as? [String: Any],
@@ -897,7 +900,7 @@ final class EngineClient: @unchecked Sendable {
                 ))
                 break
             }
-            emit(.workItemUpdated(item: item))
+            emit(.workItemUpdated(item: item, revision: envelope["revision"] as? UInt64))
         case "project_tasks_reordered":
             let projectId = payload["project_id"] as? String ?? ""
             let taskIds = payload["task_ids"] as? [String] ?? []
