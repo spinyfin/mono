@@ -14,6 +14,9 @@ pub struct Memory {
     pub ingress: Mutex<Ingress>,
     pub outbox: Mutex<Outbox>,
     pub fail_commit: AtomicBool,
+    /// Store appended commands with their body stripped, as an older hub would
+    /// see a command carrying a body it does not know.
+    pub strip_appended_body: AtomicBool,
     pub pauses: Pauses,
 }
 
@@ -56,7 +59,6 @@ pub struct Outbox {
     pub commands: Vec<Command>,
     pub encoded: BTreeMap<u64, Vec<u8>>,
     pub results: BTreeMap<String, CommandResult>,
-    pub skipped: std::collections::BTreeSet<u64>,
     pub received: u64,
 }
 
@@ -129,7 +131,7 @@ impl CommandOutbox for Memory {
         if let Some(receipt) = receipt {
             if receipt.journal_id != "commands"
                 || receipt.through < state.received
-                || receipt.through > state.commands.len() as u64
+                || receipt.through > state.encoded.len() as u64
             {
                 return Err(StoreError::ReplayGap);
             }
@@ -159,8 +161,12 @@ impl CommandOutbox for Memory {
                 Err(StoreError::Denied)
             };
         }
-        command.sequence = state.commands.len() as u64 + 1;
-        state.encoded.insert(command.sequence, command.encode_to_vec());
+        command.sequence = state.encoded.len() as u64 + 1;
+        let mut stored = command.clone();
+        if self.strip_appended_body.load(Ordering::Acquire) {
+            stored.body = None;
+        }
+        state.encoded.insert(command.sequence, stored.encode_to_vec());
         state.commands.push(command.clone());
         Ok(command)
     }
@@ -170,34 +176,53 @@ impl CommandOutbox for Memory {
         Ok(state
             .encoded
             .iter()
-            .find(|(sequence, _)| **sequence > after && !state.skipped.contains(*sequence))
+            .find(|(sequence, _)| **sequence > after)
             .map(|(sequence, bytes)| PendingCommand {
                 sequence: *sequence,
                 bytes: bytes.clone(),
             }))
     }
-    async fn reject(&self, _: &str, sequence: u64, id: &str, reason: &str) -> Result<CommandResult, StoreError> {
+    async fn reject(&self, _: &str, sequence: u64, reason: &str) -> Result<CommandResult, StoreError> {
         let mut state = self.outbox.lock().unwrap();
-        state.skipped.insert(sequence);
-        if let Some(existing) = state.results.get(id) {
-            return Ok(existing.clone());
+        if sequence <= state.received || !state.encoded.contains_key(&sequence) {
+            return Err(StoreError::Denied);
+        }
+        let id = state
+            .commands
+            .iter()
+            .find(|c| c.sequence == sequence)
+            .map(|c| c.command_id.clone())
+            .ok_or(StoreError::Denied)?;
+        // Settle the row, then close the hole behind it.
+        state.encoded.remove(&sequence);
+        state
+            .commands
+            .iter_mut()
+            .find(|c| c.sequence == sequence)
+            .unwrap()
+            .sequence = 0;
+        let later: Vec<u64> = state.encoded.range(sequence..).map(|(s, _)| *s).collect();
+        for old in later {
+            let command = state.commands.iter_mut().find(|c| c.sequence == old).unwrap();
+            command.sequence = old - 1;
+            let bytes = command.encode_to_vec();
+            state.encoded.remove(&old);
+            state.encoded.insert(old - 1, bytes);
         }
         let result = CommandResult {
-            command_id: id.into(),
+            command_id: id.clone(),
             code: ResultCode::Rejected.into(),
             reason: reason.into(),
             ..Default::default()
         };
-        if !id.is_empty() {
-            state.results.insert(id.into(), result.clone());
-        }
+        state.results.insert(id, result.clone());
         Ok(result)
     }
     async fn receipt(&self, _: &str, receipt: &Cursor) -> Result<(), StoreError> {
         let mut state = self.outbox.lock().unwrap();
         if receipt.journal_id != "commands"
             || receipt.through < state.received
-            || receipt.through > state.commands.len() as u64
+            || receipt.through > state.encoded.len() as u64
         {
             return Err(StoreError::ReplayGap);
         }

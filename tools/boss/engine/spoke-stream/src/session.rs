@@ -106,35 +106,39 @@ impl Driver {
                     .await
                     .map_err(status)?;
                 if let Some(pending) = next {
-                    let decoded = v1::Command::decode(pending.bytes.as_slice())
-                        .map_err(|_| "invalid durable command bytes")
-                        .and_then(|command| {
-                            command
-                                .validate()
-                                .map(|()| command)
-                                .map_err(|_| "invalid durable command")
-                        });
+                    // The wire sequence is a contiguous prefix. A violation means
+                    // the outbox broke its contract; the command may already have
+                    // reached the spoke, so settle nothing and fail the stream.
+                    if pending.sequence != self.command_through.saturating_add(1) {
+                        return Err(Status::internal("outbox returned a non-contiguous command sequence").into());
+                    }
+                    let decoded = v1::Command::decode(pending.bytes.as_slice());
+                    if decoded.as_ref().is_ok_and(|c| c.sequence != pending.sequence) {
+                        return Err(Status::internal("durable command sequence mismatch").into());
+                    }
                     let reason = match &decoded {
-                        Err(reason) => Some(*reason),
+                        Err(_) => Some("invalid durable command bytes"),
+                        Ok(command) if command.validate().is_err() => Some("invalid durable command"),
                         Ok(command) => self.replay_problem(command, &pending),
                     };
                     if let Some(reason) = reason {
-                        // One stale command must never block the queue: settle
-                        // it durably, tell any waiter, and move on to the next.
-                        let id = decoded.as_ref().map_or("", |c| c.command_id.as_str());
+                        // One stale command must never block the queue. The
+                        // outbox settles it by its stored sequence, closes the
+                        // hole by re-sequencing the undelivered commands behind
+                        // it, and reports the real command ID for the waiter.
+                        // Nothing was written for this sequence, so the cursors
+                        // stay put and the next command takes the freed slot.
                         let result = self
                             .manager
                             .0
                             .storage
                             .outbox
-                            .reject(&self.session.host_id, pending.sequence, id, reason)
+                            .reject(&self.session.host_id, pending.sequence, reason)
                             .await
                             .map_err(status)?;
-                        if let Some(sender) = gate.as_mut().and_then(|c| c.waiters.remove(id)) {
+                        if let Some(sender) = gate.as_mut().and_then(|c| c.waiters.remove(&result.command_id)) {
                             let _ = sender.send(result);
                         }
-                        self.command_through = self.command_through.max(pending.sequence);
-                        command_received = self.command_through;
                         continue;
                     }
                     drop(gate);
@@ -201,11 +205,10 @@ impl Driver {
         }
     }
 
-    /// Why a durable command cannot be written to this connection, if so.
+    /// Why a well-formed, strictly newer, undelivered command cannot be written to
+    /// this connection, if so.
     fn replay_problem(&self, command: &v1::Command, pending: &PendingCommand) -> Option<&'static str> {
-        if command.sequence != pending.sequence || pending.sequence <= self.command_through {
-            Some("durable command sequence mismatch")
-        } else if pending.bytes.len() + 32 > MAX_FRAME_BYTES as usize {
+        if pending.bytes.len() + 32 > MAX_FRAME_BYTES as usize {
             Some("command exceeds the frame limit")
         } else if !crate::commands::supported(command, &self.session.selection) {
             Some("command incompatible with the negotiated contract")

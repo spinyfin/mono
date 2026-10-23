@@ -54,10 +54,17 @@ impl StreamManager {
             .as_mut()
             .filter(|c| c.active.load(Ordering::Acquire))
             .ok_or(Unavailable)?;
-        // A durable rejection (or any settled result) answers a retry of the same
-        // ID even when the command no longer fits the negotiated contract.
+        // A settled result answers a retry of the same ID even when the command
+        // no longer fits the negotiated contract, but only for the identical
+        // request: a changed run or body under a settled ID is never answered.
         if let Ok(Some(result)) = self.0.storage.outbox.completed(host_id, &command.command_id).await {
-            return Ok(result);
+            return match self.0.storage.outbox.command(host_id, &command.command_id).await {
+                Ok(Some(mut original)) => {
+                    original.sequence = 0; // Only the outbox-assigned sequence may differ.
+                    if original == command { Ok(result) } else { Err(Invalid) }
+                }
+                _ => Err(OutcomeUncertain),
+            };
         }
         if !supported(&command, &connection.session.selection) {
             return Err(Invalid);

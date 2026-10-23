@@ -77,25 +77,23 @@ pub trait CommandOutbox: Send + Sync {
     async fn append(&self, host: &str, command: Command) -> Result<Command, StoreError>;
 
     /// Return at most one original encoded Command after `after`, in sequence
-    /// order, skipping sequences settled by `reject`. Retain these bytes
-    /// unchanged on retry and across software upgrades. Delivered sequences may
-    /// therefore be non-contiguous; they are always strictly increasing.
+    /// order. Delivered sequences are a contiguous prefix: the result is always
+    /// `after + 1`, because `reject` closes any hole. Bytes of a command are
+    /// retained unchanged on retry and across software upgrades, except that
+    /// `reject` may re-sequence commands that are not yet delivered.
     async fn next(&self, host: &str, after: u64) -> Result<Option<PendingCommand>, StoreError>;
 
-    /// Atomically record a terminal `REJECTED` result for a command that cannot
-    /// be replayed on the current connection (for example, its feature pins no
-    /// longer match the negotiated contract) and skip its sequence in `next`.
-    /// The result must be visible through `completed`, so a retry with the same
-    /// ID returns it. `command_id` is empty when the stored bytes cannot be
-    /// decoded; the sequence is then skipped without recording a result.
-    /// Idempotent: rejecting a settled command returns its existing result.
-    async fn reject(
-        &self,
-        host: &str,
-        sequence: u64,
-        command_id: &str,
-        reason: &str,
-    ) -> Result<CommandResult, StoreError>;
+    /// Atomically settle the undelivered command stored at `sequence` with a
+    /// terminal `REJECTED` result (for example, its feature pins no longer match
+    /// the negotiated contract, or its stored bytes are unusable), resolving its
+    /// command ID from the stored row. In the same transaction, close the hole by
+    /// re-sequencing every later undelivered command down by one (re-encoding the
+    /// embedded sequence), so the wire sequence stays contiguous. The result is
+    /// visible through `completed`, carries the real command ID, and is returned
+    /// to a retry of that ID. A sequence at or below the durable receipt (it may
+    /// have reached the spoke) or that names no live command is `Denied`: it is
+    /// never settled.
+    async fn reject(&self, host: &str, sequence: u64, reason: &str) -> Result<CommandResult, StoreError>;
 
     /// Durably advance receipt, validating identity, monotonicity and bounds.
     /// Receipt alone is never command completion.
