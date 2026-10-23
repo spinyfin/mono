@@ -299,27 +299,36 @@ macro_rules! shell_command_tokenizer_fragment {
          \x20           return word\n\
          \x20       return None\n\
          \x20   return word\n\
-         def command_groups(command):\n\
+         def command_groups(command, nested=False):\n\
          \x20   groups=[]\n\
          \x20   heredoc_end=None\n\
+         \x20   lines=[]\n\
          \x20   for line in command.split(chr(10)):\n\
          \x20       if heredoc_end is not None:\n\
          \x20           if line==heredoc_end:\n\
          \x20               heredoc_end=None\n\
          \x20           continue\n\
-         \x20       d=heredoc_delim(line)\n\
+         \x20       d=None if nested else heredoc_delim(line)\n\
          \x20       if d:\n\
          \x20           heredoc_end=d\n\
+         \x20       lines.append(line)\n\
+         \x20   for line in ([chr(10).join(lines)] if nested else lines):\n\
          \x20       try:\n\
-         \x20           _lex=shlex.shlex(line,posix=True,punctuation_chars=';&|')\n\
+         \x20           _lex=shlex.shlex(line,posix=True,punctuation_chars=(';&|()<>'+chr(10) if nested else ';&|'))\n\
+         \x20           if nested:\n\
+         \x20               _lex.whitespace=' '+chr(9)+chr(13)\n\
          \x20           _lex.whitespace_split=True\n\
          \x20           _lex.commenters=''\n\
          \x20           toks=list(_lex)\n\
+         \x20           if nested:\n\
+         \x20               toks=[p for t in toks for p in (re.split('([()])',t) if all(c in ';&|()<>'+chr(10) for c in t) else [t]) if p]\n\
          \x20       except Exception:\n\
+         \x20           if nested:\n\
+         \x20               raise\n\
          \x20           toks=line.split()\n\
          \x20       cur=[]\n\
          \x20       for tok in toks:\n\
-         \x20           if tok in DELIMS:\n\
+         \x20           if tok in DELIMS or (nested and all(c in ';&|()'+chr(10) for c in tok)):\n\
          \x20               if cur:\n\
          \x20                   groups.append(cur)\n\
          \x20               cur=[]\n\
@@ -345,9 +354,12 @@ macro_rules! shell_command_tokenizer_fragment {
 }
 
 /// Inline Python decision hook that blocks workers from launching the Boss
-/// macOS app or a Boss engine. Always applied (matcher `Bash`).
+/// macOS app or a Boss engine, or signalling processes by name, pattern,
+/// process group, or dynamically selected PID. Always applied (matcher `Bash`)
+/// by Claude, Codex, and Grok, including remote and reviewer workers.
 ///
-/// **This is the advisory layer, not the control.** It fails in-session, with
+/// For app launches, this is the advisory layer; signal restrictions are
+/// enforced here before the worker shell runs. It fails in-session, with
 /// a message the worker can act on immediately, which the engine-side gate
 /// (`boss_engine::app::agent_launch_guard`) cannot do — by the time that gate
 /// fires the worker has already spent a build. But a text matcher only
@@ -398,6 +410,7 @@ macro_rules! shell_command_tokenizer_fragment {
 /// win if the launcher ever slipped.
 pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     shell_command_tokenizer_fragment!(),
+    include_str!("signal_guard.py"),
     "PROD='/tmp/boss-engine.sock'\n",
     "ASSIGN=re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', re.S)\n",
     // Resolve single-level shell variables. Assignments are collected as the

@@ -938,6 +938,28 @@ mod tests {
         assert_eq!(decision["decision"], "deny", "must refuse to launch Boss.app: {stdout}");
     }
 
+    #[test]
+    fn grok_signal_guard_decisions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let adapter_path = write_adapter_script(tmp.path());
+        let guards = guard_commands(&interception_config(|c| c.is_standard_worker = false));
+        for (command, expected) in crate::signal_guard_tests::denied()
+            .iter()
+            .map(|c| (c.as_str(), "deny"))
+            .chain(crate::signal_guard_tests::ALLOWED.iter().map(|c| (*c, "allow")))
+        {
+            let payload = json!({
+                "hookEventName": "pre_tool_use",
+                "toolName": "run_terminal_command",
+                "toolInput": {"command": command},
+            });
+            let (code, stdout, stderr) = run_adapter(&adapter_path, &guards[0].command, &payload, true);
+            assert_eq!(code, 0, "{command}: {stderr}");
+            let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+            assert_eq!(decision["decision"], expected, "{command}: {stdout}");
+        }
+    }
+
     /// Path guard: a `write` tool call targeting a path under the Boss data
     /// dir is refused. Exercises the `write` -> `Write` tool-name rename and
     /// the guard's `file_path` check via a native (non-Bash) Grok tool.
