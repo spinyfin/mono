@@ -678,6 +678,25 @@ fn a_spent_token_only_recovers_the_certificate_it_produced() {
     );
 }
 
+#[test]
+fn a_fresh_token_cannot_reuse_a_request_id_that_already_enrolled() {
+    let fx = Fixture::new();
+    let first = fx.grant("h1", "job-1");
+    let spoke = Spoke::new();
+    fx.enroll(&spoke, ("h1", "job-1", "req-1"), &first.token)
+        .expect("enroll with the first token");
+
+    // The job re-delivers a token; the spoke retries with its old request id.
+    let second = fx.grant("h1", "job-1");
+    assert_eq!(
+        refusal(fx.enroll(&Spoke::new(), ("h1", "job-1", "req-1"), &second.token)),
+        Denial::RequestReused
+    );
+    // The refusal did not spend the token: a new request id still enrolls.
+    fx.enroll(&Spoke::new(), ("h1", "job-1", "req-2"), &second.token)
+        .expect("a new request id enrolls with the second token");
+}
+
 // ------------------------------------------------------- state permissions
 
 fn set_mode(path: &std::path::Path, mode: u32) {

@@ -88,6 +88,13 @@ impl HostCredentials {
                     if unix_secs(now) >= grant.expires_at {
                         return Err(Denial::TokenExpired.into());
                     }
+                    // Request ids are scoped to the host and job for good; a
+                    // fresh token cannot reuse one that already produced a
+                    // certificate. Refuse it by name rather than let the
+                    // uniqueness constraint surface as an internal error.
+                    if store::certificate_for_request(tx, request.host_id, CertKind::Enroll, ids)?.is_some() {
+                        return Err(Denial::RequestReused.into());
+                    }
                     let leaf =
                         self.trust
                             .ca

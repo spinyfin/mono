@@ -85,8 +85,9 @@ impl CertificateAuthority {
             }
         };
         // A crash between writing the key and the certificate leaves a key
-        // alone. The certificate is a pure function of key, name and policy,
-        // and a trust anchor matches on name and key, so reminting it is safe.
+        // alone. Reminting gives the CA certificate a new serial and validity
+        // window, but verifiers match a trust anchor on subject and public key,
+        // so leaves already issued under the old certificate still verify.
         let cert_der = match fs::read(&cert_path) {
             Ok(der) => der,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
