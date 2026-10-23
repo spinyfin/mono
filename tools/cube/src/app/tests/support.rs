@@ -19,9 +19,20 @@ use crate::app::gc;
 /// that reads it must hold this lock too, not just the ones that write it.
 pub(super) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// A fresh database whose daily pool-GC pass counts as having just run.
+/// A test of leasing is a test of leasing: the periodic pass would
+/// otherwise run on the first lease of every test, against the test's
+/// fake runner, and consume expectations meant for the lease. Tests of the
+/// pass itself age `last_pool_gc_at` (or the per-repo store-gc stamp) to
+/// make it due again.
 pub(super) fn with_database_path() -> (TempDir, std::path::PathBuf) {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let database_path = tempdir.path().join("state.db");
+    let store = crate::store::Store::open_at(&database_path).expect("store");
+    let now = crate::app::util::current_epoch_s().expect("clock");
+    store
+        .set_pool_metadata_i(gc::POOL_GC_LAST_AT_KEY, now)
+        .expect("stamp pool gc");
     (tempdir, database_path)
 }
 
@@ -294,6 +305,11 @@ pub(super) fn audit_events(tempdir: &TempDir) -> Vec<serde_json::Value> {
     events
 }
 
+/// The cube executable the fake reports. It does not exist, and the fake
+/// never starts anything anyway; what matters is that it is not the running
+/// test binary.
+pub(super) const FAKE_CUBE_EXECUTABLE: &str = "/nonexistent/fake-cube";
+
 #[derive(Default)]
 pub(super) struct FakeRunner {
     pub(super) expectations: RefCell<VecDeque<ExpectedCommand>>,
@@ -302,6 +318,15 @@ pub(super) struct FakeRunner {
     /// that a caller's wall-clock budget actually reached the subprocess
     /// bound, rather than the default 120s network timeout.
     observed_timeouts: RefCell<Vec<Duration>>,
+    /// Every detached spawn the code under test requested
+    /// ([`CommandRunner::spawn_detached`]), in call order. Nothing is ever
+    /// started: the request is the whole observable.
+    detached_spawns: RefCell<Vec<CommandInvocation>>,
+    /// When set, an invocation with no queued expectation fails like a
+    /// missing program instead of panicking. For tests of passes that must
+    /// tolerate every subprocess failing (the pool-GC throttle tests), where
+    /// enumerating the pass's commands would test nothing.
+    fail_unexpected: bool,
 }
 
 impl FakeRunner {
@@ -309,7 +334,23 @@ impl FakeRunner {
         Self {
             expectations: RefCell::new(expectations.into()),
             observed_timeouts: RefCell::new(Vec::new()),
+            detached_spawns: RefCell::new(Vec::new()),
+            fail_unexpected: false,
         }
+    }
+
+    /// A runner with no expectations that fails every command it is handed
+    /// (and still records detached spawns without starting them).
+    pub(super) fn failing_every_command() -> Self {
+        Self {
+            fail_unexpected: true,
+            ..Self::new(Vec::new())
+        }
+    }
+
+    /// The detached spawns requested so far, in call order.
+    pub(super) fn detached_spawns(&self) -> Vec<CommandInvocation> {
+        self.detached_spawns.borrow().clone()
     }
 
     pub(super) fn assert_exhausted(&self) {
@@ -326,11 +367,20 @@ impl FakeRunner {
     }
 
     fn next_expectation(&self, invocation: &CommandInvocation) -> ExpectedCommand {
-        let expected = self
-            .expectations
-            .borrow_mut()
-            .pop_front()
-            .unwrap_or_else(|| panic!("unexpected command invocation: {invocation:?}"));
+        let next = self.expectations.borrow_mut().pop_front();
+        let expected = match next {
+            Some(expected) => expected,
+            None if self.fail_unexpected => {
+                let args: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
+                return ExpectedCommand::failing(
+                    invocation.cwd.clone(),
+                    &invocation.program,
+                    &args,
+                    "no such command in this test",
+                );
+            }
+            None => panic!("unexpected command invocation: {invocation:?}"),
+        };
         assert_eq!(expected.cwd, invocation.cwd);
         assert_eq!(expected.program, invocation.program);
         assert_eq!(expected.args, invocation.args);
@@ -344,6 +394,15 @@ impl FakeRunner {
 impl CommandRunner for FakeRunner {
     fn run(&self, invocation: &CommandInvocation) -> Result<String> {
         self.next_expectation(invocation).result
+    }
+
+    fn cube_executable(&self) -> Result<PathBuf> {
+        Ok(PathBuf::from(FAKE_CUBE_EXECUTABLE))
+    }
+
+    fn spawn_detached(&self, invocation: &CommandInvocation) -> Result<u32> {
+        self.detached_spawns.borrow_mut().push(invocation.clone());
+        Ok(4242)
     }
 
     /// Honours `timeout` against the expectation's simulated `duration`, so a

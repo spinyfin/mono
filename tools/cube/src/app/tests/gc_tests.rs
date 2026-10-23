@@ -623,7 +623,13 @@ fn pool_gc_backlog_retriggers_before_24h_elapsed() {
         "an aged dirty workspace should be reported as backlog"
     );
 
-    maybe_trigger_pool_gc(&mut store, Some(&database_path), now).expect("trigger gc");
+    maybe_trigger_pool_gc(
+        &FakeRunner::failing_every_command(),
+        &mut store,
+        Some(&database_path),
+        now,
+    )
+    .expect("trigger gc");
 
     let started_ts = store
         .get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)
@@ -657,7 +663,13 @@ fn pool_gc_skips_before_24h_when_no_backlog() {
         "a pool with no unhealthy workspaces should report no backlog"
     );
 
-    maybe_trigger_pool_gc(&mut store, Some(&database_path), now).expect("trigger gc");
+    maybe_trigger_pool_gc(
+        &FakeRunner::failing_every_command(),
+        &mut store,
+        Some(&database_path),
+        now,
+    )
+    .expect("trigger gc");
 
     assert!(
         store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY).unwrap().is_none(),
@@ -1594,7 +1606,13 @@ fn aged_quarantined_rows_count_as_backlog_so_gc_retries_in_minutes() {
     // POOL_GC_BACKLOG_RETRY_SECS (5m) and nowhere near AUTO_GC_INTERVAL_SECS
     // (24h), so the next lease retriggers.
     store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, now - (10 * 60)).unwrap();
-    maybe_trigger_pool_gc(&mut store, Some(&database_path), now).expect("trigger gc");
+    maybe_trigger_pool_gc(
+        &FakeRunner::failing_every_command(),
+        &mut store,
+        Some(&database_path),
+        now,
+    )
+    .expect("trigger gc");
     assert_eq!(
         store
             .get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)

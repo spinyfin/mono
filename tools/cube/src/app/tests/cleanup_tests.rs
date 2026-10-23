@@ -635,7 +635,13 @@ fn low_free_space_retriggers_the_pool_gc_well_before_24h() {
     // A healthy volume: ten minutes since the last pass is nowhere near 24h.
     {
         let _healthy = testing::with_reading(AMPLE_TEST_VOLUME);
-        maybe_trigger_pool_gc(&mut pool.store, Some(&pool.database_path), now).expect("trigger");
+        maybe_trigger_pool_gc(
+            &FakeRunner::failing_every_command(),
+            &mut pool.store,
+            Some(&pool.database_path),
+            now,
+        )
+        .expect("trigger");
         assert!(
             pool.store
                 .get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)
@@ -646,7 +652,13 @@ fn low_free_space_retriggers_the_pool_gc_well_before_24h() {
 
     // Below the low-water mark the volume cannot wait a day.
     let _low = testing::with_reading(volume_with_free(low - GIB));
-    maybe_trigger_pool_gc(&mut pool.store, Some(&pool.database_path), now).expect("trigger");
+    maybe_trigger_pool_gc(
+        &FakeRunner::failing_every_command(),
+        &mut pool.store,
+        Some(&pool.database_path),
+        now,
+    )
+    .expect("trigger");
     assert_eq!(
         pool.store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY).unwrap(),
         Some(now),
@@ -671,7 +683,13 @@ fn a_pass_that_could_not_clean_anything_does_not_pin_the_short_interval() {
     pool.store.set_pool_metadata_i(POOL_GC_CLEANUP_PROGRESS_KEY, 0).unwrap();
 
     let _low = testing::with_reading(volume_with_free(low - GIB));
-    maybe_trigger_pool_gc(&mut pool.store, Some(&pool.database_path), now).expect("trigger");
+    maybe_trigger_pool_gc(
+        &FakeRunner::failing_every_command(),
+        &mut pool.store,
+        Some(&pool.database_path),
+        now,
+    )
+    .expect("trigger");
 
     assert!(
         pool.store

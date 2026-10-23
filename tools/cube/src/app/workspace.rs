@@ -249,7 +249,7 @@ pub(super) fn run_workspace(
 
             let leased_at_epoch_s = current_epoch_s()?;
             // Kick a background pool-wide gc pass at most once per 24h.
-            maybe_trigger_pool_gc(&mut store, database_path, leased_at_epoch_s)?;
+            maybe_trigger_pool_gc(runner, &mut store, database_path, leased_at_epoch_s)?;
 
             let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
             let mut candidates = discover_workspaces(&repo_record)?;

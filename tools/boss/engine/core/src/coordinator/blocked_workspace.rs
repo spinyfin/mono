@@ -457,4 +457,42 @@ impl ExecutionCoordinator {
             .execution_bookmark_diff(record)
             .await
     }
+
+    /// Forget a finished execution's pointers once `vouchers` prove its
+    /// work published, on whichever host holds the record.
+    pub(crate) async fn prune_execution_bookmark(
+        &self,
+        record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
+        vouchers: &[boss_engine_recovery::execution_bookmark::Voucher],
+        trunk: &str,
+    ) -> Result<boss_engine_recovery::execution_bookmark::PruneOutcome> {
+        let host = self
+            .work_db
+            .get_host(&record.host_id)?
+            .ok_or_else(|| anyhow!("recovery host {} is unavailable", record.host_id))?;
+        self.host_adapter_provider
+            .adapter_for(&host)
+            .await?
+            .prune_execution_bookmark(record, vouchers, trunk)
+            .await
+    }
+
+    /// The main branch cube records for `repo_id` on `host_id`, when the
+    /// repo is registered there.
+    pub(crate) async fn recovery_trunk(&self, host_id: &str, repo_id: &str) -> Result<Option<String>> {
+        let host = self
+            .work_db
+            .get_host(host_id)?
+            .ok_or_else(|| anyhow!("recovery host {host_id} is unavailable"))?;
+        let repos = self
+            .host_adapter_provider
+            .adapter_for(&host)
+            .await?
+            .list_repos()
+            .await?;
+        Ok(repos
+            .into_iter()
+            .find(|repo| repo.repo_id == repo_id)
+            .map(|repo| repo.main_branch))
+    }
 }
