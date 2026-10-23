@@ -73,13 +73,19 @@ impl Board {
     /// and return the per-item runtime lookups that actually missed plus the
     /// statements the cached path ran for runtimes.
     fn assert_equivalent(&self) -> (u64, i64) {
+        self.assert_equivalent_at(boss_engine_utils::epoch_time::now_epoch_secs())
+    }
+
+    /// [`assert_equivalent`] with both paths evaluated at the fixed instant
+    /// `now`, so wall-clock deadlines are exercised without racing the clock.
+    fn assert_equivalent_at(&self, now: i64) -> (u64, i64) {
         let misses_before = self.cache.stats().misses;
         let mut trace = PopulationTrace::new(self.product_id.clone(), "req", Some(1), Instant::now());
         let cached = self
             .db
-            .get_work_tree_cached(&self.product_id, &mut trace, &self.cache)
+            .get_work_tree_cached_at(&self.product_id, &mut trace, &self.cache, now)
             .unwrap();
-        let plain = self.db.get_work_tree(&self.product_id).unwrap();
+        let plain = self.db.get_work_tree_at(&self.product_id, now).unwrap();
         assert_eq!(
             serde_json::to_value(&cached).unwrap(),
             serde_json::to_value(&plain).unwrap(),
@@ -90,7 +96,11 @@ impl Board {
     }
 
     fn runtime_of(&self, work_item_id: &str) -> serde_json::Value {
-        let tree = self.db.get_work_tree(&self.product_id).unwrap();
+        self.runtime_of_at(work_item_id, boss_engine_utils::epoch_time::now_epoch_secs())
+    }
+
+    fn runtime_of_at(&self, work_item_id: &str, now: i64) -> serde_json::Value {
+        let tree = self.db.get_work_tree_at(&self.product_id, now).unwrap();
         let runtime = tree
             .task_runtimes
             .iter()
@@ -398,22 +408,29 @@ fn a_future_deadline_expires_the_entry_when_the_clock_passes_it() {
     let board = board();
     let item = board.chore("A");
     board.execution(&item, ExecutionStatus::Ready);
-    let deadline = boss_engine_utils::epoch_time::now_epoch_secs() + 1;
+    let deadline = 1_000_000;
     board.sql(
         "UPDATE work_executions SET dispatch_not_before = ?2 WHERE work_item_id = ?1",
         &[&item, &deadline.to_string()],
     );
-    board.assert_equivalent();
-    assert_eq!(board.runtime_of(&item)["dispatch_wait_reason"], "not_before");
+    board.assert_equivalent_at(deadline - 10);
+    assert_eq!(
+        board.runtime_of_at(&item, deadline - 10)["dispatch_wait_reason"],
+        "not_before"
+    );
+    let (misses, _) = board.assert_equivalent_at(deadline - 1);
+    assert_eq!(misses, 0, "still before the deadline, the entry is reused");
 
-    while boss_engine_utils::epoch_time::now_epoch_secs() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    // No write happened; only the clock moved.
-    let (misses, _) = board.assert_equivalent();
+    // No write happens from here on; only the clock moves.
+    let (misses, _) = board.assert_equivalent_at(deadline);
     assert_eq!(misses, 1, "the elapsed deadline forces a recompute");
-    assert!(board.runtime_of(&item).get("dispatch_wait_reason").is_none());
-    let (misses, _) = board.assert_equivalent();
+    assert!(
+        board
+            .runtime_of_at(&item, deadline)
+            .get("dispatch_wait_reason")
+            .is_none()
+    );
+    let (misses, _) = board.assert_equivalent_at(deadline + 5);
     assert_eq!(misses, 0, "and the recomputed value is stable");
 }
 

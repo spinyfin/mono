@@ -272,18 +272,19 @@ pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) 
 
 /// Hydrate the per-item runtime for every task and chore. This is the
 /// primary N+1 on the `get_work_tree` path: one call per work item, each
-/// running 1-3 point queries. Returns the runtimes alongside the total
+/// running 1-4 point queries. Returns the runtimes alongside the total
 /// number of SQL statements executed, so [`crate::population_timing`] can
 /// attribute the per-row subquery fan-out.
 pub(crate) fn collect_task_runtimes(
     conn: &Connection,
     tasks: &[Task],
     chores: &[Task],
+    now: i64,
 ) -> Result<(Vec<TaskRuntime>, u64)> {
     let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
     let mut queries = 0u64;
     for task in tasks.iter().chain(chores.iter()) {
-        runtimes.push(query_task_runtime(conn, &task.id, &mut queries)?);
+        runtimes.push(compute_task_runtime(conn, &task.id, &mut queries, now)?.runtime);
     }
     Ok((runtimes, queries))
 }
@@ -324,8 +325,9 @@ pub(crate) struct ComputedRuntime {
 ///   is false.
 ///
 /// A new input must be added to one of those four mechanisms, or the cache
-/// will serve it stale; `board_runtime_cache_equivalence` in the work-tree
-/// tests is the net that catches a missed one.
+/// will serve it stale; `every_runtime_input_write_invalidates_exactly_its_item`
+/// in `work/tests/board_runtime_cache_tests.rs` is the net that catches a
+/// missed one, so a new runtime input needs a step added there.
 pub(crate) fn compute_task_runtime(
     conn: &Connection,
     work_item_id: &str,

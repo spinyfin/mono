@@ -14,10 +14,10 @@ pub(crate) fn collect_task_runtimes_cached(
     tasks: &[Task],
     chores: &[Task],
     cache: &BoardRuntimeCache,
+    now: i64,
 ) -> Result<(Vec<TaskRuntime>, u64)> {
     let epochs = query_runtime_epochs(conn, product_id)?;
     let mut queries = 1u64;
-    let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let items: Vec<(&str, i64)> = tasks
         .iter()
         .chain(chores)

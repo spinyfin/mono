@@ -1074,7 +1074,14 @@ impl WorkDb {
     /// other caller goes through the wrapper above with a disabled trace, so
     /// the timing is genuinely free off the RPC path.
     pub fn get_work_tree_instrumented(&self, product_id: &str, trace: &mut PopulationTrace) -> Result<WorkTree> {
-        self.assemble_work_tree(product_id, trace, None)
+        self.assemble_work_tree(product_id, trace, None, boss_engine_utils::epoch_time::now_epoch_secs())
+    }
+
+    /// [`get_work_tree`] evaluating every wall-clock-dependent projection at
+    /// the caller's `now` (epoch seconds) instead of reading the clock.
+    pub(crate) fn get_work_tree_at(&self, product_id: &str, now: i64) -> Result<WorkTree> {
+        let mut trace = PopulationTrace::disabled();
+        self.assemble_work_tree(product_id, &mut trace, None, now)
     }
 
     /// [`get_work_tree_instrumented`] reusing per-item runtimes from `cache`
@@ -1086,7 +1093,23 @@ impl WorkDb {
         trace: &mut PopulationTrace,
         cache: &BoardRuntimeCache,
     ) -> Result<WorkTree> {
-        self.assemble_work_tree(product_id, trace, Some(cache))
+        self.get_work_tree_cached_at(
+            product_id,
+            trace,
+            cache,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+    }
+
+    /// [`get_work_tree_cached`] evaluated at the caller's `now`.
+    pub(crate) fn get_work_tree_cached_at(
+        &self,
+        product_id: &str,
+        trace: &mut PopulationTrace,
+        cache: &BoardRuntimeCache,
+        now: i64,
+    ) -> Result<WorkTree> {
+        self.assemble_work_tree(product_id, trace, Some(cache), now)
     }
 
     fn assemble_work_tree(
@@ -1094,6 +1117,7 @@ impl WorkDb {
         product_id: &str,
         trace: &mut PopulationTrace,
         runtime_cache: Option<&BoardRuntimeCache>,
+        now: i64,
     ) -> Result<WorkTree> {
         let mut connection = self.connect()?;
         // All projections must describe one consistent database snapshot.
@@ -1157,12 +1181,13 @@ impl WorkDb {
         trace.set_items(tasks.len() + chores.len());
 
         // Primary N+1: one runtime lookup per task and chore, each running
-        // 1-3 point queries (only for cache misses on the cached path). `runtime_queries` is the aggregate statement
-        // count, which makes the per-row fan-out visible in the log.
+        // 1-4 point queries (on the cached path, only for misses).
+        // `runtime_queries` is the aggregate statement count, which makes the
+        // per-row fan-out visible in the log.
         let t = Instant::now();
         let (task_runtimes, runtime_queries) = match runtime_cache {
-            Some(cache) => collect_task_runtimes_cached(&conn, product_id, &tasks, &chores, cache)?,
-            None => collect_task_runtimes(&conn, &tasks, &chores)?,
+            Some(cache) => collect_task_runtimes_cached(&conn, product_id, &tasks, &chores, cache, now)?,
+            None => collect_task_runtimes(&conn, &tasks, &chores, now)?,
         };
         trace.record_nplus1(
             segment::DB_TASK_RUNTIMES,

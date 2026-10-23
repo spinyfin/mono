@@ -1,10 +1,10 @@
 //! Bounded, epoch-validated cache of per-item board runtimes.
 //!
-//! `get_work_tree` used to rebuild a `TaskRuntime` for every card on every
-//! assembly with 1 to 4 point queries each (about 22k statements on the scale
-//! fixture) even though a runtime changes only when its own executions or runs
-//! change. This cache keeps the last computed runtime per work item and reuses
-//! it while the item's `board_runtime_epoch` is unchanged.
+//! Board assembly needs a `TaskRuntime` for every card, and computing one costs
+//! 1 to 4 point queries (about 22k statements on the scale fixture). A runtime
+//! changes only when its own executions or runs change, so this cache keeps the
+//! last computed runtime per work item and reuses it while the item's
+//! `board_runtime_epoch` is unchanged.
 //!
 //! Invalidation is data-driven, not call-site driven: SQLite triggers on
 //! `work_executions` and `work_runs` bump the owning item's epoch inside the
