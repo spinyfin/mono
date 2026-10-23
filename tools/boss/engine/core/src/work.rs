@@ -700,6 +700,7 @@ mod queued_wait;
 mod read_only_tests;
 mod remediation_state;
 pub(crate) mod remote_input_cleanup;
+mod short_id_allocations;
 pub(crate) use feedback_target::FeedbackTarget;
 mod connection_wait;
 pub(crate) mod db_diagnostics;
@@ -778,6 +779,7 @@ pub(crate) use exec_tail::content_checksum;
 use executions_runs::record_cancel_provenance;
 use ideas::list_ideas_in_tx;
 pub(crate) use insert_helpers::*;
+pub(crate) use short_id_allocations::*;
 // Private on purpose: only the list-read submodules under `work` build
 // these queries, so it stays visible to `work` and its children only.
 use list_filter::ListFilterQuery;
