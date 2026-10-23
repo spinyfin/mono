@@ -1043,6 +1043,9 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
     // Keep one bounded input directory for this singleton session. The relay
     // loads the brief before the next coordinator can replace these files.
     let input_dir = working_directory.join(".claude/coordinator-input");
+    crate::driver::initial_prompt::warm_preflight()
+        .await
+        .context("checking python3 for coordinator terminal input")?;
     crate::driver::initial_prompt::provision(&input_dir, &input_dir, &initial_prompt, &crate::driver::ClaudeDriver)
         .context("provisioning coordinator terminal input")?;
     let launch = inbox::relay_launch_command(&input_dir, "claude", model);

@@ -67,12 +67,24 @@ impl WorkDb {
         let mut pending = Vec::new();
         for row in rows {
             let raw = row?;
-            // Legacy workspace-only markers have no attempt identity or death
-            // evidence. Retain them rather than guessing which worker owns them.
+            // Rows that do not decode as a PendingRemoteInputCleanup are skipped
+            // and left in place: without an attempt id there is no directory
+            // this pass can safely remove.
             if let Ok(item) = serde_json::from_str(&raw) {
                 pending.push(item);
             }
         }
         Ok(pending)
+    }
+
+    pub(crate) fn pending_remote_input_cleanups_for_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<PendingRemoteInputCleanup>> {
+        Ok(self
+            .pending_remote_input_cleanups()?
+            .into_iter()
+            .filter(|item| item.execution_id == execution_id)
+            .collect())
     }
 }

@@ -57,11 +57,13 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The config directory belongs to this leased worker workspace. Drivers
-/// with retained per-run homes keep the actual brief there; the workspace
-/// reference holds no prompt bytes. Claude records a private input home under
-/// the same engine-owned homes root for the restart-safe retention sweep.
-pub fn provision(config_dir: &Path, run_home: &Path, prompt: &str, driver: &dyn crate::AgentDriver) -> Result<()> {
+/// Check that `python3` has the PTY modules the relay needs. Only success is
+/// cached, so a machine that gains python3 later recovers without a restart.
+fn preflight() -> Result<()> {
+    static PREFLIGHT_OK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if PREFLIGHT_OK.get().is_some() {
+        return Ok(());
+    }
     let preflight = boss_command_runner::output_blocking_timeout(
         std::process::Command::new("python3").args(["-c", "import fcntl, pty, termios"]),
         std::time::Duration::from_secs(5),
@@ -72,6 +74,24 @@ pub fn provision(config_dir: &Path, run_home: &Path, prompt: &str, driver: &dyn 
         "python3 initial brief preflight failed: {}",
         String::from_utf8_lossy(&preflight.stderr)
     );
+    let _ = PREFLIGHT_OK.set(());
+    Ok(())
+}
+
+/// Run the python3 preflight off the async executor so a following
+/// [`provision`] finds the cached result and never blocks a worker thread.
+pub async fn warm_preflight() -> Result<()> {
+    tokio::task::spawn_blocking(preflight)
+        .await
+        .context("python3 preflight task failed")?
+}
+
+/// The config directory belongs to this leased worker workspace. Drivers
+/// with retained per-run homes keep the actual brief there; the workspace
+/// reference holds no prompt bytes. Claude records a private input home under
+/// the same engine-owned homes root for the restart-safe retention sweep.
+pub fn provision(config_dir: &Path, run_home: &Path, prompt: &str, driver: &dyn crate::AgentDriver) -> Result<()> {
+    preflight()?;
     fs::create_dir_all(run_home)?;
     let prompt_path = run_home.join("initial-prompt.txt");
     write_private(&prompt_path, prompt.as_bytes())?;

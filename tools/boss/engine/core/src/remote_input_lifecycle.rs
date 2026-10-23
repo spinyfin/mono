@@ -26,10 +26,39 @@ pub(crate) fn validate_run_id(run_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Distinct config dirs of every registered driver, the same
+/// `DriverDescriptor::config_dir` values the staging path writes under.
+fn driver_config_dirs() -> Vec<&'static str> {
+    let registry = crate::driver::DriverRegistry::default();
+    let mut dirs: Vec<&'static str> = registry
+        .slugs()
+        .filter_map(|slug| registry.get(slug))
+        .map(|driver| driver.descriptor().config_dir)
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    dirs
+}
+
+/// Remove every staged input attempt recorded for `execution_id`, clearing
+/// each marker once its attempt directory is gone. The directory is named by
+/// the attempt id in the marker, not by the execution id.
+pub(crate) async fn cleanup_execution_inputs(
+    work_db: &WorkDb,
+    adapter: &dyn crate::host_adapter::HostAdapter,
+    execution_id: &str,
+) -> Result<()> {
+    for item in work_db.pending_remote_input_cleanups_for_execution(execution_id)? {
+        adapter.cleanup_initial_input(&item.workspace, &item.run_id).await?;
+        work_db.clear_remote_input_cleanup(&item)?;
+    }
+    Ok(())
+}
+
 /// Remove the exact per-run input directory under every driver config dir.
 pub(crate) async fn remove_run_input(exec: &dyn SshExec, workspace: &str, run_id: &str) -> Result<()> {
     validate_run_id(run_id)?;
-    for config in [".claude", ".codex", ".grok"] {
+    for config in driver_config_dirs() {
         let path = format!("{workspace}/{config}/runs/{run_id}");
         let output = exec.run(&["rm", "-rf", "--", &path]).await?;
         anyhow::ensure!(output.success(), "remote input cleanup failed: {}", output.stderr);
@@ -136,7 +165,7 @@ pub(crate) async fn retry_pending(work_db: &WorkDb, provider: &dyn HostAdapterPr
 /// A missing file (including a worker still starting) is inconclusive.
 pub(crate) async fn probe_input_alive(exec: &dyn SshExec, workspace: &str, run_id: &str) -> Result<Option<bool>> {
     validate_run_id(run_id)?;
-    for config in [".claude", ".codex", ".grok"] {
+    for config in driver_config_dirs() {
         let path = format!("{workspace}/{config}/runs/{run_id}/worker.pid");
         if let Some(pid) = crate::ssh_spawn::read_worker_pid_path(exec, &path).await {
             return crate::ssh_spawn::probe_worker_liveness(exec, pid, 0).await.map(Some);

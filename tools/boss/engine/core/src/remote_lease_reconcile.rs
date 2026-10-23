@@ -305,9 +305,7 @@ async fn reap_dead_remote_execution(
         return false;
     }
 
-    if let Some(workspace) = execution.workspace_path.as_deref()
-        && let Err(error) = adapter.cleanup_initial_input(workspace, &execution.id).await
-    {
+    if let Err(error) = crate::remote_input_lifecycle::cleanup_execution_inputs(work_db, adapter, &execution.id).await {
         tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
         return false;
     }
@@ -524,8 +522,8 @@ async fn release_terminal_remote_resources(
     let Ok(execution) = work_db.get_execution(&handle.execution_id) else {
         return;
     };
-    if let Some(workspace) = execution.workspace_path.as_deref()
-        && let Err(error) = adapter.cleanup_initial_input(workspace, &execution.id).await
+    if let Err(error) =
+        crate::remote_input_lifecycle::cleanup_execution_inputs(work_db, adapter.as_ref(), &execution.id).await
     {
         tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
         return;

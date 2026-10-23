@@ -1676,6 +1676,7 @@ impl AgentDriver for CodexDriver {
         // with the Claude path's shared template.
         let config_dir = workspace.join(CODEX_DESCRIPTOR.config_dir);
         fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
+        super::initial_prompt::warm_preflight().await?;
         super::initial_prompt::provision(&config_dir, &codex_home, prompt_text, self)?;
         let gitignore_path = config_dir.join(".gitignore");
         fs::write(&gitignore_path, CODEX_DIR_GITIGNORE)

@@ -124,9 +124,8 @@ impl WorkerCompletionHandler {
         if !matches!(adapter.probe_remote_worker_alive(remote_pid).await, Ok(Some(false))) {
             return false;
         }
-        if let Ok(execution) = self.work_db.get_execution(execution_id)
-            && let Some(workspace) = execution.workspace_path.as_deref()
-            && let Err(error) = adapter.cleanup_initial_input(workspace, execution_id).await
+        if let Err(error) =
+            crate::remote_input_lifecycle::cleanup_execution_inputs(&self.work_db, adapter.as_ref(), execution_id).await
         {
             tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
             return false;
