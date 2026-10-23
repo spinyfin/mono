@@ -28,6 +28,7 @@ mod release_tests;
 mod remove_tests;
 mod repo_tests;
 mod setup_tests;
+mod store_gc_tests;
 mod support;
 
 pub(super) fn with_checkleft_fixture<T>(run: impl FnOnce() -> T) -> T {

@@ -102,6 +102,10 @@ pub async fn snapshot_pointers(jj: &dyn Jj, record: &ExecutionBookmark) -> Resul
 /// reappeared are deleted in one invocation. A pointer whose current state
 /// cannot be read as a single commit (conflicted) is always set, which is
 /// what resolves the conflict.
+///
+/// Leaving unmoved pointers alone matters beyond speed: a `bookmark set`
+/// that changes nothing still records an operation, and every operation in
+/// the shared store writes a full view of all its bookmarks.
 pub async fn restore_pointers(jj: &dyn Jj, record: &ExecutionBookmark, saved: &PointerSnapshot) -> Result<()> {
     let names: Vec<String> = saved.iter().map(|(name, _)| name.clone()).collect();
     let current = resolve_bookmark_targets(jj, &record.repo_path, &names).await?;

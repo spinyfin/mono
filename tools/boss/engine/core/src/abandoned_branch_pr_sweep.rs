@@ -434,6 +434,7 @@ pub fn spawn_loop(
     let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
     let pr_creator: Arc<dyn PrAutoCreator> = Arc::new(CommandPrAutoCreator::new());
     let failure_counts: Arc<AsyncMutex<HashMap<String, u32>>> = Arc::new(AsyncMutex::new(HashMap::new()));
+    let pr_state: Arc<dyn crate::work::PrStateChecker> = Arc::new(crate::work::GhPrStateChecker);
     spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
         let coordinator = Arc::clone(&coordinator);
@@ -441,9 +442,18 @@ pub fn spawn_loop(
         let pr_creator = Arc::clone(&pr_creator);
         let dispatch_events = Arc::clone(&dispatch_events);
         let failure_counts = Arc::clone(&failure_counts);
+        let pr_state = Arc::clone(&pr_state);
         async move {
             if let Err(err) = crate::abandoned_execution_bookmarks::run_one_pass(&work_db, &coordinator).await {
                 tracing::error!(error = %err, "abandoned execution bookmark sweep failed");
+            }
+            // Retire the pointers of executions whose PR is merged or closed
+            // once their work is proven published, so the shared store's
+            // bookmark set stays bounded by live work (see that module).
+            match crate::execution_bookmark_prune::run_one_pass(&work_db, &coordinator, pr_state).await {
+                Ok(report) if report.examined > 0 => tracing::info!(?report, "execution bookmark prune pass"),
+                Ok(_) => {}
+                Err(err) => tracing::error!(error = %err, "execution bookmark prune sweep failed"),
             }
             let mut failure_counts = failure_counts.lock().await;
             boss_gh_telemetry::scope(
