@@ -1693,3 +1693,6 @@ fn stale_main_activity_preserves_a_newer_stop_boundary() {
         Some(TurnBoundary { seq: Some(5) }),
     );
 }
+
+#[path = "tests/live_worker_state_declared_wait_tests.rs"]
+mod declared_wait_tests;

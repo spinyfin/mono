@@ -698,33 +698,10 @@ pub(super) async fn dispatch_live_worker_state(
     let changed = applied.repaired || matches!(applied.outcome, ApplyEventOutcome::Applied { changed: true });
     let new_state = server_state.live_worker_states.get(slot_id);
     let new_activity = new_state.as_ref().map(|s| s.activity);
-    // A declared wait (`boss propose wait`) describes the idle period that
-    // follows it. The registry reports when the worker's main session
-    // started a new turn after a turn boundary — a prompt, or Claude Code
-    // waking the session on its own because a background command finished,
-    // which opens the turn with tool hooks and no `UserPromptSubmit`. That
-    // period is over: end the wait so the pane stops advertising a stale
-    // `wait_reason` and the nudge ladder is no longer held for an idle
-    // period that has ended. This is keyed on turn ordering, not on the
-    // activity the slot showed: it holds when the resumed turn's tool hook
-    // overtakes the `Stop` it follows (the late `Stop` reports the resume
-    // itself), and it ignores a wait declared mid-turn, a permission-prompt
-    // `Notification` and a subagent's tool hooks, none of which is the main
-    // session resuming after a boundary.
-    if let Some(boundary) = applied.resumed_after
-        && let Some(ended) = server_state.wait_registry.end_if_declared_before(run_id, boundary.seq)
-    {
-        tracing::info!(
-            execution_id = run_id,
-            slot_id,
-            boundary_seq = ?boundary.seq,
-            current_tool = new_state.as_ref().and_then(|s| s.current_tool.as_deref()).unwrap_or("-"),
-            reason = %ended.reason,
-            "live_status: worker resumed a turn; ended its declared wait",
-        );
-        // The pane advertises the wait; push the cleared caption.
-        server_state.broadcast_live_worker_states().await;
-    } else if changed {
+    // Wait consumption is part of the main-session turn reduction. A late
+    // Stop can prove a resume without changing activity, but the cleared
+    // wait caption still needs publication.
+    if changed || applied.resumed_after.is_some() {
         server_state.broadcast_live_worker_states().await;
     }
     // Fan out the matching trigger to the per-slot live-status loop.

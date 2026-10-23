@@ -508,6 +508,8 @@ struct WorkerSlotView: View, @MainActor Equatable {
         switch activity {
         case .working: .blue
         case .waitingForInput: .orange
+        case .waitingOnWork: .teal
+        case .waitOverdue: .yellow
         case .idle: .green
         case .spawning: .secondary
         case .errored: .red
@@ -576,7 +578,7 @@ struct WorkerSlotView: View, @MainActor Equatable {
                     .help(snapshot.runId ?? "")
                     .accessibilityLabel("Recovering: \(recovering)")
             }
-        } else if let live = snapshot.live?.liveStatus,
+        } else if let live = snapshot.live?.activity.slotSubtitle(prior: snapshot.live?.liveStatus),
            !live.isEmpty
         {
             HStack(alignment: .firstTextBaseline, spacing: 4) {

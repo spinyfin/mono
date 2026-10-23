@@ -85,6 +85,31 @@ pub const MAX_LIVE_STATUS_LEN: usize = 60;
 /// directly to `live_status` without a model call.
 pub const AWAITING_INPUT_LITERAL: &str = "awaiting input";
 
+/// Literal written when `activity` flips to `WaitingOnWork` and no useful
+/// prior summary exists: the worker is parked on a wait it declared itself,
+/// so it must never read as needing a person.
+pub const WAITING_ON_WORK_LITERAL: &str = "waiting on its own work";
+
+/// Literal written when `activity` flips to `WaitOverdue`: the declared wait
+/// expired and the worker was not re-woken.
+pub const WAIT_OVERDUE_LITERAL: &str = "wait expired — check on it";
+
+/// Project state literals from the authoritative activity, preserving narrative summaries.
+pub fn activity_subtitle(activity: boss_protocol::WorkerActivity, prior: Option<&str>) -> Option<String> {
+    if let Some(text) = prior
+        && !text.is_empty()
+        && ![AWAITING_INPUT_LITERAL, WAITING_ON_WORK_LITERAL, WAIT_OVERDUE_LITERAL].contains(&text)
+    {
+        return Some(text.to_owned());
+    }
+    match activity {
+        boss_protocol::WorkerActivity::WaitingForInput => Some(AWAITING_INPUT_LITERAL.to_owned()),
+        boss_protocol::WorkerActivity::WaitingOnWork => Some(WAITING_ON_WORK_LITERAL.to_owned()),
+        boss_protocol::WorkerActivity::WaitOverdue => Some(WAIT_OVERDUE_LITERAL.to_owned()),
+        _ => None,
+    }
+}
+
 /// Literal string written when `activity` flips to `Errored`.
 pub const ERRORED_LITERAL: &str = "errored — check logs";
 
