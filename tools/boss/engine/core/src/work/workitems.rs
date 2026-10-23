@@ -1632,7 +1632,8 @@ impl WorkDb {
         // Single-item lookup; the per-item subquery tally is only meaningful
         // for the `get_work_tree` N+1, so discard it here.
         let mut queries = 0u64;
-        query_task_runtime(&conn, &resolved, &mut queries)
+        let task = query_task(&conn, &resolved)?;
+        query_task_runtime(&conn, &resolved, task.as_ref(), &mut queries)
     }
 
     /// Look up a work item by its per-product short_id. Searches both

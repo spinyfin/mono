@@ -844,11 +844,13 @@ pub(super) async fn apply_work_item_patch(
                 if let Some(execution_id) = active_to_todo_execution(&work_db, &previous_task_status, &item) {
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = id.clone();
+                    let cancel_actor = resolve_cancel_actor(&server_state, peer_pid);
                     boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(
                                 &id_for_cancel,
                                 &execution_id,
+                                cancel_actor,
                                 "kanban drag: active → todo (dragged back to Backlog)",
                             )
                             .await;
@@ -1247,11 +1249,13 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                     };
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = tombstoned_id.clone();
+                    let cancel_actor = resolve_cancel_actor(&server_state, peer_pid);
                     boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(
                                 &id_for_cancel,
                                 &execution_id,
+                                cancel_actor,
                                 "work item deleted while a worker was active",
                             )
                             .await;

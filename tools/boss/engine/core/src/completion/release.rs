@@ -128,7 +128,7 @@ impl WorkerCompletionHandler {
         ForceReleaseOutcome::Released { lease_id }
     }
 
-    /// Stop a worker whose task was dragged back to Backlog by the user.
+    /// Stop a worker whose task was dragged back to Backlog or deleted.
     /// Cancels the execution row in the DB (so the orphan sweep and
     /// reconciler won't re-dispatch it) then releases the pane and cube
     /// workspace via `force_release`. Does NOT demote the task status —
@@ -136,24 +136,47 @@ impl WorkerCompletionHandler {
     /// patch before this is called.
     ///
     /// `work_item_id` is the row (task/chore) whose deletion or status
-    /// change triggered this teardown. `reason` names what triggered the
-    /// cancel (e.g. the kanban `active → todo` drag, or a row delete).
-    /// Both are stamped on a single cascade trace line once the release
-    /// completes so a post-mortem can grep `engine-trace.jsonl` for the
-    /// row id and see the whole story — what triggered it, which
-    /// execution it hit, and what the teardown actually did — without
-    /// cross-referencing separate execution-id-only log lines. This
-    /// closes the diagnosability gap behind the zombie-worker report
-    /// where two deleted tasks kept running until `bossctl agents stop`
-    /// was run by hand because nothing in the trace tied the row id to
-    /// the executions that outlived it.
-    pub async fn cancel_and_release(&self, work_item_id: &str, execution_id: &str, reason: &str) {
-        let cancelled = match self.work_db.cancel_running_execution(execution_id) {
-            Ok(cancelled) => cancelled,
+    /// change triggered this teardown. `actor` is the caller the RPC handler
+    /// resolved from the peer pid (a human, or the coordinator), and `reason`
+    /// names what triggered the cancel (e.g. the kanban `active → todo` drag,
+    /// or a row delete). Both go into the park text when this was the row's
+    /// governing execution, onto the execution's dispatch timeline as an
+    /// `execution_cancelled` event, and onto a single cascade trace line
+    /// once the release completes, so a post-mortem can grep
+    /// `engine-trace.jsonl` for the row id and see what triggered the
+    /// teardown, which execution it hit, and what the teardown actually did
+    /// without cross-referencing separate execution-id-only log lines.
+    pub async fn cancel_and_release(
+        &self,
+        work_item_id: &str,
+        execution_id: &str,
+        actor: boss_protocol::StatusActor,
+        reason: &str,
+    ) {
+        let prior_status = self.work_db.get_execution(execution_id).ok().map(|e| e.status);
+        let cancelled = match self
+            .work_db
+            .cancel_running_execution_with_reason(execution_id, actor, reason)
+        {
+            Ok((cancelled, work_item_parked)) => {
+                if cancelled {
+                    self.record_execution_cancelled(
+                        execution_id,
+                        work_item_id,
+                        prior_status,
+                        actor,
+                        reason,
+                        work_item_parked,
+                    )
+                    .await;
+                }
+                cancelled
+            }
             Err(err) => {
                 tracing::warn!(
                     work_item_id,
                     execution_id,
+                    actor = actor.as_str(),
                     reason,
                     ?err,
                     "cancel_and_release: failed to cancel execution; proceeding to release",
@@ -165,6 +188,7 @@ impl WorkerCompletionHandler {
         tracing::info!(
             work_item_id,
             execution_id,
+            actor = actor.as_str(),
             reason,
             cancelled,
             outcome = outcome.label(),
@@ -177,10 +201,10 @@ impl WorkerCompletionHandler {
         );
     }
 
-    /// Explicit human-initiated stop (`bossctl agents stop`). Unlike
-    /// the normal `on_stop` hook path — which probes for a PR and
-    /// waits for the worker to respond — this path is used when the
-    /// operator wants the worker dead *now*. The differences:
+    /// Explicit stop (`bossctl agents stop`, the app's stop action, the
+    /// merge poller's stop-on-review). Unlike the normal `on_stop` hook path
+    /// — which probes for a PR and waits for the worker to respond — this
+    /// path kills the worker *now*. The differences:
     ///
     /// 1. Cancels the execution atomically in the DB (so the orphan
     ///    sweep and `reconcile_active_dispatch` don't re-dispatch the
@@ -194,28 +218,52 @@ impl WorkerCompletionHandler {
     /// 4. Then calls `force_release` to kill the pane and free
     ///    the cube workspace.
     ///
+    /// `actor` and `reason` go into the park text when this was the row's
+    /// governing execution and onto the execution's dispatch timeline as an
+    /// `execution_cancelled` event.
+    ///
     /// Idempotent: a second call for the same execution is a no-op
     /// at both the DB and the cube-release layers.
-    pub async fn force_stop_execution(&self, execution_id: &str) {
-        let (exec_cancelled, task_demoted) = match self.work_db.cancel_running_execution_and_demote_task(execution_id) {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "force_stop: failed to cancel execution / demote task — proceeding to release",
-                );
-                (false, false)
-            }
-        };
+    pub async fn force_stop_execution_as(&self, execution_id: &str, actor: boss_protocol::StatusActor, reason: &str) {
+        let before = self.work_db.get_execution(execution_id).ok();
+        let (exec_cancelled, task_demoted) =
+            match self
+                .work_db
+                .cancel_running_execution_and_demote_task_as(execution_id, actor, reason)
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        actor = actor.as_str(),
+                        reason,
+                        ?err,
+                        "force_stop: failed to cancel execution / demote task — proceeding to release",
+                    );
+                    (false, false)
+                }
+            };
 
         if exec_cancelled || task_demoted {
             tracing::info!(
                 execution_id,
+                actor = actor.as_str(),
+                reason,
                 exec_cancelled,
                 task_demoted,
                 "force_stop: cancelled execution and demoted task",
             );
+            if exec_cancelled && let Some(before) = &before {
+                self.record_execution_cancelled(
+                    execution_id,
+                    &before.work_item_id,
+                    Some(before.status.clone()),
+                    actor,
+                    reason,
+                    task_demoted,
+                )
+                .await;
+            }
             // Publish work-item-changed so the UI refreshes. Requires
             // looking up the execution's work_item_id + product_id.
             if let Ok(execution) = self.work_db.get_execution(execution_id)
@@ -230,6 +278,38 @@ impl WorkerCompletionHandler {
         }
 
         self.force_release(execution_id).await;
+    }
+
+    /// Put a cancel this handler just performed on the execution's dispatch
+    /// timeline (`execution_cancelled`, with actor, reason, the status that
+    /// was terminalized and whether the board moved). `prior_status` is
+    /// `None` only when the pre-cancel read failed, in which case the event
+    /// still lands with the status marked unknown rather than being dropped:
+    /// the timeline must never silently stop at `pane_spawned` for a row the
+    /// durable store says is `cancelled`.
+    pub(crate) async fn record_execution_cancelled(
+        &self,
+        execution_id: &str,
+        work_item_id: &str,
+        prior_status: Option<boss_protocol::ExecutionStatus>,
+        actor: boss_protocol::StatusActor,
+        reason: &str,
+        work_item_moved: bool,
+    ) {
+        let mut event = crate::work::execution_cancelled_event(
+            execution_id,
+            work_item_id,
+            prior_status
+                .clone()
+                .unwrap_or(boss_protocol::ExecutionStatus::Cancelled),
+            actor,
+            reason,
+            work_item_moved,
+        );
+        if prior_status.is_none() {
+            event.details["prior_status"] = serde_json::Value::String("unknown".to_owned());
+        }
+        self.dispatch_events.emit(event).await;
     }
 
     /// Publish the more specific "stopped without a PR" signal so the

@@ -26,12 +26,22 @@ pub(crate) fn collect_task_runtimes_cached(
     let lookup = cache.lookup(product_id, &items, now);
     let mut runtimes = Vec::with_capacity(items.len());
     let mut fresh = Vec::new();
-    for ((id, epoch), hit) in items.iter().zip(lookup.hits) {
+    for (((id, epoch), hit), task) in items.iter().zip(lookup.hits).zip(tasks.iter().chain(chores)) {
+        // Hold reasons consult task, project, and repository state outside the
+        // execution epoch. Recompute dispatch-pending terminal/absent runtimes.
+        let hit = hit.filter(|runtime| {
+            task.status != TaskStatus::Todo
+                || !task.autostart
+                || runtime
+                    .execution_status
+                    .as_ref()
+                    .is_some_and(|status| !status.is_terminal())
+        });
         if let Some(runtime) = hit {
             runtimes.push(runtime);
             continue;
         }
-        let computed = compute_task_runtime(conn, id, &mut queries, now)?;
+        let computed = compute_task_runtime(conn, id, Some(task), &mut queries, now)?;
         if computed.cacheable {
             fresh.push((
                 (*id).to_owned(),

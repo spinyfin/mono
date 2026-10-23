@@ -149,7 +149,7 @@ use isolation::IsolationPaths;
 // Re-import process-signal helpers so child modules can access them via `use super::*`.
 use process_signals::{
     constant_time_eq, current_parent_pid, is_descendant_of_any, reap_worker_process_tree,
-    register_app_session_trust_ok, resolve_status_actor, signal_shell_pids,
+    register_app_session_trust_ok, resolve_cancel_actor, resolve_status_actor, signal_shell_pids,
 };
 
 // Re-import pane-op error types for child test modules.

@@ -1295,6 +1295,7 @@ async fn conflict_revision_signal_cleared_retires_attempt_and_finalises() {
         publisher,
         pane,
         probes,
+        ..
     } = TestHarness::new(db.clone(), detector);
     let handler = handler
         .with_branch_verifier(verifier)

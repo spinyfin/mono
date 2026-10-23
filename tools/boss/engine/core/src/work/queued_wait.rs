@@ -12,7 +12,16 @@ pub(super) struct DispatchWait {
     pub reads_other_items: bool,
 }
 
+/// Wait reason for a project task held back by the ordinal chain.
+pub(super) const WAIT_ORDINAL_CHAIN: &str = "ordinal_chain";
+/// Wait reason for a pending execution the scheduler has not stamped yet.
+pub(super) const WAIT_AWAITING_SCHEDULER: &str = "awaiting_scheduler";
+
 /// Project only pending execution state; never leak an old hold onto a live run.
+/// Every pending execution comes back with an engine-stated reason: a
+/// dependency, the ordinal chain, a scheduled time, the scheduler's recorded
+/// reason, or `awaiting_scheduler` for a runnable row the scheduler has not
+/// stamped yet. An unexplained `waiting_dependency` row is logged.
 pub(super) fn for_execution(conn: &Connection, execution: Option<&WorkExecution>, now: i64) -> Result<DispatchWait> {
     let Some(execution) = execution else {
         return Ok(DispatchWait::default());
@@ -65,7 +74,65 @@ pub(super) fn for_execution(conn: &Connection, execution: Option<&WorkExecution>
             }
         }
     }
+    if wait.reason.is_none() {
+        fill_unstamped(conn, execution, &mut wait)?;
+    }
     Ok(wait)
+}
+
+/// Explain a pending execution whose scheduler stamp is absent or stale.
+fn fill_unstamped(conn: &Connection, execution: &WorkExecution, wait: &mut DispatchWait) -> Result<()> {
+    match execution.status {
+        ExecutionStatus::WaitingDependency => {
+            if let Some(blocker) = ordinal_chain_blocker(conn, &execution.work_item_id)? {
+                wait.reason = Some(WAIT_ORDINAL_CHAIN.into());
+                wait.blocker = Some(blocker);
+            } else {
+                tracing::warn!(
+                    work_item_id = %execution.work_item_id,
+                    execution_id = %execution.id,
+                    "queued wait: waiting_dependency execution has no gating prerequisite, is not behind \
+                     an earlier project task, and carries no recorded reason",
+                );
+            }
+        }
+        _ => wait.reason = Some(WAIT_AWAITING_SCHEDULER.into()),
+    }
+    Ok(())
+}
+
+/// The earlier project task `reconcile_product_executions` keeps this task
+/// behind: project tasks run in `(ordinal, created_at, id)` order and only
+/// the first one that still accepts an execution is `ready`.
+fn ordinal_chain_blocker(conn: &Connection, work_item_id: &str) -> Result<Option<DispatchWaitBlocker>> {
+    let Some(task) = query_task(conn, work_item_id)? else {
+        return Ok(None);
+    };
+    let Some(project_id) = task.project_id.as_deref() else {
+        return Ok(None);
+    };
+    if !matches!(task.kind, TaskKind::ProjectTask | TaskKind::Design) {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id FROM tasks
+         WHERE project_id = ?1 AND deleted_at IS NULL AND kind IN ('project_task', 'design')
+         ORDER BY COALESCE(ordinal, 9223372036854775807) ASC, created_at ASC, id ASC",
+    )?;
+    let ids = stmt
+        .query_map([project_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        if id == work_item_id {
+            return Ok(None);
+        }
+        if let Some(earlier) = query_task(conn, &id)?
+            && task_accepts_execution(&earlier)
+        {
+            return blocker_for(conn, &earlier.id);
+        }
+    }
+    Ok(None)
 }
 
 /// Whether a recorded chain-hold blocker still holds the chain: running, waiting on a human,

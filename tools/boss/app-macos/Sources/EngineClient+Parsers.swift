@@ -467,7 +467,8 @@ extension EngineClient {
             dispatchWaitReason: payload["dispatch_wait_reason"] as? String,
             dispatchWaitSince: payload["dispatch_wait_since"] as? String,
             dispatchNotBefore: payload["dispatch_not_before"] as? String,
-            dispatchWaitBlocker: (payload["dispatch_wait_blocker"] as? [String: Any]).flatMap(DispatchWaitBlocker.init)
+            dispatchWaitBlocker: (payload["dispatch_wait_blocker"] as? [String: Any]).flatMap(DispatchWaitBlocker.init),
+            dispatchHoldReason: payload["dispatch_hold_reason"] as? String
         )
     }
 

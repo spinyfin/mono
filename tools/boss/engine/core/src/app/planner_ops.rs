@@ -236,6 +236,7 @@ pub(super) async fn handle_unpopulate_project(ctx: Dispatch, req: FrontendReques
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::UnpopulateProject { project_id, run_id } = req else {
@@ -328,11 +329,13 @@ pub(super) async fn handle_unpopulate_project(ctx: Dispatch, req: FrontendReques
                     };
                     let handler = server_state.completion_handler.clone();
                     let id_for_cancel = tombstoned_id.clone();
+                    let cancel_actor = resolve_cancel_actor(&server_state, peer_pid);
                     boss_task_scope::spawn(async move {
                         handler
                             .cancel_and_release(
                                 &id_for_cancel,
                                 &execution_id,
+                                cancel_actor,
                                 "work item deleted while a worker was active",
                             )
                             .await;
