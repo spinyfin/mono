@@ -196,6 +196,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::WorkItemDeleted { .. }
         | FrontendEvent::WorkItemRestored { .. }
         | FrontendEvent::WorkError { .. }
+        | FrontendEvent::WorkItemRefused { .. }
         | FrontendEvent::WorkItemDuplicateBlocked { .. }
         | FrontendEvent::Error { .. }
         | FrontendEvent::AppSessionRegistered

@@ -84,6 +84,7 @@ async fn board_drag_pause_bypass_dispatches_held_ready_execution() {
             target: BoardDropTarget::new(BoardColumn::Doing, None),
             bypass_dispatch_pause: true,
             observed_pause_since_epoch_s: Some(live_gen),
+            explicit_status: None,
         },
     )
     .await;
@@ -167,6 +168,7 @@ async fn board_drag_without_bypass_skips_when_ready_execution_exists() {
             target: BoardDropTarget::new(BoardColumn::Doing, None),
             bypass_dispatch_pause: false,
             observed_pause_since_epoch_s: None,
+            explicit_status: None,
         },
     )
     .await;
@@ -280,6 +282,7 @@ async fn assert_board_drag_pause_bypass_onto_already_live_execution_reports_no_d
             target: BoardDropTarget::new(BoardColumn::Doing, None),
             bypass_dispatch_pause: true,
             observed_pause_since_epoch_s: Some(live_gen),
+            explicit_status: None,
         },
     )
     .await;

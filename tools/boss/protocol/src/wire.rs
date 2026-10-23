@@ -11,23 +11,24 @@ use crate::metrics_wire::MetricLiveEntry;
 use crate::tmux_worker_status::TmuxWorkerStatus;
 use crate::types::{
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation,
-    AutomationDedupSuppression, AutomationPatch, AutomationRun, BackgroundWorkItem, BoardDropTarget, CiBudgetSnapshot,
-    CiRemediation, CommentAnchor, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
-    ConflictResolution, CoordinatorGuidanceView, CoordinatorHandoffView, CreateAttentionInput,
-    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateDecisionInput,
-    CreateExecutionInput, CreateIdeaInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision,
-    DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission,
-    DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
-    GitHubAuthStateDto, GuideCommentDisposition, Idea, IdeaGraduationKind, IdeaPatch, LinkExternalRefInput,
-    ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState,
-    ProbeInterruptOutcome, ProbeResumeEvidence, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt,
-    ReviewGuideSummary, ReviewGuideVersion, ReviseDocInput, ReviseDocOutcome, SelectedProductState,
-    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,
-    Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle,
-    WorkerProposal, WorkerTierDenial,
+    AutomationDedupSuppression, AutomationPatch, AutomationRun, BackgroundWorkItem, BoardDropTarget,
+    BoardRefusalAction, BoardRefusalCode, CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentThreadEntry,
+    CommentWithThread, CommentsBannerState, ConflictHotspotReport, ConflictResolution, CoordinatorGuidanceView,
+    CoordinatorHandoffView, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput,
+    CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateIdeaInput, CreateInvestigationInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
+    CreateRunInput, CreateTaskInput, Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent,
+    DesignDocTreeState, DispatchAdmission, DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction,
+    EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, GuideCommentDisposition, Idea,
+    IdeaGraduationKind, IdeaPatch, LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView,
+    PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, ProbeInterruptOutcome, ProbeResumeEvidence, Product,
+    Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt, ReviewGuideSummary, ReviewGuideVersion,
+    ReviseDocInput, ReviseDocOutcome, SelectedProductState, SetProductEditorialRulesInput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskRuntime,
+    TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
+    WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -1858,6 +1859,14 @@ pub enum FrontendRequest {
         /// staleness contract this feeds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         observed_pause_since_epoch_s: Option<u64>,
+        /// An explicit status choice (the work-card popover's Move buttons)
+        /// for a card the board already shows in the target column — e.g.
+        /// unblocking a blocked card from its own column. Bypasses drop
+        /// resolution (which reads a same-column drop as a reorder) and
+        /// applies this status through the same patch path, so refusals still
+        /// return as [`FrontendEvent::WorkItemRefused`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explicit_status: Option<crate::TaskStatus>,
     },
 
     /// Boss-tier RPC: ask the macOS app to open `path` (an absolute or
@@ -2143,6 +2152,11 @@ pub enum FrontendRequest {
     ReorderProjectTasks {
         project_id: String,
         task_ids: Vec<String>,
+        /// The card the user moved, set by the board's Move Up/Down. When
+        /// present a refusal comes back as [`FrontendEvent::WorkItemRefused`]
+        /// naming this card; when absent (the CLI) it is a plain `WorkError`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        moved_task_id: Option<String>,
     },
 
     /// App reports which product its chooser is now set to, so the
