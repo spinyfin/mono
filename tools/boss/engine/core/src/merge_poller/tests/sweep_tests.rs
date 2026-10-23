@@ -29,6 +29,10 @@ async fn merged_pr_is_promoted_and_publishes_invalidation() {
             .any(|(p, w, r)| p == &product_id && w == &chore_id && r == "pr_merged"),
         "expected pr_merged work-item event, got {events:?}",
     );
+    assert!(
+        !publisher.runtime_reasons().await.contains(&"pr_merged".to_owned()),
+        "a merge moves the card between lanes: it must stay a full-board invalidation"
+    );
 }
 
 #[tokio::test]
@@ -2664,6 +2668,14 @@ async fn ci_required_state_clears_when_rollup_recovers_to_success() {
         has_poll_update,
         "pr_poll_state_updated must be emitted when ci_required_state changes; \
              got: {all_events:?}",
+    );
+    // The poll rewrites only this task's CI / review columns: runtime-class.
+    assert!(
+        publisher
+            .runtime_reasons()
+            .await
+            .contains(&"pr_poll_state_updated".to_owned()),
+        "pr_poll_state_updated must be a runtime-class invalidation"
     );
 
     // The retire path emits a clear event; the poll-state safety net may

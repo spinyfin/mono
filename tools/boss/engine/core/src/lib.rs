@@ -26,6 +26,9 @@ pub mod awaiting_input_status;
 pub mod background_children;
 pub mod background_work;
 pub mod blocking_signal;
+pub mod board_invalidation_metrics;
+#[cfg(test)]
+mod board_invalidation_replay;
 pub mod boss_construct_scan;
 pub mod build_info;
 pub mod build_wait;
@@ -70,7 +73,6 @@ pub mod attachment_server;
 pub mod codex_guard_trace;
 pub mod codex_home_retention_sweep;
 pub mod codex_unobserved_command;
-pub mod board_invalidation_metrics;
 pub mod dispatch_failure_recovery_sweep;
 pub mod dispatch_inflight;
 pub mod dispatch_metrics;
