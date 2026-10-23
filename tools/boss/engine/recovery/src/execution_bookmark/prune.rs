@@ -20,11 +20,14 @@
 //! execution recorded after its push, the pushed branch's remote-tracking
 //! bookmark, or the trunk's. Nothing is ever inferred from a name.
 //!
-//! Unproven work keeps its recovery bookmark; only the baseline and
-//! publication bookmarks go, because the record's `base_commit` and jj's
-//! evolution log already let the baseline be rebuilt
-//! ([`resolve_base`]) and the publication bookmark is just the pushed branch
-//! name, which `cube pr update` recreates from `@` whenever it is needed.
+//! A head is forgotten only once some voucher carries it; the baseline is
+//! always forgotten, because the record's `base_commit` and jj's evolution log
+//! let it be rebuilt ([`resolve_base`]). The recovery and publication heads
+//! can legitimately diverge, so each is judged on its own: a head no voucher
+//! carries stays, whichever head that is, and when no voucher resolved at all
+//! both stay. Because only proven heads are ever forgotten, a later call with
+//! a better voucher (the PR head GitHub reports) sees every head that still
+//! needs proof.
 use super::reconcile::containment;
 use super::*;
 
@@ -80,10 +83,11 @@ pub enum PruneOutcome {
         /// rewrites rather than by ancestry.
         rewritten: usize,
     },
-    /// Preserved work nothing could vouch for. The recovery head stays at
-    /// `kept`; the other bookmarks were forgotten.
+    /// Preserved work nothing could vouch for. The heads in `kept` are the
+    /// ones no voucher carries and they stay; the baseline and any head a
+    /// voucher did carry were forgotten.
     Unproven {
-        kept: String,
+        kept: Vec<String>,
         missing: Vec<MissingChange>,
         forgotten: Vec<String>,
         /// Each voucher that was tried and why it did not vouch.
@@ -222,6 +226,9 @@ pub async fn prune(jj: &dyn Jj, record: &ExecutionBookmark, vouchers: &[Voucher]
         Err(err) => tried.push(format!("remote bookmarks: {err:#}")),
     }
     let mut best: Option<Attempt> = None;
+    // Per head (in `named` order): the voucher that carried it, if any.
+    let mut carried_by: Vec<Option<(String, String)>> = vec![None; named.len()];
+    let mut rewritten_changes: Vec<String> = Vec::new();
     for voucher in vouchers {
         let commits = resolve_revset(jj, repo, &voucher.revset).await?;
         let commit = match commits.as_slice() {
@@ -244,6 +251,14 @@ pub async fn prune(jj: &dyn Jj, record: &ExecutionBookmark, vouchers: &[Voucher]
             commit,
             containment: containments,
         };
+        for (slot, containment) in carried_by.iter_mut().zip(&attempt.containment) {
+            if containment.is_contained() && slot.is_none() {
+                *slot = Some((attempt.label.clone(), attempt.commit.clone()));
+            }
+            if let Containment::Rewritten { matched } = containment {
+                rewritten_changes.extend(matched.iter().map(|change| change.change_id.clone()));
+            }
+        }
         if attempt.contained() {
             let mut forgotten = Vec::new();
             if base_bookmarked {
@@ -270,19 +285,39 @@ pub async fn prune(jj: &dyn Jj, record: &ExecutionBookmark, vouchers: &[Voucher]
             best = Some(attempt);
         }
     }
-    // Keep the recovery head (or the publication head when it is the only
-    // one left); the baseline is rebuilt from the record and the publication
-    // bookmark from `@` whenever either is needed again.
-    let kept = match (&heads.recovery, &heads.publication) {
-        (Some(_), _) => record.head(),
-        (None, Some(_)) => record.publication(),
-        (None, None) => unreachable!("resolve_heads rejects two missing heads"),
-    };
     let mut forgotten = Vec::new();
     if base_bookmarked {
         forgotten.push(base_name);
     }
-    forgotten.extend(named.into_iter().map(|(name, _)| name).filter(|name| *name != kept));
+    let mut kept = Vec::new();
+    for ((name, _), carried) in named.iter().zip(&carried_by) {
+        if carried.is_some() {
+            forgotten.push(name.clone());
+        } else {
+            kept.push(name.clone());
+        }
+    }
+    if kept.is_empty() {
+        // Every head is carried, each by a different voucher: nothing is
+        // left to recover.
+        forget(jj, repo, &forgotten).await?;
+        let mut labels: Vec<&str> = carried_by.iter().flatten().map(|(label, _)| label.as_str()).collect();
+        labels.dedup();
+        let commit = carried_by
+            .iter()
+            .flatten()
+            .next()
+            .map(|(_, commit)| commit.clone())
+            .unwrap_or_default();
+        rewritten_changes.sort_unstable();
+        rewritten_changes.dedup();
+        return Ok(PruneOutcome::Published {
+            vouched_by: labels.join(" + "),
+            commit,
+            forgotten,
+            rewritten: rewritten_changes.len(),
+        });
+    }
     forget(jj, repo, &forgotten).await?;
     Ok(PruneOutcome::Unproven {
         kept,

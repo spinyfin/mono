@@ -358,9 +358,6 @@ pub(crate) mod prune_outcome {
 #[builder(on(String, into))]
 pub(crate) struct PruneCandidate {
     pub execution: WorkExecution,
-    /// The task that owns the PR: the execution's own work item or, for a
-    /// revision, the root of its chain.
-    pub chain_root_id: String,
     /// The chain root's PR, when one was ever bound.
     pub pr_url: Option<String>,
     /// True when the chain root is `done` or `archived`: its PR is merged
@@ -409,7 +406,10 @@ impl WorkDb {
                 |row| row.get::<_, String>(0),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut candidates = Vec::with_capacity(ids.len());
+        // The database has one connection behind a mutex, so everything that
+        // needs it is read here before it is released: the chain walk below
+        // (`list_executions_for_chain`) takes its own.
+        let mut rows = Vec::with_capacity(ids.len());
         for id in ids {
             let execution = query_execution(&conn, &id)?.context("prune candidate disappeared")?;
             let chain_root_id = super::chain_helpers::chain_root(&conn, &execution.work_item_id)?;
@@ -420,7 +420,12 @@ impl WorkDb {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let (status, pr_url, observed_pr_head) = root.unwrap_or_default();
+            rows.push((execution, chain_root_id, root.unwrap_or_default()));
+        }
+        drop(stmt);
+        drop(conn);
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (execution, chain_root_id, (status, pr_url, observed_pr_head)) in rows {
             let mut recorded_pr_heads = Vec::new();
             let mut push_head = |head: Option<String>| {
                 if let Some(head) = head.filter(|h| !h.trim().is_empty())
@@ -437,7 +442,6 @@ impl WorkDb {
             }
             candidates.push(PruneCandidate {
                 execution,
-                chain_root_id,
                 pr_url: pr_url.filter(|url| !url.trim().is_empty()),
                 chain_closed: matches!(status.as_str(), "done" | "archived"),
                 observed_pr_head: observed_pr_head.filter(|sha| !sha.trim().is_empty()),

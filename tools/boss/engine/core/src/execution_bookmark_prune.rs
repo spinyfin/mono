@@ -2,12 +2,10 @@
 //!
 //! Every execution gets three bookmarks in the shared jj store (`boss-base/`,
 //! `boss-recovery/`, `boss/`), and jj writes every bookmark into the view of
-//! every operation in that store. Nothing used to delete them, so the view a
-//! `jj new`, a snapshot or a `jj bookmark set` writes grew with the number of
-//! executions ever run (2.6 MB each, at ~5,000 operations a day, on the dev
-//! Mac before this sweep existed). The pointers only matter while the work
-//! might still have to be recovered, and that ends when the PR that carried
-//! it is merged or closed.
+//! every operation in that store, so each pointer kept past its use makes
+//! every later `jj new`, snapshot and `jj bookmark set` larger. The pointers
+//! only matter while the work might still have to be recovered, and that
+//! ends when the PR that carried it is merged or closed.
 //!
 //! Each pass examines a bounded batch of terminal, local executions whose
 //! records are still live ([`crate::work::WorkDb::list_prune_candidates`]).
@@ -20,8 +18,8 @@
 //! bookmark, the trunk's. Only when a voucher is missing does the sweep
 //! spend a bounded number of `gh pr view` calls per pass on the PR's live
 //! head. Proven work loses all three bookmarks and its record is retired;
-//! unproven work keeps its recovery head, is re-examined daily, and is
-//! surfaced as an attention item naming the changes nothing vouches for.
+//! unproven work keeps every head nothing carries, is re-examined daily, and
+//! is surfaced as an attention item naming the changes nothing vouches for.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -213,7 +211,8 @@ async fn prune_candidate(
             tried,
         } => {
             report.unproven += 1;
-            tracing::warn!(execution_id = %execution.id, %kept, missing = missing.len(), "execution bookmark prune: work not proven published; keeping the recovery head");
+            let kept_list = kept.join("`, `");
+            tracing::warn!(execution_id = %execution.id, kept = %kept_list, missing = missing.len(), "execution bookmark prune: work not proven published; keeping the unproven heads");
             if db.reraise_open_execution_attention(&execution.id, UNPROVEN)?.is_none() {
                 let missing_lines = missing
                     .iter()
@@ -225,20 +224,22 @@ async fn prune_candidate(
                     String::new()
                 } else {
                     format!(
-                        "\n\nIts other pointers (`{}`) were forgotten; the baseline is rebuilt from the record when needed.",
+                        "\n\nThe pointers `{}` were carried by a voucher and forgotten; the baseline is rebuilt from the record when needed.",
                         forgotten.join("`, `")
                     )
                 };
                 db.create_attention_item(CreateAttentionItemInput {
                     execution_id: Some(execution.id.clone()),
-                    work_item_id: Some(candidate.chain_root_id.clone()),
+                    work_item_id: None,
                     kind: UNPROVEN.to_owned(),
                     status: None,
                     title: "Finished PR left execution work nothing vouches for".to_owned(),
                     body_markdown: format!(
-                        "The PR owning execution `{}` is merged or closed, but the work preserved at `{kept}` in the shared jj store is not carried by anything the engine recorded, so the pointer was kept. Changes nothing vouches for:\n{missing_lines}\n\nVouchers tried:\n{tried_lines}{forgotten_note}\n\nInspect with `jj -R {} log -r 'bookmarks(exact:\"{kept}\")'`. If the work is known to be obsolete, `jj bookmark forget {kept}` retires it; the sweep re-examines the record daily.",
+                        "The PR owning execution `{}` is merged or closed, but the work preserved at `{kept_list}` in the shared jj store is not carried by anything the engine recorded, so the pointer was kept. Changes nothing vouches for:\n{missing_lines}\n\nVouchers tried:\n{tried_lines}{forgotten_note}\n\nInspect with `jj -R {} log -r 'bookmarks(exact:\"{first_kept}\")'`. If the work is known to be obsolete, `jj bookmark forget {kept_args}` retires it; the sweep re-examines the record daily.",
                         execution.id,
                         record.repo_path.display(),
+                        first_kept = kept[0],
+                        kept_args = kept.join(" "),
                     ),
                     resolved_at: None,
                 })?;

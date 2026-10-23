@@ -680,37 +680,46 @@ greppable.
 ### Shared-store upkeep (`cube repo gc`)
 
 The two passes above never touch `repos/<repo>`, but that store has its own
-unbounded growth: every workspace of a repo is a secondary jj workspace on
-it, and every operation any of them records — a `jj new` on lease, a worker's
+growth: every workspace of a repo is a secondary jj workspace on it, and
+every operation any of them records — a `jj new` on lease, a worker's
 snapshot, a bookmark set, a fetch — writes one view file listing every
-bookmark in the store. Nothing in jj ever removes an operation. On the dev
-Mac the mono store reached 95 GiB of op store (137k operations, 2.7 MB per
-view at 13k bookmarks, 5–6k operations on a busy day) before this existed.
+bookmark in the store. jj never removes operations on its own, so the log
+grows until old operations are abandoned and their files collected.
 
 `cube repo gc <repo>` is the generic jj recipe, run in the store's primary
 checkout and not aware of anything above jj:
 
 1. `jj op abandon ..<cut>`, where the cut is the newest operation that ended
    before the keep window (`--keep-hours`, default 72). Descendant operations
-   are reparented; views are content-addressed and untouched. Measured on jj
-   0.26 with a second workspace idle across the abandon: its next command
-   proceeds normally and `jj workspace update-stale` reports it was never
-   stale.
+   are reparented; views are content-addressed and untouched. The rewrite
+   gives every kept operation a new id, so a jj command that loaded the old
+   head and commits afterwards would leave a second operation head that
+   shares only the root with the new one, and jj would merge the two views
+   against an empty base. The abandon therefore runs only at an instant with
+   no `jj` process on the host (the pass waits up to five minutes for one and
+   otherwise skips the abandon and the collection until the next daily
+   pass), and the pass stops before collecting if the store then holds
+   anything but exactly one operation head.
 2. `jj util gc`. By default jj deletes only unreferenced files older than
    two weeks, and jj 0.26 accepts no other threshold than `--expire now`.
-   The two-week default is what protects a jj command in flight: the abandon
-   rewrote every operation newer than the cut under a new id, so a command
-   that loaded the store before it still names the old id of the head it
-   started from, and deleting that file would leave its operation with a
-   missing parent and every later command unable to merge the heads. So the
-   pass collects immediately (`--expire now`) only after it has observed an
-   instant with no `jj` process on the host — every command that loaded the
-   store before the abandon has then finished, and any later command loads
+   A command that loaded the store before the abandon still names the old
+   id of the head it started from, and deleting that file would leave its
+   operation with a missing parent. So the pass collects immediately
+   (`--expire now`) only after it has observed an instant with no `jj`
+   process on the host _after_ the abandon: every command that loaded the
+   store before the rewrite has then finished, and any later command loads
    the rewritten head, whose files the collection keeps. If the host is
    never quiet for five minutes, the pass falls back to the two-week
-   threshold and the next daily pass tries again.
+   threshold.
 3. `refs/heads/pr/<n>` git refs whose `pr/<n>` bookmark is gone are deleted;
    jj's next import drops them from the view.
+
+Each workspace's working copy records the id of the operation it last
+updated at, and the abandon rewrites that operation under a new id. Verified
+on jj 0.26.0 with a second workspace: after its recorded operation was
+abandoned and deleted by `--expire now`, and its `@` was rewritten from the
+first workspace, its next `jj status` ran normally and landed on the
+rewritten `@` without `jj workspace update-stale`.
 
 The periodic pool-GC pass starts this once a day per repo as a detached
 `cube repo gc` child, because the collection deletes one file per abandoned
