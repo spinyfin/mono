@@ -94,6 +94,7 @@ extension ChatViewModel {
         // Done before the @Published assignments take effect in the view so
         // the next render uses real boardColumn values — no visible flicker.
         reconcileOptimisticOverrides(from: tasks + chores)
+        reconcileCIFailureBadges(from: tasks + chores)
         reconcileWorkSelection()
         refreshWorkSubscriptions()
         workErrorMessage = nil

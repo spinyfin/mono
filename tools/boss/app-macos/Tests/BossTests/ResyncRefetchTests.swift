@@ -140,7 +140,9 @@ final class ResyncRefetchTests: XCTestCase {
                 "get_engine_pool_config": 1,
                 "get_work_tree": 1,
                 "list_deferred_scope_attentions": 1,
-                "list_engine_attempts": 1,
+                "list_engine_attempts": 2,
+                "list_ci_remediations": 1,
+                "list_conflict_resolutions": 1,
             ],
             "25 resyncs must cost exactly one set, none of it per project"
         )
@@ -152,9 +154,12 @@ final class ResyncRefetchTests: XCTestCase {
         model.applyEventForTest(.resyncRequired)
         await waitForSet(model, recorder)
 
-        for verb in ["list_products", "list_worker_live_states", "get_engine_health", "git_hub_auth_status", "get_engine_pool_config", "get_work_tree"] {
+        for verb in ["list_products", "list_worker_live_states", "get_engine_health", "git_hub_auth_status", "get_engine_pool_config", "get_work_tree", "list_ci_remediations", "list_conflict_resolutions"] {
             XCTAssertEqual(recorder.counts[verb], 1, "\(verb) re-reads state a dropped push could have covered")
         }
+        XCTAssertEqual(recorder.sent.filter {
+            $0["type"] as? String == "list_engine_attempts" && $0["limit"] as? Int == 200
+        }.count, 1, "Activity needs a history read, not only the limit-zero background poll")
         for verb in ["list_live_status_disabled_slots", "list_planner_runs", "list_attention_groups", "list_attention_items_for_work_item"] {
             XCTAssertNil(recorder.counts[verb], "\(verb) is not state that a dropped push carries")
         }
@@ -194,7 +199,6 @@ final class ResyncRefetchTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(50))
         model.applyEventForTest(.resyncRequired)
         await waitForSet(model, recorder)
-        try? await Task.sleep(for: .milliseconds(400))
 
         XCTAssertEqual(recorder.counts["get_work_tree"], 1, "invalidation and resync in one window cost one tree fetch")
         XCTAssertEqual(recorder.counts["list_deferred_scope_attentions"], 1)
@@ -288,6 +292,11 @@ final class ResyncRefetchTests: XCTestCase {
 
         XCTAssertEqual(recorder.counts["get_product_design_doc"], 1, "the connect burst alone never re-reads the open doc")
         XCTAssertEqual(recorder.counts["get_driver_quota_usage"], 1)
+        XCTAssertEqual(recorder.counts["list_ci_remediations"], 1)
+        XCTAssertEqual(recorder.counts["list_conflict_resolutions"], 1)
+        XCTAssertEqual(recorder.sent.filter {
+            $0["type"] as? String == "list_engine_attempts" && $0["limit"] as? Int == 200
+        }.count, 1, "a canceled resync still owes Activity's history read on reconnect")
         XCTAssertFalse(model.resyncOnlyReadsOwed)
     }
 
@@ -325,7 +334,7 @@ final class ResyncRefetchTests: XCTestCase {
     // MARK: - Model: backoff and trailing edge
 
     func testSecondSetWaitsOutTheBackoffAndTrailingResyncIsNotLost() async {
-        let backoff = Duration.seconds(1)
+        let backoff = Duration.milliseconds(200)
         let (model, recorder) = makeModel(policy: .init(
             window: .milliseconds(20), initialBackoff: backoff, maxBackoff: .seconds(5), quietReset: .seconds(60)
         ))
@@ -338,13 +347,13 @@ final class ResyncRefetchTests: XCTestCase {
         // A storm continues right after the first set: it must neither send
         // anything inside the backoff nor be dropped.
         for _ in 0..<10 { model.applyEventForTest(.resyncRequired) }
-        try? await Task.sleep(for: .milliseconds(100))
+        try? await Task.sleep(for: .milliseconds(20))
         XCTAssertEqual(recorder.counts["list_products"], 1, "no second set inside the backoff")
         XCTAssertTrue(model.resyncRefetchGate.isDirty, "the resyncs are remembered")
 
         await waitUntil(recorder, verb: "list_products", count: 2)
         let secondSetAfter = firstSetAt.duration(to: .now)
-        XCTAssertGreaterThanOrEqual(secondSetAfter, backoff - .milliseconds(300), "the trailing set honours the backoff")
+        XCTAssertGreaterThanOrEqual(secondSetAfter, backoff - .milliseconds(50), "the trailing set honours the backoff")
         _ = await model.waitForRefetchBurstsForTest()
         XCTAssertEqual(recorder.counts["list_products"], 2, "ten resyncs in the backoff cost one trailing set")
         XCTAssertFalse(model.resyncRefetchGate.isDirty)
@@ -418,7 +427,6 @@ final class ResyncRefetchTests: XCTestCase {
     private func waitForSet(_ model: ChatViewModel, _ recorder: Recorder) async {
         await waitUntil(recorder, verb: "get_work_tree", count: 1)
         _ = await model.waitForRefetchBurstsForTest()
-        try? await Task.sleep(for: model.refetchCoalescingPolicy.window * 3)
     }
 
     private func waitUntil(

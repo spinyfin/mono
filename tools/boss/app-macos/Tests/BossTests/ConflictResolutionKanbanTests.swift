@@ -214,6 +214,18 @@ final class ConflictResolutionKanbanTests: XCTestCase {
                        "task with finished resolution must NOT be in Backlog")
     }
 
+    func testListRecoversMissedSuccessAndSubsequentFailurePushes() {
+        let model = makeModel()
+        var success = makeResolution(id: "success", workItemID: "task", status: "succeeded")
+        success.finishedAt = String(Int(Date().timeIntervalSince1970))
+        model.applyEventForTest(.conflictResolutionsList(attempts: [success]))
+        XCTAssertTrue(model.showsConflictClearedBadge(forPR: success.prURL))
+
+        let failed = makeResolution(id: "newer", workItemID: "task", status: "failed")
+        model.applyEventForTest(.conflictResolutionsList(attempts: [failed, success]))
+        XCTAssertFalse(model.showsConflictClearedBadge(forPR: success.prURL))
+    }
+
     // MARK: - Helpers
 
     private func makeTask(

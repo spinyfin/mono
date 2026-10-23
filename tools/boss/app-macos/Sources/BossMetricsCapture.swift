@@ -19,6 +19,13 @@ enum BossMetricsCapture {
             exit(1)
         }
         model.startIfNeeded()
+        // Exercise the real board Refresh action during an isolated traffic
+        // capture, after the cold-start burst has settled.
+        if CommandLine.arguments.contains("--capture-refresh-work") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                model.refreshWork()
+            }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             let captureWindow = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 1080, height: 1000),

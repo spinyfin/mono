@@ -13,6 +13,109 @@ import XCTest
 /// of stranding the badge.
 @MainActor
 final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
+    func testInReviewFixSurvivesBothReplyOrdersUntilAttemptCompletes() {
+        for status in ["pending", "running"] {
+            for listFirst in [true, false] {
+                let model = makeModel()
+                let task = badgeTask(status: "in_review")
+                let attempt = makeRemediation(id: "attempt", prURL: task.prURL!, status: status, finishedAt: nil)
+                if listFirst { model.applyEventForTest(.ciRemediationsList(attempts: [attempt])) }
+                model.choresByProductID["product"] = [task]
+                model.reconcileCIFailureBadges(from: [task])
+                if !listFirst { model.applyEventForTest(.ciRemediationsList(attempts: [attempt])) }
+                XCTAssertEqual(model.ciFailureBadge(forPR: task.prURL)?.state, .inFlight)
+                model.reconcileCIFailureBadges(from: [task])
+                XCTAssertEqual(model.ciFailureBadge(forPR: task.prURL)?.state, .inFlight)
+                model.applyEventForTest(.ciRemediationsList(attempts: [
+                    makeRemediation(id: "attempt", prURL: task.prURL!, status: "succeeded", finishedAt: nil),
+                ]))
+                XCTAssertNil(model.ciFailureBadge(forPR: task.prURL))
+                XCTAssertTrue(model.showsCIAutoFixedBadge(forPR: task.prURL))
+            }
+        }
+    }
+
+    func testRecentSuccessRecoversFromStaleBlockedTreeInBothReplyOrders() {
+        for listFirst in [true, false] {
+            for successPush in [true, false] {
+                let model = makeModel()
+                var task = badgeTask(status: "blocked")
+                task.blockedReason = "ci_failure"
+                model.choresByProductID["product"] = [task]
+                model.reconcileCIFailureBadges(from: [task])
+                XCTAssertNotNil(model.ciFailureBadge(forPR: task.prURL))
+                if successPush {
+                    model.applyEventForTest(.ciRemediationSucceeded(
+                        productID: "product", workItemID: "task", attemptID: "attempt", prURL: task.prURL!
+                    ))
+                }
+                let attempt = makeRemediation(
+                    id: "attempt", prURL: task.prURL!, status: "succeeded", finishedAt: nil
+                )
+                if listFirst {
+                    model.applyEventForTest(.ciRemediationsList(attempts: [attempt]))
+                    XCTAssertNil(model.ciFailureBadge(forPR: task.prURL))
+                    XCTAssertTrue(model.showsCIAutoFixedBadge(forPR: task.prURL))
+                }
+                task.status = "in_review"
+                task.blockedReason = nil
+                model.choresByProductID["product"] = [task]
+                model.reconcileCIFailureBadges(from: [task])
+                if !listFirst { model.applyEventForTest(.ciRemediationsList(attempts: [attempt])) }
+                XCTAssertNil(model.ciFailureBadge(forPR: task.prURL))
+                XCTAssertTrue(model.showsCIAutoFixedBadge(forPR: task.prURL))
+
+                task.status = "blocked"
+                task.blockedReason = "ci_failure"
+                task.updatedAt = String(Int(Date().addingTimeInterval(1).timeIntervalSince1970))
+                model.reconcileCIFailureBadges(from: [task])
+                XCTAssertEqual(model.ciFailureBadge(forPR: task.prURL)?.state, .inFlight)
+                XCTAssertFalse(model.showsCIAutoFixedBadge(forPR: task.prURL))
+            }
+        }
+    }
+
+    private func badgeTask(status: String) -> WorkTask {
+        WorkTask(
+            id: "task", productID: "product", projectID: nil, kind: "chore",
+            name: "fixture", description: "", status: status, priority: "medium",
+            ordinal: nil, prURL: "https://github.com/x/y/pull/42", deletedAt: nil,
+            createdAt: "0", updatedAt: "0"
+        )
+    }
+
+    func testTreeRecoversDroppedClearAndExhaustionInEitherReplyOrder() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/3256"
+        var task = WorkTask(
+            id: "task", productID: "product", projectID: nil, kind: "chore",
+            name: "fixture", description: "", status: "in_review", priority: "medium",
+            ordinal: nil, prURL: prURL, deletedAt: nil, createdAt: "0", updatedAt: "0"
+        )
+        model.ciFailureBadges[prURL] = CiFailureBadge(state: .inFlight, attemptsUsed: 1, budget: 3)
+        model.choresByProductID["product"] = [task]
+        model.reconcileCIFailureBadges(from: [task])
+        XCTAssertNil(model.ciFailureBadges[prURL], "the tree recovers a lost ci_failure_cleared")
+        model.applyEventForTest(.ciRemediationsList(attempts: [
+            makeRemediation(id: "attempt", prURL: prURL, status: "failed", finishedAt: nil),
+        ]))
+        XCTAssertNil(model.ciFailureBadges[prURL], "a later list cannot resurrect the cleared chip")
+
+        task.status = "blocked"
+        task.blockedReason = "ci_failure_exhausted"
+        model.choresByProductID["product"] = [task]
+        model.reconcileCIFailureBadges(from: [task])
+        XCTAssertEqual(model.ciFailureBadges[prURL]?.state, .exhausted)
+        model.applyEventForTest(.ciRemediationsList(attempts: [
+            makeRemediation(id: "attempt", prURL: prURL, status: "failed", finishedAt: "1"),
+        ]))
+        XCTAssertEqual(model.ciFailureBadges[prURL]?.state, .exhausted)
+        task.status = "in_review"
+        task.blockedReason = nil
+        model.reconcileCIFailureBadges(from: [task])
+        XCTAssertNil(model.ciFailureBadges[prURL], "a later tree also clears a terminal attempt's chip")
+    }
+
     /// A fresh non-terminal attempt for a PR must drop a stale
     /// "auto-fixed" badge even when the `ciRemediationStarted` push that
     /// would normally clear it never arrived — the list refresh alone
