@@ -2624,3 +2624,19 @@ fn every_remediation_lifecycle_push_carries_a_compact_row() {
     }
     assert_eq!(count, 8);
 }
+
+#[test]
+fn unknown_invalidation_class_is_structural() {
+    let payload: TopicEventPayload = serde_json::from_value(serde_json::json!({
+        "type": "work_invalidated", "reason": "future_writer",
+        "product_id": "prod", "item_ids": [], "class": "something_new"
+    }))
+    .unwrap();
+    assert!(matches!(
+        payload,
+        TopicEventPayload::WorkInvalidated {
+            class: InvalidationClass::Structural,
+            ..
+        }
+    ));
+}

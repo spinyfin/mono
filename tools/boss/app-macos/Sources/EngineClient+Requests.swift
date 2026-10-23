@@ -291,24 +291,25 @@ extension EngineClient {
     /// [[PopulationTiming]] record the send timestamp for the
     /// request→reply segment plus the per-product session issue count
     /// (which surfaces duplicate fetches).
-    func sendGetWorkTree(productId: String, flow: PopulationFlow) {
+    func sendGetWorkTree(productId: String, flow: PopulationFlow, delta: Bool = true) {
         // Propagate the app-side `fetch_seq` on the wire so the engine can
         // stamp it on its `engine-population-timing-*.jsonl` segments and the
         // two sides join on `(product_id, fetch_seq)`.
         let fetchSeq = PopulationTiming.shared.fetchIssued(productId: productId, flow: flow)
-        onWorkTreeRequested?(productId)
+        let requestId = UUID().uuidString
+        onWorkTreeRequested?(productId, requestId)
         sendLine([
             "type": "get_work_tree",
-            "delta": true,
+            "delta": delta,
             "product_id": productId,
             "fetch_seq": fetchSeq,
-        ], queueIfDisconnected: true)
+        ], queueIfDisconnected: true, envelopeRequestId: requestId)
     }
 
     /// Re-read a few cards of `productId` (and their revision chains) without
     /// the engine assembling the board: the answer to a runtime-class
     /// `work_invalidated` push. Replies with `work_runtime_patch`.
-    func sendGetWorkRuntimePatch(productId: String, itemIds: [String]) {
+    func sendGetWorkRuntimePatch(productId: String, itemIds: [String]) -> String? {
         sendLine([
             "type": "get_work_runtime_patch",
             "product_id": productId,

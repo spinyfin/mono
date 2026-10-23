@@ -42,7 +42,7 @@ final class RuntimePatchTests: XCTestCase {
 
         model.engine.consumeLineForTesting(
             """
-            {"payload":{"type":"work_runtime_patch","product_id":"prod_a","absent":["task_gone"],"items":[\
+            {"revision":19,"request_id":"\(model.boardReadFences["prod_a"]!.patchRequestID!)","payload":{"type":"work_runtime_patch","product_id":"prod_a","absent":["task_gone"],"items":[\
             {"item":{"item_type":"task","id":"task_1","product_id":"prod_a","project_id":"proj_a1","kind":"project_task",\
             "name":"Task task_1","description":"","status":"todo","priority":"medium","created_at":"2026-07-10T00:00:00Z",\
             "updated_at":"2026-07-10T00:00:00Z","ci_required_state":"success"},\
@@ -53,6 +53,7 @@ final class RuntimePatchTests: XCTestCase {
 
         XCTAssertEqual(model.taskRuntime(for: "task_1")?.dispatchWaitReason, "pool_exhausted")
         XCTAssertEqual(model.taskRuntime(for: "task_1")?.executionStatus, "ready")
+        XCTAssertEqual(model.boardReadFences["prod_a"]?.revision, 19)
         XCTAssertTrue(recorder.sent.isEmpty, "a patch that changes only runtime fields needs no further read")
     }
 
@@ -63,7 +64,7 @@ final class RuntimePatchTests: XCTestCase {
 
         model.engine.consumeLineForTesting(
             """
-            {"payload":{"type":"work_runtime_patch","product_id":"prod_a","items":[{"item":{"item_type":"task","id":"task_1"}}]}}
+            {"request_id":"\(model.boardReadFences["prod_a"]!.patchRequestID!)","payload":{"type":"work_runtime_patch","product_id":"prod_a","items":[{"item":{"item_type":"task","id":"task_1"}}]}}
             """
         )
         await waitFor(recorder, "get_work_tree")
@@ -161,7 +162,7 @@ final class RuntimePatchTests: XCTestCase {
     func testAnAnsweredTreeNoLongerBlocksPatches() {
         let (model, recorder) = makeModel(cards: [makeTask(id: "task_1")])
         model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
-        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_1")]))
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_1")], requestID: model.boardReadFences["prod_a"]?.trees.keys.first))
         recorder.reset()
 
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
@@ -177,7 +178,7 @@ final class RuntimePatchTests: XCTestCase {
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_3"])
         XCTAssertEqual(recorder.patchBodies.count, 1, "one patch in flight per product")
 
-        model.applyEventForTest(patchReply(cards: [(makeTask(id: "task_1"), runtime("task_1"))]))
+        model.applyEventForTest(patchReply(model: model, cards: [(makeTask(id: "task_1"), runtime("task_1"))]))
 
         XCTAssertEqual(recorder.patchBodies.count, 2)
         XCTAssertEqual(recorder.patchBodies.last, ["task_2", "task_3"])
@@ -192,7 +193,7 @@ final class RuntimePatchTests: XCTestCase {
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
         model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
         recorder.reset()
-        model.applyEventForTest(patchReply(cards: [(stale, runtime("task_1"))]))
+        model.applyEventForTest(patchReply(model: model, cards: [(stale, runtime("task_1"))]))
 
         XCTAssertNil(
             model.task(withID: "task_1")?.ciRequiredState,
@@ -206,17 +207,17 @@ final class RuntimePatchTests: XCTestCase {
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
         recorder.reset()
 
-        model.applyEventForTest(.workError(message: "database busy", requestId: nil))
+        model.applyEventForTest(.workError(message: "database busy", requestId: model.boardReadFences["prod_a"]?.patchRequestID))
 
-        XCTAssertEqual(recorder.counts["get_work_tree"], 1, "an error names no request; nothing else would re-read the card")
+        XCTAssertEqual(recorder.counts["get_work_tree"], 1, "a matching error must re-read the card")
     }
 
-    func testAReplyNobodyIsWaitingForRefetchesTheBoard() {
+    func testAReplyNobodyIsWaitingForIsIgnored() {
         let (model, recorder) = makeModel(cards: [makeTask(id: "task_1")])
 
-        model.applyEventForTest(patchReply(cards: [(makeTask(id: "task_1"), runtime("task_1"))]))
+        model.applyEventForTest(patchReply(model: model, cards: [(makeTask(id: "task_1"), runtime("task_1"))]))
 
-        XCTAssertEqual(recorder.counts["get_work_tree"], 1, "its place in the order is unknown")
+        XCTAssertTrue(recorder.sent.isEmpty, "a retired reply must not trigger another read")
     }
 
     func testADisconnectForgetsOutstandingReads() {
@@ -231,6 +232,128 @@ final class RuntimePatchTests: XCTestCase {
         XCTAssertEqual(recorder.counts, ["get_work_runtime_patch": 1], "the tree died with the connection")
     }
 
+    func testSupersededReplyDrainsInvalidationsAfterTreeApplied() {
+        let (model, recorder) = makeModel(cards: [makeTask(id: "task_1")])
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        let reply = patchReply(model: model, cards: [])
+        model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
+        model.applyEventForTest(makeWorkTreeEvent(
+            tasks: [makeTask(id: "task_1")],
+            requestID: model.boardReadFences["prod_a"]?.trees.keys.first
+        ))
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        recorder.reset()
+        model.applyEventForTest(reply)
+        XCTAssertEqual(recorder.patchBodies, [["task_1"]])
+    }
+
+    func testFailedTreeThenSuccessfulTreeAllowsPatch() {
+        let (model, recorder) = makeModel()
+        model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
+        let failedID = model.boardReadFences["prod_a"]!.trees.keys.first!
+        model.applyEventForTest(.workError(message: "read failed", requestId: failedID))
+        model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
+        model.applyEventForTest(makeWorkTreeEvent(
+            tasks: [], requestID: model.boardReadFences["prod_a"]?.trees.keys.first
+        ))
+        recorder.reset()
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        XCTAssertEqual(recorder.counts, ["get_work_runtime_patch": 1])
+    }
+
+    func testUndecodableTreeSettlesItsRequest() async {
+        let (model, recorder) = makeModel()
+        model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
+        let id = model.boardReadFences["prod_a"]!.trees.keys.first!
+        model.engine.consumeLineForTesting(
+            "{\"request_id\":\"\(id)\",\"payload\":{\"type\":\"work_tree\",\"product\":{}}}"
+        )
+        await waitUntil { model.boardReadFences["prod_a"]!.trees.isEmpty }
+        XCTAssertTrue(model.boardReadFences["prod_a"]!.trees.isEmpty)
+        recorder.reset()
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        XCTAssertEqual(recorder.counts, ["get_work_runtime_patch": 1])
+    }
+
+    func testUnrelatedErrorLeavesPatchOutstanding() {
+        let (model, recorder) = makeModel(cards: [makeTask(id: "task_1")])
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        let id = model.boardReadFences["prod_a"]?.patchRequestID
+        recorder.reset()
+        model.applyEventForTest(.workError(message: "mutation rejected", requestId: "another-request"))
+        XCTAssertEqual(model.boardReadFences["prod_a"]?.patchRequestID, id)
+        XCTAssertTrue(recorder.sent.isEmpty)
+        var updated = makeTask(id: "task_1")
+        updated.ciRequiredState = "success"
+        model.applyEventForTest(patchReply(model: model, cards: [(updated, runtime("task_1"))]))
+        XCTAssertEqual(model.task(withID: "task_1")?.ciRequiredState, "success")
+    }
+
+    func testLateExpiredTreeCannotOverwriteNewerPatch() {
+        let (model, _) = makeModel(cards: [makeTask(id: "task_1")])
+        model.engine.sendGetWorkTree(productId: "prod_a", flow: .invalidationRefetch)
+        let treeID = model.boardReadFences["prod_a"]!.trees.keys.first!
+        model.boardReadFences["prod_a"]!.trees[treeID] = .now - .seconds(31)
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        var updated = makeTask(id: "task_1")
+        updated.ciRequiredState = "success"
+        model.applyEventForTest(patchReply(model: model, cards: [(updated, runtime("task_1"))]))
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [makeTask(id: "task_1")], requestID: treeID))
+        XCTAssertEqual(model.task(withID: "task_1")?.ciRequiredState, "success")
+    }
+
+    func testSlowUnretiredPatchReplyStillDrainsQueuedIDs() {
+        let (model, recorder) = makeModel(cards: [makeTask(id: "task_1")])
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_2"])
+        model.boardReadFences["prod_a"]!.patchSentAt = .now - .seconds(31)
+        recorder.reset()
+        model.applyEventForTest(patchReply(model: model, cards: []))
+        XCTAssertEqual(recorder.patchBodies, [["task_2"]])
+    }
+
+    func testNewTreeDoesNotExtendOlderTreesExpiry() {
+        let (model, recorder) = makeModel()
+        model.noteWorkTreeRequested(productID: "prod_a", requestID: "old")
+        model.boardReadFences["prod_a"]!.trees["old"] = .now - .seconds(31)
+        model.noteWorkTreeRequested(productID: "prod_a", requestID: "new")
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [], requestID: "new"))
+        recorder.reset()
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        XCTAssertEqual(recorder.patchBodies, [["task_1"]])
+        XCTAssertTrue(model.boardReadFences["prod_a"]!.trees.isEmpty)
+    }
+
+    func testExpiredPatchReplyCannotSettleReplacementPatch() {
+        let (model, recorder) = makeModel(cards: [makeTask(id: "task_1")])
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        let oldReply = patchReply(model: model, cards: [])
+        model.boardReadFences["prod_a"]!.patchSentAt = .now - .seconds(31)
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        let replacementID = model.boardReadFences["prod_a"]?.patchRequestID
+        recorder.reset()
+        model.applyEventForTest(oldReply)
+        XCTAssertEqual(model.boardReadFences["prod_a"]?.patchRequestID, replacementID)
+        XCTAssertTrue(recorder.sent.isEmpty)
+    }
+
+    func testPatchOlderThanDirectUpdateCannotRevertRename() {
+        let (model, recorder) = makeModel(cards: [makeTask(id: "task_1")])
+        model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1"])
+        let requestID = model.boardReadFences["prod_a"]?.patchRequestID
+        var renamed = makeTask(id: "task_1")
+        renamed.name = "New name"
+        model.applyEventForTest(.workItemUpdated(item: .task(renamed), revision: 12))
+        recorder.reset()
+        model.applyEventForTest(.workRuntimePatch(
+            productId: "prod_a",
+            cards: [WorkRuntimePatchCard(item: .task(makeTask(id: "task_1")), runtime: runtime("task_1"))],
+            absent: [], isComplete: true, requestId: requestID, revision: 11
+        ))
+        XCTAssertEqual(model.task(withID: "task_1")?.name, "New name")
+        XCTAssertEqual(recorder.counts["get_work_tree"], 1)
+    }
+
     // MARK: - Applying a patch
 
     func testPatchUpdatesRuntimeFieldsInPlaceWithoutReadingTheBoard() {
@@ -241,7 +364,7 @@ final class RuntimePatchTests: XCTestCase {
         var patched = makeTask(id: "task_1")
         patched.ciRequiredState = "success"
         patched.prStatePolledAt = "2026-10-22T10:00:00Z"
-        model.applyEventForTest(patchReply(cards: [(patched, runtime("task_1", waitReason: "pool_exhausted"))]))
+        model.applyEventForTest(patchReply(model: model, cards: [(patched, runtime("task_1", waitReason: "pool_exhausted"))]))
 
         XCTAssertEqual(model.task(withID: "task_1")?.ciRequiredState, "success")
         XCTAssertEqual(model.taskRuntime(for: "task_1")?.dispatchWaitReason, "pool_exhausted")
@@ -263,7 +386,7 @@ final class RuntimePatchTests: XCTestCase {
         patchedRoot.reviewGuideLifecycle = "ready"
         var patchedRevision = revision
         patchedRevision.revisionParentPrUrl = "https://github.com/org/repo/pull/9"
-        model.applyEventForTest(patchReply(cards: [
+        model.applyEventForTest(patchReply(model: model, cards: [
             (patchedRoot, runtime("root")),
             (patchedRevision, runtime("rev", executionStatus: "running")),
         ]))
@@ -281,7 +404,7 @@ final class RuntimePatchTests: XCTestCase {
 
         var moved = makeTask(id: "task_1", projectID: "proj_a2")
         moved.ciRequiredState = "success"
-        model.applyEventForTest(patchReply(cards: [(moved, runtime("task_1"))]))
+        model.applyEventForTest(patchReply(model: model, cards: [(moved, runtime("task_1"))]))
 
         XCTAssertEqual(model.tasksByProjectID["proj_a1"]?.map(\.id), ["task_1"], "the board is left for the tree to rewrite")
         XCTAssertNil(model.task(withID: "task_1")?.ciRequiredState)
@@ -303,7 +426,7 @@ final class RuntimePatchTests: XCTestCase {
 
             var changed = makeTask(id: "task_1")
             mutate(&changed)
-            model.applyEventForTest(patchReply(cards: [(changed, runtime("task_1"))]))
+            model.applyEventForTest(patchReply(model: model, cards: [(changed, runtime("task_1"))]))
 
             XCTAssertEqual(recorder.counts["get_work_tree"], 1, "a structural field changed under a runtime push")
             XCTAssertEqual(model.task(withID: "task_1")?.status, "todo")
@@ -316,7 +439,7 @@ final class RuntimePatchTests: XCTestCase {
         recorder.reset()
 
         model.applyEventForTest(patchReply(
-            cards: [(makeTask(id: "task_1", projectID: nil, kind: "chore"), runtime("task_1"))],
+            model: model, cards: [(makeTask(id: "task_1", projectID: nil, kind: "chore"), runtime("task_1"))],
             asChore: false
         ))
 
@@ -328,7 +451,7 @@ final class RuntimePatchTests: XCTestCase {
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1", "task_2"])
         recorder.reset()
 
-        model.applyEventForTest(patchReply(cards: [(makeTask(id: "task_1"), runtime("task_1"))], absent: ["task_2"]))
+        model.applyEventForTest(patchReply(model: model, cards: [(makeTask(id: "task_1"), runtime("task_1"))], absent: ["task_2"]))
 
         XCTAssertEqual(recorder.counts["get_work_tree"], 1, "task_2 is held but no longer a live card")
         XCTAssertNotNil(model.task(withID: "task_2"), "the tree, not the patch, removes it")
@@ -339,7 +462,7 @@ final class RuntimePatchTests: XCTestCase {
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_1", "proj_other"])
         recorder.reset()
 
-        model.applyEventForTest(patchReply(cards: [(makeTask(id: "task_1"), runtime("task_1"))], absent: ["proj_other"]))
+        model.applyEventForTest(patchReply(model: model, cards: [(makeTask(id: "task_1"), runtime("task_1"))], absent: ["proj_other"]))
 
         XCTAssertTrue(recorder.sent.isEmpty)
     }
@@ -349,7 +472,7 @@ final class RuntimePatchTests: XCTestCase {
         model.requestRuntimePatch(productID: "prod_a", itemIDs: ["task_new"])
         recorder.reset()
 
-        model.applyEventForTest(patchReply(cards: [(makeTask(id: "task_new"), runtime("task_new"))]))
+        model.applyEventForTest(patchReply(model: model, cards: [(makeTask(id: "task_new"), runtime("task_new"))]))
 
         XCTAssertEqual(recorder.counts["get_work_tree"], 1, "a new card is a membership change")
         XCTAssertNil(model.task(withID: "task_new"))
@@ -364,7 +487,7 @@ final class RuntimePatchTests: XCTestCase {
         fine.ciRequiredState = "success"
         var structural = makeTask(id: "task_2")
         structural.status = "done"
-        model.applyEventForTest(patchReply(cards: [(fine, runtime("task_1", waitReason: "x")), (structural, runtime("task_2"))]))
+        model.applyEventForTest(patchReply(model: model, cards: [(fine, runtime("task_1", waitReason: "x")), (structural, runtime("task_2"))]))
 
         XCTAssertNil(model.task(withID: "task_1")?.ciRequiredState, "all cards are checked before any is applied")
         XCTAssertNil(model.taskRuntime(for: "task_1")?.dispatchWaitReason)
@@ -379,7 +502,7 @@ final class RuntimePatchTests: XCTestCase {
 
         var patched = makeTask(id: "task_1")
         patched.ciRequiredState = "success"
-        model.applyEventForTest(patchReply(cards: [(patched, runtime("task_1"))]))
+        model.applyEventForTest(patchReply(model: model, cards: [(patched, runtime("task_1"))]))
 
         XCTAssertTrue(recorder.sent.isEmpty, "the switch fetched the new product itself")
     }
@@ -421,6 +544,7 @@ final class RuntimePatchTests: XCTestCase {
     }
 
     private func patchReply(
+        model: ChatViewModel,
         cards: [(WorkTask, WorkTaskRuntime)],
         absent: [String] = [],
         asChore: Bool? = nil,
@@ -432,7 +556,8 @@ final class RuntimePatchTests: XCTestCase {
                 WorkRuntimePatchCard(item: (asChore ?? task.isChore) ? .chore(task) : .task(task), runtime: runtime)
             },
             absent: absent,
-            isComplete: isComplete
+            isComplete: isComplete,
+            requestId: model.boardReadFences["prod_a"]?.patchRequestID
         )
     }
 
@@ -517,7 +642,7 @@ final class RuntimePatchTests: XCTestCase {
         )
     }
 
-    private func makeWorkTreeEvent(tasks: [WorkTask]) -> EngineEvent {
+    private func makeWorkTreeEvent(tasks: [WorkTask], requestID: String? = nil, revision: UInt64? = nil) -> EngineEvent {
         let projects = ["proj_a1", "proj_a2"].map { id in
             WorkProject(
                 id: id,
@@ -540,7 +665,8 @@ final class RuntimePatchTests: XCTestCase {
             chores: chores,
             taskRuntimes: [],
             dependencies: [],
-            ideas: []
+            ideas: [],
+            requestId: requestID, revision: revision
         )
     }
 }
