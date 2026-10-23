@@ -424,11 +424,9 @@ fn a_future_deadline_expires_the_entry_when_the_clock_passes_it() {
     // No write happens from here on; only the clock moves.
     let (misses, _) = board.assert_equivalent_at(deadline);
     assert_eq!(misses, 1, "the elapsed deadline forces a recompute");
-    assert!(
-        board
-            .runtime_of_at(&item, deadline)
-            .get("dispatch_wait_reason")
-            .is_none()
+    assert_eq!(
+        board.runtime_of_at(&item, deadline)["dispatch_wait_reason"],
+        "awaiting_scheduler"
     );
     let (misses, _) = board.assert_equivalent_at(deadline + 5);
     assert_eq!(misses, 0, "and the recomputed value is stable");
@@ -486,4 +484,21 @@ fn entries_follow_board_membership_and_stay_within_capacity() {
     assert_eq!(stats.entries, 1, "the global capacity bounds the cache");
     assert!(stats.evictions >= 1);
     board.assert_equivalent();
+}
+
+#[test]
+fn dispatch_hold_recomputes_when_task_changes_without_execution_write() {
+    let board = board();
+    let chore = board.chore("held chore");
+    board.assert_equivalent();
+    board.assert_equivalent();
+    board.sql(
+        "UPDATE tasks SET status = ?1, autostart = 1 WHERE id = ?2",
+        &[&"todo", &chore],
+    );
+    board.assert_equivalent();
+    assert!(board.runtime_of(&chore)["dispatch_hold_reason"].is_string());
+    board.sql("UPDATE tasks SET autostart = 0 WHERE id = ?1", &[&chore]);
+    board.assert_equivalent();
+    assert!(board.runtime_of(&chore)["dispatch_hold_reason"].is_null());
 }
