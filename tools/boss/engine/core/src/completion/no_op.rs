@@ -109,6 +109,31 @@ impl WorkerCompletionHandler {
         contribution: Option<ContributionEvidence>,
         attention: Option<CreateAttentionItemInput>,
     ) -> StopOutcome {
+        // Both the proposal seam and the ordinary Stop path must verify a
+        // primary workspace before accepting its no-changes-needed declaration.
+        if should_enqueue_reviewer_for_primary(&execution.kind) {
+            let empty = if let Some(path) = execution.workspace_path.as_deref() {
+                match self
+                    .workspace_diff_verifier
+                    .is_workspace_contribution_empty(std::path::Path::new(path))
+                    .await
+                {
+                    Ok(empty) => empty,
+                    Err(err) => {
+                        tracing::warn!(execution_id = %execution.id, ?err,
+                            "no-op declaration: workspace contribution could not be verified");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !empty {
+                return self
+                    .nudge_or_park(execution, PROBE_NO_PR, "no_pr", None, StopOutcome::AwaitingInput)
+                    .await;
+            }
+        }
         let declaration_id = match self.work_db.current_no_op_declaration_id(&execution.id) {
             Ok(Some(id)) => id,
             Ok(None) => return StopOutcome::AwaitingInput,
