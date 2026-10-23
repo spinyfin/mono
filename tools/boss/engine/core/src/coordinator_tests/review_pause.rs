@@ -759,10 +759,12 @@ async fn automation_pause_does_not_hold_pr_review_guide_but_holds_automation_row
     // `reconcile_product_executions` below does not also mint an ordinary
     // main-pool execution for this root chore itself.
     let root = create_test_chore_manual(&db, product.clone(), "Review guide root").id;
-    let (_series_id, comparison_id) = seed_review_guide_series(&db, &root);
-    let guide_execution = db
-        .create_pr_review_guide_execution(&comparison_id, "https://github.com/test/repo")
+    let (series_id, comparison_id) = seed_review_guide_series(&db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, boss_review_guide::PROMPT_VERSION)
         .unwrap();
+    let bound = db.dispatch_pr_review_guide_attempt(&attempt.id, &root).unwrap();
+    let guide_execution = db.get_execution(bound.execution_id.as_deref().unwrap()).unwrap();
 
     // An automation-produced chore, whose execution targets the automation
     // pool — mirrors `automation_pause_holds_automation_pool_row_until_resume`.
@@ -815,12 +817,32 @@ async fn automation_pause_does_not_hold_pr_review_guide_but_holds_automation_row
         1,
         "only the review-guide execution should have dispatched while automation is paused"
     );
+    assert_eq!(
+        calls[0].1, guide_execution.id,
+        "the runner must receive the execution bound to the guide attempt"
+    );
     assert!(
         calls[0].0.starts_with(REVIEW_WORKER_ID_PREFIX),
         "pr_review_guide must claim a review-pool worker id, got {:?}",
         calls[0].0
     );
     drop(calls);
+
+    let running = db
+        .pr_review_guide_attempt_for_execution(&guide_execution.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.id, attempt.id);
+    assert_eq!(running.status, "running");
+    assert_eq!(
+        db.get_pr_review_guide_summary_for_root(&root)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        "generating"
+    );
+    assert_eq!(coordinator.review_worker_pool().idle_count().await, 0);
+    assert_eq!(coordinator.automation_worker_pool().idle_count().await, 1);
 
     assert_eq!(
         db.get_execution(&auto_execution_id).unwrap().status,
