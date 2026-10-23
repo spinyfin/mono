@@ -141,7 +141,7 @@ extension ChatViewModel {
             engineAttempts = attempts
         }
         backgroundWorkPending.removeValue(forKey: requestId)
-        replayRemediationEvents(for: requestId)
+        replayRemediationEventsIntoHistory(for: requestId)
         pruneStaleBackgroundWorkPending()
     }
 

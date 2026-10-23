@@ -3,13 +3,24 @@ use super::*;
 impl WorkDb {
     /// Add current card state to a compact row; never attach diagnostic blobs.
     pub fn remediation_entry(&self, mut row: EngineAttemptListEntry) -> EngineAttemptListEntry {
-        if row.kind == "ci"
+        if matches!(row.kind.as_str(), "ci" | "ci_state")
             && let Some(id) = row.work_item_id.as_deref()
         {
             match self.ci_budget_snapshot(id) {
                 Ok(Some(budget)) => {
                     row.extra.insert("attempts_used".into(), budget.used.to_string());
                     row.extra.insert("budget".into(), budget.effective.to_string());
+                    if row.kind == "ci" {
+                        // The parent's blocked state is the authoritative
+                        // card state, so a terminal attempt pushed without a
+                        // preceding start still sets or clears the chip.
+                        let card_state = match budget.blocked_reason.as_deref() {
+                            Some("ci_failure_exhausted") => "exhausted",
+                            Some("ci_failure") => "in_flight",
+                            _ => "clear",
+                        };
+                        row.extra.insert("card_state".into(), card_state.into());
+                    }
                 }
                 Ok(None) => {}
                 Err(err) => tracing::warn!(%err, "could not project remediation budget"),
@@ -71,19 +82,18 @@ impl WorkDb {
         // Failure chips are task signals, including exhausted PRs that have
         // no active attempt. Include an authoritative state row for each PR.
         let mut stmt = conn.prepare(
-            "SELECT t.id, t.product_id, t.pr_url, t.created_at, t.ci_attempts_used,
-                    min(10, max(0, COALESCE(t.ci_attempt_budget, p.ci_attempt_budget, 3))),
+            "SELECT t.id, t.product_id, t.pr_url, t.created_at,
                     EXISTS(SELECT 1 FROM task_blocked_signals s WHERE s.work_item_id = t.id
                            AND s.reason = 'ci_failure_exhausted' AND s.cleared_at IS NULL),
                     EXISTS(SELECT 1 FROM task_blocked_signals s WHERE s.work_item_id = t.id
                            AND s.reason = 'ci_failure' AND s.cleared_at IS NULL)
-             FROM tasks t JOIN products p ON p.id = t.product_id
+             FROM tasks t
              WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived') AND t.kind != 'revision' AND t.pr_url IS NOT NULL"
         )?;
         let rows = stmt.query_map([], |r| {
             let id: String = r.get(0)?;
-            let exhausted: bool = r.get(6)?;
-            let failing: bool = r.get(7)?;
+            let exhausted: bool = r.get(4)?;
+            let failing: bool = r.get(5)?;
             Ok(EngineAttemptListEntry {
                 id: format!("ci_state:{id}"),
                 work_item_id: Some(id),
@@ -102,11 +112,8 @@ impl WorkDb {
                 failure_reason: None,
                 started_at: None,
                 finished_at: None,
-                extra: [
-                    ("attempts_used".into(), r.get::<_, i64>(4)?.to_string()),
-                    ("budget".into(), r.get::<_, i64>(5)?.to_string()),
-                ]
-                .into(),
+                // attempts_used/budget are filled by `remediation_entry`.
+                extra: Default::default(),
             })
         })?;
         for row in rows {

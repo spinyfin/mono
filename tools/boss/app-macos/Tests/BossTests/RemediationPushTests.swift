@@ -194,6 +194,52 @@ final class RemediationPushTests: XCTestCase {
         XCTAssertNil(model.ciFailureBadges[pr])
         XCTAssertNil(model.remediationEventsDuringRead[historyID])
     }
+
+    func testStaleHistoryReplayCannotRegressNewerOpenSnapshot() throws {
+        let model = ChatViewModel(socketPath: "/tmp/boss-remediation-\(UUID()).sock")
+        model.applyEventForTest(.connected)
+        defer { model.applyEventForTest(.disconnected) }
+        let firstState = try XCTUnwrap(model.remediationStateRequestID)
+        model.applyEventForTest(.engineAttemptsList(attempts: [], backgroundWork: [], requestId: firstState))
+        model.activityIsVisible = true
+        model.refreshEngineAttempts()
+        let historyID = try XCTUnwrap(model.backgroundWorkPending.first { $0.value.replacesAttempts }?.key)
+        // H outstanding; a running push is buffered under it.
+        model.applyEventForTest(event(row("ci", "running")))
+        model.applyEventForTest(event(row("conflict", "running")))
+        // A newer snapshot S reports both attempts already succeeded.
+        model.refreshRemediationState()
+        let stateID = try XCTUnwrap(model.remediationStateRequestID)
+        model.applyEventForTest(.engineAttemptsList(
+            attempts: [row("ci", "succeeded"), row("conflict", "succeeded"), row("ci_state", "clear")],
+            backgroundWork: [], requestId: stateID
+        ))
+        model.applyEventForTest(.engineAttemptsList(attempts: [], backgroundWork: [], requestId: historyID))
+
+        XCTAssertEqual(model.ciRemediations.map(\.status), ["succeeded"])
+        XCTAssertEqual(model.conflictResolutions.map(\.status), ["succeeded"])
+        XCTAssertNil(model.ciFailureBadges[pr])
+        XCTAssertNotNil(model.recentlyClearedCIPRs[pr])
+        XCTAssertNotNil(model.recentlyClearedConflictPRs[pr])
+    }
+
+    private func ciDetail(id: String) -> WorkCiRemediation {
+        WorkCiRemediation(
+            id: id, productID: "prod", workItemID: "task", prURL: pr, prNumber: 42,
+            headBranch: "feature/test", headSHAAtTrigger: "abc123", headSHAAfter: nil,
+            attemptKind: "fix", consumesBudget: 1, failedChecks: "[]", triageClass: nil,
+            logExcerpt: nil, status: "running", failureReason: nil, cubeLeaseID: nil,
+            cubeWorkspaceID: nil, workerID: nil, createdAt: "1", startedAt: nil, finishedAt: nil
+        )
+    }
+
+    func testPushKeepsCachedDetailOfSelectedAttempt() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-remediation-\(UUID()).sock")
+        let running = row("ci", "running")
+        model.engineAttemptDetails[running.id] = .ciRemediation(ciDetail(id: running.id))
+        model.applyEventForTest(event(running))
+        XCTAssertNotNil(model.engineAttemptDetails[running.id], "an update for the same id must not blank the pane")
+    }
 }
 
 private final class PayloadRecorder: @unchecked Sendable {

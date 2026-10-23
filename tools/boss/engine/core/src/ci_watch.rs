@@ -646,7 +646,7 @@ pub async fn on_ci_failure_detected(
             // dependency > review_feedback > merge_conflict >
             // ci_failure_exhausted > ci_failure) and conflict pre-empts CI
             // (§Q1), so ci_watch never takes a row over from another
-            // watcher's bucket — but make the skip visible (T2381/PR#1861:
+            // watcher's bucket — but make the skip visible (see PR#1861:
             // this class of cross-watcher orphaning previously left no
             // trace at all) instead of a bare "manually moved" guess.
             match work_db.task_blocked_reason(&candidate.work_item_id) {
@@ -1446,7 +1446,7 @@ async fn on_queue_side_failure_detected(
     // known-open (it was in a merge queue), so a static checker is correct
     // here and avoids a redundant `gh pr view` round-trip.
     //
-    // T2381/PR#1861 fix: unlike `on_ci_failure_detected`, this path used to leave
+    // PR#1861 fix: unlike `on_ci_failure_detected`, this path used to leave
     // the upfront `blocked: ci_failure` flip in place even after a fix revision
     // spawned successfully — the parent never returned to `in_review`, so it sat
     // in `list_chores_blocked_on_ci_failure`'s bucket forever instead of the

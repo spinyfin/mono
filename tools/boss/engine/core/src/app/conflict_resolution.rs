@@ -85,7 +85,7 @@ pub(super) async fn handle_get_conflict_hotspots(ctx: Dispatch, req: FrontendReq
     };
     {
         // Read-only aggregation surface for `boss engine conflicts
-        // hotspots` (Layer 0 / T5). No auth gate, same reasoning as
+        // hotspots`. No auth gate, same reasoning as
         // `list_conflict_resolutions`: diagnostic-only, and the
         // caller can already read the SQLite file directly.
         let top_n = top.unwrap_or(20) as usize;

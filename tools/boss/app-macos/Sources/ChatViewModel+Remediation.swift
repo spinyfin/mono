@@ -22,8 +22,40 @@ extension ChatViewModel {
         }
     }
 
+    /// The compact row a lifecycle push carries, if any. Pushes without a
+    /// projection (exhausted, ci_failure_cleared) have no history row.
+    func remediationRow(of event: EngineEvent) -> EngineAttemptListEntry? {
+        switch event {
+        case .conflictResolutionStarted(_, _, _, _, let attempt),
+             .conflictResolutionSucceeded(_, _, _, _, let attempt),
+             .conflictResolutionFailed(_, _, _, _, _, let attempt),
+             .conflictResolutionAbandoned(_, _, _, _, _, let attempt),
+             .ciRemediationStarted(_, _, _, _, _, let attempt),
+             .ciRemediationSucceeded(_, _, _, _, let attempt),
+             .ciRemediationFailed(_, _, _, _, _, let attempt),
+             .ciRemediationAbandoned(_, _, _, _, _, let attempt):
+            return attempt
+        default:
+            return nil
+        }
+    }
+
+    /// Fold pushes buffered during a history read into the history it
+    /// replaced. Deliberately touches only `engineAttempts`: the source rows
+    /// and chips were already updated when each push arrived, and a newer
+    /// open-set snapshot may since have superseded them.
+    func replayRemediationEventsIntoHistory(for requestID: String) {
+        let events = remediationEventsDuringRead.removeValue(forKey: requestID) ?? []
+        for event in events {
+            if let row = remediationRow(of: event) {
+                engineAttempts = upserting(row, into: engineAttempts, limit: 200)
+            }
+        }
+    }
+
     func applyRemediationPush(_ row: EngineAttemptListEntry) {
-        engineAttemptDetails.removeValue(forKey: row.id)
+        // Keep any cached detail: it is refreshed by the Activity detail pane
+        // when the selected row's status or finish time changes.
         engineAttempts = upserting(row, into: engineAttempts, limit: 200)
         if row.kind == "conflict" {
             conflictResolutions = upserting(row, into: conflictResolutions)
@@ -54,7 +86,10 @@ extension ChatViewModel {
             switch row.status {
             case "pending", "running": recentlyClearedConflictPRs.removeValue(forKey: row.prURL)
             case "succeeded": recentlyClearedConflictPRs[row.prURL] = fresh
-            default: break
+            default:
+                // The latest attempt did not succeed, so any earlier
+                // "conflict cleared" chip no longer describes the PR.
+                recentlyClearedConflictPRs.removeValue(forKey: row.prURL)
             }
             return
         }
@@ -79,7 +114,18 @@ extension ChatViewModel {
         case "succeeded":
             ciFailureBadges.removeValue(forKey: row.prURL)
             recentlyClearedCIPRs[row.prURL] = fresh
-        default: break
+        default:
+            // Terminal failed/abandoned attempt (possibly with no preceding
+            // start): the engine's card state decides the failure chip, since
+            // not every abandonment means CI is failing (manual clearance too).
+            recentlyClearedCIPRs.removeValue(forKey: row.prURL)
+            switch row.extra["card_state"] {
+            case "exhausted": ciFailureBadges[row.prURL] = CiFailureBadge(
+                state: .exhausted, attemptsUsed: badge.attemptsUsed, budget: badge.budget)
+            case "in_flight": ciFailureBadges[row.prURL] = badge
+            case "clear": ciFailureBadges.removeValue(forKey: row.prURL)
+            default: break
+            }
         }
     }
 

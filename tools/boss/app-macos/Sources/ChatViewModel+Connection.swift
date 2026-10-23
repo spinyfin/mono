@@ -54,9 +54,6 @@ extension ChatViewModel {
         startBackgroundWorkPolling()
         if resyncOnlyReadsOwed {
             resyncOnlyReadsOwed = false
-            refreshCiRemediations()
-            refreshConflictResolutions()
-            refreshEngineAttempts()
             sendResyncOnlyReads()
         }
     }

@@ -972,6 +972,36 @@ fn chore_blocked_attempt_id(db: &WorkDb, id: &str) -> Option<String> {
 }
 
 #[tokio::test]
+async fn retire_with_already_terminal_attempt_still_clears_signal_and_broadcasts() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    // A concurrent abandon wins the race: the succeeded mark becomes a no-op.
+    db.mark_conflict_resolution_abandoned(&attempt.id, "raced").unwrap();
+
+    retire_attempt_at_rung(&db, pub_.as_ref(), &candidate, &attempt, 1, &[]).await;
+
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "abandoned");
+    let (status, _) = chore_state(&db, &chore_id);
+    assert_eq!(status, "InReview");
+    assert!(
+        pub_.lifecycle_reasons()
+            .await
+            .contains(&"merge_conflict_resolved".to_owned()),
+        "parent transition must still be broadcast"
+    );
+    let typed = pub_.typed_events.lock().await;
+    assert!(
+        !typed
+            .iter()
+            .any(|(_, e)| matches!(e, FrontendEvent::ConflictResolutionSucceeded { .. })),
+        "no success push for an attempt that did not succeed"
+    );
+}
+
+#[tokio::test]
 async fn mechanical_rung_marker_is_persisted_during_rung1_and_cleared_after_retire() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("boss.db");

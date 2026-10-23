@@ -169,9 +169,6 @@ extension ChatViewModel {
         engine.sendGetEngineHealth()
         engine.sendGitHubAuthStatus()
         engine.sendGetEnginePoolConfig()
-        refreshCiRemediations()
-        refreshConflictResolutions()
-        refreshEngineAttempts()
         commentBridge.reloadOpenLayers()
         sendResyncOnlyReads()
         if !productJoined {

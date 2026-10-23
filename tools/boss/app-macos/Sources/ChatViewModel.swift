@@ -595,13 +595,19 @@ final class ChatViewModel: ObservableObject {
         didSet { notePublishedWorkInputChanged() }
     }
 
+    /// True while buffered pushes are being replayed through `handle`, so the
+    /// replay is not itself buffered again.
+    var replayingRemediationEvents = false
+    /// Whether the Activity tab is on screen; history reads are issued only then.
+    var activityIsVisible = false
+    /// Request id of the outstanding open-PR snapshot read, if any.
+    var remediationStateRequestID: String?
+    /// Lifecycle pushes received while a read (history or open-PR snapshot)
+    /// was outstanding, keyed by request id and replayed when it returns.
+    var remediationEventsDuringRead: [String: [EngineEvent]] = [:]
     /// The authoritative, merged attempt feed for Activity. Unlike the
     /// source-specific arrays above, these entries deliberately contain only
     /// shared list fields; a selected row loads its detailed record on demand.
-    var replayingRemediationEvents = false
-    var activityIsVisible = false
-    var remediationStateRequestID: String?
-    var remediationEventsDuringRead: [String: [EngineEvent]] = [:]
     @Published var engineAttempts: [EngineAttemptListEntry] = []
 
     /// Engine-owned snapshot for the background-work toolbar affordance.
