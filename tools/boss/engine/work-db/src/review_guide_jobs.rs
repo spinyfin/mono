@@ -304,7 +304,10 @@ impl WorkDb {
                         &tx,
                         &mut pending,
                         execution_id,
-                        CancelExecutionOpts::default(),
+                        CancelExecutionOpts {
+                            reason: Some("review guide request replaced by a newer one".to_owned()),
+                            ..CancelExecutionOpts::default()
+                        },
                     )?;
                 }
             }

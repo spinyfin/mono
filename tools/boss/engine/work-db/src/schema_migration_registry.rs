@@ -314,6 +314,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: execution_bookmarks::migrate_retire_prune_state,
         },
         Migration {
+            id: cancel_records::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: cancel_records::migrate,
+        },
+        Migration {
             id: progression_candidates::EXECUTION_PROVENANCE_MIGRATION_ID.into(),
             legacy_version: None,
             apply: progression_candidates::migrate_execution_provenance,
