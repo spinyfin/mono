@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use boss_host_enrollment::{AuthorizedHost, Clock, CredentialEvent, EnrollmentService, HostAuthorizer, ServiceLimits};
+use boss_host_enrollment::{EnrollmentService, HostAuthorizer, ServiceLimits, admit};
 use boss_protocol_spoke::v1::enrollment_client::EnrollmentClient;
 use boss_protocol_spoke::v1::spoke_hub_server::{SpokeHub, SpokeHubServer};
 use boss_protocol_spoke::v1::{self, EnrollRequest, RenewRequest};
@@ -29,7 +29,6 @@ use tonic::{Code, Request, Response, Status, Streaming};
 use crate::support::{Fixture, Spoke};
 
 const STEP: Duration = Duration::from_secs(20);
-const DEADLINE_POLL: Duration = Duration::from_millis(25);
 
 fn pem(label: &str, der: &[u8]) -> String {
     let body = STANDARD.encode(der);
@@ -44,10 +43,9 @@ fn pem(label: &str, der: &[u8]) -> String {
 // ------------------------------------------------------------ the server
 
 /// The slice of the stream manager's `Connect` handler that this crate's
-/// contract governs.
+/// contract governs, built on the library's `admit` and `StreamGuard`.
 struct Hub {
     authorizer: Arc<dyn HostAuthorizer>,
-    clock: Arc<dyn Clock>,
 }
 
 #[tonic::async_trait]
@@ -61,73 +59,19 @@ impl SpokeHub for Hub {
         let chain = request
             .peer_certs()
             .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
-        // Subscribe first: a revocation committed between authorize and a
-        // later subscribe would otherwise never reach this stream.
-        let mut events = self.authorizer.subscribe();
-        // authorize blocks on the credential store, so keep it off the runtime.
         let chain: Vec<_> = chain.iter().map(|cert| cert.clone().into_owned()).collect();
-        let authorizing = Arc::clone(&self.authorizer);
-        let host = tokio::task::spawn_blocking(move || authorizing.authorize(&chain))
+        let mut guard = admit(Arc::clone(&self.authorizer), chain)
             .await
-            .map_err(|_| Status::internal("authorization task failed"))?
             .map_err(|_| Status::unauthenticated("not permitted"))?;
-        let authorizer = Arc::clone(&self.authorizer);
         let (tx, rx) = mpsc::channel(4);
         tx.send(Ok(v1::HubFrame::default())).await.expect("first frame");
-        let clock = Arc::clone(&self.clock);
         tokio::spawn(async move {
-            // Nothing is published when a certificate expires or an overlap
-            // ends, so the stream closes itself at its deadline. The deadline
-            // only ever moves earlier: from a matching `Superseded`, and from
-            // what `revalidate` reports after missed events. The deadline is
-            // sampled on every iteration, so events about other hosts cannot
-            // postpone it. (A production handler keeps one `sleep_until`
-            // future outside the loop and resets it only when the deadline
-            // moves; this one polls the injected clock so tests can move time
-            // without waiting.)
-            let mut host = host;
-            loop {
-                let still_valid = tokio::select! {
-                    () = tokio::time::sleep(DEADLINE_POLL) => clock.now() < host.valid_until,
-                    event = events.recv() => match event {
-                        Ok(CredentialEvent::Revoked { host_id }) => host_id != host.host_id,
-                        Ok(CredentialEvent::Superseded { host_id, serial, valid_until }) => {
-                            if host_id == host.host_id && serial == host.serial {
-                                host.valid_until = host.valid_until.min(valid_until);
-                                refreshed(&authorizer, &mut host).await
-                            } else {
-                                true
-                            }
-                        }
-                        // Missed events: the only safe answer is to look again.
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            refreshed(&authorizer, &mut host).await
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
-                    },
-                };
-                if !still_valid || clock.now() >= host.valid_until {
-                    let _ = tx
-                        .send(Err(Status::unauthenticated("credential no longer valid")))
-                        .await;
-                    return;
-                }
-            }
+            let _ = guard.closed().await;
+            let _ = tx
+                .send(Err(Status::unauthenticated("credential no longer valid")))
+                .await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))
-    }
-}
-
-/// Re-checks `host` and adopts its current deadline. `revalidate` blocks on
-/// the credential store, so it runs off the runtime.
-async fn refreshed(authorizer: &Arc<dyn HostAuthorizer>, host: &mut AuthorizedHost) -> bool {
-    let (authorizer, current) = (Arc::clone(authorizer), host.clone());
-    match tokio::task::spawn_blocking(move || authorizer.revalidate(&current)).await {
-        Ok(Ok(updated)) => {
-            *host = updated;
-            true
-        }
-        _ => false,
     }
 }
 
@@ -194,12 +138,11 @@ async fn start(fx: &Fixture, limits: ServiceLimits) -> Running {
     let addr = listener.local_addr().expect("addr");
     let (shutdown, stopped) = oneshot::channel::<()>();
     let authorizer: Arc<dyn HostAuthorizer> = fx.credentials.clone();
-    let clock: Arc<dyn Clock> = fx.clock.clone();
     let server = Server::builder()
         .tls_config(tls)
         .expect("server tls")
         .add_service(EnrollmentService::new(fx.credentials.clone(), limits).into_server())
-        .add_service(SpokeHubServer::new(Hub { authorizer, clock }))
+        .add_service(SpokeHubServer::new(Hub { authorizer }))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
             let _ = stopped.await;
         });

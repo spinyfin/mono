@@ -1324,7 +1324,7 @@
           "FILE:@@//tools/boss/trunk_auth/Cargo.toml b587b790d373b83f7d915d79936c7d01de8e2eae3fc6464b75c1942bb9e3d30e",
           "FILE:@@//tools/boss/trunk_client/Cargo.toml 00e773c389042058175ef4fd166bf39817f0f50e8817d55e2fb76e3b7f3d33c8",
           "FILE:@@//tools/boss/cli/Cargo.toml 355636523be53200e7afbf166ff66ade3624d955fc69df8e9809f2bb562b327f",
-          "FILE:@@//tools/boss/engine/host-enrollment/Cargo.toml 59146e6ccc790f890248c665c6f3a79d98ee27a5436cd8e98960aefd04d1a677",
+          "FILE:@@//tools/boss/engine/host-enrollment/Cargo.toml 009467e569e48c2537e9d862b2b8468493a6ada3579b6d7aa31d41b498d5ec8e",
           "FILE:@@//tools/boss/protocol-spoke/Cargo.toml 599e38414445891c6b5c33e54ce67b29d7b2ad5b1c32946ac798df99f5b30dc5",
           "FILE:@@//tools/boss/engine/spoke-stream/Cargo.toml 67505d17fc57639713deea27a4d98f5cd7be0595087ab4e8657060a578cd3e9e",
           "FILE:@@//tools/boss/engine/design-doc-fetcher/Cargo.toml 0a79020eec188bff6f98a6cd447d9d2c751f2036b436b4e1a11bfd4632ff7ebd",

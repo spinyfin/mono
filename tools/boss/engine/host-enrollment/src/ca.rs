@@ -32,6 +32,10 @@ use crate::policy::Policy;
 
 const KEY_FILE: &str = "issuer.key.pem";
 const CERT_FILE: &str = "issuer.crt.der";
+// A rotation in progress: the incoming issuer's key and its certificate, which
+// the outgoing issuer has signed.
+const NEXT_KEY_FILE: &str = "next.key.pem";
+const NEXT_CERT_FILE: &str = "next.crt.der";
 const COMMON_NAME: &str = "Boss hub host CA";
 const CA_LIFETIME: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
@@ -47,6 +51,10 @@ pub enum CaError {
     Generate(#[from] rcgen::Error),
     #[error("unusable host id")]
     HostId,
+    #[error("a CA rotation is already in progress in {path}")]
+    RotationInProgress { path: PathBuf },
+    #[error("no CA rotation is in progress in {path}")]
+    NoRotation { path: PathBuf },
 }
 
 /// A host certificate the CA has signed.
@@ -57,9 +65,17 @@ pub(crate) struct IssuedLeaf {
 }
 
 /// The hub's host-certificate issuer.
+///
+/// Normally one certificate. During a rotation (see
+/// [`begin_rotation`](Self::begin_rotation)) it signs with the incoming key
+/// while the bundle also keeps the outgoing certificate, so host certificates
+/// issued before the rotation keep verifying until it is finished.
 pub struct CertificateAuthority {
     issuer: Issuer<'static, KeyPair>,
+    /// The issuing certificate, the one whose key signs new host certificates.
     cert_der: Vec<u8>,
+    /// The outgoing certificate, still trusted, while a rotation is open.
+    outgoing_der: Option<Vec<u8>>,
 }
 
 impl CertificateAuthority {
@@ -102,20 +118,87 @@ impl CertificateAuthority {
                 });
             }
         };
-        let issuer = Issuer::from_ca_cert_der(&CertificateDer::from(cert_der.as_slice()), key)?;
-        Ok(Self { issuer, cert_der })
+        match read_rotation(dir, &cert_der)? {
+            Rotation::None => {
+                let issuer = Issuer::from_ca_cert_der(&CertificateDer::from(cert_der.as_slice()), key)?;
+                Ok(Self {
+                    issuer,
+                    cert_der,
+                    outgoing_der: None,
+                })
+            }
+            Rotation::Open {
+                key: next_key,
+                cert_der: next_der,
+            } => {
+                let issuer = Issuer::from_ca_cert_der(&CertificateDer::from(next_der.as_slice()), *next_key)?;
+                Ok(Self {
+                    issuer,
+                    cert_der: next_der,
+                    outgoing_der: Some(cert_der),
+                })
+            }
+        }
+    }
+
+    /// Starts replacing the CA stored in `dir` with a new key.
+    ///
+    /// The incoming certificate is signed by the outgoing key, so the new CA
+    /// is vouched for by the one every existing host certificate chains to.
+    /// From the next [`open_or_create`](Self::open_or_create) the authority
+    /// signs with the new key and its bundle holds both certificates: host
+    /// certificates issued before and after both verify, and the bundle reaches
+    /// spokes in `chain_der` on their next enrollment or renewal. The outgoing
+    /// certificate is dropped by [`finish_rotation`](Self::finish_rotation),
+    /// once every host has renewed under the new key (one certificate lifetime,
+    /// by design). Both calls act on the files; a running hub picks the change
+    /// up when it reopens its credential state.
+    pub fn begin_rotation(dir: &Path, now: SystemTime, policy: &Policy) -> Result<(), CaError> {
+        let current = Self::open_or_create(dir, now, policy)?;
+        if current.outgoing_der.is_some() {
+            return Err(CaError::RotationInProgress { path: dir.to_owned() });
+        }
+        let next_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        // Key first: a crash before the certificate leaves a key that the next
+        // open treats as a rotation to resume.
+        write_private(&dir.join(NEXT_KEY_FILE), next_key.serialize_pem().as_bytes())?;
+        let next_der = cross_sign(&next_key, &current.issuer, now, policy)?;
+        write_private(&dir.join(NEXT_CERT_FILE), &next_der)
+    }
+
+    /// Ends a rotation: the incoming certificate becomes the only CA and the
+    /// outgoing one stops being trusted, so any host certificate it issued that
+    /// was not renewed in the meantime is refused.
+    pub fn finish_rotation(dir: &Path, now: SystemTime, policy: &Policy) -> Result<(), CaError> {
+        // Opening resumes a half-finished rotation and settles the files.
+        let current = Self::open_or_create(dir, now, policy)?;
+        if current.outgoing_der.is_none() {
+            return Err(CaError::NoRotation { path: dir.to_owned() });
+        }
+        promote(dir)
+    }
+
+    /// Whether a rotation is open: the bundle holds both the incoming and the
+    /// outgoing certificate.
+    pub fn is_rotating(&self) -> bool {
+        self.outgoing_der.is_some()
     }
 
     /// The certificates a verifier must trust to accept host certificates,
     /// the issuing CA first.
     pub fn trust_bundle_der(&self) -> Vec<Vec<u8>> {
-        vec![self.cert_der.clone()]
+        let mut bundle = vec![self.cert_der.clone()];
+        bundle.extend(self.outgoing_der.clone());
+        bundle
     }
 
     /// [`trust_bundle_der`](Self::trust_bundle_der) as PEM, the form a TLS
     /// listener's client-CA setting takes.
     pub fn trust_bundle_pem(&self) -> String {
-        pem_encode("CERTIFICATE", &self.cert_der)
+        self.trust_bundle_der()
+            .iter()
+            .map(|der| pem_encode("CERTIFICATE", der))
+            .collect()
     }
 
     /// Signs a client-only certificate for `host_id` over `key`.
@@ -164,6 +247,79 @@ fn self_sign(key: &KeyPair, now: SystemTime, policy: &Policy) -> Result<Vec<u8>,
     params.not_after = offset(now + CA_LIFETIME);
     params.serial_number = Some(random_serial());
     Ok(params.self_signed(key)?.der().to_vec())
+}
+
+/// A CA certificate for `key` that `signer` has signed. Its subject differs
+/// from the signer's so a verifier holding both can tell the anchors apart.
+fn cross_sign(
+    key: &KeyPair,
+    signer: &Issuer<'static, KeyPair>,
+    now: SystemTime,
+    policy: &Policy,
+) -> Result<Vec<u8>, CaError> {
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, format!("{COMMON_NAME} {}", unix_secs(now)));
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.not_before = offset(now - policy.clock_skew_allowance);
+    params.not_after = offset(now + CA_LIFETIME);
+    params.serial_number = Some(random_serial());
+    params.use_authority_key_identifier_extension = true;
+    Ok(params.signed_by(key, signer)?.der().to_vec())
+}
+
+enum Rotation {
+    None,
+    Open { key: Box<KeyPair>, cert_der: Vec<u8> },
+}
+
+/// Reads a rotation left in `dir`, finishing the parts a crash interrupted.
+///
+/// A key without its certificate is a rotation that never got signed; it is
+/// discarded and `begin_rotation` can run again. A next certificate equal to
+/// the current one is a promotion that crashed after replacing the
+/// certificate and before the key.
+fn read_rotation(dir: &Path, current_cert: &[u8]) -> Result<Rotation, CaError> {
+    let (key_path, cert_path) = (dir.join(NEXT_KEY_FILE), dir.join(NEXT_CERT_FILE));
+    let Some(pem) = read_private(&key_path)? else {
+        return Ok(Rotation::None);
+    };
+    let cert_der = match fs::read(&cert_path) {
+        Ok(der) => der,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::remove_file(&key_path).map_err(io_error(&key_path))?;
+            return Ok(Rotation::None);
+        }
+        Err(source) => {
+            return Err(CaError::Io {
+                path: cert_path,
+                source,
+            });
+        }
+    };
+    if cert_der == current_cert {
+        promote(dir)?;
+        return Ok(Rotation::None);
+    }
+    Ok(Rotation::Open {
+        key: Box::new(KeyPair::from_pem(&pem)?),
+        cert_der,
+    })
+}
+
+/// Makes the next key and certificate the CA's. Certificate first, so a crash
+/// between the two writes is recognised by `read_rotation` and resumed.
+fn promote(dir: &Path) -> Result<(), CaError> {
+    let (key_path, cert_path) = (dir.join(NEXT_KEY_FILE), dir.join(NEXT_CERT_FILE));
+    let key = fs::read(&key_path).map_err(io_error(&key_path))?;
+    let cert = fs::read(&cert_path).map_err(io_error(&cert_path))?;
+    write_private(&dir.join(CERT_FILE), &cert)?;
+    write_private(&dir.join(KEY_FILE), &key)?;
+    fs::remove_file(&key_path).map_err(io_error(&key_path))?;
+    fs::remove_file(&cert_path).map_err(io_error(&cert_path))
 }
 
 fn offset(time: SystemTime) -> OffsetDateTime {
@@ -305,6 +461,79 @@ mod tests {
         fs::remove_file(dir.join(CERT_FILE)).expect("rm cert");
         CertificateAuthority::open_or_create(&dir, now(), &Policy::default()).expect("remint");
         assert!(dir.join(CERT_FILE).exists());
+    }
+
+    #[test]
+    fn a_rotation_trusts_both_cas_until_it_is_finished() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("ca");
+        let policy = Policy::default();
+        let before = CertificateAuthority::open_or_create(&dir, now(), &policy).expect("create");
+        let outgoing = before.trust_bundle_der();
+
+        CertificateAuthority::begin_rotation(&dir, now(), &policy).expect("begin");
+        let rotating = CertificateAuthority::open_or_create(&dir, now(), &policy).expect("reopen");
+        assert!(rotating.is_rotating());
+        let bundle = rotating.trust_bundle_der();
+        assert_eq!(bundle.len(), 2);
+        assert_eq!(
+            bundle[1], outgoing[0],
+            "the outgoing CA stays trusted, after the incoming one"
+        );
+        assert_ne!(bundle[0], outgoing[0]);
+        let (_, incoming) = x509_parser::parse_x509_certificate(&bundle[0]).expect("parse");
+        let (_, old) = x509_parser::parse_x509_certificate(&outgoing[0]).expect("parse");
+        assert_eq!(
+            incoming.issuer(),
+            old.subject(),
+            "the incoming CA is issued by the outgoing one"
+        );
+        assert!(matches!(
+            CertificateAuthority::begin_rotation(&dir, now(), &policy),
+            Err(CaError::RotationInProgress { .. })
+        ));
+
+        CertificateAuthority::finish_rotation(&dir, now(), &policy).expect("finish");
+        let after = CertificateAuthority::open_or_create(&dir, now(), &policy).expect("reopen");
+        assert!(!after.is_rotating());
+        assert_eq!(after.trust_bundle_der(), vec![bundle[0].clone()]);
+        assert!(!dir.join(NEXT_KEY_FILE).exists() && !dir.join(NEXT_CERT_FILE).exists());
+        assert!(matches!(
+            CertificateAuthority::finish_rotation(&dir, now(), &policy),
+            Err(CaError::NoRotation { .. })
+        ));
+    }
+
+    #[test]
+    fn a_promotion_interrupted_after_the_certificate_is_resumed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("ca");
+        let policy = Policy::default();
+        CertificateAuthority::open_or_create(&dir, now(), &policy).expect("create");
+        CertificateAuthority::begin_rotation(&dir, now(), &policy).expect("begin");
+        let incoming = fs::read(dir.join(NEXT_CERT_FILE)).expect("next cert");
+        // The crash: the certificate was replaced, the key was not.
+        write_private(&dir.join(CERT_FILE), &incoming).expect("write");
+
+        let resumed = CertificateAuthority::open_or_create(&dir, now(), &policy).expect("resume");
+        assert!(!resumed.is_rotating());
+        assert_eq!(resumed.trust_bundle_der(), vec![incoming]);
+        assert!(!dir.join(NEXT_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn a_rotation_key_without_its_certificate_is_discarded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("ca");
+        let policy = Policy::default();
+        let before = CertificateAuthority::open_or_create(&dir, now(), &policy).expect("create");
+        CertificateAuthority::begin_rotation(&dir, now(), &policy).expect("begin");
+        fs::remove_file(dir.join(NEXT_CERT_FILE)).expect("rm next cert");
+
+        let reopened = CertificateAuthority::open_or_create(&dir, now(), &policy).expect("reopen");
+        assert!(!reopened.is_rotating());
+        assert_eq!(reopened.trust_bundle_der(), before.trust_bundle_der());
+        CertificateAuthority::begin_rotation(&dir, now(), &policy).expect("can begin again");
     }
 
     #[test]
