@@ -47,30 +47,22 @@ impl WorkDb {
             return Ok(false);
         };
         let now = boss_engine_utils::iso8601::format_epoch_iso8601(boss_engine_utils::epoch_time::now_epoch_secs());
-        // The tool and turn signals are carried by the same four events
-        // (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`), so one
-        // keyed UPDATE writes both or neither; `zip` keeps that pairing a
-        // compile-visible fact rather than two independently-maintained
-        // match arms.
-        match tool_condition_signal(event).zip(turn_condition_signal(event)) {
-            Some((tool_condition, turn_condition)) => {
-                conn.execute(
-                    "UPDATE work_runs
-                     SET semantic_progress_at = ?2, semantic_tool_condition = ?3, semantic_turn_condition = ?4
-                     WHERE id = ?1
-                       AND (semantic_progress_at IS NOT ?2
-                            OR semantic_tool_condition IS NOT ?3
-                            OR semantic_turn_condition IS NOT ?4)",
-                    params![run_id, now, tool_condition.as_str(), turn_condition.as_str()],
-                )?;
-            }
-            None => {
-                conn.execute(
-                    "UPDATE work_runs SET semantic_progress_at = ?2 WHERE id = ?1 AND semantic_progress_at IS NOT ?2",
-                    params![run_id, now],
-                )?;
-            }
-        }
+        // Bound independently: each column is carried through unchanged
+        // (`COALESCE`) when its own signal is absent, so a divergence between
+        // the two signal functions can never drop a transition.
+        let tool = tool_condition_signal(event).map(|c| c.as_str());
+        let turn = turn_condition_signal(event).map(|c| c.as_str());
+        conn.execute(
+            "UPDATE work_runs
+             SET semantic_progress_at = ?2,
+                 semantic_tool_condition = COALESCE(?3, semantic_tool_condition),
+                 semantic_turn_condition = COALESCE(?4, semantic_turn_condition)
+             WHERE id = ?1
+               AND (semantic_progress_at IS NOT ?2
+                    OR (?3 IS NOT NULL AND semantic_tool_condition IS NOT ?3)
+                    OR (?4 IS NOT NULL AND semantic_turn_condition IS NOT ?4))",
+            params![run_id, now, tool, turn],
+        )?;
         Ok(true)
     }
 

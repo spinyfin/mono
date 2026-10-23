@@ -376,3 +376,25 @@ async fn an_older_accepted_dispatch_persists_the_latest_checkpoint() {
         boss_protocol::WorkerActivity::Working,
     );
 }
+
+/// The persistence callback talks to the database, whose connection holders
+/// (dispatch's live-run check) take the registry mutex. The registry mutex
+/// must therefore not be held while the callback runs, or the two orders
+/// deadlock.
+#[test]
+fn semantic_checkpoint_persistence_does_not_hold_the_registry_mutex() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let state = server_state.clone();
+    std::thread::spawn(move || {
+        state.live_worker_states.with_semantic_progress(SLOT, |_| {
+            // Re-taking the registry mutex here self-deadlocks if it is held.
+            let _ = state.live_worker_states.is_run_live(&execution_id);
+        });
+        done_tx.send(()).unwrap();
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("with_semantic_progress held the registry mutex across the callback");
+}
