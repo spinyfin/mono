@@ -5,7 +5,7 @@ import CryptoKit
 /// evidence. The real thumbnail and detail views read it through their normal cache.
 @MainActor
 enum BossReviewGuideAttachmentCapture {
-    static func attachments(taskId: String) throws -> [AttachmentVM] {
+    static func attachments(taskId: String, captions overrideCaptions: [String]? = nil) throws -> [AttachmentVM] {
         guard BossCaptureArgs.shared.isCaptureMode, BossEnginePaths.isIsolatedInstance else { return [] }
         let args = CommandLine.arguments
         let count = args.first { $0.hasPrefix("--capture-attachments=") }
@@ -23,7 +23,7 @@ enum BossReviewGuideAttachmentCapture {
         }
         let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
         // Deliberately interleaved input exercises before/after adjacency.
-        let captions = ["Wide layout — after", "Narrow layout — before", "Wide layout — before",
+        let captions = overrideCaptions ?? ["Wide layout — after", "Narrow layout — before", "Wide layout — before",
                         "Narrow layout — after", "Additional evidence"]
         let attachments = (0..<count).map { index in
             AttachmentVM(
