@@ -156,6 +156,7 @@ impl WorkerCompletionHandler {
             .publish_frontend_event_on_product(
                 &updated.product_id,
                 FrontendEvent::ConflictResolutionFailed {
+                    attempt: self.work_db.remediation_entry(updated.list_entry()),
                     product_id: updated.product_id.clone(),
                     work_item_id: updated.work_item_id.clone(),
                     attempt_id: updated.id.clone(),
@@ -364,6 +365,7 @@ impl WorkerCompletionHandler {
             .publish_frontend_event_on_product(
                 &updated.product_id,
                 FrontendEvent::CiRemediationFailed {
+                    attempt: self.work_db.remediation_entry(updated.list_entry()),
                     product_id: updated.product_id.clone(),
                     work_item_id: updated.work_item_id.clone(),
                     attempt_id: updated.id.clone(),

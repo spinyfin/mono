@@ -98,6 +98,7 @@ pub(super) async fn handle_mark_ci_remediation_failed(ctx: Dispatch, req: Fronte
                     .publish_frontend_event_on_product(
                         &attempt.product_id,
                         FrontendEvent::CiRemediationFailed {
+                            attempt: work_db.remediation_entry(attempt.list_entry()),
                             product_id: attempt.product_id.clone(),
                             work_item_id: attempt.work_item_id.clone(),
                             attempt_id: attempt.id.clone(),
@@ -455,6 +456,7 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
                             .publish_frontend_event_on_product(
                                 &updated.product_id,
                                 FrontendEvent::CiRemediationSucceeded {
+                                    attempt: work_db.remediation_entry(updated.list_entry()),
                                     product_id: updated.product_id.clone(),
                                     work_item_id: updated.work_item_id.clone(),
                                     attempt_id: updated.id.clone(),
@@ -697,6 +699,7 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
                             .publish_frontend_event_on_product(
                                 &succeeded.product_id,
                                 FrontendEvent::CiRemediationSucceeded {
+                                    attempt: work_db.remediation_entry(succeeded.list_entry()),
                                     product_id: succeeded.product_id.clone(),
                                     work_item_id: succeeded.work_item_id.clone(),
                                     attempt_id: succeeded.id.clone(),
@@ -946,6 +949,7 @@ pub(super) async fn handle_abandon_ci_remediation(ctx: Dispatch, req: FrontendRe
                     .publish_frontend_event_on_product(
                         &attempt.product_id,
                         FrontendEvent::CiRemediationAbandoned {
+                            attempt: work_db.remediation_entry(attempt.list_entry()),
                             product_id: attempt.product_id.clone(),
                             work_item_id: attempt.work_item_id.clone(),
                             attempt_id: attempt.id.clone(),

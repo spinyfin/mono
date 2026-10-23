@@ -556,6 +556,7 @@ pub(crate) async fn run_engine_attempts_command(
             let include_background_work = args.background;
             let response = client
                 .send_request(&FrontendRequest::ListEngineAttempts {
+                    open_prs_only: false,
                     kinds: args.kind.clone(),
                     product_id,
                     status: args.status.clone(),

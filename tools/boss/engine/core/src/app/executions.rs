@@ -1376,6 +1376,7 @@ pub(super) async fn handle_list_engine_attempts(ctx: Dispatch, req: FrontendRequ
         ..
     } = ctx;
     let FrontendRequest::ListEngineAttempts {
+        open_prs_only,
         kinds,
         product_id,
         status,
@@ -1396,14 +1397,17 @@ pub(super) async fn handle_list_engine_attempts(ctx: Dispatch, req: FrontendRequ
         },
         None => None,
     };
-    let attempts =
-        match work_db.list_engine_attempts(&kinds, product_id.as_deref(), &status, work_item_id.as_deref(), limit) {
-            Ok(attempts) => attempts,
-            Err(err) => {
-                send_work_error(&sink, &request_id, &err);
-                return;
-            }
-        };
+    let attempts = match if open_prs_only {
+        work_db.open_remediation_state()
+    } else {
+        work_db.list_engine_attempts(&kinds, product_id.as_deref(), &status, work_item_id.as_deref(), limit)
+    } {
+        Ok(attempts) => attempts,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
     let background_work = if include_background_work {
         match crate::background_work::snapshot(&work_db) {
             Ok(items) => items,

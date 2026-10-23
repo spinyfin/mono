@@ -324,6 +324,64 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
         )
     }
 
+    // MARK: - Pushed rows
+
+    /// A new episode whose attempt is abandoned at creation
+    /// (`revision_create_failed`) arrives with no started push: the prior
+    /// success chip must clear and the failure chip must follow the engine's
+    /// card state.
+    func testDetectionTimeAbandonmentReplacesPriorSuccessChip() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/3273"
+        model.applyRemediationPush(makeRow(id: "cir_old", prURL: prURL, status: "succeeded", ageMinutes: 60))
+        XCTAssertTrue(model.showsCIAutoFixedBadge(forPR: prURL))
+
+        model.applyRemediationPush(makeRow(
+            id: "cir_new", prURL: prURL, status: "abandoned", failureReason: "revision_create_failed",
+            extra: ["attempts_used": "1", "budget": "3", "card_state": "in_flight"]
+        ))
+
+        XCTAssertFalse(model.showsCIAutoFixedBadge(forPR: prURL))
+        XCTAssertEqual(model.ciFailureBadge(forPR: prURL), CiFailureBadge(state: .inFlight, attemptsUsed: 1, budget: 3))
+    }
+
+    func testAbandonmentOfClearedCardLeavesNoFailureChip() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/3274"
+        model.applyRemediationPush(makeRow(id: "cir_a", prURL: prURL, status: "running", ageMinutes: 20))
+
+        model.applyRemediationPush(makeRow(
+            id: "cir_a", prURL: prURL, status: "abandoned", ageMinutes: 20,
+            extra: ["attempts_used": "1", "budget": "3", "card_state": "clear"]
+        ))
+
+        XCTAssertNil(model.ciFailureBadge(forPR: prURL), "manual clearance abandons without CI failing")
+    }
+
+    func testTerminalRowWithExhaustedCardStateShowsExhaustedChip() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/3275"
+
+        model.applyRemediationPush(makeRow(
+            id: "cir_b", prURL: prURL, status: "failed",
+            extra: ["attempts_used": "3", "budget": "3", "card_state": "exhausted"]
+        ))
+
+        XCTAssertEqual(model.ciFailureBadge(forPR: prURL), CiFailureBadge(state: .exhausted, attemptsUsed: 3, budget: 3))
+    }
+
+    private func makeRow(
+        id: String, prURL: String, status: String, finishedAt: String? = nil, kind: String = "ci",
+        failureReason: String? = nil, ageMinutes: Int = 10, extra: [String: String] = [:]
+    ) -> EngineAttemptListEntry {
+        let createdAt = String(Int(Date().addingTimeInterval(-Double(ageMinutes) * 60).timeIntervalSince1970))
+        return EngineAttemptListEntry(
+            id: id, productID: "prod_test", createdAt: createdAt, extra: extra, kind: kind, prURL: prURL,
+            status: status, failureReason: failureReason, finishedAt: finishedAt, startedAt: nil,
+            workItemID: "task_1"
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeModel() -> ChatViewModel {

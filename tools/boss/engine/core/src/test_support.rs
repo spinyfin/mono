@@ -1256,6 +1256,45 @@ impl ExecutionPublisher for RecordingPublisher {
             .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
     }
     async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
+        let projection = match &event {
+            FrontendEvent::ConflictResolutionStarted {
+                attempt, attempt_id, ..
+            }
+            | FrontendEvent::CiRemediationStarted {
+                attempt, attempt_id, ..
+            } => Some((attempt, attempt_id, "started")),
+            FrontendEvent::ConflictResolutionSucceeded {
+                attempt, attempt_id, ..
+            }
+            | FrontendEvent::CiRemediationSucceeded {
+                attempt, attempt_id, ..
+            } => Some((attempt, attempt_id, "succeeded")),
+            FrontendEvent::ConflictResolutionFailed {
+                attempt, attempt_id, ..
+            }
+            | FrontendEvent::CiRemediationFailed {
+                attempt, attempt_id, ..
+            } => Some((attempt, attempt_id, "failed")),
+            FrontendEvent::ConflictResolutionAbandoned {
+                attempt, attempt_id, ..
+            }
+            | FrontendEvent::CiRemediationAbandoned {
+                attempt, attempt_id, ..
+            } => Some((attempt, attempt_id, "abandoned")),
+            _ => None,
+        };
+        if let Some((row, id, status)) = projection {
+            assert_eq!(&row.id, id);
+            assert_eq!(row.product_id, product_id);
+            assert!(row.work_item_id.is_some());
+            assert!(!row.created_at.is_empty());
+            if status == "started" {
+                assert!(matches!(row.status.as_str(), "pending" | "running"));
+            } else {
+                assert_eq!(row.status, status);
+                assert!(row.finished_at.is_some());
+            }
+        }
         self.typed_events.lock().await.push((product_id.to_owned(), event));
     }
 }

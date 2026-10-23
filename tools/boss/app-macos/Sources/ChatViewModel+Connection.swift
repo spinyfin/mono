@@ -20,7 +20,7 @@ extension ChatViewModel {
         // pane's Refresh button disabled for the rest of the session.
         isRefreshingDriverQuota = false
         engine.sendRegisterAppSession()
-        refreshWorkSubscriptions()
+        refreshWorkSubscriptions(refreshRemediation: false)
         // Re-subscribe any open markdown viewers' comment topics and reload
         // them; the engine dropped every subscription on the disconnect.
         commentBridge.handleReconnected()
@@ -47,12 +47,13 @@ extension ChatViewModel {
         if let productID = currentSelectedProductID, engine.claimConnectTree(productId: productID) {
             engine.sendGetWorkTree(productId: productID, flow: flow)
         }
+        refreshRemediationState()
+        if activityIsVisible, !backgroundWorkPending.values.contains(where: { $0.replacesAttempts }) {
+            refreshEngineAttempts()
+        }
         startBackgroundWorkPolling()
         if resyncOnlyReadsOwed {
             resyncOnlyReadsOwed = false
-            refreshCiRemediations()
-            refreshConflictResolutions()
-            refreshEngineAttempts()
             sendResyncOnlyReads()
         }
     }

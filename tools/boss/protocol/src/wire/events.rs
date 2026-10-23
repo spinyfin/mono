@@ -777,6 +777,7 @@ pub enum FrontendEvent {
     /// work-tree topic so the macOS app can render an activity-feed
     /// entry without having to poll.
     ConflictResolutionStarted {
+        attempt: EngineAttemptListEntry,
         product_id: String,
         work_item_id: String,
         attempt_id: String,
@@ -788,6 +789,7 @@ pub enum FrontendEvent {
     /// `in_review`; the attempt row is `succeeded`; the worker's cube
     /// workspace lease has been released (if not already).
     ConflictResolutionSucceeded {
+        attempt: EngineAttemptListEntry,
         product_id: String,
         work_item_id: String,
         attempt_id: String,
@@ -800,6 +802,7 @@ pub enum FrontendEvent {
     /// terminal-failure transition. The parent remains `blocked:
     /// merge_conflict`; the user is the next actor.
     ConflictResolutionFailed {
+        attempt: EngineAttemptListEntry,
         product_id: String,
         work_item_id: String,
         attempt_id: String,
@@ -812,6 +815,7 @@ pub enum FrontendEvent {
     /// override). The parent has typically already moved out of
     /// `blocked: merge_conflict` by some other path.
     ConflictResolutionAbandoned {
+        attempt: EngineAttemptListEntry,
         product_id: String,
         work_item_id: String,
         attempt_id: String,
@@ -842,6 +846,7 @@ pub enum FrontendEvent {
     /// Phase 8 #22). `attempt_kind` is `"fix"` or `"retrigger"` —
     /// the engine's pre-spawn triage decision.
     CiRemediationStarted {
+        attempt: EngineAttemptListEntry,
         product_id: String,
         work_item_id: String,
         attempt_id: String,
@@ -853,6 +858,7 @@ pub enum FrontendEvent {
     /// been flipped from `blocked: ci_failure` back to `in_review`;
     /// the attempt row is `succeeded`.
     CiRemediationSucceeded {
+        attempt: EngineAttemptListEntry,
         product_id: String,
         work_item_id: String,
         attempt_id: String,
@@ -875,6 +881,7 @@ pub enum FrontendEvent {
     /// `boss engine ci mark-failed` or when the completion path's
     /// catch-all fires. The parent remains `blocked: ci_failure`.
     CiRemediationFailed {
+        attempt: EngineAttemptListEntry,
         product_id: String,
         work_item_id: String,
         attempt_id: String,
@@ -885,6 +892,7 @@ pub enum FrontendEvent {
     /// (engine declined to spawn — opt-out, suppression, or
     /// budget-related path).
     CiRemediationAbandoned {
+        attempt: EngineAttemptListEntry,
         product_id: String,
         work_item_id: String,
         attempt_id: String,

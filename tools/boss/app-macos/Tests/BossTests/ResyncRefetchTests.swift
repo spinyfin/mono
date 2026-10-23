@@ -141,11 +141,13 @@ final class ResyncRefetchTests: XCTestCase {
                 "get_work_tree": 1,
                 "list_deferred_scope_attentions": 1,
                 "list_engine_attempts": 2,
-                "list_ci_remediations": 1,
-                "list_conflict_resolutions": 1,
             ],
             "25 resyncs must cost exactly one set, none of it per project"
         )
+        let attempts = recorder.sent.filter { $0["type"] as? String == "list_engine_attempts" }
+        XCTAssertEqual(attempts.filter { $0["open_prs_only"] as? Bool == true }.count, 1)
+        XCTAssertEqual(attempts.filter { $0["limit"] as? Int == 0 }.count, 1)
+        XCTAssertFalse(attempts.contains { $0["limit"] as? Int == 200 }, "hidden Activity must not fetch history")
     }
 
     func testRefetchSetCoversEveryEvictablePushAndNothingMore() async {
@@ -154,12 +156,15 @@ final class ResyncRefetchTests: XCTestCase {
         model.applyEventForTest(.resyncRequired)
         await waitForSet(model, recorder)
 
-        for verb in ["list_products", "list_worker_live_states", "get_engine_health", "git_hub_auth_status", "get_engine_pool_config", "get_work_tree", "list_ci_remediations", "list_conflict_resolutions"] {
+        for verb in ["list_products", "list_worker_live_states", "get_engine_health", "git_hub_auth_status", "get_engine_pool_config", "get_work_tree"] {
             XCTAssertEqual(recorder.counts[verb], 1, "\(verb) re-reads state a dropped push could have covered")
         }
         XCTAssertEqual(recorder.sent.filter {
+            $0["type"] as? String == "list_engine_attempts" && $0["open_prs_only"] as? Bool == true
+        }.count, 1, "card chips recover through the open-PR snapshot")
+        XCTAssertEqual(recorder.sent.filter {
             $0["type"] as? String == "list_engine_attempts" && $0["limit"] as? Int == 200
-        }.count, 1, "Activity needs a history read, not only the limit-zero background poll")
+        }.count, 0, "hidden Activity needs no history read")
         for verb in ["list_live_status_disabled_slots", "list_planner_runs", "list_attention_groups", "list_attention_items_for_work_item"] {
             XCTAssertNil(recorder.counts[verb], "\(verb) is not state that a dropped push carries")
         }
@@ -292,11 +297,9 @@ final class ResyncRefetchTests: XCTestCase {
 
         XCTAssertEqual(recorder.counts["get_product_design_doc"], 1, "the connect burst alone never re-reads the open doc")
         XCTAssertEqual(recorder.counts["get_driver_quota_usage"], 1)
-        XCTAssertEqual(recorder.counts["list_ci_remediations"], 1)
-        XCTAssertEqual(recorder.counts["list_conflict_resolutions"], 1)
         XCTAssertEqual(recorder.sent.filter {
-            $0["type"] as? String == "list_engine_attempts" && $0["limit"] as? Int == 200
-        }.count, 1, "a canceled resync still owes Activity's history read on reconnect")
+            $0["type"] as? String == "list_engine_attempts" && $0["open_prs_only"] as? Bool == true
+        }.count, 1, "the connect burst recovers card chips through the open-PR snapshot")
         XCTAssertFalse(model.resyncOnlyReadsOwed)
     }
 

@@ -1332,38 +1332,12 @@ impl WorkDb {
         let mut out: Vec<EngineAttemptListEntry> = Vec::new();
         if want_conflict {
             for c in self.list_conflict_resolutions(product_id, statuses, work_item_id, None)? {
-                out.push(EngineAttemptListEntry {
-                    kind: "conflict".into(),
-                    id: c.id,
-                    product_id: c.product_id,
-                    work_item_id: Some(c.work_item_id),
-                    pr_url: c.pr_url,
-                    status: c.status,
-                    failure_reason: c.failure_reason,
-                    created_at: c.created_at,
-                    started_at: c.started_at,
-                    finished_at: c.finished_at,
-                    extra: Default::default(),
-                });
+                out.push(self.remediation_entry(c.list_entry()));
             }
         }
         if want_ci {
             for r in self.list_ci_remediations(product_id, statuses, work_item_id, None)? {
-                let mut extra = std::collections::BTreeMap::new();
-                extra.insert("attempt_kind".into(), r.attempt_kind.clone());
-                out.push(EngineAttemptListEntry {
-                    kind: "ci".into(),
-                    id: r.id,
-                    product_id: r.product_id,
-                    work_item_id: Some(r.work_item_id),
-                    pr_url: r.pr_url,
-                    status: r.status,
-                    failure_reason: r.failure_reason,
-                    created_at: r.created_at,
-                    started_at: r.started_at,
-                    finished_at: r.finished_at,
-                    extra,
-                });
+                out.push(self.remediation_entry(r.list_entry()));
             }
         }
         if want_rebase {

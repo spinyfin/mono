@@ -817,14 +817,16 @@ async fn retire_attempt_at_rung(
 
     // The pushed head sha is not returned by the rebase/push payload; leave
     // `head_sha_after` for a later probe to fill. The rung stamp is the point.
-    if let Err(err) = work_db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, rung) {
-        tracing::warn!(
-            attempt_id = %attempt.id,
-            rung,
-            ?err,
-            "conflict_ladder: failed to mark attempt succeeded",
-        );
-    }
+    // A concurrent abandon/supersede/success makes the mark a no-op
+    // (`Ok(None)`); the signal clear and parent broadcast below must still
+    // run, since the parent was already flipped back to `in_review`.
+    let marked = match work_db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, rung) {
+        Ok(updated) => updated,
+        Err(err) => {
+            tracing::warn!(%err, "conflict_ladder: failed to mark attempt succeeded");
+            None
+        }
+    };
 
     // Clear the in-flight merge_conflict signal so `maybe_clear_blocked` does
     // not re-fire on the next probe. No-op when no signal row exists.
@@ -837,17 +839,20 @@ async fn retire_attempt_at_rung(
         );
     }
 
-    publisher
-        .publish_frontend_event_on_product(
-            &candidate.product_id,
-            FrontendEvent::ConflictResolutionSucceeded {
-                product_id: candidate.product_id.clone(),
-                work_item_id: candidate.work_item_id.clone(),
-                attempt_id: attempt.id.clone(),
-                pr_url: candidate.pr_url.clone(),
-            },
-        )
-        .await;
+    if let Some(attempt) = marked {
+        publisher
+            .publish_frontend_event_on_product(
+                &candidate.product_id,
+                FrontendEvent::ConflictResolutionSucceeded {
+                    attempt: work_db.remediation_entry(attempt.list_entry()),
+                    product_id: candidate.product_id.clone(),
+                    work_item_id: candidate.work_item_id.clone(),
+                    attempt_id: attempt.id.clone(),
+                    pr_url: candidate.pr_url.clone(),
+                },
+            )
+            .await;
+    }
 
     // Broadcast the parent status change only when it actually transitioned
     // (blocked → in_review). Mirrors `on_resolved`.

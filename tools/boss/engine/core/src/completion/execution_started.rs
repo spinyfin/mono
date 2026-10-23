@@ -345,6 +345,7 @@ impl WorkerCompletionHandler {
                         .publish_frontend_event_on_product(
                             &product_id,
                             FrontendEvent::ConflictResolutionSucceeded {
+                                attempt: self.work_db.remediation_entry(succeeded.list_entry()),
                                 product_id: product_id.clone(),
                                 work_item_id: parent_chore_id.clone(),
                                 attempt_id: succeeded.id.clone(),
@@ -419,11 +420,12 @@ impl WorkerCompletionHandler {
                 "stop event: CI already cleared — retiring attempt without nudging"
             );
             match self.work_db.mark_ci_remediation_succeeded(&attempt.id, None) {
-                Ok(Some(_)) => {
+                Ok(Some(succeeded)) => {
                     self.publisher
                         .publish_frontend_event_on_product(
                             &product_id,
                             FrontendEvent::CiRemediationSucceeded {
+                                attempt: self.work_db.remediation_entry(succeeded.list_entry()),
                                 product_id: product_id.clone(),
                                 work_item_id: parent_chore_id.clone(),
                                 attempt_id: attempt.id.clone(),

@@ -162,14 +162,13 @@ extension ChatViewModel {
         guard resyncRefetchGate.isDirty else { return }
         let productJoined = resyncRefetchGate.productBurstJoined
         resyncRefetchGate.noteFire(at: .now)
+        refreshRemediationState()
+        if activityIsVisible { refreshEngineAttempts() }
         engine.sendListProducts()
         engine.sendListWorkerLiveStates()
         engine.sendGetEngineHealth()
         engine.sendGitHubAuthStatus()
         engine.sendGetEnginePoolConfig()
-        refreshCiRemediations()
-        refreshConflictResolutions()
-        refreshEngineAttempts()
         commentBridge.reloadOpenLayers()
         sendResyncOnlyReads()
         if !productJoined {

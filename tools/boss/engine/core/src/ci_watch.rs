@@ -646,7 +646,7 @@ pub async fn on_ci_failure_detected(
             // dependency > review_feedback > merge_conflict >
             // ci_failure_exhausted > ci_failure) and conflict pre-empts CI
             // (§Q1), so ci_watch never takes a row over from another
-            // watcher's bucket — but make the skip visible (T2381/PR#1861:
+            // watcher's bucket — but make the skip visible (see PR#1861:
             // this class of cross-watcher orphaning previously left no
             // trace at all) instead of a bare "manually moved" guess.
             match work_db.task_blocked_reason(&candidate.work_item_id) {
@@ -774,13 +774,7 @@ pub async fn on_ci_failure_detected(
             publisher
                 .publish_frontend_event_on_product(
                     &candidate.product_id,
-                    FrontendEvent::CiRemediationStarted {
-                        product_id: candidate.product_id.clone(),
-                        work_item_id: candidate.work_item_id.clone(),
-                        attempt_id: attempt.id.clone(),
-                        pr_url: candidate.pr_url.clone(),
-                        attempt_kind: attempt.attempt_kind.clone(),
-                    },
+                    crate::remediation_push::ci_detected(work_db, attempt),
                 )
                 .await;
         }
@@ -1452,7 +1446,7 @@ async fn on_queue_side_failure_detected(
     // known-open (it was in a merge queue), so a static checker is correct
     // here and avoids a redundant `gh pr view` round-trip.
     //
-    // T2381/PR#1861 fix: unlike `on_ci_failure_detected`, this path used to leave
+    // PR#1861 fix: unlike `on_ci_failure_detected`, this path used to leave
     // the upfront `blocked: ci_failure` flip in place even after a fix revision
     // spawned successfully — the parent never returned to `in_review`, so it sat
     // in `list_chores_blocked_on_ci_failure`'s bucket forever instead of the
@@ -1505,13 +1499,7 @@ async fn on_queue_side_failure_detected(
         publisher
             .publish_frontend_event_on_product(
                 &candidate.product_id,
-                FrontendEvent::CiRemediationStarted {
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    attempt_id: attempt.id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                    attempt_kind: attempt.attempt_kind.clone(),
-                },
+                crate::remediation_push::ci_detected(work_db, &attempt),
             )
             .await;
         tracing::info!(
@@ -2424,6 +2412,7 @@ pub async fn on_ci_resolved(
                     .publish_frontend_event_on_product(
                         &candidate.product_id,
                         FrontendEvent::CiRemediationSucceeded {
+                            attempt: work_db.remediation_entry(succeeded.list_entry()),
                             product_id: candidate.product_id.clone(),
                             work_item_id: candidate.work_item_id.clone(),
                             attempt_id: succeeded.id.clone(),

@@ -209,23 +209,11 @@ extension ChatViewModel {
         openProjectDesignDoc(project)
     }
 
-    /// Engine-tab entry point: ask the engine for the current attempt
-    /// list. Idempotent — the view-model just overwrites the array
-    /// when the reply lands.
-    func refreshConflictResolutions() {
-        engine.sendListConflictResolutions(limit: 200)
-    }
-
-    /// Mirror of [[refreshConflictResolutions]] for the CI subsystem
-    /// (design Phase 11 #37). Idempotent.
-    func refreshCiRemediations() {
-        engine.sendListCiRemediations(limit: 200)
-    }
-
     /// Refresh Activity's one authoritative engine-attempt list. The
     /// background-work snapshot shares this response so the app need not
     /// reconstruct either view from the source-specific attempt tables.
     func refreshEngineAttempts() {
+        guard activityIsVisible else { return }
         guard let requestId = engine.sendListEngineAttempts(limit: 200, includeBackgroundWork: true) else {
             return
         }

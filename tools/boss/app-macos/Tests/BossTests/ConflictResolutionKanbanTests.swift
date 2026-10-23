@@ -26,28 +26,28 @@ final class ConflictResolutionKanbanTests: XCTestCase {
     func testBlockedMergeConflictWithPendingResolutionStaysInReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
-        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "pending")]
+        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "pending")].map(\.listEntry)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
     func testBlockedMergeConflictWithRunningResolutionStaysInReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
-        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "running")]
+        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "running")].map(\.listEntry)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
     func testBlockedCIFailureWithPendingRemediationStaysInReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "ci_failure", attemptID: "cir_1")
-        model.ciRemediations = [makeRemediation(id: "cir_1", workItemID: task.id, status: "pending")]
+        model.ciRemediations = [makeRemediation(id: "cir_1", workItemID: task.id, status: "pending")].map(\.listEntry)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
     func testBlockedCIFailureWithRunningRemediationStaysInReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "ci_failure", attemptID: "cir_1")
-        model.ciRemediations = [makeRemediation(id: "cir_1", workItemID: task.id, status: "running")]
+        model.ciRemediations = [makeRemediation(id: "cir_1", workItemID: task.id, status: "running")].map(\.listEntry)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
@@ -63,14 +63,14 @@ final class ConflictResolutionKanbanTests: XCTestCase {
     func testBlockedMergeConflictWithSucceededResolutionRoutesToReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
-        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "succeeded")]
+        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "succeeded")].map(\.listEntry)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
     func testBlockedMergeConflictWithFailedResolutionRoutesToReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
-        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "failed")]
+        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "failed")].map(\.listEntry)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
@@ -120,42 +120,42 @@ final class ConflictResolutionKanbanTests: XCTestCase {
     func testActiveConflictResolutionReturnsPendingAttempt() {
         let model = makeModel()
         let resolution = makeResolution(id: "crz_42", workItemID: "task_1", status: "pending")
-        model.conflictResolutions = [resolution]
+        model.conflictResolutions = [resolution].map(\.listEntry)
         XCTAssertEqual(model.activeConflictResolution(for: "task_1")?.id, "crz_42")
     }
 
     func testActiveConflictResolutionReturnsRunningAttempt() {
         let model = makeModel()
         let resolution = makeResolution(id: "crz_99", workItemID: "task_1", status: "running")
-        model.conflictResolutions = [resolution]
+        model.conflictResolutions = [resolution].map(\.listEntry)
         XCTAssertEqual(model.activeConflictResolution(for: "task_1")?.id, "crz_99")
     }
 
     func testActiveConflictResolutionNilForFinishedAttempt() {
         let model = makeModel()
         let resolution = makeResolution(id: "crz_7", workItemID: "task_1", status: "succeeded")
-        model.conflictResolutions = [resolution]
+        model.conflictResolutions = [resolution].map(\.listEntry)
         XCTAssertNil(model.activeConflictResolution(for: "task_1"))
     }
 
     func testActiveConflictResolutionNilForWrongTask() {
         let model = makeModel()
         let resolution = makeResolution(id: "crz_5", workItemID: "task_other", status: "running")
-        model.conflictResolutions = [resolution]
+        model.conflictResolutions = [resolution].map(\.listEntry)
         XCTAssertNil(model.activeConflictResolution(for: "task_1"))
     }
 
     func testActiveCiRemediationReturnsPendingAttempt() {
         let model = makeModel()
         let remediation = makeRemediation(id: "cir_42", workItemID: "task_1", status: "pending")
-        model.ciRemediations = [remediation]
+        model.ciRemediations = [remediation].map(\.listEntry)
         XCTAssertEqual(model.activeCiRemediation(for: "task_1")?.id, "cir_42")
     }
 
     func testActiveCiRemediationNilForFinishedAttempt() {
         let model = makeModel()
         let remediation = makeRemediation(id: "cir_7", workItemID: "task_1", status: "succeeded")
-        model.ciRemediations = [remediation]
+        model.ciRemediations = [remediation].map(\.listEntry)
         XCTAssertNil(model.activeCiRemediation(for: "task_1"))
     }
 
@@ -165,7 +165,7 @@ final class ConflictResolutionKanbanTests: XCTestCase {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
         model.choresByProductID = ["prod_test": [task]]
-        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "running")]
+        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "running")].map(\.listEntry)
 
         let reviewItems = model.workItems(in: .review)
         XCTAssertTrue(reviewItems.contains(where: { $0.id == task.id }),
@@ -184,7 +184,7 @@ final class ConflictResolutionKanbanTests: XCTestCase {
         let model = makeModel()
         let task = makeTask(blockedReason: "ci_failure", attemptID: "cir_1")
         model.choresByProductID = ["prod_test": [task]]
-        model.ciRemediations = [makeRemediation(id: "cir_1", workItemID: task.id, status: "running")]
+        model.ciRemediations = [makeRemediation(id: "cir_1", workItemID: task.id, status: "running")].map(\.listEntry)
 
         let reviewItems = model.workItems(in: .review)
         XCTAssertTrue(reviewItems.contains(where: { $0.id == task.id }),
@@ -199,7 +199,7 @@ final class ConflictResolutionKanbanTests: XCTestCase {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
         model.choresByProductID = ["prod_test": [task]]
-        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "failed")]
+        model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "failed")].map(\.listEntry)
 
         let reviewItems = model.workItems(in: .review)
         XCTAssertTrue(reviewItems.contains(where: { $0.id == task.id }),

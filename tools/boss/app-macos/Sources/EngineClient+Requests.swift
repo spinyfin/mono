@@ -1190,55 +1190,6 @@ extension EngineClient {
         ], queueIfDisconnected: true)
     }
 
-    /// Engine-tab listing fetch (Phase 5 #14). `productID = nil`
-    /// returns every product's attempts; `statuses` is AND-ed on the
-    /// server, `limit` caps the response.
-    func sendListConflictResolutions(
-        productID: String? = nil,
-        statuses: [String] = [],
-        workItemID: String? = nil,
-        limit: Int? = nil
-    ) {
-        var payload: [String: Any] = ["type": "list_conflict_resolutions"]
-        if let productID {
-            payload["product_id"] = productID
-        }
-        if !statuses.isEmpty {
-            payload["status"] = statuses
-        }
-        if let workItemID {
-            payload["work_item_id"] = workItemID
-        }
-        if let limit {
-            payload["limit"] = limit
-        }
-        sendLine(payload, queueIfDisconnected: true)
-    }
-
-    /// Engine-tab listing fetch for CI remediations (design Phase 11
-    /// #37). Mirror of `sendListConflictResolutions`.
-    func sendListCiRemediations(
-        productID: String? = nil,
-        statuses: [String] = [],
-        workItemID: String? = nil,
-        limit: Int? = nil
-    ) {
-        var payload: [String: Any] = ["type": "list_ci_remediations"]
-        if let productID {
-            payload["product_id"] = productID
-        }
-        if !statuses.isEmpty {
-            payload["status"] = statuses
-        }
-        if let workItemID {
-            payload["work_item_id"] = workItemID
-        }
-        if let limit {
-            payload["limit"] = limit
-        }
-        sendLine(payload, queueIfDisconnected: true)
-    }
-
     /// Fetch the merged, shallow engine-attempt feed. Detailed records remain
     /// behind their source-specific get requests so list refreshes stay small.
     /// `limit: 0` is the background-only polling form: `attempts` comes back
@@ -1246,8 +1197,9 @@ extension EngineClient {
     /// Returns the envelope `request_id` so the model can drop out-of-order
     /// snapshot replies, or `nil` when the line was not written.
     @discardableResult
-    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false) -> String? {
+    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false, openPRsOnly: Bool = false) -> String? {
         var payload: [String: Any] = ["type": "list_engine_attempts"]
+        if openPRsOnly { payload["open_prs_only"] = true }
         if let limit {
             payload["limit"] = limit
         }

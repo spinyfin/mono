@@ -85,7 +85,7 @@ pub(super) async fn handle_get_conflict_hotspots(ctx: Dispatch, req: FrontendReq
     };
     {
         // Read-only aggregation surface for `boss engine conflicts
-        // hotspots` (Layer 0 / T5). No auth gate, same reasoning as
+        // hotspots`. No auth gate, same reasoning as
         // `list_conflict_resolutions`: diagnostic-only, and the
         // caller can already read the SQLite file directly.
         let top_n = top.unwrap_or(20) as usize;
@@ -126,6 +126,7 @@ pub(super) async fn handle_retry_conflict_resolution(ctx: Dispatch, req: Fronten
                     .publish_frontend_event_on_product(
                         &attempt.product_id,
                         FrontendEvent::ConflictResolutionStarted {
+                            attempt: work_db.remediation_entry(attempt.list_entry()),
                             product_id: attempt.product_id.clone(),
                             work_item_id: attempt.work_item_id.clone(),
                             attempt_id: attempt.id.clone(),
@@ -179,6 +180,7 @@ pub(super) async fn handle_abandon_conflict_resolution(ctx: Dispatch, req: Front
                     .publish_frontend_event_on_product(
                         &attempt.product_id,
                         FrontendEvent::ConflictResolutionAbandoned {
+                            attempt: work_db.remediation_entry(attempt.list_entry()),
                             product_id: attempt.product_id.clone(),
                             work_item_id: attempt.work_item_id.clone(),
                             attempt_id: attempt.id.clone(),
@@ -247,6 +249,7 @@ pub(super) async fn handle_mark_conflict_resolution_failed(ctx: Dispatch, req: F
                     .publish_frontend_event_on_product(
                         &attempt.product_id,
                         FrontendEvent::ConflictResolutionFailed {
+                            attempt: work_db.remediation_entry(attempt.list_entry()),
                             product_id: attempt.product_id.clone(),
                             work_item_id: attempt.work_item_id.clone(),
                             attempt_id: attempt.id.clone(),

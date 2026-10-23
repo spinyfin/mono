@@ -28,6 +28,7 @@ use common::TestEngine;
 
 fn list_engine_attempts_request(include_background_work: bool, limit: Option<u32>) -> FrontendRequest {
     FrontendRequest::ListEngineAttempts {
+        open_prs_only: false,
         kinds: vec![],
         product_id: None,
         status: vec![],
