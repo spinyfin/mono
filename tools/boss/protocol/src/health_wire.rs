@@ -52,6 +52,42 @@ pub struct EngineHealthReport {
     /// Issues the UI should render, in display order (highest priority
     /// first). Empty when the engine is healthy.
     pub issues: Vec<EngineHealthIssue>,
+    /// Active pre-start spawn-failure streak alerts, one per (driver,
+    /// worker kind) combination currently at or past the engine's
+    /// consecutive-failure threshold. Each also appears in `issues` as a
+    /// `pre_start_spawn_failure_streak` entry carrying the same facts as
+    /// prose; this is the structured form for CLI / `jq` consumers. Empty
+    /// when no combination is in a streak.
+    #[serde(default)]
+    #[builder(default)]
+    pub spawn_failure_streaks: Vec<SpawnFailureStreak>,
+}
+
+/// One fleet-level alert: a (driver, worker kind) combination has failed
+/// to spawn `consecutive_failures` times in a row before any worker pane
+/// existed, with no successful spawn for that combination in between.
+/// Raised by the engine at its streak threshold, updated in place on every
+/// further failure, and dropped from the report on the combination's next
+/// successful spawn.
+#[derive(bon::Builder, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[builder(on(String, into))]
+pub struct SpawnFailureStreak {
+    /// Driver slug the failing spawns resolved to (e.g. `codex`).
+    pub driver: String,
+    /// Worker kind label (`standard`, `reviewer`, `triage`,
+    /// `answer-agent`, `review-guide`).
+    pub worker_kind: String,
+    /// Pre-start failures since the combination's last successful spawn.
+    /// The current count, never a capped or deduplicated one.
+    pub consecutive_failures: u32,
+    /// Unix epoch seconds of the first failure in this streak.
+    pub first_failure_epoch_s: i64,
+    /// Unix epoch seconds of the most recent failure in this streak.
+    pub latest_failure_epoch_s: i64,
+    /// Full error chain of the most recent failure, untruncated.
+    pub latest_error: String,
+    /// Execution whose spawn produced `latest_error`.
+    pub latest_execution_id: String,
 }
 
 /// What the startup pass that retries pre-start-failed review guides did.

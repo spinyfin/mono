@@ -95,6 +95,9 @@ const ATTENTION_RAISED_AT: &str = "COALESCE(work_attention_items.last_raised_at,
 /// would leave a same-second signal stuck open forever, since `started_at`
 /// never advances — reproducing the exact defect this pass exists to fix.
 fn work_resumed_evidence() -> String {
+    // Run insertion precedes spawn. A pane-spawn failure therefore needs a
+    // completed spawn run, not merely another attempt (active or failed).
+    // Other WorkResumed signals retain their run-start clearing contract.
     format!(
         "EXISTS (
              SELECT 1
@@ -102,6 +105,7 @@ fn work_resumed_evidence() -> String {
              JOIN work_executions e ON e.id = r.execution_id
              WHERE e.work_item_id = {ATTENTION_WORK_ITEM}
                AND r.started_at IS NOT NULL
+               AND (work_attention_items.kind != 'pane_spawn_failed' OR r.status = 'completed')
                AND CAST(r.started_at AS INTEGER) >= CAST({ATTENTION_RAISED_AT} AS INTEGER)
                AND r.execution_id IS NOT work_attention_items.execution_id
          )"
