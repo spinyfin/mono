@@ -145,6 +145,9 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::GetCoordinatorHandoff => {
             Box::pin(coordinator_handoff::handle_get_coordinator_handoff(ctx, r))
         }
+        r @ FrontendRequest::VerifyCoordinatorResetRequest { .. } => {
+            Box::pin(coordinator_handoff::handle_verify_coordinator_reset_request(ctx, r))
+        }
         r @ FrontendRequest::GetCostWindowReport { .. } => Box::pin(cost::handle_get_cost_window_report(ctx, r)),
         r @ FrontendRequest::GetDecision { .. } => Box::pin(decisions::handle_get_decision(ctx, r)),
         r @ FrontendRequest::GetDispatchConcurrency => Box::pin(engine_meta::handle_get_dispatch_concurrency(ctx, r)),

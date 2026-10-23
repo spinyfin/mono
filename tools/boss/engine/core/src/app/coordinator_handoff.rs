@@ -69,6 +69,23 @@ pub(super) async fn handle_get_coordinator_handoff(ctx: Dispatch, req: FrontendR
     }
 }
 
+pub(super) async fn handle_verify_coordinator_reset_request(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch { sink, request_id, .. } = ctx;
+    let FrontendRequest::VerifyCoordinatorResetRequest {
+        request_id: reset_request_id,
+    } = req
+    else {
+        unreachable!()
+    };
+    send_response(
+        &sink,
+        &request_id,
+        FrontendEvent::CoordinatorResetRequestStatus {
+            pending: crate::coordinator_tmux::reset_handoff::is_request_pending(&reset_request_id),
+        },
+    );
+}
+
 pub(super) async fn handle_set_coordinator_handoff(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,

@@ -283,6 +283,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::PrBodyResult { .. }
         | FrontendEvent::CoordinatorHandoffResult { .. }
         | FrontendEvent::CoordinatorHandoffSet { .. }
+        | FrontendEvent::CoordinatorResetRequestStatus { .. }
         | FrontendEvent::CoordinatorGuidanceList { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }
         | FrontendEvent::FeatureFlagsList { .. }

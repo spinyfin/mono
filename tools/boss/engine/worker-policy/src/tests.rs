@@ -353,6 +353,9 @@ fn coordinator_verbs_stay_closed() {
             reason: CoordinatorRecreateReason::OperatorReset,
         },
         FrontendRequest::GetCoordinatorHandoff,
+        FrontendRequest::VerifyCoordinatorResetRequest {
+            request_id: "id".into(),
+        },
         FrontendRequest::SetCoordinatorHandoff {
             body: "- greyarea is down".into(),
         },
