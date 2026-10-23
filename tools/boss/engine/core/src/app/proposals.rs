@@ -201,7 +201,17 @@ pub(super) fn attribute_caller(
         ));
     };
 
-    let Some((matched_pid, resolved_run_id)) = server_state.worker_registry.resolve_with_ancestor_walk(peer_pid) else {
+    // Log the whole walked chain whatever the outcome, so a rejection can be
+    // diagnosed from the log alone (which pid matched, what each level was).
+    let resolution = server_state.worker_registry.resolve_ancestry(peer_pid);
+    let chain = resolution.describe_chain();
+    let Some((matched_pid, resolved_run_id)) = resolution.matched else {
+        tracing::warn!(
+            peer_pid,
+            claimed_run_id,
+            %chain,
+            "proposal attribution rejected: no registered worker run in the peer's process ancestry",
+        );
         return Err(ProposalSubmissionError::new(
             ProposalErrorCode::AttributionUnresolved,
             format!(
@@ -216,16 +226,13 @@ pub(super) fn attribute_caller(
     // the power to make a call fail — so a worker cannot reach another run's
     // work item by supplying its id.
     if claimed_run_id != resolved_run_id {
-        // The caller-facing error cannot carry the matched pid, and the call
-        // sites log only the claimed id; without this a mismatch caused by a
-        // stale registry entry is indistinguishable from a misconfigured
-        // worker in the log.
         tracing::warn!(
-            claimed_run_id,
-            resolved_run_id = %resolved_run_id,
-            matched_pid,
             peer_pid,
-            "attribution failed: peer resolves to a different run than the claimed BOSS_RUN_ID",
+            claimed_run_id,
+            matched_pid,
+            resolved_run_id = %resolved_run_id,
+            %chain,
+            "proposal attribution rejected: BOSS_RUN_ID does not match the run the peer resolves to",
         );
         return Err(ProposalSubmissionError::new(
             ProposalErrorCode::AttributionMismatch,
@@ -237,6 +244,14 @@ pub(super) fn attribute_caller(
             ),
         ));
     }
+    tracing::info!(
+        peer_pid,
+        claimed_run_id,
+        matched_pid,
+        resolved_run_id = %resolved_run_id,
+        %chain,
+        "proposal attribution resolved",
+    );
 
     match work_db.work_item_for_execution(&resolved_run_id) {
         Ok(Some(work_item_id)) => Ok(AttributedCaller {

@@ -2019,7 +2019,10 @@ mod tests {
         assert_eq!(outcome.terminal_handoffs, 0);
         assert_eq!(outcome.refused_schema_skew, 0);
 
-        assert_eq!(spawner.registry.lookup(4321).as_deref(), Some(execution_id.as_str()));
+        assert_eq!(
+            spawner.registry.lookup_unverified(4321).as_deref(),
+            Some(execution_id.as_str())
+        );
         assert_eq!(
             spawner.registry.pane_for_run(&execution_id),
             Some(crate::worker_registry::RegisteredWorkerPane {
@@ -2153,7 +2156,10 @@ mod tests {
         assert_eq!(outcome.terminal_handoffs, 0);
         assert_eq!(outcome.refused_schema_skew, 0);
 
-        assert_eq!(spawner.registry.lookup(4321).as_deref(), Some(execution_id.as_str()));
+        assert_eq!(
+            spawner.registry.lookup_unverified(4321).as_deref(),
+            Some(execution_id.as_str())
+        );
         assert_eq!(
             spawner.registry.pane_for_run(&execution_id),
             Some(crate::worker_registry::RegisteredWorkerPane {

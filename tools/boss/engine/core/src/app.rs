@@ -322,6 +322,9 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         if outcome != tmux_teardown::TmuxTeardownOutcome::Reaped {
             return Err("token-verified tmux teardown refused; retaining workspace for recovery".into());
         }
+        // The process is gone and this path never reaches `release_worker_pane`,
+        // so drop its pid entry here rather than leave it resolvable.
+        self.worker_registry.forget_run_pids(run_id);
         Ok(())
     }
 

@@ -1436,7 +1436,7 @@ mod tests {
         let started = start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
 
         assert_eq!(started.shell_pid, 4242);
-        assert_eq!(registry.lookup(4242).as_deref(), Some("run-test"));
+        assert_eq!(registry.lookup_unverified(4242).as_deref(), Some("run-test"));
         assert_eq!(
             spawner.spawn_calls.load(Ordering::SeqCst),
             1,
@@ -1748,7 +1748,7 @@ mod tests {
         assert!(started.written_files.claude_md_path.exists());
         assert!(started.written_files.settings_path.exists());
         assert!(started.written_files.gitignore_path.exists());
-        assert_eq!(registry.lookup(4242).as_deref(), Some("run-test"));
+        assert_eq!(registry.lookup_unverified(4242).as_deref(), Some("run-test"));
     }
 
     /// Call-site cutover acceptance: `start_worker` must use the driver Arc
@@ -1855,7 +1855,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(started.shell_pid, 4242);
-        assert_eq!(spawner.registry.lookup(4242).as_deref(), Some("run-test"));
+        assert_eq!(spawner.registry.lookup_unverified(4242).as_deref(), Some("run-test"));
     }
 
     /// Engine-owns-slots invariant: the slot the runner claimed for
@@ -2823,7 +2823,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(started.shell_pid, 4242);
-            assert_eq!(spawner.registry.lookup(4242).as_deref(), Some("run-test"));
+            assert_eq!(spawner.registry.lookup_unverified(4242).as_deref(), Some("run-test"));
             assert_eq!(spawner.registry.slot_for_run("run-test"), Some(3));
         }
     }

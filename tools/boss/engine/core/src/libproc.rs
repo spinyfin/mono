@@ -1,8 +1,8 @@
 //! Single shared mirror of Darwin's `proc_bsdinfo` (`<sys/proc_info.h>`),
 //! read via `libproc`'s `proc_pidinfo(PROC_PIDTBSDINFO, ...)`.
 //!
-//! [`crate::worker_registry::parent_pid`] needs `pbi_ppid` out of this
-//! struct. The pgid/foreground-pgid fields this used to also expose (for
+//! [`crate::worker_registry::process_snapshot`] needs `pbi_ppid`, the start
+//! time and the process name out of this struct. The pgid/foreground-pgid fields this used to also expose (for
 //! [`crate::background_children`]'s process-group probe) were removed along
 //! with that probe — see `background_children`'s module doc for why the
 //! pgid discriminator was abandoned. The full raw layout mirror stays as-is
@@ -75,14 +75,15 @@ struct RawProcBsdInfo {
 }
 
 /// The subset of `proc_bsdinfo` this crate's callers need.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ProcBsdInfo {
     pub(crate) ppid: libc::pid_t,
-    /// `pbi_start_tvsec` / `pbi_start_tvusec`: when the process started. A
-    /// pid recycled by the kernel reports a different value than its
-    /// previous holder, which is what makes this usable as process identity.
-    pub(crate) start_seconds: u64,
-    pub(crate) start_microseconds: u64,
+    /// Process start time in microseconds since the epoch (`pbi_start_tvsec` /
+    /// `pbi_start_tvusec`). Together with the pid it identifies one process
+    /// incarnation: a recycled pid always starts later.
+    pub(crate) start_micros: u64,
+    /// Short process name (`pbi_name`, falling back to `pbi_comm`).
+    pub(crate) command: String,
 }
 
 unsafe extern "C" {
@@ -112,14 +113,41 @@ pub(crate) fn proc_bsd_info(pid: libc::pid_t) -> std::io::Result<ProcBsdInfo> {
     }
     Ok(ProcBsdInfo {
         ppid: info.header.ppid as libc::pid_t,
-        start_seconds: info.start_time.seconds,
-        start_microseconds: info.start_time.microseconds,
+        start_micros: info
+            .start_time
+            .seconds
+            .saturating_mul(1_000_000)
+            .saturating_add(info.start_time.microseconds),
+        command: c_name(&info.names.name)
+            .filter(|name| !name.is_empty())
+            .or_else(|| c_name(&info.names.command))
+            .unwrap_or_default(),
     })
+}
+
+/// Decode a NUL-terminated fixed-size C name buffer.
+fn c_name(raw: &[u8]) -> Option<String> {
+    let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+    std::str::from_utf8(&raw[..end]).ok().map(str::to_owned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c_name_stops_at_the_first_nul() {
+        assert_eq!(c_name(b"zsh\0garbage").as_deref(), Some("zsh"));
+        assert_eq!(c_name(b"abc").as_deref(), Some("abc"));
+        assert_eq!(c_name(b"\0").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn self_info_has_a_start_time_and_name() {
+        let info = proc_bsd_info(std::process::id() as libc::pid_t).unwrap();
+        assert!(info.start_micros > 0);
+        assert!(!info.command.is_empty());
+    }
 
     #[test]
     fn layout_matches_darwin_abi() {
