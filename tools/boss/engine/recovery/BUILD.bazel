@@ -20,7 +20,9 @@ rust_library(
 
 rust_test(
     name = "recovery_test",
-    size = "small",
+    # Real-jj tests: ~36s serially on an idle machine, which a loaded CI
+    # host stretches past the 60s "small" timeout.
+    size = "medium",
     crate = ":recovery",
     data = ["@jj_test_tools//:jj"],
     edition = "2024",
