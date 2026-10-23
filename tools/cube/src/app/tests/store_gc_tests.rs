@@ -109,6 +109,9 @@ fn seed_store_files(source: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(op_store.join("views")).unwrap();
     std::fs::write(op_store.join("operations/op"), b"op").unwrap();
     std::fs::write(op_store.join("views/view"), b"view").unwrap();
+    let op_heads = source.join(".jj/repo/op_heads/heads");
+    std::fs::create_dir_all(&op_heads).unwrap();
+    std::fs::write(op_heads.join("head"), b"").unwrap();
     std::fs::create_dir_all(source.join(".git")).unwrap();
     source.to_path_buf()
 }
@@ -177,13 +180,15 @@ fn repo_gc_abandons_old_operations_collects_and_drops_stale_pr_refs() {
     let cut = "d".repeat(64);
     let mut expected = vec![
         op_log_command(&source, &op_log(now)),
+        // The host is quiet before the abandon...
+        ps_command(&source, "/bin/sh\n"),
         ExpectedCommand::ok(
             source.clone(),
             "jj",
             &["--ignore-working-copy", "op", "abandon", &format!("..{cut}")],
             "Abandoned 2 operations and reparented 3 descendant operations.\n",
         ),
-        // The host is quiet right after the abandon: collect immediately.
+        // ...and right after it: collect immediately.
         ps_command(&source, "/bin/sh\n/usr/bin/git\n"),
         ExpectedCommand::ok(
             source.clone(),
@@ -298,7 +303,7 @@ fn repo_gc_with_nothing_old_enough_still_collects() {
 }
 
 #[test]
-fn collection_is_deferred_to_the_two_week_threshold_when_jj_never_goes_quiet() {
+fn collection_is_deferred_to_the_two_week_threshold_when_jj_goes_busy_after_the_abandon() {
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     seed_mono_repo(&workspace_root, &database_path);
@@ -311,6 +316,7 @@ fn collection_is_deferred_to_the_two_week_threshold_when_jj_never_goes_quiet() {
     let now = crate::app::util::current_epoch_s().unwrap();
     let mut expected = vec![
         op_log_command(&source, &op_log(now)),
+        ps_command(&source, ""),
         ExpectedCommand::ok(
             source.clone(),
             "jj",
@@ -678,4 +684,82 @@ fn repo_gc_refuses_a_repo_without_a_jj_store() {
         matches!(err, CubeError::InvalidArgument(ref m) if m.contains("not a jj repository")),
         "{err:?}"
     );
+}
+
+#[test]
+fn a_busy_store_is_neither_abandoned_nor_collected() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    seed_mono_repo(&workspace_root, &database_path);
+    let source = seed_store_files(&source_of(&database_path));
+    let record = Store::open_at(&database_path)
+        .unwrap()
+        .get_repo("mono")
+        .unwrap()
+        .unwrap();
+    let now = crate::app::util::current_epoch_s().unwrap();
+    // The quiescence probe is the first thing after the read-only log
+    // listing, and with a jj process at every poll nothing destructive runs:
+    // the FakeRunner has no abandon or gc expectation, so one would fail it.
+    let mut expected = vec![
+        op_log_command(&source, &op_log(now)),
+        ps_command(&source, "/opt/homebrew/bin/jj\n"),
+        ps_command(&source, "/opt/homebrew/bin/jj\n"),
+    ];
+    expected.extend(pr_ref_commands(&source, "", ""));
+    let runner = FakeRunner::new(expected);
+    let report = gc_repo_store(
+        &runner,
+        Some(&database_path),
+        &record,
+        DEFAULT_KEEP,
+        Duration::from_millis(400),
+        false,
+    )
+    .expect("repo gc");
+    runner.assert_exhausted();
+    assert_eq!(report.collection, Collection::Skipped);
+    assert_eq!(report.abandoned_through, None);
+    assert!(report.summary().contains("skipped"), "{}", report.summary());
+}
+
+#[test]
+fn a_second_operation_head_after_the_abandon_stops_the_pass_before_collecting() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    seed_mono_repo(&workspace_root, &database_path);
+    let source = seed_store_files(&source_of(&database_path));
+    std::fs::write(source.join(".jj/repo/op_heads/heads/raced"), b"").unwrap();
+    let record = Store::open_at(&database_path)
+        .unwrap()
+        .get_repo("mono")
+        .unwrap()
+        .unwrap();
+    let now = crate::app::util::current_epoch_s().unwrap();
+    let runner = FakeRunner::new(vec![
+        op_log_command(&source, &op_log(now)),
+        ps_command(&source, ""),
+        ExpectedCommand::ok(
+            source.clone(),
+            "jj",
+            &[
+                "--ignore-working-copy",
+                "op",
+                "abandon",
+                &format!("..{}", "d".repeat(64)),
+            ],
+            "",
+        ),
+    ]);
+    let err = gc_repo_store(
+        &runner,
+        Some(&database_path),
+        &record,
+        DEFAULT_KEEP,
+        Duration::from_millis(400),
+        false,
+    )
+    .expect_err("two heads");
+    runner.assert_exhausted();
+    assert!(err.to_string().contains("2 operation heads"), "{err}");
 }

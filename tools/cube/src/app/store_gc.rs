@@ -4,9 +4,8 @@
 //! Every cube workspace of a repo is a secondary jj workspace on one shared
 //! store (`repos/<repo>`), so every operation any of them records — a
 //! `jj new` on lease, a worker's snapshot, a bookmark set, a fetch — writes
-//! one view file listing every bookmark in the store, and nothing ever
-//! removed them. On the dev Mac that op store reached 92 GiB (136k
-//! operations, 2.6 MB views) before this existed.
+//! one view file listing every bookmark in the store. The log grows without
+//! bound unless old operations are abandoned and their files collected.
 //!
 //! The upkeep is the generic jj recipe, in two steps, run in the store's
 //! primary checkout:
@@ -14,40 +13,48 @@
 //! 1. `jj op abandon ..<cut>`, where `<cut>` is the newest operation that
 //!    ended before the keep window. Descendant operations are reparented
 //!    onto the root; views are content-addressed and untouched, so the
-//!    rewrite costs one small file per kept operation. Measured on jj 0.26
-//!    with a second workspace idle across the abandon: its next command
-//!    (status, `jj new`) proceeds normally, and `jj workspace update-stale`
-//!    reports it was never stale.
+//!    rewrite costs one small file per kept operation. The rewrite gives
+//!    every kept operation a new id, so a jj command that loaded the old
+//!    head and commits afterwards would leave a second operation head whose
+//!    only common ancestor is the root, and jj would merge the two views
+//!    against an empty base (conflicting bookmarks, undoing deletions,
+//!    moving a workspace's `@`). The abandon therefore runs only at an
+//!    instant with no `jj` process on the host (waiting up to
+//!    [`QUIESCENCE_WAIT`] for one); when none comes, the pass abandons and
+//!    collects nothing and the next daily pass tries again. After the
+//!    abandon the store must hold exactly one operation head; otherwise the
+//!    pass stops before collecting and reports the extra heads.
 //! 2. `jj util gc`, which deletes operation and view files no head reaches.
 //!    By default jj only deletes files older than two weeks, and jj 0.26
-//!    accepts no other threshold than `--expire now`. The two-week default
-//!    is what makes a collection safe next to a jj command in flight: the
-//!    abandon above rewrote every operation newer than the cut under a new
-//!    id, so a command that loaded the store before it still names the old
-//!    id of the head it started from, and a collection that deleted that
-//!    file would leave the command's own operation with a missing parent
-//!    and every later command unable to merge the heads. But a two-week
-//!    lag keeps fourteen days of views on disk, so the pass collects
-//!    immediately (`--expire now`) once it has observed an instant with no
-//!    `jj` process on the host: every command that loaded the store before
-//!    the abandon has then finished, and any command that starts later
-//!    loads the rewritten head, whose files the collection keeps. If no
-//!    such instant comes within [`QUIESCENCE_WAIT`], the pass falls back to
-//!    the two-week default and the next daily pass tries again.
+//!    accepts no other threshold than `--expire now`. A collection that
+//!    deleted a file a command in flight still names would leave that
+//!    command's own operation with a missing parent, so the pass collects
+//!    immediately (`--expire now`) only once it has observed an instant with
+//!    no `jj` process *after* the abandon: every command that loaded the
+//!    store before the rewrite has then finished, and any command that
+//!    starts later loads the rewritten head, whose files the collection
+//!    keeps. If no such instant comes within [`QUIESCENCE_WAIT`], the pass
+//!    falls back to the two-week default.
+//!
+//! Each workspace's working copy records the id of the operation it last
+//! updated at, and the abandon rewrites that operation under a new id
+//! without remapping the record. Verified on jj 0.26.0: a workspace whose
+//! recorded operation was abandoned and collected by `--expire now`, and
+//! whose `@` was rewritten from another workspace in the meantime, still
+//! runs its next command (`jj status`) normally and lands on the rewritten
+//! `@` without `jj workspace update-stale`.
 //!
 //! A third, cheap step removes `refs/heads/pr/<n>` git refs that no longer
-//! have a `pr/<n>` bookmark (an older jj left them behind when the
-//! bookmark was forgotten); jj's next import drops them from the view.
+//! have a `pr/<n>` bookmark; jj's next import drops them from the view.
 //!
 //! The periodic pool-GC pass starts the upkeep in a detached `cube repo gc`
 //! child ([`spawn_detached_store_gc`]) through the injected
 //! [`CommandRunner`], never by resolving the running executable itself:
 //! under `cube_lib_test` the running executable is the test binary, and a
 //! test binary re-run with `repo gc <repo>` runs every test those words
-//! match as a name filter, each of which leases and spawns again. That is
-//! the fork bomb that took down a dev Mac on 2026-10-23; the only runner
-//! that knows a cube executable is the real one, and test doubles record
-//! the request.
+//! match as a name filter, each of which leases and spawns again. The only
+//! runner that knows a cube executable is the real one, and test doubles
+//! record the request.
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -61,21 +68,20 @@ use crate::store::Store;
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::run_jj;
 
-/// Operations newer than this are never abandoned. Three days keeps
-/// `jj op undo` useful for anything a worker or an operator did this week
-/// while bounding the log to a few thousand operations.
+/// Operations newer than this are never abandoned. Three days of history
+/// keeps `jj op undo` useful while the log stays bounded.
 pub(super) const DEFAULT_KEEP: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// The periodic pass runs the upkeep for a repo at most this often.
 pub(super) const STORE_GC_INTERVAL_SECS: i64 = 24 * 60 * 60;
-/// Abandoning and collecting are not interruptible mid-file and the first
-/// collection of a neglected store deletes hundreds of thousands of files;
-/// this bounds each of the two jj calls.
+/// Abandoning and collecting are not interruptible mid-file and collecting
+/// a large log deletes hundreds of thousands of files; this bounds each of
+/// the two jj calls.
 const MAINTENANCE_CMD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// How long a pass waits for an instant with no `jj` process on the host
-/// before it settles for the two-week collection. jj commands take
-/// seconds, so a quiet instant comes within a few of them even on a busy
-/// pool; a pool that is never quiet for five minutes is not one to collect
-/// under.
+/// How long a pass waits for an instant with no `jj` process on the host,
+/// before the abandon and again before an immediate collection. jj commands
+/// take seconds, so a quiet instant comes within a few of them even on a
+/// busy pool; a pool that is never quiet for five minutes is not one to
+/// rewrite the op log under.
 pub(super) const QUIESCENCE_WAIT: Duration = Duration::from_secs(5 * 60);
 /// How often the quiescence wait looks at the process table.
 const QUIESCENCE_POLL: Duration = Duration::from_millis(250);
@@ -184,6 +190,14 @@ pub(super) fn jj_processes(ps_output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Number of operation heads in the store at `source`. One means every
+/// workspace's operations descend from a single head.
+pub(super) fn count_op_heads(source: &Path) -> Result<usize> {
+    let heads = source.join(".jj/repo/op_heads/heads");
+    let entries = std::fs::read_dir(&heads).map_err(CubeError::Io)?;
+    Ok(entries.flatten().filter(|entry| entry.path().is_file()).count())
+}
+
 /// Wait up to `timeout` for an instant with no `jj` process on the host,
 /// polling the process table every `poll`. `Ok(true)` when one was seen.
 pub(super) fn wait_for_jj_quiescence(
@@ -202,7 +216,7 @@ pub(super) fn wait_for_jj_quiescence(
         }
         if !announced {
             eprintln!(
-                "cube: store gc: waiting for {} jj process(es) to finish before collecting immediately",
+                "cube: store gc: waiting for {} jj process(es) to finish before maintaining the op log",
                 busy.len()
             );
             announced = true;
@@ -220,6 +234,9 @@ pub(super) fn wait_for_jj_quiescence(
 pub(super) enum Collection {
     /// A dry run collects nothing.
     None,
+    /// The host never went quiet before the abandon, so neither the
+    /// abandon nor the collection ran.
+    Skipped,
     /// `jj util gc --expire now`, after an instant with no jj process.
     Immediate,
     /// `jj util gc` with jj's two-week threshold: the host never went
@@ -248,11 +265,13 @@ impl StoreGcReport {
     pub(super) fn summary(&self) -> String {
         let verb = if self.dry_run { "would abandon" } else { "abandoned" };
         let cut = match &self.abandoned_through {
+            None if self.collection == Collection::Skipped => "no operations abandoned".to_owned(),
             Some(id) => format!("{verb} operations through {}", &id[..12.min(id.len())]),
             None => "nothing older than the keep window to abandon".to_owned(),
         };
         let collected = match self.collection {
             Collection::None => "",
+            Collection::Skipped => "; skipped (jj never went quiet, nothing was abandoned or collected)",
             Collection::Immediate => "; collected immediately",
             Collection::Deferred => "; collection deferred to jj's two-week threshold (jj never went quiet)",
         };
@@ -319,28 +338,48 @@ pub(super) fn gc_repo_store(
     let now = crate::app::util::current_epoch_s()?;
     let abandoned_through = select_abandon_cut(&op_log, now, keep);
     let mut collection = Collection::None;
+    let mut abandoned_through = abandoned_through;
     if !dry_run {
-        if let Some(cut) = &abandoned_through {
-            let range = format!("..{cut}");
+        if let Some(cut) = abandoned_through.clone() {
+            // The abandon rewrites every kept operation under a new id, so
+            // it runs only at an instant with no jj process to race it.
+            if wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)? {
+                let range = format!("..{cut}");
+                runner.run_with_timeout(
+                    &RealCommandRunner::invocation(&source, "jj", &["--ignore-working-copy", "op", "abandon", &range]),
+                    MAINTENANCE_CMD_TIMEOUT,
+                )?;
+                let heads = count_op_heads(&source)?;
+                if heads != 1 {
+                    return Err(CubeError::InvalidArgument(format!(
+                        "repo `{}`: the store holds {heads} operation heads after the abandon (expected 1); \
+                         a jj command raced it, so nothing was collected. The next jj command merges the heads; \
+                         check `jj bookmark list --conflicted` in {}",
+                        record.repo,
+                        source.display()
+                    )));
+                }
+            } else {
+                abandoned_through = None;
+                collection = Collection::Skipped;
+            }
+        }
+        if collection != Collection::Skipped {
+            // The observation that makes `--expire now` safe has to come
+            // after the abandon: it is the commands that loaded the store
+            // before the rewrite that must have finished.
+            let mut gc_args = vec!["--ignore-working-copy", "util", "gc"];
+            if wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)? {
+                gc_args.extend(["--expire", "now"]);
+                collection = Collection::Immediate;
+            } else {
+                collection = Collection::Deferred;
+            }
             runner.run_with_timeout(
-                &RealCommandRunner::invocation(&source, "jj", &["--ignore-working-copy", "op", "abandon", &range]),
+                &RealCommandRunner::invocation(&source, "jj", &gc_args),
                 MAINTENANCE_CMD_TIMEOUT,
             )?;
         }
-        // Quiescence is checked after the abandon, not before: it is the
-        // commands that loaded the store before the rewrite that must have
-        // finished, so the observation has to come after it.
-        let mut gc_args = vec!["--ignore-working-copy", "util", "gc"];
-        if wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)? {
-            gc_args.extend(["--expire", "now"]);
-            collection = Collection::Immediate;
-        } else {
-            collection = Collection::Deferred;
-        }
-        runner.run_with_timeout(
-            &RealCommandRunner::invocation(&source, "jj", &gc_args),
-            MAINTENANCE_CMD_TIMEOUT,
-        )?;
     }
 
     let mut stale_pr_refs_removed = Vec::new();

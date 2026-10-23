@@ -109,7 +109,7 @@ async fn work_rewritten_into_the_pr_head_counts_as_published() {
 }
 
 #[tokio::test]
-async fn unproven_work_keeps_only_the_recovery_head_and_names_what_is_missing() {
+async fn unproven_work_keeps_every_unproven_head_and_names_what_is_missing() {
     let s = revision_on_pr_head("exec_prune_unproven").await;
     let repo = &s.repo.repo;
     let pr_head = one(repo, "pr/7");
@@ -130,11 +130,11 @@ async fn unproven_work_keeps_only_the_recovery_head_and_names_what_is_missing() 
             forgotten,
             tried,
         } => {
-            assert_eq!(kept, s.record.head());
+            assert_eq!(kept, vec![s.record.head(), s.record.publication()]);
             assert_eq!(missing.len(), 1, "{missing:?}");
             assert_eq!(missing[0].commit, work);
             assert_eq!(missing[0].description, "Revision work");
-            assert_eq!(forgotten, vec![s.record.base(), s.record.publication()]);
+            assert_eq!(forgotten, vec![s.record.base()]);
             assert_eq!(tried.len(), 3, "{tried:?}");
             assert!(
                 tried[0].contains("remote bookmarks: unpublished changes remain"),
@@ -146,8 +146,8 @@ async fn unproven_work_keeps_only_the_recovery_head_and_names_what_is_missing() 
         other => panic!("expected unproven: {other:?}"),
     }
     assert!(bookmark_exists(repo, &s.record.head()));
+    assert!(bookmark_exists(repo, &s.record.publication()));
     assert!(!bookmark_exists(repo, &s.record.base()));
-    assert!(!bookmark_exists(repo, &s.record.publication()));
     // The record still recovers from its recorded baseline commit.
     let patch = diff(&LocalJj, &s.record).await.unwrap();
     assert!(patch.contains("revision.txt"), "{patch}");
@@ -250,5 +250,121 @@ async fn work_reachable_from_a_remote_bookmark_needs_no_voucher() {
     }
     for name in [s.record.base(), s.record.head(), s.record.publication()] {
         assert!(!bookmark_exists(repo, &name), "{name} survived");
+    }
+}
+
+/// The publication head carries a commit the recovery head lacks.
+async fn publication_ahead_of_recovery(execution_id: &str) -> (super::reconcile_tests::Scene, String, String) {
+    let s = revision_on_pr_head(execution_id).await;
+    let repo = &s.repo.repo;
+    let work = one(repo, &revision(&s.record.head()));
+    JjRepo::run(repo, &["new", &work, "-m", "Pushed follow-up"]);
+    std::fs::write(repo.join("follow-up.txt"), "follow-up\n").unwrap();
+    JjRepo::run(repo, &["status"]);
+    let ahead = one(repo, "@");
+    bookmark(repo, &s.record.publication(), &ahead);
+    (s, work, ahead)
+}
+
+#[tokio::test]
+async fn a_publication_head_ahead_of_recovery_survives_a_voucher_that_carries_only_recovery() {
+    let (s, work, ahead) = publication_ahead_of_recovery("exec_prune_pub_ahead").await;
+    let repo = &s.repo.repo;
+    let outcome = prune(&LocalJj, &s.record, &[voucher("work only", &work)], "main")
+        .await
+        .unwrap();
+    match outcome {
+        PruneOutcome::Unproven {
+            kept,
+            missing,
+            forgotten,
+            ..
+        } => {
+            assert_eq!(kept, vec![s.record.publication()]);
+            assert_eq!(forgotten, vec![s.record.base(), s.record.head()]);
+            assert_eq!(missing.len(), 1, "{missing:?}");
+            assert_eq!(missing[0].commit, ahead);
+        }
+        other => panic!("expected unproven: {other:?}"),
+    }
+    assert!(bookmark_exists(repo, &s.record.publication()));
+    assert!(!bookmark_exists(repo, &s.record.head()));
+    assert_eq!(one(repo, &revision(&s.record.publication())), ahead);
+}
+
+#[tokio::test]
+async fn a_publication_head_ahead_of_recovery_survives_when_no_voucher_resolves() {
+    let (s, _, ahead) = publication_ahead_of_recovery("exec_prune_pub_ahead_none").await;
+    let repo = &s.repo.repo;
+    let bogus = "0123456789abcdef0123456789abcdef01234567";
+    let outcome = prune(&LocalJj, &s.record, &[voucher("stale PR head", bogus)], "main")
+        .await
+        .unwrap();
+    match outcome {
+        PruneOutcome::Unproven { kept, forgotten, .. } => {
+            assert_eq!(kept, vec![s.record.head(), s.record.publication()]);
+            assert_eq!(forgotten, vec![s.record.base()]);
+        }
+        other => panic!("expected unproven: {other:?}"),
+    }
+    assert_eq!(one(repo, &revision(&s.record.publication())), ahead);
+}
+
+#[tokio::test]
+async fn diverged_heads_keep_the_one_with_unpublished_work_and_a_retry_with_its_voucher_retires_it() {
+    let s = revision_on_pr_head("exec_prune_diverged").await;
+    let repo = &s.repo.repo;
+    let work = one(repo, &revision(&s.record.head()));
+    let pr_head = one(repo, "pr/7");
+    // The publication head moved sideways onto a sibling of the preserved work.
+    JjRepo::run(repo, &["new", &pr_head, "-m", "Sibling work"]);
+    std::fs::write(repo.join("sibling.txt"), "sibling\n").unwrap();
+    JjRepo::run(repo, &["status"]);
+    let sibling = one(repo, "@");
+    bookmark(repo, &s.record.publication(), &sibling);
+    // The first look only knows a head carrying the recovery work.
+    let first = prune(&LocalJj, &s.record, &[voucher("PR head (poller)", &work)], "main")
+        .await
+        .unwrap();
+    match first {
+        PruneOutcome::Unproven { kept, forgotten, .. } => {
+            assert_eq!(kept, vec![s.record.publication()]);
+            assert_eq!(forgotten, vec![s.record.base(), s.record.head()]);
+        }
+        other => panic!("expected unproven: {other:?}"),
+    }
+    assert!(bookmark_exists(repo, &s.record.publication()));
+    // The GitHub retry sees only the head that still needs proof.
+    let retry = prune(&LocalJj, &s.record, &[voucher("PR head (GitHub)", &sibling)], "main")
+        .await
+        .unwrap();
+    match retry {
+        PruneOutcome::Published {
+            vouched_by, forgotten, ..
+        } => {
+            assert_eq!(vouched_by, "PR head (GitHub)");
+            assert_eq!(forgotten, vec![s.record.publication()]);
+        }
+        other => panic!("expected published: {other:?}"),
+    }
+    assert!(!bookmark_exists(repo, &s.record.publication()));
+}
+
+#[tokio::test]
+async fn a_later_voucher_that_descends_from_both_heads_publishes_them_after_an_earlier_partial_one() {
+    let (s, work, ahead) = publication_ahead_of_recovery("exec_prune_descendant_voucher").await;
+    let outcome = prune(
+        &LocalJj,
+        &s.record,
+        &[voucher("older head", &work), voucher("newer head", &ahead)],
+        "main",
+    )
+    .await
+    .unwrap();
+    // The earlier voucher carries only the recovery head; `ahead` descends
+    // from `work`, so the later one carries both.
+    match outcome {
+        PruneOutcome::Published { vouched_by, .. } => assert!(vouched_by.contains("head"), "{vouched_by}"),
+        other => panic!("expected published: {other:?}"),
     }
 }
