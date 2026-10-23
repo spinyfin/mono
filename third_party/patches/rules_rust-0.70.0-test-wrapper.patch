@@ -255,7 +255,7 @@ index f43ddab..7c37b30 100644
 +    cc_info_providers = establish_cc_info(ctx, attr, crate_info, toolchain, cc_toolchain, feature_configuration, interface_library)
 +    for cc_provider in cc_info_providers:
 +        # establish_cc_info returns CcInfo and optionally AllocatorLibrariesImplInfo
-+        if type(cc_provider) == "CcInfo":
++        if hasattr(cc_provider, "linking_context"):
 +            providers["CcInfo"] = cc_provider
 +        else:
 +            # AllocatorLibrariesImplInfo

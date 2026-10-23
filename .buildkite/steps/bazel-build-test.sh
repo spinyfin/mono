@@ -15,6 +15,10 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
+echo "--- [spoke-proto] staging merge-base schema baseline"
+# Fail closed: see the script header.
+"$(dirname "${BASH_SOURCE[0]}")/stage-spoke-proto-merge-base.sh"
+
 echo "--- [bazel-build] building"
 
 if ! bazel build --verbose_failures --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...; then
