@@ -56,6 +56,13 @@ pub enum CredentialEvent {
 /// that moment; a receiver created afterwards never sees it, and the stream
 /// would stay open until its certificate expires.
 ///
+/// A stream must also close on its own when its deadline passes: nothing is
+/// published when a certificate expires or an overlap ends. Arm a timer from
+/// [`AuthorizedHost::valid_until`], shorten it from the `valid_until` of a
+/// matching [`CredentialEvent::Superseded`], and **reschedule it from the
+/// host `revalidate` returns** (after `Lagged`, or after the post-subscribe
+/// check), since a renewal that was missed may have shortened the deadline.
+///
 /// `authorize` and `revalidate` are blocking: they take the store's lock and
 /// run synchronous SQLite queries, which can wait behind an enrollment or
 /// renewal that is signing and syncing to disk. From async code, run them with
@@ -70,9 +77,10 @@ pub trait HostAuthorizer: Send + Sync {
     /// receiver. The caller still compares the returned `host_id` with `Hello.host_id`.
     fn authorize(&self, peer_chain: &[CertificateDer<'_>]) -> Result<AuthorizedHost, Denial>;
 
-    /// Re-checks a host authorized earlier against the current records.
-    /// Blocking.
-    fn revalidate(&self, host: &AuthorizedHost) -> Result<(), Denial>;
+    /// Re-checks a host authorized earlier against the current records and
+    /// returns it with its current `valid_until`, which may be sooner than
+    /// before. Callers must replace their closure timer with it. Blocking.
+    fn revalidate(&self, host: &AuthorizedHost) -> Result<AuthorizedHost, Denial>;
 
     /// Changes that can end an open stream.
     fn subscribe(&self) -> broadcast::Receiver<CredentialEvent>;
@@ -105,14 +113,19 @@ impl HostAuthorizer for HostCredentials {
         })
     }
 
-    fn revalidate(&self, host: &AuthorizedHost) -> Result<(), Denial> {
+    fn revalidate(&self, host: &AuthorizedHost) -> Result<AuthorizedHost, Denial> {
         let now = unix_secs(self.clock.now());
-        self.store
+        let valid_until = self
+            .store
             .read(|conn| {
                 let row = store::host(conn, &host.host_id)?.ok_or(Denial::UnknownHost)?;
-                check_serial(conn, &row, &host.serial, now).map(|_| ())
+                check_serial(conn, &row, &host.serial, now)
             })
-            .map_err(denial_of)
+            .map_err(denial_of)?;
+        Ok(AuthorizedHost {
+            valid_until: from_unix_secs(valid_until),
+            ..host.clone()
+        })
     }
 
     fn subscribe(&self) -> broadcast::Receiver<CredentialEvent> {

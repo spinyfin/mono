@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use boss_host_enrollment::{AuthorizedHost, CredentialEvent, EnrollmentService, HostAuthorizer, ServiceLimits};
+use boss_host_enrollment::{AuthorizedHost, Clock, CredentialEvent, EnrollmentService, HostAuthorizer, ServiceLimits};
 use boss_protocol_spoke::v1::enrollment_client::EnrollmentClient;
 use boss_protocol_spoke::v1::spoke_hub_server::{SpokeHub, SpokeHubServer};
 use boss_protocol_spoke::v1::{self, EnrollRequest, RenewRequest};
@@ -29,6 +29,7 @@ use tonic::{Code, Request, Response, Status, Streaming};
 use crate::support::{Fixture, Spoke};
 
 const STEP: Duration = Duration::from_secs(20);
+const DEADLINE_POLL: Duration = Duration::from_millis(25);
 
 fn pem(label: &str, der: &[u8]) -> String {
     let body = STANDARD.encode(der);
@@ -46,6 +47,7 @@ fn pem(label: &str, der: &[u8]) -> String {
 /// contract governs.
 struct Hub {
     authorizer: Arc<dyn HostAuthorizer>,
+    clock: Arc<dyn Clock>,
 }
 
 #[tonic::async_trait]
@@ -72,18 +74,34 @@ impl SpokeHub for Hub {
         let authorizer = Arc::clone(&self.authorizer);
         let (tx, rx) = mpsc::channel(4);
         tx.send(Ok(v1::HubFrame::default())).await.expect("first frame");
+        let clock = Arc::clone(&self.clock);
         tokio::spawn(async move {
+            // Nothing is published when a certificate expires or an overlap
+            // ends, so the stream closes itself at its deadline. The deadline
+            // only ever moves earlier: from a matching `Superseded`, and from
+            // what `revalidate` reports after missed events. (A production
+            // handler sleeps until the deadline; this one polls the injected
+            // clock so tests can move time without waiting.)
+            let mut host = host;
             loop {
-                let still_valid = match events.recv().await {
-                    Ok(CredentialEvent::Revoked { host_id }) => host_id != host.host_id,
-                    Ok(CredentialEvent::Superseded { host_id, serial, .. }) => {
-                        host_id != host.host_id || serial != host.serial || still_authorized(&authorizer, &host).await
-                    }
-                    // Missed events: the only safe answer is to look again.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        still_authorized(&authorizer, &host).await
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
+                let still_valid = tokio::select! {
+                    () = tokio::time::sleep(DEADLINE_POLL) => clock.now() < host.valid_until,
+                    event = events.recv() => match event {
+                        Ok(CredentialEvent::Revoked { host_id }) => host_id != host.host_id,
+                        Ok(CredentialEvent::Superseded { host_id, serial, valid_until }) => {
+                            if host_id == host.host_id && serial == host.serial {
+                                host.valid_until = host.valid_until.min(valid_until);
+                                refreshed(&authorizer, &mut host).await
+                            } else {
+                                true
+                            }
+                        }
+                        // Missed events: the only safe answer is to look again.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            refreshed(&authorizer, &mut host).await
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
+                    },
                 };
                 if !still_valid {
                     let _ = tx
@@ -97,12 +115,17 @@ impl SpokeHub for Hub {
     }
 }
 
-/// `revalidate` blocks on the credential store, so it runs off the runtime.
-async fn still_authorized(authorizer: &Arc<dyn HostAuthorizer>, host: &AuthorizedHost) -> bool {
-    let (authorizer, host) = (Arc::clone(authorizer), host.clone());
-    tokio::task::spawn_blocking(move || authorizer.revalidate(&host).is_ok())
-        .await
-        .unwrap_or(false)
+/// Re-checks `host` and adopts its current deadline. `revalidate` blocks on
+/// the credential store, so it runs off the runtime.
+async fn refreshed(authorizer: &Arc<dyn HostAuthorizer>, host: &mut AuthorizedHost) -> bool {
+    let (authorizer, current) = (Arc::clone(authorizer), host.clone());
+    match tokio::task::spawn_blocking(move || authorizer.revalidate(&current)).await {
+        Ok(Ok(updated)) => {
+            *host = updated;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// A throwaway CA for the hub's *server* certificate, which is separate trust
@@ -168,11 +191,12 @@ async fn start(fx: &Fixture, limits: ServiceLimits) -> Running {
     let addr = listener.local_addr().expect("addr");
     let (shutdown, stopped) = oneshot::channel::<()>();
     let authorizer: Arc<dyn HostAuthorizer> = fx.credentials.clone();
+    let clock: Arc<dyn Clock> = fx.clock.clone();
     let server = Server::builder()
         .tls_config(tls)
         .expect("server tls")
         .add_service(EnrollmentService::new(fx.credentials.clone(), limits).into_server())
-        .add_service(SpokeHubServer::new(Hub { authorizer }))
+        .add_service(SpokeHubServer::new(Hub { authorizer, clock }))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
             let _ = stopped.await;
         });
@@ -438,6 +462,81 @@ async fn a_certificate_from_another_ca_never_gets_past_the_handshake() {
     assert!(
         outcome.is_err(),
         "a certificate this hub's CA did not sign must be refused"
+    );
+    hub.stop().await;
+}
+
+/// Stands in for time passing: the hub's clock moves, and the open stream must
+/// close without anyone revoking anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_stream_closes_when_its_certificate_expires() {
+    let fx = Fixture::new();
+    let hub = start(&fx, ServiceLimits::default()).await;
+    let (spoke, cert) = fx.enrolled("edge-1");
+    let wire = v1::Certificate {
+        leaf_der: cert.leaf_der.clone(),
+        ..v1::Certificate::default()
+    };
+    let mut stream = connect(&hub, identity_of(&spoke, &wire)).await.expect("connects");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), stream.frames.message())
+            .await
+            .is_err(),
+        "a healthy idle stream stays open"
+    );
+
+    fx.clock.advance(Duration::from_secs(31 * 24 * 3600));
+    assert_eq!(closed_with(&mut stream).await, Code::Unauthenticated);
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_stream_on_the_old_certificate_closes_when_the_renewal_overlap_ends() {
+    let fx = Fixture::new();
+    let hub = start(&fx, ServiceLimits::default()).await;
+    let (spoke_a, a) = fx.enrolled("edge-1");
+    let wire_a = v1::Certificate {
+        leaf_der: a.leaf_der.clone(),
+        ..v1::Certificate::default()
+    };
+    let mut old_stream = connect(&hub, identity_of(&spoke_a, &wire_a)).await.expect("connects");
+
+    let caller = fx
+        .credentials
+        .authorize(&crate::support::presented(&a))
+        .expect("authorized");
+    let spoke_b = Spoke::new();
+    let b = fx
+        .credentials
+        .renew(
+            &caller,
+            &boss_host_enrollment::RenewInput {
+                request_id: "renew-1",
+                csr_der: &spoke_b.csr(),
+            },
+        )
+        .expect("renew");
+    let wire_b = v1::Certificate {
+        leaf_der: b.leaf_der.clone(),
+        ..v1::Certificate::default()
+    };
+    let mut new_stream = connect(&hub, identity_of(&spoke_b, &wire_b)).await.expect("connects");
+
+    // Inside the overlap neither stream is cut.
+    fx.clock.advance(Duration::from_secs(23 * 3600));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), old_stream.frames.message())
+            .await
+            .is_err()
+    );
+    // Past the overlap the old one closes on its own; the replacement stays.
+    fx.clock.advance(Duration::from_secs(2 * 3600));
+    assert_eq!(closed_with(&mut old_stream).await, Code::Unauthenticated);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), new_stream.frames.message())
+            .await
+            .is_err(),
+        "the replacement certificate is unaffected"
     );
     hub.stop().await;
 }

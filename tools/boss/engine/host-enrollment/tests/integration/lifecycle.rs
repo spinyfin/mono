@@ -406,6 +406,52 @@ fn a_renewed_certificate_overlaps_the_one_it_replaces_for_a_day() {
         .expect("the replacement is unaffected");
 }
 
+/// Deadlines are whole seconds, so allow the sub-second remainder of `now`.
+fn assert_one_day_left(fx: &Fixture, host: &boss_host_enrollment::AuthorizedHost) {
+    let left = host.valid_until.duration_since(fx.now()).expect("ends in the future");
+    assert!(left <= DAY && left + Duration::from_secs(1) > DAY, "{left:?}");
+}
+
+#[test]
+fn revalidate_reports_the_overlap_deadline_when_a_renewal_landed_after_authorize() {
+    let fx = Fixture::new();
+    let (_spoke, old) = fx.enrolled("h1");
+    let caller = fx.credentials.authorize(&presented(&old)).expect("authorized");
+
+    // The renewal commits after the caller authorized, and before it subscribed.
+    fx.clock.advance(MINUTE);
+    renew(&fx, &caller, &Spoke::new(), "renew-1").expect("renew");
+
+    let current = fx.credentials.revalidate(&caller).expect("still inside the overlap");
+    assert_eq!(current.host_id, caller.host_id);
+    assert_eq!(current.serial, caller.serial);
+    assert!(
+        current.valid_until < caller.valid_until,
+        "the deadline moved from the certificate's expiry to the overlap end"
+    );
+    assert_one_day_left(&fx, &current);
+}
+
+#[test]
+fn a_missed_superseded_event_is_recovered_by_revalidate() {
+    let fx = Fixture::new();
+    let (_spoke, old) = fx.enrolled("h1");
+    let caller = fx.credentials.authorize(&presented(&old)).expect("authorized");
+    let mut events = fx.credentials.subscribe();
+    renew(&fx, &caller, &Spoke::new(), "renew-1").expect("renew");
+    // The receiver drops the event, as a lagged one would.
+    drop(events.try_recv());
+
+    let current = fx
+        .credentials
+        .revalidate(&caller)
+        .expect("old certificate still authorizes");
+    assert_one_day_left(&fx, &current);
+
+    fx.clock.advance(DAY + MINUTE);
+    assert_eq!(fx.credentials.revalidate(&current).unwrap_err(), Denial::OverlapElapsed);
+}
+
 #[test]
 fn the_overlap_never_outlives_the_old_certificates_own_expiry() {
     let fx = Fixture::new();

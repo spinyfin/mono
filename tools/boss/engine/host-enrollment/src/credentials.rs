@@ -83,6 +83,11 @@ pub struct CredentialStatus {
 impl HostCredentials {
     /// Opens (creating on first use) the credential state under `dir`: the
     /// CA in `dir/ca` and the database at `dir/credentials.db`.
+    ///
+    /// `dir` and any existing database or `-wal`/`-shm` file must be
+    /// owner-only (no group or other permission bits, e.g. `0o700`); permissive
+    /// ones are refused with an internal error rather than tightened. A `dir`
+    /// that does not exist is created `0o700`.
     pub fn open(dir: &Path, policy: Policy, clock: Arc<dyn Clock>) -> Result<Self, CredentialError> {
         let ca = CertificateAuthority::open_or_create(&dir.join("ca"), clock.now(), &policy)?;
         let mut roots = RootCertStore::empty();
