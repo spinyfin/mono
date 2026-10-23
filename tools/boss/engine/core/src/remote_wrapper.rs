@@ -253,7 +253,6 @@ mod tests {
         let bin_dir = temp.path().join("bin");
         let remote_home = temp.path().join("remote-home");
         let remote_tmp = temp.path().join("remote-tmp");
-        let output_capture = temp.path().join("output-path");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir(&bin_dir).unwrap();
         std::fs::create_dir(&remote_home).unwrap();
@@ -265,7 +264,7 @@ mod tests {
         for (name, body) in [
             (
                 "claude",
-                "#!/bin/sh\nprintf '%s|%s\\n' \"$BOSS_STRUCTURED_OUTPUT\" \"$BOSS_PR_URL_OUTPUT\" > \"$OUTPUT_CAPTURE\"\n",
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$BOSS_STRUCTURED_OUTPUT\" \"$BOSS_PR_URL_OUTPUT\" >&3\n",
             ),
             ("cube", "#!/bin/sh\nexit 0\n"),
             ("gh", "#!/bin/sh\nexit 0\n"),
@@ -277,12 +276,17 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
+        // Preserve the captured stdout pipe on fd 3 before the production
+        // wrapper redirects the detached supervisor's stdout/stderr to its log.
+        // The fake driver writes its complete result to that pipe. output()
+        // waits for EOF from the driver/supervisor, not just the wrapper's
+        // launch handshake, so scheduler delays cannot race the assertion.
         let output = Command::new("/bin/sh")
+            .args(["-c", "exec 3>&1; exec /bin/sh \"$1\"", "structured-output-test"])
             .arg(&wrapper)
             .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
             .env("HOME", &remote_home)
             .env("TMPDIR", &remote_tmp)
-            .env("OUTPUT_CAPTURE", &output_capture)
             .env("BOSS_RUN_ID", "run-test")
             .env("BOSS_EVENTS_SOCKET", "/tmp/boss-events-test.sock")
             .env("BOSS_LEASE_ID", "lease-test")
@@ -299,19 +303,9 @@ mod tests {
             "wrapper stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        for _ in 0..1_000 {
-            if output_capture
-                .metadata()
-                .map(|metadata| metadata.len() > 0)
-                .unwrap_or(false)
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
         let expected = remote_tmp.join("boss-worker-output/run-test.review-result.json");
         assert_eq!(
-            std::fs::read_to_string(&output_capture).unwrap().trim(),
+            String::from_utf8(output.stdout).unwrap().trim(),
             format!(
                 "{}|{}",
                 expected.display(),
