@@ -561,6 +561,7 @@ mod t04;
 // schema migrations, short_id allocator, work-item writes, CI remediation).
 mod ai_review_state_tests;
 mod blocked_workspace_tests;
+mod board_mutation_events;
 mod ci_remediation_tests;
 mod current_head_review_badge_tests;
 mod decision_tests;
@@ -610,6 +611,7 @@ mod t32;
 mod t33;
 mod t34;
 mod tmux_pane_observation_tests;
+mod updated_reply_projections;
 mod work_item_tags_tests;
 mod work_item_write_tests;
 

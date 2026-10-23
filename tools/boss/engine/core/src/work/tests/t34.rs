@@ -481,6 +481,28 @@ fn reconcile_active_dispatch_does_not_reopen_retired_attempt() {
     }
 }
 
+#[tokio::test]
+async fn settling_retired_revision_publishes_its_board_change() {
+    use boss_event_bus::{Event, EventKind, TopicFilter};
+    let db = WorkDb::open(temp_db_path("retired-revision-board-change")).unwrap();
+    let (product_id, _rem_id, revision_id, _execution_id) =
+        active_revision_with_retired_attempt(&db, "board-change", true);
+    let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::WorkItemChanged));
+    db.reconcile_product_executions(&product_id).unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        event,
+        Event::WorkItemChanged {
+            product_id,
+            task_id: revision_id.clone()
+        }
+    );
+    assert_eq!(task_status(&db, &revision_id), "in_review");
+}
+
 #[test]
 fn rescan_active_dispatch_does_not_reopen_retired_attempt() {
     for succeeded in [false, true] {

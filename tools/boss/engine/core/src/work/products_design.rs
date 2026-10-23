@@ -844,15 +844,6 @@ impl WorkDb {
     }
 }
 
-/// Resolve and attach [`Task::doc_link_state`] for a single task from its
-/// `doc_*` columns. Independent of `kind` — any work item may carry a
-/// per-task pointer. Shared by the work-tree loop, list/show read paths,
-/// and `set_task_doc`'s return so a change to the resolution contract
-/// only needs to land once.
-///
-/// Errors are non-fatal: log with `caller` as the message prefix and
-/// leave the field `None` (affordance hidden). The workspace lookup is
-/// always `|_| None`: cube is not consulted on these paths.
 /// Attach everything a `WorkItemUpdated` reply must carry beyond the raw
 /// `tasks` columns: the doc-link state and the derived projections
 /// (`has_in_progress_revision`, `ready_for_review`, `ai_review_state`,
@@ -874,6 +865,15 @@ pub(crate) fn project_for_work_item_updated(conn: &Connection, task: &mut Task, 
     }
 }
 
+/// Resolve and attach [`Task::doc_link_state`] for a single task from its
+/// `doc_*` columns. Independent of `kind` — any work item may carry a
+/// per-task pointer. Shared by the work-tree loop, list/show read paths,
+/// and `set_task_doc`'s return so a change to the resolution contract
+/// only needs to land once.
+///
+/// Errors are non-fatal: log with `caller` as the message prefix and
+/// leave the field `None` (affordance hidden). The workspace lookup is
+/// always `|_| None`: cube is not consulted on these paths.
 pub(crate) fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, caller: &str, queries: &mut u64) {
     match resolve_task_doc_pointer(conn, &task.id, |_| None, queries) {
         Ok(state) => task.doc_link_state = state,

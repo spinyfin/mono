@@ -1,5 +1,5 @@
 import Foundation
-import os.log
+import os
 
 /// Where the board reports a Review-column card that arrived without an
 /// engine section when one was owed.
@@ -25,7 +25,27 @@ enum ReviewSectionDiagnostics {
     /// card swap in their own observer for the duration and restore this.
     nonisolated(unsafe) static var onMissingSection: ((WorkTask) -> Void)?
 
+    private struct Version: Hashable {
+        let id: String
+        let updatedAt: String
+    }
+
+    private static let reportedVersions = OSAllocatedUnfairLock(initialState: Set<Version>())
+
     static func reportMissingSection(_ task: WorkTask) {
+        // A prior render must never hide a defect from the current test.
+        onMissingSection?(task)
+        guard claimFaultReport(task) else { return }
+        logMissingSection(task)
+    }
+
+    static func claimFaultReport(_ task: WorkTask) -> Bool {
+        reportedVersions.withLock { versions in
+            versions.insert(Version(id: task.id, updatedAt: task.updatedAt)).inserted
+        }
+    }
+
+    private static func logMissingSection(_ task: WorkTask) {
         log.fault(
             """
             Review card \(task.id, privacy: .public) "\(task.name, privacy: .public)" arrived without \
@@ -39,6 +59,5 @@ enum ReviewSectionDiagnostics {
             The engine owns this classification: an update path dropped it.
             """
         )
-        onMissingSection?(task)
     }
 }

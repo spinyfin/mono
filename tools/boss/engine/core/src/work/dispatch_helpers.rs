@@ -1,6 +1,18 @@
 use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
 use super::*;
 
+/// Stage a board refresh in the transaction that changed classification
+/// inputs, including callers with no frontend mutation handler.
+pub(crate) fn stage_task_board_change(pending: &mut PendingEvents, conn: &Connection, id: &str) -> Result<()> {
+    if let Some(task) = query_task(conn, id)? {
+        pending.push(boss_event_bus::Event::WorkItemChanged {
+            product_id: task.product_id,
+            task_id: task.id,
+        });
+    }
+    Ok(())
+}
+
 /// Shared per-product short-id read-modify-write. Reads the current
 /// `next_value` from `table` for `product_id` (defaulting to 1 when no
 /// row exists yet), writes back `next_value + 1`, and returns the value
@@ -1018,6 +1030,7 @@ pub(crate) fn reconcile_revision_execution(
                 )?
             };
             if settled > 0 {
+                stage_task_board_change(pending, conn, &task.id)?;
                 if attempt_succeeded {
                     tracing::info!(
                         task_id = %task.id,
@@ -1299,6 +1312,10 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
     let kind = execution_kind_for_work_item(conn, &work_item_id)?;
+
+    // Every successful request can clear blocks or change revision readiness.
+    // Failed transactions drop this event together with their writes.
+    stage_task_board_change(pending, conn, &work_item_id)?;
 
     // Refuse explicit dispatch against a status that can't accept one
     // (terminal or deleted) instead of silently creating a `ready`

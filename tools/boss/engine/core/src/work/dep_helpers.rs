@@ -489,6 +489,7 @@ pub(crate) fn maybe_engine_block_dependent(
              WHERE id = ?1 AND status = 'blocked' AND deleted_at IS NULL",
             [dependent_id],
         )?;
+        stage_task_board_change(pending, conn, dependent_id)?;
         // Invariant: a `blocked` work item must never have a live
         // execution. If a worker is actively running this dependent —
         // i.e. a `blocks` edge just landed on an already-`active`
@@ -702,6 +703,7 @@ pub(crate) fn maybe_engine_unblock_dependent(
              WHERE id = ?1 AND deleted_at IS NULL",
             [dependent_id],
         )?;
+        stage_task_board_change(pending, conn, dependent_id)?;
     }
     tracing::info!(
         dependent_id,

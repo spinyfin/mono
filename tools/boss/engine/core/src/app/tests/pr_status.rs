@@ -670,6 +670,40 @@ async fn drain_invalidations(sink: &SessionSink) -> Vec<(String, Vec<String>)> {
     seen
 }
 
+#[tokio::test]
+async fn retry_exhausted_ci_publishes_the_changed_parent() {
+    let fx = PrFixture::new_with_probe(None);
+    fx.server_state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure_exhausted' WHERE id = ?1",
+            [&fx.task_id],
+        )
+        .unwrap();
+    let observer = fx.observe_board_pushes("retry-board").await;
+    let sink = make_session_sink();
+    crate::app::ci_remediation::handle_retry_ci_remediation(
+        dispatch_with_peer(&fx.server_state, &sink, None),
+        FrontendRequest::RetryCiRemediation {
+            selector: fx.task_id.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        sole_response(&sink).await,
+        FrontendEvent::CiRemediationRetryDone {
+            was_exhausted: true,
+            ..
+        }
+    ));
+    assert_eq!(
+        drain_invalidations(&observer).await,
+        vec![("ci_remediation_retried".into(), vec![fx.task_id])]
+    );
+}
+
 /// Root cause of "Review column shows Ready cards under Pending": a worker's
 /// `boss pr status --refresh` persisted the live mergeability (and dropped
 /// the CI state for a new head) straight into the `tasks` row without

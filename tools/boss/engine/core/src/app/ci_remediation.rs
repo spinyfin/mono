@@ -861,6 +861,7 @@ pub(super) async fn handle_get_ci_remediation(ctx: Dispatch, req: FrontendReques
 
 pub(super) async fn handle_retry_ci_remediation(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -892,6 +893,12 @@ pub(super) async fn handle_retry_ci_remediation(ctx: Dispatch, req: FrontendRequ
                         was_exhausted,
                         "retry_ci_remediation: budget reset, parent unblocked={was_exhausted}",
                     );
+                    if let Ok(item) = work_db.get_work_item(&work_item_id) {
+                        server_state
+                            .publisher
+                            .publish_work_item_changed(item.product_id(), &work_item_id, "ci_remediation_retried")
+                            .await;
+                    }
                     send_response(
                         &sink,
                         &request_id,

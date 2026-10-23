@@ -101,6 +101,28 @@ final class ReviewSectionsTests: XCTestCase {
 
     // MARK: - Cards without an engine section
 
+    func testMissingSectionFaultIsDeduplicatedPerCardVersion() {
+        var card = makeReviewItem(id: UUID().uuidString, section: nil)
+        XCTAssertTrue(ReviewSectionDiagnostics.claimFaultReport(card))
+        XCTAssertFalse(ReviewSectionDiagnostics.claimFaultReport(card))
+        card.updatedAt = "2026-05-16T00:00:00Z"
+        XCTAssertTrue(ReviewSectionDiagnostics.claimFaultReport(card))
+        XCTAssertFalse(ReviewSectionDiagnostics.claimFaultReport(card))
+        let other = makeReviewItem(id: UUID().uuidString, section: nil)
+        XCTAssertTrue(ReviewSectionDiagnostics.claimFaultReport(other))
+        card.updatedAt = "2026-05-15T00:00:00Z"
+        XCTAssertFalse(ReviewSectionDiagnostics.claimFaultReport(card))
+    }
+
+    func testRepeatedMissingSectionsStillReachTheTestObserver() {
+        let card = makeReviewItem(id: UUID().uuidString, section: nil)
+        let reports = capturingMissingSectionReports {
+            ReviewSectionDiagnostics.reportMissingSection(card)
+            ReviewSectionDiagnostics.reportMissingSection(card)
+        }
+        XCTAssertEqual(reports, [card.id, card.id])
+    }
+
     /// Documented fallback 1: the engine predates `review_section` (its
     /// payload had no such key, so `reviewSectionReported` is false). The
     /// card lands in Pending, unhidden, and is not a defect.
