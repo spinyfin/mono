@@ -14,18 +14,11 @@ struct ResyncRefetchPolicy: Equatable, Sendable {
     /// and the next resync starts again from `window` and `initialBackoff`.
     var quietReset: Duration
 
-    /// Chosen from the traffic in
-    /// docs/investigations/app-engine-request-audit-2026-10-19.md §4.2: an
-    /// overflow loop re-triggered itself about twice a second (433 resyncs in
-    /// three minutes), and the refill from one refetch set arrives within a
-    /// second or two. `window` matches the 150 ms work-invalidation burst.
-    /// `initialBackoff` of 1 s already cuts that loop to one set per second,
-    /// the doubling reaches `maxBackoff` after five refetches, and 30 s is
-    /// the slowest the board may lag a sustained storm — one set per 30 s is
-    /// two sets a minute against the 120 the loop produced. `quietReset`
-    /// of 10 s is several times the refill time, so a storm still being fed
-    /// is never mistaken for a quiet one, while an isolated overflow later
-    /// is answered promptly instead of at the stale ceiling.
+    /// Retained after live overflow and normal-workload measurements; see
+    /// docs/investigations/resync-overflow-validation-2026-10-23.md for the
+    /// observed margins. The shared window avoids a second product burst,
+    /// the initial gap covers the first refill, the cap bounds storm latency,
+    /// and the quiet reset outlasts even the large fixture's refill.
     static let standard = ResyncRefetchPolicy(
         window: .milliseconds(150),
         initialBackoff: .seconds(1),
@@ -149,6 +142,8 @@ extension ChatViewModel {
     /// - `worker_live_states_list`: pushed when a state changes, never on a
     ///   timer, so a dropped one stays stale until asked for.
     /// - `engine_health_result` and `git_hub_auth_state`.
+    /// - `ci_remediation_*`, `ci_failure_cleared`, and `conflict_resolution_*`
+    ///   pushes: attempt lists and Activity; the tree recovers active CI chips.
     /// - comment invalidations: each open comment layer reloads once.
     /// - `engine_pool_config`: pool sizes and coordinator model, pushed once
     ///   at session registration, so a dropped one is never re-sent. The
@@ -172,6 +167,9 @@ extension ChatViewModel {
         engine.sendGetEngineHealth()
         engine.sendGitHubAuthStatus()
         engine.sendGetEnginePoolConfig()
+        refreshCiRemediations()
+        refreshConflictResolutions()
+        refreshEngineAttempts()
         commentBridge.reloadOpenLayers()
         sendResyncOnlyReads()
         if !productJoined {

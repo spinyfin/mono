@@ -9,7 +9,8 @@ extension ChatViewModel {
     func handleConnected() {
         let flow: PopulationFlow = hasConnectedOnce ? .reconnect : .coldStart
         UpdateLifecycle.recordStartup("engine-connected")
-        // This burst re-reads everything a pending resync refetch would.
+        // This burst re-reads most of the pending resync set. Attempt lists,
+        // cached quota and open docs are recovered below via resyncOnlyReadsOwed.
         cancelPendingResyncRefetch()
         markConnected()
         resetConnectionLostBanner()
@@ -49,6 +50,9 @@ extension ChatViewModel {
         startBackgroundWorkPolling()
         if resyncOnlyReadsOwed {
             resyncOnlyReadsOwed = false
+            refreshCiRemediations()
+            refreshConflictResolutions()
+            refreshEngineAttempts()
             sendResyncOnlyReads()
         }
     }

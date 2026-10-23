@@ -13,6 +13,38 @@ import XCTest
 /// of stranding the badge.
 @MainActor
 final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
+    func testTreeRecoversDroppedClearAndExhaustionInEitherReplyOrder() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/3256"
+        var task = WorkTask(
+            id: "task", productID: "product", projectID: nil, kind: "chore",
+            name: "fixture", description: "", status: "in_review", priority: "medium",
+            ordinal: nil, prURL: prURL, deletedAt: nil, createdAt: "0", updatedAt: "0"
+        )
+        model.ciFailureBadges[prURL] = CiFailureBadge(state: .inFlight, attemptsUsed: 1, budget: 3)
+        model.choresByProductID["product"] = [task]
+        model.reconcileCIFailureBadges(from: [task])
+        XCTAssertNil(model.ciFailureBadges[prURL], "the tree recovers a lost ci_failure_cleared")
+        model.applyEventForTest(.ciRemediationsList(attempts: [
+            makeRemediation(id: "attempt", prURL: prURL, status: "running", finishedAt: nil),
+        ]))
+        XCTAssertNil(model.ciFailureBadges[prURL], "a later list cannot resurrect the cleared chip")
+
+        task.status = "blocked"
+        task.blockedReason = "ci_failure_exhausted"
+        model.choresByProductID["product"] = [task]
+        model.reconcileCIFailureBadges(from: [task])
+        XCTAssertEqual(model.ciFailureBadges[prURL]?.state, .exhausted)
+        model.applyEventForTest(.ciRemediationsList(attempts: [
+            makeRemediation(id: "attempt", prURL: prURL, status: "failed", finishedAt: "1"),
+        ]))
+        XCTAssertEqual(model.ciFailureBadges[prURL]?.state, .exhausted)
+        task.status = "in_review"
+        task.blockedReason = nil
+        model.reconcileCIFailureBadges(from: [task])
+        XCTAssertNil(model.ciFailureBadges[prURL], "a later tree also clears a terminal attempt's chip")
+    }
+
     /// A fresh non-terminal attempt for a PR must drop a stale
     /// "auto-fixed" badge even when the `ciRemediationStarted` push that
     /// would normally clear it never arrived — the list refresh alone

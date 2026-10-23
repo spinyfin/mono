@@ -397,6 +397,15 @@ extension ChatViewModel {
             applyReviewGuideRetryQueued(rootTaskId: rootTaskId)
         case .conflictResolutionsList(let attempts):
             conflictResolutions = attempts
+            var seenPRs = Set<String>()
+            for row in attempts where seenPRs.insert(row.prURL).inserted {
+                if row.status == "succeeded",
+                   let finished = AutomationTime.parse(row.finishedAt ?? row.createdAt) {
+                    recentlyClearedConflictPRs[row.prURL] = finished
+                } else {
+                    recentlyClearedConflictPRs.removeValue(forKey: row.prURL)
+                }
+            }
         case .conflictResolutionStarted(_, _, _, let prURL):
             // A (re)dispatch of the conflict resolver means the PR is
             // conflicting again, so the prior "conflict cleared" badge is
@@ -477,6 +486,13 @@ extension ChatViewModel {
                     break
                 }
             }
+            // A loaded tree carries the durable failure condition. Apply it
+            // last so reply ordering cannot resurrect a cleared CI chip.
+            reconcileCIFailureBadges(from:
+                tasksByProjectID.values.flatMap { $0 }
+                + choresByProductID.values.flatMap { $0 }
+                + productLevelTasksByProductID.values.flatMap { $0 }
+                + productLevelRevisionsByProductID.values.flatMap { $0 })
         case .engineAttemptsList(let attempts, let backgroundWork, let requestId):
             applyEngineAttemptsList(
                 attempts: attempts,
