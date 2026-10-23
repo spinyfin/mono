@@ -33,6 +33,7 @@ use checkleft::install::{
 };
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
 use checkleft::progress::render::TermRenderer;
+use checkleft::progress::slow::{DEFAULT_SLOW_CHECK_THRESHOLD, SlowCheckReporter, SlowCheckSink};
 use checkleft::progress::{DEFAULT_DEBOUNCE, LiveProgress, NoopProgressReporter, ProgressReporter, RenderFindings};
 use checkleft::runner::{DEFAULT_FIX_PASSES, Runner};
 use checkleft::source_tree::LocalSourceTree;
@@ -636,10 +637,13 @@ async fn dispatch_run(
             );
         let mut live = progress_enabled
             .then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE, !show_skipped));
-        let reporter: Arc<dyn ProgressReporter> = match &live {
-            Some(progress) => progress.reporter(make_render_findings(style)),
-            None => Arc::new(NoopProgressReporter),
-        };
+        let reporter = with_slow_check_reporting(
+            match &live {
+                Some(progress) => progress.reporter(make_render_findings(style)),
+                None => Arc::new(NoopProgressReporter),
+            },
+            live.as_ref(),
+        );
 
         let run_started_at = Instant::now();
         let mut results = runner.run_changeset_with_progress(&changeset, reporter).await?;
@@ -1376,10 +1380,13 @@ async fn dispatch_fix(
         );
     let mut live =
         progress_enabled.then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE, !show_skipped));
-    let reporter: Arc<dyn ProgressReporter> = match &live {
-        Some(progress) => progress.reporter(make_render_findings(style)),
-        None => Arc::new(NoopProgressReporter),
-    };
+    let reporter = with_slow_check_reporting(
+        match &live {
+            Some(progress) => progress.reporter(make_render_findings(style)),
+            None => Arc::new(NoopProgressReporter),
+        },
+        live.as_ref(),
+    );
 
     let run_started_at = Instant::now();
     let mut results = runner
@@ -2296,6 +2303,26 @@ fn severity_sort_key(severity: Severity) -> u8 {
         Severity::Warning => 1,
         Severity::Info => 2,
     }
+}
+
+/// Wrap `inner` so a check running past the slow-check threshold is reported.
+/// Silent for any run whose checks all finish under the threshold. Lines go to
+/// the live UI's log area when it is active (so they do not tear the pinned
+/// status block); otherwise to stderr, which keeps `--format json` stdout
+/// parseable.
+fn with_slow_check_reporting(
+    inner: Arc<dyn ProgressReporter>,
+    live: Option<&LiveProgress>,
+) -> Arc<dyn ProgressReporter> {
+    let sink: SlowCheckSink = match live {
+        Some(progress) => progress.log_sink(),
+        None => Arc::new(|lines| {
+            for line in lines {
+                eprintln!("{line}");
+            }
+        }),
+    };
+    Arc::new(SlowCheckReporter::new(inner, DEFAULT_SLOW_CHECK_THRESHOLD, sink))
 }
 
 /// Decide whether to show the interactive progress UI.
