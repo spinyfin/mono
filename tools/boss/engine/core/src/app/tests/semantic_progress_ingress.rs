@@ -5,7 +5,7 @@ use super::*;
 
 use crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS;
 use crate::protocol::WorkerEvent;
-use crate::semantic_progress::SemanticToolCondition;
+use crate::semantic_progress::{SemanticToolCondition, SemanticTurnCondition};
 use crate::test_support::*;
 use boss_protocol::RequestExecutionInput;
 
@@ -67,6 +67,27 @@ fn session_start(execution_id: &str) -> crate::events_socket::IncomingHookEvent 
     )
 }
 
+fn user_prompt_submit(execution_id: &str) -> crate::events_socket::IncomingHookEvent {
+    hook(
+        WorkerEvent::UserPromptSubmit {
+            session_id: "claude-sess-1".into(),
+            prompt: String::new(),
+        },
+        execution_id,
+    )
+}
+
+fn stop(execution_id: &str) -> crate::events_socket::IncomingHookEvent {
+    hook(
+        WorkerEvent::Stop {
+            session_id: "claude-sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        execution_id,
+    )
+}
+
 fn notification(execution_id: &str) -> crate::events_socket::IncomingHookEvent {
     hook(
         WorkerEvent::Notification {
@@ -107,6 +128,82 @@ async fn ingress_persists_driver_originated_progress_and_tool_condition() {
     assert_eq!(idle.tool_condition, SemanticToolCondition::Idle);
 }
 
+/// The 2026-10-23 incident, end to end through the durable checkpoint. A
+/// worker is mid-turn with its last tool call balanced — exactly what a Codex
+/// worker waiting on its own background command looks like, since the
+/// rollout translator announces the command once and its continuation polls
+/// emit nothing. The engine restarts; boot adoption rebuilds the slot in a
+/// fresh registry from the checkpoint alone. The rebuilt slot must read
+/// `Working`, not `Idle`: the driver never reported a turn boundary.
+#[tokio::test]
+async fn a_rebuilt_slot_reads_working_for_a_turn_the_driver_never_ended() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+
+    dispatch_worker_event_fanout(&server_state, &user_prompt_submit(&execution_id)).await;
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id)).await;
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id)).await;
+
+    let checkpoint = server_state
+        .work_db
+        .get_run_semantic_progress_checkpoint(&execution_id)
+        .unwrap()
+        .expect("tool boundaries persist a checkpoint");
+    assert_eq!(checkpoint.tool_condition, SemanticToolCondition::Idle);
+    assert_eq!(
+        checkpoint.turn_condition,
+        SemanticTurnCondition::InTurn,
+        "a balanced tool call leaves the turn open",
+    );
+
+    // Engine restart: a fresh registry, seeded only from the row.
+    let rebuilt = crate::live_worker_state::LiveWorkerStateRegistry::new();
+    rebuilt.register_readoption(
+        SLOT,
+        execution_id.clone(),
+        "codex",
+        4242,
+        None,
+        false,
+        crate::live_worker_state::LiveSpawnRouting::none(),
+        crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
+    );
+    rebuilt.seed_semantic_progress(SLOT, &checkpoint);
+    let seeded = rebuilt.get(SLOT).unwrap();
+    assert_eq!(
+        seeded.activity,
+        boss_protocol::WorkerActivity::Working,
+        "a worker whose turn is in progress is busy for the whole turn, \
+         including while it waits on its own background command",
+    );
+    assert_eq!(seeded.current_tool, None);
+
+    // And once the driver does end the turn, the same path reads idle.
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id)).await;
+    let ended = server_state
+        .work_db
+        .get_run_semantic_progress_checkpoint(&execution_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.turn_condition, SemanticTurnCondition::Ended);
+    let rebuilt_after_stop = crate::live_worker_state::LiveWorkerStateRegistry::new();
+    rebuilt_after_stop.register_readoption(
+        SLOT,
+        execution_id.clone(),
+        "codex",
+        4242,
+        None,
+        false,
+        crate::live_worker_state::LiveSpawnRouting::none(),
+        crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
+    );
+    rebuilt_after_stop.seed_semantic_progress(SLOT, &ended);
+    assert_eq!(
+        rebuilt_after_stop.get(SLOT).unwrap().activity,
+        boss_protocol::WorkerActivity::Idle,
+    );
+}
+
 #[tokio::test]
 async fn session_start_ingress_does_not_coerce_unknown_to_idle() {
     let (server_state, _dir) = test_server_state();
@@ -119,6 +216,11 @@ async fn session_start_ingress_does_not_coerce_unknown_to_idle() {
         .unwrap()
         .expect("session start is driver-originated progress");
     assert_eq!(checkpoint.tool_condition, SemanticToolCondition::Unknown);
+    assert_eq!(
+        checkpoint.turn_condition,
+        SemanticTurnCondition::Unknown,
+        "session start is not turn activity either",
+    );
 }
 
 #[tokio::test]

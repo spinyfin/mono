@@ -22,7 +22,9 @@ use boss_protocol::{
 };
 
 use crate::driver::ProgressFidelity;
-use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, next_tool_condition};
+use crate::semantic_progress::{
+    SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition, next_tool_condition, next_turn_condition,
+};
 
 mod never_started_reap;
 pub use never_started_reap::NeverStartedReapCommit;
@@ -352,6 +354,14 @@ struct SlotMeta {
     /// [`SemanticToolCondition::Unknown`]; unknown is never coerced to idle.
     #[builder(default = SemanticToolCondition::Unknown)]
     semantic_tool_condition: SemanticToolCondition,
+    /// Tri-state turn condition established by driver events — the durable
+    /// shadow of `activity`'s turn gate (`Working` until a `Stop`). Defaults
+    /// to [`SemanticTurnCondition::Unknown`]; unknown is never coerced to
+    /// ended. Restored by [`LiveWorkerStateRegistry::seed_semantic_progress`]
+    /// and the reason a re-adopted mid-turn worker seeds as `Working` even
+    /// though its tool condition reads idle.
+    #[builder(default = SemanticTurnCondition::Unknown)]
+    semantic_turn_condition: SemanticTurnCondition,
     /// Consecutive [`crate::transcript_liveness::TranscriptLiveness::Undeterminable`]
     /// reap outcomes recorded for this slot's current run by
     /// [`crate::spawn_ack_sweep::reap_never_started_spawn`]. Reset only by a
@@ -964,14 +974,36 @@ impl LiveWorkerStateRegistry {
         }
         entry.meta.semantic_progress_at = Some(checkpoint.progress_at.clone());
         entry.meta.semantic_tool_condition = checkpoint.tool_condition;
-        match checkpoint.tool_condition {
-            SemanticToolCondition::InFlight => {
+        entry.meta.semantic_turn_condition = checkpoint.turn_condition;
+        // The turn condition is the authority on busy-vs-idle: it is the
+        // durable shadow of the reducer's own turn gate, where `Working`
+        // holds from the first turn activity until a `Stop`. The tool
+        // condition only says whether a tool call is unbalanced, which is
+        // `Idle` for most of a live turn — between tools, during a long
+        // think, and for the whole of a Codex background-terminal wait, whose
+        // continuation polls are deliberately never re-announced. Seeding
+        // `Idle` from it is how a re-adopted mid-turn worker was painted idle
+        // for as long as the wait lasted (2026-10-23).
+        match (checkpoint.turn_condition, checkpoint.tool_condition) {
+            (SemanticTurnCondition::InTurn, _) | (SemanticTurnCondition::Unknown, SemanticToolCondition::InFlight) => {
+                // An unbalanced tool call is itself in-turn evidence, so a
+                // row that predates the turn column still seeds `Working`
+                // when a tool was in flight.
                 entry.state.activity = WorkerActivity::Working;
             }
-            SemanticToolCondition::Idle => {
+            (SemanticTurnCondition::Ended, _) => {
                 entry.state.activity = WorkerActivity::Idle;
             }
-            SemanticToolCondition::Unknown => {
+            (SemanticTurnCondition::Unknown, SemanticToolCondition::Idle) => {
+                // A row written before the turn column existed: the last
+                // tool boundary balanced, and nothing says whether the turn
+                // went on. The pre-column behaviour is kept rather than
+                // guessed at — the re-established ingress corrects it on the
+                // worker's next event, and the column is populated from
+                // then on.
+                entry.state.activity = WorkerActivity::Idle;
+            }
+            (SemanticTurnCondition::Unknown, SemanticToolCondition::Unknown) => {
                 // Leave Spawning. Unknown must never be coerced to idle.
             }
         }
@@ -986,6 +1018,7 @@ impl LiveWorkerStateRegistry {
             Some(SemanticProgressCheckpoint {
                 progress_at: entry.meta.semantic_progress_at.clone()?,
                 tool_condition: entry.meta.semantic_tool_condition,
+                turn_condition: entry.meta.semantic_turn_condition,
             })
         })
     }
@@ -1722,6 +1755,7 @@ impl LiveWorkerStateRegistry {
         // semantic checkpoint.
         meta.semantic_progress_at = Some(now);
         meta.semantic_tool_condition = next_tool_condition(event, meta.semantic_tool_condition);
+        meta.semantic_turn_condition = next_turn_condition(event, meta.semantic_turn_condition);
         // Any hook event is proof the worker's session is responsive
         // again — clear a stale recovery banner regardless of which
         // event arrived, so real progress after a nudge is never

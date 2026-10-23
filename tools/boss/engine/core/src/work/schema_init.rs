@@ -17,7 +17,7 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 /// Schema version stamped once every post-floor migration has run. Bump it
 /// together with the migration that earns it; the guard and the stamp in
 /// `init` both read this constant.
-pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 49;
+pub(in crate::work) const CURRENT_SCHEMA_VERSION: u32 = 50;
 
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
@@ -37,6 +37,15 @@ const TASKS_PR_UPDATED_AT_45: &str = "ALTER TABLE tasks ADD COLUMN pr_updated_at
 /// unless `priority = 'critical'`; see `work/critical_priority.rs`.
 const TASKS_CRITICAL_PROVENANCE_46: &str = "ALTER TABLE tasks ADD COLUMN critical_set_by TEXT;
      ALTER TABLE tasks ADD COLUMN critical_set_at TEXT";
+
+/// Schema 50: the durable turn condition of a run's worker
+/// (`in_turn` / `ended` / `unknown`), written beside `semantic_tool_condition`
+/// by the same driver events. Re-adoption after an engine restart seeds the
+/// slot's activity from it, so a worker that was mid-turn — including one
+/// waiting on its own background command, whose tool condition reads `idle`
+/// — comes back `Working` rather than `Idle`. NULL on every pre-existing row,
+/// which parses as `unknown`; see `semantic_progress::SemanticTurnCondition`.
+const WORK_RUNS_SEMANTIC_TURN_CONDITION_50: &str = "ALTER TABLE work_runs ADD COLUMN semantic_turn_condition TEXT";
 
 /// Serves the shared-PR probes (`o.pr_url = t.pr_url`, `pr_url = ?`) so they
 /// are index lookups instead of full `tasks` scans.
@@ -232,6 +241,11 @@ impl WorkDb {
         }
         if version < 49 {
             tx.execute_batch(BOARD_RUNTIME_EPOCH_49)?;
+        }
+        // Guarded for the same reason as schema 46: a replay against a
+        // database that already carries the column must be a no-op.
+        if version < 50 && !table_has_column(&tx, "work_runs", "semantic_turn_condition")? {
+            tx.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50)?;
         }
         if version < CURRENT_SCHEMA_VERSION {
             tx.execute(
@@ -612,6 +626,19 @@ mod tests {
             "expected per-run semantic progress columns",
         );
 
+        let semantic_turn_column: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('work_runs')
+                 WHERE name = 'semantic_turn_condition'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            semantic_turn_column, 1,
+            "expected work_runs.semantic_turn_condition (schema 50)",
+        );
+
         let tmux_token_index_exists: bool = conn
             .query_row(
                 "SELECT EXISTS(
@@ -802,6 +829,9 @@ mod floor_tests {
             if version >= 49 {
                 conn.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
             }
+            if version >= 50 {
+                conn.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
+            }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
                 [version.to_string()],
@@ -838,6 +868,7 @@ mod floor_tests {
             expected.execute_batch(IN_FLIGHT_WORKSPACES_INDEX_SQL).unwrap();
             expected.execute_batch(ATTENTION_OPEN_KIND_INDEX_SQL).unwrap();
             expected.execute_batch(BOARD_RUNTIME_EPOCH_49).unwrap();
+            expected.execute_batch(WORK_RUNS_SEMANTIC_TURN_CONDITION_50).unwrap();
             let before = capture(&expected);
             drop(conn);
             for _ in 0..2 {

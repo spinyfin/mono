@@ -53,29 +53,11 @@ fn driver_tails_a_progress_file(driver: &dyn crate::driver::AgentDriver, run_id:
     )
 }
 
-/// What [`ServerState::readopt_progress_ingress`] did, for the dispatch trace.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IngressReadoption {
-    /// The run's driver observes progress some other way (hook callbacks).
-    NotFileIngress,
-    /// The tail is back, reading from the recorded resume point.
-    Reestablished,
-    /// The run recorded no checkpoint, so whether it needed one is unknown.
-    Unknown,
-    /// It needed one and could not be re-established; an attention item says so.
-    Failed,
-}
-
-impl IngressReadoption {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NotFileIngress => "not_file_ingress",
-            Self::Reestablished => "reestablished",
-            Self::Unknown => "unknown",
-            Self::Failed => "failed",
-        }
-    }
-}
+/// What [`ServerState::readopt_progress_ingress`] did, for the dispatch
+/// trace. Shared with boot-time tmux adoption, which re-establishes the
+/// same ingress for a live run through
+/// [`crate::spawn_flow::WorkerSpawner::reestablish_progress_ingress`].
+pub(crate) use crate::spawn_flow::IngressReadoption;
 
 #[async_trait::async_trait]
 impl crate::worker_readoption::LiveWorkerConvergence for ServerState {
@@ -653,7 +635,13 @@ impl ServerState {
     /// recorded rollout cannot be re-attached the run is left un-observed
     /// *and an operator is told*, because an unobservable live session is
     /// exactly the state that needs a human.
-    async fn readopt_progress_ingress(
+    ///
+    /// Two callers: [`Self::readopt_live_worker`] for a survivor whose row
+    /// was wrongly terminalized, and — through the
+    /// [`crate::spawn_flow::WorkerSpawner`] hook — boot-time tmux adoption
+    /// for a survivor whose row was never wrong. The row's status differs;
+    /// the tail it needs back does not.
+    pub(super) async fn readopt_progress_ingress(
         &self,
         execution: &WorkExecution,
         driver: Option<std::sync::Arc<dyn crate::driver::AgentDriver>>,

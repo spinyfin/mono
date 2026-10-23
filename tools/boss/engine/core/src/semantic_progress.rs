@@ -53,6 +53,56 @@ impl SemanticToolCondition {
     }
 }
 
+/// What the engine knows about whether the worker's *turn* is open.
+///
+/// Distinct from [`SemanticToolCondition`], which answers a narrower
+/// question — "is a tool call unbalanced right now?" — and which is `Idle`
+/// for most of an ordinary turn: between one tool's `PostToolUse` and the
+/// next tool's `PreToolUse`, while the model thinks, and for the whole of a
+/// Codex background-terminal wait (its continuation polls are deliberately
+/// not re-announced, so they produce no tool-boundary event at all). None of
+/// those is "the worker has ended its turn", and conflating the two is how a
+/// re-adopted slot came back `Idle` over a worker that was mid-turn.
+///
+/// Stored as a TEXT column (`in_turn` / `ended` / `unknown`). Unrecognised
+/// or NULL values parse as [`Self::Unknown`], never as ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SemanticTurnCondition {
+    /// The driver reported turn activity (`UserPromptSubmit`, `PreToolUse`,
+    /// `PostToolUse`) and has not reported a turn boundary since. The worker
+    /// is busy — whatever its tool condition says.
+    InTurn,
+    /// The driver reported a turn boundary (`Stop`) and nothing since: the
+    /// worker is parked at its prompt.
+    Ended,
+    /// No driver event has established turn state. The default for a fresh
+    /// run and for every row that predates the column.
+    #[default]
+    Unknown,
+}
+
+impl SemanticTurnCondition {
+    /// Stable on-disk / query label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InTurn => "in_turn",
+            Self::Ended => "ended",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a stored column. `None` (legacy NULL) and any unrecognised
+    /// string are [`Self::Unknown`] — never ended.
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("in_turn") => Self::InTurn,
+            Some("ended") => Self::Ended,
+            Some("unknown") | None => Self::Unknown,
+            Some(_) => Self::Unknown,
+        }
+    }
+}
+
 /// One run's durable semantic-progress checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticProgressCheckpoint {
@@ -61,6 +111,9 @@ pub struct SemanticProgressCheckpoint {
     /// Tri-state tool condition established by that event (or still
     /// unknown, if the event was not a tool-state signal).
     pub tool_condition: SemanticToolCondition,
+    /// Tri-state turn condition established by that event (or still
+    /// unknown, if the event was not a turn-state signal).
+    pub turn_condition: SemanticTurnCondition,
 }
 
 /// Advance the tri-state tool condition for a driver-originated event.
@@ -103,6 +156,35 @@ pub fn tool_condition_signal(event: &WorkerEvent) -> Option<SemanticToolConditio
         }
         WorkerEvent::SessionStart { .. } | WorkerEvent::SessionEnd { .. } | WorkerEvent::Notification { .. } => None,
     }
+}
+
+/// What turn-state `event` establishes on its own — `None` for an event
+/// that carries no turn-state signal, and the established condition
+/// otherwise.
+///
+/// The three turn-activity events and `Stop` are exactly the events
+/// `apply_event` in `live_worker_state.rs` reduces to `Working` and
+/// `Idle`/`WaitingForInput` respectively, so this is the durable shadow of
+/// that reducer's turn gate — the driver's own turn signals, never a timer
+/// or an inference from silence. `SessionStart` (including a resume) does
+/// not open a turn, `SessionEnd` does not close one (a `SessionEnd` with an
+/// unbalanced tool is evidence the session did *not* end — see the
+/// reducer), and `Notification` is not a turn signal for the same reason it
+/// is not a tool signal above.
+pub fn turn_condition_signal(event: &WorkerEvent) -> Option<SemanticTurnCondition> {
+    match event {
+        WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. } | WorkerEvent::UserPromptSubmit { .. } => {
+            Some(SemanticTurnCondition::InTurn)
+        }
+        WorkerEvent::Stop { .. } => Some(SemanticTurnCondition::Ended),
+        WorkerEvent::SessionStart { .. } | WorkerEvent::SessionEnd { .. } | WorkerEvent::Notification { .. } => None,
+    }
+}
+
+/// Advance the tri-state turn condition for a driver-originated event; the
+/// turn-state twin of [`next_tool_condition`].
+pub fn next_turn_condition(event: &WorkerEvent, previous: SemanticTurnCondition) -> SemanticTurnCondition {
+    turn_condition_signal(event).unwrap_or(previous)
 }
 
 #[cfg(test)]
@@ -216,5 +298,83 @@ mod tests {
             SemanticToolCondition::parse(Some("in_flight")),
             SemanticToolCondition::InFlight,
         );
+    }
+
+    fn user_prompt() -> WorkerEvent {
+        WorkerEvent::UserPromptSubmit {
+            session_id: "s".into(),
+            prompt: String::new(),
+        }
+    }
+
+    /// The incident shape: a turn whose last tool-boundary event was a
+    /// `PostToolUse` reads `Idle` on the tool axis, but the turn is still
+    /// open until the driver says otherwise. A worker waiting on its own
+    /// background command sits in exactly this state.
+    #[test]
+    fn a_completed_tool_leaves_the_turn_open() {
+        let mut turn = SemanticTurnCondition::Unknown;
+        let mut tool = SemanticToolCondition::Unknown;
+        for event in [user_prompt(), pre_tool(), post_tool()] {
+            turn = next_turn_condition(&event, turn);
+            tool = next_tool_condition(&event, tool);
+        }
+        assert_eq!(
+            tool,
+            SemanticToolCondition::Idle,
+            "no tool is in flight after PostToolUse"
+        );
+        assert_eq!(
+            turn,
+            SemanticTurnCondition::InTurn,
+            "but the turn has not ended: only a Stop establishes that",
+        );
+        assert_eq!(next_turn_condition(&stop(), turn), SemanticTurnCondition::Ended);
+    }
+
+    #[test]
+    fn turn_condition_ignores_the_same_non_signals_as_tool_condition() {
+        let notification = WorkerEvent::Notification {
+            session_id: "s".into(),
+            message: "guard-trace replay".into(),
+        };
+        for previous in [
+            SemanticTurnCondition::Unknown,
+            SemanticTurnCondition::InTurn,
+            SemanticTurnCondition::Ended,
+        ] {
+            for event in [session_start(), session_end(), notification.clone()] {
+                assert_eq!(turn_condition_signal(&event), None);
+                assert_eq!(next_turn_condition(&event, previous), previous);
+            }
+        }
+    }
+
+    #[test]
+    fn turn_parse_never_turns_null_or_garbage_into_ended() {
+        assert_eq!(SemanticTurnCondition::parse(None), SemanticTurnCondition::Unknown);
+        assert_eq!(
+            SemanticTurnCondition::parse(Some("bogus")),
+            SemanticTurnCondition::Unknown
+        );
+        assert_eq!(
+            SemanticTurnCondition::parse(Some("unknown")),
+            SemanticTurnCondition::Unknown
+        );
+        assert_eq!(
+            SemanticTurnCondition::parse(Some("in_turn")),
+            SemanticTurnCondition::InTurn
+        );
+        assert_eq!(
+            SemanticTurnCondition::parse(Some("ended")),
+            SemanticTurnCondition::Ended
+        );
+        for condition in [
+            SemanticTurnCondition::InTurn,
+            SemanticTurnCondition::Ended,
+            SemanticTurnCondition::Unknown,
+        ] {
+            assert_eq!(SemanticTurnCondition::parse(Some(condition.as_str())), condition);
+        }
     }
 }
