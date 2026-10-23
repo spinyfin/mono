@@ -1,18 +1,6 @@
 use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
 use super::*;
 
-/// Stage a board refresh in the transaction that changed classification
-/// inputs, including callers with no frontend mutation handler.
-pub(crate) fn stage_task_board_change(pending: &mut PendingEvents, conn: &Connection, id: &str) -> Result<()> {
-    if let Some(task) = query_task(conn, id)? {
-        pending.push(boss_event_bus::Event::WorkItemChanged {
-            product_id: task.product_id,
-            task_id: task.id,
-        });
-    }
-    Ok(())
-}
-
 /// Shared per-product short-id read-modify-write. Reads the current
 /// `next_value` from `table` for `product_id` (defaulting to 1 when no
 /// row exists yet), writes back `next_value + 1`, and returns the value
