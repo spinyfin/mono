@@ -1006,14 +1006,26 @@ impl LiveWorkerStateRegistry {
     /// or `None` if no driver-originated event has been recorded (and none
     /// was restored on re-adoption).
     pub fn semantic_progress_for_slot(&self, slot_id: u8) -> Option<SemanticProgressCheckpoint> {
+        self.with_semantic_progress(slot_id, |checkpoint| checkpoint)
+    }
+
+    /// Consume the latest checkpoint while holding the reducer lock.
+    /// Persistence must finish inside this callback so an older dispatch
+    /// cannot overwrite a newer accepted event. Do not re-enter the registry.
+    pub fn with_semantic_progress<R>(
+        &self,
+        slot_id: u8,
+        consume: impl FnOnce(Option<SemanticProgressCheckpoint>) -> R,
+    ) -> R {
         let guard = self.inner.lock().expect("registry mutex poisoned");
-        guard.get(&slot_id).and_then(|entry| {
+        let checkpoint = guard.get(&slot_id).and_then(|entry| {
             Some(SemanticProgressCheckpoint {
                 progress_at: entry.meta.semantic_progress_at.clone()?,
                 tool_condition: entry.meta.semantic_tool_condition,
                 turn_condition: entry.meta.semantic_turn_condition,
             })
-        })
+        });
+        consume(checkpoint)
     }
 
     /// Declare the [`ProgressFidelity`] tier for `slot_id`'s driver. The
@@ -2090,6 +2102,11 @@ impl LiveWorkerStateRegistry {
             }
             if meta.spawned_at > cutoff {
                 // Spawned too recently; give the worker more time.
+                continue;
+            }
+            if meta.semantic_progress_at.is_some() {
+                // A checkpoint-seeded driver is past startup; an unknown
+                // restored turn is not a directory-trust prompt.
                 continue;
             }
             let promoted = if meta.awaiting_input_capable {

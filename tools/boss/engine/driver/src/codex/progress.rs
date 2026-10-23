@@ -2675,9 +2675,9 @@ mod tests {
             "the background command is announced exactly once, when it starts"
         );
 
-        // The wait itself: the cell yields, then the model polls it again and
-        // again. Twelve-plus minutes of this in the incident; three rounds
-        // here. Every record is silent — no PostToolUse (the command has
+        // The wait itself: the cell yields, then the model polls it again
+        // (a real wait can last many minutes; three rounds here).
+        // Every record is silent — no PostToolUse (the command has
         // not finished), no Stop (the turn has not ended), nothing that a
         // reducer could read as idle.
         let mut quiet = Vec::new();

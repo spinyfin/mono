@@ -475,14 +475,16 @@ pub(super) fn dispatch_codex_guard_trace_on_notification(
 /// Persist the semantic-progress checkpoint for one dispatched event.
 ///
 /// `settled` is the registry's post-apply checkpoint, present only when the
-/// live-state reducer accepted the event. The reducer owns ingress ordering
+/// live-state reducer accepted the event, refreshed under the registry lock
+/// which remains held through the DB write. The reducer owns ingress ordering
 /// and the subagent rules, so a refused (stale) event stamps the time alone
 /// and an accepted one writes what the reducer settled on. With no slot to
-/// settle it, the event's own signals are the only evidence there is.
+/// settle it, main-session signals are used; subagent tools only stamp liveness.
 fn persist_semantic_progress(
     server_state: &Arc<ServerState>,
     run_id: &str,
     event: &crate::protocol::WorkerEvent,
+    origin: HookOrigin,
     outcome: Option<&ApplyEventOutcome>,
     settled: Option<crate::semantic_progress::SemanticProgressCheckpoint>,
 ) {
@@ -490,6 +492,14 @@ fn persist_semantic_progress(
         (Some(ApplyEventOutcome::Stale { .. }), _) => server_state.work_db.record_semantic_progress_stamp(run_id),
         (Some(ApplyEventOutcome::Applied { .. }), Some(checkpoint)) => {
             server_state.work_db.record_semantic_checkpoint(run_id, &checkpoint)
+        }
+        _ if origin.from_subagent
+            && matches!(
+                event,
+                crate::protocol::WorkerEvent::PreToolUse { .. } | crate::protocol::WorkerEvent::PostToolUse { .. }
+            ) =>
+        {
+            server_state.work_db.record_semantic_progress_stamp(run_id)
         }
         _ => server_state.work_db.record_semantic_progress(run_id, event),
     };
@@ -507,12 +517,37 @@ fn persist_semantic_progress(
     }
 }
 
+/// Persist accepted state without allowing a dispatch paused after apply to
+/// write an obsolete snapshot. The registry lock serializes capture and write
+/// with every reducer transition, even when another dispatch overtakes this one.
+pub(super) fn persist_applied_semantic_progress(
+    server_state: &Arc<ServerState>,
+    run_id: &str,
+    slot_id: u8,
+    incoming: &crate::events_socket::IncomingHookEvent,
+    outcome: &ApplyEventOutcome,
+) {
+    let origin = HookOrigin {
+        ingress_seq: incoming.connection.ingress_seq,
+        from_subagent: incoming.connection.from_subagent,
+    };
+    server_state
+        .live_worker_states
+        .with_semantic_progress(slot_id, |settled| {
+            persist_semantic_progress(server_state, run_id, &incoming.event, origin, Some(outcome), settled);
+        });
+}
+
 pub(super) async fn dispatch_live_worker_state(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
     let event_kind = worker_event_kind(&incoming.event);
     server_state.dispatcher_stats.inc_hook_events_total();
+    let origin = HookOrigin {
+        ingress_seq: incoming.connection.ingress_seq,
+        from_subagent: incoming.connection.from_subagent,
+    };
     tracing::info!(
         run_id = ?incoming.run_id,
         peer_pid = ?incoming.connection.peer_pid,
@@ -639,7 +674,7 @@ pub(super) async fn dispatch_live_worker_state(
                         from_cache,
                     )
                     .await;
-                    persist_semantic_progress(server_state, run_id, &incoming.event, None, None);
+                    persist_semantic_progress(server_state, run_id, &incoming.event, origin, None, None);
                     // No slot, and not a live remote worker. Before we
                     // drop the event, check whether it belongs to an
                     // execution the engine already believes is terminal —
@@ -716,8 +751,7 @@ pub(super) async fn dispatch_live_worker_state(
         },
         &incoming.event,
     );
-    let settled = server_state.live_worker_states.semantic_progress_for_slot(slot_id);
-    persist_semantic_progress(server_state, run_id, &incoming.event, Some(&applied.outcome), settled);
+    persist_applied_semantic_progress(server_state, run_id, slot_id, incoming, &applied.outcome);
     let stale_event = matches!(applied.outcome, ApplyEventOutcome::Stale { .. });
     let changed = applied.repaired || matches!(applied.outcome, ApplyEventOutcome::Applied { changed: true });
     let new_state = server_state.live_worker_states.get(slot_id);

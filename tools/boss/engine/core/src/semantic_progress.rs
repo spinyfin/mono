@@ -309,7 +309,7 @@ mod tests {
         }
     }
 
-    /// The incident shape: a turn whose last tool-boundary event was a
+    /// A turn whose last tool-boundary event was a
     /// `PostToolUse` reads `Idle` on the tool axis, but the turn is still
     /// open until the driver says otherwise. A worker waiting on its own
     /// background command sits in exactly this state.

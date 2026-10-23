@@ -274,3 +274,105 @@ fn mark_errored_does_not_write_semantic_progress() {
         "mark_errored is engine inference, not driver progress",
     );
 }
+
+#[tokio::test]
+async fn no_slot_subagent_tool_hooks_preserve_an_ended_turn() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id)).await;
+    server_state.worker_registry.take_slot_for_run(&execution_id);
+    server_state.live_worker_states.release_slot(SLOT);
+    for mut event in [pre_tool_use(&execution_id), post_tool_use(&execution_id)] {
+        event.connection.from_subagent = true;
+        dispatch_worker_event_fanout(&server_state, &event).await;
+        assert_reseeded_turn(
+            &server_state,
+            &execution_id,
+            SemanticTurnCondition::Ended,
+            boss_protocol::WorkerActivity::Idle,
+        );
+    }
+}
+
+fn assert_reseeded_turn(
+    server_state: &ServerState,
+    execution_id: &str,
+    turn: SemanticTurnCondition,
+    activity: boss_protocol::WorkerActivity,
+) {
+    let checkpoint = server_state
+        .work_db
+        .get_run_semantic_progress_checkpoint(execution_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.turn_condition, turn);
+    let rebuilt = crate::live_worker_state::LiveWorkerStateRegistry::new();
+    rebuilt.register_readoption(
+        SLOT,
+        execution_id,
+        "codex",
+        4242,
+        None,
+        false,
+        crate::live_worker_state::LiveSpawnRouting::none(),
+        crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
+    );
+    rebuilt.seed_semantic_progress(SLOT, &checkpoint);
+    assert_eq!(rebuilt.get(SLOT).unwrap().activity, activity);
+}
+
+#[tokio::test]
+async fn an_older_accepted_dispatch_persists_the_latest_checkpoint() {
+    use crate::live_worker_state::HookOrigin;
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let older_state = server_state.clone();
+    let older_id = execution_id.clone();
+    let older = std::thread::spawn(move || {
+        let applied = older_state.live_worker_states.apply_hook_event(
+            SLOT,
+            HookOrigin {
+                ingress_seq: Some(3),
+                from_subagent: false,
+            },
+            &stop(&older_id).event,
+        );
+        assert!(matches!(
+            applied.outcome,
+            crate::live_worker_state::ApplyEventOutcome::Applied { .. }
+        ));
+        let captured = older_state.live_worker_states.semantic_progress_for_slot(SLOT).unwrap();
+        assert_eq!(captured.turn_condition, SemanticTurnCondition::Ended);
+        captured_tx.send(()).unwrap();
+        resume_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        // The dispatcher must refresh under the lock and keep it through
+        // persistence, never write the snapshot captured before the pause.
+        crate::app::worker_events::persist_applied_semantic_progress(
+            &older_state,
+            &older_id,
+            SLOT,
+            &stop(&older_id),
+            &applied.outcome,
+        );
+    });
+    captured_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    let mut newer = pre_tool_use(&execution_id);
+    newer.connection.ingress_seq = Some(4);
+    dispatch_worker_event_fanout(&server_state, &newer).await;
+    assert_reseeded_turn(
+        &server_state,
+        &execution_id,
+        SemanticTurnCondition::InTurn,
+        boss_protocol::WorkerActivity::Working,
+    );
+    resume_tx.send(()).unwrap();
+    older.join().unwrap();
+    assert_reseeded_turn(
+        &server_state,
+        &execution_id,
+        SemanticTurnCondition::InTurn,
+        boss_protocol::WorkerActivity::Working,
+    );
+}

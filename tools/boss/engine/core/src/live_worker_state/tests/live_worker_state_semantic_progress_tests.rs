@@ -197,6 +197,15 @@ fn seed_semantic_progress_infers_no_turn_boundary_for_a_legacy_row() {
             expected,
             "tool condition {tool_condition:?}"
         );
+        for capable in [false, true] {
+            reg.set_awaiting_input_capable(1, capable);
+            let now = boss_engine_utils::epoch_time::now_epoch_secs();
+            assert!(
+                reg.mark_stalled_spawns(now + STALLED_SPAWN_THRESHOLD_SECS + 1, STALLED_SPAWN_THRESHOLD_SECS)
+                    .is_empty()
+            );
+            assert_eq!(reg.get(1).unwrap().activity, expected);
+        }
     }
 }
 
