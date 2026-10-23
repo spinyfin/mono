@@ -79,9 +79,12 @@ impl SpokeHub for Hub {
             // Nothing is published when a certificate expires or an overlap
             // ends, so the stream closes itself at its deadline. The deadline
             // only ever moves earlier: from a matching `Superseded`, and from
-            // what `revalidate` reports after missed events. (A production
-            // handler sleeps until the deadline; this one polls the injected
-            // clock so tests can move time without waiting.)
+            // what `revalidate` reports after missed events. The deadline is
+            // sampled on every iteration, so events about other hosts cannot
+            // postpone it. (A production handler keeps one `sleep_until`
+            // future outside the loop and resets it only when the deadline
+            // moves; this one polls the injected clock so tests can move time
+            // without waiting.)
             let mut host = host;
             loop {
                 let still_valid = tokio::select! {
@@ -103,7 +106,7 @@ impl SpokeHub for Hub {
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
                     },
                 };
-                if !still_valid {
+                if !still_valid || clock.now() >= host.valid_until {
                     let _ = tx
                         .send(Err(Status::unauthenticated("credential no longer valid")))
                         .await;
@@ -487,6 +490,40 @@ async fn an_idle_stream_closes_when_its_certificate_expires() {
 
     fx.clock.advance(Duration::from_secs(31 * 24 * 3600));
     assert_eq!(closed_with(&mut stream).await, Code::Unauthenticated);
+    hub.stop().await;
+}
+
+/// Events about other hosts arriving faster than the poll interval must not
+/// postpone the deadline of a stream they do not concern.
+#[tokio::test(flavor = "multi_thread")]
+async fn unrelated_credential_traffic_cannot_postpone_an_expired_streams_closure() {
+    let fx = Fixture::new();
+    let hub = start(&fx, ServiceLimits::default()).await;
+    let (spoke, cert) = fx.enrolled("edge-1");
+    let wire = v1::Certificate {
+        leaf_der: cert.leaf_der.clone(),
+        ..v1::Certificate::default()
+    };
+    let mut stream = connect(&hub, identity_of(&spoke, &wire)).await.expect("connects");
+    let others: Vec<String> = (0..60).map(|i| format!("other-{i}")).collect();
+    for id in &others {
+        fx.enrolled(id);
+    }
+
+    let credentials = Arc::clone(&fx.credentials);
+    let storm = tokio::spawn(async move {
+        for id in others {
+            credentials.revoke(&id, "test", "traffic").expect("revoke");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    fx.clock.advance(Duration::from_secs(31 * 24 * 3600));
+    assert_eq!(closed_with(&mut stream).await, Code::Unauthenticated);
+    assert!(
+        !storm.is_finished(),
+        "the stream closed while unrelated events were still arriving"
+    );
+    storm.abort();
     hub.stop().await;
 }
 
