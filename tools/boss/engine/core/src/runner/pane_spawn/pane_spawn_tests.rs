@@ -70,6 +70,50 @@ struct CapturingSpawner {
     hook_before_registration: std::sync::atomic::AtomicBool,
     /// Cancel exactly when confirmation first observes the pane.
     cancel_on_capture: StdMutex<Option<(Arc<WorkDb>, String)>>,
+    /// Keeps the per-run homes root pointed inside the test's workspace for
+    /// as long as the spawner lives. See [`HomesPin`].
+    homes_pin: StdMutex<Option<HomesPin>>,
+}
+
+/// Pins `BOSS_CODEX_HOMES_DIR` to a directory inside the test's own workspace.
+///
+/// Claude provisioning writes the private brief under the per-run homes root
+/// and leaves `.claude/initial-prompt.txt` as a symlink to it. That root comes
+/// from a process-global env var which sibling tests repoint at their own temp
+/// dirs, so a spawn that lands inside such a window leaves a symlink into a
+/// directory that is deleted when that sibling finishes, and the read-back
+/// fails with `NotFound`. Holding the override for the whole test (on a helper
+/// thread, because its guard is a blocking lock that must not be held across
+/// `.await`) keeps the brief where the test can read it.
+struct HomesPin {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HomesPin {
+    fn new(root: PathBuf) -> Self {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (ready_tx, ready) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _guard = crate::driver::test_support::codex_homes_override(&root);
+            ready_tx.send(()).unwrap();
+            let _ = released.recv();
+        });
+        ready.recv().unwrap();
+        Self {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for HomesPin {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl CapturingSpawner {
@@ -88,6 +132,7 @@ impl CapturingSpawner {
             capture_log: StdMutex::new(Vec::new()),
             hook_before_registration: std::sync::atomic::AtomicBool::new(false),
             cancel_on_capture: StdMutex::new(None),
+            homes_pin: StdMutex::new(None),
         }
     }
 
@@ -373,6 +418,7 @@ fn spawn_test_env(
     Arc<WorkDb>,
 ) {
     let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+    *spawner.homes_pin.lock().unwrap() = Some(HomesPin::new(workspace.path().join("codex-homes")));
     let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
         Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
     let cfg = test_runtime_config(
