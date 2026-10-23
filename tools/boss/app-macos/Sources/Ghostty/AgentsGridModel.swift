@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import PaneLayout
 
@@ -190,7 +191,7 @@ final class AgentsGridModel: ObservableObject {
         interactivePoolSize: Int,
         automationPoolSize: Int,
         reviewPoolSize: Int,
-        feedUnavailable: Bool
+        feedUnavailable: Bool = false
     ) {
         if !isVisible { setVisible(false) }
         apply(
@@ -214,16 +215,13 @@ final class AgentsGridModel: ObservableObject {
         placedRunIds(in: layout).union(attached).sorted()
     }
 
-    /// Authoritative membership + current viewer map. Callers must pass
-    /// only an accepted live-state snapshot: duplicates and a disconnected
-    /// feed are handled by `LiveWorkerStateStore` before they reach here.
     func apply(
         states: [WorkerLiveState],
         viewers: [String: WorkerSlot],
         interactivePoolSize: Int,
         automationPoolSize: Int,
         reviewPoolSize: Int,
-        feedUnavailable: Bool
+        feedUnavailable: Bool = false
     ) {
         if self.feedUnavailable != feedUnavailable {
             self.feedUnavailable = feedUnavailable
@@ -259,9 +257,8 @@ final class AgentsGridModel: ObservableObject {
         }
         replaceLayout { $0.updateMembers(members) }
 
-        let placed = placedRunIds(in: layout)
         let needed = Set(local.map(\.runId))
-            .union(placed)
+            .union(placedRunIds(in: layout))
             .union(viewers.keys)
         personaByRun = personaByRun.filter { needed.contains($0.key) }
 
@@ -314,6 +311,42 @@ final class AgentsGridModel: ObservableObject {
     /// Test seam: skip the 300 ms quiet window.
     func flushGeometryForTesting() {
         liveResizeDidEnd()
+    }
+
+    /// Frame and visibility for a run's surface within `area`. Pane
+    /// rectangles use the same `policy.gap` the capacity and shape math
+    /// scores with. A run in no cell (released, detach pending) gets a usable
+    /// hidden frame.
+    func placement(for runId: String, area: CGSize) -> (frame: CGRect, visible: Bool) {
+        Self.placement(for: runId, area: area, layout: layout)
+    }
+
+    static func placement(for runId: String, area: CGSize, layout: PaneLayoutModel) -> (frame: CGRect, visible: Bool) {
+        let gap = CGFloat(layout.policy.gap)
+        for page in layout.pages {
+            for cell in page.cells {
+                let id: String?
+                switch cell.content {
+                case .occupied(let member): id = member.runId
+                case .placeholder(let run): id = run
+                case .empty: id = nil
+                }
+                guard id == runId else { continue }
+                let columns = CGFloat(page.shape.columns)
+                let rows = CGFloat(page.shape.rows)
+                let width = max(1, (area.width - (columns - 1) * gap) / columns)
+                let height = max(1, (area.height - (rows - 1) * gap) / rows)
+                let position = page.shape.position(ofLocalIndex: cell.localIndex)
+                let frame = CGRect(
+                    x: CGFloat(position.column) * (width + gap),
+                    y: CGFloat(position.row) * (height + gap),
+                    width: width,
+                    height: height
+                )
+                return (frame, page.index == layout.selectedPage)
+            }
+        }
+        return (CGRect(x: 0, y: 0, width: max(420, area.width), height: max(356, area.height)), false)
     }
 
     static func poolStrip(

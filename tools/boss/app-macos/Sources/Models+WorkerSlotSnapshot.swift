@@ -84,6 +84,8 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
 
     var badgeType: AgentType { live?.badgeType ?? .unknown }
     var isExited: Bool { live?.isExited == true }
+    /// A finished placeholder is historical text, not an addressable worker.
+    var offersLiveStatusToggle: Bool { !isPlaceholder }
     var isViewerMissing: Bool { runId != nil && session == nil && !isPlaceholder }
 
     /// Caption for the viewer-missing card. A live member legitimately has
