@@ -1,0 +1,25 @@
+[package]
+name = "boss-host-enrollment"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+base64 = { workspace = true }
+boss-protocol-spoke = { path = "../../protocol-spoke" }
+rand = { workspace = true }
+rcgen = { workspace = true }
+rusqlite = { workspace = true }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { version = "0.3", default-features = false }
+tokio = { workspace = true, features = ["rt", "sync"] }
+tonic = { workspace = true }
+tracing = { workspace = true }
+x509-parser = "0.18.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }

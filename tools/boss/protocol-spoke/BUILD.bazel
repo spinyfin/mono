@@ -22,10 +22,9 @@ rust_prost_library(
     proto = ":spoke_v1_proto",
 )
 
-# No consumer exists yet, so this is package-private. Each design-named
-# consumer (engine/core, engine/spoke, engine/spoke-journal,
-# engine/spoke-stream) is added to `visibility` in the PR that makes it depend
-# on this crate.
+# Visible only to its consumers. The rest of the design-named ones
+# (engine/core, engine/spoke, engine/spoke-journal, engine/spoke-stream) are
+# added in the PR that makes each depend on this crate.
 rust_library(
     name = "protocol-spoke",
     srcs = glob(["src/**/*.rs"]),
@@ -33,6 +32,7 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/host-enrollment:__pkg__"],
     deps = [
         ":spoke_v1_rust_proto",
         "//tools/boss/protocol",
