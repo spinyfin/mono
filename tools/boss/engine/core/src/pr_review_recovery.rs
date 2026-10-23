@@ -48,7 +48,6 @@ use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::{
     DeadPrReviewCandidate, GhPrStateChecker, ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
     ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, PrOpenState, PrStateChecker, RetryDeadReviewBatchMember, WorkDb,
-    WorkItem,
 };
 
 /// Attention-item kind filed when a dead review is auto-refired — lets the
@@ -156,9 +155,11 @@ pub async fn run_one_pass(
         // the merge poller moving the task to `done` — without this check a
         // leaf would spawn a reviewer (and burn a review-pool slot and a
         // cube lease) for a PR that no longer needs one.
-        let pr_url = match work_db.get_work_item(&work_item_id) {
-            Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => task.pr_url,
-            Ok(_) => None,
+        // A narrow `pr_url` read (see `work/sweep_reads.rs`): the candidate
+        // query joins `tasks`, so this is always a task/chore row, and the
+        // full projection's badge/chain work was pure cost here.
+        let pr_url = match work_db.task_pr_url(&work_item_id) {
+            Ok(pr_url) => pr_url,
             Err(error) => {
                 tracing::warn!(
                     work_item_id = %work_item_id,

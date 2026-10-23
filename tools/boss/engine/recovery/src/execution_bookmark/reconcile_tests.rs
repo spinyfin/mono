@@ -742,3 +742,79 @@ async fn abandoned_recorded_baseline_without_a_successor_is_a_typed_missing_base
     let patch = diff(&LocalJj, &record).await.unwrap();
     assert!(patch.is_empty(), "{patch}");
 }
+
+/// Counts child processes so the batched snapshot / restore can be held to
+/// its spawn budget: one `jj` per snapshot, one per no-op restore, and one
+/// extra per distinct target commit when pointers actually moved.
+#[derive(Default)]
+struct CountingJj {
+    spawns: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait]
+impl Jj for CountingJj {
+    async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
+        self.spawns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LocalJj.run(repo, args).await
+    }
+
+    async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
+        LocalJj.shared_repo(workspace).await
+    }
+}
+
+#[tokio::test]
+async fn pointer_snapshot_and_restore_spawn_one_jj_per_batch() {
+    let s = revision_on_pr_head("exec_spawn_budget").await;
+    let jj = CountingJj::default();
+    let before = snapshot_pointers(&jj, &s.record).await.unwrap();
+    assert_eq!(
+        jj.spawns.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "snapshot is one jj log"
+    );
+    assert_eq!(before.len(), 3);
+    assert!(
+        before
+            .iter()
+            .any(|(name, commit)| name == &s.record.head() && commit.is_some()),
+        "{before:?}"
+    );
+    assert_eq!(before, snapshot_pointers(&LocalJj, &s.record).await.unwrap());
+
+    // Nothing moved: the restore reads the current pointers and sets none.
+    restore_pointers(&jj, &s.record, &before).await.unwrap();
+    assert_eq!(
+        jj.spawns.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "no-op restore is one jj log"
+    );
+
+    // Two pointers moved to the same commit: one read plus one set per
+    // distinct saved target among the moved pointers.
+    let pr = one(&s.repo.repo, "pr/7");
+    bookmark(&s.repo.repo, &s.record.publication(), &pr);
+    bookmark(&s.repo.repo, &s.record.head(), &pr);
+    let distinct_targets = before
+        .iter()
+        .filter(|(name, _)| name == &s.record.head() || name == &s.record.publication())
+        .filter_map(|(_, commit)| commit.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    restore_pointers(&jj, &s.record, &before).await.unwrap();
+    assert_eq!(
+        jj.spawns.load(std::sync::atomic::Ordering::Relaxed),
+        3 + distinct_targets as u64,
+        "{before:?}"
+    );
+    assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
+
+    // A saved-absent pointer that reappeared is deleted again; a conflicted
+    // current pointer is always re-set.
+    let mut without_base = before.clone();
+    without_base[0].1 = None;
+    restore_pointers(&LocalJj, &s.record, &without_base).await.unwrap();
+    assert!(!bookmark_exists(&s.repo.repo, &s.record.base()));
+    restore_pointers(&LocalJj, &s.record, &before).await.unwrap();
+    assert_eq!(snapshot_pointers(&LocalJj, &s.record).await.unwrap(), before);
+}

@@ -20,6 +20,11 @@ pub(super) fn new_metrics_registry() -> Arc<crate::metrics::Registry> {
     let registry = Arc::new(crate::metrics::Registry::new());
     register_metrics(&registry);
     crate::work::db_diagnostics::register_metrics(&registry);
+    // The sweeps publish their per-pass telemetry through `WorkDb`'s
+    // registry (`WorkDb::metrics_registry`), so a standalone `WorkDb` —
+    // every unit test — needs those handles registered too. The engine's
+    // own registry gets them from `metrics_init::init_all`.
+    crate::sweep_metrics::register_metrics(&registry);
     registry
 }
 

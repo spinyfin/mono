@@ -38,13 +38,13 @@
 //! worker-session pipeline today; duration is the cost signal T298 showed
 //! dominates — ~42% of that run was model thinking time, not builds.)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
 use boss_event_bus::{Event, EventBus, EventKind, TopicFilter, spawn_supervised};
-use boss_protocol::{CreateAttentionItemInput, EffortLevel, LiveWorkerState, WorkItem, WorkerActivity};
+use boss_protocol::{CreateAttentionItemInput, EffortLevel, LiveWorkerState, WorkerActivity};
 use boss_timer_wheel::TimerWheel;
 
 use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -170,6 +170,11 @@ impl crate::sweep_loop::SweepOutcome for EnvelopeSweepOutcome {
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`, firing
 /// once immediately on boot (so a run that overran before an engine restart is
 /// re-signalled at boot without waiting for the first interval).
+///
+/// Each pass runs on the blocking pool: it is synchronous SQLite work, and
+/// running it inline on an async worker thread stalled every other task on
+/// that thread for the duration of the pass (visible on the 2026-10-21
+/// engine sample as multi-thread scheduler frames under the sweep).
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
@@ -180,8 +185,18 @@ pub fn spawn_loop(
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         async move {
-            let now = boss_engine_utils::epoch_time::now_epoch_secs();
-            run_one_pass(work_db.as_ref(), live_states.as_ref(), &thresholds, now)
+            let pass = crate::work::db_diagnostics::spawn_blocking(move || {
+                let now = boss_engine_utils::epoch_time::now_epoch_secs();
+                run_one_pass(work_db.as_ref(), live_states.as_ref(), &thresholds, now)
+            })
+            .await;
+            match pass {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    tracing::error!(?err, "envelope-watch: sweep pass did not complete");
+                    EnvelopeSweepOutcome::default()
+                }
+            }
         }
     })
 }
@@ -190,18 +205,40 @@ pub fn spawn_loop(
 /// reads live worker state and the DB, files an attention item on a fresh
 /// overrun, and returns a summary. `now_epoch_secs` is injected for
 /// deterministic tests.
+///
+/// The pass is two-phase so its DB cost is one execution point-read per
+/// live slot plus ONE batched effort-level read for the whole pass, instead
+/// of the full work-item projection (revision chain, AI-review badge, …)
+/// per slot it used to build just to read `effort_level`.
 pub fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     thresholds: &EnvelopeThresholds,
     now_epoch_secs: i64,
 ) -> EnvelopeSweepOutcome {
+    let registry = work_db.metrics_registry();
+    let timer = crate::sweep_metrics::ENVELOPE_WATCH.begin(registry);
     let mut outcome = EnvelopeSweepOutcome::default();
 
-    for state in live_states.snapshot() {
-        match evaluate_slot(work_db, thresholds, now_epoch_secs, &state) {
-            SlotOutcome::NotWorking => outcome.not_working_skipped += 1,
-            SlotOutcome::LookupFailed | SlotOutcome::Terminal => {}
+    let states = live_states.snapshot();
+    let mut loaded = Vec::with_capacity(states.len());
+    for state in &states {
+        match load_slot(
+            work_db,
+            state,
+            "envelope-watch: failed to look up execution; skipping slot",
+        ) {
+            Ok(slot) => loaded.push(slot),
+            Err(SlotOutcome::NotWorking) => outcome.not_working_skipped += 1,
+            Err(_) => {}
+        }
+    }
+    let efforts = prefetch_efforts(work_db, loaded.iter().map(|slot| slot.execution.work_item_id.as_str()));
+
+    for slot in &loaded {
+        let effort = efforts.get(&slot.execution.work_item_id).copied();
+        match evaluate_loaded_slot(work_db, thresholds, now_epoch_secs, slot, effort) {
+            SlotOutcome::NotWorking | SlotOutcome::LookupFailed | SlotOutcome::Terminal => {}
             SlotOutcome::NoStartedAt => outcome.no_started_at_skipped += 1,
             SlotOutcome::NoEnvelope => outcome.no_envelope_skipped += 1,
             SlotOutcome::WithinEnvelope => outcome.within_envelope += 1,
@@ -216,6 +253,7 @@ pub fn run_one_pass(
         }
     }
 
+    timer.finish(registry, states.len());
     outcome
 }
 
@@ -243,6 +281,58 @@ enum SlotOutcome {
     Signaled,
 }
 
+/// A live `Working` slot paired with its execution row — the per-slot
+/// state both the batched sweep and the single-slot timer path evaluate.
+struct LoadedSlot<'a> {
+    state: &'a LiveWorkerState,
+    execution: boss_protocol::WorkExecution,
+}
+
+/// Phase one of a slot evaluation: the activity filter and the execution
+/// point-read. `Err` carries the outcome to count for a slot that never
+/// reaches evaluation.
+fn load_slot<'a>(
+    work_db: &WorkDb,
+    state: &'a LiveWorkerState,
+    lookup_context: &str,
+) -> Result<LoadedSlot<'a>, SlotOutcome> {
+    // Only actively-working slots count toward the work-time envelope. A
+    // slot waiting for human input or idle is blocked on the operator,
+    // not overrunning on compute; `Spawning` has no `started_at` yet. A
+    // long foreground build keeps the slot `Working`, and that time
+    // legitimately counts against the envelope — so, unlike the stale
+    // sweep, we do NOT skip a tool-in-flight slot here.
+    if state.activity != WorkerActivity::Working {
+        return Err(SlotOutcome::NotWorking);
+    }
+    let execution = crate::sweep_loop::lookup_execution_or_warn(work_db, &state.run_id, lookup_context)
+        .ok_or(SlotOutcome::LookupFailed)?;
+    Ok(LoadedSlot { state, execution })
+}
+
+/// One batched effort-level read for every work item a pass will evaluate.
+/// A failed batch degrades every slot to "no envelope" for this pass —
+/// the same answer the per-slot read used to give on a lookup error — and
+/// is logged once rather than once per slot.
+fn prefetch_efforts<'a>(
+    work_db: &WorkDb,
+    work_item_ids: impl Iterator<Item = &'a str>,
+) -> HashMap<String, EffortLevel> {
+    let mut ids: Vec<String> = work_item_ids.map(str::to_owned).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    match work_db.task_effort_levels(&ids) {
+        Ok(efforts) => efforts,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "envelope-watch: batched effort lookup failed; treating every slot as unclassified this pass"
+            );
+            HashMap::new()
+        }
+    }
+}
+
 /// Evaluate a single live slot against its envelope, filing the overrun
 /// attention item (via [`file_overrun_attention`]) exactly once per
 /// execution. Pure detection plus the same best-effort signal side effect
@@ -254,24 +344,29 @@ fn evaluate_slot(
     now_epoch_secs: i64,
     state: &LiveWorkerState,
 ) -> SlotOutcome {
-    // Only actively-working slots count toward the work-time envelope. A
-    // slot waiting for human input or idle is blocked on the operator,
-    // not overrunning on compute; `Spawning` has no `started_at` yet. A
-    // long foreground build keeps the slot `Working`, and that time
-    // legitimately counts against the envelope — so, unlike the stale
-    // sweep, we do NOT skip a tool-in-flight slot here.
-    if state.activity != WorkerActivity::Working {
-        return SlotOutcome::NotWorking;
-    }
-
-    let execution_id = &state.run_id;
-    let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
+    let slot = match load_slot(
         work_db,
-        execution_id,
+        state,
         "envelope-watch: failed to look up execution; skipping slot",
-    ) else {
-        return SlotOutcome::LookupFailed;
+    ) {
+        Ok(slot) => slot,
+        Err(outcome) => return outcome,
     };
+    let effort = effort_for_work_item(work_db, &slot.execution.work_item_id);
+    evaluate_loaded_slot(work_db, thresholds, now_epoch_secs, &slot, effort)
+}
+
+/// Phase two of a slot evaluation, given the execution row and the work
+/// item's (already resolved) effort class.
+fn evaluate_loaded_slot(
+    work_db: &WorkDb,
+    thresholds: &EnvelopeThresholds,
+    now_epoch_secs: i64,
+    slot: &LoadedSlot<'_>,
+    effort: Option<EffortLevel>,
+) -> SlotOutcome {
+    let execution = &slot.execution;
+    let execution_id = &slot.state.run_id;
 
     // A completion may have raced the sweep — a terminal execution is done.
     if execution.status.is_terminal() {
@@ -285,7 +380,7 @@ fn evaluate_slot(
 
     // Resolve the row's effort class → its envelope. An unclassified row,
     // `Max`, or a disabled class has no envelope and is never signalled.
-    let Some(effort) = effort_for_work_item(work_db, &execution.work_item_id) else {
+    let Some(effort) = effort else {
         return SlotOutcome::NoEnvelope;
     };
     let Some(envelope_secs) = thresholds.for_effort(effort) else {
@@ -425,30 +520,33 @@ fn reconcile_envelope_deadlines(
 ) {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let mut current_ids: HashSet<String> = HashSet::new();
-    for state in live_states.snapshot() {
-        if state.activity != WorkerActivity::Working {
-            continue;
-        }
-        let execution_id = state.run_id.clone();
-        let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
+    let states = live_states.snapshot();
+    let mut loaded = Vec::with_capacity(states.len());
+    for state in &states {
+        if let Ok(slot) = load_slot(
             work_db,
-            &execution_id,
+            state,
             "envelope-watch: failed to look up execution; not scheduling deadline",
-        ) else {
-            continue;
-        };
+        ) {
+            loaded.push(slot);
+        }
+    }
+    let efforts = prefetch_efforts(work_db, loaded.iter().map(|slot| slot.execution.work_item_id.as_str()));
+    for slot in &loaded {
+        let execution = &slot.execution;
         if execution.status.is_terminal() {
             continue;
         }
         let Some(started_epoch) = execution.started_epoch() else {
             continue;
         };
-        let Some(effort) = effort_for_work_item(work_db, &execution.work_item_id) else {
+        let Some(effort) = efforts.get(&execution.work_item_id).copied() else {
             continue;
         };
         let Some(envelope_secs) = thresholds.for_effort(effort) else {
             continue;
         };
+        let execution_id = slot.state.run_id.clone();
         if !scheduled_ids.contains(&execution_id) {
             let elapsed_secs = (now - started_epoch).max(0);
             let remaining_secs = (envelope_secs - elapsed_secs).max(0) as u64;
@@ -482,11 +580,21 @@ fn handle_timer_deadline(
 }
 
 /// The effort classification of the work item behind an execution, if any.
-/// `None` for an unclassified row or a non-task/chore work item.
+/// `None` for an unclassified row or a non-task/chore work item. A narrow
+/// single-column read (see `work/sweep_reads.rs`), used by the timer path
+/// that evaluates exactly one slot; the sweep batches via
+/// [`prefetch_efforts`] instead.
 fn effort_for_work_item(work_db: &WorkDb, work_item_id: &str) -> Option<EffortLevel> {
-    match work_db.get_work_item(work_item_id) {
-        Ok(WorkItem::Task(t) | WorkItem::Chore(t)) => t.effort_level,
-        _ => None,
+    match work_db.task_effort_level(work_item_id) {
+        Ok(effort) => effort,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id,
+                ?err,
+                "envelope-watch: effort lookup failed; treating slot as unclassified"
+            );
+            None
+        }
     }
 }
 
