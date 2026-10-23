@@ -585,24 +585,23 @@ final class ChatViewModel: ObservableObject {
     @Published var designDocContentByRef: [DesignDocRef: DesignDocContent] = [:]
     /// The document the Designs tab reader pane is showing, if any.
     @Published var selectedDesignDocRef: DesignDocRef?
-    /// Engine-tab attempt list, freshest first. Refreshed on Engine-tab
-    /// entry, on `conflict_resolution_*` topic pushes, and on `Refresh`
-    /// button taps. Phase 5 #14 of the merge-conflict design.
-    @Published var conflictResolutions: [WorkConflictResolution] = [] {
+    /// Compact conflict rows, updated by pushes and open-PR recovery.
+    @Published var conflictResolutions: [EngineAttemptListEntry] = [] {
         didSet { notePublishedWorkInputChanged() }
     }
 
-    /// Engine-tab CI-remediation attempt list, freshest first.
-    /// Mirror of [[conflictResolutions]]; refreshed on Engine-tab
-    /// entry, on `ci_remediation_*` topic pushes, and on `Refresh`
-    /// button taps. Phase 11 #37 of the merge-conflict design.
-    @Published var ciRemediations: [WorkCiRemediation] = [] {
+    /// Compact CI rows, updated by pushes and open-PR recovery.
+    @Published var ciRemediations: [EngineAttemptListEntry] = [] {
         didSet { notePublishedWorkInputChanged() }
     }
 
     /// The authoritative, merged attempt feed for Activity. Unlike the
     /// source-specific arrays above, these entries deliberately contain only
     /// shared list fields; a selected row loads its detailed record on demand.
+    var replayingRemediationEvents = false
+    var activityIsVisible = false
+    var remediationStateRequestID: String?
+    var remediationEventsDuringRead: [String: [EngineEvent]] = [:]
     @Published var engineAttempts: [EngineAttemptListEntry] = []
 
     /// Engine-owned snapshot for the background-work toolbar affordance.

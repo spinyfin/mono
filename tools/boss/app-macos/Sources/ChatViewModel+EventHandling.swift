@@ -28,7 +28,15 @@ extension ChatViewModel {
         }
     }
 
+    func replayRemediationEvents(for requestID: String) {
+        let events = remediationEventsDuringRead.removeValue(forKey: requestID) ?? []
+        replayingRemediationEvents = true
+        for event in events { handle(event) }
+        replayingRemediationEvents = false
+    }
+
     private func handle(_ event: EngineEvent) {
+        recordRemediationEvent(event)
         switch event {
         case .connected:
             handleConnected()
@@ -46,6 +54,8 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            remediationStateRequestID = nil
+            remediationEventsDuringRead.removeAll()
             cancelPendingResyncRefetch()
             pendingProjectDesignDocOpen = nil
             engine.resetConnectTreeClaims()
@@ -396,7 +406,7 @@ extension ChatViewModel {
         case .reviewGuideRetryQueued(let rootTaskId, _, _):
             applyReviewGuideRetryQueued(rootTaskId: rootTaskId)
         case .conflictResolutionsList(let attempts):
-            conflictResolutions = attempts
+            conflictResolutions = attempts.map(\.listEntry)
             var seenPRs = Set<String>()
             for row in attempts where seenPRs.insert(row.prURL).inserted {
                 if row.status == "succeeded",
@@ -406,36 +416,86 @@ extension ChatViewModel {
                     recentlyClearedConflictPRs.removeValue(forKey: row.prURL)
                 }
             }
-        case .conflictResolutionStarted(_, _, _, let prURL):
+        case .conflictResolutionStarted(_, _, _, let prURL, let attempt):
+            if let attempt { applyRemediationPush(attempt); break }
             // A (re)dispatch of the conflict resolver means the PR is
             // conflicting again, so the prior "conflict cleared" badge is
             // stale. Mirrors the ciRemediationStarted arm that clears
             // recentlyClearedCIPRs for the same reason.
             recentlyClearedConflictPRs.removeValue(forKey: prURL)
-            engine.sendListConflictResolutions(limit: 200)
-            refreshEngineAttempts()
-        case .conflictResolutionFailed, .conflictResolutionAbandoned:
-            // Refreshes the engine-tab list so the status column re-renders.
-            // These don't touch the badge: failure/abandon don't un-clear a
-            // previously cleared conflict — only a new start signals re-conflict.
-            engine.sendListConflictResolutions(limit: 200)
-            refreshEngineAttempts()
-        case .conflictResolutionSucceeded(_, _, _, let prURL):
+        case .conflictResolutionFailed(_, _, _, _, _, let attempt),
+             .conflictResolutionAbandoned(_, _, _, _, _, let attempt):
+            if let attempt { applyRemediationPush(attempt) }
+        case .conflictResolutionSucceeded(_, _, _, let prURL, let attempt):
+            if let attempt { applyRemediationPush(attempt); break }
             // Stamp the PR url so the kanban card shows the
             // "🔧 conflict cleared" chip for the next 24h (#15). The
             // engine doesn't carry a finished_at on the push, so we
             // record the wall-clock observation time — close enough
             // for an ageing window measured in hours.
             recentlyClearedConflictPRs[prURL] = Date()
-            engine.sendListConflictResolutions(limit: 200)
-            refreshEngineAttempts()
         case .ciRemediationsList(let attempts):
-            ciRemediations = attempts
+            ciRemediations = attempts.map(\.listEntry)
             reconcileCIFailureBadges(from:
                 tasksByProjectID.values.flatMap { $0 }
                 + choresByProductID.values.flatMap { $0 }
                 + productLevelTasksByProductID.values.flatMap { $0 }
                 + productLevelRevisionsByProductID.values.flatMap { $0 })
+            // Reconcile both PR-card chips against the row list, which is
+            // freshest-first (`created_at DESC, id DESC`) — so the first
+            // row seen per PR is that PR's latest attempt:
+            //  - latest non-terminal (pending/running): mark the failure
+            //    chip `in_flight` if none exists yet, and drop any stale
+            //    "ci auto-fixed" chip — a fresh attempt means the prior
+            //    auto-fix claim no longer holds even if the
+            //    `ciRemediationStarted` push that would normally clear it
+            //    was missed (the push is the only other writer of
+            //    `recentlyClearedCIPRs`, so a dropped push stranded the
+            //    badge for up to the full freshness window).
+            //  - latest succeeded: the attempt that was fixing this PR is
+            //    done, so an `in_flight` failure chip is now stale even if
+            //    the `ciRemediationSucceeded` push that would normally
+            //    clear it was missed — drop it here so the chip can't
+            //    outlive the condition it represents. If still fresh,
+            //    (re)stamp the "ci auto-fixed" chip using the engine's own
+            //    timestamp rather than local observation time, so this same
+            //    missed push self-heals the auto-fixed badge too.
+            // Exhausted chips are sticky until the user clears them via
+            // retry — they are not derivable from the row list alone (the
+            // engine tracks them via `task_blocked_signals`), so we leave
+            // pre-existing exhausted chips alone. Terminal failed/abandoned
+            // attempts also leave the `in_flight` chip alone: the parent PR
+            // is still `blocked: ci_failure` until the engine retries or
+            // exhausts (see the `.ciRemediationFailed`/`.ciRemediationAbandoned`
+            // handling below), so the chip is still accurate.
+            var seenPRs = Set<String>()
+            for row in attempts {
+                guard seenPRs.insert(row.prURL).inserted else { continue }
+                switch row.status {
+                case "pending", "running":
+                    if ciFailureBadges[row.prURL] == nil {
+                        ciFailureBadges[row.prURL] = CiFailureBadge(
+                            state: .inFlight,
+                            attemptsUsed: 0,
+                            budget: 0,
+                        )
+                    }
+                    recentlyClearedCIPRs.removeValue(forKey: row.prURL)
+                case "succeeded":
+                    // Skip only the sticky `.exhausted` state so any future
+                    // non-sticky `CiFailureBadge.State` case defaults to
+                    // clearable here, rather than silently stranding it.
+                    if ciFailureBadges[row.prURL]?.state != .exhausted {
+                        ciFailureBadges.removeValue(forKey: row.prURL)
+                    }
+                    if let observedAt = AutomationTime.parse(row.finishedAt ?? row.createdAt),
+                       Date().timeIntervalSince(observedAt) < badgeFreshnessWindow {
+                        recentlyClearedCIPRs[row.prURL] = observedAt
+                    }
+                default:
+                    break
+                }
+            }
         case .engineAttemptsList(let attempts, let backgroundWork, let requestId):
             applyEngineAttemptsList(
                 attempts: attempts,
@@ -454,7 +514,8 @@ extension ChatViewModel {
             if engineAttemptDetailRequestID == attempt.id {
                 engineAttemptDetailRequestID = nil
             }
-        case .ciRemediationStarted(_, _, _, let prURL, _):
+        case .ciRemediationStarted(_, _, _, let prURL, _, let attempt):
+            if let attempt { applyRemediationPush(attempt); break }
             // A fresh CI attempt was created (detect path or `retry`).
             // The card stays in `blocked: ci_failure` — the in-flight
             // chip lives until the next probe either reports clean or
@@ -471,37 +532,28 @@ extension ChatViewModel {
                 existing.state = .inFlight
                 ciFailureBadges[prURL] = existing
             }
-            engine.sendListCiRemediations(limit: 200)
-            refreshEngineAttempts()
-        case .ciRemediationSucceeded(_, _, _, let prURL):
+        case .ciRemediationSucceeded(_, _, _, let prURL, let attempt):
+            if let attempt { applyRemediationPush(attempt); break }
             // Engine observed CI back at clean and retired the attempt.
             // Drop the failure chip and stamp the "✅ ci auto-fixed"
             // chip for the next 24h (per design Q11).
             ciFailureBadges.removeValue(forKey: prURL)
             recentlyClearedCIPRs[prURL] = Date()
-            engine.sendListCiRemediations(limit: 200)
-            refreshEngineAttempts()
         case .ciFailureCleared(_, _, let prURL):
             // Engine cleared `blocked: ci_failure` but found no active
             // remediation attempt (the prior attempt was already terminal).
             // Clear the failure badge only — do NOT set the auto-fixed badge
             // because the clearance was not driven by an auto-fix.
             ciFailureBadges.removeValue(forKey: prURL)
-        case .ciRemediationFailed(_, _, _, _, _),
-             .ciRemediationAbandoned(_, _, _, _, _):
-            // Terminal failures keep the parent `blocked: ci_failure`
-            // until the engine either retries or exhausts. The list
-            // refresh keeps the engine tab consistent.
-            engine.sendListCiRemediations(limit: 200)
-            refreshEngineAttempts()
+        case .ciRemediationFailed(_, _, _, _, _, let attempt),
+             .ciRemediationAbandoned(_, _, _, _, _, let attempt):
+            if let attempt { applyRemediationPush(attempt) }
         case .ciRemediationExhausted(_, _, let prURL, let used, let budget):
             // Budget exhausted means CI is still failing and auto-fix
             // cannot help further. Any prior "ci auto-fixed" claim is now
             // stale.
             recentlyClearedCIPRs.removeValue(forKey: prURL)
             ciFailureBadges[prURL] = CiFailureBadge(state: .exhausted, attemptsUsed: used, budget: budget)
-            engine.sendListCiRemediations(limit: 200)
-            refreshEngineAttempts()
         case .attentionItemsForWorkItemList(let workItemID, let items):
             attentionItemsByWorkItemID[workItemID] = items
         case .attentionItemCreated, .attentionItemUpdated, .attentionItemConverted, .deferredScopeAttentionsList:

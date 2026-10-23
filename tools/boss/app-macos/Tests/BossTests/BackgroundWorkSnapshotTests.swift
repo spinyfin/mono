@@ -10,6 +10,7 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
 
     func testQueuedHistoryReplySurvivesRepeatedDisconnectsAndReconnect() throws {
         let model = makeModel()
+        model.activityIsVisible = true
         model.refreshEngineAttempts()
         let requestId = try XCTUnwrap(model.backgroundWorkPending.keys.first)
         XCTAssertTrue(model.engine.isReadQueued(requestId: requestId))

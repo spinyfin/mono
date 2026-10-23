@@ -401,7 +401,7 @@ extension ChatViewModel {
     /// The active conflict resolution for `taskID`, if any. A resolution
     /// is "active" when its status is `pending` or `running`. Returns
     /// `nil` when no such attempt exists.
-    func activeConflictResolution(for taskID: String) -> WorkConflictResolution? {
+    func activeConflictResolution(for taskID: String) -> EngineAttemptListEntry? {
         conflictResolutions.first {
             $0.workItemID == taskID && ($0.status == "pending" || $0.status == "running")
         }
@@ -410,7 +410,7 @@ extension ChatViewModel {
     /// The active CI remediation for `taskID`, if any. A remediation is
     /// "active" when its status is `pending` or `running`. Returns `nil`
     /// when no such attempt exists. Parallel to [[activeConflictResolution(for:)]].
-    func activeCiRemediation(for taskID: String) -> WorkCiRemediation? {
+    func activeCiRemediation(for taskID: String) -> EngineAttemptListEntry? {
         ciRemediations.first {
             $0.workItemID == taskID && ($0.status == "pending" || $0.status == "running")
         }

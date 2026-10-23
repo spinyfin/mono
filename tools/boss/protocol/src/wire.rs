@@ -1471,6 +1471,9 @@ pub enum FrontendRequest {
     /// a five-second poller does not re-fetch attempt history it
     /// already has.
     ListEngineAttempts {
+        /// Recover card state for current PRs, without reading history or blobs.
+        #[serde(default)]
+        open_prs_only: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         kinds: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

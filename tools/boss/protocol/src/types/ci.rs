@@ -350,3 +350,50 @@ pub struct QueueCiRun {
     /// Explains target coverage; whole-job failures must reproduce the full invocation.
     pub coverage: String,
 }
+
+impl ConflictResolution {
+    /// Compact projection shared by lifecycle pushes and Activity lists.
+    pub fn list_entry(&self) -> super::EngineAttemptListEntry {
+        let mut extra = std::collections::BTreeMap::new();
+        if let Some(id) = &self.revision_task_id {
+            extra.insert("revision_task_id".into(), id.clone());
+        }
+        super::EngineAttemptListEntry {
+            id: self.id.clone(),
+            product_id: self.product_id.clone(),
+            kind: "conflict".into(),
+            work_item_id: Some(self.work_item_id.clone()),
+            pr_url: self.pr_url.clone(),
+            status: self.status.clone(),
+            failure_reason: self.failure_reason.clone(),
+            created_at: self.created_at.clone(),
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+            extra,
+        }
+    }
+}
+
+impl CiRemediation {
+    /// Compact projection shared by lifecycle pushes and Activity lists.
+    pub fn list_entry(&self) -> super::EngineAttemptListEntry {
+        let mut extra = std::collections::BTreeMap::new();
+        if let Some(id) = &self.revision_task_id {
+            extra.insert("revision_task_id".into(), id.clone());
+        }
+        extra.insert("attempt_kind".into(), self.attempt_kind.clone());
+        super::EngineAttemptListEntry {
+            id: self.id.clone(),
+            product_id: self.product_id.clone(),
+            kind: "ci".into(),
+            work_item_id: Some(self.work_item_id.clone()),
+            pr_url: self.pr_url.clone(),
+            status: self.status.clone(),
+            failure_reason: self.failure_reason.clone(),
+            created_at: self.created_at.clone(),
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+            extra,
+        }
+    }
+}

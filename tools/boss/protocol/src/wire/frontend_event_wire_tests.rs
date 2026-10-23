@@ -1210,6 +1210,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "ConflictResolutionStarted",
             event: FrontendEvent::ConflictResolutionStarted {
+                attempt: conflict_resolution().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "crz_1".into(),
@@ -1220,6 +1221,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "ConflictResolutionSucceeded",
             event: FrontendEvent::ConflictResolutionSucceeded {
+                attempt: conflict_resolution().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "crz_1".into(),
@@ -1230,6 +1232,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "ConflictResolutionFailed",
             event: FrontendEvent::ConflictResolutionFailed {
+                attempt: conflict_resolution().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "crz_1".into(),
@@ -1241,6 +1244,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "ConflictResolutionAbandoned",
             event: FrontendEvent::ConflictResolutionAbandoned {
+                attempt: conflict_resolution().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "crz_1".into(),
@@ -1265,6 +1269,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "CiRemediationStarted",
             event: FrontendEvent::CiRemediationStarted {
+                attempt: ci_remediation().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "cir_1".into(),
@@ -1276,6 +1281,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "CiRemediationSucceeded",
             event: FrontendEvent::CiRemediationSucceeded {
+                attempt: ci_remediation().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "cir_1".into(),
@@ -1295,6 +1301,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "CiRemediationFailed",
             event: FrontendEvent::CiRemediationFailed {
+                attempt: ci_remediation().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "cir_1".into(),
@@ -1306,6 +1313,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "CiRemediationAbandoned",
             event: FrontendEvent::CiRemediationAbandoned {
+                attempt: ci_remediation().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "cir_1".into(),
@@ -2516,4 +2524,29 @@ fn skipped_option_field_is_present_when_some() {
     })
     .unwrap();
     assert_eq!(v["live_sha"], "deadbeef");
+}
+
+#[test]
+fn every_remediation_lifecycle_push_carries_a_compact_row() {
+    let mut count = 0;
+    for case in tag_cases() {
+        if ["conflict_resolution", "ci_remediation"].iter().any(|prefix| {
+            ["started", "succeeded", "failed", "abandoned"]
+                .iter()
+                .any(|suffix| case.expected_tag == format!("{prefix}_{suffix}"))
+        }) {
+            let json = serde_json::to_value(&case.event).unwrap();
+            let row = &json["attempt"];
+            assert!(row["id"].is_string(), "{}", case.expected_tag);
+            assert!(row["status"].is_string());
+            assert!(row["created_at"].is_string());
+            assert!(row["work_item_id"].is_string());
+            assert_eq!(row["pr_url"], json["pr_url"]);
+            for blob in ["conflict_diagnosis", "log_excerpt", "failed_checks"] {
+                assert!(row.get(blob).is_none());
+            }
+            count += 1;
+        }
+    }
+    assert_eq!(count, 8);
 }

@@ -120,25 +120,25 @@ enum EngineEvent {
     /// created (or a `retry` reset an existing one) and a worker is
     /// about to take over. The Engine tab refreshes; the badge state
     /// is unaffected (only `succeeded` counts as a "cleared" event).
-    case conflictResolutionStarted(productID: String, workItemID: String, attemptID: String, prURL: String)
+    case conflictResolutionStarted(productID: String, workItemID: String, attemptID: String, prURL: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: an attempt finished successfully. Drives the
     /// "🔧 conflict cleared" PR-card badge (Phase 5 #15) and refreshes
     /// the Engine tab.
-    case conflictResolutionSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String)
+    case conflictResolutionSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: an attempt failed terminally.
-    case conflictResolutionFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    case conflictResolutionFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: an attempt was abandoned on purpose.
-    case conflictResolutionAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    case conflictResolutionAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: a fresh CI-remediation attempt was created
     /// for an in-review PR. `attemptKind` is `"fix"` or `"retrigger"`
     /// per the engine's pre-spawn triage. Mirrors
     /// `conflictResolutionStarted` (merge-conflict-handling-in-review
     /// Phase 10 #34).
-    case ciRemediationStarted(productID: String, workItemID: String, attemptID: String, prURL: String, attemptKind: String)
+    case ciRemediationStarted(productID: String, workItemID: String, attemptID: String, prURL: String, attemptKind: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: the engine observed the parent PR back at
     /// CI clean and retired the remediation attempt. The parent has
     /// been flipped from `blocked: ci_failure` back to `in_review`.
-    case ciRemediationSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String)
+    case ciRemediationSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: the engine cleared `blocked: ci_failure` on a
     /// task but found no active remediation attempt to retire — the prior
     /// attempt was already terminal (failed/abandoned). Distinct from
@@ -149,10 +149,10 @@ enum EngineEvent {
     /// `failed`. Fired when the worker calls
     /// `boss engine ci mark-failed` or when the completion-path
     /// catch-all (`no_push_no_classification`) fires.
-    case ciRemediationFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    case ciRemediationFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: a CI-remediation attempt was abandoned on
     /// purpose (parent PR closed externally, manual move, etc.).
-    case ciRemediationAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    case ciRemediationAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: the engine has given up auto-fixing this
     /// PR's CI. The parent is now `blocked: ci_failure_exhausted` and
     /// the user is the next actor (typically via

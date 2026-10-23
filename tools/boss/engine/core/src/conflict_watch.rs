@@ -424,6 +424,7 @@ pub async fn on_conflict_detected_with(
                                     .publish_frontend_event_on_product(
                                         &candidate.product_id,
                                         FrontendEvent::ConflictResolutionStarted {
+                                            attempt: work_db.remediation_entry(active_crz.list_entry()),
                                             product_id: candidate.product_id.clone(),
                                             work_item_id: candidate.work_item_id.clone(),
                                             attempt_id: active_crz.id.clone(),
@@ -977,12 +978,7 @@ pub async fn on_conflict_detected_with(
         publisher
             .publish_frontend_event_on_product(
                 &candidate.product_id,
-                FrontendEvent::ConflictResolutionStarted {
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    attempt_id: a.id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                },
+                crate::remediation_push::conflict_detected(work_db, a),
             )
             .await;
     }
@@ -1668,6 +1664,7 @@ pub async fn on_resolved(
                         .publish_frontend_event_on_product(
                             &candidate.product_id,
                             FrontendEvent::ConflictResolutionSucceeded {
+                                attempt: work_db.remediation_entry(succeeded.list_entry()),
                                 product_id: candidate.product_id.clone(),
                                 work_item_id: candidate.work_item_id.clone(),
                                 attempt_id: succeeded.id.clone(),

@@ -1119,14 +1119,16 @@ final class EngineClient: @unchecked Sendable {
                 productID: payload["product_id"] as? String ?? "",
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
-                prURL: payload["pr_url"] as? String ?? ""
+                prURL: payload["pr_url"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "conflict_resolution_succeeded":
             emit(.conflictResolutionSucceeded(
                 productID: payload["product_id"] as? String ?? "",
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
-                prURL: payload["pr_url"] as? String ?? ""
+                prURL: payload["pr_url"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "conflict_resolution_failed":
             emit(.conflictResolutionFailed(
@@ -1134,7 +1136,8 @@ final class EngineClient: @unchecked Sendable {
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
                 prURL: payload["pr_url"] as? String ?? "",
-                failureReason: payload["failure_reason"] as? String ?? ""
+                failureReason: payload["failure_reason"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "conflict_resolution_abandoned":
             emit(.conflictResolutionAbandoned(
@@ -1142,7 +1145,8 @@ final class EngineClient: @unchecked Sendable {
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
                 prURL: payload["pr_url"] as? String ?? "",
-                failureReason: payload["failure_reason"] as? String ?? ""
+                failureReason: payload["failure_reason"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_remediation_started":
             emit(.ciRemediationStarted(
@@ -1150,14 +1154,16 @@ final class EngineClient: @unchecked Sendable {
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
                 prURL: payload["pr_url"] as? String ?? "",
-                attemptKind: payload["attempt_kind"] as? String ?? ""
+                attemptKind: payload["attempt_kind"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_remediation_succeeded":
             emit(.ciRemediationSucceeded(
                 productID: payload["product_id"] as? String ?? "",
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
-                prURL: payload["pr_url"] as? String ?? ""
+                prURL: payload["pr_url"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_failure_cleared":
             emit(.ciFailureCleared(
@@ -1171,7 +1177,8 @@ final class EngineClient: @unchecked Sendable {
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
                 prURL: payload["pr_url"] as? String ?? "",
-                failureReason: payload["failure_reason"] as? String ?? ""
+                failureReason: payload["failure_reason"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_remediation_abandoned":
             emit(.ciRemediationAbandoned(
@@ -1179,7 +1186,8 @@ final class EngineClient: @unchecked Sendable {
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
                 prURL: payload["pr_url"] as? String ?? "",
-                failureReason: payload["failure_reason"] as? String ?? ""
+                failureReason: payload["failure_reason"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_remediation_exhausted":
             emit(.ciRemediationExhausted(

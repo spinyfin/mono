@@ -232,7 +232,7 @@ extension ChatViewModel {
         return topics
     }
 
-    func refreshWorkSubscriptions() {
+    func refreshWorkSubscriptions(refreshRemediation: Bool = true) {
         guard isConnected else { return }
         let desired = desiredWorkTopics
         let toSubscribe = desired.subtracting(subscribedWorkTopics)
@@ -246,6 +246,11 @@ extension ChatViewModel {
         }
 
         subscribedWorkTopics = desired
+        // Switching products can miss lifecycle pushes while unsubscribed.
+        // Recover compact card state after subscribing, without loading history.
+        if refreshRemediation, toSubscribe.contains(where: { $0.hasPrefix("work.product.") }) {
+            refreshRemediationState()
+        }
     }
 
     func appendSystemMessage(_ text: String, alwaysShow: Bool = false) {

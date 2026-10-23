@@ -103,3 +103,28 @@ struct WorkCiRemediation: Identifiable, Hashable {
     /// before a revision was created.
     var revisionTaskId: String? = nil
 }
+
+extension WorkConflictResolution {
+    var listEntry: EngineAttemptListEntry {
+        var extra: [String: String] = [:]
+        extra["revision_task_id"] = revisionTaskId
+        return EngineAttemptListEntry(
+            id: id, productID: productID, createdAt: createdAt, extra: extra,
+            kind: "conflict", prURL: prURL, status: status, failureReason: failureReason,
+            finishedAt: finishedAt, startedAt: startedAt, workItemID: workItemID
+        )
+    }
+}
+
+extension WorkCiRemediation {
+    var listEntry: EngineAttemptListEntry {
+        var extra: [String: String] = [:]
+        extra["revision_task_id"] = revisionTaskId
+        extra["attempt_kind"] = attemptKind
+        return EngineAttemptListEntry(
+            id: id, productID: productID, createdAt: createdAt, extra: extra,
+            kind: "ci", prURL: prURL, status: status, failureReason: failureReason,
+            finishedAt: finishedAt, startedAt: startedAt, workItemID: workItemID
+        )
+    }
+}

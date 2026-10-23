@@ -774,13 +774,7 @@ pub async fn on_ci_failure_detected(
             publisher
                 .publish_frontend_event_on_product(
                     &candidate.product_id,
-                    FrontendEvent::CiRemediationStarted {
-                        product_id: candidate.product_id.clone(),
-                        work_item_id: candidate.work_item_id.clone(),
-                        attempt_id: attempt.id.clone(),
-                        pr_url: candidate.pr_url.clone(),
-                        attempt_kind: attempt.attempt_kind.clone(),
-                    },
+                    crate::remediation_push::ci_detected(work_db, attempt),
                 )
                 .await;
         }
@@ -1505,13 +1499,7 @@ async fn on_queue_side_failure_detected(
         publisher
             .publish_frontend_event_on_product(
                 &candidate.product_id,
-                FrontendEvent::CiRemediationStarted {
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    attempt_id: attempt.id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                    attempt_kind: attempt.attempt_kind.clone(),
-                },
+                crate::remediation_push::ci_detected(work_db, &attempt),
             )
             .await;
         tracing::info!(
@@ -2424,6 +2412,7 @@ pub async fn on_ci_resolved(
                     .publish_frontend_event_on_product(
                         &candidate.product_id,
                         FrontendEvent::CiRemediationSucceeded {
+                            attempt: work_db.remediation_entry(succeeded.list_entry()),
                             product_id: candidate.product_id.clone(),
                             work_item_id: candidate.work_item_id.clone(),
                             attempt_id: succeeded.id.clone(),

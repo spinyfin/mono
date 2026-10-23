@@ -78,6 +78,9 @@ extension ChatViewModel {
     }
 
     func registerBackgroundWorkRequest(requestId: String, replacesAttempts: Bool) {
+        if replacesAttempts, remediationEventsDuringRead[requestId] == nil {
+            remediationEventsDuringRead[requestId] = []
+        }
         backgroundWorkSendGeneration += 1
         backgroundWorkPending[requestId] = BackgroundWorkPendingRequest(
             generation: backgroundWorkSendGeneration,
@@ -95,6 +98,9 @@ extension ChatViewModel {
             let canWinAttempts = pending.replacesAttempts
                 && pending.generation >= attemptsAppliedGeneration
             return canWinSnapshot || canWinAttempts
+        }
+        remediationEventsDuringRead = remediationEventsDuringRead.filter { id, _ in
+            id == remediationStateRequestID || backgroundWorkPending[id] != nil
         }
     }
 
@@ -120,7 +126,13 @@ extension ChatViewModel {
     ) {
         guard isConnected else { return }
         guard let requestId else { return }
-        guard let pending = backgroundWorkPending.removeValue(forKey: requestId) else { return }
+        if requestId == remediationStateRequestID {
+            applyOpenRemediationState(attempts, requestID: requestId)
+            return
+        }
+        // Keep this request registered while applying the snapshot: pruning
+        // must retain its buffered pushes until the history has been replaced.
+        guard let pending = backgroundWorkPending[requestId] else { return }
         if pending.generation >= backgroundWorkAppliedGeneration {
             applyBackgroundWorkSnapshot(backgroundWork, generation: pending.generation)
         }
@@ -128,6 +140,8 @@ extension ChatViewModel {
             attemptsAppliedGeneration = pending.generation
             engineAttempts = attempts
         }
+        backgroundWorkPending.removeValue(forKey: requestId)
+        replayRemediationEvents(for: requestId)
         pruneStaleBackgroundWorkPending()
     }
 
@@ -136,5 +150,7 @@ extension ChatViewModel {
     func abandonBackgroundWorkRequest(requestId: String?) {
         guard let requestId else { return }
         backgroundWorkPending.removeValue(forKey: requestId)
+        remediationEventsDuringRead.removeValue(forKey: requestId)
+        if remediationStateRequestID == requestId { remediationStateRequestID = nil }
     }
 }

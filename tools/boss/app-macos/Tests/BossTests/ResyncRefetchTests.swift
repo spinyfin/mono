@@ -146,6 +146,10 @@ final class ResyncRefetchTests: XCTestCase {
             ],
             "25 resyncs must cost exactly one set, none of it per project"
         )
+        let attempts = recorder.sent.filter { $0["type"] as? String == "list_engine_attempts" }
+        XCTAssertEqual(attempts.filter { $0["open_prs_only"] as? Bool == true }.count, 1)
+        XCTAssertEqual(attempts.filter { $0["limit"] as? Int == 0 }.count, 1)
+        XCTAssertFalse(attempts.contains { $0["limit"] as? Int == 200 }, "hidden Activity must not fetch history")
     }
 
     func testRefetchSetCoversEveryEvictablePushAndNothingMore() async {

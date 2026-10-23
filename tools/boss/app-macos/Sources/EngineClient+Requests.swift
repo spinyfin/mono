@@ -1246,8 +1246,9 @@ extension EngineClient {
     /// Returns the envelope `request_id` so the model can drop out-of-order
     /// snapshot replies, or `nil` when the line was not written.
     @discardableResult
-    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false) -> String? {
+    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false, openPRsOnly: Bool = false) -> String? {
         var payload: [String: Any] = ["type": "list_engine_attempts"]
+        if openPRsOnly { payload["open_prs_only"] = true }
         if let limit {
             payload["limit"] = limit
         }

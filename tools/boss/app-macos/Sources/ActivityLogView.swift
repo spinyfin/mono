@@ -240,9 +240,12 @@ struct ActivityLogView: View {
             mainContent
         }
         .onAppear {
+            chat.activityIsVisible = true
+            chat.refreshEngineAttempts()
             model.start()
         }
         .onDisappear {
+            chat.activityIsVisible = false
             model.stop()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
