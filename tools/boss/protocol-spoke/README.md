@@ -133,8 +133,11 @@ protoc and no network. It fails in two situations:
    baseline from the PR's merge base into `compat/merge_base/`
    (`.buildkite/steps/stage-spoke-proto-merge-base.sh`) as an input file of the
    test. This is what stops a pull request from making a breaking change and
-   regenerating the baseline to match. Staging is best effort: if it cannot
-   run, the test reports that and checks the checked-in baseline alone.
+   regenerating the baseline to match. Staging fails closed: on pull-request
+   builds, a fetch or merge-base failure fails the job. The only way to proceed
+   without a merge-base baseline is a pull request that introduces the schema,
+   where the baseline is proven absent at the merge base. Non-PR builds check
+   the checked-in baseline.
 
 If a change is genuinely breaking, do not edit the baseline. Add the new shape
 in a new package (`boss.spoke.v2`) or keep the old field.

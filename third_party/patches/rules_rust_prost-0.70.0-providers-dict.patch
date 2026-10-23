@@ -1,27 +1,7 @@
 diff --git a/private/prost.bzl b/private/prost.bzl
 --- a/private/prost.bzl
 +++ b/private/prost.bzl
-@@ -139,12 +139,17 @@
-     fail("Couldn't find a DepInfo in the list of providers")
- 
- def _get_cc_info(providers):
--    """Finds the CcInfo provider in the list of providers."""
-+    """Finds the CcInfo provider in the list of providers, or None."""
-     for provider in providers:
-         if hasattr(provider, "linking_context"):
-             return provider
--    fail("Couldn't find a CcInfo in the list of providers")
- 
-+    # The mono rules_rust patch files CcInfo under the wrong dict key on
-+    # Bazel 9 (its `type(...) == "CcInfo"` test is false for rules_cc's
-+    # Starlark CcInfo), so the allocator provider overwrites it. No rlib built
-+    # in this repo carries a CcInfo; DepVariantInfo accepts None.
-+    return None
-+
- def _compile_rust(
-         *,
-         ctx,
-@@ -199,6 +204,10 @@
+@@ -199,6 +199,10 @@
          rustc_rmeta_output = generate_output_diagnostics(ctx, rmeta)
          metadata_supports_pipelining = can_use_metadata_for_pipelining(toolchain, "rlib")
  
