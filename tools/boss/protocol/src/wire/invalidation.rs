@@ -28,11 +28,31 @@ pub enum InvalidationClass {
     Runtime,
 }
 
+/// The most cards one runtime-class push (or one runtime-only burst of them)
+/// may name before a whole-board read is the cheaper answer. A patch re-reads
+/// each named card's whole revision chain, so its cost grows with the cards
+/// named while the tree's does not; past this many the engine promotes a
+/// coalesced push to [`InvalidationClass::Structural`] and the app asks for the
+/// tree. The app holds the same number for the bursts it assembles itself.
+pub const MAX_RUNTIME_PATCH_ITEMS: usize = 64;
+
 impl InvalidationClass {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Structural => "structural",
             Self::Runtime => "runtime",
+        }
+    }
+
+    /// The class of one push that stands in for two. Structural wins: a
+    /// consumer that skipped a structural change leaves its board wrong,
+    /// whereas one that reads the whole board for a runtime change only pays
+    /// for it.
+    pub fn merge(self, other: Self) -> Self {
+        if self == Self::Structural || other == Self::Structural {
+            Self::Structural
+        } else {
+            Self::Runtime
         }
     }
 }

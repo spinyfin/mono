@@ -167,10 +167,11 @@ impl SessionQueue {
         {
             if let Some(&idx) = self.pending_topics.get(&topic) {
                 debug_assert!(idx < self.items.len());
-                // Overwrite the stale invalidation in place, keeping the
-                // original enqueue instant so `oldest_age_ms` still reflects
-                // how long this queue slot has been waiting to flush.
-                self.items[idx].1 = env;
+                // Fold the stale invalidation into the new one in place,
+                // keeping the original enqueue instant so `oldest_age_ms`
+                // still reflects how long this queue slot has been waiting to
+                // flush.
+                coalesce_topic_event(&mut self.items[idx].1, env);
                 return EnqueueOutcome::Coalesced;
             }
             if self.items.len() >= MAX_SESSION_QUEUE {
@@ -313,6 +314,66 @@ impl SessionQueue {
             *enqueued_at = Instant::now() - std::time::Duration::from_millis(age_ms);
         }
     }
+}
+
+/// Replace the unsent push `pending` with the newer `next` for the same topic
+/// without losing what `pending` told the app.
+///
+/// A [`TopicEventPayload::WorkInvalidated`] carries the class of the change and
+/// the cards it names, and the app chooses its refetch from both. Replacing one
+/// with the other would corrupt that choice: a structural push followed by a
+/// runtime one would arrive as runtime only and leave the board stale, and
+/// runtime pushes for different cards would lose every card but the last. So
+/// two invalidations merge into one with the stronger class and the union of
+/// the cards, and everything else (reason, revision, origin) from the newer
+/// push. A union that names more cards than a patch is cheaper than is promoted
+/// to structural, as is a pair for different products. Any other pairing keeps
+/// the replace-with-newest behavior.
+fn coalesce_topic_event(pending: &mut FrontendEventEnvelope, mut next: FrontendEventEnvelope) {
+    let merged = match (&pending.payload, &next.payload) {
+        (
+            FrontendEvent::TopicEvent {
+                event:
+                    TopicEventPayload::WorkInvalidated {
+                        product_id: pending_product,
+                        item_ids: pending_ids,
+                        class: pending_class,
+                        ..
+                    },
+                ..
+            },
+            FrontendEvent::TopicEvent {
+                event:
+                    TopicEventPayload::WorkInvalidated {
+                        product_id: next_product,
+                        item_ids: next_ids,
+                        class: next_class,
+                        ..
+                    },
+                ..
+            },
+        ) => {
+            let known: std::collections::HashSet<&str> = pending_ids.iter().map(String::as_str).collect();
+            let mut item_ids = pending_ids.clone();
+            item_ids.extend(next_ids.iter().filter(|id| !known.contains(id.as_str())).cloned());
+            let mut class = pending_class.merge(*next_class);
+            if pending_product != next_product || item_ids.len() > crate::protocol::MAX_RUNTIME_PATCH_ITEMS {
+                class = InvalidationClass::Structural;
+            }
+            Some((class, item_ids))
+        }
+        _ => None,
+    };
+    if let Some((merged_class, merged_ids)) = merged
+        && let FrontendEvent::TopicEvent {
+            event: TopicEventPayload::WorkInvalidated { class, item_ids, .. },
+            ..
+        } = &mut next.payload
+    {
+        *class = merged_class;
+        *item_ids = merged_ids;
+    }
+    *pending = next;
 }
 
 pub(super) fn topic_event_topic(payload: &FrontendEvent) -> Option<String> {

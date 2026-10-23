@@ -59,6 +59,8 @@ extension ChatViewModel {
             cancelPendingResyncRefetch()
             pendingProjectDesignDocOpen = nil
             engine.resetConnectTreeClaims()
+            // No reply is coming for a read the dropped connection carried.
+            resetBoardReadFences()
             disconnectOffsiteBackupEdit()
             if engine.hasUnsentAction(kind: "recreate_coordinator") {
                 coordinatorResetWaiting = false
@@ -103,7 +105,7 @@ extension ChatViewModel {
             // kept; only checks whose request was in flight are settled.
             bounceUnparkedDrags(message: nil, includeMovesWithoutCheck: false)
             scheduleConnectionLostBannerCheck()
-        case .workInvalidated(let topic, let productId, let itemIDs):
+        case .workInvalidated(let topic, let productId, let itemIDs, let invalidationClass):
             if CommentEngineBridge.isCommentTopic(topic) {
                 // A comment row on an open viewer's artifact changed elsewhere;
                 // the bridge reloads the bound layer(s). Invalidation-not-patch.
@@ -123,8 +125,11 @@ extension ChatViewModel {
             } ?? false
             scheduleInvalidationRefetch(
                 productID: onBoard ? currentSelectedProductID : productId,
-                itemIDs: itemIDs
+                itemIDs: itemIDs,
+                invalidationClass: invalidationClass
             )
+        case .workRuntimePatch(let productId, let cards, let absent, let isComplete):
+            handleWorkRuntimePatch(productID: productId, cards: cards, absent: absent, isComplete: isComplete)
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
             let activeIDs = Set(activeProducts.map(\.id))
@@ -183,6 +188,9 @@ extension ChatViewModel {
         case .operatorQuestionError(let message, let requestId):
             handleOperatorQuestionError(message: message, requestId: requestId)
         case .workError(let message, let requestId):
+            // The error names no request: a patch in flight may be the one that
+            // failed, and nothing else would re-read its cards.
+            failInFlightRuntimePatches()
             if settleOffsiteBackupError(message, requestID: requestId) { return }
             // An error carrying the answer's own request id is not ambiguous:
             // settle it onto that card without blaming any other request.

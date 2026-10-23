@@ -92,6 +92,9 @@ final class ChatViewModel: ObservableObject {
     /// Part of `resyncOnlyReadsOwed`: a quota snapshot or refresh was awaited
     /// when the resync was dropped, so the cached quota read is owed too.
     var resyncQuotaReadOwed = false
+    /// Outstanding whole-board and runtime-patch reads per product; see
+    /// [[BoardReadFence]].
+    var boardReadFences: [String: BoardReadFence] = [:]
     /// Views currently showing a task's execution history (card popover,
     /// transcript viewer), by task id, each identified by a per-view token.
     /// A task with no entry has no consumer: its history is not cached and
@@ -888,6 +891,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func commonInit() {
+        bindBoardReadObserver()
         commentBridge.onSubmissionRejected = { [weak self] action in
             self?.showActionNotSaved(requestKind: action)
         }
