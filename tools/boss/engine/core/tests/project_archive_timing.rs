@@ -195,8 +195,10 @@ async fn measure(child_count: usize, boundaries: &archive_timing_support::Bounda
             reason,
             product_id,
             item_ids,
+            class,
         } => {
             assert_eq!(reason, "work_item_updated");
+            assert_eq!(class, boss_protocol::InvalidationClass::Structural);
             assert_eq!(product_id.as_deref(), Some(seeded.product_id.as_str()));
             assert_eq!(item_ids, vec![seeded.project.id.clone()]);
         }

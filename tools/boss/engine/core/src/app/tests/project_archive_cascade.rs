@@ -255,11 +255,17 @@ async fn archive_with_children(child_count: usize) -> Cost {
                     reason,
                     product_id: pushed_product,
                     item_ids,
+                    class,
                 },
             ..
         } => {
             assert_eq!(pushed_topic, topic);
             assert_eq!(reason, "work_item_updated");
+            assert_eq!(
+                class,
+                crate::protocol::InvalidationClass::Structural,
+                "an archive cascade moves cards, so it must stay a full-board invalidation"
+            );
             assert_eq!(pushed_product.as_deref(), Some(product_id.as_str()));
             assert_eq!(item_ids, vec![project.id.clone()]);
         }
