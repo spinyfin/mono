@@ -5,6 +5,11 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+anyhow = { workspace = true }
+boss-backoff = { path = "../../backoff" }
+boss-spoke-journal = { path = "../spoke-journal" }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 bon = { workspace = true }
 boss-host-enrollment = { path = "../host-enrollment" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }

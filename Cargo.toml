@@ -33,6 +33,8 @@ members = [
   "tools/boss/engine/dispatch-reader",
   "tools/boss/engine/event-bus",
   "tools/boss/engine/single-flight",
+  "tools/boss/engine/spoke-journal",
+  "tools/boss/engine/spoke",
   "tools/boss/engine/core",
   "tools/boss/engine/grok-home-retention",
   "tools/boss/engine/host-enrollment",

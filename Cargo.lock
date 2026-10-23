@@ -1208,6 +1208,44 @@ name = "boss-single-flight"
 version = "0.1.0"
 
 [[package]]
+name = "boss-spoke"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-protocol-spoke",
+ "boss-spoke-journal",
+ "boss-spoke-stream",
+ "clap",
+ "fs4",
+ "libc",
+ "prost",
+ "rcgen",
+ "rusqlite",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "boss-spoke-journal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-protocol-spoke",
+ "fs4",
+ "libc",
+ "prost",
+ "rusqlite",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "boss-spoke-credentials"
 version = "0.1.0"
 dependencies = [
@@ -1228,9 +1266,12 @@ dependencies = [
 name = "boss-spoke-stream"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bon",
+ "boss-backoff",
  "boss-host-enrollment",
  "boss-protocol-spoke",
+ "boss-spoke-journal",
  "prost",
  "rand 0.8.6",
  "rcgen",
@@ -1239,6 +1280,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
