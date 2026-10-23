@@ -1138,28 +1138,16 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, minHeight: 80, alignment: .topLeading)
                 Spacer(minLength: 0)
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView(.vertical) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            ForEach(sections) { section in
-                                workSectionView(section, column: column)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                    }
-                    .frame(maxHeight: .infinity)
-                    .task(id: model.revealScrollTarget.map { "\(model.revealGeneration)-\($0)" }) {
-                        guard let target = model.revealScrollTarget else { return }
-                        let columnIDs = sections.flatMap { $0.items.map(\.id) }
-                        guard columnIDs.contains(target) else { return }
-                        // Wait for disclosure expansion and lazy card layout. Retry
-                        // until the card's viewport probe acknowledges this request.
-                        for _ in 0..<40 {
-                            guard !Task.isCancelled, model.revealScrollTarget == target else { return }
-                            boardProxy.scrollTo(column, anchor: .center)
-                            proxy.scrollTo(target, anchor: .center)
-                            do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
-                        }
+                WorkBoardColumnScrollView(
+                    column: column,
+                    cardIDs: sections.flatMap { $0.items.map(\.id) },
+                    revealTarget: model.revealScrollTarget,
+                    revealGeneration: model.revealGeneration,
+                    boardProxy: boardProxy,
+                    isRevealStillPending: { [model] target in model.revealScrollTarget == target }
+                ) {
+                    ForEach(sections) { section in
+                        workSectionView(section, column: column)
                     }
                 }
             }

@@ -86,13 +86,17 @@ struct WorkBoardSectionItemsView: View {
                 )
                 .id(task.id)
                 .background {
-                    if model.revealScrollTarget == task.id {
+                    if model.revealScrollTarget == task.id || BossRevealCapture.viewportTargetID == task.id {
                         RevealCardViewport(cardID: task.id, generation: model.revealGeneration, model: model)
                             .allowsHitTesting(false)
                     }
                 }
             }
         }
+        // Cards are the column's scroll targets: `WorkBoardColumnScrollView`
+        // anchors the column on the card at the viewport centre so a refresh
+        // that reorders or resizes rows keeps that card where the user left it.
+        .scrollTargetLayout()
     }
 }
 
