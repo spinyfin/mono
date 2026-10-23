@@ -409,14 +409,13 @@ fn semantic_checkpoint_persistence_does_not_hold_the_registry_mutex() {
 /// closure takes the registry mutex; hook dispatch applies an event and then
 /// persists its checkpoint to the DB. Overlap the two deterministically: the
 /// live check parks inside the closure (DB connection held) until dispatch has
-/// been started, then takes the registry mutex. Both must finish.
+/// applied its event, then checks liveness. Both must finish.
 #[test]
 fn live_check_and_hook_dispatch_do_not_deadlock() {
     let wait = std::time::Duration::from_secs(20);
     let (server_state, _dir) = test_server_state();
     let (execution_id, work_item_id) = spawned_worker_for_item(&server_state);
     let (inside_tx, inside_rx) = std::sync::mpsc::channel();
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let (live_done_tx, live_done_rx) = std::sync::mpsc::channel();
     let (dispatch_done_tx, dispatch_done_rx) = std::sync::mpsc::channel();
 
@@ -427,9 +426,19 @@ fn live_check_and_hook_dispatch_do_not_deadlock() {
             RequestExecutionInput::builder().work_item_id(work_item_id).build(),
             |run_id| {
                 inside_tx.send(()).unwrap();
-                // Give dispatch time to apply its event and reach persistence
-                // while this thread still holds the DB connection.
-                let _ = go_rx.recv_timeout(std::time::Duration::from_secs(5));
+                // Observe dispatch's transition while holding the DB connection.
+                // Dispatch cannot finish persistence until this closure returns.
+                let deadline = std::time::Instant::now() + wait;
+                loop {
+                    if registry
+                        .semantic_progress_for_slot(SLOT)
+                        .is_some_and(|checkpoint| checkpoint.turn_condition == SemanticTurnCondition::InTurn)
+                    {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "dispatch never applied its event");
+                    std::thread::yield_now();
+                }
                 registry.is_run_live(run_id)
             },
         );
@@ -447,10 +456,6 @@ fn live_check_and_hook_dispatch_do_not_deadlock() {
         runtime.block_on(dispatch_live_worker_state(&dispatch_state, &pre_tool_use(&dispatch_id)));
         dispatch_done_tx.send(()).unwrap();
     });
-    // Let dispatch reach its DB write, then release the live check.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    go_tx.send(()).unwrap();
-
     assert!(
         live_done_rx
             .recv_timeout(wait)
@@ -475,12 +480,23 @@ async fn a_recycled_slot_never_leaks_its_checkpoint_to_the_prior_run() {
             ingress_seq: Some(1),
             from_subagent: false,
         },
-        &pre_tool_use(&run_a).event,
+        &stop(&run_a).event,
     );
     assert!(matches!(
         applied.outcome,
         crate::live_worker_state::ApplyEventOutcome::Applied { .. }
     ));
+
+    // A newer event persists the opposite state before the old Stop resumes.
+    let mut newer = pre_tool_use(&run_a);
+    newer.connection.ingress_seq = Some(2);
+    dispatch_live_worker_state(&server_state, &newer).await;
+    let newer_checkpoint = server_state
+        .work_db
+        .get_run_semantic_progress_checkpoint(&run_a)
+        .unwrap()
+        .unwrap();
+    assert_eq!(newer_checkpoint.turn_condition, SemanticTurnCondition::InTurn);
 
     // Run A's slot is recycled to run B, which has its own (ended-turn) state.
     server_state.live_worker_states.release_slot(SLOT);
@@ -510,7 +526,7 @@ async fn a_recycled_slot_never_leaks_its_checkpoint_to_the_prior_run() {
         &server_state,
         &run_a,
         SLOT,
-        &pre_tool_use(&run_a),
+        &stop(&run_a),
         &applied.outcome,
     );
     let a_row = server_state
@@ -518,11 +534,8 @@ async fn a_recycled_slot_never_leaks_its_checkpoint_to_the_prior_run() {
         .get_run_semantic_progress_checkpoint(&run_a)
         .unwrap()
         .expect("run A still records its own progress");
-    assert_ne!(
-        a_row.turn_condition,
-        SemanticTurnCondition::Ended,
-        "B's turn state leaked into A"
-    );
+    assert_eq!(a_row.turn_condition, newer_checkpoint.turn_condition);
+    assert_eq!(a_row.tool_condition, newer_checkpoint.tool_condition);
     assert!(
         server_state
             .work_db

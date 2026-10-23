@@ -478,10 +478,11 @@ pub(super) fn dispatch_codex_guard_trace_on_notification(
 /// live-state reducer accepted the event and the slot still belongs to this
 /// run, captured under the dedicated persistence lock after the registry
 /// mutex is released. The registry mutex is deliberately not held across the
-/// DB write: DB-connection holders call `is_run_live`. The reducer owns ingress ordering
-/// and the subagent rules, so a refused (stale) event stamps the time alone
-/// and an accepted one writes what the reducer settled on. With no slot to
-/// settle it, main-session signals are used; subagent tools only stamp liveness.
+/// DB write: DB-connection holders call `is_run_live`.
+/// The reducer owns ingress ordering and the subagent rules, so a refused
+/// (stale) event or an ownership mismatch stamps the time alone. An accepted
+/// event writes what the reducer settled on. Without a reducer outcome,
+/// main-session signals are used; subagent tools only stamp liveness.
 fn persist_semantic_progress(
     server_state: &Arc<ServerState>,
     run_id: &str,
@@ -491,7 +492,9 @@ fn persist_semantic_progress(
     settled: Option<crate::semantic_progress::SemanticProgressCheckpoint>,
 ) {
     let result = match (outcome, settled) {
-        (Some(ApplyEventOutcome::Stale { .. }), _) => server_state.work_db.record_semantic_progress_stamp(run_id),
+        (Some(ApplyEventOutcome::Stale { .. }), _) | (Some(ApplyEventOutcome::Applied { .. }), None) => {
+            server_state.work_db.record_semantic_progress_stamp(run_id)
+        }
         (Some(ApplyEventOutcome::Applied { .. }), Some(checkpoint)) => {
             server_state.work_db.record_semantic_checkpoint(run_id, &checkpoint)
         }
