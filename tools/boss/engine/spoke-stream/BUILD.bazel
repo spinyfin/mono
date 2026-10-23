@@ -1,0 +1,38 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# No engine consumer until the adapter supplies durable policy/storage.
+rust_library(
+    name = "spoke-stream",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_spoke_stream",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "integration_test",
+    size = "small",
+    srcs = glob(["tests/**/*.rs"]),
+    crate_root = "tests/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":spoke-stream",
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

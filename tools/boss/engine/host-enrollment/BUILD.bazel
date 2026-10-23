@@ -3,9 +3,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
-# No consumer exists yet, so this is package-private. The hub stream manager
-# (engine/spoke-stream) and the hub's provisioning jobs are added to
-# `visibility` in the PRs that make them depend on this crate.
+# Visible only to the authenticated stream boundary.
 rust_library(
     name = "host-enrollment",
     srcs = glob(["src/**/*.rs"]),
@@ -13,6 +11,7 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/spoke-stream:__pkg__"],
     deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),
 )
 

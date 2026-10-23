@@ -1,0 +1,22 @@
+[package]
+name = "boss-spoke-stream"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+bon = { workspace = true }
+boss-host-enrollment = { path = "../host-enrollment" }
+boss-protocol-spoke = { path = "../../protocol-spoke" }
+prost = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+tokio-stream = { workspace = true, features = ["net"] }

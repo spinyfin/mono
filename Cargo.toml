@@ -36,6 +36,7 @@ members = [
   "tools/boss/engine/core",
   "tools/boss/engine/grok-home-retention",
   "tools/boss/engine/host-enrollment",
+  "tools/boss/engine/spoke-stream",
   "tools/boss/engine/jsonl-append",
   "tools/boss/engine/offsite-backup",
   "tools/boss/engine/day-rotated-log",
