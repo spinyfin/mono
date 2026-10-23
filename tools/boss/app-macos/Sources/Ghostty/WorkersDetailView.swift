@@ -197,6 +197,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
                     )
                     .equatable()
                 }
+                idleCells(area: geo.size)
                 if grid.layout.isEmpty { emptyState }
             }
         }
@@ -215,33 +216,34 @@ struct WorkersDetailView: View, @MainActor Equatable {
         )
     }
 
+    private func cellFrame(page: PaneLayoutPage, localIndex: Int, area: CGSize) -> CGRect {
+        let width = max(1, (area.width - CGFloat(page.shape.columns - 1)) / CGFloat(page.shape.columns))
+        let height = max(1, (area.height - CGFloat(page.shape.rows - 1)) / CGFloat(page.shape.rows))
+        let position = page.shape.position(ofLocalIndex: localIndex)
+        return CGRect(x: CGFloat(position.column) * (width + 1), y: CGFloat(position.row) * (height + 1), width: width, height: height)
+    }
+
     private var emptyState: some View {
         let crew = TrekPortraitGrid.workerNames
         let character = crew[abs(emptyFlavorCycle) % max(crew.count, 1)]
-        return VStack(spacing: 14) {
-            Spacer()
-            if let nsImage = TrekIconAssets.portrait(forPersona: character) {
-                Image(nsImage: nsImage)
-                    .resizable()
-                    .interpolation(.none)
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: 220, maxHeight: 240)
-                    .opacity(0.85)
+        return IdleCrewView(persona: character, title: grid.layout.filter.isActive && grid.layout.hiddenCount > 0
+                ? "No agents match the filter" : "No agents running", flavorCycle: emptyFlavorCycle)
+    }
+
+    /// Decorative fillers for the selected page's unassigned rectangles.
+    /// Hit testing is off so they never take focus or clicks from real panes.
+    @ViewBuilder
+    private func idleCells(area: CGSize) -> some View {
+        if !grid.layout.isEmpty, let page = grid.layout.pages.first(where: { $0.index == grid.layout.selectedPage }) {
+            ForEach(grid.idleCells(for: page), id: \.localIndex) { idle in
+                let frame = cellFrame(page: page, localIndex: idle.localIndex, area: area)
+                IdleCrewView(persona: idle.persona, title: idle.persona, flavorCycle: idle.flavorCycle, compact: true)
+                    .frame(width: frame.width, height: frame.height)
+                    .offset(x: frame.minX, y: frame.minY)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
             }
-            Text(grid.layout.filter.isActive && grid.layout.hiddenCount > 0
-                ? "No agents match the filter" : "No agents running")
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(Color.white.opacity(0.85))
-            Text(TrekIdleFlavor.line(for: character, cycle: emptyFlavorCycle))
-                .font(.callout)
-                .foregroundStyle(Color.white.opacity(0.6))
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 24)
-                .lineLimit(3)
-            Spacer()
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .black))
     }
 
     private var paneSizeReader: some View {
