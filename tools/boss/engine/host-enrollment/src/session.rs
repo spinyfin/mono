@@ -40,6 +40,11 @@ pub struct StreamGuard {
     authorizer: Arc<dyn HostAuthorizer>,
     events: broadcast::Receiver<CredentialEvent>,
     host: AuthorizedHost,
+    /// A recheck against the records is owed: set when events were missed or
+    /// the host's certificate was superseded, cleared only once `revalidate`
+    /// has answered. It lives on the guard so dropping a `closed()` future
+    /// mid-recheck does not forget it.
+    needs_revalidate: bool,
 }
 
 /// Authorizes the certificate chain of a new stream.
@@ -60,6 +65,7 @@ pub async fn admit(
         authorizer,
         events,
         host,
+        needs_revalidate: false,
     })
 }
 
@@ -87,6 +93,11 @@ impl StreamGuard {
     /// other hosts do not postpone it.
     pub async fn closed(&mut self) -> CloseReason {
         loop {
+            if self.needs_revalidate
+                && let Err(reason) = self.refresh().await
+            {
+                return reason;
+            }
             let now = self.authorizer.now();
             let Ok(remaining) = self.host.valid_until.duration_since(now) else {
                 return CloseReason::DeadlineElapsed;
@@ -104,17 +115,11 @@ impl StreamGuard {
                         if host_id == self.host.host_id && serial == self.host.serial =>
                     {
                         self.host.valid_until = self.host.valid_until.min(valid_until);
-                        if let Err(reason) = self.refresh().await {
-                            return reason;
-                        }
+                        self.needs_revalidate = true;
                     }
                     Ok(_) => {}
                     // Missed events: the only safe answer is to look again.
-                    Err(RecvError::Lagged(_)) => {
-                        if let Err(reason) = self.refresh().await {
-                            return reason;
-                        }
-                    }
+                    Err(RecvError::Lagged(_)) => self.needs_revalidate = true,
                     Err(RecvError::Closed) => return CloseReason::AuthorityGone,
                 },
             }
@@ -127,6 +132,7 @@ impl StreamGuard {
         match tokio::task::spawn_blocking(move || authorizer.revalidate(&current)).await {
             Ok(Ok(updated)) => {
                 self.host = updated;
+                self.needs_revalidate = false;
                 Ok(())
             }
             Ok(Err(Denial::Revoked)) => Err(CloseReason::Revoked),

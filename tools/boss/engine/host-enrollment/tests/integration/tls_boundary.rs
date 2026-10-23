@@ -63,6 +63,15 @@ impl SpokeHub for Hub {
         let mut guard = admit(Arc::clone(&self.authorizer), chain)
             .await
             .map_err(|_| Status::unauthenticated("not permitted"))?;
+        // The first frame must be a Hello naming the host the certificate proved.
+        let mut inbound = request.into_inner();
+        let hello = match inbound.message().await?.and_then(|frame| frame.body) {
+            Some(v1::spoke_frame::Body::Hello(hello)) => hello,
+            _ => return Err(Status::invalid_argument("the first frame must be a Hello")),
+        };
+        guard
+            .check_hello(&hello.host_id)
+            .map_err(|_| Status::permission_denied("not permitted"))?;
         let (tx, rx) = mpsc::channel(4);
         tx.send(Ok(v1::HubFrame::default())).await.expect("first frame");
         tokio::spawn(async move {
@@ -196,8 +205,22 @@ struct Session {
 /// Opens a `Connect` stream as `identity`. A refusal is reported as the status
 /// code the hub answered with (`Unavailable` if the handshake itself failed).
 async fn connect(hub: &Running, identity: Identity) -> Result<Session, Code> {
+    connect_claiming(hub, identity, "edge-1").await
+}
+
+/// Like [`connect`], with the host id the spoke claims in its Hello.
+async fn connect_claiming(hub: &Running, identity: Identity, claimed_host_id: &str) -> Result<Session, Code> {
     let channel = dial(hub, Some(identity)).await.map_err(|_| Code::Unavailable)?;
-    let (requests, rx) = mpsc::channel(1);
+    let (requests, rx) = mpsc::channel(2);
+    requests
+        .send(v1::SpokeFrame {
+            body: Some(v1::spoke_frame::Body::Hello(v1::Hello {
+                host_id: claimed_host_id.to_owned(),
+                ..v1::Hello::default()
+            })),
+        })
+        .await
+        .expect("hello");
     let mut client = v1::spoke_hub_client::SpokeHubClient::new(channel);
     let mut frames = tokio::time::timeout(STEP, client.connect(ReceiverStream::new(rx)))
         .await
@@ -311,6 +334,24 @@ async fn a_spoke_enrolls_renews_and_is_cut_off_on_revocation_over_real_mtls() {
         .expect_err("revoked renewal");
     assert_eq!(error.code(), Code::Unauthenticated);
 
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hello_naming_another_host_than_the_certificate_proves_is_refused() {
+    let fx = Fixture::new();
+    let hub = start(&fx, ServiceLimits::default()).await;
+    let (spoke, cert) = fx.enrolled("edge-1");
+    fx.enrolled("edge-2");
+    let wire = v1::Certificate {
+        leaf_der: cert.leaf_der.clone(),
+        ..v1::Certificate::default()
+    };
+    let refused = connect_claiming(&hub, identity_of(&spoke, &wire), "edge-2")
+        .await
+        .err()
+        .expect("a certificate for edge-1 cannot speak as edge-2");
+    assert_eq!(refused, Code::PermissionDenied);
     hub.stop().await;
 }
 

@@ -460,6 +460,18 @@ pub(crate) fn key_in_use(conn: &Connection, host: &HostRow, digest: &[u8]) -> Re
     Ok(false)
 }
 
+/// Each enrolled host with the certificate it should currently be using,
+/// as `(host_id, leaf_der)`, ordered by host id.
+pub(crate) fn enrolled_current_certificates(conn: &Connection) -> Result<Vec<(String, Vec<u8>)>, CredentialError> {
+    let mut statement = conn.prepare(
+        "SELECT hosts.host_id, certificates.leaf_der
+         FROM hosts JOIN certificates ON certificates.serial = hosts.current_serial
+         WHERE hosts.state = 'enrolled' ORDER BY hosts.host_id",
+    )?;
+    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect::<Result<_, _>>().map_err(Into::into)
+}
+
 /// Records a state change. `detail` must never contain a secret.
 pub(crate) fn audit(
     tx: &Transaction<'_>,

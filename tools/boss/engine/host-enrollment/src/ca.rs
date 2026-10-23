@@ -89,6 +89,9 @@ impl CertificateAuthority {
         ensure_private_dir(dir)?;
         let key_path = dir.join(KEY_FILE);
         let cert_path = dir.join(CERT_FILE);
+        // Settle a promotion a crash interrupted before reading anything, so
+        // the key and certificate read below are a matching pair.
+        finish_interrupted_promotion(dir, &cert_path)?;
         let key = match read_private(&key_path)? {
             Some(pem) => KeyPair::from_pem(&pem)?,
             None => {
@@ -169,6 +172,11 @@ impl CertificateAuthority {
     /// Ends a rotation: the incoming certificate becomes the only CA and the
     /// outgoing one stops being trusted, so any host certificate it issued that
     /// was not renewed in the meantime is refused.
+    ///
+    /// This does not check that every host has renewed; gate the call on
+    /// [`HostCredentials::hosts_awaiting_rotation`](crate::HostCredentials::hosts_awaiting_rotation)
+    /// being empty. A running hub keeps trusting both certificates until it
+    /// reopens its credential state.
     pub fn finish_rotation(dir: &Path, now: SystemTime, policy: &Policy) -> Result<(), CaError> {
         // Opening resumes a half-finished rotation and settles the files.
         let current = Self::open_or_create(dir, now, policy)?;
@@ -182,6 +190,19 @@ impl CertificateAuthority {
     /// outgoing certificate.
     pub fn is_rotating(&self) -> bool {
         self.outgoing_der.is_some()
+    }
+
+    /// Whether `leaf_der` was signed by the issuing certificate (the incoming
+    /// one during a rotation), judged by its issuer name. Issuer names differ
+    /// between the two certificates by construction.
+    pub(crate) fn issued_by_current(&self, leaf_der: &[u8]) -> bool {
+        let (Ok((_, leaf)), Ok((_, ca))) = (
+            x509_parser::parse_x509_certificate(leaf_der),
+            x509_parser::parse_x509_certificate(&self.cert_der),
+        ) else {
+            return false;
+        };
+        leaf.issuer().as_raw() == ca.subject().as_raw()
     }
 
     /// The certificates a verifier must trust to accept host certificates,
@@ -279,9 +300,8 @@ enum Rotation {
 /// Reads a rotation left in `dir`, finishing the parts a crash interrupted.
 ///
 /// A key without its certificate is a rotation that never got signed; it is
-/// discarded and `begin_rotation` can run again. A next certificate equal to
-/// the current one is a promotion that crashed after replacing the
-/// certificate and before the key.
+/// discarded and `begin_rotation` can run again. (A promotion that crashed
+/// midway was already settled by `finish_interrupted_promotion`.)
 fn read_rotation(dir: &Path, current_cert: &[u8]) -> Result<Rotation, CaError> {
     let (key_path, cert_path) = (dir.join(NEXT_KEY_FILE), dir.join(NEXT_CERT_FILE));
     let Some(pem) = read_private(&key_path)? else {
@@ -301,13 +321,34 @@ fn read_rotation(dir: &Path, current_cert: &[u8]) -> Result<Rotation, CaError> {
         }
     };
     if cert_der == current_cert {
-        promote(dir)?;
-        return Ok(Rotation::None);
+        // Unreachable after `finish_interrupted_promotion`; failing closed
+        // beats pairing a key with a certificate it may not belong to.
+        return Err(CaError::Io {
+            path: cert_path,
+            source: io::Error::other("promotion left unsettled"),
+        });
     }
     Ok(Rotation::Open {
         key: Box::new(KeyPair::from_pem(&pem)?),
         cert_der,
     })
+}
+
+/// A next certificate equal to the current one is a promotion that crashed
+/// after replacing the certificate and before the key: finish it, so the
+/// active key is the one the certificate was made for.
+fn finish_interrupted_promotion(dir: &Path, cert_path: &Path) -> Result<(), CaError> {
+    let next_cert_path = dir.join(NEXT_CERT_FILE);
+    if !dir.join(NEXT_KEY_FILE).exists() {
+        return Ok(());
+    }
+    let (Ok(current), Ok(next)) = (fs::read(cert_path), fs::read(&next_cert_path)) else {
+        return Ok(());
+    };
+    if current == next {
+        promote(dir)?;
+    }
+    Ok(())
 }
 
 /// Makes the next key and certificate the CA's. Certificate first, so a crash
@@ -519,6 +560,34 @@ mod tests {
         assert!(!resumed.is_rotating());
         assert_eq!(resumed.trust_bundle_der(), vec![incoming]);
         assert!(!dir.join(NEXT_KEY_FILE).exists());
+
+        // The authority that comes back must sign with the key that belongs
+        // to the certificate it advertises.
+        let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("key");
+        let request = CertificateParams::default().serialize_request(&leaf_key).expect("csr");
+        let leaf_public = rcgen::CertificateSigningRequestParams::from_der(request.der())
+            .expect("parse csr")
+            .public_key;
+        let leaf = resumed
+            .issue_host_certificate("edge-1", &leaf_public, now(), &policy)
+            .expect("issue");
+        let mut roots = rustls::RootCertStore::empty();
+        for der in resumed.trust_bundle_der() {
+            roots.add(CertificateDer::from(der)).expect("anchor");
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            std::sync::Arc::new(roots),
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .expect("verifier");
+        let at = rustls::pki_types::UnixTime::since_unix_epoch(
+            now().duration_since(SystemTime::UNIX_EPOCH).expect("after epoch"),
+        );
+        verifier
+            .verify_client_cert(&CertificateDer::from(leaf.der.clone()), &[], at)
+            .expect("the leaf validates under the authority's own trust bundle");
+        assert!(resumed.issued_by_current(&leaf.der));
     }
 
     #[test]

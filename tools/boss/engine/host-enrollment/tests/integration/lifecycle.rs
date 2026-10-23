@@ -794,6 +794,43 @@ mod stream_guard {
 
     use crate::support::{Fixture, Spoke, presented};
 
+    /// Delegates to the real authority, but can hold `revalidate` shut so a
+    /// test controls when a recheck finishes.
+    struct Gated {
+        inner: Arc<dyn HostAuthorizer>,
+        open: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl HostAuthorizer for Gated {
+        fn authorize(
+            &self,
+            peer_chain: &[rustls::pki_types::CertificateDer<'_>],
+        ) -> Result<boss_host_enrollment::AuthorizedHost, Denial> {
+            self.inner.authorize(peer_chain)
+        }
+
+        fn revalidate(
+            &self,
+            host: &boss_host_enrollment::AuthorizedHost,
+        ) -> Result<boss_host_enrollment::AuthorizedHost, Denial> {
+            let (lock, wake) = &*self.open;
+            let mut open = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*open {
+                open = wake.wait(open).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            drop(open);
+            self.inner.revalidate(host)
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<boss_host_enrollment::CredentialEvent> {
+            self.inner.subscribe()
+        }
+
+        fn now(&self) -> std::time::SystemTime {
+            self.inner.now()
+        }
+    }
+
     fn authorizer(fx: &Fixture) -> Arc<dyn HostAuthorizer> {
         fx.credentials.clone()
     }
@@ -876,6 +913,42 @@ mod stream_guard {
         fx.credentials.revoke("edge-1", "test", "gone").expect("revoke");
         assert_eq!(guard.closed().await, CloseReason::Revoked);
     }
+
+    /// A caller that `select!`s `closed()` against frames drops the future
+    /// whenever a frame arrives. The recheck a lag owes must survive that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recheck_owed_after_a_lag_survives_the_future_being_dropped() {
+        let fx = Fixture::new();
+        let (_spoke, cert) = fx.enrolled("edge-1");
+        let open = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
+        let gated: Arc<dyn HostAuthorizer> = Arc::new(Gated {
+            inner: authorizer(&fx),
+            open: Arc::clone(&open),
+        });
+        let mut guard = admit(gated, presented(&cert)).await.expect("admitted");
+
+        // The target's revocation goes first and is then pushed out of the
+        // backlog by other hosts' events, so only a recheck can find it.
+        fx.credentials.revoke("edge-1", "test", "gone").expect("revoke");
+        for i in 0..300 {
+            let id = format!("other-{i}");
+            fx.enrolled(&id);
+            fx.credentials.revoke(&id, "test", "noise").expect("revoke");
+        }
+
+        // Hold the recheck open, let the guard start it, and abandon the call.
+        *open.0.lock().expect("lock") = false;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), guard.closed())
+                .await
+                .is_err(),
+            "the recheck is blocked, so nothing is reported yet"
+        );
+        *open.0.lock().expect("lock") = true;
+        open.1.notify_all();
+
+        assert_eq!(guard.closed().await, CloseReason::Revoked);
+    }
 }
 
 // ------------------------------------------------------------ CA rotation
@@ -894,6 +967,11 @@ fn a_ca_rotation_keeps_old_certificates_valid_until_it_is_finished() {
     fx.restart();
     let bundle = fx.credentials.trust_bundle_der();
     assert_eq!(bundle.len(), 2, "both CAs are trusted during the rotation");
+    assert_eq!(
+        fx.credentials.hosts_awaiting_rotation().expect("query"),
+        ["kept", "stale"],
+        "nobody has renewed under the incoming CA yet"
+    );
 
     // Certificates issued before the rotation still authorize.
     let kept_host = fx
@@ -917,6 +995,11 @@ fn a_ca_rotation_keeps_old_certificates_valid_until_it_is_finished() {
         )
         .expect("renew");
     assert_eq!(renewed.chain_der, bundle);
+    assert_eq!(
+        fx.credentials.hosts_awaiting_rotation().expect("query"),
+        ["stale"],
+        "a renewal moves its host off the list"
+    );
     fx.credentials.authorize(&presented(&renewed)).expect("new CA trusted");
     drop(kept_spoke);
 
