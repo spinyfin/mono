@@ -14,11 +14,11 @@ struct ResyncRefetchPolicy: Equatable, Sendable {
     /// and the next resync starts again from `window` and `initialBackoff`.
     var quietReset: Duration
 
-    /// Retained after live overflow and normal-workload measurements; see
-    /// docs/investigations/resync-overflow-validation-2026-10-23.md for the
-    /// observed margins. The shared window avoids a second product burst,
-    /// the initial gap covers the first refill, the cap bounds storm latency,
-    /// and the quiet reset outlasts even the large fixture's refill.
+    /// The window matches product invalidation bursts so resync shares them.
+    /// The initial backoff must exceed one reply set's queue refill time;
+    /// the cap bounds board staleness during a sustained storm, and the quiet
+    /// reset must exceed the slowest refill. Measured margins are recorded in
+    /// docs/investigations/resync-overflow-validation-2026-10-23.md.
     static let standard = ResyncRefetchPolicy(
         window: .milliseconds(150),
         initialBackoff: .seconds(1),

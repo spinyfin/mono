@@ -431,63 +431,6 @@ extension ChatViewModel {
             refreshEngineAttempts()
         case .ciRemediationsList(let attempts):
             ciRemediations = attempts
-            // Reconcile both PR-card chips against the row list, which is
-            // freshest-first (`created_at DESC, id DESC`) — so the first
-            // row seen per PR is that PR's latest attempt:
-            //  - latest non-terminal (pending/running): mark the failure
-            //    chip `in_flight` if none exists yet, and drop any stale
-            //    "ci auto-fixed" chip — a fresh attempt means the prior
-            //    auto-fix claim no longer holds even if the
-            //    `ciRemediationStarted` push that would normally clear it
-            //    was missed (the push is the only other writer of
-            //    `recentlyClearedCIPRs`, so a dropped push stranded the
-            //    badge for up to the full freshness window).
-            //  - latest succeeded: the attempt that was fixing this PR is
-            //    done, so an `in_flight` failure chip is now stale even if
-            //    the `ciRemediationSucceeded` push that would normally
-            //    clear it was missed — drop it here so the chip can't
-            //    outlive the condition it represents. If still fresh,
-            //    (re)stamp the "ci auto-fixed" chip using the engine's own
-            //    timestamp rather than local observation time, so this same
-            //    missed push self-heals the auto-fixed badge too.
-            // Exhausted chips are sticky until the user clears them via
-            // retry — they are not derivable from the row list alone (the
-            // engine tracks them via `task_blocked_signals`), so we leave
-            // pre-existing exhausted chips alone. Terminal failed/abandoned
-            // attempts also leave the `in_flight` chip alone: the parent PR
-            // is still `blocked: ci_failure` until the engine retries or
-            // exhausts (see the `.ciRemediationFailed`/`.ciRemediationAbandoned`
-            // handling below), so the chip is still accurate.
-            var seenPRs = Set<String>()
-            for row in attempts {
-                guard seenPRs.insert(row.prURL).inserted else { continue }
-                switch row.status {
-                case "pending", "running":
-                    if ciFailureBadges[row.prURL] == nil {
-                        ciFailureBadges[row.prURL] = CiFailureBadge(
-                            state: .inFlight,
-                            attemptsUsed: 0,
-                            budget: 0,
-                        )
-                    }
-                    recentlyClearedCIPRs.removeValue(forKey: row.prURL)
-                case "succeeded":
-                    // Skip only the sticky `.exhausted` state so any future
-                    // non-sticky `CiFailureBadge.State` case defaults to
-                    // clearable here, rather than silently stranding it.
-                    if ciFailureBadges[row.prURL]?.state != .exhausted {
-                        ciFailureBadges.removeValue(forKey: row.prURL)
-                    }
-                    if let observedAt = AutomationTime.parse(row.finishedAt ?? row.createdAt),
-                       Date().timeIntervalSince(observedAt) < badgeFreshnessWindow {
-                        recentlyClearedCIPRs[row.prURL] = observedAt
-                    }
-                default:
-                    break
-                }
-            }
-            // A loaded tree carries the durable failure condition. Apply it
-            // last so reply ordering cannot resurrect a cleared CI chip.
             reconcileCIFailureBadges(from:
                 tasksByProjectID.values.flatMap { $0 }
                 + choresByProductID.values.flatMap { $0 }

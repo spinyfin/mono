@@ -2,28 +2,51 @@ import Foundation
 
 /// PR-card CI and conflict-cleared badge helpers.
 extension ChatViewModel {
-    /// A full tree is authoritative even when a clearing or exhaustion push
-    /// was evicted. Group by PR because revisions can share their parent's PR.
+    /// Combine tree state with the latest attempt: a fix revision leaves its
+    /// parent in review while CI is still failing. Lists are newest-first.
     func reconcileCIFailureBadges(from tasks: [WorkTask]) {
         let byPR = Dictionary(grouping: tasks.filter { $0.prURL != nil }, by: { $0.prURL! })
-        for (prURL, rows) in byPR {
-            let blocked = rows.filter { $0.status == "blocked" }
+        let attempts = Dictionary(grouping: ciRemediations, by: { $0.prURL })
+        for prURL in Set(byPR.keys).union(attempts.keys) {
+            let rows = byPR[prURL] ?? []
+            let latest = attempts[prURL]?.first
+            let succeededAt = latest.flatMap { row in
+                row.status == "succeeded" ? AutomationTime.parse(row.finishedAt ?? row.createdAt) : nil
+            }
+            // A cached blocked tree must not undo a newer success. A later
+            // failure still wins, even inside the auto-fixed badge window.
+            let clearedAt = succeededAt ?? recentlyClearedCIPRs[prURL]
+            let blocked = rows.filter { row in
+                guard row.status == "blocked" else { return false }
+                guard let clearedAt, let updatedAt = AutomationTime.parse(row.updatedAt) else { return true }
+                return updatedAt > clearedAt
+            }
             let state: CiFailureBadge.State?
             if blocked.contains(where: { $0.blockedReason == "ci_failure_exhausted" }) {
                 state = .exhausted
-            } else if blocked.contains(where: { $0.blockedReason == "ci_failure" }) {
+            } else if latest?.status == "pending" || latest?.status == "running"
+                || blocked.contains(where: { $0.blockedReason == "ci_failure" }) {
                 state = .inFlight
-            } else {
+            } else if rows.isEmpty && ciFailureBadges[prURL]?.state == .exhausted {
+                state = .exhausted
+            } else if latest?.status == "succeeded" || !rows.isEmpty {
                 state = nil
+            } else {
+                state = ciFailureBadges[prURL]?.state
             }
-            guard let state else {
+            if let state {
+                var badge = ciFailureBadges[prURL] ?? CiFailureBadge(state: state, attemptsUsed: 0, budget: 0)
+                badge.state = state
+                ciFailureBadges[prURL] = badge
+                if latest?.status == "pending" || latest?.status == "running" || !blocked.isEmpty {
+                    recentlyClearedCIPRs.removeValue(forKey: prURL)
+                }
+            } else {
                 ciFailureBadges.removeValue(forKey: prURL)
-                continue
+                if let succeededAt, Date().timeIntervalSince(succeededAt) < badgeFreshnessWindow {
+                    recentlyClearedCIPRs[prURL] = succeededAt
+                }
             }
-            var badge = ciFailureBadges[prURL] ?? CiFailureBadge(state: state, attemptsUsed: 0, budget: 0)
-            badge.state = state
-            ciFailureBadges[prURL] = badge
-            recentlyClearedCIPRs.removeValue(forKey: prURL)
         }
     }
 
