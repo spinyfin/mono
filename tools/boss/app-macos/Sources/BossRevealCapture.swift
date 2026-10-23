@@ -58,6 +58,10 @@ enum BossRevealCapture {
             BossReviewGuideCapture.start(path: path)
             return
         }
+        if state == "agent-pane-activity" {
+            BossAgentPaneActivityCapture.start(path: path)
+            return
+        }
         let model = ChatViewModel(paths: BossEnginePaths.production())
         let now = ISO8601DateFormatter().string(from: Date())
         let product = WorkProduct(

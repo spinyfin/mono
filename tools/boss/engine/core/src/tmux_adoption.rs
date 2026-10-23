@@ -921,6 +921,15 @@ async fn adopt_one<S>(
     };
 
     let driver = crate::driver_transcript::driver_for_spawned_execution(work_db, execution_id);
+    // The periodic husk sweep re-runs this routine for every live run. A run
+    // whose slot this process already holds is already observed here, so
+    // only a run adopted for the first time needs its ingress re-established.
+    let previously_live = spawner.live_worker_state_registry().is_some_and(|live_states| {
+        live_states
+            .snapshot()
+            .iter()
+            .any(|state| state.run_id == execution_id && !state.activity.is_terminal())
+    });
     crate::tmux_adoption_live_state::register_adopted_live_state(
         work_db,
         spawner,
@@ -928,9 +937,26 @@ async fn adopt_one<S>(
         execution_id,
         slot_id,
         shell_pid,
-        driver,
+        driver.clone(),
     )
     .await;
+
+    // A file-tailing driver is observed only through the tail the previous
+    // engine process held, so without re-establishing it the slot stays at
+    // its seeded activity and never sees the turn boundary. Same
+    // re-establishment the terminalized-survivor path does, from the same
+    // checkpoint.
+    let progress_ingress = if previously_live {
+        crate::spawn_flow::IngressReadoption::AlreadyObserved
+    } else {
+        spawner.reestablish_progress_ingress(&execution, driver).await
+    };
+    tracing::info!(
+        execution_id,
+        slot_id,
+        progress_ingress = progress_ingress.as_str(),
+        "tmux boot adoption: progress ingress re-establishment",
+    );
 
     outcome.adopted_execution_ids.insert(execution_id.to_owned());
 
@@ -948,6 +974,7 @@ async fn adopt_one<S>(
                     "shell_pid_write_reason": shell_pid_write_reason,
                     "tmux_session_name": session_name,
                     "repaired_intent": repaired_intent,
+                    "progress_ingress": progress_ingress.as_str(),
                 })),
         )
         .await;
@@ -1802,6 +1829,9 @@ mod tests {
         live_states: LiveWorkerStateRegistry,
         live_status_calls: StdMutex<Vec<(u8, String)>>,
         publish_calls: StdMutex<usize>,
+        /// Execution ids whose progress ingress the pass asked to have
+        /// re-established, in call order. Answered as `Reestablished`.
+        ingress_calls: StdMutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -1831,6 +1861,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((slot_id, run_id.to_owned()));
+        }
+
+        async fn reestablish_progress_ingress(
+            &self,
+            execution: &crate::work::WorkExecution,
+            _driver: Option<Arc<dyn AgentDriver>>,
+        ) -> crate::spawn_flow::IngressReadoption {
+            self.ingress_calls.lock().unwrap().push(execution.id.clone());
+            crate::spawn_flow::IngressReadoption::Reestablished
         }
     }
 
@@ -2007,6 +2046,12 @@ mod tests {
             spawner.live_status_calls.lock().unwrap().as_slice(),
             &[(1u8, execution_id.clone())]
         );
+        assert_eq!(
+            spawner.ingress_calls.lock().unwrap().as_slice(),
+            std::slice::from_ref(&execution_id),
+            "a live run's progress ingress must be re-established alongside its slot: a file-tailing \
+             driver has no other way back to being observed after the restart",
+        );
 
         assert!(
             coordinator
@@ -2028,6 +2073,7 @@ mod tests {
             events[0].details["shell_pid_write_reason"],
             "refresh_created_tmux_session"
         );
+        assert_eq!(events[0].details["progress_ingress"], "reestablished");
     }
 
     /// A variant of the cardinal non-terminal-match case: the durable

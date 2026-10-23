@@ -40,6 +40,17 @@ The two statuses now mean what they say, and both are `is_live()`:
 
 `waiting_human` has exactly one writer and exactly one clearer, both in `engine/core/src/awaiting_input_status.rs`, driven off the `WorkerActivity::WaitingForInput` transition on the ordinary hook-dispatch path. That signal is the driver's own notification (Claude's `Notification` hook), honoured only for a driver declaring `Capability::AwaitingInputSignal` — never inferred from tool timing or elapsed silence. The write is guarded in SQL to the `running` ⇄ `waiting_human` pair, so a late hook can never drag a settled row (terminal, `waiting_review`, `waiting_merge`) back into a live status.
 
+### A worker is busy for the whole turn, including while it waits on its own background command
+
+`activity` is `Working` from the first turn activity the driver reports (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`) until the driver reports the turn boundary (`Stop`). Nothing in between lowers it: not a balanced tool call, not a long think, not minutes of silence. `Idle` means one thing — the driver said the turn ended — and the only honest way to get there is a `Stop` the driver actually emitted.
+
+Two driver facts make this matter more than it sounds:
+
+- **A Codex background-terminal wait is silent by design.** The rollout translator (`engine/driver/src/codex/progress.rs`) announces a command once, when its cell starts (`PreToolUse`), and treats every `wait`/`write_stdin` poll of that cell as a continuation of the announced command: no `PreToolUse` for the poll, no `PostToolUse` while the command is still running. `• Waiting for background terminal (12m 49s • esc to interrupt)` on the TUI is a chain of 30-second polls inside one turn, and the engine sees no event for any of them. The command's own `PreToolUse` is the last tool-boundary event, so the slot stays `Working` with `current_tool` set — correctly — until the command's real output or the turn's `task_complete` arrives. A Claude worker's equivalent is a long foreground `Bash` call (one `PreToolUse`, then nothing); a Claude worker that backgrounds a command _ends its turn_ (`Stop`) and is woken by Claude Code when the command finishes, so `Idle` there is the truth, not this bug.
+- **The durable checkpoint carries the turn, not just the tool.** `work_runs.semantic_tool_condition` (`in_flight` / `idle` / `unknown`) answers only "is a tool call unbalanced right now?", which is `idle` for most of a live turn — between tools, during a think, and for the whole of a background wait whose polls emit nothing after an earlier command completed. `work_runs.semantic_turn_condition` (`in_turn` / `ended` / `unknown`, schema 50) mirrors the reducer's turn gate: set to `in_turn` by the main session's turn-activity events, to `ended` by `Stop`, and left alone by everything else. Both columns are persisted under the reducer lock from its latest post-apply state (`WorkDb::record_semantic_checkpoint`, `engine/core/src/work/semantic_progress.rs`), so an event the reducer refuses as stale (a `Stop` that arrives after the next turn's tool hook) or does not count (a subagent's tool hooks) never changes them. Both are restored to the slot by `LiveWorkerStateRegistry::seed_semantic_progress` on re-adoption, where the turn condition decides busy-vs-idle: `in_turn` seeds `Working`; `ended` seeds `Idle`; a row from before the column (`unknown`) seeds `Working` only when a tool was in flight and otherwise leaves the slot unknown (`Spawning`) until the next driver event. A balanced last tool call is not evidence that the turn ended, so no `Idle` is inferred from it. This is a one-time gap at upgrade: a worker that was mid-turn in a silent background wait remains unknown (`Spawning`) until its next driver event, for either driver. Checkpoint-seeded slots are exempt from startup-stall promotion, so the 30-second timer cannot turn this uncertainty into `Idle` or `WaitingForInput`.
+
+A re-adopted slot seeded from the tool condition alone reads `Idle` over a worker that is mid-turn in a background wait: the last tool boundary was an earlier command completing, and the polls since emit nothing. Seeding from the turn condition, and re-establishing the rollout tail on adoption (below), is what keeps the pane header at `Working` for such a worker.
+
 A pane going `Terminated`/`Errored` is deliberately NOT mirrored. That is a death signal, and death detection has its own owners with their own corroboration rules — see Convergence below.
 
 ### `live_status` is not the indicator's input
@@ -102,8 +113,24 @@ closes that gap, once at boot and periodically thereafter, before
 `boss` tmux server, exact-matches each live session's authoritative
 `BOSS_SPAWN_TOKEN` (`show-environment`, never the `@boss_spawn_token` option
 mirror) against the non-terminal tmux-tracked `work_runs` rows, and rebuilds
-the pool slot claim, `WorkerRegistry` entry, `LiveWorkerState` entry, and
-live-status summarizer for every match. A matching session whose worker pane
+the pool slot claim, `WorkerRegistry` entry, `LiveWorkerState` entry
+(seeded from the durable semantic-progress checkpoint, turn condition
+first — see "busy for the whole turn" above), live-status summarizer, and
+**progress ingress** for every match. The last of those is what keeps the
+rebuilt slot from freezing at its seeded activity: a hook-callback driver's
+shim reconnects to the events socket on its own, but a file-tailing driver
+(Codex) is observed only through the rollout tail the previous engine
+process held, and that tail died with it. Adoption therefore calls the same
+`readopt_progress_ingress` the terminalized-survivor path uses
+(`WorkerSpawner::reestablish_progress_ingress`), resuming the tail at the
+recorded byte or filing the "Re-adopted worker has no progress ingress"
+attention item when it cannot; the `tmux_adopt` dispatch event records the
+outcome as `details.progress_ingress`. Without this step every engine restart
+would leave every live Codex worker unobserved for the rest of its run. The
+periodic sweep re-runs adoption for every live session, so a run whose slot
+this process already holds is skipped (`details.progress_ingress =
+already_observed`): its tail is already in place, and re-establishing it
+would only repeat failures. A matching session whose worker pane
 is dead (`#{pane_dead}=1`) is not a live worker: `remain-on-exit` keeps the
 session listed after the command has exited, and that is terminal evidence.
 The sweep records the pane exit status (and a pane-capture snippet when
@@ -228,5 +255,6 @@ Three things close the ordering hole:
 - **`Unknown` is not `Gone`.** A worker with no recorded pid is mid-spawn, not dead. `WorkerProcess::Unknown` and `PaneReleaseOutcome::NoLiveWorker` both exist to keep that case from being read as death — treating it as death reaps live-but-slow spawns and releases cube leases out from under workspaces a worker is about to occupy.
 - **`EPERM` means alive.** `kill(pid, 0)` returning `EPERM` proves the process exists.
 - **A pid is a durable number, not a durable handle.** Once the OS recycles it — macOS wraps at ~99999 — the same integer names an unrelated process, and the reap signals its whole process _group_. Anything that signals a process or restores state from the pid must use a bounded probe (`probe_execution_worker_within`, `probe_work_item_worker`), which declines to answer once the run row ages past `REDISPATCH_PID_TRUST_SECS`. The unbounded `probe_execution_worker` is only for callers whose failure direction is to decline to act, where a stale pid costs a missed reconciliation rather than a killed bystander.
-- **Never infer activity from pane output or timers.** `activity` is reduced from the hook stream, in emission order (`ingress_seq`). If a pane looks busy while the slot says `Idle`, the bug is in ingress ordering or the reducer — fix that, not the symptom.
+- **Never infer activity from pane output or timers.** `activity` is reduced from the hook stream, in emission order (`ingress_seq`). If a pane looks busy while the slot says `Idle`, the bug is in ingress ordering, the reducer, or — after an engine restart — the re-adoption seed or a tail that was never re-established; fix that, not the symptom.
+- **A balanced tool call is not a turn boundary.** `semantic_tool_condition = idle` says no tool is unbalanced; only `semantic_turn_condition = ended` (a driver `Stop`) says the worker is parked. Anything that restores or classifies a slot's activity from durable state must read the turn column, and a Codex worker polling its own background command — silent on both columns for as long as the wait lasts — is `Working`, not idle and not stuck.
 - **Don't lengthen a timeout to fix a contradiction.** A longer spawn-ack window narrows the race without closing it, and leaves the system with no answer for the times it still loses.

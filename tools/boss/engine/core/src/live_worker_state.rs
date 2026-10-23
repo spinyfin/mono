@@ -22,7 +22,9 @@ use boss_protocol::{
 };
 
 use crate::driver::ProgressFidelity;
-use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, next_tool_condition};
+use crate::semantic_progress::{
+    SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition, next_tool_condition, next_turn_condition,
+};
 
 mod never_started_reap;
 pub use never_started_reap::NeverStartedReapCommit;
@@ -352,6 +354,14 @@ struct SlotMeta {
     /// [`SemanticToolCondition::Unknown`]; unknown is never coerced to idle.
     #[builder(default = SemanticToolCondition::Unknown)]
     semantic_tool_condition: SemanticToolCondition,
+    /// Tri-state turn condition established by driver events — the durable
+    /// shadow of `activity`'s turn gate (`Working` until a `Stop`). Defaults
+    /// to [`SemanticTurnCondition::Unknown`]; unknown is never coerced to
+    /// ended. Restored by [`LiveWorkerStateRegistry::seed_semantic_progress`]
+    /// and the reason a re-adopted mid-turn worker seeds as `Working` even
+    /// though its tool condition reads idle.
+    #[builder(default = SemanticTurnCondition::Unknown)]
+    semantic_turn_condition: SemanticTurnCondition,
     /// Consecutive [`crate::transcript_liveness::TranscriptLiveness::Undeterminable`]
     /// reap outcomes recorded for this slot's current run by
     /// [`crate::spawn_ack_sweep::reap_never_started_spawn`]. Reset only by a
@@ -964,15 +974,30 @@ impl LiveWorkerStateRegistry {
         }
         entry.meta.semantic_progress_at = Some(checkpoint.progress_at.clone());
         entry.meta.semantic_tool_condition = checkpoint.tool_condition;
-        match checkpoint.tool_condition {
-            SemanticToolCondition::InFlight => {
+        entry.meta.semantic_turn_condition = checkpoint.turn_condition;
+        // The turn condition, not the tool condition, decides busy vs idle:
+        // the tool condition is `Idle` for most of a live turn, including a
+        // Codex background-terminal wait whose polls emit no events. The
+        // turn condition is persisted from the reducer's own turn gate, so
+        // `InTurn` holds from the first turn activity until a `Stop`.
+        match (checkpoint.turn_condition, checkpoint.tool_condition) {
+            (SemanticTurnCondition::InTurn, _) | (SemanticTurnCondition::Unknown, SemanticToolCondition::InFlight) => {
+                // An unbalanced tool call is itself in-turn evidence, so a
+                // row that predates the turn column still seeds `Working`
+                // when a tool was in flight.
                 entry.state.activity = WorkerActivity::Working;
             }
-            SemanticToolCondition::Idle => {
+            (SemanticTurnCondition::Ended, _) => {
                 entry.state.activity = WorkerActivity::Idle;
             }
-            SemanticToolCondition::Unknown => {
-                // Leave Spawning. Unknown must never be coerced to idle.
+            (SemanticTurnCondition::Unknown, _) => {
+                // No turn evidence. A balanced last tool boundary does not
+                // say the turn ended (the worker may be thinking or waiting
+                // on a background command), so no turn boundary is inferred
+                // from it: the slot stays unknown (`Spawning`) until the
+                // next driver event establishes the turn state. Rows
+                // written before the turn column existed are in this state
+                // once, at upgrade. Unknown must never be coerced to idle.
             }
         }
     }
@@ -981,13 +1006,26 @@ impl LiveWorkerStateRegistry {
     /// or `None` if no driver-originated event has been recorded (and none
     /// was restored on re-adoption).
     pub fn semantic_progress_for_slot(&self, slot_id: u8) -> Option<SemanticProgressCheckpoint> {
+        self.with_semantic_progress(slot_id, |checkpoint| checkpoint)
+    }
+
+    /// Consume the latest checkpoint while holding the reducer lock.
+    /// Persistence must finish inside this callback so an older dispatch
+    /// cannot overwrite a newer accepted event. Do not re-enter the registry.
+    pub fn with_semantic_progress<R>(
+        &self,
+        slot_id: u8,
+        consume: impl FnOnce(Option<SemanticProgressCheckpoint>) -> R,
+    ) -> R {
         let guard = self.inner.lock().expect("registry mutex poisoned");
-        guard.get(&slot_id).and_then(|entry| {
+        let checkpoint = guard.get(&slot_id).and_then(|entry| {
             Some(SemanticProgressCheckpoint {
                 progress_at: entry.meta.semantic_progress_at.clone()?,
                 tool_condition: entry.meta.semantic_tool_condition,
+                turn_condition: entry.meta.semantic_turn_condition,
             })
-        })
+        });
+        consume(checkpoint)
     }
 
     /// Declare the [`ProgressFidelity`] tier for `slot_id`'s driver. The
@@ -1722,6 +1760,14 @@ impl LiveWorkerStateRegistry {
         // semantic checkpoint.
         meta.semantic_progress_at = Some(now);
         meta.semantic_tool_condition = next_tool_condition(event, meta.semantic_tool_condition);
+        // A subagent's tool hooks say nothing about the main session's turn:
+        // they can land after the main session's `Stop`, and counting them
+        // would reopen a turn that has genuinely ended.
+        let subagent_tool_event =
+            origin.from_subagent && matches!(event, WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. });
+        if !subagent_tool_event {
+            meta.semantic_turn_condition = next_turn_condition(event, meta.semantic_turn_condition);
+        }
         // Any hook event is proof the worker's session is responsive
         // again — clear a stale recovery banner regardless of which
         // event arrived, so real progress after a nudge is never
@@ -2056,6 +2102,11 @@ impl LiveWorkerStateRegistry {
             }
             if meta.spawned_at > cutoff {
                 // Spawned too recently; give the worker more time.
+                continue;
+            }
+            if meta.semantic_progress_at.is_some() {
+                // A checkpoint-seeded driver is past startup; an unknown
+                // restored turn is not a directory-trust prompt.
                 continue;
             }
             let promoted = if meta.awaiting_input_capable {

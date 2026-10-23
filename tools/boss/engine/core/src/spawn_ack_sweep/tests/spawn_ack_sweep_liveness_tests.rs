@@ -473,6 +473,7 @@ async fn a_readopted_worker_with_durable_driver_proof_is_not_reaped() {
         &SemanticProgressCheckpoint {
             progress_at: "2026-09-02T12:00:00Z".to_owned(),
             tool_condition: SemanticToolCondition::Unknown,
+            turn_condition: crate::semantic_progress::SemanticTurnCondition::Unknown,
         },
     );
     assert!(

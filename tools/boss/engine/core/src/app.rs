@@ -411,6 +411,14 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         self.agent_jsonl_progress_manager.stop_run(run_id);
     }
 
+    async fn reestablish_progress_ingress(
+        &self,
+        execution: &crate::work::WorkExecution,
+        driver: Option<Arc<dyn AgentDriver>>,
+    ) -> crate::spawn_flow::IngressReadoption {
+        self.readopt_progress_ingress(execution, driver).await
+    }
+
     fn draft_pr_mode(&self) -> bool {
         self.settings.is_enabled("default_pr_draft_mode")
     }

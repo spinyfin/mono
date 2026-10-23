@@ -1998,6 +1998,7 @@ impl<'a> WorkerTerminalInspector for RefreshesProgressOnRecheckInspector<'a> {
                 self.slot_id,
                 &SemanticProgressCheckpoint {
                     tool_condition: SemanticToolCondition::Idle,
+                    turn_condition: crate::semantic_progress::SemanticTurnCondition::Unknown,
                     progress_at: iso8601_utc(boss_engine_utils::epoch_time::now_epoch_secs()),
                 },
             );
@@ -2030,6 +2031,7 @@ async fn auto_reap_recheck_new_driver_event_blocks_the_reap() {
         1,
         &SemanticProgressCheckpoint {
             tool_condition: SemanticToolCondition::Idle,
+            turn_condition: crate::semantic_progress::SemanticTurnCondition::Unknown,
             progress_at: iso8601_utc(now - 10_000),
         },
     );

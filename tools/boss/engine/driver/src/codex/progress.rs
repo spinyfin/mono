@@ -2628,4 +2628,98 @@ mod tests {
             ]
         );
     }
+
+    /// At the driver boundary: a Codex worker ran
+    /// `timeout 1800 checkleft run` as a background terminal and sat in
+    /// `Waiting for background terminal (12m 49s • esc to interrupt)`: a chain
+    /// of `wait` polls, each bounded by the cell harness's 30 s yield, inside
+    /// one turn that had not ended. The driver must report that turn as still
+    /// open for the whole wait — the command is announced once, the polls
+    /// are continuations and are deliberately silent, and no turn boundary
+    /// (`Stop`) exists until Codex writes `task_complete`. Idle on the pane
+    /// is therefore never something this stream justifies mid-wait.
+    #[test]
+    fn a_background_wait_inside_a_turn_reports_no_turn_boundary() {
+        let mut session = cell_harness_session();
+        const SCRIPT: &str = concat!(
+            r#"const r = await tools.exec_command({"cmd":"timeout 1800 checkleft run","yield_time_ms":30000});"#,
+            "\ntext(JSON.stringify(r));"
+        );
+        // A completed cell whose forwarded chunk carries no exit code: the
+        // command is still running at the end of this 30 s poll.
+        const RUNNING_CHUNK: &str = concat!(
+            r#"{"chunk_id":"c1","wall_time_seconds":30.0,"session_id":17883,"#,
+            r#""original_token_count":3,"output":"checking…\n"}"#
+        );
+
+        let opened = session
+            .normalize_progress_events(
+                &json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-bg"}}),
+            )
+            .unwrap();
+        assert!(
+            matches!(opened.as_slice(), [WorkerEvent::UserPromptSubmit { .. }]),
+            "task_started opens the turn: {opened:?}"
+        );
+
+        let announced = session
+            .normalize_progress_events(&cell_exec_call("call-bg", SCRIPT))
+            .unwrap();
+        assert_eq!(
+            announced,
+            vec![WorkerEvent::PreToolUse {
+                session_id: "thread-cell".into(),
+                tool_name: "Bash".into(),
+                tool_input: json!({"command": "timeout 1800 checkleft run"}),
+            }],
+            "the background command is announced exactly once, when it starts"
+        );
+
+        // The wait itself: the cell yields, then the model polls it again
+        // (a real wait can last many minutes; three rounds here).
+        // Every record is silent — no PostToolUse (the command has
+        // not finished), no Stop (the turn has not ended), nothing that a
+        // reducer could read as idle.
+        let mut quiet = Vec::new();
+        quiet.extend(
+            session
+                .normalize_progress_events(&cell_yield_output("call-bg", 1))
+                .unwrap(),
+        );
+        for round in 0..3u32 {
+            let wait_id = format!("call-bg-wait-{round}");
+            quiet.extend(session.normalize_progress_events(&cell_wait_call(&wait_id, 1)).unwrap());
+            quiet.extend(
+                session
+                    .normalize_progress_events(&cell_completed_output(&wait_id, RUNNING_CHUNK))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            quiet,
+            Vec::new(),
+            "a background wait is a continuation of the announced command and emits nothing: {quiet:?}"
+        );
+        assert!(
+            session.calls.has_open_calls(),
+            "the announced command stays open for as long as the model keeps polling it"
+        );
+
+        // The turn boundary is the driver's own signal: nothing in the
+        // wait is one, and the turn's `task_complete` is the first.
+        let driver = crate::codex::CodexDriver::default();
+        let closed = session
+            .normalize_progress_events(&json!({"type":"event_msg","payload":{"type":"task_complete"}}))
+            .unwrap();
+        let boundaries: Vec<_> = opened
+            .iter()
+            .chain(announced.iter())
+            .chain(closed.iter())
+            .filter(|event| crate::AgentDriver::turn_boundary(&driver, event).is_some())
+            .collect();
+        assert!(
+            matches!(boundaries.as_slice(), [WorkerEvent::Stop { .. }]),
+            "the turn's Stop is the only turn boundary in the stream: {boundaries:?}"
+        );
+    }
 }

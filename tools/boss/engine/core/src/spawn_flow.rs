@@ -599,6 +599,35 @@ pub enum StartWorkerError {
     ProgressFidelity(ProgressFidelity),
 }
 
+/// What re-establishing a re-adopted run's progress ingress did, for the
+/// dispatch trace. Produced by [`WorkerSpawner::reestablish_progress_ingress`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressReadoption {
+    /// The run's driver observes progress some other way (hook callbacks).
+    NotFileIngress,
+    /// The tail is back, reading from the recorded resume point.
+    Reestablished,
+    /// The run recorded no checkpoint, so whether it needed one is unknown.
+    Unknown,
+    /// It needed one and could not be re-established; an attention item says so.
+    Failed,
+    /// This process already holds the run's slot, so its tail (if any) is
+    /// already in place and nothing was re-established.
+    AlreadyObserved,
+}
+
+impl IngressReadoption {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFileIngress => "not_file_ingress",
+            Self::Reestablished => "reestablished",
+            Self::Unknown => "unknown",
+            Self::Failed => "failed",
+            Self::AlreadyObserved => "already_observed",
+        }
+    }
+}
+
 /// Public API for callers that want to wire pane-spawning into the
 /// coordinator (or a test). The trait is implemented by
 /// [`crate::app::ServerState`]; users should typically call through
@@ -665,6 +694,23 @@ pub trait WorkerSpawner: Send + Sync {
 
     /// Cancel a prepared or active source after spawn failure/teardown.
     fn stop_progress_ingress(&self, _run_id: &str) {}
+
+    /// Re-establish a *re-adopted* run's progress ingress from the durable
+    /// record of where it got to, after an engine restart rebuilt the run's
+    /// slot. A hook-callback driver needs nothing here — its shim reconnects
+    /// to the events socket on its own — but a file-tailing driver (Codex)
+    /// is observed only through the tail this engine process holds, and a
+    /// rebuilt slot with no tail stays frozen at whatever activity it was
+    /// seeded with and never sees the turn boundary that completes the run.
+    /// Production `ServerState` resumes the tail at the recorded byte or
+    /// files an attention item; the default is for tests.
+    async fn reestablish_progress_ingress(
+        &self,
+        _execution: &crate::work::WorkExecution,
+        _driver: Option<Arc<dyn AgentDriver>>,
+    ) -> IngressReadoption {
+        IngressReadoption::Unknown
+    }
 
     /// Whether the `default_pr_draft_mode` setting is enabled. When
     /// `true`, the worker's CLAUDE.md gets a directive to pass
