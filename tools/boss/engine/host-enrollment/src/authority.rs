@@ -1,9 +1,8 @@
 //! The authorization boundary the hub's stream manager calls.
 //!
 //! TLS proves a peer holds a key the CA signed. That is necessary and not
-//! sufficient: a certificate that was revoked, replaced by a renewal whose
-//! overlap has ended, or issued to a host that has since been removed still
-//! passes the handshake. [`HostAuthorizer::authorize`] is the check that
+//! sufficient: a certificate that was revoked, or replaced by a renewal whose
+//! overlap has ended or a re-enrollment, still passes the handshake. [`HostAuthorizer::authorize`] is the check that
 //! closes the gap, and [`CredentialEvent`] is how a stream already open is told
 //! that its certificate stopped counting.
 
@@ -51,15 +50,28 @@ pub enum CredentialEvent {
 
 /// What the stream manager asks of the credential authority.
 ///
+/// Call [`subscribe`](Self::subscribe) **before** [`authorize`](Self::authorize)
+/// (or call [`revalidate`](Self::revalidate) once after subscribing). A change
+/// committed between the two calls is published to subscribers that exist at
+/// that moment; a receiver created afterwards never sees it, and the stream
+/// would stay open until its certificate expires.
+///
+/// `authorize` and `revalidate` are blocking: they take the store's lock and
+/// run synchronous SQLite queries, which can wait behind an enrollment or
+/// renewal that is signing and syncing to disk. From async code, run them with
+/// `tokio::task::spawn_blocking`.
+///
 /// `subscribe` is lossy by construction: a receiver that falls behind gets
 /// `Lagged` and must re-run [`revalidate`](Self::revalidate) for every open
 /// stream rather than assume nothing was missed.
 pub trait HostAuthorizer: Send + Sync {
-    /// Authorizes the peer certificate chain a TLS handshake produced. The
-    /// caller still compares the returned `host_id` with `Hello.host_id`.
+    /// Authorizes the peer certificate chain a TLS handshake produced. Blocking,
+    /// and the caller must already hold a [`subscribe`](Self::subscribe)
+    /// receiver. The caller still compares the returned `host_id` with `Hello.host_id`.
     fn authorize(&self, peer_chain: &[CertificateDer<'_>]) -> Result<AuthorizedHost, Denial>;
 
     /// Re-checks a host authorized earlier against the current records.
+    /// Blocking.
     fn revalidate(&self, host: &AuthorizedHost) -> Result<(), Denial>;
 
     /// Changes that can end an open stream.

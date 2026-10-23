@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use boss_host_enrollment::{CredentialEvent, EnrollmentService, HostAuthorizer, ServiceLimits};
+use boss_host_enrollment::{AuthorizedHost, CredentialEvent, EnrollmentService, HostAuthorizer, ServiceLimits};
 use boss_protocol_spoke::v1::enrollment_client::EnrollmentClient;
 use boss_protocol_spoke::v1::spoke_hub_server::{SpokeHub, SpokeHubServer};
 use boss_protocol_spoke::v1::{self, EnrollRequest, RenewRequest};
@@ -59,11 +59,16 @@ impl SpokeHub for Hub {
         let chain = request
             .peer_certs()
             .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
-        let host = self
-            .authorizer
-            .authorize(&chain)
-            .map_err(|_| Status::unauthenticated("not permitted"))?;
+        // Subscribe first: a revocation committed between authorize and a
+        // later subscribe would otherwise never reach this stream.
         let mut events = self.authorizer.subscribe();
+        // authorize blocks on the credential store, so keep it off the runtime.
+        let chain: Vec<_> = chain.iter().map(|cert| cert.clone().into_owned()).collect();
+        let authorizing = Arc::clone(&self.authorizer);
+        let host = tokio::task::spawn_blocking(move || authorizing.authorize(&chain))
+            .await
+            .map_err(|_| Status::internal("authorization task failed"))?
+            .map_err(|_| Status::unauthenticated("not permitted"))?;
         let authorizer = Arc::clone(&self.authorizer);
         let (tx, rx) = mpsc::channel(4);
         tx.send(Ok(v1::HubFrame::default())).await.expect("first frame");
@@ -72,10 +77,12 @@ impl SpokeHub for Hub {
                 let still_valid = match events.recv().await {
                     Ok(CredentialEvent::Revoked { host_id }) => host_id != host.host_id,
                     Ok(CredentialEvent::Superseded { host_id, serial, .. }) => {
-                        host_id != host.host_id || serial != host.serial || authorizer.revalidate(&host).is_ok()
+                        host_id != host.host_id || serial != host.serial || still_authorized(&authorizer, &host).await
                     }
                     // Missed events: the only safe answer is to look again.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => authorizer.revalidate(&host).is_ok(),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        still_authorized(&authorizer, &host).await
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
                 };
                 if !still_valid {
@@ -88,6 +95,14 @@ impl SpokeHub for Hub {
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+/// `revalidate` blocks on the credential store, so it runs off the runtime.
+async fn still_authorized(authorizer: &Arc<dyn HostAuthorizer>, host: &AuthorizedHost) -> bool {
+    let (authorizer, host) = (Arc::clone(authorizer), host.clone());
+    tokio::task::spawn_blocking(move || authorizer.revalidate(&host).is_ok())
+        .await
+        .unwrap_or(false)
 }
 
 /// A throwaway CA for the hub's *server* certificate, which is separate trust

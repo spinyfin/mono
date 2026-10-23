@@ -66,12 +66,13 @@ impl HostCredentials {
             match grant.state {
                 GrantState::Replaced => Err(Denial::TokenReplaced.into()),
                 GrantState::Cancelled => Err(Denial::JobCancelled.into()),
-                GrantState::Consumed(consumed_at) => {
+                GrantState::Consumed(consumed_at, bound_serial) => {
                     let replay = Replay {
                         host_id: request.host_id,
                         ids,
                         key_digest: &csr.key_digest,
                         consumed_at,
+                        bound_serial: &bound_serial,
                     };
                     let stored = self.recover_enrollment(tx, &host, &replay, now)?;
                     store::audit(
@@ -97,7 +98,7 @@ impl HostCredentials {
                         leaf_der: leaf.der,
                         not_after: unix_secs(leaf.not_after),
                     };
-                    store::consume_grant(tx, &hash, unix_secs(now))?;
+                    store::consume_grant(tx, &hash, unix_secs(now), &row.serial)?;
                     store::insert_certificate(tx, request.host_id, CertKind::Enroll, ids, &row)?;
                     // A new enrollment is a new identity: whatever the host
                     // held before stops authorizing at once.
@@ -142,6 +143,12 @@ impl HostCredentials {
     ) -> Result<CertRow, CredentialError> {
         let stored = store::certificate_for_request(conn, replay.host_id, CertKind::Enroll, replay.ids)?
             .ok_or(Denial::TokenReplayed)?;
+        // The token is bound to the one certificate it produced. Another
+        // request's certificate for the same host and job is not its to hand
+        // back, even if every id and key in this request matches that one.
+        if replay.bound_serial != stored.serial {
+            return Err(Denial::TokenReplayed.into());
+        }
         if stored.key_digest != replay.key_digest {
             return Err(Denial::KeyChanged.into());
         }
@@ -166,6 +173,8 @@ struct Replay<'a> {
     ids: (&'a str, &'a str),
     key_digest: &'a [u8; 32],
     consumed_at: i64,
+    /// The serial recorded on the consumed grant.
+    bound_serial: &'a str,
 }
 
 fn note_job(job_id: &str) -> String {

@@ -593,6 +593,88 @@ fn revoking_a_host_the_hub_never_authorized_is_an_error() {
 // ------------------------------------------------------------ durability
 
 #[test]
+fn a_spent_token_only_recovers_the_certificate_it_produced() {
+    let fx = Fixture::new();
+    let first = fx.grant("h1", "job-1");
+    let spoke_a = Spoke::new();
+    let cert_a = fx
+        .enroll(&spoke_a, ("h1", "job-1", "req-1"), &first.token)
+        .expect("enroll with the first token");
+
+    // A second token for the same host and job, used by another request and key.
+    let second = fx.grant("h1", "job-1");
+    let spoke_b = Spoke::new();
+    let cert_b = fx
+        .enroll(&spoke_b, ("h1", "job-1", "req-2"), &second.token)
+        .expect("enroll with the second token");
+    assert_ne!(cert_a, cert_b);
+
+    // The first token, presented with the second one's identity, must not be
+    // handed the second one's certificate.
+    assert_eq!(
+        refusal(fx.enroll(&spoke_b, ("h1", "job-1", "req-2"), &first.token)),
+        Denial::TokenReplayed
+    );
+    // Each token still answers only its own request, though the first
+    // certificate is no longer the current one.
+    assert_eq!(
+        refusal(fx.enroll(&spoke_a, ("h1", "job-1", "req-1"), &first.token)),
+        Denial::Superseded
+    );
+    assert_eq!(
+        fx.enroll(&spoke_b, ("h1", "job-1", "req-2"), &second.token)
+            .expect("the second token recovers its own certificate"),
+        cert_b
+    );
+    assert_eq!(
+        refusal(fx.enroll(&spoke_a, ("h1", "job-1", "req-1"), &second.token)),
+        Denial::TokenReplayed
+    );
+}
+
+// ------------------------------------------------------- state permissions
+
+fn set_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+fn reopen(fx: &Fixture) -> Result<boss_host_enrollment::HostCredentials, CredentialError> {
+    let clock: std::sync::Arc<dyn boss_host_enrollment::Clock> = fx.clock.clone();
+    boss_host_enrollment::HostCredentials::open(fx.dir.path(), Policy::default(), clock)
+}
+
+#[test]
+fn a_permissive_credential_database_is_refused_on_reopen() {
+    let fx = Fixture::new();
+    fx.enrolled("h1");
+    let db = fx.dir.path().join("credentials.db");
+
+    set_mode(&db, 0o660);
+    assert!(matches!(reopen(&fx), Err(CredentialError::Internal(_))));
+    set_mode(&db, 0o600);
+    reopen(&fx).expect("owner-only database is accepted");
+
+    let wal = fx.dir.path().join("credentials.db-wal");
+    if wal.exists() {
+        set_mode(&wal, 0o666);
+        assert!(matches!(reopen(&fx), Err(CredentialError::Internal(_))));
+        set_mode(&wal, 0o600);
+    }
+}
+
+#[test]
+fn a_writable_state_directory_is_refused() {
+    let fx = Fixture::new();
+    fx.enrolled("h1");
+    set_mode(fx.dir.path(), 0o770);
+    let result = reopen(&fx);
+    set_mode(fx.dir.path(), 0o700);
+    assert!(matches!(result, Err(CredentialError::Internal(_))));
+    reopen(&fx).expect("owner-only directory is accepted");
+}
+
+#[test]
 fn credentials_and_spent_tokens_survive_a_hub_restart() {
     let mut fx = Fixture::new();
     let grant = fx.grant("h1", "job-1");

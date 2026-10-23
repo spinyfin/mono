@@ -5,11 +5,14 @@
 //! what makes "consume the token and bind it to the certificate" atomic and
 //! serializes two racing enrollments of the same token. Times are Unix
 //! seconds. Nothing secret is stored: tokens as digests, certificates as the
-//! public bytes that were sent.
+//! public bytes that were sent. The records still decide who may connect (a
+//! revoked host flipped back to enrolled would reconnect), so the database and
+//! its directory are held to the same owner-only rule as the CA's.
 
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
@@ -34,7 +37,10 @@ CREATE TABLE IF NOT EXISTS enrollment_grants (
     generation INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('issued','consumed','replaced','cancelled')),
-    consumed_at INTEGER
+    consumed_at INTEGER,
+    -- The certificate a consumed token produced: the only one a retry of it
+    -- may be handed back.
+    certificate_serial TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS enrollment_grants_by_host ON enrollment_grants (host_id, state);
 CREATE TABLE IF NOT EXISTS certificates (
@@ -86,20 +92,21 @@ impl HostState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GrantState {
     Issued,
-    /// Consumed at this Unix second.
-    Consumed(i64),
+    /// Consumed at this Unix second, producing the certificate with this
+    /// serial: the only one a retry of the token may be handed back.
+    Consumed(i64, String),
     Replaced,
     Cancelled,
 }
 
 impl GrantState {
-    fn parse(text: &str, consumed_at: Option<i64>) -> Option<Self> {
+    fn parse(text: &str, consumed_at: Option<i64>, serial: Option<String>) -> Option<Self> {
         match text {
             "issued" => Some(Self::Issued),
-            "consumed" => consumed_at.map(Self::Consumed),
+            "consumed" => consumed_at.zip(serial).map(|(at, serial)| Self::Consumed(at, serial)),
             "replaced" => Some(Self::Replaced),
             "cancelled" => Some(Self::Cancelled),
             _ => None,
@@ -157,9 +164,18 @@ pub(crate) struct Store {
 
 impl Store {
     pub(crate) fn open(path: &Path) -> Result<Self, CredentialError> {
-        // Create the file owner-only before SQLite does: the database holds
-        // no secrets, but there is no reason for other users to read who is
-        // enrolled. SQLite gives its -wal and -shm files the same mode.
+        // The mode below applies only when the file is created, so anything
+        // that already exists is checked rather than trusted.
+        let dir = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        require_owner_only(dir)?;
+        for existing in [path.to_owned(), sidecar(path, "-wal"), sidecar(path, "-shm")] {
+            require_owner_only(&existing)?;
+        }
+        // Create the file owner-only before SQLite does. SQLite gives its -wal
+        // and -shm files the same mode.
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -202,6 +218,27 @@ impl Store {
         f: impl FnOnce(&Connection) -> Result<T, CredentialError>,
     ) -> Result<T, CredentialError> {
         f(&self.conn.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Refuses a file or directory that group or others can access. A path that
+/// does not exist yet passes: it is about to be created owner-only.
+fn require_owner_only(path: &Path) -> Result<(), CredentialError> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.mode() & 0o077 == 0 => Ok(()),
+        Ok(meta) => Err(CredentialError::Internal(format!(
+            "{} is accessible to other users (mode {:o}); refusing to trust it",
+            path.display(),
+            meta.mode() & 0o777
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CredentialError::Internal(format!("{}: {error}", path.display()))),
     }
 }
 
@@ -275,7 +312,7 @@ pub(crate) fn bump_generation(tx: &Transaction<'_>, host_id: &str) -> Result<(),
 
 pub(crate) fn grant(conn: &Connection, token_hash: &[u8]) -> Result<Option<GrantRow>, CredentialError> {
     conn.query_row(
-        "SELECT host_id, job_id, generation, expires_at, state, consumed_at
+        "SELECT host_id, job_id, generation, expires_at, state, consumed_at, certificate_serial
          FROM enrollment_grants WHERE token_hash = ?1",
         [token_hash],
         |row| {
@@ -286,7 +323,7 @@ pub(crate) fn grant(conn: &Connection, token_hash: &[u8]) -> Result<Option<Grant
                 generation: row.get(2)?,
                 expires_at: row.get(3)?,
                 // An unreadable state fails closed.
-                state: GrantState::parse(&state, row.get(5)?).unwrap_or(GrantState::Cancelled),
+                state: GrantState::parse(&state, row.get(5)?, row.get(6)?).unwrap_or(GrantState::Cancelled),
             })
         },
     )
@@ -310,10 +347,17 @@ pub(crate) fn insert_grant(
     Ok(())
 }
 
-pub(crate) fn consume_grant(tx: &Transaction<'_>, token_hash: &[u8], now: i64) -> Result<(), CredentialError> {
+/// Spends the grant and binds it to the certificate it produced.
+pub(crate) fn consume_grant(
+    tx: &Transaction<'_>,
+    token_hash: &[u8],
+    now: i64,
+    serial: &str,
+) -> Result<(), CredentialError> {
     tx.execute(
-        "UPDATE enrollment_grants SET state = 'consumed', consumed_at = ?2 WHERE token_hash = ?1",
-        params![token_hash, now],
+        "UPDATE enrollment_grants SET state = 'consumed', consumed_at = ?2, certificate_serial = ?3
+         WHERE token_hash = ?1",
+        params![token_hash, now, serial],
     )?;
     Ok(())
 }

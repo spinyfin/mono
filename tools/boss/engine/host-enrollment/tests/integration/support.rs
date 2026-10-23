@@ -41,6 +41,8 @@ pub struct Fixture {
 impl Fixture {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
+        // The hub's state directory is owner-only, and the store insists.
+        std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("chmod");
         let clock = ManualClock::new();
         let credentials = open(&dir, &clock);
         Self {
