@@ -1207,6 +1207,23 @@ name = "boss-single-flight"
 version = "0.1.0"
 
 [[package]]
+name = "boss-spoke-stream"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "boss-host-enrollment",
+ "boss-protocol-spoke",
+ "prost",
+ "rand 0.8.6",
+ "rcgen",
+ "rustls",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "boss-ssh-transport"
 version = "0.1.0"
 dependencies = [

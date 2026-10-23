@@ -32,7 +32,10 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = ["//tools/boss/engine/host-enrollment:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/host-enrollment:__pkg__",
+        "//tools/boss/engine/spoke-stream:__pkg__",
+    ],
     deps = [
         ":spoke_v1_rust_proto",
         "//tools/boss/protocol",
