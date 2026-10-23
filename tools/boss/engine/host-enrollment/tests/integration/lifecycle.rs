@@ -695,6 +695,19 @@ fn a_fresh_token_cannot_reuse_a_request_id_that_already_enrolled() {
     // The refusal did not spend the token: a new request id still enrolls.
     fx.enroll(&Spoke::new(), ("h1", "job-1", "req-2"), &second.token)
         .expect("a new request id enrolls with the second token");
+    // The refusal is audited even though its transaction rolled back.
+    let trail: Vec<_> = fx
+        .credentials
+        .audit_trail("h1")
+        .expect("trail")
+        .into_iter()
+        .map(|(event, _)| event)
+        .collect();
+    assert_eq!(
+        trail.iter().filter(|e| *e == "enroll_request_reused").count(),
+        1,
+        "{trail:?}"
+    );
 }
 
 // ------------------------------------------------------- state permissions
