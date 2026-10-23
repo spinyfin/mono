@@ -1,9 +1,9 @@
 use crate::{
-    Host, StreamManager,
+    ChallengeOutcome, Host, StreamManager,
     codec::{Outbound, RawFrame},
     service::frame,
     status,
-    store::Session,
+    store::{PendingCommand, Session},
 };
 use boss_host_enrollment::{AuthorizedHost, CredentialEvent, HostAuthorizer};
 use boss_protocol_spoke::{
@@ -32,7 +32,7 @@ pub(crate) struct Driver {
     active: Arc<AtomicBool>,
     terminal: Arc<std::sync::Mutex<Option<Status>>>,
     wake: Arc<Notify>,
-    probes: mpsc::Receiver<oneshot::Sender<()>>,
+    probes: mpsc::Receiver<oneshot::Sender<ChallengeOutcome>>,
     record_through: u64,
     command_journal: String,
     command_through: u64,
@@ -41,18 +41,27 @@ pub(crate) struct Driver {
 impl Driver {
     pub(crate) async fn run(
         mut self,
-        identity: AuthorizedHost,
-        events: broadcast::Receiver<CredentialEvent>,
+        mut identity: AuthorizedHost,
+        mut events: broadcast::Receiver<CredentialEvent>,
         _permit: OwnedSemaphorePermit,
     ) {
         let auth = self.manager.0.auth.clone();
         let closed = self.tx.clone();
         let terminal = tokio::select! {
-            _ = watch_credentials(auth, identity, events) => Some(Status::unauthenticated("credential no longer valid")),
+            // Credentials first: a revoked or expired identity must not get one
+            // more command write or record commit from a ready transport branch.
+            biased;
+            _ = watch_credentials(auth, &mut identity, &mut events) => Some(Status::unauthenticated("credential no longer valid")),
             result = self.drive() => result.err().map(|status| *status),
             _ = closed.closed() => None,
         };
-        *self.terminal.lock().expect("terminal lock") = terminal;
+        // A fence publishes its own status first; do not overwrite it.
+        {
+            let mut slot = self.terminal.lock().expect("terminal lock");
+            if slot.is_none() {
+                *slot = terminal;
+            }
+        }
         self.active.store(false, Ordering::Release);
         // Wake an idle response body before waiting for a concurrent outbox
         // operation to release the host gate. A full queue is already readable.
@@ -86,7 +95,7 @@ impl Driver {
             // One unreceipted command per connection bounds bytes even for a
             // 512 KiB spawn. Results may remain pending independently.
             if self.command_through == command_received {
-                let gate = self.host.lock().await;
+                let mut gate = self.host.lock().await;
                 self.check(&gate)?;
                 let next = self
                     .manager
@@ -96,23 +105,43 @@ impl Driver {
                     .next(&self.session.host_id, self.command_through)
                     .await
                     .map_err(status)?;
-                drop(gate);
-                if let Some(bytes) = next {
-                    let command = v1::Command::decode(bytes.as_slice())
-                        .map_err(|_| Status::internal("invalid durable command bytes"))?;
-                    command
-                        .validate()
-                        .map_err(|_| Status::internal("invalid durable command"))?;
-                    if command.sequence != self.command_through.saturating_add(1)
-                        || bytes.len() + 32 > MAX_FRAME_BYTES as usize
-                        || !crate::commands::supported(&command, &self.session.selection)
-                    {
-                        return Err(Status::failed_precondition("command replay incompatible").into());
+                if let Some(pending) = next {
+                    let decoded = v1::Command::decode(pending.bytes.as_slice())
+                        .map_err(|_| "invalid durable command bytes")
+                        .and_then(|command| {
+                            command
+                                .validate()
+                                .map(|()| command)
+                                .map_err(|_| "invalid durable command")
+                        });
+                    let reason = match &decoded {
+                        Err(reason) => Some(*reason),
+                        Ok(command) => self.replay_problem(command, &pending),
+                    };
+                    if let Some(reason) = reason {
+                        // One stale command must never block the queue: settle
+                        // it durably, tell any waiter, and move on to the next.
+                        let id = decoded.as_ref().map_or("", |c| c.command_id.as_str());
+                        let result = self
+                            .manager
+                            .0
+                            .storage
+                            .outbox
+                            .reject(&self.session.host_id, pending.sequence, id, reason)
+                            .await
+                            .map_err(status)?;
+                        if let Some(sender) = gate.as_mut().and_then(|c| c.waiters.remove(id)) {
+                            let _ = sender.send(result);
+                        }
+                        self.command_through = self.command_through.max(pending.sequence);
+                        command_received = self.command_through;
+                        continue;
                     }
-                    self.command_through = command.sequence;
+                    drop(gate);
+                    self.command_through = pending.sequence;
                     self.send(Outbound::Command {
                         generation: self.session.generation,
-                        bytes,
+                        bytes: pending.bytes,
                     })
                     .await?;
                 }
@@ -123,15 +152,23 @@ impl Driver {
                 .unwrap_or_else(|| tokio::time::Instant::now() + self.manager.0.config.pulse_timeout);
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(deadline), if challenge.is_some() => return Err(Status::deadline_exceeded("nonce challenge expired").into()),
+                _ = tokio::time::sleep_until(deadline), if challenge.is_some() => {
+                    if let Some(reply) = challenge.take().and_then(|c| c.reply) {
+                        let _ = reply.send(ChallengeOutcome::Expired);
+                    }
+                    return Err(Status::deadline_exceeded("nonce challenge expired").into());
+                },
                 probe = self.probes.recv() => {
                     if let Some(reply) = probe {
-                        if challenge.as_ref().is_some_and(|c| c.reply.is_some()) {
-                            // A replacement challenge is already outstanding. Refuse
-                            // the additional contender; do not displace its waiter.
-                            let _ = reply.send(());
-                        } else {
-                            challenge = Some(self.challenge(Some(reply)).await?);
+                        match challenge.as_mut() {
+                            // A contender's challenge is already outstanding. Refuse
+                            // the additional one; do not displace its waiter.
+                            Some(c) if c.reply.is_some() => {
+                                let _ = reply.send(ChallengeOutcome::Pending);
+                            }
+                            // A routine pulse is in flight: its deadline decides.
+                            Some(c) => c.reply = Some(reply),
+                            None => challenge = Some(self.challenge(Some(reply)).await?),
                         }
                     }
                 },
@@ -144,7 +181,7 @@ impl Driver {
                             pulse.validate().map_err(|_| Status::invalid_argument("invalid pulse"))?;
                             if challenge.as_ref().is_some_and(|c| c.nonce == pulse.nonce)
                                 && let Some(reply) = challenge.take().and_then(|c| c.reply) {
-                                let _ = reply.send(());
+                                let _ = reply.send(ChallengeOutcome::Answered);
                             }
                         },
                         Some(spoke_frame::Body::CommandReceipt(cursor)) => {
@@ -161,6 +198,19 @@ impl Driver {
                     }
                 }
             }
+        }
+    }
+
+    /// Why a durable command cannot be written to this connection, if so.
+    fn replay_problem(&self, command: &v1::Command, pending: &PendingCommand) -> Option<&'static str> {
+        if command.sequence != pending.sequence || pending.sequence <= self.command_through {
+            Some("durable command sequence mismatch")
+        } else if pending.bytes.len() + 32 > MAX_FRAME_BYTES as usize {
+            Some("command exceeds the frame limit")
+        } else if !crate::commands::supported(command, &self.session.selection) {
+            Some("command incompatible with the negotiated contract")
+        } else {
+            None
         }
     }
 
@@ -220,7 +270,7 @@ impl Driver {
             .await
     }
 
-    async fn challenge(&mut self, reply: Option<oneshot::Sender<()>>) -> Result<Challenge, Box<Status>> {
+    async fn challenge(&mut self, reply: Option<oneshot::Sender<ChallengeOutcome>>) -> Result<Challenge, Box<Status>> {
         let nonce = rand::random::<[u8; 32]>().to_vec();
         self.send(frame(
             self.session.generation,
@@ -241,19 +291,25 @@ impl Driver {
 struct Challenge {
     nonce: Vec<u8>,
     until: tokio::time::Instant,
-    reply: Option<oneshot::Sender<()>>,
+    reply: Option<oneshot::Sender<ChallengeOutcome>>,
 }
 
-async fn watch_credentials(
+/// Resolves once the credential is revoked, expired or can no longer be
+/// validated. Cancellation-safe: `identity` and `events` keep their progress so
+/// admission and the driver can share one view of the credential.
+pub(crate) async fn watch_credentials(
     auth: Arc<dyn HostAuthorizer>,
-    mut identity: AuthorizedHost,
-    mut events: broadcast::Receiver<CredentialEvent>,
+    identity: &mut AuthorizedHost,
+    events: &mut broadcast::Receiver<CredentialEvent>,
 ) {
     loop {
         let remaining = identity
             .valid_until
             .duration_since(SystemTime::now())
             .unwrap_or_default();
+        if remaining.is_zero() {
+            return;
+        }
         tokio::select! {
             _ = tokio::time::sleep(remaining) => return,
             event = events.recv() => match event {
@@ -266,7 +322,7 @@ async fn watch_credentials(
                     let auth = auth.clone();
                     let previous = identity.clone();
                     match tokio::task::spawn_blocking(move || auth.revalidate(&previous)).await {
-                        Ok(Ok(current)) => identity = current,
+                        Ok(Ok(current)) => *identity = current,
                         _ => return,
                     }
                 },

@@ -14,7 +14,30 @@ pub struct Memory {
     pub ingress: Mutex<Ingress>,
     pub outbox: Mutex<Outbox>,
     pub fail_commit: AtomicBool,
-    pub pause_append: Mutex<Option<std::sync::Arc<Pause>>>,
+    pub pauses: Pauses,
+}
+
+type Slot = Mutex<Option<std::sync::Arc<Pause>>>;
+
+/// Per-operation pauses. Each one is taken by the next matching call, which
+/// blocks until released; `append` keeps its pause installed.
+#[derive(Default)]
+pub struct Pauses {
+    pub append: Slot,
+    pub resume: Slot,
+    pub open: Slot,
+    pub commit: Slot,
+    pub next: Slot,
+}
+
+impl Memory {
+    async fn pause(slot: &Slot) {
+        let pause = slot.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -33,12 +56,14 @@ pub struct Outbox {
     pub commands: Vec<Command>,
     pub encoded: BTreeMap<u64, Vec<u8>>,
     pub results: BTreeMap<String, CommandResult>,
+    pub skipped: std::collections::BTreeSet<u64>,
     pub received: u64,
 }
 
 #[tonic::async_trait]
 impl SpokeObservationSink for Memory {
     async fn open(&self, hello: &Hello, _: &Selection) -> Result<Admission, StoreError> {
+        Self::pause(&self.pauses.open).await;
         let mut state = self.ingress.lock().unwrap();
         let through = state.records.len() as u64;
         if state.journal.as_ref().is_some_and(|id| id != &hello.journal_id)
@@ -58,6 +83,7 @@ impl SpokeObservationSink for Memory {
         })
     }
     async fn commit(&self, session: &Session, raw: &[u8], record: &Record) -> Result<Cursor, StoreError> {
+        Self::pause(&self.pauses.commit).await;
         if self.fail_commit.load(Ordering::Acquire) {
             return Err(StoreError::Unavailable);
         }
@@ -98,6 +124,7 @@ impl SpokeObservationSink for Memory {
 #[tonic::async_trait]
 impl CommandOutbox for Memory {
     async fn resume(&self, _: &str, receipt: Option<&Cursor>) -> Result<CommandJournal, StoreError> {
+        Self::pause(&self.pauses.resume).await;
         let mut state = self.outbox.lock().unwrap();
         if let Some(receipt) = receipt {
             if receipt.journal_id != "commands"
@@ -118,7 +145,7 @@ impl CommandOutbox for Memory {
         })
     }
     async fn append(&self, _: &str, mut command: Command) -> Result<Command, StoreError> {
-        let pause = { self.pause_append.lock().unwrap().clone() };
+        let pause = { self.pauses.append.lock().unwrap().clone() };
         if let Some(pause) = pause {
             pause.entered.notify_one();
             pause.release.notified().await;
@@ -137,15 +164,34 @@ impl CommandOutbox for Memory {
         state.commands.push(command.clone());
         Ok(command)
     }
-    async fn next(&self, _: &str, after: u64) -> Result<Option<Vec<u8>>, StoreError> {
-        Ok(self
-            .outbox
-            .lock()
-            .unwrap()
+    async fn next(&self, _: &str, after: u64) -> Result<Option<PendingCommand>, StoreError> {
+        Self::pause(&self.pauses.next).await;
+        let state = self.outbox.lock().unwrap();
+        Ok(state
             .encoded
             .iter()
-            .find(|(sequence, _)| **sequence > after)
-            .map(|(_, bytes)| bytes.clone()))
+            .find(|(sequence, _)| **sequence > after && !state.skipped.contains(*sequence))
+            .map(|(sequence, bytes)| PendingCommand {
+                sequence: *sequence,
+                bytes: bytes.clone(),
+            }))
+    }
+    async fn reject(&self, _: &str, sequence: u64, id: &str, reason: &str) -> Result<CommandResult, StoreError> {
+        let mut state = self.outbox.lock().unwrap();
+        state.skipped.insert(sequence);
+        if let Some(existing) = state.results.get(id) {
+            return Ok(existing.clone());
+        }
+        let result = CommandResult {
+            command_id: id.into(),
+            code: ResultCode::Rejected.into(),
+            reason: reason.into(),
+            ..Default::default()
+        };
+        if !id.is_empty() {
+            state.results.insert(id.into(), result.clone());
+        }
+        Ok(result)
     }
     async fn receipt(&self, _: &str, receipt: &Cursor) -> Result<(), StoreError> {
         let mut state = self.outbox.lock().unwrap();

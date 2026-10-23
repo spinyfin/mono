@@ -68,7 +68,11 @@ async fn reconnect_fences_old_reader_and_writer_and_returns_durable_receipt() {
             body: Some(spoke_frame::Body::Record(record(2))),
         })
         .await;
-    assert!(old.next().await.is_none());
+    // A deliberate fence is an error status, never a clean OK shutdown.
+    assert_eq!(
+        old.closed().await.expect("fenced stream ends with an error").code(),
+        Code::Aborted
+    );
     new.send(spoke_frame::Body::Record(record(1))).await;
     assert!(matches!(new.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 1));
     assert_eq!(fx.store.ingress.lock().unwrap().records.len(), 1);
@@ -280,4 +284,76 @@ async fn original_unknown_fields_survive_to_the_receipt_sink() {
         }
     }
     assert_eq!(fx.store.ingress.lock().unwrap().records[&1], expected);
+}
+
+#[tokio::test]
+async fn slow_driver_does_not_let_a_contender_displace_a_live_daemon() {
+    let fx = Fixture::new().await;
+    let mut old = fx.connect(hello()).await.unwrap();
+    old.welcome().await;
+    // Settle the opening pulse so only the contender's challenge is outstanding.
+    old.send(spoke_frame::Body::Record(record(1))).await;
+    assert!(matches!(old.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 1));
+    old.settle_pulse().await;
+    // Hold the driver in commit while the contender queues behind the host gate,
+    // then stall its next command fetch for longer than the pulse timeout.
+    let commit = std::sync::Arc::new(super::store::Pause::default());
+    *fx.store.pauses.commit.lock().unwrap() = Some(commit.clone());
+    old.send(spoke_frame::Body::Record(record(2))).await;
+    tokio::time::timeout(STEP, commit.entered.notified()).await.unwrap();
+    let next = std::sync::Arc::new(super::store::Pause::default());
+    *fx.store.pauses.next.lock().unwrap() = Some(next.clone());
+    let mut other = hello();
+    other.instance_nonce = vec![2; 16];
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        commit.release.notify_one();
+        tokio::time::timeout(STEP, next.entered.notified()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        next.release.notify_one();
+        std::future::pending::<()>().await
+    };
+    let live_peer = async {
+        loop {
+            match old.next().await {
+                Some(hub_frame::Body::RecordReceipt(_)) => {}
+                other => panic!("unexpected frame for the live daemon: {other:?}"),
+            }
+        }
+    };
+    tokio::select! {
+        response = fx.connect(other) => assert_eq!(response.err().unwrap().code(), Code::AlreadyExists),
+        _ = release => unreachable!(),
+        _ = live_peer => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn credential_lost_during_storage_admission_never_gets_a_stream() {
+    for (blocked_open, expire) in [(false, false), (true, false), (true, true)] {
+        let fx = Fixture::new().await;
+        if expire {
+            fx.auth.identity.lock().unwrap().valid_until = SystemTime::now() + Duration::from_millis(400);
+        }
+        let pause = std::sync::Arc::new(super::store::Pause::default());
+        if blocked_open {
+            *fx.store.pauses.open.lock().unwrap() = Some(pause.clone());
+        } else {
+            *fx.store.pauses.resume.lock().unwrap() = Some(pause.clone());
+        }
+        let channel = fx.channel.clone();
+        let attempt = tokio::spawn(async move { connect(channel, hello()).await });
+        tokio::time::timeout(STEP, pause.entered.notified()).await.unwrap();
+        if !expire {
+            *fx.auth.revoked.lock().unwrap() = true;
+            fx.auth
+                .events
+                .send(CredentialEvent::Revoked { host_id: "host".into() })
+                .unwrap();
+        }
+        let refused = attempt.await.unwrap().err().expect("no Welcome for a dead credential");
+        assert_eq!(refused.code(), Code::Unauthenticated);
+        assert_eq!(fx.store.ingress.lock().unwrap().generation, 0);
+        assert_eq!(fx.store.outbox.lock().unwrap().received, 0);
+    }
 }

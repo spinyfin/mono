@@ -1,8 +1,8 @@
 use crate::{
-    Connection, StreamManager,
+    ChallengeOutcome, Connection, StreamManager,
     codec::{Outbound, RawFrame, WireCodec},
     contracts,
-    session::Driver,
+    session::{Driver, watch_credentials},
     status,
     store::Session,
 };
@@ -91,12 +91,12 @@ impl StreamManager {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("connection limit"))?;
-        let events = self.0.auth.subscribe(); // Before authorization: no revocation race.
+        let mut events = self.0.auth.subscribe(); // Before authorization: no revocation race.
         let chain = request
             .peer_certs()
             .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
         let auth = self.0.auth.clone();
-        let identity = tokio::task::spawn_blocking(move || auth.authorize(&chain))
+        let mut identity = tokio::task::spawn_blocking(move || auth.authorize(&chain))
             .await
             .map_err(|_| Status::internal("authorization failed"))?
             .map_err(|_| Status::unauthenticated("not permitted"))?;
@@ -133,11 +133,21 @@ impl StreamManager {
                 .try_send(reply)
                 .map_err(|_| Status::already_exists("host challenge pending"))?;
             drop(gate);
-            if matches!(
-                tokio::time::timeout(self.0.config.pulse_timeout, answer).await,
-                Ok(Ok(()))
-            ) {
-                return Err(Status::already_exists("another daemon answered the challenge").into());
+            // The driver owns the challenge deadline: it starts when the Pulse is
+            // actually sent, which can trail this request while the driver is in
+            // storage or a stalled write. Replace only on its Expired outcome or
+            // when the driver is gone. The overall bound covers one stalled write
+            // plus one challenge; past it the contender retries and the live
+            // stream is left alone, since slowness is not proof of death.
+            match tokio::time::timeout(self.0.config.pulse_timeout.saturating_mul(3), answer).await {
+                Ok(Ok(ChallengeOutcome::Answered)) => {
+                    return Err(Status::already_exists("another daemon answered the challenge").into());
+                }
+                Ok(Ok(ChallengeOutcome::Pending)) => {
+                    return Err(Status::already_exists("host challenge pending").into());
+                }
+                Err(_) => return Err(Status::unavailable("host challenge still in progress; retry").into()),
+                Ok(Ok(ChallengeOutcome::Expired)) | Ok(Err(_)) => {}
             }
             gate = host.lock().await;
             if gate.as_ref().is_some_and(|c| c.session.generation != generation) {
@@ -146,32 +156,56 @@ impl StreamManager {
         }
         // Recheck after Hello/challenge: expiry or revocation may have happened.
         let auth = self.0.auth.clone();
-        let identity = tokio::task::spawn_blocking(move || auth.revalidate(&identity))
+        identity = tokio::task::spawn_blocking(move || auth.revalidate(&identity))
             .await
             .map_err(|_| Status::internal("authorization failed"))?
             .map_err(|_| Status::unauthenticated("not permitted"))?;
-        let journal = self
-            .0
-            .storage
-            .outbox
-            .resume(&hello.host_id, hello.received_commands.as_ref())
-            .await
-            .map_err(status)?;
-        // If this RPC is cancelled while the durable generation is committing,
-        // fence the old session even though we cannot know whether it committed.
-        // A known rejection preserves the current stream.
-        let mut claim = ClaimGuard {
-            slot: &mut gate,
-            armed: true,
+        // Storage admission can be slow: watch the credential across it so a
+        // revocation or expiry stops admission instead of fencing a live stream
+        // for an identity that is already dead.
+        let (journal, admission) = {
+            let credentials = watch_credentials(self.0.auth.clone(), &mut identity, &mut events);
+            tokio::pin!(credentials);
+            let journal = tokio::select! {
+                biased;
+                _ = &mut credentials => return Err(Status::unauthenticated("credential no longer valid").into()),
+                journal = self.0.storage.outbox.resume(&hello.host_id, hello.received_commands.as_ref()) => journal.map_err(status)?,
+            };
+            // If this RPC is cancelled while the durable generation is committing,
+            // fence the old session even though we cannot know whether it committed.
+            // A known rejection preserves the current stream.
+            let mut claim = ClaimGuard {
+                slot: &mut gate,
+                armed: true,
+            };
+            let admission = tokio::select! {
+                biased;
+                _ = &mut credentials => return Err(Status::unauthenticated("credential no longer valid").into()),
+                admission = self.0.storage.sink.open(&hello, &selection) => match admission {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        claim.armed = false;
+                        return Err(status(error).into());
+                    }
+                },
+            };
+            (journal, admission)
         };
-        let admission = match self.0.storage.sink.open(&hello, &selection).await {
-            Ok(admission) => admission,
-            Err(error) => {
-                claim.armed = false;
-                return Err(status(error).into());
+        // The claim is committed and has fenced any old stream. Revalidate before
+        // publishing: a credential lost during open must never get a Welcome.
+        let auth = self.0.auth.clone();
+        let revalidated = tokio::task::spawn_blocking({
+            let previous = identity.clone();
+            move || auth.revalidate(&previous)
+        })
+        .await;
+        match revalidated {
+            Ok(Ok(current)) => identity = current,
+            _ => {
+                gate.take();
+                return Err(Status::unauthenticated("credential no longer valid").into());
             }
-        };
-        drop(claim);
+        }
         // Defense in depth: never advertise a fabricated receipt or bridge a gap.
         let receipt = &admission.received;
         if admission.generation == 0
@@ -208,6 +242,7 @@ impl StreamManager {
                 .nonce(hello.instance_nonce)
                 .active(active.clone())
                 .probe(probe)
+                .terminal(terminal.clone())
                 .wake(wake.clone())
                 .waiters(Default::default())
                 .build(),

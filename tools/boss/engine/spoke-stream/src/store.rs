@@ -52,6 +52,12 @@ pub trait SpokeObservationSink: Send + Sync {
     async fn commit(&self, session: &Session, raw_frame: &[u8], record: &Record) -> Result<Cursor, StoreError>;
 }
 
+/// An original encoded Command and the outbox sequence it was stored under.
+pub struct PendingCommand {
+    pub sequence: u64,
+    pub bytes: Vec<u8>,
+}
+
 pub struct CommandJournal {
     pub journal_id: String,
     pub received: u64,
@@ -71,8 +77,25 @@ pub trait CommandOutbox: Send + Sync {
     async fn append(&self, host: &str, command: Command) -> Result<Command, StoreError>;
 
     /// Return at most one original encoded Command after `after`, in sequence
-    /// order. Retain these bytes unchanged on retry and across software upgrades.
-    async fn next(&self, host: &str, after: u64) -> Result<Option<Vec<u8>>, StoreError>;
+    /// order, skipping sequences settled by `reject`. Retain these bytes
+    /// unchanged on retry and across software upgrades. Delivered sequences may
+    /// therefore be non-contiguous; they are always strictly increasing.
+    async fn next(&self, host: &str, after: u64) -> Result<Option<PendingCommand>, StoreError>;
+
+    /// Atomically record a terminal `REJECTED` result for a command that cannot
+    /// be replayed on the current connection (for example, its feature pins no
+    /// longer match the negotiated contract) and skip its sequence in `next`.
+    /// The result must be visible through `completed`, so a retry with the same
+    /// ID returns it. `command_id` is empty when the stored bytes cannot be
+    /// decoded; the sequence is then skipped without recording a result.
+    /// Idempotent: rejecting a settled command returns its existing result.
+    async fn reject(
+        &self,
+        host: &str,
+        sequence: u64,
+        command_id: &str,
+        reason: &str,
+    ) -> Result<CommandResult, StoreError>;
 
     /// Durably advance receipt, validating identity, monotonicity and bounds.
     /// Receipt alone is never command completion.

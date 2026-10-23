@@ -160,11 +160,12 @@ pub async fn connect(channel: Channel, hello: Hello) -> Result<Peer, Box<Status>
     .await
     .unwrap()?
     .into_inner();
-    Ok(Peer { tx, rx })
+    Ok(Peer { tx, rx, pulses: 0 })
 }
 pub struct Peer {
     pub tx: mpsc::Sender<SpokeFrame>,
     pub rx: Streaming<HubFrame>,
+    pub pulses: usize,
 }
 impl Peer {
     pub async fn send(&self, body: spoke_frame::Body) {
@@ -179,6 +180,7 @@ impl Peer {
                 return None;
             };
             if let Some(hub_frame::Body::Pulse(pulse)) = message.body {
+                self.pulses += 1;
                 // The peer may already be fenced while a previously delivered
                 // pulse is still buffered in gRPC. Keep reading to observe EOF.
                 let _ = self
@@ -189,6 +191,47 @@ impl Peer {
                     .await;
             } else {
                 return message.body;
+            }
+        }
+    }
+    /// Read until the stream ends; the terminal gRPC status, `None` when it was OK.
+    pub async fn closed(&mut self) -> Option<Status> {
+        loop {
+            let message = tokio::time::timeout(STEP, self.rx.message())
+                .await
+                .expect("bounded stream read");
+            match message {
+                Ok(Some(frame)) => {
+                    if let Some(hub_frame::Body::Pulse(pulse)) = frame.body {
+                        let _ = self
+                            .tx
+                            .send(SpokeFrame {
+                                body: Some(spoke_frame::Body::PulseReply(pulse)),
+                            })
+                            .await;
+                    }
+                }
+                Ok(None) => return None,
+                Err(status) => return Some(status),
+            }
+        }
+    }
+    /// Block until the hub's routine pulse has been seen and answered.
+    pub async fn settle_pulse(&mut self) {
+        while self.pulses == 0 {
+            let message = tokio::time::timeout(STEP, self.rx.message())
+                .await
+                .expect("bounded stream read")
+                .expect("stream open")
+                .expect("stream open");
+            if let Some(hub_frame::Body::Pulse(pulse)) = message.body {
+                self.pulses += 1;
+                let _ = self
+                    .tx
+                    .send(SpokeFrame {
+                        body: Some(spoke_frame::Body::PulseReply(pulse)),
+                    })
+                    .await;
             }
         }
     }

@@ -54,6 +54,11 @@ impl StreamManager {
             .as_mut()
             .filter(|c| c.active.load(Ordering::Acquire))
             .ok_or(Unavailable)?;
+        // A durable rejection (or any settled result) answers a retry of the same
+        // ID even when the command no longer fits the negotiated contract.
+        if let Ok(Some(result)) = self.0.storage.outbox.completed(host_id, &command.command_id).await {
+            return Ok(result);
+        }
         if !supported(&command, &connection.session.selection) {
             return Err(Invalid);
         }

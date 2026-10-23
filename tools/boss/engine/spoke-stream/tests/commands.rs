@@ -33,7 +33,7 @@ async fn revocation_closes_response_while_command_storage_is_busy() {
     let mut peer = fx.connect(hello()).await.unwrap();
     peer.welcome().await;
     let pause = std::sync::Arc::new(super::store::Pause::default());
-    *fx.store.pause_append.lock().unwrap() = Some(pause.clone());
+    *fx.store.pauses.append.lock().unwrap() = Some(pause.clone());
     let manager = fx.manager.clone();
     let waiting = tokio::spawn(async move { manager.command("host", command("stop"), STEP).await });
     tokio::time::timeout(STEP, pause.entered.notified()).await.unwrap();
@@ -204,4 +204,42 @@ async fn command_replay_preserves_unknown_fields_from_durable_bytes() {
         .unwrap()
         .unwrap();
     assert_eq!(replay.command, expected);
+}
+
+#[tokio::test]
+async fn unreplayable_command_is_durably_rejected_without_wedging_the_host() {
+    use boss_protocol_spoke::negotiate::feature;
+    use boss_spoke_stream::store::CommandOutbox;
+    let fx = Fixture::new().await;
+    let mut capture = command("capture");
+    capture.body = Some(command::Body::Capture(Capture {
+        subscription_id: "sub".into(),
+        interval_ms: 1000,
+        max_bytes: 1024,
+        ttl_seconds: 60,
+    }));
+    fx.store.append("host", capture.clone()).await.unwrap();
+    fx.store.append("host", command("stop")).await.unwrap();
+    // The reconnecting spoke no longer offers pane capture.
+    let mut reconnect = hello();
+    reconnect.features.retain(|f| f.name != feature::PANE_CAPTURE);
+    let mut peer = fx.connect(reconnect).await.unwrap();
+    peer.welcome().await;
+    // The stale command is skipped; the next one is delivered in sequence order.
+    match peer.next().await {
+        Some(hub_frame::Body::Command(c)) => assert_eq!((c.command_id.as_str(), c.sequence), ("stop", 2)),
+        other => panic!("{other:?}"),
+    }
+    peer.send(spoke_frame::Body::CommandReceipt(Cursor {
+        journal_id: "commands".into(),
+        through: 2,
+    }))
+    .await;
+    // The stream is still admitting records.
+    peer.send(spoke_frame::Body::Record(record(1))).await;
+    assert!(matches!(peer.next().await, Some(hub_frame::Body::RecordReceipt(c)) if c.through == 1));
+    let rejected = fx.manager.command("host", capture, STEP).await.unwrap();
+    assert_eq!(rejected.code, ResultCode::Rejected as i32);
+    assert_eq!(rejected.command_id, "capture");
+    assert_eq!(fx.store.completed("host", "capture").await.unwrap(), Some(rejected));
 }

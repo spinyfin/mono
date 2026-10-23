@@ -43,6 +43,17 @@ pub struct Config {
     pub pulse_timeout: Duration,
 }
 
+/// How a nonce challenge against the connection that holds a host ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChallengeOutcome {
+    /// The live daemon answered before its challenge deadline.
+    Answered,
+    /// A challenge was already outstanding for another contender.
+    Pending,
+    /// The challenge deadline passed without an answer.
+    Expired,
+}
+
 pub(crate) type Host = Arc<Mutex<Option<Connection>>>;
 pub(crate) type Waiters = HashMap<String, oneshot::Sender<CommandResult>>;
 
@@ -51,13 +62,23 @@ pub(crate) struct Connection {
     session: store::Session,
     nonce: Vec<u8>,
     active: Arc<AtomicBool>,
-    probe: mpsc::Sender<oneshot::Sender<()>>,
+    probe: mpsc::Sender<oneshot::Sender<ChallengeOutcome>>,
+    terminal: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     wake: Arc<Notify>,
     waiters: Waiters,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Still active means a newer claim (or a failed one) is fencing this
+        // stream; a driver that ended on its own already cleared `active` and
+        // recorded its own status. Publish the status before clearing `active`.
+        if self.active.load(Ordering::Acquire) {
+            self.terminal
+                .lock()
+                .expect("terminal lock")
+                .get_or_insert_with(|| tonic::Status::aborted("superseded by a newer connection"));
+        }
         self.active.store(false, Ordering::Release);
         self.wake.notify_one();
     }
