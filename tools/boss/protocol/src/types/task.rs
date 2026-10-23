@@ -1168,7 +1168,13 @@ pub struct Task {
     /// order blocked, in revision, AI review, ready, pending — see
     /// `classify_review_section` in the engine for the rule and why it is in
     /// that order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Always serialized — as `null` for a non-Review row — unlike the other
+    /// derived projections. The macOS client uses the key's presence to tell
+    /// an engine that predates the field (key absent: the client may fall
+    /// back) from a section-aware engine that sent a Review card with no
+    /// section (key `null`: a defect the client reports rather than hides).
+    #[serde(default)]
     pub review_section: Option<ReviewSection>,
 
     /// GitHub's `updatedAt` for this card's bound PR (RFC 3339), as of the

@@ -256,6 +256,9 @@ extension EngineClient {
             aiReviewFindingsRevisionId: payload["ai_review_findings_revision_id"] as? String,
             readyForReview: (payload["ready_for_review"] as? Bool) ?? false,
             reviewSection: (payload["review_section"] as? String).flatMap(ReviewSection.init(rawValue:)),
+            // Key presence, not value: a section-aware engine sends `null`
+            // for a non-Review row, a pre-field engine omits the key.
+            reviewSectionReported: payload["review_section"] != nil,
             prUpdatedAt: payload["pr_updated_at"] as? String,
             docLinkState: parseDocLinkState(payload["doc_link_state"]),
             reviewGuideLifecycle: payload["review_guide_lifecycle"] as? String,

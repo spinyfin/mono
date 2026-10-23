@@ -86,12 +86,24 @@ extension ChatViewModel {
     /// `items` keeps its incoming order within each section, except Pending,
     /// which is ordered by most recent activity (see `pendingRecencySort`).
     ///
-    /// The client does not classify: a card the engine sent no section for
-    /// (an engine that predates the field, or a card optimistically moved
-    /// into Review before the next work-tree refresh) lands in `.pending`,
-    /// the neutral "not ready, nothing wrong" section, so it is never hidden
-    /// and never claims a state the engine did not report.
-    static func reviewSections(items: [WorkTask]) -> [WorkBoardSection] {
+    /// The client does not classify. A card the engine sent no section for
+    /// lands in `.pending`, the neutral "not ready, nothing wrong" section,
+    /// so it is never hidden and never claims a state the engine did not
+    /// report — but that is only legitimate when `missingSectionIsExpected`
+    /// says so (the two documented cases are in
+    /// `ChatViewModel.missingReviewSectionIsExpected(for:)`). Any other
+    /// sectionless Review card is a defect: a section-aware engine sends a
+    /// section for every Review-lane row, so a nil here means some update
+    /// path dropped it, and the card is reported through
+    /// `ReviewSectionDiagnostics.reportMissingSection` (a fault-level log in
+    /// the app, a test failure under XCTest) rather than filed silently.
+    static func reviewSections(
+        items: [WorkTask],
+        missingSectionIsExpected: (WorkTask) -> Bool = { !$0.reviewSectionReported }
+    ) -> [WorkBoardSection] {
+        for task in items where task.reviewSection == nil && !missingSectionIsExpected(task) {
+            ReviewSectionDiagnostics.reportMissingSection(task)
+        }
         let grouped = Dictionary(grouping: items) { $0.reviewSection ?? .pending }
         return ReviewSection.allCases.compactMap { section in
             guard let sectionItems = grouped[section], !sectionItems.isEmpty else { return nil }
@@ -103,6 +115,23 @@ extension ChatViewModel {
                 defaultExpanded: true
             )
         }
+    }
+
+    /// The two documented reasons a card in the Review column may carry no
+    /// engine section. Anything else is a defect — see
+    /// `reviewSections(items:missingSectionIsExpected:)`.
+    ///
+    /// 1. **Pre-field engine.** The payload had no `review_section` key at
+    ///    all (`reviewSectionReported == false`). A section-aware engine
+    ///    always writes the key, `null` included, so absence identifies the
+    ///    engine, not the row.
+    /// 2. **Card just dragged into Review.** It is in the column only through
+    ///    the optimistic override: its engine-reported state still places it
+    ///    elsewhere (`realEffectiveBoardColumn` is not `.review`), so the
+    ///    engine has not classified it yet. The engine's `work_item_updated`
+    ///    reply to the drop carries the section and clears the override.
+    func missingReviewSectionIsExpected(for task: WorkTask) -> Bool {
+        !task.reviewSectionReported || realEffectiveBoardColumn(for: task) != .review
     }
 
     /// Pending-section order: newest activity first, where activity is the
@@ -326,7 +355,7 @@ extension ChatViewModel {
         // (Ready, In Revision, ...), whatever the board's project grouping
         // is set to.
         if column == .review {
-            return Self.reviewSections(items: items)
+            return Self.reviewSections(items: items, missingSectionIsExpected: missingReviewSectionIsExpected(for:))
         }
         // Doing's "Needs Attention" section sits above everything else —
         // flat or project-grouped alike: a task waiting on an answer needs attention

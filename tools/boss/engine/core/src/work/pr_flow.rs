@@ -23,6 +23,36 @@ pub struct DeferredReviewAdmissionCandidate {
     pub cycle_root_id: String,
 }
 
+/// The `tasks` columns a `boss pr status --refresh` observation can move, in
+/// one comparable value, so [`WorkDb::set_pr_status_observation`] can report
+/// whether it changed anything.
+#[derive(Debug, PartialEq, Eq)]
+struct PrObservationColumns {
+    pr_mergeable_state: Option<String>,
+    pr_merge_state_status: Option<String>,
+    pr_head_sha: Option<String>,
+    ci_required_state: Option<String>,
+}
+
+/// `None` when the row is absent or deleted.
+fn read_pr_observation_columns(conn: &Connection, work_item_id: &str) -> Result<Option<PrObservationColumns>> {
+    conn.query_row(
+        "SELECT pr_mergeable_state, pr_merge_state_status, pr_head_sha, ci_required_state
+         FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+        params![work_item_id],
+        |row| {
+            Ok(PrObservationColumns {
+                pr_mergeable_state: row.get(0)?,
+                pr_merge_state_status: row.get(1)?,
+                pr_head_sha: row.get(2)?,
+                ci_required_state: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Record that a worker produced a PR for `execution_id`. In a single
@@ -1638,6 +1668,18 @@ impl WorkDb {
     /// `update_task_pr_poll_state`'s doc comment); a worker refresh advancing
     /// it would make a wedged poller look alive. `pr_status_observed_at` is
     /// the shared "last observed by anyone" timestamp both writers stamp.
+    ///
+    /// Returns `true` when the write moved any column the board's Review
+    /// classification reads (`pr_mergeable_state`, `ci_required_state`) or
+    /// the merge poller's changed-guard compares against
+    /// (`pr_merge_state_status`, `pr_head_sha`). The caller must then publish
+    /// a work invalidation itself: nothing else will. The merge poller's next
+    /// sweep diffs its probe against the row this call just wrote, so a
+    /// refresh that already stored what the sweep would have stored makes
+    /// that sweep report "unchanged" and publish nothing — the board would
+    /// keep showing the card where the last published state put it (for
+    /// example under Pending with `pr_mergeable_state = "unknown"`) while the
+    /// engine itself classifies the row as Ready.
     pub fn set_pr_status_observation(
         &self,
         work_item_id: &str,
@@ -1645,9 +1687,11 @@ impl WorkDb {
         merge_state_status: Option<&str>,
         head_sha: Option<&str>,
         observed_at: &str,
-    ) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute(
+    ) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let before = read_pr_observation_columns(&tx, work_item_id)?;
+        tx.execute(
             "UPDATE tasks
              SET pr_mergeable_state    = ?2,
                  pr_merge_state_status = COALESCE(?3, pr_merge_state_status),
@@ -1661,7 +1705,9 @@ impl WorkDb {
              WHERE id = ?1 AND deleted_at IS NULL",
             params![work_item_id, mergeable_state, merge_state_status, head_sha, observed_at],
         )?;
-        Ok(())
+        let after = read_pr_observation_columns(&tx, work_item_id)?;
+        tx.commit()?;
+        Ok(before != after)
     }
 
     /// Write the Merging-UI columns for `work_item_id` directly — the
@@ -2128,7 +2174,9 @@ impl WorkDb {
             .ok_or(OperatorQuestionError::NotFound)?;
         if question.status != OperatorQuestionStatus::Open {
             if question.status == OperatorQuestionStatus::Answered && question.answer.as_ref() == Some(&answer) {
-                return Ok(OperatorAnswerOutcome::unchanged(task_to_item(task)));
+                let mut unchanged = task;
+                project_for_work_item_updated(&tx, &mut unchanged, "answer_operator_question");
+                return Ok(OperatorAnswerOutcome::unchanged(task_to_item(unchanged)));
             }
             return Err(OperatorQuestionError::Conflict {
                 state: match question.status {
@@ -2208,7 +2256,8 @@ impl WorkDb {
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
         }
 
-        let updated = query_task(&tx, &task.id).require("task", &task.id)?;
+        let mut updated = query_task(&tx, &task.id).require("task", &task.id)?;
+        project_for_work_item_updated(&tx, &mut updated, "answer_operator_question");
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(OperatorAnswerOutcome {
             item: task_to_item(updated),

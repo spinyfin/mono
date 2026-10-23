@@ -99,13 +99,116 @@ final class ReviewSectionsTests: XCTestCase {
         )
     }
 
-    func testCardWithoutAnEngineSectionLandsInPendingNotHidden() {
-        let model = makeModel()
-        model.choresByProductID = ["prod_test": [makeReviewItem(id: "unclassified", section: nil)]]
+    // MARK: - Cards without an engine section
 
-        let sections = model.workSections(in: .review)
-        XCTAssertEqual(sections.map(\.title), ["Pending"])
-        XCTAssertEqual(sections.first?.items.map(\.id), ["unclassified"])
+    /// Documented fallback 1: the engine predates `review_section` (its
+    /// payload had no such key, so `reviewSectionReported` is false). The
+    /// card lands in Pending, unhidden, and is not a defect.
+    func testCardFromAPreFieldEngineLandsInPendingWithoutAReport() {
+        let model = makeModel()
+        var card = makeReviewItem(id: "unclassified", section: nil)
+        card.reviewSectionReported = false
+        model.choresByProductID = ["prod_test": [card]]
+
+        let reported = capturingMissingSectionReports {
+            let sections = model.workSections(in: .review)
+            XCTAssertEqual(sections.map(\.title), ["Pending"])
+            XCTAssertEqual(sections.first?.items.map(\.id), ["unclassified"])
+        }
+        XCTAssertEqual(reported, [], "a pre-field engine is the legitimate fallback, not a defect")
+    }
+
+    /// A section-aware engine (the key was present, here as `null`) sent a
+    /// Review-lane card with no section: a defect in some engine update
+    /// path. The card is still shown — under Pending, never hidden, never
+    /// reclassified by the client — but it is reported, which under XCTest
+    /// is a test failure (see `BossTestsPrincipal`).
+    func testSectionAwareEngineCardWithoutASectionIsReportedAndStillShown() {
+        let model = makeModel()
+        var card = makeReviewItem(id: "dropped", section: nil)
+        card.reviewSectionReported = true
+        model.choresByProductID = ["prod_test": [card]]
+
+        let reported = capturingMissingSectionReports {
+            let sections = model.workSections(in: .review)
+            XCTAssertEqual(sections.map(\.title), ["Pending"])
+            XCTAssertEqual(sections.first?.items.map(\.id), ["dropped"])
+        }
+        XCTAssertEqual(reported, ["dropped"])
+    }
+
+    /// Documented fallback 2: a card the user just dragged into Review. Its
+    /// engine state still says Doing; only the optimistic override puts it
+    /// in the column, and the engine's reply to the drop will bring the
+    /// section. Not a defect.
+    func testCardJustDraggedIntoReviewWithoutASectionIsNotReported() {
+        let model = makeModel()
+        var card = makeReviewItem(id: "dragged", section: nil)
+        card.status = "active"
+        card.reviewSectionReported = true
+        model.choresByProductID = ["prod_test": [card]]
+        model.optimisticColumnByTaskID["dragged"] = .review
+
+        let reported = capturingMissingSectionReports {
+            let sections = model.workSections(in: .review)
+            XCTAssertEqual(sections.map(\.title), ["Pending"])
+            XCTAssertEqual(sections.first?.items.map(\.id), ["dragged"])
+        }
+        XCTAssertEqual(reported, [])
+    }
+
+    #if BOSS_BAZEL_TEST_BUILD
+    /// Under `bazel test`, the shard's Info.plist names `BossTestsPrincipal`
+    /// and XCTest instantiates it before the first test, so the bundle-wide
+    /// observer that turns a reported defect into `XCTFail` is in place.
+    /// This pins that the plist wiring actually took effect in the built
+    /// bundle; `swift test` has no such plist and skips this check.
+    func testBundlePrincipalInstalledTheFailingObserver() {
+        XCTAssertNotNil(
+            ReviewSectionDiagnostics.onMissingSection,
+            "BossTestsPrincipal did not run: check NSPrincipalClass in Tests/BossTests/Info.plist and infoplists in BUILD.bazel"
+        )
+    }
+    #endif
+
+    /// A card with a section is never reported, whatever the engine said
+    /// about the key — the report is only for a section that is owed and
+    /// missing.
+    func testCardWithASectionIsNeverReported() {
+        let model = makeModel()
+        var card = makeReviewItem(id: "ready", section: .ready)
+        card.reviewSectionReported = true
+        model.choresByProductID = ["prod_test": [card]]
+
+        let reported = capturingMissingSectionReports {
+            XCTAssertEqual(model.workSections(in: .review).map(\.title), ["Ready"])
+        }
+        XCTAssertEqual(reported, [])
+    }
+
+    /// The wire distinction the fallback rests on: a section-aware engine
+    /// always writes the key (`null` for a non-Review row), a pre-field
+    /// engine omits it.
+    func testParserRecordsWhetherTheEngineSentTheReviewSectionKey() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var payload: [String: Any] = [
+            "id": "task_1", "product_id": "prod_test", "kind": "chore", "name": "n", "description": "",
+            "status": "in_review", "created_at": "2026-05-15T00:00:00Z", "updated_at": "2026-05-15T00:00:00Z",
+        ]
+
+        let absent = try XCTUnwrap(client.parseTask(payload))
+        XCTAssertNil(absent.reviewSection)
+        XCTAssertFalse(absent.reviewSectionReported, "no key: a pre-field engine")
+
+        payload["review_section"] = NSNull()
+        let null = try XCTUnwrap(client.parseTask(payload))
+        XCTAssertNil(null.reviewSection)
+        XCTAssertTrue(null.reviewSectionReported, "null: the engine classified the row and found no section")
+
+        payload["review_section"] = "ready"
+        let ready = try XCTUnwrap(client.parseTask(payload))
+        XCTAssertEqual(ready.reviewSection, .ready)
+        XCTAssertTrue(ready.reviewSectionReported)
     }
 
     func testReviewIsGroupedByStateEvenWhenBoardIsGroupedByProject() {
@@ -146,6 +249,18 @@ final class ReviewSectionsTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// Run `body` with `ReviewSectionDiagnostics.onMissingSection` replaced
+    /// by a recorder, restoring the bundle-wide observer (the one that calls
+    /// `XCTFail`) afterwards. Returns the ids reported.
+    private func capturingMissingSectionReports(_ body: () -> Void) -> [String] {
+        let previous = ReviewSectionDiagnostics.onMissingSection
+        defer { ReviewSectionDiagnostics.onMissingSection = previous }
+        var reported: [String] = []
+        ReviewSectionDiagnostics.onMissingSection = { reported.append($0.id) }
+        body()
+        return reported
+    }
 
     private func makeReviewItem(id: String, section: ReviewSection?) -> WorkTask {
         var task = WorkTask(

@@ -750,7 +750,7 @@ pub(crate) use mappers::*;
 pub(crate) use pr_state::stored_pr_number;
 pub(crate) use products_design::{
     attach_task_doc_link_state, attach_task_doc_link_states, attach_task_doc_link_states_for_groups,
-    parse_pr_doc_artifact_id,
+    parse_pr_doc_artifact_id, project_for_work_item_updated,
 };
 pub(crate) use review_guide_jobs::{
     PrReviewGuideAttempt, PrReviewGuideVersion, PublishReviewGuideOutcome, RetryReviewGuideOutcome,

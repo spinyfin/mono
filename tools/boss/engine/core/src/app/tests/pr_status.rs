@@ -79,6 +79,26 @@ impl PrFixture {
         }
     }
 
+    /// Subscribe an observer session to the fixture product's work topic, so
+    /// a test can see the `work_invalidated` pushes the handler fans out to
+    /// the board. Returns the observer's sink; close it and drain `next()`.
+    async fn observe_board_pushes(&self, session: &str) -> Arc<SessionSink> {
+        let product_id = match self.server_state.work_db.get_work_item(&self.task_id).unwrap() {
+            WorkItem::Chore(task) | WorkItem::Task(task) => task.product_id,
+            other => panic!("fixture task is not a task row: {other:?}"),
+        };
+        let sink = make_session_sink();
+        self.server_state
+            .topic_broker
+            .register_session(session, sink.clone())
+            .await;
+        self.server_state
+            .topic_broker
+            .subscribe(session, &[crate::protocol::work_product_topic(&product_id)])
+            .await;
+        sink
+    }
+
     fn new() -> Self {
         Self::new_with_probe(None)
     }
@@ -631,4 +651,178 @@ async fn status_and_body_resolve_pr_via_chain_root_for_revision_execution() {
     assert_eq!(body.pr_url.as_deref(), Some(pr_url.as_str()));
     assert_eq!(body.title.as_deref(), Some("Fix the thing"));
     assert_eq!(body.body.as_deref(), Some("## Summary\nFixed it."));
+}
+
+/// Drain every `work_invalidated` push an observer sink received, as
+/// `(reason, item_ids)` pairs. Closes the sink.
+async fn drain_invalidations(sink: &SessionSink) -> Vec<(String, Vec<String>)> {
+    sink.close();
+    let mut seen = Vec::new();
+    while let Some(event) = sink.next().await {
+        if let FrontendEvent::TopicEvent {
+            event: crate::protocol::TopicEventPayload::WorkInvalidated { reason, item_ids, .. },
+            ..
+        } = event.payload
+        {
+            seen.push((reason, item_ids));
+        }
+    }
+    seen
+}
+
+/// Root cause of "Review column shows Ready cards under Pending": a worker's
+/// `boss pr status --refresh` persisted the live mergeability (and dropped
+/// the CI state for a new head) straight into the `tasks` row without
+/// telling the board, and the merge poller's next sweep — which diffs its
+/// probe against that very row — then found nothing changed and published
+/// nothing either. The engine classified the card Ready; the app kept the
+/// last section it had been sent. A refresh that moves a classification
+/// input must publish the invalidation itself.
+#[tokio::test]
+async fn status_refresh_that_moves_the_row_publishes_a_board_invalidation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::new(FixedProbe::open("MERGEABLE", "CLEAN", "sha0", calls.clone()));
+    let fx = PrFixture::new_with_probe(Some(probe));
+    // The poller's last sweep saw GitHub still computing mergeability.
+    fx.seed_snapshot("unknown", "UNKNOWN", "sha0", "1000000000");
+    let observer = fx.observe_board_pushes("board").await;
+
+    let status = status_view(call_status(&fx.server_state, Some(self_pid()), &fx.execution_id, true).await);
+    assert!(status.refreshed);
+    assert_eq!(status.mergeable.as_deref(), Some("mergeable"));
+
+    let pushes = drain_invalidations(&observer).await;
+    assert_eq!(
+        pushes,
+        vec![(
+            pr_status::PR_STATUS_REFRESHED_REASON.to_owned(),
+            vec![fx.task_id.clone()]
+        )],
+        "a refresh that changed pr_mergeable_state must publish exactly one work_invalidated for the status row",
+    );
+}
+
+/// A refresh whose live probe matches what the row already stores is not
+/// news for the board: no invalidation, so a worker polling `--refresh`
+/// cannot turn into a second source of board churn.
+#[tokio::test]
+async fn status_refresh_that_changes_nothing_publishes_no_board_invalidation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::new(FixedProbe::open("MERGEABLE", "CLEAN", "sha0", calls.clone()));
+    let fx = PrFixture::new_with_probe(Some(probe));
+    fx.seed_snapshot("mergeable", "CLEAN", "sha0", "1000000000");
+    let observer = fx.observe_board_pushes("board").await;
+
+    let status = status_view(call_status(&fx.server_state, Some(self_pid()), &fx.execution_id, true).await);
+    assert!(status.refreshed, "the probe still runs; only the publish is skipped");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    assert!(
+        drain_invalidations(&observer).await.is_empty(),
+        "an observation identical to the stored row must not invalidate the board",
+    );
+}
+
+/// The refresh handler publishes for the row the observation was written to
+/// — the chain root for a revision worker — not the caller's own revision
+/// row, which never carries PR state.
+#[tokio::test]
+async fn status_refresh_from_a_revision_worker_invalidates_the_chain_root() {
+    use crate::work::{FakePrStateChecker, PrOpenState};
+    use boss_protocol::{CreateExecutionInput, CreateRevisionInput};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::new(FixedProbe::open("MERGEABLE", "CLEAN", "sha1", calls.clone()));
+    let fx = PrFixture::new_with_probe(Some(probe));
+    fx.seed_snapshot("unknown", "UNKNOWN", "sha0", "1000000000");
+    let db = &fx.server_state.work_db;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+            rusqlite::params![fx.task_id],
+        )
+        .unwrap();
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(fx.task_id.clone())
+                .description("follow-up")
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    let revision_execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    fx.server_state
+        .worker_registry
+        .register(self_pid(), revision_execution.id.clone());
+    let observer = fx.observe_board_pushes("board").await;
+
+    let status = status_view(call_status(&fx.server_state, Some(self_pid()), &revision_execution.id, true).await);
+    assert!(status.refreshed);
+
+    assert_eq!(
+        drain_invalidations(&observer).await,
+        vec![(
+            pr_status::PR_STATUS_REFRESHED_REASON.to_owned(),
+            vec![fx.task_id.clone()]
+        )],
+    );
+}
+
+/// `set_pr_status_observation` reports whether it moved a column the
+/// Review classifier or the poller's changed-guard reads; the timestamp
+/// alone never counts.
+#[tokio::test]
+async fn set_pr_status_observation_reports_whether_classification_inputs_moved() {
+    let fx = PrFixture::new();
+    let db = &fx.server_state.work_db;
+    fx.seed_snapshot("unknown", "UNKNOWN", "sha0", "1000000000");
+
+    // Mergeability resolves: changed.
+    assert!(
+        db.set_pr_status_observation(&fx.task_id, "mergeable", Some("CLEAN"), Some("sha0"), "1000000001")
+            .unwrap()
+    );
+    // Same observation again, only the timestamp moves: unchanged.
+    assert!(
+        !db.set_pr_status_observation(&fx.task_id, "mergeable", Some("CLEAN"), Some("sha0"), "1000000002")
+            .unwrap()
+    );
+    // A field GitHub omitted keeps the stored value, so still unchanged.
+    assert!(
+        !db.set_pr_status_observation(&fx.task_id, "mergeable", None, None, "1000000003")
+            .unwrap()
+    );
+    // A new head drops the stored CI state (and moves pr_head_sha): changed.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET ci_required_state = 'success' WHERE id = ?1",
+            rusqlite::params![fx.task_id],
+        )
+        .unwrap();
+    assert!(
+        db.set_pr_status_observation(&fx.task_id, "mergeable", Some("CLEAN"), Some("sha1"), "1000000004")
+            .unwrap()
+    );
+    let ci: Option<String> = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT ci_required_state FROM tasks WHERE id = ?1",
+            rusqlite::params![fx.task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ci, None, "CI for the previous head is dropped on a head change");
 }

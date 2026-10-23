@@ -213,6 +213,15 @@ struct WorkTask: Identifiable, Hashable {
     /// the key it is given and never re-derives it from the badge fields
     /// above. Mirrors `Task.review_section` on the wire.
     var reviewSection: ReviewSection? = nil
+    /// Whether the engine's payload carried the `review_section` key at all
+    /// — as a section or as `null`. A section-aware engine always writes the
+    /// key (null for a row that is not a Review-lane card), so a payload
+    /// without it came from an engine that predates the field: the one case
+    /// where a Review card with `reviewSection == nil` is not a defect (see
+    /// `ChatViewModel.missingReviewSectionIsExpected(for:)`). Rows built
+    /// in-app rather than parsed off the wire default to `false` for the
+    /// same reason — no engine vouched for them.
+    var reviewSectionReported: Bool = false
     /// GitHub's `updatedAt` for the bound PR (RFC 3339), engine-supplied.
     /// Together with `updatedAt` it keys the Review column's Pending-section
     /// order. Mirrors `Task.pr_updated_at` on the wire.
