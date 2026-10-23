@@ -464,10 +464,9 @@ extension ChatViewModel {
             // retry — they are not derivable from the row list alone (the
             // engine tracks them via `task_blocked_signals`), so we leave
             // pre-existing exhausted chips alone. Terminal failed/abandoned
-            // attempts also leave the `in_flight` chip alone: the parent PR
-            // is still `blocked: ci_failure` until the engine retries or
-            // exhausts (see the `.ciRemediationFailed`/`.ciRemediationAbandoned`
-            // handling below), so the chip is still accurate.
+            // attempts are not handled here: the push path
+            // (`reconcileRemediationBadge`) applies the engine's `card_state`,
+            // which is derived from the same signals as the open-PR snapshot.
             var seenPRs = Set<String>()
             for row in attempts {
                 guard seenPRs.insert(row.prURL).inserted else { continue }

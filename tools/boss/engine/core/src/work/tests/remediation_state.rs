@@ -81,3 +81,73 @@ fn open_remediation_snapshot_is_compact_complete_and_recovers_exhaustion() {
     .unwrap();
     assert!(db.open_remediation_state().unwrap().is_empty());
 }
+
+/// The pushed `card_state` must equal the open-PR snapshot's `ci_state` row
+/// for every parent shape, including an `in_review` parent whose failure
+/// signal is still armed after a fix revision spawned.
+#[test]
+fn ci_card_state_matches_open_snapshot_for_every_parent_shape() {
+    let (_dir, path) = disk_db_path("ci-card-state");
+    let db = WorkDb::open(path).unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "open PR");
+    let pr_url = "https://github.com/foo/bar/pull/42";
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".into()),
+            pr_url: Some(pr_url.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let check = |expected: &str| {
+        let projected = db
+            .remediation_entry(
+                EngineAttemptListEntry::builder()
+                    .id("attempt")
+                    .product_id(product.id.clone())
+                    .created_at("2026-01-01")
+                    .kind("ci")
+                    .pr_url(pr_url)
+                    .status("failed")
+                    .work_item_id(chore.id.clone())
+                    .extra(Default::default())
+                    .build(),
+            )
+            .extra["card_state"]
+            .clone();
+        let snapshot = db.open_remediation_state().unwrap();
+        let state_row = snapshot.iter().find(|r| r.kind == "ci_state").unwrap();
+        assert_eq!(projected, expected);
+        assert_eq!(state_row.status, expected);
+    };
+
+    check("clear");
+
+    db.mark_chore_blocked_ci_failure(&chore.id, pr_url, None).unwrap();
+    check("in_flight");
+
+    // Fix revision spawned: parent back to in_review, signal stays armed.
+    db.clear_chore_blocked_ci_failure(&chore.id, pr_url).unwrap();
+    db.record_ci_failure_in_flight(&chore.id, "att-1").unwrap();
+    check("in_flight");
+
+    db.mark_chore_blocked_ci_failure_exhausted(&chore.id, pr_url).unwrap();
+    check("exhausted");
+
+    // A higher-priority scalar reason occupies the slot; the exhausted
+    // signal is still armed and the chip must stay sticky.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'review_feedback' WHERE id = ?1",
+            params![chore.id],
+        )
+        .unwrap();
+    check("exhausted");
+
+    db.clear_ci_failure_signal_only(&chore.id).unwrap();
+    check("clear");
+}

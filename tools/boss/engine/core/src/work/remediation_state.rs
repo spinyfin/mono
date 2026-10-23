@@ -1,5 +1,23 @@
 use super::*;
 
+/// `(exhausted, failing)` predicates over uncleared CI signals, shared by the
+/// per-PR card state and the open-PR snapshot so the two cannot drift.
+const CI_SIGNAL_EXISTS_COLUMNS: &str = "\
+EXISTS(SELECT 1 FROM task_blocked_signals s WHERE s.work_item_id = t.id
+       AND s.reason = 'ci_failure_exhausted' AND s.cleared_at IS NULL),
+EXISTS(SELECT 1 FROM task_blocked_signals s WHERE s.work_item_id = t.id
+       AND s.reason = 'ci_failure' AND s.cleared_at IS NULL)";
+
+fn ci_card_state_label(exhausted: bool, failing: bool) -> &'static str {
+    if exhausted {
+        "exhausted"
+    } else if failing {
+        "in_flight"
+    } else {
+        "clear"
+    }
+}
+
 impl WorkDb {
     /// Add current card state to a compact row; never attach diagnostic blobs.
     pub fn remediation_entry(&self, mut row: EngineAttemptListEntry) -> EngineAttemptListEntry {
@@ -11,15 +29,16 @@ impl WorkDb {
                     row.extra.insert("attempts_used".into(), budget.used.to_string());
                     row.extra.insert("budget".into(), budget.effective.to_string());
                     if row.kind == "ci" {
-                        // The parent's blocked state is the authoritative
-                        // card state, so a terminal attempt pushed without a
+                        // The uncleared blocked signals are the authoritative
+                        // card state (the same source as the open-PR
+                        // snapshot), so a terminal attempt pushed without a
                         // preceding start still sets or clears the chip.
-                        let card_state = match budget.blocked_reason.as_deref() {
-                            Some("ci_failure_exhausted") => "exhausted",
-                            Some("ci_failure") => "in_flight",
-                            _ => "clear",
-                        };
-                        row.extra.insert("card_state".into(), card_state.into());
+                        match self.ci_card_state(id) {
+                            Ok(card_state) => {
+                                row.extra.insert("card_state".into(), card_state.into());
+                            }
+                            Err(err) => tracing::warn!(%err, "could not project ci card state"),
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -27,6 +46,19 @@ impl WorkDb {
             }
         }
         row
+    }
+
+    /// Chip state for a PR's CI failure, derived from uncleared
+    /// `task_blocked_signals` (not the scalar `blocked_reason`, which is only
+    /// kept while the parent is `blocked`): exhausted, then in_flight, then clear.
+    pub fn ci_card_state(&self, work_item_id: &str) -> Result<&'static str> {
+        let conn = self.connect()?;
+        let (exhausted, failing) = conn.query_row(
+            &format!("SELECT {CI_SIGNAL_EXISTS_COLUMNS} FROM tasks t WHERE t.id = ?1"),
+            params![work_item_id],
+            |r| Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?)),
+        )?;
+        Ok(ci_card_state_label(exhausted, failing))
     }
 
     /// Latest compact attempt per kind for each current, nonterminal PR.
@@ -81,15 +113,12 @@ impl WorkDb {
         }
         // Failure chips are task signals, including exhausted PRs that have
         // no active attempt. Include an authoritative state row for each PR.
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT t.id, t.product_id, t.pr_url, t.created_at,
-                    EXISTS(SELECT 1 FROM task_blocked_signals s WHERE s.work_item_id = t.id
-                           AND s.reason = 'ci_failure_exhausted' AND s.cleared_at IS NULL),
-                    EXISTS(SELECT 1 FROM task_blocked_signals s WHERE s.work_item_id = t.id
-                           AND s.reason = 'ci_failure' AND s.cleared_at IS NULL)
+                    {CI_SIGNAL_EXISTS_COLUMNS}
              FROM tasks t
              WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived') AND t.kind != 'revision' AND t.pr_url IS NOT NULL"
-        )?;
+        ))?;
         let rows = stmt.query_map([], |r| {
             let id: String = r.get(0)?;
             let exhausted: bool = r.get(4)?;
@@ -101,14 +130,7 @@ impl WorkDb {
                 pr_url: r.get(2)?,
                 created_at: r.get(3)?,
                 kind: "ci_state".into(),
-                status: if exhausted {
-                    "exhausted"
-                } else if failing {
-                    "in_flight"
-                } else {
-                    "clear"
-                }
-                .into(),
+                status: ci_card_state_label(exhausted, failing).into(),
                 failure_reason: None,
                 started_at: None,
                 finished_at: None,
