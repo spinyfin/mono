@@ -307,49 +307,6 @@ impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
     }
 }
 
-/// Spawn the GitHub OAuth auth-state forwarder.
-///
-/// At boot it restores any keychain-persisted token (so the status surface
-/// reflects a prior connection across engine restarts), then hands the
-/// controller's state channel to [`run_auth_forwarder`], which:
-/// - pushes the display-safe [`GitHubAuthStateDto`] on the `github.auth` topic
-///   whenever it differs from the last one pushed, so subscribed frontends
-///   re-render, and
-/// - runs the org/SSO probe ([`probe_and_record_org_state`]) once per
-///   authorization that lands as `Authorized { org_state: Unknown }`.
-///
-/// A probe that resolves to `Unknown` (no GitHub-tracked product, transient
-/// failure) is not retried by this loop: re-probing is the job of the
-/// on-demand recheck (`GitHubAuthStatus`, and a product's tracker config
-/// changing), both via [`github_auth::spawn_org_recheck`]. A newly connected
-/// session reads the current state with its connect-time `GitHubAuthStatus`.
-fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
-    boss_task_scope::spawn(async move {
-        let controller = server_state.github_auth.clone();
-        // Restore a persisted token (if any) before subscribing, so the first
-        // loop iteration sees the restored `Authorized { Unknown }` state and
-        // runs the org probe.
-        controller.restore_from_store();
-
-        let rx = controller.subscribe();
-        let probe_state = server_state.clone();
-        let broadcast_state = server_state.clone();
-        run_auth_forwarder(
-            &controller,
-            rx,
-            |token| {
-                let server_state = probe_state.clone();
-                async move { github_auth::probe_org_state(&server_state, &token).await }
-            },
-            |dto| {
-                let server_state = broadcast_state.clone();
-                async move { server_state.broadcast_github_auth_state(dto).await }
-            },
-        )
-        .await;
-    })
-}
-
 /// Run the frontend server until the listener fails.
 ///
 /// `socket_path` is bound exclusively (the file is removed first if it exists).
@@ -2307,7 +2264,7 @@ async fn serve_scoped(
     // then watches the controller's state machine and (a) pushes every
     // transition on the `github.auth` topic and (b) runs the org/SSO probe on
     // each freshly-Authorized state. See the OAuth device-flow design §3/§7.
-    let _github_auth_handle = spawn_github_auth_forwarder(server_state.clone());
+    let _github_auth_handle = github_auth::spawn_github_auth_forwarder(server_state.clone());
 
     // Dependency-unblock safety-net sweeper: periodically re-evaluates
     // every dependency-blocked work item and unblocks any whose gating
@@ -2396,6 +2353,8 @@ async fn serve_scoped(
         Arc::new(move || coord_for_scheduler_pause_check.is_automation_paused()),
         automation_scheduler_timer_wheel,
     );
+
+    let _boothby_scheduler_handle = boothby::spawn_scheduler(&server_state);
 
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded
     // by a dropped wakeup (the `status_transition` → `request_recorded`

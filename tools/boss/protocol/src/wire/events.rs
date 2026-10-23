@@ -1710,4 +1710,28 @@ pub enum FrontendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<Box<Project>>,
     },
+
+    // --- Boothby replies (boothby.md) ---
+    /// Response to [`FrontendRequest::ListBoothbyPasses`].
+    BoothbyPassesList {
+        passes: Vec<BoothbyPass>,
+    },
+    /// Response to [`FrontendRequest::GetBoothbyState`] and
+    /// [`FrontendRequest::SetBoothbyMode`].
+    BoothbyState {
+        mode: String,
+        open_pass: Option<BoothbyPass>,
+        last_pass: Option<BoothbyPass>,
+    },
+    /// Response to [`FrontendRequest::RunBoothbyPass`]: the pass row that was
+    /// opened. A pass that finds no candidates finishes essentially
+    /// instantly, but this reply does not wait for that — it confirms the pass opened, not that it finished.
+    BoothbyPassStarted {
+        pass: BoothbyPass,
+    },
+    /// Pushed on [`TOPIC_BOOTHBY_ACTIVITY`] whenever a `boothby_passes` row
+    /// opens or closes.
+    BoothbyActivity {
+        pass: BoothbyPass,
+    },
 }
