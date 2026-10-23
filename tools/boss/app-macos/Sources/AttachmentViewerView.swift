@@ -160,19 +160,32 @@ enum AttachmentImageCache {
 struct AttachmentRow: View {
     let attachment: AttachmentVM
 
+    static let thumbnailSlot: CGFloat = 48
+    /// Generous cap; normal captions wrap fully, only pathological ones
+    /// truncate (and then the full text is in the row tooltip).
+    static let captionLineLimit = 8
+
     var body: some View {
-        HStack(spacing: 8) {
-            AttachmentThumbnail(attachment: attachment)
-                .frame(width: 40, height: 40)
+        HStack(alignment: .top, spacing: 8) {
+            // The slot is a fixed-size layout box and the image is `.fit`
+            // inside it, so the thumbnail can never report a larger size
+            // than the slot and spill over the text column.
+            AttachmentThumbnail(attachment: attachment, contentMode: .fit)
+                .frame(width: Self.thumbnailSlot, height: Self.thumbnailSlot)
+                .fixedSize()
             VStack(alignment: .leading, spacing: 2) {
                 Text(attachment.displayTitle)
                     .font(.callout)
-                    .lineLimit(1)
+                    .lineLimit(Self.captionLineLimit)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(AttachmentDateFormatting.format(attachment.createdAt))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .help(attachment.displayTitle)
         .padding(.vertical, 2)
     }
 }
@@ -191,9 +204,15 @@ struct AttachmentThumbnail: View {
                 Image(systemName: "trash")
                     .foregroundStyle(.secondary)
             } else if let image = loadedImage {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: contentMode)
+                // Overlay on a clear box: a `.fill` image's own layout size
+                // exceeds the proposal, which would otherwise inflate the
+                // thumbnail past its slot.
+                Color.clear.overlay(
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: contentMode)
+                )
+                .clipped()
             } else {
                 Image(systemName: "photo.badge.exclamationmark")
                     .foregroundStyle(.secondary)
