@@ -200,10 +200,9 @@ pub async fn run_one_pass(
         }
         // A row parked because its governing execution was *cancelled*
         // (`park_work_item_after_cancel`) is a stop-until-asked decision in
-        // exactly the same sense: an operator or an engine transition
-        // deliberately ended the run, and only an explicit `bossctl work
-        // start` / drag-to-Doing may resume it. Retrying it here would
-        // silently undo the cancel.
+        // exactly the same sense: the execution was explicitly cancelled,
+        // and only an explicit `bossctl work start` / drag-to-Doing may
+        // resume it. Retrying it here would silently undo the cancel.
         if dispatch_failed_reason.as_deref() == Some(EXECUTION_CANCELLED_DISPATCH_FAILED_REASON) {
             outcome.execution_cancelled_excluded += 1;
             continue;

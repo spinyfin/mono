@@ -460,3 +460,53 @@ fn attention_reconcile_keeps_a_cancel_park_stamped_in_the_run_start_second() {
     );
     assert!(!row.autostart);
 }
+
+/// An earlier execution that ran and completed in the same second a later
+/// execution was queued and cancelled must not erase the later cancel's park.
+#[test]
+fn attention_reconcile_keeps_a_cancel_park_when_an_earlier_execution_ran_in_the_same_second() {
+    let (db, _product_id, chore_id) = setup_product_and_chore();
+    let earlier = create_ready_chore_execution(&db, chore_id.clone());
+    db.start_execution_run(&earlier.id, "worker-1", "cube-repo", "lease", "ws", "/tmp/ws")
+        .unwrap();
+    db.cancel_running_execution_for_requeue(&earlier.id).unwrap();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'todo' WHERE id = ?1", [&chore_id])
+        .unwrap();
+    let later = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.cancel_execution_with(
+        &later.id,
+        CancelExecutionOpts {
+            actor: StatusActor::Human,
+            ..CancelExecutionOpts::default()
+        },
+    )
+    .unwrap();
+    for sql in [
+        "UPDATE work_runs SET started_at = '1700000000' WHERE execution_id = ?1",
+        "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+    ] {
+        db.connect().unwrap().execute(sql, [&earlier.id]).unwrap();
+    }
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET dispatch_failed_at = '1700000000' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+
+    db.reconcile_stale_attention_signals().unwrap();
+
+    let row = task(&db, &chore_id);
+    assert_parked_by_cancel(&row, &later.id);
+}

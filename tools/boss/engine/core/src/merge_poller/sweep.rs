@@ -931,6 +931,9 @@ pub(crate) async fn stop_active_revision_executions(
         let cancel_result = work_db.cancel_execution_with(
             &execution.id,
             crate::work::CancelExecutionOpts {
+                // Records its own timeline event with richer context.
+                caller_records_timeline: true,
+                peer_pid: None,
                 reason: Some("parent PR merged".to_owned()),
                 queued_only: false,
                 record_failure_reason: false,

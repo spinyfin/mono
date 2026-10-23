@@ -192,7 +192,7 @@ pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) 
 /// Hydrate the per-item runtime for every task and chore. This is the
 /// primary N+1 on the `get_work_tree` path: one call per work item, each
 /// running a handful of point queries. Returns the runtimes alongside the total
-/// number of SQL statements executed, so [`crate::population_timing`] can
+/// number of database lookups made, so [`crate::population_timing`] can
 /// attribute the per-row subquery fan-out.
 pub(crate) fn collect_task_runtimes(
     conn: &Connection,
@@ -202,15 +202,26 @@ pub(crate) fn collect_task_runtimes(
 ) -> Result<(Vec<TaskRuntime>, u64)> {
     let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
     let mut queries = 0u64;
+    // The ordinal chain is the same for every row of a project; build it once
+    // from the tasks already in hand instead of re-reading siblings per row.
+    let chains = super::queued_wait::OrdinalChains::from_tasks(tasks.iter().chain(chores.iter()));
     for task in tasks.iter().chain(chores.iter()) {
-        runtimes.push(compute_task_runtime(conn, &task.id, Some(task), &mut queries, now)?.runtime);
+        runtimes.push(compute_task_runtime(conn, &task.id, Some(task), Some(&chains), &mut queries, now)?.runtime);
     }
     Ok((runtimes, queries))
 }
 
-/// Runtime snapshot for a single work item. The in-hand task lets hold-reason
-/// projection rule out non-pending rows without another query. The query
-/// count includes execution/run lookups and any dispatch-hold gate queries.
+/// Runtime snapshot for a single work item. `task` is the already-loaded row
+/// (`None` for a project or unknown id) so the dispatch-hold check can rule
+/// out non-pending rows without a query. `queries` is incremented once per
+/// database lookup this call makes — the execution lookups (a live-execution
+/// fallback and a non-abandoned fallback for an all-abandoned work item), the
+/// queued-wait lookups, a latest-run lookup, and, only for a dispatch-pending
+/// `todo` row with nothing queued, each gate lookup of
+/// [`dispatch_hold_reason_for`]. A lookup helper may itself run more than one
+/// SQL statement (`work_item_is_deliberately_parked`, the repo and chain-root
+/// resolvers), so this is a lookup count, not a statement count: N+1 callers
+/// get a stable measure of per-row fan-out, not an exact statement total.
 pub(crate) fn query_task_runtime(
     conn: &Connection,
     work_item_id: &str,
@@ -218,7 +229,7 @@ pub(crate) fn query_task_runtime(
     queries: &mut u64,
 ) -> Result<TaskRuntime> {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
-    Ok(compute_task_runtime(conn, work_item_id, task, queries, now)?.runtime)
+    Ok(compute_task_runtime(conn, work_item_id, task, None, queries, now)?.runtime)
 }
 
 /// A freshly computed runtime plus what the board runtime cache needs to know
@@ -254,6 +265,7 @@ pub(crate) fn compute_task_runtime(
     conn: &Connection,
     work_item_id: &str,
     task: Option<&Task>,
+    chains: Option<&super::queued_wait::OrdinalChains>,
     queries: &mut u64,
     now: i64,
 ) -> Result<ComputedRuntime> {
@@ -295,7 +307,7 @@ pub(crate) fn compute_task_runtime(
             None => latest,
         }
     };
-    let wait = super::queued_wait::for_execution(conn, execution.as_ref(), now)?;
+    let wait = super::queued_wait::for_execution(conn, execution.as_ref(), task, chains, queries, now)?;
     let dispatch_hold_reason = dispatch_hold_reason_for(conn, task, execution.as_ref(), queries)?;
     let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at, dispatch_wait_since) =
         if let Some(execution) = execution {
@@ -523,19 +535,25 @@ pub(crate) fn reconcile_work_item_execution(
     // Returns whether a row was minted: `false` when a decline-to-mint gate
     // (bound PR, deliberate park, unresolved repo) applies.
     let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<bool> {
+        let declines = super::decline_log::DeclineLog::global();
+        let governing = predecessor.map(|execution| execution.id.as_str());
         if primary_pr_awaits_review(conn, work_item_id)? {
-            tracing::debug!(
-                work_item_id,
-                "reconcile: skipping execution mint — the row already has a PR awaiting review",
-            );
+            if declines.entered(work_item_id, governing, DISPATCH_HOLD_PR_AWAITS_REVIEW) {
+                tracing::debug!(
+                    work_item_id,
+                    "reconcile: skipping execution mint — the row already has a PR awaiting review",
+                );
+            }
             return Ok(false);
         }
         if work_item_is_deliberately_parked(conn, work_item_id)? {
-            tracing::info!(
-                work_item_id,
-                "reconcile: skipping execution mint — this row's run ended in a deliberate park \
-                 (`bossctl work start` resumes it)",
-            );
+            if declines.entered(work_item_id, governing, DISPATCH_HOLD_DELIBERATELY_PARKED) {
+                tracing::info!(
+                    work_item_id,
+                    "reconcile: skipping execution mint — this row's run ended in a deliberate park \
+                     (`bossctl work start` resumes it)",
+                );
+            }
             return Ok(false);
         }
         // Resolve through the single helper so per-row overrides beat the
@@ -575,6 +593,7 @@ pub(crate) fn reconcile_work_item_execution(
                 .build(),
         )?;
         result.created.push(created);
+        declines.cleared(work_item_id);
         Ok(true)
     };
 

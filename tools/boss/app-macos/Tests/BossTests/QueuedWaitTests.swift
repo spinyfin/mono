@@ -7,6 +7,7 @@ final class QueuedWaitTests: XCTestCase {
         let labels = [
             "ordinal_chain": "Queued — waiting for the earlier project task",
             "awaiting_scheduler": "Queued — waiting for the scheduler",
+            "awaiting_reconcile": "Queued — waiting for the engine to reconcile",
             "waiting_dependency": "Queued — waiting for a dependency",
             "dispatch_paused": "Queued — dispatch paused",
             "automation_paused": "Queued — automation paused",

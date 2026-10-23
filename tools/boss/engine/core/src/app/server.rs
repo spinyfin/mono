@@ -2235,6 +2235,12 @@ async fn serve_scoped(
         server_state.event_bus.clone(),
     );
 
+    // Engine-side cancels committed inside the work DB (dependency block,
+    // tombstoned remediation, review-guide replacement) have no dispatch sink
+    // of their own; this puts each on the execution's dispatch timeline.
+    let _cancel_timeline_handle =
+        crate::cancel_timeline::spawn_subscriber(server_state.dispatch_events.clone(), server_state.event_bus.clone());
+
     // Periodic dispatch-failure recovery reconciler: the pre-spawn
     // sibling of the orphan-active sweep above. Re-enqueues work items
     // the engine bounced to Backlog after a pre-spawn dispatch failure

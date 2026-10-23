@@ -78,6 +78,7 @@ extension WorkCardLiveStatus {
         case "waiting_dependency": return "Queued — waiting for a dependency"
         case "ordinal_chain": return "Queued — waiting for the earlier project task"
         case "awaiting_scheduler": return "Queued — waiting for the scheduler"
+        case "awaiting_reconcile": return "Queued — waiting for the engine to reconcile"
         case "dispatch_paused": return "Queued — dispatch paused"
         case "automation_paused": return "Queued — automation paused"
         case "pool_exhausted": return "Queued — worker pool full"

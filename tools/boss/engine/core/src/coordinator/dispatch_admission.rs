@@ -433,6 +433,9 @@ impl ExecutionCoordinator {
             if let Ok(cancelled) = self.work_db.cancel_execution_with_outcome(
                 &refreshed.id,
                 CancelExecutionOpts {
+                    // Records its own timeline event with richer context.
+                    caller_records_timeline: true,
+                    peer_pid: None,
                     reason: Some(cancel_reason.clone()),
                     queued_only: true,
                     record_failure_reason: false,
@@ -532,6 +535,9 @@ impl ExecutionCoordinator {
                 if let Ok(cancelled) = self.work_db.cancel_execution_with_outcome(
                     &execution.id,
                     CancelExecutionOpts {
+                        // Records its own timeline event with richer context.
+                        caller_records_timeline: true,
+                        peer_pid: None,
                         reason: Some(cancel_reason.to_string()),
                         queued_only: true,
                         record_failure_reason: false,

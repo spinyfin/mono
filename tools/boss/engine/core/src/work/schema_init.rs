@@ -162,6 +162,7 @@ impl WorkDb {
     pub(crate) fn init(&self) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        let mut pending = PendingEvents::new();
         let has_schema: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')",
             [],
@@ -202,7 +203,11 @@ impl WorkDb {
         }
         if version < 39 {
             // Data only: restart items blocked by the false ancestry failure.
-            execution_recovery_rearm::migrate(&tx, execution_recovery_rearm::is_false_not_descended_blocker)?;
+            execution_recovery_rearm::migrate(
+                &tx,
+                execution_recovery_rearm::is_false_not_descended_blocker,
+                &mut pending,
+            )?;
         }
         if version < 40 {
             tx.execute_batch("ALTER TABLE ci_remediations ADD COLUMN queue_base_sha TEXT")?;
@@ -219,6 +224,7 @@ impl WorkDb {
             execution_recovery_rearm::migrate(
                 &tx,
                 boss_engine_recovery::execution_bookmark::is_legacy_reconcilable_blocker,
+                &mut pending,
             )?;
         }
         if version < 44 {
@@ -263,6 +269,7 @@ impl WorkDb {
         // discovery remains outside DB startup (no processes or network).
         crate::host_registry::ensure_local_host(&tx)?;
         tx.commit()?;
+        pending.record_audit();
         Ok(())
     }
 

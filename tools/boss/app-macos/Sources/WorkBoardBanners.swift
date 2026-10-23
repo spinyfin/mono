@@ -20,9 +20,9 @@ struct WorkDispatchFailureBanner: View {
     private static let deliberateParkReason = "deliberate_park"
 
     /// Mirrors `boss_engine_core::work::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON`.
-    /// The row's governing execution was cancelled — an operator stop,
+    /// The row's governing execution was explicitly cancelled (a stop,
     /// `bossctl executions cancel`, a drag back to Backlog, or an engine
-    /// transition — and the engine parked it so the board shows the stop
+    /// transition) and the engine parked it so the board shows the stop
     /// instead of a phantom "Queued" card. Not a failure: the stored text
     /// names the execution, the cancel reason, and how to resume.
     private static let executionCancelledReason = "execution_cancelled"

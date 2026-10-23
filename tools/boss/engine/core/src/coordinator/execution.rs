@@ -1040,6 +1040,9 @@ impl ExecutionCoordinator {
                     match self.work_db.cancel_execution_with_outcome(
                         &execution.id,
                         CancelExecutionOpts {
+                            // Records its own timeline event with richer context.
+                            caller_records_timeline: true,
+                            peer_pid: None,
                             reason: Some(reason.clone()),
                             queued_only: true,
                             record_failure_reason: true,
@@ -2771,6 +2774,9 @@ impl ExecutionCoordinator {
         match self.work_db.cancel_execution_with_outcome(
             &execution.id,
             CancelExecutionOpts {
+                // Records its own timeline event with richer context.
+                caller_records_timeline: true,
+                peer_pid: None,
                 reason: Some(reason.clone()),
                 queued_only: true,
                 record_failure_reason: true,

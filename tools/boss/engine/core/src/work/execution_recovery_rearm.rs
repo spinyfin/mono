@@ -17,6 +17,10 @@ use boss_engine_recovery::execution_bookmark::NOT_DESCENDED_MESSAGE;
 
 use super::*;
 
+/// Reason recorded when the re-arm retires an execution shadowed by the
+/// terminal attempt it is replacing.
+const REARM_CANCEL_REASON: &str = "retired by recovery re-arm; superseded by a replacement execution";
+
 /// The schema-39 recognizer: exactly the not-descended message followed by
 /// the engine-created baseline `boss-base/exec_<id>`.
 pub(super) fn is_false_not_descended_blocker(detail: &str) -> bool {
@@ -33,7 +37,13 @@ pub(super) fn is_false_not_descended_blocker(detail: &str) -> bool {
 /// blocked. Rearmed items still run the integrity check, so a pointer that
 /// truly cannot be vouched for blocks again, loudly, with the new precise
 /// text that this recognizer does not match.
-pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result<usize> {
+///
+/// Each shadowed execution it retires is staged on `pending` so the caller
+/// writes its `engine-audit.log` cancel record once the migration commits.
+/// The migration runs at database open, before the engine has a dispatch
+/// timeline sink, so the cancel also lands on the row's own `last_error`,
+/// where `boss task show` reads it.
+pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool, pending: &mut PendingEvents) -> Result<usize> {
     let candidates: Vec<(String, String)> = {
         let mut statement = conn.prepare(
             "SELECT id, blocked_detail FROM tasks
@@ -82,12 +92,43 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         if has_started_live {
             continue;
         }
+        let shadowed: Vec<(String, ExecutionStatus)> = {
+            let mut statement = conn.prepare(
+                "SELECT id FROM work_executions WHERE work_item_id = ?1
+                 AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')",
+            )?;
+            let ids = statement
+                .query_map([&id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.into_iter()
+                .map(|exec_id| {
+                    let status = query_execution(conn, &exec_id).require("execution", &exec_id)?.status;
+                    Ok((exec_id, status))
+                })
+                .collect::<Result<_>>()?
+        };
         conn.execute(
-            "UPDATE work_executions SET status = 'cancelled', finished_at = ?2
+            "UPDATE work_executions SET status = 'cancelled', finished_at = ?2, last_error = ?3
              WHERE work_item_id = ?1
                AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')",
-            params![id, now_string()],
+            params![id, now_string(), REARM_CANCEL_REASON],
         )?;
+        for (exec_id, from_status) in shadowed {
+            stage_cancel_provenance(
+                pending,
+                CancelProvenance {
+                    execution_id: &exec_id,
+                    work_item_id: &id,
+                    from_status,
+                    actor: StatusActor::Engine,
+                    reason: REARM_CANCEL_REASON,
+                    work_item_moved: false,
+                    queued_only: false,
+                    peer_pid: None,
+                    caller_records_timeline: true,
+                },
+            );
+        }
         let kind = execution_kind_for_work_item(conn, &id)?;
         let pr_url = if kind == ExecutionKind::RevisionImplementation {
             get_chain_root_task(conn, &id)?.and_then(|root| root.pr_url)
@@ -197,9 +238,12 @@ mod tests {
         ];
 
         let conn = db.connect().unwrap();
-        assert_eq!(migrate(&conn, is_false_not_descended_blocker).unwrap(), 1);
         assert_eq!(
-            migrate(&conn, is_false_not_descended_blocker).unwrap(),
+            migrate(&conn, is_false_not_descended_blocker, &mut PendingEvents::new()).unwrap(),
+            1
+        );
+        assert_eq!(
+            migrate(&conn, is_false_not_descended_blocker, &mut PendingEvents::new()).unwrap(),
             0,
             "a second run is a no-op"
         );
@@ -493,9 +537,12 @@ mod tests {
             ),
         ];
         let conn = db.connect().unwrap();
-        assert_eq!(migrate(&conn, is_legacy_reconcilable_blocker).unwrap(), 3);
         assert_eq!(
-            migrate(&conn, is_legacy_reconcilable_blocker).unwrap(),
+            migrate(&conn, is_legacy_reconcilable_blocker, &mut PendingEvents::new()).unwrap(),
+            3
+        );
+        assert_eq!(
+            migrate(&conn, is_legacy_reconcilable_blocker, &mut PendingEvents::new()).unwrap(),
             0,
             "a second run is a no-op"
         );

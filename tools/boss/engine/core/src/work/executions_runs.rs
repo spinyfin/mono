@@ -6,7 +6,8 @@ use super::*;
 ///
 /// Defaults match the historical `cancel_execution` contract: any
 /// non-terminal row may be cancelled, with reason `"explicit cancel"`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct CancelExecutionOpts {
     /// Caller-supplied reason written into the
     /// terminalization log line (and, at the RPC layer, the engine
@@ -19,6 +20,7 @@ pub struct CancelExecutionOpts {
     /// requested-host pre-start cancel depends on being able to
     /// terminalize it. Live workers must be stopped via
     /// `bossctl agents stop` instead.
+    #[builder(default)]
     pub queued_only: bool,
     /// When true, a never-started cancel with a supplied reason writes that
     /// reason onto `work_executions.last_error`. Opt-in so benign cancels
@@ -26,6 +28,7 @@ pub struct CancelExecutionOpts {
     /// do not stamp a pre-start failure onto a field that `boss task show`
     /// and review-guide reconcile treat as one. Set by requested-host
     /// pre-start failure and host-ineligible cancels.
+    #[builder(default)]
     pub record_failure_reason: bool,
     /// When true, the cancel leaves the work item exactly as it was. The
     /// default (`false`) applies the cancel-means-stop contract: when the
@@ -39,6 +42,7 @@ pub struct CancelExecutionOpts {
     /// dispatch cleaning up a row it created) — leaving `autostart = 1`
     /// behind a terminal execution with no successor is the stranded state
     /// `reconcile_work_item_execution` otherwise has to converge later.
+    #[builder(default)]
     pub keep_work_item_schedulable: bool,
     /// Who decided the cancel. Written into the park text ("was cancelled
     /// by a human (…)") and the terminalization log line; the app-level
@@ -46,7 +50,19 @@ pub struct CancelExecutionOpts {
     /// [`StatusActor::Engine`]: every entry point that does not name an
     /// actor is reached from engine code, and an RPC handler names the
     /// caller it resolved from the peer pid.
+    #[builder(default = StatusActor::Engine)]
     pub actor: StatusActor,
+    /// Pid of the process that issued the cancel, when it arrived over RPC.
+    /// Carried onto the audit record so a cancel traces to its issuer.
+    pub peer_pid: Option<i32>,
+    /// True when the caller puts this cancel on the execution's dispatch
+    /// timeline itself (it holds the async sink and richer context). The
+    /// default (`false`) makes the committed cancel publish an
+    /// [`Event::ExecutionCancelled`] that the engine's subscriber writes to
+    /// the timeline, so a cancel from a path with no sink of its own still
+    /// shows up in `bossctl dispatch diagnose`.
+    #[builder(default)]
+    pub caller_records_timeline: bool,
 }
 
 impl Default for CancelExecutionOpts {
@@ -57,6 +73,8 @@ impl Default for CancelExecutionOpts {
             record_failure_reason: false,
             keep_work_item_schedulable: false,
             actor: StatusActor::Engine,
+            peer_pid: None,
+            caller_records_timeline: false,
         }
     }
 }
@@ -75,33 +93,44 @@ pub fn describe_cancel_actor(actor: Option<StatusActor>) -> &'static str {
     }
 }
 
-/// Durable record of one cancel, written to `engine-audit.log` by every path
-/// that terminalizes an execution as `cancelled`: [`WorkDb::cancel_execution_with`]
-/// and its in-transaction variants, the running-execution cancels behind
-/// `agents stop` / `cancel_and_release`, a dependency block, and the
-/// review-revision tombstone. One funnel keeps the vocabulary identical
-/// across them: who (`actor`, the `tasks.last_status_actor` vocabulary), why
-/// (`reason`), the status that was terminalized (`from_status`), and whether
-/// the cancel also moved the owning row (`work_item_moved`).
-pub(crate) fn record_cancel_provenance(
-    execution_id: &str,
-    work_item_id: &str,
-    from_status: ExecutionStatus,
-    actor: StatusActor,
-    reason: &str,
-    work_item_moved: bool,
-) {
-    crate::audit::record_event(
-        "execution_cancelled",
-        &serde_json::json!({
-            "execution_id": execution_id,
-            "work_item_id": work_item_id,
-            "from_status": from_status.as_str(),
-            "actor": actor.as_str(),
-            "reason": reason,
-            "work_item_moved": work_item_moved,
-        }),
-    );
+/// Everything one cancel records. Built by every path that terminalizes an
+/// execution as `cancelled` and handed to [`stage_cancel_provenance`].
+#[derive(bon::Builder)]
+pub(crate) struct CancelProvenance<'a> {
+    pub execution_id: &'a str,
+    pub work_item_id: &'a str,
+    pub from_status: ExecutionStatus,
+    pub actor: StatusActor,
+    pub reason: &'a str,
+    pub work_item_moved: bool,
+    pub queued_only: bool,
+    pub peer_pid: Option<i32>,
+    /// The caller writes the dispatch-timeline event itself.
+    pub caller_records_timeline: bool,
+}
+
+/// Stage the durable record of one cancel. It is published as an
+/// [`Event::ExecutionCancelled`] only once the cancelling transaction
+/// commits (so a rollback leaves no trace), and at that point
+/// [`PendingEvents::record_audit`] writes the `engine-audit.log` record and
+/// the engine's subscriber writes the `execution_cancelled` dispatch event
+/// (unless `caller_records_timeline`). One funnel keeps the vocabulary
+/// identical across every cancel path: who (`actor`, the
+/// `tasks.last_status_actor` vocabulary), why (`reason`), the status that
+/// was terminalized (`from_status`), and whether the cancel also moved the
+/// owning row (`work_item_moved`).
+pub(crate) fn stage_cancel_provenance(pending: &mut PendingEvents, cancel: CancelProvenance<'_>) {
+    pending.push(Event::ExecutionCancelled {
+        execution_id: cancel.execution_id.to_owned(),
+        task_id: cancel.work_item_id.to_owned(),
+        from_status: cancel.from_status.as_str().to_owned(),
+        actor: cancel.actor.as_str().to_owned(),
+        reason: cancel.reason.to_owned(),
+        work_item_moved: cancel.work_item_moved,
+        queued_only: cancel.queued_only,
+        peer_pid: cancel.peer_pid,
+        on_timeline: !cancel.caller_records_timeline,
+    });
 }
 
 /// The `execution_cancelled` dispatch-timeline event for one cancel.
@@ -2477,13 +2506,19 @@ pub(super) fn cancel_execution_in_tx_with_outcome(
         work_item_parked,
         "execution terminalized: cancel",
     );
-    record_cancel_provenance(
-        execution_id,
-        &updated.work_item_id,
-        existing.status.clone(),
-        opts.actor,
-        &reason,
-        work_item_parked,
+    stage_cancel_provenance(
+        pending,
+        CancelProvenance {
+            execution_id,
+            work_item_id: &updated.work_item_id,
+            from_status: existing.status.clone(),
+            actor: opts.actor,
+            reason: &reason,
+            work_item_moved: work_item_parked,
+            queued_only: opts.queued_only,
+            peer_pid: opts.peer_pid,
+            caller_records_timeline: opts.caller_records_timeline,
+        },
     );
     stage_execution_terminal(pending, tx, execution_id, &updated.work_item_id)?;
     Ok((updated, work_item_parked))

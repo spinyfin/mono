@@ -177,6 +177,22 @@ impl WorkDb {
                 work_item_parked =
                     park_work_item_after_cancel(&tx, &execution.work_item_id, execution_id, Some(actor), reason, &now)?;
             }
+            stage_cancel_provenance(
+                &mut pending,
+                CancelProvenance {
+                    execution_id,
+                    work_item_id: &execution.work_item_id,
+                    from_status: execution.status.clone(),
+                    actor,
+                    reason,
+                    work_item_moved: task_demoted || work_item_parked,
+                    queued_only: false,
+                    peer_pid: None,
+                    // Every caller (`cancel_and_release`, `force_stop_execution_as`,
+                    // the preemption requeue) writes the timeline event itself.
+                    caller_records_timeline: true,
+                },
+            );
             stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
         commit_and_publish(tx, pending, &self.event_bus)?;
@@ -190,14 +206,6 @@ impl WorkDb {
                 reason = %reason,
                 work_item_parked,
                 "execution terminalized: cancel",
-            );
-            record_cancel_provenance(
-                execution_id,
-                &execution.work_item_id,
-                execution.status.clone(),
-                actor,
-                reason,
-                task_demoted || work_item_parked,
             );
         }
         Ok((exec_cancelled, task_demoted || work_item_parked))

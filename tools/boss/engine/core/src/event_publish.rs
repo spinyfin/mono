@@ -58,6 +58,41 @@ impl PendingEvents {
         self.0.is_empty()
     }
 
+    /// Write the `engine-audit.log` record for every staged
+    /// [`Event::ExecutionCancelled`]. Called only once the enclosing
+    /// transaction has committed, so the audit trail never names a cancel
+    /// that was rolled back.
+    pub fn record_audit(&self) {
+        for event in &self.0 {
+            if let Event::ExecutionCancelled {
+                execution_id,
+                task_id,
+                from_status,
+                actor,
+                reason,
+                work_item_moved,
+                queued_only,
+                peer_pid,
+                ..
+            } = event
+            {
+                crate::audit::record_event(
+                    "execution_cancelled",
+                    &serde_json::json!({
+                        "execution_id": execution_id,
+                        "work_item_id": task_id,
+                        "from_status": from_status,
+                        "actor": actor,
+                        "reason": reason,
+                        "work_item_moved": work_item_moved,
+                        "queued_only": queued_only,
+                        "peer_pid": peer_pid,
+                    }),
+                );
+            }
+        }
+    }
+
     /// Consume `self`, yielding every staged event. For the rare
     /// non-transactional producer that has no `Transaction` to hand
     /// [`commit_and_publish`] — its single `Connection::execute` write
@@ -80,6 +115,7 @@ pub fn commit_and_publish(
 ) -> rusqlite::Result<()> {
     tx.commit()?;
     tracing::debug!(target: "work_write_timing", boundary = "commit");
+    pending.record_audit();
     for event in pending.0 {
         bus.publish(event);
     }

@@ -543,13 +543,19 @@ fn cancel_live_execution_for_block_in_tx(
         execution_id = %live.id,
         "engine: cancelled live execution because its dependent transitioned to blocked",
     );
-    record_cancel_provenance(
-        &live.id,
-        work_item_id,
-        live.status.clone(),
-        StatusActor::Engine,
-        BLOCK_CANCEL_REASON,
-        false,
+    stage_cancel_provenance(
+        pending,
+        CancelProvenance {
+            execution_id: &live.id,
+            work_item_id,
+            from_status: live.status.clone(),
+            actor: StatusActor::Engine,
+            reason: BLOCK_CANCEL_REASON,
+            work_item_moved: false,
+            queued_only: false,
+            peer_pid: None,
+            caller_records_timeline: false,
+        },
     );
     // Canonical terminalization trace — see `WorkDb::mark_execution_orphaned`
     // in executions_runs.rs. This cancels a genuinely *live* execution, so

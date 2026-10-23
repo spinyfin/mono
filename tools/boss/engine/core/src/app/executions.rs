@@ -962,6 +962,9 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
             record_failure_reason: false,
             keep_work_item_schedulable: false,
             actor,
+            peer_pid,
+            // The handler puts this cancel on the timeline below.
+            caller_records_timeline: true,
         };
         match server_state.work_db.cancel_execution_with_outcome(&execution_id, opts) {
             Ok(crate::work::CancelledExecution {

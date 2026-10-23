@@ -312,8 +312,9 @@ impl WorkDb {
             if let Some(ref existing_task) = existing {
                 let mut conn = self.connect()?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                tombstone_orphaned_remediation_in_tx(&tx, &existing_task.id, &now_string())?;
-                tx.commit()?;
+                let mut pending = PendingEvents::new();
+                tombstone_orphaned_remediation_in_tx(&tx, &mut pending, &existing_task.id, &now_string())?;
+                commit_and_publish(tx, pending, &self.event_bus)?;
             }
         }
 
@@ -477,6 +478,7 @@ impl WorkDb {
     ) -> Result<Option<String>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvents::new();
         let current_state: Option<String> = tx
             .query_row(
                 "SELECT state FROM worker_proposals WHERE id = ?1",
@@ -507,9 +509,9 @@ impl WorkDb {
             if current_state != ProposalState::Applied.as_str()
                 && let Some(task_id) = remediating_task_id
             {
-                tombstone_orphaned_remediation_in_tx(&tx, task_id, &now_string())?;
+                tombstone_orphaned_remediation_in_tx(&tx, &mut pending, task_id, &now_string())?;
             }
-            tx.commit()?;
+            commit_and_publish(tx, pending, &self.event_bus)?;
             return Ok(applied_ref);
         }
 
@@ -551,7 +553,6 @@ impl WorkDb {
         };
 
         let now = now_string();
-        let mut pending = PendingEvents::new();
         let batch_rows_changed = tx.execute(
             "UPDATE pr_review_batches
              SET status = 'completed', completed_at = ?2, updated_at = ?2
@@ -800,8 +801,9 @@ impl WorkDb {
     pub(crate) fn test_tombstone_orphaned_remediation(&self, task_id: &str) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        tombstone_orphaned_remediation_in_tx(&tx, task_id, &now_string())?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        tombstone_orphaned_remediation_in_tx(&tx, &mut pending, task_id, &now_string())?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(())
     }
 }
@@ -831,7 +833,12 @@ const TOMBSTONE_CANCEL_REASON: &str = "orphaned review remediation tombstoned";
 /// Cancel the task's never-started executions in the same transaction so
 /// the orphan sweep and reconciler will not re-dispatch it. Each retired
 /// execution gets a cancel provenance record.
-fn tombstone_orphaned_remediation_in_tx(tx: &rusqlite::Transaction<'_>, task_id: &str, now: &str) -> Result<()> {
+fn tombstone_orphaned_remediation_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    pending: &mut PendingEvents,
+    task_id: &str,
+    now: &str,
+) -> Result<()> {
     tx.execute(
         "UPDATE tasks SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
         params![task_id, now],
@@ -858,14 +865,21 @@ fn tombstone_orphaned_remediation_in_tx(tx: &rusqlite::Transaction<'_>, task_id:
         params![task_id, now],
     )?;
     for execution in pending_executions {
-        record_cancel_provenance(
-            &execution.id,
-            task_id,
-            execution.status,
-            StatusActor::Engine,
-            TOMBSTONE_CANCEL_REASON,
-            false,
+        stage_cancel_provenance(
+            pending,
+            CancelProvenance {
+                execution_id: &execution.id,
+                work_item_id: task_id,
+                from_status: execution.status.clone(),
+                actor: StatusActor::Engine,
+                reason: TOMBSTONE_CANCEL_REASON,
+                work_item_moved: false,
+                queued_only: false,
+                peer_pid: None,
+                caller_records_timeline: false,
+            },
         );
+        stage_execution_terminal(pending, tx, &execution.id, task_id)?;
     }
     Ok(())
 }

@@ -217,10 +217,11 @@ fn queued_wait_missing_execution_is_absent_and_missing_prerequisite_is_honest() 
     let (db, _, chore_id) = setup_product_and_chore();
     assert!(db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.is_none());
     let execution = seed_ready_execution(&db, &chore_id);
-    // Nothing gates: do not invent a dependency wait.
+    // Nothing gates: do not invent a dependency wait; the row only awaits the
+    // readiness reconcile, and the engine says so.
     db.downgrade_ready_to_waiting_dependency(&execution.id).unwrap();
     let wait = db.get_task_runtime(&chore_id).unwrap();
-    assert!(wait.dispatch_wait_reason.is_none());
+    assert_eq!(wait.dispatch_wait_reason.as_deref(), Some("awaiting_reconcile"));
     assert!(wait.dispatch_wait_blocker.is_none());
     // An edge to a prerequisite row that no longer exists still gates, without a link.
     db.connect()
