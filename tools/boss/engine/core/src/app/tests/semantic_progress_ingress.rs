@@ -128,7 +128,7 @@ async fn ingress_persists_driver_originated_progress_and_tool_condition() {
     assert_eq!(idle.tool_condition, SemanticToolCondition::Idle);
 }
 
-/// The 2026-10-23 incident, end to end through the durable checkpoint. A
+/// End to end through the durable checkpoint. A
 /// worker is mid-turn with its last tool call balanced — exactly what a Codex
 /// worker waiting on its own background command looks like, since the
 /// rollout translator announces the command once and its continuation polls

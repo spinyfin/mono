@@ -61,8 +61,8 @@ impl SemanticToolCondition {
 /// next tool's `PreToolUse`, while the model thinks, and for the whole of a
 /// Codex background-terminal wait (its continuation polls are deliberately
 /// not re-announced, so they produce no tool-boundary event at all). None of
-/// those is "the worker has ended its turn", and conflating the two is how a
-/// re-adopted slot came back `Idle` over a worker that was mid-turn.
+/// those is "the worker has ended its turn", so the tool condition alone
+/// cannot decide whether a re-adopted slot is busy.
 ///
 /// Stored as a TEXT column (`in_turn` / `ended` / `unknown`). Unrecognised
 /// or NULL values parse as [`Self::Unknown`], never as ended.
@@ -164,9 +164,11 @@ pub fn tool_condition_signal(event: &WorkerEvent) -> Option<SemanticToolConditio
 ///
 /// The three turn-activity events and `Stop` are exactly the events
 /// `apply_event` in `live_worker_state.rs` reduces to `Working` and
-/// `Idle`/`WaitingForInput` respectively, so this is the durable shadow of
-/// that reducer's turn gate — the driver's own turn signals, never a timer
-/// or an inference from silence. `SessionStart` (including a resume) does
+/// `Idle`/`WaitingForInput` respectively, so these are the driver's own
+/// turn signals, never a timer or an inference from silence. The stored
+/// column is not written from this function directly: it is persisted from
+/// the reducer's post-apply state, which also honours ingress ordering and
+/// ignores subagent tool hooks. `SessionStart` (including a resume) does
 /// not open a turn, `SessionEnd` does not close one (a `SessionEnd` with an
 /// unbalanced tool is evidence the session did *not* end — see the
 /// reducer), and `Notification` is not a turn signal for the same reason it

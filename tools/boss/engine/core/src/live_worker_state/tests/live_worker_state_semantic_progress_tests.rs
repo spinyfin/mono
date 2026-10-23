@@ -117,7 +117,7 @@ fn readopted(reg: &LiveWorkerStateRegistry) {
     assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Spawning);
 }
 
-/// The 2026-10-23 incident shape. A Codex worker mid-turn, waiting on its own
+/// A Codex worker mid-turn, waiting on its own
 /// background `checkleft run`: its last tool-boundary event was the
 /// `PostToolUse` of an earlier command (tool condition `Idle`), its
 /// continuation polls produce no events, and the turn has not ended. The
@@ -171,14 +171,15 @@ fn seed_semantic_progress_restores_idle_only_for_a_turn_the_driver_ended() {
 }
 
 #[test]
-fn seed_semantic_progress_keeps_the_pre_column_mapping_for_a_legacy_row() {
+fn seed_semantic_progress_infers_no_turn_boundary_for_a_legacy_row() {
     // A row written before `semantic_turn_condition` existed: turn
-    // unknown. An unbalanced tool is still in-turn evidence; a balanced one
-    // keeps the old idle reading rather than guessing, and the re-established
-    // ingress corrects it on the next event.
+    // unknown. An unbalanced tool is still in-turn evidence. A balanced one
+    // is not evidence the turn ended — a worker mid-turn in a background
+    // wait looks exactly like that — so the slot stays unknown rather than
+    // being painted idle.
     for (tool_condition, expected) in [
         (SemanticToolCondition::InFlight, WorkerActivity::Working),
-        (SemanticToolCondition::Idle, WorkerActivity::Idle),
+        (SemanticToolCondition::Idle, WorkerActivity::Spawning),
         (SemanticToolCondition::Unknown, WorkerActivity::Spawning),
     ] {
         let reg = LiveWorkerStateRegistry::new();
@@ -197,6 +198,38 @@ fn seed_semantic_progress_keeps_the_pre_column_mapping_for_a_legacy_row() {
             "tool condition {tool_condition:?}"
         );
     }
+}
+
+/// Upgrade regression: a Codex worker already mid-turn (balanced last tool,
+/// background wait) when the engine is upgraded has a legacy checkpoint. It
+/// must not come back `Idle`, and the first driver event after the tail
+/// resumes settles it.
+#[test]
+fn a_legacy_row_for_an_open_turn_is_not_seeded_idle_and_settles_on_the_next_event() {
+    let reg = LiveWorkerStateRegistry::new();
+    readopted(&reg);
+    reg.seed_semantic_progress(
+        1,
+        &SemanticProgressCheckpoint {
+            progress_at: "2026-10-23T19:27:22Z".into(),
+            tool_condition: SemanticToolCondition::Idle,
+            turn_condition: SemanticTurnCondition::Unknown,
+        },
+    );
+    assert_ne!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+
+    reg.apply_hook_event(
+        1,
+        HookOrigin::default(),
+        &WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+    let settled = reg.semantic_progress_for_slot(1).unwrap();
+    assert_eq!(settled.turn_condition, SemanticTurnCondition::InTurn);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
 }
 
 /// The in-memory twin of the durable column: the reducer's own events keep

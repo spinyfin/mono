@@ -16,7 +16,12 @@ use boss_protocol::WorkerEvent;
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Record a driver-originated progress event against the run's
-    /// agent-session row.
+    /// agent-session row, deriving the conditions from the event alone.
+    ///
+    /// Use this only when the live-state reducer has no slot to settle the
+    /// event (see [`Self::record_semantic_checkpoint`] otherwise): it applies
+    /// events in arrival order and knows nothing of ingress ordering or
+    /// subagent origin.
     ///
     /// Updates the last-progress timestamp on every call. The tri-state tool
     /// condition advances through [`next_tool_condition`], but never by
@@ -66,6 +71,57 @@ impl WorkDb {
                 )?;
             }
         }
+        Ok(true)
+    }
+
+    /// Persist the registry's post-apply checkpoint for a run.
+    ///
+    /// The live-state reducer is the authority on ingress ordering and on
+    /// which events count as main-session activity, so the durable column is
+    /// written from what it settled on rather than from the event as it
+    /// arrived: a late `Stop` the reducer refused, or a subagent tool hook it
+    /// does not count, therefore cannot overwrite the turn state. An
+    /// `Unknown` condition leaves the stored column untouched.
+    ///
+    /// Returns `false` when no run row exists yet, like
+    /// [`Self::record_semantic_progress`].
+    pub fn record_semantic_checkpoint(
+        &self,
+        execution_id: &str,
+        checkpoint: &SemanticProgressCheckpoint,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(false);
+        };
+        let tool =
+            (checkpoint.tool_condition != SemanticToolCondition::Unknown).then(|| checkpoint.tool_condition.as_str());
+        let turn =
+            (checkpoint.turn_condition != SemanticTurnCondition::Unknown).then(|| checkpoint.turn_condition.as_str());
+        conn.execute(
+            "UPDATE work_runs
+             SET semantic_progress_at = ?2,
+                 semantic_tool_condition = COALESCE(?3, semantic_tool_condition),
+                 semantic_turn_condition = COALESCE(?4, semantic_turn_condition)
+             WHERE id = ?1",
+            params![run_id, checkpoint.progress_at, tool, turn],
+        )?;
+        Ok(true)
+    }
+
+    /// Stamp driver progress time alone, leaving both conditions as stored.
+    /// For an event the reducer refused as stale: it still proves the worker
+    /// is alive, but describes a state the worker has already left.
+    pub fn record_semantic_progress_stamp(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(false);
+        };
+        let now = boss_engine_utils::iso8601::format_epoch_iso8601(boss_engine_utils::epoch_time::now_epoch_secs());
+        conn.execute(
+            "UPDATE work_runs SET semantic_progress_at = ?2 WHERE id = ?1 AND semantic_progress_at IS NOT ?2",
+            params![run_id, now],
+        )?;
         Ok(true)
     }
 

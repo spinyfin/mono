@@ -2629,7 +2629,7 @@ mod tests {
         );
     }
 
-    /// The 2026-10-23 incident, at the driver boundary. A Codex worker ran
+    /// At the driver boundary: a Codex worker ran
     /// `timeout 1800 checkleft run` as a background terminal and sat in
     /// `Waiting for background terminal (12m 49s • esc to interrupt)`: a chain
     /// of `wait` polls, each bounded by the cell harness's 30 s yield, inside
@@ -2637,9 +2637,7 @@ mod tests {
     /// open for the whole wait — the command is announced once, the polls
     /// are continuations and are deliberately silent, and no turn boundary
     /// (`Stop`) exists until Codex writes `task_complete`. Idle on the pane
-    /// is therefore never something this stream justifies mid-wait; the
-    /// engine-side regression that produced it is covered in
-    /// `live_worker_state`'s seed tests.
+    /// is therefore never something this stream justifies mid-wait.
     #[test]
     fn a_background_wait_inside_a_turn_reports_no_turn_boundary() {
         let mut session = cell_harness_session();
@@ -2707,15 +2705,21 @@ mod tests {
             "the announced command stays open for as long as the model keeps polling it"
         );
 
-        // The pane's turn-state authority is the driver's own boundary
-        // signal, and the stream has not carried one.
+        // The turn boundary is the driver's own signal: nothing in the
+        // wait is one, and the turn's `task_complete` is the first.
         let driver = crate::codex::CodexDriver::default();
-        for event in opened.iter().chain(announced.iter()) {
-            assert_eq!(
-                crate::AgentDriver::turn_boundary(&driver, event),
-                None,
-                "no event of an in-progress turn is a turn boundary: {event:?}"
-            );
-        }
+        let closed = session
+            .normalize_progress_events(&json!({"type":"event_msg","payload":{"type":"task_complete"}}))
+            .unwrap();
+        let boundaries: Vec<_> = opened
+            .iter()
+            .chain(announced.iter())
+            .chain(closed.iter())
+            .filter(|event| crate::AgentDriver::turn_boundary(&driver, event).is_some())
+            .collect();
+        assert!(
+            matches!(boundaries.as_slice(), [WorkerEvent::Stop { .. }]),
+            "the turn's Stop is the only turn boundary in the stream: {boundaries:?}"
+        );
     }
 }

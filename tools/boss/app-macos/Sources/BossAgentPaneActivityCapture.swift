@@ -3,14 +3,12 @@ import SwiftUI
 
 /// Quiet, isolated fixture: --capture-reveal-state=agent-pane-activity --capture-to.
 ///
-/// Hosts the real Agents-pane slot header twice, fed exactly the live state
-/// the engine now publishes for a Codex worker whose turn is in progress
-/// while it waits on its own background command (`activity = working`, no
-/// tool in flight), and for the same worker once its driver reported the
-/// turn boundary (`activity = idle`). The pill is the one the operator reads
-/// on the board; this fixture shows what each engine state renders as, it
-/// does not exercise the engine's re-adoption path (that is covered by the
-/// engine's own tests).
+/// Hosts the real Agents-pane slot header twice, fed the live state the
+/// engine publishes for a Codex worker whose turn is in progress while it
+/// waits on its own background command (`activity = working`, no tool in
+/// flight), and for the same worker once its driver reported the turn
+/// boundary (`activity = idle`). This fixture renders the board's activity
+/// pill for each engine state; engine tests cover re-adoption.
 @MainActor
 enum BossAgentPaneActivityCapture {
     private static var window: NSWindow?

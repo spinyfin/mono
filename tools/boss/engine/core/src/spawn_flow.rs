@@ -611,6 +611,9 @@ pub enum IngressReadoption {
     Unknown,
     /// It needed one and could not be re-established; an attention item says so.
     Failed,
+    /// This process already holds the run's slot, so its tail (if any) is
+    /// already in place and nothing was re-established.
+    AlreadyObserved,
 }
 
 impl IngressReadoption {
@@ -620,6 +623,7 @@ impl IngressReadoption {
             Self::Reestablished => "reestablished",
             Self::Unknown => "unknown",
             Self::Failed => "failed",
+            Self::AlreadyObserved => "already_observed",
         }
     }
 }

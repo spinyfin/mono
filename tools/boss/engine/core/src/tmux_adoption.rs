@@ -921,6 +921,15 @@ async fn adopt_one<S>(
     };
 
     let driver = crate::driver_transcript::driver_for_spawned_execution(work_db, execution_id);
+    // The periodic husk sweep re-runs this routine for every live run. A run
+    // whose slot this process already holds is already observed here, so
+    // only a run adopted for the first time needs its ingress re-established.
+    let previously_live = spawner.live_worker_state_registry().is_some_and(|live_states| {
+        live_states
+            .snapshot()
+            .iter()
+            .any(|state| state.run_id == execution_id && !state.activity.is_terminal())
+    });
     crate::tmux_adoption_live_state::register_adopted_live_state(
         work_db,
         spawner,
@@ -932,15 +941,16 @@ async fn adopt_one<S>(
     )
     .await;
 
-    // The slot is rebuilt and seeded from the durable checkpoint; now give
-    // the run back the one thing a seed cannot stand in for. A file-tailing
-    // driver (Codex) is observed only through the rollout tail the previous
-    // engine process held, and that tail died with it. Without this the
-    // slot stays at its seeded activity for the rest of the run — the
-    // 2026-10-23 "Idle while waiting on `checkleft run`" pane — and the run
-    // never sees the turn boundary that completes it. Same re-establishment
-    // the terminalized-survivor path does, from the same checkpoint.
-    let progress_ingress = spawner.reestablish_progress_ingress(&execution, driver).await;
+    // A file-tailing driver is observed only through the tail the previous
+    // engine process held, so without re-establishing it the slot stays at
+    // its seeded activity and never sees the turn boundary. Same
+    // re-establishment the terminalized-survivor path does, from the same
+    // checkpoint.
+    let progress_ingress = if previously_live {
+        crate::spawn_flow::IngressReadoption::AlreadyObserved
+    } else {
+        spawner.reestablish_progress_ingress(&execution, driver).await
+    };
     tracing::info!(
         execution_id,
         slot_id,

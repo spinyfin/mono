@@ -975,15 +975,11 @@ impl LiveWorkerStateRegistry {
         entry.meta.semantic_progress_at = Some(checkpoint.progress_at.clone());
         entry.meta.semantic_tool_condition = checkpoint.tool_condition;
         entry.meta.semantic_turn_condition = checkpoint.turn_condition;
-        // The turn condition is the authority on busy-vs-idle: it is the
-        // durable shadow of the reducer's own turn gate, where `Working`
-        // holds from the first turn activity until a `Stop`. The tool
-        // condition only says whether a tool call is unbalanced, which is
-        // `Idle` for most of a live turn — between tools, during a long
-        // think, and for the whole of a Codex background-terminal wait, whose
-        // continuation polls are deliberately never re-announced. Seeding
-        // `Idle` from it is how a re-adopted mid-turn worker was painted idle
-        // for as long as the wait lasted (2026-10-23).
+        // The turn condition, not the tool condition, decides busy vs idle:
+        // the tool condition is `Idle` for most of a live turn, including a
+        // Codex background-terminal wait whose polls emit no events. The
+        // turn condition is persisted from the reducer's own turn gate, so
+        // `InTurn` holds from the first turn activity until a `Stop`.
         match (checkpoint.turn_condition, checkpoint.tool_condition) {
             (SemanticTurnCondition::InTurn, _) | (SemanticTurnCondition::Unknown, SemanticToolCondition::InFlight) => {
                 // An unbalanced tool call is itself in-turn evidence, so a
@@ -994,17 +990,14 @@ impl LiveWorkerStateRegistry {
             (SemanticTurnCondition::Ended, _) => {
                 entry.state.activity = WorkerActivity::Idle;
             }
-            (SemanticTurnCondition::Unknown, SemanticToolCondition::Idle) => {
-                // A row written before the turn column existed: the last
-                // tool boundary balanced, and nothing says whether the turn
-                // went on. The pre-column behaviour is kept rather than
-                // guessed at — the re-established ingress corrects it on the
-                // worker's next event, and the column is populated from
-                // then on.
-                entry.state.activity = WorkerActivity::Idle;
-            }
-            (SemanticTurnCondition::Unknown, SemanticToolCondition::Unknown) => {
-                // Leave Spawning. Unknown must never be coerced to idle.
+            (SemanticTurnCondition::Unknown, _) => {
+                // No turn evidence. A balanced last tool boundary does not
+                // say the turn ended (the worker may be thinking or waiting
+                // on a background command), so no turn boundary is inferred
+                // from it: the slot stays unknown (`Spawning`) until the
+                // next driver event establishes the turn state. Rows
+                // written before the turn column existed are in this state
+                // once, at upgrade. Unknown must never be coerced to idle.
             }
         }
     }
@@ -1755,7 +1748,14 @@ impl LiveWorkerStateRegistry {
         // semantic checkpoint.
         meta.semantic_progress_at = Some(now);
         meta.semantic_tool_condition = next_tool_condition(event, meta.semantic_tool_condition);
-        meta.semantic_turn_condition = next_turn_condition(event, meta.semantic_turn_condition);
+        // A subagent's tool hooks say nothing about the main session's turn:
+        // they can land after the main session's `Stop`, and counting them
+        // would reopen a turn that has genuinely ended.
+        let subagent_tool_event =
+            origin.from_subagent && matches!(event, WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. });
+        if !subagent_tool_event {
+            meta.semantic_turn_condition = next_turn_condition(event, meta.semantic_turn_condition);
+        }
         // Any hook event is proof the worker's session is responsive
         // again — clear a stale recovery banner regardless of which
         // event arrived, so real progress after a nudge is never

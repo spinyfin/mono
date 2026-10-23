@@ -211,6 +211,13 @@ async fn a_stop_whose_ingress_finishes_after_the_next_turns_tool_hook_does_not_r
         "the Stop the worker emitted before its current tool call must not win the race",
     );
     assert_eq!(after_late_stop.current_tool.as_deref(), Some("Bash"));
+    // The durable checkpoint follows the reducer, not arrival order: a
+    // restart now must still find the resumed turn open and seed `Working`.
+    assert_eq!(
+        reseeded_activity(&server_state, &execution_id),
+        WorkerActivity::Working,
+        "the refused late Stop must not close the turn in the durable checkpoint",
+    );
 
     // The resumed turn's own Stop ends it.
     dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 5)).await;
@@ -218,6 +225,55 @@ async fn a_stop_whose_ingress_finishes_after_the_next_turns_tool_hook_does_not_r
     let idle = snapshot(&server_state);
     assert_eq!(idle.activity, WorkerActivity::Idle);
     assert!(idle.current_tool.is_none());
+}
+
+/// What a freshly restarted engine would seed the slot to from the run's
+/// durable checkpoint alone.
+fn reseeded_activity(server_state: &ServerState, execution_id: &str) -> WorkerActivity {
+    let checkpoint = server_state
+        .work_db
+        .get_run_semantic_progress_checkpoint(execution_id)
+        .unwrap()
+        .expect("driver events persist a checkpoint");
+    let rebuilt = crate::live_worker_state::LiveWorkerStateRegistry::new();
+    rebuilt.register_readoption(
+        SLOT,
+        execution_id.to_owned(),
+        "claude",
+        4242,
+        None,
+        false,
+        crate::live_worker_state::LiveSpawnRouting::none(),
+        crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
+    );
+    rebuilt.seed_semantic_progress(SLOT, &checkpoint);
+    rebuilt.get(SLOT).unwrap().activity
+}
+
+#[tokio::test]
+async fn a_subagent_tool_hook_after_stop_does_not_reopen_the_durable_turn() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 2)).await;
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+    assert_eq!(reseeded_activity(&server_state, &execution_id), WorkerActivity::Idle);
+
+    dispatch_worker_event_fanout(
+        &server_state,
+        &post_tool_use(&execution_id, "Bash", 4).with_subagent_origin(true),
+    )
+    .await;
+    assert_eq!(
+        reseeded_activity(&server_state, &execution_id),
+        WorkerActivity::Idle,
+        "a subagent's tool hook is not main-session activity, so it cannot reopen an ended turn",
+    );
+
+    // The main session's own tool hook does.
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 5)).await;
+    assert_eq!(reseeded_activity(&server_state, &execution_id), WorkerActivity::Working);
 }
 
 #[tokio::test]

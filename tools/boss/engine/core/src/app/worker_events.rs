@@ -203,20 +203,6 @@ pub(super) async fn dispatch_worker_event_fanout(
         &incoming.event,
     );
     crate::events_socket::publish_hook_derived_events(&server_state.event_bus, incoming).await;
-    if let Some(run_id) = incoming.run_id.as_deref() {
-        match server_state.work_db.record_semantic_progress(run_id, &incoming.event) {
-            Ok(true) => {}
-            Ok(false) => tracing::debug!(
-                run_id,
-                "semantic-progress event observed before any run row existed; not recorded"
-            ),
-            Err(err) => tracing::warn!(
-                run_id,
-                error = %format!("{err:#}"),
-                "failed to persist semantic worker-progress checkpoint",
-            ),
-        }
-    }
     dispatch_live_worker_state(server_state, incoming).await;
     // Codex unobserved-command detection: stage any abandoned-command
     // Notification the progress session emitted ahead of its Stop, so
@@ -486,6 +472,41 @@ pub(super) fn dispatch_codex_guard_trace_on_notification(
     crate::codex_guard_trace::record(&server_state.metrics, incoming.run_id.as_deref(), &signal);
 }
 
+/// Persist the semantic-progress checkpoint for one dispatched event.
+///
+/// `settled` is the registry's post-apply checkpoint, present only when the
+/// live-state reducer accepted the event. The reducer owns ingress ordering
+/// and the subagent rules, so a refused (stale) event stamps the time alone
+/// and an accepted one writes what the reducer settled on. With no slot to
+/// settle it, the event's own signals are the only evidence there is.
+fn persist_semantic_progress(
+    server_state: &Arc<ServerState>,
+    run_id: &str,
+    event: &crate::protocol::WorkerEvent,
+    outcome: Option<&ApplyEventOutcome>,
+    settled: Option<crate::semantic_progress::SemanticProgressCheckpoint>,
+) {
+    let result = match (outcome, settled) {
+        (Some(ApplyEventOutcome::Stale { .. }), _) => server_state.work_db.record_semantic_progress_stamp(run_id),
+        (Some(ApplyEventOutcome::Applied { .. }), Some(checkpoint)) => {
+            server_state.work_db.record_semantic_checkpoint(run_id, &checkpoint)
+        }
+        _ => server_state.work_db.record_semantic_progress(run_id, event),
+    };
+    match result {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            run_id,
+            "semantic-progress event observed before any run row existed; not recorded"
+        ),
+        Err(err) => tracing::warn!(
+            run_id,
+            error = %format!("{err:#}"),
+            "failed to persist semantic worker-progress checkpoint",
+        ),
+    }
+}
+
 pub(super) async fn dispatch_live_worker_state(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
@@ -618,6 +639,7 @@ pub(super) async fn dispatch_live_worker_state(
                         from_cache,
                     )
                     .await;
+                    persist_semantic_progress(server_state, run_id, &incoming.event, None, None);
                     // No slot, and not a live remote worker. Before we
                     // drop the event, check whether it belongs to an
                     // execution the engine already believes is terminal —
@@ -694,6 +716,8 @@ pub(super) async fn dispatch_live_worker_state(
         },
         &incoming.event,
     );
+    let settled = server_state.live_worker_states.semantic_progress_for_slot(slot_id);
+    persist_semantic_progress(server_state, run_id, &incoming.event, Some(&applied.outcome), settled);
     let stale_event = matches!(applied.outcome, ApplyEventOutcome::Stale { .. });
     let changed = applied.repaired || matches!(applied.outcome, ApplyEventOutcome::Applied { changed: true });
     let new_state = server_state.live_worker_states.get(slot_id);
