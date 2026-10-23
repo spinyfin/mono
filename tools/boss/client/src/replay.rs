@@ -142,6 +142,7 @@ pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> 
         | FrontendRequest::GetDriverQuotaUsage { .. }
         | FrontendRequest::GetDriverTrafficSplit
         | FrontendRequest::GetEngineHealth
+        | FrontendRequest::GetEnginePoolConfig
         | FrontendRequest::GetEngineVersion
         | FrontendRequest::GetExecution { .. }
         | FrontendRequest::GetHost { .. }

@@ -33,7 +33,7 @@ extension ChatViewModel {
         case .connected:
             handleConnected()
         case .resyncRequired:
-            handleResyncRequired() // socket never went down; see ChatViewModel+Connection.swift
+            handleResyncRequired() // socket never went down; see ChatViewModel+ResyncRefetch.swift
         case .appSessionRegistered:
             isAppSessionRegistered = true
             engine.sendRegisterCapabilities(capabilityIds: CapabilityRegistry.shared.all)
@@ -46,6 +46,7 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            cancelPendingResyncRefetch()
             pendingProjectDesignDocOpen = nil
             engine.resetConnectTreeClaims()
             disconnectOffsiteBackupEdit()

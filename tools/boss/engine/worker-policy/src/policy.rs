@@ -383,6 +383,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GetDispatchConcurrency
         | FrontendRequest::GetDispatchState
         | FrontendRequest::GetEngineHealth
+        | FrontendRequest::GetEnginePoolConfig
         | FrontendRequest::GetReviewGuideContent { .. }
         | FrontendRequest::GetReviewGuideSummary { .. }
         | FrontendRequest::RetryReviewGuide { .. }

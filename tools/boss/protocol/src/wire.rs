@@ -915,6 +915,14 @@ pub enum FrontendRequest {
     /// silently break summarization the way it did before #699.
     GetEngineHealth,
 
+    /// One-shot read of the pool sizes and coordinator model the engine
+    /// pushes as [`FrontendEvent::EnginePoolConfig`] at session
+    /// registration. Read-only and idempotent; replies with that same
+    /// event, correlated by request id. The app sends it on
+    /// `resync_required`, because the registration push is uncorrelated
+    /// and can be evicted from the session queue.
+    GetEnginePoolConfig,
+
     /// Ask the engine to identify itself. Replies with
     /// [`FrontendEvent::EngineVersionResult`] carrying the stamped
     /// Boss version, build SHA, build time, and binary-content

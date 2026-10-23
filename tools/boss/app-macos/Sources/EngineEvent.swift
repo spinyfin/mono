@@ -6,8 +6,10 @@ enum EngineEvent {
     /// The engine had to drop pending invalidations for this session's
     /// outbound queue while riding out a publish burst (e.g. a
     /// merge-poller sweep across many products/executions) instead of
-    /// disconnecting. The socket is still up — treat this like the
-    /// refetch-on-reconnect path, silently, with no connection-lost UI.
+    /// disconnecting. The socket is still up — refetch what a dropped push
+    /// could have covered (coalesced and backed off, see
+    /// `ChatViewModel+ResyncRefetch.swift`), silently, with no
+    /// connection-lost UI.
     case resyncRequired
     case workInvalidated(topic: String, productId: String?, itemIds: [String])
     case appSessionRegistered

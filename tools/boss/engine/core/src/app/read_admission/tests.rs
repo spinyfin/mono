@@ -129,6 +129,7 @@ fn live_lane_is_exactly_the_audited_local_only_set() {
     // socket only. Changing live membership requires this audit.
     let live = [
         R::GetEngineHealth,
+        R::GetEnginePoolConfig,
         R::GetEngineVersion,
         R::ListHostedPaneStatuses,
         R::ListTmuxWorkerStatuses,
