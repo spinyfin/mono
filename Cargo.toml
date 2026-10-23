@@ -35,6 +35,7 @@ members = [
   "tools/boss/engine/single-flight",
   "tools/boss/engine/core",
   "tools/boss/engine/grok-home-retention",
+  "tools/boss/engine/host-enrollment",
   "tools/boss/engine/jsonl-append",
   "tools/boss/engine/offsite-backup",
   "tools/boss/engine/day-rotated-log",
@@ -135,7 +136,14 @@ md-5 = "0.10.6"
 prost = "0.13.5"
 prost-types = "0.13.5"
 rand = "0.8"
-rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+# `x509-parser` lets rcgen read a CSR (verifying its signature) and reload a CA
+# certificate from disk; the hub's host-enrollment crate needs both.
+rcgen = { version = "0.14.10", default-features = false, features = [
+  "crypto",
+  "pem",
+  "ring",
+  "x509-parser",
+] }
 rayon = "1.10"
 rsa = "0.9"
 regex = "1.11.1"
