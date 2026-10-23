@@ -35,6 +35,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/host-enrollment:__pkg__",
         "//tools/boss/engine/spoke-stream:__pkg__",
+        "//tools/boss/spoke-credentials:__pkg__",
     ],
     deps = [
         ":spoke_v1_rust_proto",

@@ -1,0 +1,21 @@
+[package]
+name = "boss-spoke-credentials"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+base64 = { workspace = true }
+bon = { workspace = true }
+boss-protocol-spoke = { path = "../protocol-spoke" }
+rand = { workspace = true }
+rcgen = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tonic = { workspace = true }
+
+[dev-dependencies]
+boss-host-enrollment = { path = "../engine/host-enrollment" }
+rustls = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
