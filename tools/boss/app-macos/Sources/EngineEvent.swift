@@ -53,7 +53,7 @@ enum EngineEvent {
     /// Delivered both as a one-shot reply to
     /// `list_worker_live_states` and as a topic push on
     /// `worker.live_states` whenever any slot changes.
-    case workerLiveStatesList(states: [WorkerLiveState])
+    case workerLiveStatesList(states: [WorkerLiveState], doingSections: [String: DoingSection] = [:])
     /// Snapshot of slot ids whose live-status summarizer has been
     /// manually disabled by the human. Sourced from a one-shot reply
     /// to `list_live_status_disabled_slots`.

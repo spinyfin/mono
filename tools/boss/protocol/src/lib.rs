@@ -5,6 +5,7 @@
 //! crate so that engine and clients link against the same types.
 
 mod boothby;
+mod doing_section;
 mod engine_app;
 mod health_wire;
 mod host_registry_wire;
@@ -22,6 +23,7 @@ mod worker_event;
 mod worker_names;
 
 pub use boothby::*;
+pub use doing_section::*;
 pub use engine_app::*;
 pub use health_wire::*;
 pub use host_registry_wire::*;

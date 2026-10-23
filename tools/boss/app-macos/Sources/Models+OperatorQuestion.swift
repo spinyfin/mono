@@ -5,8 +5,8 @@ import Foundation
 /// wire). `nil` on `WorkTask` once the question is answered or withdrawn.
 ///
 /// The card renders `text` with labeled decision context from `explanation`;
-/// technical details stay in the "Why?" popover. `askedAt` orders the Doing
-/// column's "Needs Attention" section.
+/// technical details stay in the "Why?" popover. `askedAt` orders awaiting-answer
+/// cards at the top of the Doing column's Queued section.
 struct OperatorQuestion: Hashable {
     /// How the user answers. Mirrors `OperatorAnswerType`. Both kinds are
     /// answered with Yes/No; a payload carrying any other kind is not decoded
@@ -36,7 +36,7 @@ struct OperatorQuestion: Hashable {
     /// cannot render: a stored question the card cannot answer would be a
     /// permanent park, so such a task falls back to the plain blocked card
     /// in Backlog (its tooltip already carries the question text via
-    /// `blocked_detail`) rather than a Needs Attention card with no buttons.
+    /// `blocked_detail`) rather than a Queued card with no buttons.
     static func parse(_ value: Any?) -> OperatorQuestion? {
         guard let dict = value as? [String: Any],
               let id = dict["id"] as? String,

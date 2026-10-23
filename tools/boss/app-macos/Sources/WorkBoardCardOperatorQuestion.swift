@@ -1,7 +1,7 @@
 import SwiftUI
 
 // ===========================================================================
-// The inline question on a Doing ▸ Needs Attention card: what a blocked
+// The inline question on a Doing ▸ Queued card: what a blocked
 // worker asked the user, a "Why?" disclosure with the full detail, and
 // Yes / No buttons.
 //

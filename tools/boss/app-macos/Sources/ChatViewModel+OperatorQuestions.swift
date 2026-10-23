@@ -1,7 +1,7 @@
 import Foundation
 
 extension ChatViewModel {
-    // MARK: Operator questions (Doing ▸ Needs Attention)
+    // MARK: Operator questions (Doing ▸ Queued)
 
     /// Answer the question a blocked worker asked on `task`'s card — the
     /// card's Yes / No buttons. Yes re-authorizes and restarts the task, No
@@ -33,7 +33,7 @@ extension ChatViewModel {
     /// `validation_failed`): re-enable the buttons and say why the click did
     /// nothing. The card is left in place — if the question was answered or
     /// withdrawn elsewhere, the `work_item_updated` that moved the task is
-    /// what takes it out of Needs Attention.
+    /// what takes it out of the awaiting-answer state.
     func handleOperatorQuestionError(message: String, requestId: String?) {
         guard let taskID = taskIDForOperatorAnswer(requestId: requestId) else {
             workErrorMessage = message

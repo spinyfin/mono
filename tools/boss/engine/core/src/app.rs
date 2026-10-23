@@ -81,6 +81,7 @@ mod cost;
 mod decisions;
 mod dependencies;
 mod design_docs;
+mod doing_sections;
 mod effort;
 mod engine_meta;
 mod events_accept;
