@@ -135,6 +135,19 @@ fn ensure_pr_uses_body_file_flag_not_body_flag() {
             ],
             "abc123",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/99")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
+        ),
     ]);
 
     let cli = Cli::parse_from([
@@ -272,6 +285,19 @@ fn ensure_pr_created_json_has_action_url_number() {
             ],
             "abc123",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
@@ -380,6 +406,19 @@ fn ensure_pr_exists_json_has_action_url_number() {
                 "present(pr/7@git)",
                 "-T",
                 r#"commit_id ++ "\n""#,
+            ],
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
             ],
             "abc123",
         ),
@@ -522,6 +561,19 @@ fn ensure_pr_pushes_to_github_remote_not_local_mirror() {
                 "present(pr/77@git)",
                 "-T",
                 r#"commit_id ++ "\n""#,
+            ],
+            "deadbeef",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/77")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
             ],
             "deadbeef",
         ),
@@ -730,6 +782,19 @@ fn ensure_pr_sets_pr_bookmark_on_create() {
             ],
             "abc123",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/55")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
+        ),
     ]);
 
     let cli = Cli::parse_from([
@@ -845,6 +910,19 @@ fn ensure_pr_sets_pr_bookmark_on_existing_pr() {
                 "present(pr/33@git)",
                 "-T",
                 r#"commit_id ++ "\n""#,
+            ],
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/33")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
             ],
             "abc123",
         ),
@@ -1052,6 +1130,19 @@ fn pr_create_opens_pr_when_none_exists() {
             ],
             "abc123",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "create", "--branch", "my-feature", "--title", "New PR"]);
@@ -1157,7 +1248,7 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
             &[
                 "log",
                 "-r",
-                "bookmarks(exact:\"pr/7\")",
+                r#"bookmarks(exact:"pr/7")"#,
                 "--no-graph",
                 "-T",
                 "commit_id",
@@ -1283,6 +1374,19 @@ fn pr_update_pushes_when_pr_exists() {
                 "present(pr/7@git)",
                 "-T",
                 r#"commit_id ++ "\n""#,
+            ],
+            "abc123",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
             ],
             "abc123",
         ),
@@ -1514,6 +1618,19 @@ fn pr_update_proceeds_when_working_copy_is_empty_child_of_branch_head() {
             ],
             "abc123",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "update", "--branch", "my-feature"]);
@@ -1623,6 +1740,19 @@ fn pr_update_allow_detached_push_skips_working_copy_check() {
             ],
             "abc123",
         ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "abc123",
+        ),
     ]);
 
     let cli = Cli::parse_from([
@@ -1708,11 +1838,58 @@ fn resolve_pr_body_is_none_when_neither_flag_supplied() {
 fn publication_fails_if_bookmark_verification_observes_multiple_heads() {
     let cwd = std::path::PathBuf::from("/repo");
     let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "published", "-T", r#"commit_id ++ "\n""#],
+            "published",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
             &["bookmark", "set", "pr/42", "-r", "published", "--allow-backwards"],
             "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "published",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/42@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "published",
         ),
         ExpectedCommand::ok(
             cwd.clone(),

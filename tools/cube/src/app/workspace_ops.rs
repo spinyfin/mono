@@ -1114,6 +1114,16 @@ pub(super) fn workspace_push(
     pr: Option<u64>,
 ) -> Result<RunResult> {
     let cwd = std::env::current_dir().map_err(CubeError::Io)?;
+    workspace_push_at(cwd, database_path, runner, bookmark, pr)
+}
+
+pub(super) fn workspace_push_at(
+    cwd: PathBuf,
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    bookmark: Option<String>,
+    pr: Option<u64>,
+) -> Result<RunResult> {
     let (github_remote, owner_repo) = resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
 
     let opts = RebaseOpts {

@@ -21,6 +21,10 @@ struct PublishFixture<'a> {
 }
 
 impl CommandRunner for PublishFixture<'_> {
+    fn lock_pr_bookmarks(&self, _cwd: &Path) -> Result<crate::lock::RepoLock> {
+        crate::lock::RepoLock::for_workspace(self.worker)
+    }
+
     fn run(&self, invocation: &crate::command_runner::CommandInvocation) -> Result<String> {
         if invocation.program == "gh" {
             if invocation.args == ["api", "repos/test/repo/pulls/42"] {
@@ -76,6 +80,7 @@ fn exercise_publication(ambiguous: bool) {
     let remote_git = remote.join(".jj/repo/store/git");
     jj(&repo, &["git", "remote", "add", "origin", remote_git.to_str().unwrap()]);
     jj(&repo, &["git", "push", "-b", "feature", "--allow-new"]);
+    let published_before = jj_commit_id(&runner, &repo, "feature").unwrap();
     jj(&repo, &["new", "base", "-m", "upstream"]);
     std::fs::write(repo.join("file"), "upstream\n").unwrap();
     jj(&repo, &["bookmark", "set", "main", "-r", "@"]);
@@ -84,6 +89,9 @@ fn exercise_publication(ambiguous: bool) {
         jj(&repo, &["log", "-r", "pr/42", "--no-graph", "-T", "conflict"]).trim(),
         "true"
     );
+    // Earlier cube publications record each head they publish; the raw pushes
+    // in this fixture stand in for them.
+    let mut earlier_heads = vec![published_before, jj_commit_id(&runner, &repo, "pr/42").unwrap()];
 
     // A revision stages its own history, preserving the old conflicted head.
     let worker = temp.path().join("worker");
@@ -105,6 +113,7 @@ fn exercise_publication(ambiguous: bool) {
         let operation = jj(&repo, &["op", "log", "--no-graph", "--limit", "1", "-T", "id"]);
         jj(&repo, &["new", "base", "-m", "other history"]);
         jj(&repo, &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"]);
+        earlier_heads.push(jj_commit_id(&runner, &repo, "@").unwrap());
         jj(
             &repo,
             &[
@@ -160,7 +169,10 @@ fn exercise_publication(ambiguous: bool) {
         } else {
             (None, Some(42))
         };
-        crate::app::workspace_ops::workspace_push(None, &publisher, bookmark, pr).unwrap();
+        for head in &earlier_heads {
+            crate::app::pr_bookmarks::record_head(&worker, 42, head).unwrap();
+        }
+        crate::app::workspace_ops::workspace_push_at(worker.clone(), None, &publisher, bookmark, pr).unwrap();
     });
     assert_eq!(jj_commit_id(&runner, &remote, "feature").unwrap(), pushed);
     let heads = jj(

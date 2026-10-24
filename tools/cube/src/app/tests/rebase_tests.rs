@@ -379,11 +379,58 @@ fn rebase_pr_arg_resolves_head_branch_from_github() {
     cmds.extend(push_and_verify_cmds(branch, Some(7)));
 
     cmds.extend([
+        ExpectedCommand::ok(rebase_cwd(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            rebase_cwd(),
+            "jj",
+            &["log", "--no-graph", "-r", "pushed1", "-T", r#"commit_id ++ "\n""#],
+            "pushed1",
+        ),
+        ExpectedCommand::ok(
+            rebase_cwd(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
         ExpectedCommand::ok(
             rebase_cwd(),
             "jj",
             &["bookmark", "set", "pr/7", "-r", "pushed1", "--allow-backwards"],
             "",
+        ),
+        ExpectedCommand::ok(rebase_cwd(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            rebase_cwd(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/7")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "pushed1",
+        ),
+        ExpectedCommand::ok(
+            rebase_cwd(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/7@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "pushed1",
         ),
         ExpectedCommand::ok(
             rebase_cwd(),
