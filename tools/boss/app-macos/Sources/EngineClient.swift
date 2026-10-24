@@ -525,7 +525,7 @@ final class EngineClient: @unchecked Sendable {
         connectTreeClaims.withLock { $0.removeAll() }
     }
 
-    private func flushQueuedReads() {
+    func flushQueuedReads() {
         let drained = queuedReads.withLock { state -> [(id: String, data: Data, treeProductID: String?)] in
             let copy = state.map { (id: $0.id, data: $0.data, treeProductID: $0.treeProductID) }
             state.removeAll()
@@ -534,6 +534,10 @@ final class EngineClient: @unchecked Sendable {
         for item in drained {
             if let productID = item.treeProductID, !claimConnectTree(productId: productID) { continue }
             guard let payload = (try? JSONSerialization.jsonObject(with: item.data)) as? [String: Any] else { continue }
+            if let productID = item.treeProductID {
+                onWorkTreeRequested?(productID, item.id)
+            }
+            if simulateConnectedForTesting { continue }
             write(payload, envelopeRequestId: item.id)
         }
     }
@@ -741,7 +745,7 @@ final class EngineClient: @unchecked Sendable {
         if type == "work_tree_update" {
             guard let update = payload["update"] as? [String: Any],
                   let tree = workTreeCache.apply(update) else {
-                emit(.workError(message: "received invalid work tree update", requestId: envelope["request_id"] as? String))
+                emit(.boardReadFailed(requestId: envelope["request_id"] as? String))
                 if let update = payload["update"] as? [String: Any],
                    let productID = update["product_id"] as? String {
                     sendGetWorkTree(productId: productID, flow: .itemRefetch, delta: false)
@@ -800,7 +804,7 @@ final class EngineClient: @unchecked Sendable {
             guard let productPayload = payload["product"] as? [String: Any],
                   let product = parseProduct(productPayload)
             else {
-                emit(.workError(message: "received invalid work tree payload from engine", requestId: envelopeRequestId))
+                emit(.boardReadFailed(requestId: envelopeRequestId))
                 break
             }
             let projects = (payload["projects"] as? [[String: Any]] ?? []).compactMap(parseProject)
@@ -853,7 +857,7 @@ final class EngineClient: @unchecked Sendable {
             ))
         case "work_runtime_patch":
             guard let productId = payload["product_id"] as? String else {
-                emit(.workError(message: "received invalid work runtime patch from engine", requestId: envelopeRequestId))
+                emit(.boardReadFailed(requestId: envelopeRequestId))
                 break
             }
             var cards: [WorkRuntimePatchCard] = []

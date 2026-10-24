@@ -1,20 +1,27 @@
 import Foundation
 
 /// Request identities and snapshot watermark for one product's board.
-/// Expired reads are retired individually; their late replies cannot mutate state.
+/// Expired reads retain their refresh obligations until a replacement is requested.
 struct BoardReadFence {
     static let staleAfter: Duration = .seconds(30)
     var trees: [String: ContinuousClock.Instant] = [:]
     var patchRequestID: String?
     var patchSentAt: ContinuousClock.Instant?
+    var patchItemIDs: Set<String> = []
+    var needsTree = false
     var patchSuperseded = false
     var queuedPatchItemIDs: Set<String> = []
     var revision: UInt64 = 0
 
     mutating func expire(now: ContinuousClock.Instant = .now) {
-        trees = trees.filter { $0.value.duration(to: now) < Self.staleAfter }
+        let liveTrees = trees.filter { $0.value.duration(to: now) < Self.staleAfter }
+        needsTree = needsTree || liveTrees.count != trees.count
+        trees = liveTrees
         if let sent = patchSentAt, sent.duration(to: now) >= Self.staleAfter {
+            queuedPatchItemIDs.formUnion(patchItemIDs)
+            patchItemIDs.removeAll()
             patchRequestID = nil
+            patchSentAt = nil
         }
     }
 }
@@ -49,6 +56,7 @@ extension ChatViewModel {
         var fence = boardReadFences[productID] ?? BoardReadFence()
         fence.expire()
         fence.trees[requestID] = .now
+        fence.needsTree = false
         if fence.patchRequestID != nil { fence.patchSuperseded = true }
         fence.queuedPatchItemIDs.removeAll()
         boardReadFences[productID] = fence
@@ -58,12 +66,16 @@ extension ChatViewModel {
         var fence = boardReadFences[productID] ?? BoardReadFence()
         let known = requestID.map { fence.trees.removeValue(forKey: $0) != nil } ?? true
         let fresh = revision.map { $0 >= fence.revision } ?? true
-        if known && fresh { fence.revision = revision ?? fence.revision }
+        let accepted = fresh && (known || revision != nil)
+        if accepted {
+            fence.revision = revision ?? fence.revision
+            fence.needsTree = false
+        }
         boardReadFences[productID] = fence
-        if known && !fresh && productID == currentSelectedProductID {
+        if !accepted && productID == currentSelectedProductID {
             refetchBoard(productID: productID)
         }
-        return known && fresh
+        return accepted
     }
 
     func noteBoardRevision(_ revision: UInt64?, item: WorkItemPayload) {
@@ -97,6 +109,8 @@ extension ChatViewModel {
             let patchFailed = fence.patchRequestID == requestID
             if patchFailed {
                 fence.patchRequestID = nil
+                fence.patchSentAt = nil
+                fence.patchItemIDs.removeAll()
                 fence.queuedPatchItemIDs.removeAll()
             }
             boardReadFences[productID] = fence
@@ -124,7 +138,7 @@ extension ChatViewModel {
         let now = ContinuousClock.now
         fence.expire(now: now)
         boardReadFences[productID] = fence
-        if itemIDs.union(fence.queuedPatchItemIDs).count > Self.maxRuntimePatchItems || !fence.trees.isEmpty {
+        if itemIDs.union(fence.queuedPatchItemIDs).count > Self.maxRuntimePatchItems || !fence.trees.isEmpty || fence.needsTree {
             refetchBoard(productID: productID)
             return
         }
@@ -137,6 +151,7 @@ extension ChatViewModel {
         fence.patchSuperseded = false
         let ids = itemIDs.union(fence.queuedPatchItemIDs)
         fence.queuedPatchItemIDs.removeAll()
+        fence.patchItemIDs = ids
         fence.patchRequestID = engine.sendGetWorkRuntimePatch(productId: productID, itemIds: ids.sorted())
         boardReadFences[productID] = fence
     }
@@ -155,6 +170,8 @@ extension ChatViewModel {
         let superseded = fence.patchSuperseded
         let queued = fence.queuedPatchItemIDs
         fence.patchRequestID = nil
+        fence.patchSentAt = nil
+        fence.patchItemIDs.removeAll()
         fence.patchSuperseded = false
         fence.queuedPatchItemIDs.removeAll()
         boardReadFences[productID] = fence

@@ -60,6 +60,7 @@ enum EngineEvent {
     case workItemUpdated(item: WorkItemPayload, revision: UInt64? = nil)
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
+    case boardReadFailed(requestId: String?)
     case workError(message: String, requestId: String?)
     /// A `work_item_updated` reply whose payload failed to decode. Carries
     /// the envelope request id so a pending request waiting on that reply
