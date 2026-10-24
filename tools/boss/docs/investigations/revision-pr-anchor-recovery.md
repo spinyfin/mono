@@ -30,13 +30,16 @@ There were additional routes around the product reconciler: `reconcile_active_di
 
 After bound-PR checkout, both host adapters verify the alias. Missing or conflicted aliases trigger a fresh GitHub head lookup using the existing `git_utils::gh_cli` helpers, a fetch of the head branch, and an explicit alias update to the returned full SHA. Fetch preserves and restores the execution's baseline, recovery, and publication pointers. Reconciliation retains its content-equivalence checks: repairing a PR alias is never permission to discard unpublished work. A second check at reconciliation handles alias loss between preparation and consumption with one repair attempt, not an unbounded retry loop.
 
-GitHub metadata lookup has a bound, and jj commands retain their existing bounds. Failure to import the authoritative head becomes an explicit recovery error. In addition to the execution failure signal, an unrecoverable revision raises a deduplicated attention item on the root PR card, explaining that later revisions remain gated and that the blocked revision needs repair and explicit restart. This signal requires human acknowledgement; unrelated review activity on the root must not clear it. No revision is marked done or failed merely to release its dependents.
+Rebased restore performs another alias check after its own fetch. Both host adapters repair a missing or conflicted alias at that boundary and retry restore once, including when preparation was skipped because reconciliation already ran. The PR branch and SHA come from one fresh GitHub response.
+
+GitHub metadata lookup has a bound, and jj commands retain their existing bounds. Timeouts, unsuccessful GitHub commands (including network and server errors), and fetch failures retain the ordinary pre-start retry backoff. A successful GitHub response without a usable head or a definitive preserved-work integrity failure instead blocks for human repair. In addition to the execution failure signal, an unrecoverable revision raises a deduplicated attention item on the root PR card, explaining that later revisions remain gated and that the blocked revision needs repair and explicit restart. This signal requires human acknowledgement; unrelated review activity on the root must not clear it. No revision is marked done or failed merely to release its dependents.
 
 Schema migration 51 rearms only the two exact legacy PR-alias error messages once. It preserves the failed attempt and creates a dependency-gated recovery attempt through the existing migration helper. Other pointer failures and new repair-failure messages are not rearmed.
 
 ## Regression coverage
 
 - `execution_bookmark::pr_anchor_tests`: missing and conflicted PR aliases repaired from a fetched head; execution pointers unchanged by the repair; normal containment reconciliation succeeds afterward; strict recognition of legacy blocker text.
+- `host_adapter::pr_anchor::tests`: fake GitHub CLI plus real jj stores exercise repair and second reconciliation, aliases deleted or conflicted by restore's fetch, retryable lookup failures and timeout, and an unavailable authoritative head.
 - `work::tests::revision_recovery`: completed implementation not reminted across three reconcile passes; root PR attention deduplicated without changing revision status; upgrade rearm runs once and preserves the original failed execution.
 
 These use temporary stores and databases, not the reported live PRs. Validation commands and their observed results are recorded in the PR evidence section.

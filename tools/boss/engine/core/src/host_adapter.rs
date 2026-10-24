@@ -529,7 +529,7 @@ impl HostAdapter for LocalHostAdapter {
         let remote = git_utils::repo_slug::parse_github_remote(&remotes)
             .map(|(name, _)| name)
             .unwrap_or_else(|| "origin".into());
-        execution_bookmark::restore_rebased(&LocalJj, record, workspace, pr_bookmark, base_branch, &remote).await
+        pr_anchor::restore_rebased(&LocalJj, record, workspace, pr_bookmark, base_branch, &remote).await
     }
     async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
         anyhow::ensure!(
@@ -1101,7 +1101,7 @@ impl HostAdapter for SshHostAdapter {
         let remote = git_utils::repo_slug::parse_github_remote(&remotes)
             .map(|(name, _)| name)
             .unwrap_or_else(|| "origin".into());
-        execution_bookmark::restore_rebased(self, record, workspace, pr_bookmark, base_branch, &remote).await
+        pr_anchor::restore_rebased(self, record, workspace, pr_bookmark, base_branch, &remote).await
     }
     async fn checkpoint_execution_baseline(&self, record: &ExecutionBookmark) -> Result<String> {
         anyhow::ensure!(

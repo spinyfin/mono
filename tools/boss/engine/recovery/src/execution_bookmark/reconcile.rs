@@ -168,7 +168,7 @@ fn short(id: &str) -> &str {
     &id[..12.min(id.len())]
 }
 
-async fn resolve_pr_head(jj: &dyn Jj, record: &ExecutionBookmark, pr_bookmark: &str) -> Result<String> {
+pub(super) async fn resolve_pr_head(jj: &dyn Jj, record: &ExecutionBookmark, pr_bookmark: &str) -> Result<String> {
     let pr_head = match resolve_optional(jj, &record.repo_path, pr_bookmark).await {
         Ok(head) => head,
         Err(err) if is_pointer_integrity_error(&err) => {

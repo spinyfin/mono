@@ -7,6 +7,16 @@ pub(super) async fn reconcile(
     pr_bookmark: Option<&str>,
     trunk: &str,
 ) -> Result<Option<execution_bookmark::Reconciliation>> {
+    reconcile_with_gh(jj, record, pr_bookmark, trunk, Path::new("gh")).await
+}
+
+async fn reconcile_with_gh(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    pr_bookmark: Option<&str>,
+    trunk: &str,
+    gh: &Path,
+) -> Result<Option<execution_bookmark::Reconciliation>> {
     use execution_bookmark::{PointerIntegrityKind, pointer_integrity_kind};
     let initial = execution_bookmark::reconcile(jj, record, pr_bookmark, trunk).await;
     if !initial
@@ -20,7 +30,7 @@ pub(super) async fn reconcile(
         .strip_prefix("pr/")
         .ok_or_else(|| anyhow::anyhow!("invalid PR anchor {bookmark}"))?
         .parse()?;
-    repair(jj, record, pr).await?;
+    repair_with_gh(jj, record, pr, gh).await?;
     execution_bookmark::reconcile(jj, record, pr_bookmark, trunk).await
 }
 
@@ -33,7 +43,56 @@ pub(super) async fn ensure(jj: &dyn Jj, record: &ExecutionBookmark, pr: u64) -> 
     }
 }
 
+pub(super) async fn restore_rebased(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    workspace: &Path,
+    pr_bookmark: Option<&str>,
+    base_branch: &str,
+    upstream: &str,
+) -> Result<execution_bookmark::RestoreReport> {
+    restore_with_gh(
+        jj,
+        record,
+        workspace,
+        pr_bookmark,
+        base_branch,
+        upstream,
+        Path::new("gh"),
+    )
+    .await
+}
+
+async fn restore_with_gh(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    workspace: &Path,
+    pr_bookmark: Option<&str>,
+    base_branch: &str,
+    upstream: &str,
+    gh: &Path,
+) -> Result<execution_bookmark::RestoreReport> {
+    let initial = execution_bookmark::restore_rebased(jj, record, workspace, pr_bookmark, base_branch, upstream).await;
+    if !initial.as_ref().is_err_and(|err| {
+        execution_bookmark::pointer_integrity_kind(err)
+            == Some(execution_bookmark::PointerIntegrityKind::PrHeadUnavailable)
+    }) {
+        return initial;
+    }
+    let bookmark = pr_bookmark.ok_or_else(|| anyhow::anyhow!("missing bound PR"))?;
+    let pr = bookmark
+        .strip_prefix("pr/")
+        .ok_or_else(|| anyhow::anyhow!("invalid PR anchor {bookmark}"))?
+        .parse()?;
+    repair_with_gh(jj, record, pr, gh).await?;
+    execution_bookmark::restore_rebased(jj, record, workspace, pr_bookmark, base_branch, upstream).await
+}
+
 async fn repair(jj: &dyn Jj, record: &ExecutionBookmark, pr: u64) -> Result<()> {
+    repair_with_gh(jj, record, pr, Path::new("gh")).await
+}
+
+async fn repair_with_gh(jj: &dyn Jj, record: &ExecutionBookmark, pr: u64, gh: &Path) -> Result<()> {
     let bookmark = format!("pr/{pr}");
     // One repair, never a retry loop. The host's jj runner imports the head;
     // existing gh authentication supplies the authoritative GitHub identity.
@@ -41,28 +100,27 @@ async fn repair(jj: &dyn Jj, record: &ExecutionBookmark, pr: u64) -> Result<()> 
         let remotes = jj.run(&record.repo_path, &["git", "remote", "list"]).await?;
         let (remote, slug) = git_utils::repo_slug::parse_github_remote(&remotes)
             .ok_or_else(|| anyhow::anyhow!("recovery store has no GitHub remote"))?;
-        let head_ref = git_utils::gh_cli::fetch_pr_head_ref(&slug, pr).await?;
-        let head_sha = git_utils::gh_cli::fetch_pr_head_oid_fresh(&slug, pr).await?;
+        let (head_ref, head_sha) = git_utils::gh_cli::fetch_pr_head(gh, &slug, pr).await.map_err(|err| {
+            if err.is::<git_utils::gh_cli::PrHeadUnavailable>() {
+                execution_bookmark::pointer_integrity_error(format!("GitHub head for {bookmark} is unavailable"))
+            } else {
+                err
+            }
+        })?;
         Ok::<_, anyhow::Error>((remote, head_ref, head_sha))
     };
     let (remote, head_ref, head_sha) = tokio::time::timeout(std::time::Duration::from_secs(120), metadata)
         .await
-        .map_err(|_| {
-            execution_bookmark::pointer_integrity_error(format!(
-                "repair of {bookmark} from GitHub timed out; revision chain needs operator attention"
-            ))
-        })?
-        .map_err(|err| {
-            execution_bookmark::pointer_integrity_error(format!(
-                "cannot repair {bookmark} from GitHub: {err:#}; revision chain needs operator attention"
-            ))
-        })?;
+        .map_err(|_| anyhow::anyhow!("repair of {bookmark} from GitHub timed out"))?
+        .with_context(|| format!("cannot repair {bookmark} from GitHub"))?;
     // The jj runner bounds each command. Do not cancel the fetch/restore
     // sequence as a whole: even a failed fetch must restore saved pointers.
     execution_bookmark::repair_pr_anchor(jj, record, pr, &remote, &head_ref, &head_sha)
         .await
-        .map_err(|err| {
-            execution_bookmark::pointer_integrity_error(format!("cannot import GitHub head for {bookmark}: {err:#}"))
-        })?;
+        .with_context(|| format!("cannot import GitHub head for {bookmark}"))?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "pr_anchor_tests.rs"]
+mod tests;
