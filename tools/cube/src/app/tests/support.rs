@@ -660,39 +660,3 @@ pub(super) fn pr_git_verify_command(cwd: &std::path::Path, name: &str, output: &
         output,
     )
 }
-
-/// The two probes `pr_bookmarks::was_published` makes for a commit that was
-/// never published: the current view, then the recorded operations.
-pub(super) fn not_published_commands(cwd: PathBuf, commit: &str) -> Vec<ExpectedCommand> {
-    vec![
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &[
-                "--ignore-working-copy",
-                "log",
-                "--no-graph",
-                "-r",
-                &format!(r#"present({commit}) & ::(remote_bookmarks() ~ remote_bookmarks(glob:"pr/*"))"#),
-                "-T",
-                r#"commit_id ++ "\n""#,
-            ],
-            "",
-        ),
-        ExpectedCommand::ok(
-            cwd,
-            "jj",
-            &[
-                "--ignore-working-copy",
-                "op",
-                "log",
-                "--no-graph",
-                "-n",
-                "400",
-                "-T",
-                r#"id ++ "\t" ++ description.first_line() ++ "\n""#,
-            ],
-            "",
-        ),
-    ]
-}

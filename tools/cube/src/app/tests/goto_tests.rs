@@ -59,23 +59,18 @@ fn goto_pr_bookmark_commits_cmd(pr: u64, out: &str) -> ExpectedCommand {
 /// The commands `point_pr_bookmark` issues around the `pr/<n>` set, up to and
 /// including the set itself: import any stale git ref, resolve the head, read
 /// what `pr/<n>` currently resolves to (`before`).
-fn goto_pr_bookmark_prelude(pr: u64, branch: &str, head: &str, before: &str) -> Vec<ExpectedCommand> {
-    let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+fn goto_pr_bookmark_prelude(pr: u64, head: &str, before: &str) -> Vec<ExpectedCommand> {
     vec![
         goto_jj(&["git", "import"], ""),
-        goto_jj(
-            &["log", "--no-graph", "-r", &remote_ref, "-T", r#"commit_id ++ "\n""#],
-            head,
-        ),
+        goto_jj(&["log", "--no-graph", "-r", head, "-T", r#"commit_id ++ "\n""#], head),
         goto_pr_bookmark_commits_cmd(pr, before),
     ]
 }
 
-fn goto_pr_bookmark_set_cmds(pr: u64, branch: &str, head: &str) -> Vec<ExpectedCommand> {
-    let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+fn goto_pr_bookmark_set_cmds(pr: u64, head: &str) -> Vec<ExpectedCommand> {
     let pr_bm = format!("pr/{pr}");
     vec![
-        goto_jj(&["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"], ""),
+        goto_jj(&["bookmark", "set", &pr_bm, "-r", head, "--allow-backwards"], ""),
         goto_jj(&["git", "export"], ""),
         goto_pr_bookmark_commits_cmd(pr, head),
         goto_jj(
@@ -93,10 +88,40 @@ fn goto_pr_bookmark_set_cmds(pr: u64, branch: &str, head: &str) -> Vec<ExpectedC
 }
 
 /// Whole healthy-`pr/<n>` sequence: nothing there before, exactly the head after.
-fn goto_set_pr_bookmark_cmds(pr: u64, branch: &str, head: &str) -> Vec<ExpectedCommand> {
-    let mut cmds = goto_pr_bookmark_prelude(pr, branch, head, "");
-    cmds.extend(goto_pr_bookmark_set_cmds(pr, branch, head));
+fn goto_set_pr_bookmark_cmds(pr: u64, head: &str) -> Vec<ExpectedCommand> {
+    let mut cmds = goto_pr_bookmark_prelude(pr, head, "");
+    cmds.extend(goto_pr_bookmark_set_cmds(pr, head));
     cmds
+}
+
+/// What `goto --pr` runs after GitHub's PR JSON: confirm `head` is in the
+/// store, then point the local branch bookmark at it.
+fn goto_pr_head_cmds(branch: &str, head: &str) -> Vec<ExpectedCommand> {
+    vec![
+        goto_jj(
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("present({head})"),
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            head,
+        ),
+        goto_jj(&["bookmark", "set", branch, "-r", head, "--allow-backwards"], ""),
+    ]
+}
+
+fn goto_pr_json(branch: &str, head: &str) -> String {
+    format!(r#"{{"head":{{"ref":"{branch}","sha":"{head}"}},"state":"open","merged":false}}"#)
+}
+
+fn goto_pr_positioned_cmd(head: &str, out: &str) -> ExpectedCommand {
+    goto_jj(
+        &["log", "-r", &format!("{head} & ::@"), "--no-graph", "-T", "commit_id"],
+        out,
+    )
 }
 
 fn goto_positioned_cmd(branch: &str, sha: &str) -> ExpectedCommand {
@@ -196,14 +221,13 @@ fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
             goto_cwd(),
             "gh",
             &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
-            &format!(r#"{{"head":{{"ref":"{branch}"}},"state":"open","merged":false}}"#),
+            &goto_pr_json(branch, "e42"),
         ),
-        goto_exists_cmd(branch, "e42"),
-        goto_set_bookmark_cmd(branch),
     ];
-    cmds.extend(goto_set_pr_bookmark_cmds(42, branch, "e42"));
-    cmds.push(goto_positioned_cmd(branch, ""));
-    cmds.push(goto_new_cmd(branch));
+    cmds.extend(goto_pr_head_cmds(branch, "e42"));
+    cmds.extend(goto_set_pr_bookmark_cmds(42, "e42"));
+    cmds.push(goto_pr_positioned_cmd("e42", ""));
+    cmds.push(goto_jj(&["new", "e42"], ""));
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, None, Some(42)).expect("pr goto");
     runner.assert_exhausted();
@@ -295,12 +319,11 @@ fn goto_pr_repairs_conflicted_bookmark_when_other_side_is_an_ancestor() {
             goto_cwd(),
             "gh",
             &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
-            &format!(r#"{{"head":{{"ref":"{branch}"}},"state":"open","merged":false}}"#),
+            &goto_pr_json(branch, "e42"),
         ),
-        goto_exists_cmd(branch, "e42"),
-        goto_set_bookmark_cmd(branch),
     ];
-    cmds.extend(goto_pr_bookmark_prelude(42, branch, "e42", "e42\nold1\n"));
+    cmds.extend(goto_pr_head_cmds(branch, "e42"));
+    cmds.extend(goto_pr_bookmark_prelude(42, "e42", "e42\nold1\n"));
     cmds.push(goto_jj(
         &[
             "log",
@@ -314,8 +337,8 @@ fn goto_pr_repairs_conflicted_bookmark_when_other_side_is_an_ancestor() {
         ],
         "",
     ));
-    cmds.extend(goto_pr_bookmark_set_cmds(42, branch, "e42"));
-    cmds.push(goto_positioned_cmd(branch, "e42"));
+    cmds.extend(goto_pr_bookmark_set_cmds(42, "e42"));
+    cmds.push(goto_pr_positioned_cmd("e42", "e42"));
     let runner = FakeRunner::new(cmds);
     run_goto(&runner, None, Some(42)).expect("conflicted pr bookmark repaired");
     runner.assert_exhausted();
@@ -333,12 +356,11 @@ fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
             goto_cwd(),
             "gh",
             &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
-            &format!(r#"{{"head":{{"ref":"{branch}"}},"state":"open","merged":false}}"#),
+            &goto_pr_json(branch, "e42"),
         ),
-        goto_exists_cmd(branch, "e42"),
-        goto_set_bookmark_cmd(branch),
     ];
-    cmds.extend(goto_pr_bookmark_prelude(42, branch, "e42", "e42\nuniq9\n"));
+    cmds.extend(goto_pr_head_cmds(branch, "e42"));
+    cmds.extend(goto_pr_bookmark_prelude(42, "e42", "e42\nuniq9\n"));
     cmds.push(goto_jj(
         &[
             "log",
@@ -352,7 +374,6 @@ fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
         ],
         "chg1\tuniq9\n",
     ));
-    cmds.extend(super::support::not_published_commands(goto_cwd(), "uniq9"));
     cmds.push(goto_jj(
         &[
             "log",
