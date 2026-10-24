@@ -43,7 +43,59 @@ fn pr_push_happy_path_advance() {
         // advance head-branch bookmark
         ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
         // advance pr/42 bookmark
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/42@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
         // push (no --allow-new)
         ExpectedCommand::ok(
             cwd.clone(),
@@ -251,7 +303,59 @@ fn pr_push_stale_push_error() {
             "aabbcc\n",
         ),
         ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/42@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
         // push fails
         ExpectedCommand {
             cwd: cwd.clone(),
@@ -363,7 +467,59 @@ fn pr_push_force_with_lease_happy_path() {
         ),
         // advance bookmarks
         ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/42@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
         // force push via git
         ExpectedCommand::ok(
             cwd.clone(),
@@ -511,7 +667,59 @@ fn pr_push_infers_from_ancestry() {
         ),
         // advance bookmarks
         ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "import"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", r#"commit_id ++ "\n""#],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(cwd.clone(), "jj", &["git", "export"], ""),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                r#"bookmarks(exact:"pr/42")"#,
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(pr/42@git)",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            "head",
+        ),
         // push
         ExpectedCommand::ok(
             cwd.clone(),

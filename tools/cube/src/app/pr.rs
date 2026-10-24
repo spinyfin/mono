@@ -419,7 +419,7 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
 ///
 /// Returns the bookmark name if the number was resolved, or `None` if the PR
 /// URL didn't contain a parseable number (so callers can include it in JSON).
-fn set_pr_bookmark(
+pub(super) fn set_pr_bookmark(
     runner: &dyn CommandRunner,
     cwd: &Path,
     number: Option<u64>,
@@ -429,13 +429,8 @@ fn set_pr_bookmark(
         return Ok(None);
     };
     let bookmark_name = pr_bookmark::pr_bookmark_name(n);
-    runner
-        .run(&RealCommandRunner::invocation(
-            cwd,
-            "jj",
-            &["bookmark", "set", &bookmark_name, "-r", branch],
-        ))
-        .map_err(|e| CubeError::InvalidArgument(format!("failed to set local bookmark `{bookmark_name}`: {e}")))?;
+    let _lock = runner.lock_pr_bookmarks(cwd)?;
+    crate::app::pr_bookmarks::point_pr_bookmark(runner, None, cwd, n, branch)?;
     Ok(Some(bookmark_name))
 }
 
@@ -826,7 +821,13 @@ fn fetch_github_sha(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, br
 }
 
 /// Advance `head_branch` and `pr_bm` bookmarks to `@`.
-fn advance_pr_bookmarks(runner: &dyn CommandRunner, cwd: &Path, head_branch: &str, pr_bm: &str) -> Result<()> {
+pub(super) fn advance_pr_bookmarks(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    head_branch: &str,
+    pr_bm: &str,
+) -> Result<()> {
+    let _lock = runner.lock_pr_bookmarks(cwd)?;
     runner
         .run(&RealCommandRunner::invocation(
             cwd,
@@ -834,12 +835,10 @@ fn advance_pr_bookmarks(runner: &dyn CommandRunner, cwd: &Path, head_branch: &st
             &["bookmark", "set", head_branch, "-r", "@"],
         ))
         .map_err(|e| CubeError::InvalidArgument(format!("failed to advance `{head_branch}` bookmark to @: {e}")))?;
-    runner
-        .run(&RealCommandRunner::invocation(
-            cwd,
-            "jj",
-            &["bookmark", "set", pr_bm, "-r", "@"],
-        ))
-        .map_err(|e| CubeError::InvalidArgument(format!("failed to advance `{pr_bm}` bookmark to @: {e}")))?;
+    let number = pr_bm
+        .strip_prefix("pr/")
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| CubeError::InvalidArgument(format!("invalid PR bookmark {pr_bm}")))?;
+    crate::app::pr_bookmarks::point_pr_bookmark(runner, None, cwd, number, "@")?;
     Ok(())
 }

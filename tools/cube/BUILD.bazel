@@ -38,6 +38,10 @@ rust_test(
     name = "cube_lib_test",
     size = "medium",
     crate = ":cube_lib",
+    # Real-jj fixtures (a throwaway colocated repo) for the `pr/<n>` bookmark
+    # lifecycle tests; the binary is declared, never taken from PATH.
+    data = ["@jj_test_tools//:jj"],
+    env = {"BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)"},
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,

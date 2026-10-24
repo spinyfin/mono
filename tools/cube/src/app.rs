@@ -20,6 +20,7 @@ mod health;
 mod jj;
 mod lease_reclaim;
 mod pr;
+mod pr_bookmarks;
 mod provision;
 mod reclaim;
 mod reconcile;

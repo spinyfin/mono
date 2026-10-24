@@ -1,8 +1,9 @@
 use super::support::{
-    ExpectedCommand, FakeRunner, audit_events, gc_exec_sweep_command, gc_noop_command, gc_pr_noop_command,
-    gc_pr_sweep_command, head_status_command, head_status_output, lease_runner_for, release_guard_reusable_command,
-    release_runner_for, seed_mono_repo, unpushed_probe_command, with_database_path,
+    ExpectedCommand, FakeRunner, audit_events, gc_exec_sweep_command, gc_git_import_command, gc_noop_command,
+    gc_pr_noop_command, gc_pr_sweep_command, head_status_command, head_status_output, lease_runner_for,
+    release_guard_reusable_command, release_runner_for, seed_mono_repo, unpushed_probe_command, with_database_path,
 };
+use super::support::{gc_pr_safe_command, pr_git_verify_command};
 use clap::Parser;
 use tempfile::TempDir;
 
@@ -46,6 +47,7 @@ fn workspace_gc_verb_forgets_consumed_bookmarks_on_free_workspaces() {
     // gc: ws1 is leased → skipped; ws2 is free → fetch + forget.
     let gc_runner = FakeRunner::new(vec![
         ExpectedCommand::ok(ws2_path.clone(), "jj", &["git", "fetch"], ""),
+        gc_git_import_command(&ws2_path),
         gc_exec_sweep_command(&ws2_path, "boss/exec_dead_01"),
         gc_pr_noop_command(&ws2_path),
         ExpectedCommand::ok(ws2_path.clone(), "jj", &["bookmark", "forget", "boss/exec_dead_01"], ""),
@@ -179,9 +181,15 @@ fn gc_forgets_pr_bookmark_no_workspace_is_positioned_on() {
 
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
+        gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         gc_pr_sweep_command(&workspace_path, "pr/42\n"),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/42"], ""),
+        gc_pr_safe_command(&workspace_path, "pr/42", ""),
+        // Decided again immediately before acting.
+        gc_pr_safe_command(&workspace_path, "pr/42", ""),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "delete", "pr/42"], ""),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "export"], ""),
+        pr_git_verify_command(&workspace_path, "pr/42", ""),
     ]);
     let release_runner = FakeRunner::new(commands);
     run_with_dependencies(
@@ -210,9 +218,10 @@ fn gc_retains_pr_bookmark_a_workspace_is_still_positioned_on() {
 
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
-        gc_noop_command(&workspace_path),
         // The revset excludes anything reachable from a working copy, so a
         // still-referenced pr/7 simply never appears here.
+        gc_git_import_command(&workspace_path),
+        gc_noop_command(&workspace_path),
         gc_pr_noop_command(&workspace_path),
     ]);
     let release_runner = FakeRunner::new(commands);
@@ -248,14 +257,26 @@ fn gc_sweeps_an_accumulated_backlog_with_one_local_command_and_no_network() {
     // Far apart in PR number, the way a long-lived pool accumulates them.
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
+        gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         gc_pr_sweep_command(&workspace_path, "pr/1579\npr/2201\npr/2332\n"),
+        gc_pr_safe_command(&workspace_path, "pr/1579", ""),
+        gc_pr_safe_command(&workspace_path, "pr/2201", ""),
+        gc_pr_safe_command(&workspace_path, "pr/2332", ""),
+        // Decided again immediately before acting.
+        gc_pr_safe_command(&workspace_path, "pr/1579", ""),
+        gc_pr_safe_command(&workspace_path, "pr/2201", ""),
+        gc_pr_safe_command(&workspace_path, "pr/2332", ""),
         ExpectedCommand::ok(
             workspace_path.clone(),
             "jj",
-            &["bookmark", "forget", "pr/1579", "pr/2201", "pr/2332"],
+            &["bookmark", "delete", "pr/1579", "pr/2201", "pr/2332"],
             "",
         ),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "export"], ""),
+        pr_git_verify_command(&workspace_path, "pr/1579", ""),
+        pr_git_verify_command(&workspace_path, "pr/2201", ""),
+        pr_git_verify_command(&workspace_path, "pr/2332", ""),
     ]);
     let release_runner = FakeRunner::new(commands);
     run_with_dependencies(
@@ -284,9 +305,15 @@ fn gc_pr_sweep_runs_offline() {
 
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
+        gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         gc_pr_sweep_command(&workspace_path, "pr/1586\n"),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/1586"], ""),
+        gc_pr_safe_command(&workspace_path, "pr/1586", ""),
+        // Decided again immediately before acting.
+        gc_pr_safe_command(&workspace_path, "pr/1586", ""),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "delete", "pr/1586"], ""),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "export"], ""),
+        pr_git_verify_command(&workspace_path, "pr/1586", ""),
     ]);
     let release_runner = FakeRunner::new(commands);
     run_with_dependencies(
@@ -318,10 +345,15 @@ fn gc_pr_sweep_ignores_co_located_bookmarks_in_other_namespaces() {
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
         // The exec half finds nothing consumed: this branch has not landed.
+        gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         gc_pr_sweep_command(&workspace_path, "boss/exec_still_open_01\npr/2609\nmain\n"),
-        // Only pr/2609 is forgotten.
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/2609"], ""),
+        gc_pr_safe_command(&workspace_path, "pr/2609", ""),
+        gc_pr_safe_command(&workspace_path, "pr/2609", ""),
+        // Only pr/2609 is deleted.
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "delete", "pr/2609"], ""),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "export"], ""),
+        pr_git_verify_command(&workspace_path, "pr/2609", ""),
     ]);
     let release_runner = FakeRunner::new(commands);
     run_with_dependencies(
@@ -352,6 +384,7 @@ fn gc_release_records_an_audit_event_when_the_sweep_fails() {
 
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
+        gc_git_import_command(&workspace_path),
         gc_noop_command(&workspace_path),
         ExpectedCommand {
             cwd: workspace_path.clone(),
@@ -695,6 +728,7 @@ fn workspace_gc_verb_runs_unhealthy_recycler() {
     let gc_runner = FakeRunner::new(vec![
         // gc_workspace_bookmarks
         ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+        gc_git_import_command(&ws_path),
         gc_noop_command(&ws_path),
         gc_pr_noop_command(&ws_path),
         // gc_aged_unhealthy_workspaces → probe (fetch + head status), then reset

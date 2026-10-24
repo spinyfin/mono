@@ -45,6 +45,11 @@ pub(super) fn head_ref(value: &Value) -> Option<&str> {
     value.get("head").and_then(|h| h.get("ref")).and_then(|v| v.as_str())
 }
 
+/// Extract `head.sha` from a PR's REST JSON.
+pub(super) fn head_sha(value: &Value) -> Option<&str> {
+    value.get("head").and_then(|h| h.get("sha")).and_then(|v| v.as_str())
+}
+
 /// Normalize a PR's REST JSON to the `"OPEN"` / `"CLOSED"` / `"MERGED"`
 /// vocabulary `gh pr view --json state` used to return. REST's own `state`
 /// field only ever holds `"open"`/`"closed"`; `merged` is a separate bool.
