@@ -107,6 +107,7 @@ struct ResyncRefetchGate: Equatable, Sendable {
 extension ChatViewModel {
     /// A resync arrived. Nothing is sent here; see [[fireResyncRefetch]].
     func handleResyncRequired() {
+        reviewNotifier.suspendDecisionReminders()
         let now = ContinuousClock.now
         let armsTimer = resyncRefetchGate.noteResync(at: now)
         let delay = resyncRefetchGate.delay(at: now)
@@ -160,6 +161,7 @@ extension ChatViewModel {
     func fireResyncRefetch() {
         pendingResyncRefetchTask = nil
         guard resyncRefetchGate.isDirty else { return }
+        engine.sendSubscribe(topics: ["work.decisions"])
         let productJoined = resyncRefetchGate.productBurstJoined
         resyncRefetchGate.noteFire(at: .now)
         refreshRemediationState()

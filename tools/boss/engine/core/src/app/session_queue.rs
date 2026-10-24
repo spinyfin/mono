@@ -379,6 +379,7 @@ fn coalesce_topic_event(pending: &mut FrontendEventEnvelope, mut next: FrontendE
 pub(super) fn topic_event_topic(payload: &FrontendEvent) -> Option<String> {
     match payload {
         FrontendEvent::TopicEvent { topic, .. } => Some(topic.clone()),
+        FrontendEvent::OperatorDecisionSnapshot { .. } => Some(super::decision_notifications::TOPIC.to_owned()),
         _ => None,
     }
 }
@@ -632,6 +633,7 @@ impl SessionSink {
 
 #[derive(Default)]
 pub(super) struct TopicBroker {
+    pub(super) decision_snapshot: Mutex<Option<Vec<boss_protocol::OperatorDecisionNotification>>>,
     pub(super) inner: Mutex<TopicBrokerInner>,
 }
 

@@ -38,6 +38,8 @@ extension ChatViewModel {
     private func handle(_ event: EngineEvent) {
         recordRemediationEvent(event)
         switch event {
+        case .operatorDecisionSnapshot(let questions):
+            reviewNotifier.applyDecisionSnapshot(questions)
         case .connected:
             handleConnected()
         case .resyncRequired:
@@ -54,6 +56,7 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            reviewNotifier.suspendDecisionReminders()
             remediationStateRequestID = nil
             remediationEventsDuringRead.removeAll()
             cancelPendingResyncRefetch()

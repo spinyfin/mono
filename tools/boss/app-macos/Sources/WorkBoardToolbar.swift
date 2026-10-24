@@ -100,7 +100,9 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .frame(width: 10)
-                        Text("\(title) (\(count))")
+                        Text(sectionID == "doing-needs-attention"
+                             ? "\(title) · \(count) \(count == 1 ? "decision" : "decisions") waiting"
+                             : "\(title) (\(count))")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                         if let label = shortIDLabel {

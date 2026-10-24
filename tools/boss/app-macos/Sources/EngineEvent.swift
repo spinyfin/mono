@@ -26,6 +26,7 @@ struct WorkRuntimePatchCard {
 }
 
 enum EngineEvent {
+    case operatorDecisionSnapshot(questions: [DecisionNotification])
     case connected
     case disconnected
     /// The engine had to drop pending invalidations for this session's
