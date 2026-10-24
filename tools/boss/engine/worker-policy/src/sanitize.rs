@@ -361,6 +361,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::IdeaUpdated { .. }
         | FrontendEvent::IdeaDeleted { .. }
         | FrontendEvent::IdeaGraduated { .. }
+        | FrontendEvent::OperatorDecisionSnapshot { .. }
         | FrontendEvent::OperatorQuestionsList { .. }
         | FrontendEvent::OperatorQuestionError { .. }
         | FrontendEvent::DispatchAdmissionEvaluated { .. }) => passthrough,

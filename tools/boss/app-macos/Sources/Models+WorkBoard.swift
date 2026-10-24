@@ -349,6 +349,7 @@ struct WorkBoardSection: Identifiable {
     /// rollup). `nil` for every section except "Merging" while a tracked
     /// Trunk queue is non-`running`.
     var queueBannerText: String? = nil
+    var countLabel: String? = nil
 
     /// The group a drop landing on this section should report to the engine:
     /// [`groupKey`], except that a **collapsed** section reports `nil`.

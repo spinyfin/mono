@@ -626,6 +626,10 @@ pub(super) async fn publish_work_invalidation(
         coordinator.kick();
     }
 
+    server_state
+        .topic_broker
+        .refresh_decisions(&server_state.work_db, false)
+        .await;
     let revision = server_state.bump_work_revision();
     let event = FrontendEvent::TopicEvent {
         topic: String::new(),

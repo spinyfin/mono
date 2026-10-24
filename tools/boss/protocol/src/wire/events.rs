@@ -99,6 +99,11 @@ pub enum FrontendEvent {
     WorkItemUpdated {
         item: WorkItem,
     },
+    /// Full open-decision snapshot on the global `work.decisions` topic.
+    /// Sent at subscription and whenever the set or its display text changes.
+    OperatorDecisionSnapshot {
+        questions: Vec<super::OperatorDecisionNotification>,
+    },
     OperatorQuestionsList {
         questions: Vec<crate::OperatorQuestionRecord>,
     },

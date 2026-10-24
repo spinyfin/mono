@@ -17,6 +17,8 @@
 // `t03` and `trust_authorization` use.
 
 use super::*;
+
+mod decision_notifications;
 use crate::app::proposals;
 use boss_protocol::{
     PROPOSAL_CAP_PER_KIND_PER_EXECUTION, ProposalErrorCode, ProposalKind, ProposalState, ProposalSubmissionError,

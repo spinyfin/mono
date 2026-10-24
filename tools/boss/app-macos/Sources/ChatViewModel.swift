@@ -937,6 +937,9 @@ final class ChatViewModel: ObservableObject {
 
         bindEngineEventStream()
 
+        reviewNotifier.onSelectDecision = { [weak self] taskID, productID in
+            self?.revealWorkCard(taskID, productID: productID) { _ in }
+        }
         reviewNotifier.configure()
         reviewNotifier.onSelectWorkItem = { [weak self] taskID in
             self?.setNavigationMode(.work)

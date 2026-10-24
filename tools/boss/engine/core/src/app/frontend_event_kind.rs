@@ -20,6 +20,7 @@ pub(super) fn kind(event: &FrontendEvent) -> &'static str {
         FrontendEvent::WorkItemCreated { .. } => "WorkItemCreated",
         FrontendEvent::WorkItemsCreated { .. } => "WorkItemsCreated",
         FrontendEvent::WorkItemUpdated { .. } => "WorkItemUpdated",
+        FrontendEvent::OperatorDecisionSnapshot { .. } => "OperatorDecisionSnapshot",
         FrontendEvent::OperatorQuestionsList { .. } => "OperatorQuestionsList",
         FrontendEvent::OperatorQuestionError { .. } => "OperatorQuestionError",
         FrontendEvent::ProjectTasksReordered { .. } => "ProjectTasksReordered",
