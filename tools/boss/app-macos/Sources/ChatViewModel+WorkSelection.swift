@@ -260,17 +260,20 @@ extension ChatViewModel {
     }
 
     /// Navigate the kanban to `taskID` and play a 1.5 s highlight.
-    /// Switches to the Work tab, selects the task's product, clears
-    /// every active board filter, and queues a scroll. If the task's
-    /// product is not the one currently loaded, the scroll is deferred
-    /// until the `workTree` event for that product arrives.
+    /// Switches to the Work tab, selects the task's product, clears the
+    /// search / blocked-only / chores-only / hidden-chores filters,
+    /// reconciles the project filter (see
+    /// `reconcileProjectFilterForReveal`), and queues a scroll. If the
+    /// task's product is not the one currently loaded, the scroll is
+    /// deferred until the `workTree` event for that product arrives, and
+    /// the project filter is reconciled then.
     ///
     /// Reveal's contract is "show me this card", so it must override any
     /// filter that would hide the target — a stale search query, a
-    /// blocked-only / chores-only toggle, a project filter, or chores
-    /// being hidden — all of which can exclude the card and make the
-    /// scroll silently land on nothing (#1249). We reset the board to its
-    /// unfiltered state before asking the view to expand and scroll.
+    /// blocked-only / chores-only toggle, a project filter that excludes
+    /// the card, or chores being hidden — all of which can make the
+    /// scroll silently land on nothing (#1249). A project filter that
+    /// already contains the target is left alone.
     ///
     /// `taskID` itself is not always the card that gets scrolled to/
     /// highlighted — see `revealCardTarget(for:)`: a revision rolled up
@@ -291,9 +294,11 @@ extension ChatViewModel {
         // product before selection, or refetch the target a second time.
         setNavigationMode(.work, refreshWorkOnEntry: false)
         let switching = currentSelectedProductID != productID
+        let hadProjectFilter = !selectedProjectFilterIDs.isEmpty
         clearWorkFiltersForReveal()
-        reconcileProjectFilterForReveal(taskID, switchingProduct: switching)
         if switching {
+            // Selecting a product resets the project filter; the user's
+            // filter intent is carried in `hadProjectFilter` instead.
             selectWorkProduct(productID)
         } else {
             refreshWork()
@@ -301,20 +306,23 @@ extension ChatViewModel {
         let outcome: RevealCardResult
         if switching || task(withID: taskID) == nil {
             pendingRevealScrollID = taskID
+            pendingRevealReconcilesProjectFilter = hadProjectFilter
             armRevealDeadline(taskID: taskID, waitingForTree: true)
             outcome = .deferred
         } else {
+            reconcileProjectFilterForReveal(taskID, hadProjectFilter: hadProjectFilter)
             outcome = prepareReveal(taskID)
         }
         return outcome
     }
 
-    /// Reset every board filter that could hide a reveal target so the
-    /// full work board for the product is shown. Each assignment is a
-    /// no-op when the filter is already in its neutral state, so this is
-    /// cheap to call unconditionally. Keep this in sync with
-    /// `computeVisibleWorkItems` — any new narrowing filter added there
-    /// must be neutralized here too, or reveal can silently fail again.
+    /// Reset every board filter that could hide a reveal target other than
+    /// the project filter, which `reconcileProjectFilterForReveal` handles.
+    /// Each assignment is a no-op when the filter is already in its neutral
+    /// state, so this is cheap to call unconditionally. Keep this in sync
+    /// with `computeVisibleWorkItems` — any new narrowing filter added there
+    /// must be neutralized here (or reconciled in
+    /// `reconcileProjectFilterForReveal`), or reveal can silently fail again.
     private func clearWorkFiltersForReveal() {
         workSearchText = ""
         showBlockedOnly = false
@@ -322,27 +330,30 @@ extension ChatViewModel {
         includeChores = true
     }
 
-    /// Leave the project filter alone when the reveal target is already in
-    /// it. Only when the target would be hidden does the filter change: to
-    /// the target's project, or to All when the target has no project (or
-    /// can't be resolved yet, e.g. its product tree hasn't loaded).
-    private func reconcileProjectFilterForReveal(_ taskID: String, switchingProduct: Bool) {
-        guard !selectedProjectFilterIDs.isEmpty else { return }
-        guard !switchingProduct, let item = task(withID: taskID) else {
-            selectedProjectFilterIDs = []
-            return
-        }
+    /// Leave the project filter alone when the reveal target's card is
+    /// already in it. Only when the card would be hidden does the filter
+    /// change: to the card's project, or to All when it has none.
+    /// `hadProjectFilter` is whether a filter was active when the reveal
+    /// began; it matters for a cross-product reveal, where selecting the
+    /// product has already emptied the filter, so an empty filter with
+    /// `hadProjectFilter` means "switch to the target's project". A
+    /// target that cannot be resolved yet leaves the filter untouched.
+    func reconcileProjectFilterForReveal(_ taskID: String, hadProjectFilter: Bool) {
+        guard hadProjectFilter || !selectedProjectFilterIDs.isEmpty else { return }
+        guard let item = task(withID: taskID) else { return }
         var cardTask = item
         if case .revealed(let cardID) = revealCardTarget(for: taskID), let host = task(withID: cardID) {
             cardTask = host
         }
-        guard let projectID = cardTask.projectID else {
-            selectedProjectFilterIDs = []
-            return
+        let updated: Set<String>
+        if let projectID = cardTask.projectID {
+            updated = selectedProjectFilterIDs.contains(projectID) ? selectedProjectFilterIDs : [projectID]
+        } else {
+            updated = []
         }
-        if !selectedProjectFilterIDs.contains(projectID) {
-            selectedProjectFilterIDs = [projectID]
-        }
+        guard updated != selectedProjectFilterIDs else { return }
+        selectedProjectFilterIDs = updated
+        persistProjectFilterIDs()
     }
 
     func setWorkBoardGrouping(_ grouping: WorkBoardGrouping) {
