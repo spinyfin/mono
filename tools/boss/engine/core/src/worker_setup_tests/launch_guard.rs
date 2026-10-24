@@ -463,3 +463,57 @@ fn launch_guard_reason_names_the_isolated_alternative() {
         assert!(reason.contains(expected), "reason must mention {expected}: {reason}");
     }
 }
+
+// --- PR-review prompts must render commands the guard approves ---
+
+/// Every `propose` submission command a PR-review prompt tells the worker to
+/// run must pass the launch guard as rendered, so the prompt text and the guard
+/// cannot drift apart. A bare `boss propose` is blocked by the guard.
+#[test]
+fn pr_review_prompts_render_guard_approved_submission_commands() {
+    use boss_pr_review::{
+        ReviewBriefPacket, ReviewScope, ReviewerReportDestination, SupervisorSourceRole,
+        render_batch_reviewer_initial_prompt, render_post_merge_reviewer_initial_prompt,
+        render_supervisor_initial_prompt,
+    };
+
+    let brief = ReviewBriefPacket::builder()
+        .task_name("Review change")
+        .work_item_brief("Inspect the implementation.")
+        .build();
+    let destination = ReviewerReportDestination::builder()
+        .batch_id("rvb_1")
+        .pr_url("https://github.com/org/repo/pull/1")
+        .target_sha("head_1")
+        .phase(boss_protocol::ReviewBatchPhase::PreMerge)
+        .body_path("/tmp/boss-worker-output/exec_1.review-result.json")
+        .build();
+    let prompts = [
+        render_batch_reviewer_initial_prompt(&brief, &destination, ReviewScope::Code, None, "org/repo"),
+        render_supervisor_initial_prompt(
+            &brief,
+            &destination,
+            &[],
+            &[SupervisorSourceRole::Claude, SupervisorSourceRole::Codex],
+            "org/repo",
+        ),
+        render_post_merge_reviewer_initial_prompt(&brief, &destination, ReviewScope::Code, "org/repo"),
+    ];
+
+    let env = [("BOSS_BIN", "/usr/bin/true")];
+    let mut checked = 0;
+    for prompt in &prompts {
+        for line in prompt.lines().map(str::trim) {
+            assert!(
+                !line.starts_with("boss propose"),
+                "prompt renders a bare `boss propose` command: {line}"
+            );
+            if line.contains("propose review-") && line.starts_with("\"$BOSS_BIN\"") {
+                let (decision, reason) = run_launch_guard_with_env(line, &env);
+                assert_eq!(decision, "approve", "guard blocked rendered command {line:?}: {reason}");
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, prompts.len(), "each prompt must render one submission command");
+}
