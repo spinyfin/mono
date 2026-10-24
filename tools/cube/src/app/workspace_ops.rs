@@ -524,6 +524,7 @@ pub(super) fn workspace_goto(
         );
     }
 
+    let mut pr_head: Option<pr_bookmarks::PrHead> = None;
     let branch: String = if let Some(b) = bookmark {
         strip_remote_suffix(&b).to_string()
     } else if let Some(n) = pr {
@@ -536,47 +537,68 @@ pub(super) fn workspace_goto(
                  Use `cube workspace lease` for a fresh task (don't run `cube workspace goto`), or verify the PR number."
             )));
         }
-        gh_pr::head_ref(&pr_info)
+        let branch = gh_pr::head_ref(&pr_info)
             .ok_or_else(|| {
                 CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no head.ref from GitHub"))
             })?
-            .to_string()
+            .to_string();
+        // GitHub's `head.sha` is the PR head, the same commit lease repair
+        // uses. The branch name only labels it: on a fork-headed PR the same
+        // name on the base remote is an unrelated branch.
+        pr_head = Some(pr_bookmarks::resolve_pr_head(
+            runner,
+            database_path,
+            &cwd,
+            &owner_repo,
+            n,
+            &pr_info,
+            None,
+        )?);
+        branch
     } else {
         return Err(CubeError::InvalidArgument(
             "cube workspace goto: either --bookmark or --pr must be provided".to_string(),
         ));
     };
 
-    let remote_ref = format!("{branch}@{github_remote}");
-
-    if runner
-        .run(&RealCommandRunner::invocation(
-            &cwd,
-            "jj",
-            &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
-        ))
-        .is_err()
-    {
-        return Err(CubeError::InvalidArgument(format!(
-            "branch `{branch}` was not found on remote `{github_remote}` \
-             (looked for `{remote_ref}`). Confirm the bookmark exists and is pushed, \
-             or pass `--pr <n>` to let cube resolve the head from GitHub."
-        )));
-    }
+    let remote_ref = match &pr_head {
+        Some(head) => head.sha.clone(),
+        None => {
+            let remote_ref = format!("{branch}@{github_remote}");
+            if runner
+                .run(&RealCommandRunner::invocation(
+                    &cwd,
+                    "jj",
+                    &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+                ))
+                .is_err()
+            {
+                return Err(CubeError::InvalidArgument(format!(
+                    "branch `{branch}` was not found on remote `{github_remote}` \
+                     (looked for `{remote_ref}`). Confirm the bookmark exists and is pushed, \
+                     or pass `--pr <n>` to let cube resolve the head from GitHub."
+                )));
+            }
+            remote_ref
+        }
+    };
 
     let _pr_lock = runner.lock_pr_bookmarks(&cwd)?;
 
-    // Set the local bookmark to track the remote head (idempotent; --allow-backwards
-    // handles any local divergence).
-    run_jj(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(
-            &cwd,
-            "jj",
-            &["bookmark", "set", &branch, "-r", &remote_ref, "--allow-backwards"],
-        ),
-    )?;
+    // Set the local bookmark to track the head (idempotent; --allow-backwards
+    // handles any local divergence). A fork's branch name is never mapped onto
+    // a local bookmark: it could be `main`.
+    if pr_head.as_ref().is_none_or(|head| head.same_repo) {
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(
+                &cwd,
+                "jj",
+                &["bookmark", "set", &branch, "-r", &remote_ref, "--allow-backwards"],
+            ),
+        )?;
+    }
 
     // Also set the pr/<n> bookmark when the caller specified --pr so that
     // `cube pr push` and `cube workspace rebase` can find the PR number later.

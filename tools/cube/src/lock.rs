@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fs4::fs_std::FileExt;
 
@@ -9,24 +9,30 @@ pub struct RepoLock {
     _file: File,
 }
 
+/// The jj repo directory shared by every workspace of the store `cwd` belongs
+/// to (the `.jj/repo` of the colocated source checkout, even from a secondary
+/// workspace).
+pub fn shared_repo_dir(cwd: &Path) -> Result<PathBuf, CubeError> {
+    let marker = cwd
+        .ancestors()
+        .map(|p| p.join(".jj/repo"))
+        .find(|p| p.exists())
+        .ok_or_else(|| CubeError::InvalidArgument(format!("no jj repository in {}", cwd.display())))?;
+    let repo = if marker.is_dir() {
+        marker
+    } else {
+        let target = std::fs::read_to_string(&marker).map_err(CubeError::Io)?;
+        marker.parent().unwrap().join(target.trim())
+    };
+    std::fs::canonicalize(repo).map_err(CubeError::Io)
+}
+
 impl RepoLock {
     /// Serialize PR bookmark mutation and positioning across secondary workspaces.
     /// Reuse the existing file-lock implementation with a separate store-wide lock
     /// so callers already holding the pool/registry lock cannot deadlock.
     pub fn for_workspace(cwd: &Path) -> Result<Self, CubeError> {
-        let marker = cwd
-            .ancestors()
-            .map(|p| p.join(".jj/repo"))
-            .find(|p| p.exists())
-            .ok_or_else(|| CubeError::InvalidArgument(format!("no jj repository in {}", cwd.display())))?;
-        let repo = if marker.is_dir() {
-            marker
-        } else {
-            let target = std::fs::read_to_string(&marker).map_err(CubeError::Io)?;
-            marker.parent().unwrap().join(target.trim())
-        };
-        let repo = std::fs::canonicalize(repo).map_err(CubeError::Io)?;
-        crate::lock::RepoLock::acquire(&repo.join("cube-pr-bookmarks.lock"))
+        crate::lock::RepoLock::acquire(&shared_repo_dir(cwd)?.join("cube-pr-bookmarks.lock"))
     }
 
     pub fn acquire(lock_path: &Path) -> Result<Self, CubeError> {

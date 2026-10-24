@@ -46,6 +46,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_ws_path("ws")
+    }
+
+    /// As [`Fixture::new`], with the secondary workspace at `<tmp>/<ws_path>`.
+    fn with_ws_path(ws_path: &str) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("jj-config.toml");
         std::fs::write(
@@ -54,7 +59,8 @@ impl Fixture {
         )
         .unwrap();
         let root = dir.path().join("root");
-        let ws = dir.path().join("ws");
+        let ws = dir.path().join(ws_path);
+        std::fs::create_dir_all(ws.parent().unwrap()).unwrap();
         // Bazel hands over a runfiles-relative path; the fixture runs jj from
         // other directories, so pin it to an absolute one up front.
         let binary = std::fs::canonicalize(std::env::var("BOSS_JJ_BIN").expect("Bazel must declare BOSS_JJ_BIN"))
@@ -77,7 +83,15 @@ impl Fixture {
         fixture.jj(&root, &["new", "main"]);
         fixture.jj(
             &root,
-            &["workspace", "add", ws.to_str().unwrap(), "--name", "ws", "-r", "main"],
+            &[
+                "workspace",
+                "add",
+                ws.to_str().unwrap(),
+                "--name",
+                ws.file_name().unwrap().to_str().unwrap(),
+                "-r",
+                "main",
+            ],
         );
         fixture
     }
@@ -334,7 +348,17 @@ struct LeaseRunner<'a> {
 
 impl<'a> LeaseRunner<'a> {
     fn new(jj: &'a DeclaredJj) -> Self {
-        Self::with_pr_json(jj, r#"{"state":"open","head":{"ref":"feat"}}"#.to_string())
+        Self::with_pr_json(
+            jj,
+            r#"{"state":"open","head":{"ref":"feat","sha":"unused"}}"#.to_string(),
+        )
+    }
+
+    fn fork_json(sha: &str, branch: &str, clone_url: &Path) -> String {
+        format!(
+            r#"{{"state":"open","head":{{"ref":"{branch}","sha":"{sha}","repo":{{"full_name":"fork/repo","clone_url":"{}"}}}}}}"#,
+            clone_url.display()
+        )
     }
 
     fn with_pr_json(jj: &'a DeclaredJj, pr_json: String) -> Self {
@@ -473,16 +497,74 @@ fn lease_repairs_a_fork_headed_pr_from_head_sha() {
 fn lease_leaves_a_conflict_untouched_when_the_head_is_not_in_the_store() {
     let f = Fixture::new();
     let (_, other) = conflicted_pr_bookmark(&f, false);
+    // The head repository has nothing to fetch: the fetch fails, the head stays
+    // missing, and the bookmark is left alone.
+    let missing = f._dir.path().join("no-such-fork");
     let runner = LeaseRunner::with_pr_json(
         &f.runner,
-        format!(
-            r#"{{"state":"open","head":{{"ref":"feat","sha":"{}","repo":{{"full_name":"fork/repo"}}}}}}"#,
-            "0123456789abcdef0123456789abcdef01234567"
-        ),
+        LeaseRunner::fork_json("0123456789abcdef0123456789abcdef01234567", "feat", &missing),
     );
     assert_eq!(repair(&f, &runner).unrepaired, ["pr/1"]);
     assert_eq!(f.pr_commits(1).len(), 2);
     assert!(f.pr_commits(1).contains(&other));
+    assert!(
+        !f.jj(&f.ws, &["git", "remote", "list"]).contains("cube-pr-fetch"),
+        "the temporary remote is removed even when the fetch fails"
+    );
+    let sides = crate::app::pr_bookmarks::bookmark_commits_best_effort(&f.runner, None, &f.ws, "pr/1");
+    assert!(
+        sides.contains(&other) && sides.contains(", "),
+        "the skip names both sides: {sides}"
+    );
+}
+
+/// A fork's `feat` holding a commit `fork_sha` that this store has never seen,
+/// as a child of the base repository's `feat`. The base repository's own
+/// `feat@backup` stays at the older commit.
+fn fork_with_new_head(f: &Fixture) -> (PathBuf, String) {
+    let forge = f._dir.path().join("fork");
+    f.jj(
+        f._dir.path(),
+        &[
+            "git",
+            "clone",
+            "--colocate",
+            f.root.to_str().unwrap(),
+            forge.to_str().unwrap(),
+        ],
+    );
+    f.jj(&forge, &["bookmark", "track", "feat@origin"]);
+    f.jj(&forge, &["new", "feat", "-m", "fork work"]);
+    std::fs::write(forge.join("fork.txt"), "fork\n").unwrap();
+    f.jj(&forge, &["bookmark", "set", "feat", "-r", "@", "--allow-backwards"]);
+    let sha = f.jj(&forge, &["log", "--no-graph", "-r", "feat", "-T", "commit_id"]);
+    f.jj(&forge, &["new", "main@origin"]);
+    if !f.jj(&f.ws, &["git", "remote", "list"]).contains("backup") {
+        f.protect_feat_remotely();
+    }
+    assert_eq!(
+        f.jj(
+            &f.ws,
+            &["log", "--no-graph", "-r", &format!("present({sha})"), "-T", "commit_id"]
+        ),
+        "",
+        "precondition: the fork head is not in this store"
+    );
+    (forge, sha)
+}
+
+#[test]
+fn lease_fetches_a_fork_head_missing_from_the_store_and_repairs_to_it() {
+    let f = Fixture::new();
+    conflicted_pr_bookmark(&f, false);
+    let (forge, sha) = fork_with_new_head(&f);
+    let runner = LeaseRunner::with_pr_json(&f.runner, LeaseRunner::fork_json(&sha, "feat", &forge));
+
+    assert!(repair(&f, &runner).unrepaired.is_empty());
+
+    assert_eq!(f.pr_commits(1), vec![sha.clone()]);
+    assert_eq!(f.git_ref(1), Some(sha));
+    assert!(!f.jj(&f.ws, &["git", "remote", "list"]).contains("cube-pr-fetch"));
 }
 
 #[test]
@@ -494,9 +576,10 @@ fn lease_leaves_a_conflict_untouched_when_github_cannot_be_reached() {
     assert_eq!(f.pr_commits(1).len(), 2);
 }
 
-#[test]
-fn goto_replaces_a_head_that_was_rewritten_outside_this_store() {
-    let f = Fixture::new();
+/// PR 1 was positioned at a head cube recorded, then rewritten in a separate
+/// "forge" store and fetched, then (with `churn`) buried under hundreds of
+/// operations so that no bounded op-log scan could still reach the old head. Returns `(published, rewritten)`.
+fn pr_rewritten_outside_this_store(f: &Fixture, churn: bool) -> (String, String) {
     // The "forge" is a separate jj store with its own clone of the history.
     let forge = f._dir.path().join("forge");
     let parent = f._dir.path().to_path_buf();
@@ -541,10 +624,203 @@ fn goto_replaces_a_head_that_was_rewritten_outside_this_store() {
         "precondition: no local ancestry links the two heads"
     );
 
-    point_pr_bookmark(&f.runner, None, &f.ws, 1, "feat@forge").expect("superseded published head is replaced");
+    // Ordinary activity in the shared store: remote operations from other
+    // workspaces, then plain snapshots and rewrites.
+    if churn {
+        for _ in 0..65 {
+            f.jj(&f.ws, &["git", "fetch", "--remote", "forge"]);
+        }
+        for i in 0..420 {
+            f.jj(&f.ws, &["describe", "-m", &format!("churn {i}")]);
+        }
+    }
+    (published, rewritten)
+}
+
+#[test]
+fn point_replaces_a_head_that_was_rewritten_outside_this_store() {
+    let f = Fixture::new();
+    let (_, rewritten) = pr_rewritten_outside_this_store(&f, false);
+
+    point_pr_bookmark(&f.runner, None, &f.ws, 1, "feat@forge").expect("superseded recorded head is replaced");
 
     assert_eq!(f.pr_commits(1), vec![rewritten.clone()]);
     assert_eq!(f.git_ref(1), Some(rewritten));
+}
+
+#[test]
+fn goto_replaces_a_head_that_was_rewritten_outside_this_store() {
+    let f = Fixture::new();
+    let (_, rewritten) = pr_rewritten_outside_this_store(&f, true);
+    f.protect_feat_remotely();
+    let runner = LeaseRunner::with_pr_json(
+        &f.runner,
+        format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{rewritten}"}}}}"#),
+    );
+
+    crate::app::workspace_ops::workspace_goto(None, &runner, Some(f.ws.display().to_string()), None, Some(1), None)
+        .expect("goto --pr replaces the superseded head");
+
+    assert_eq!(f.pr_commits(1), vec![rewritten.clone()]);
+    assert_eq!(f.git_ref(1), Some(rewritten.clone()));
+    assert_eq!(f.commit("@-"), rewritten, "@ sits directly on the PR head");
+}
+
+/// Content that reached some unrelated remote branch is not evidence that a
+/// conflicting side was this PR's head, whether or not that branch still exists.
+#[test]
+fn a_side_published_only_on_an_unrelated_branch_is_not_obsolete() {
+    let f = Fixture::new();
+    let (head, other) = conflicted_pr_bookmark(&f, true);
+    f.jj(&f.root, &["bookmark", "create", "wip", "-r", &other]);
+    f.root_write();
+    f.jj(&f.ws, &["git", "fetch", "--remote", "backup"]);
+    let wip_remote = r#"remote_bookmarks(exact:"wip", exact:"backup")"#;
+    assert_eq!(
+        f.commit(wip_remote),
+        other,
+        "precondition: published on the unrelated branch"
+    );
+    let before = f.jj(&f.ws, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+
+    let err = point_pr_bookmark(&f.runner, None, &f.ws, 1, &head).expect_err("published on wip only");
+    assert!(err.to_string().contains("will not pick a side"), "{err}");
+
+    // The backup branch is deleted and the deletion fetched: the commit was
+    // never tied to this PR in the first place.
+    f.jj(&f.root, &["bookmark", "delete", "wip"]);
+    f.root_write();
+    f.jj(&f.ws, &["git", "fetch", "--remote", "backup"]);
+    assert_eq!(f.commit(wip_remote), "", "precondition: the branch is gone");
+    let err = point_pr_bookmark(&f.runner, None, &f.ws, 1, &head).expect_err("branch deleted");
+    assert!(err.to_string().contains("will not pick a side"), "{err}");
+
+    assert_eq!(f.pr_commits(1).len(), 2, "still conflicted, no side picked");
+    assert!(f.pr_commits(1).contains(&other));
+    let after = f.jj(&f.ws, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    assert_eq!(
+        after.lines().count(),
+        before.lines().count(),
+        "refused writes leave no bookmark change"
+    );
+}
+
+#[test]
+fn goto_positions_a_fork_pr_on_head_sha_not_the_same_named_base_branch() {
+    let f = Fixture::new();
+    let (forge, sha) = fork_with_new_head(&f);
+    let base_feat = f.commit("feat");
+    let runner = LeaseRunner::with_pr_json(&f.runner, LeaseRunner::fork_json(&sha, "feat", &forge));
+
+    crate::app::workspace_ops::workspace_goto(None, &runner, Some(f.ws.display().to_string()), None, Some(1), None)
+        .expect("goto --pr positions on the fork head");
+
+    assert_eq!(f.pr_commits(1), vec![sha.clone()]);
+    assert_eq!(f.git_ref(1), Some(sha.clone()));
+    assert_eq!(f.commit("@-"), sha);
+    assert_eq!(
+        f.commit("feat"),
+        base_feat,
+        "the base repo's `feat` is not moved onto the fork"
+    );
+}
+
+/// The repository-level fixture the lease entry point needs: two pool
+/// workspaces of one real store, both reporting the same conflicted `pr/1`.
+struct LeaseEntry {
+    f: Fixture,
+    _db_dir: TempDir,
+    db: PathBuf,
+    sibling: PathBuf,
+}
+
+impl LeaseEntry {
+    fn new() -> Self {
+        let f = Fixture::with_ws_path("workspaces/mono-agent-001");
+        let sibling = f._dir.path().join("workspaces/mono-agent-002");
+        f.jj(
+            &f.root,
+            &[
+                "workspace",
+                "add",
+                sibling.to_str().unwrap(),
+                "--name",
+                "mono-agent-002",
+                "-r",
+                "main",
+            ],
+        );
+        let (db_dir, db) = super::support::with_database_path();
+        super::support::seed_mono_repo(&f._dir.path().join("workspaces"), &db);
+        Self {
+            f,
+            _db_dir: db_dir,
+            db,
+            sibling,
+        }
+    }
+
+    fn lease(&self, head: &str) -> crate::app::errors::Result<crate::app::errors::RunResult> {
+        let runner = LeaseRunner::with_pr_json(
+            &self.f.runner,
+            format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{head}"}}}}"#),
+        );
+        let lease =
+            <crate::cli::Cli as clap::Parser>::parse_from(["cube", "workspace", "lease", "mono", "--task", "t"]);
+        crate::app::dispatch::run_with_dependencies(lease, Some(&self.db), &runner)
+    }
+
+    fn cached_health(&self, workspace_id: &str) -> Option<String> {
+        rusqlite::Connection::open(&self.db)
+            .expect("sqlite")
+            .query_row(
+                "SELECT health_status FROM workspaces WHERE workspace_id = ?1",
+                [workspace_id],
+                |row| row.get(0),
+            )
+            .expect("cached health row")
+    }
+}
+
+#[test]
+fn lease_entry_point_leaves_a_unique_conflict_alone_and_keeps_the_health_cache() {
+    let l = LeaseEntry::new();
+    let f = &l.f;
+    let (head, other) = conflicted_pr_bookmark(f, true);
+    assert!(
+        f.jj(&l.sibling, &["status"]).contains("pr/1"),
+        "the sibling sees the conflict too"
+    );
+
+    let result = l.lease(&head).expect("a refused repair must not fail the lease");
+
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
+    assert_eq!(f.pr_commits(1).len(), 2, "no side picked");
+    assert!(f.pr_commits(1).contains(&other));
+    assert_eq!(f.git_ref(1), Some(other), "the git ref is untouched");
+    assert_eq!(
+        l.cached_health("mono-agent-002").as_deref(),
+        Some("conflicted"),
+        "the conflict is still there, so the sibling's cached verdict stays"
+    );
+}
+
+#[test]
+fn lease_entry_point_repairs_an_obsolete_conflict_and_clears_the_health_cache() {
+    let l = LeaseEntry::new();
+    let f = &l.f;
+    let (head, _) = conflicted_pr_bookmark(f, false);
+
+    let result = l.lease(&head).expect("lease");
+
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
+    assert_eq!(f.pr_commits(1), vec![head.clone()]);
+    assert_eq!(f.git_ref(1), Some(head));
+    assert_eq!(
+        l.cached_health("mono-agent-002"),
+        None,
+        "the repair cleared the sibling's cached verdict"
+    );
 }
 
 #[test]
@@ -654,17 +930,22 @@ impl CommandRunner for WaitingGcRunner {
 
 struct PausingGotoRunner {
     runner: DeclaredJj,
+    head: String,
     positioned_bookmark: std::sync::mpsc::Sender<()>,
     proceed: std::sync::mpsc::Receiver<()>,
 }
 
 impl CommandRunner for PausingGotoRunner {
     fn run(&self, invocation: &CommandInvocation) -> Result<String> {
-        if invocation.args.iter().any(|arg| arg == "feat@backup & ::@") {
+        if invocation.args.iter().any(|arg| *arg == format!("{} & ::@", self.head)) {
             self.positioned_bookmark.send(()).unwrap();
             self.proceed.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         }
-        LeaseRunner::new(&self.runner).run(invocation)
+        LeaseRunner::with_pr_json(
+            &self.runner,
+            format!(r#"{{"state":"open","head":{{"ref":"feat","sha":"{}"}}}}"#, self.head),
+        )
+        .run(invocation)
     }
 }
 
@@ -679,6 +960,7 @@ fn gc_waits_until_positioning_has_made_the_bookmark_reachable() {
             binary: f.runner.binary.clone(),
             config: f.runner.config.clone(),
         },
+        head: f.commit("feat"),
         positioned_bookmark: positioned_tx,
         proceed: proceed_rx,
     };
