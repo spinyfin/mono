@@ -432,9 +432,9 @@ fn repairing_a_conflicted_bookmark_clears_the_cached_conflict_of_sibling_workspa
     let mut script = vec![
         // The revalidation window re-probes both; both report the same
         // store-wide conflict. The first becomes the repairable candidate.
-        scan_status_command(ws1, &jj_status_conflicted("pr/3226")),
-        scan_status_command(ws2, &jj_status_conflicted("pr/3226")),
-        ExpectedCommand::ok(ws1.clone(), "jj", &["bookmark", "forget", "pr/3226"], ""),
+        scan_status_command(ws1, &jj_status_conflicted("fix-burst")),
+        scan_status_command(ws2, &jj_status_conflicted("fix-burst")),
+        ExpectedCommand::ok(ws1.clone(), "jj", &["bookmark", "forget", "fix-burst"], ""),
     ];
     script.extend(claim_reset_commands_for(ws1, "def5678"));
     let runner = FakeRunner::new(script);
@@ -460,7 +460,7 @@ fn repairing_a_conflicted_bookmark_clears_the_cached_conflict_of_sibling_workspa
     assert_eq!(cleared.len(), 1);
     assert_eq!(cleared[0]["repaired_in"], "mono-agent-001");
     assert_eq!(cleared[0]["cleared"], 1);
-    assert_eq!(cleared[0]["bookmarks"][0], "pr/3226");
+    assert_eq!(cleared[0]["bookmarks"][0], "fix-burst");
 }
 
 /// The fetch, head read and unpushed probe of a reclaim attempt that finds

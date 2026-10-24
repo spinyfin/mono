@@ -1,6 +1,5 @@
 use super::*;
 use boss_engine_test_git::jj::JjRepo;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 struct Store {
@@ -80,13 +79,6 @@ impl Jj for Store {
     }
 }
 
-fn fake_gh(dir: &Path, body: &str) -> PathBuf {
-    let path = dir.join("fake-gh");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
 async fn scene(dir: &Path, conflicted: bool, restore: bool) -> (Store, ExecutionBookmark, String) {
     let repo = JjRepo::new(dir);
     JjRepo::run(&repo.repo, &["bookmark", "set", "main"]);
@@ -138,12 +130,10 @@ async fn scene(dir: &Path, conflicted: bool, restore: bool) -> (Store, Execution
 async fn repaired(conflicted: bool, restore: bool) {
     let dir = tempfile::tempdir().unwrap();
     let (store, record, head) = scene(dir.path(), conflicted, restore).await;
-    let gh = fake_gh(
-        dir.path(),
-        &format!(
-            "test \"$1\" = api || exit 9\ntest \"$4\" = repos/example/recovery/pulls/7 || exit 10\nprintf 'published\\n{head}\\n'"
-        ),
-    );
+    let gh = FakeHead {
+        sha: head.clone(),
+        calls: 0.into(),
+    };
     if restore {
         let preserved = one(&store.repo.repo, &record.head());
         let report = restore_with_gh(
@@ -192,23 +182,62 @@ async fn restore_repairs_alias_conflicted_by_fetch() {
     repaired(true, true).await;
 }
 
+struct FailingHead(&'static str);
+
+#[async_trait]
+impl PrHeadLookup for FailingHead {
+    async fn fetch(&self, _: &str, _: u64) -> Result<(String, String)> {
+        Err(anyhow::anyhow!(self.0))
+    }
+}
+
+struct AbsentHead;
+
+#[async_trait]
+impl PrHeadLookup for AbsentHead {
+    async fn fetch(&self, _: &str, _: u64) -> Result<(String, String)> {
+        parse_pr_head("null\nnull\n")
+    }
+}
+
 #[tokio::test]
 async fn lookup_failures_remain_retryable_but_absent_head_blocks() {
     let dir = tempfile::tempdir().unwrap();
     let (store, record, _) = scene(dir.path(), false, false).await;
-    for (body, permanent) in [
-        ("echo 'HTTP 503 network unavailable' >&2; exit 1", false),
-        ("printf 'null\\nnull\\n'", true),
+    let transient = reconcile_with_gh(
+        &store,
+        &record,
+        Some("pr/7"),
+        "main",
+        &FailingHead("HTTP 503 network unavailable"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !execution_bookmark::is_pointer_integrity_error(&transient),
+        "{transient:#}"
+    );
+    let absent = reconcile_with_gh(&store, &record, Some("pr/7"), "main", &AbsentHead)
+        .await
+        .unwrap_err();
+    assert!(execution_bookmark::is_pointer_integrity_error(&absent), "{absent:#}");
+}
+
+#[test]
+fn parse_pr_head_accepts_only_a_branch_and_full_sha() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    assert_eq!(
+        parse_pr_head(&format!("published\n{sha}\n")).unwrap(),
+        ("published".to_owned(), sha.to_owned())
+    );
+    for bad in [
+        "",
+        "null\nnull\n",
+        &format!("\n{sha}\n"),
+        "published\nabc123\n",
+        "published\n",
     ] {
-        let gh = fake_gh(dir.path(), body);
-        let err = reconcile_with_gh(&store, &record, Some("pr/7"), "main", &gh)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            execution_bookmark::is_pointer_integrity_error(&err),
-            permanent,
-            "{err:#}"
-        );
+        assert!(parse_pr_head(bad).unwrap_err().is::<PrHeadUnavailable>(), "{bad:?}");
     }
 }
 
@@ -231,7 +260,7 @@ async fn lookup_timeout_keeps_prestart_retry_classification() {
     let dir = tempfile::tempdir().unwrap();
     let (_, record, _) = scene(dir.path(), false, false).await;
     tokio::time::pause();
-    let err = repair_with_gh(&PendingLookup, &record, 7, &PathBuf::from("unused-gh"))
+    let err = repair_with_gh(&PendingLookup, &record, 7, &FailingHead("unused"))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("timed out"));
@@ -294,29 +323,43 @@ async fn transient_fetch_failure_retries_repair_and_preserves_pointers() {
     assert!(!execution_bookmark::is_pointer_integrity_error(&err));
     assert!(format!("{err:#}").contains("SSH connection reset"));
     use crate::work::{CreateExecutionInput, ExecutionKind, WorkDb};
+    let alerts = |db: &WorkDb| {
+        db.list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
+            .unwrap()
+            .len()
+    };
     let db = WorkDb::open_in_memory().unwrap();
     let product = crate::test_support::create_test_product(&db);
-    let task = crate::test_support::create_test_chore(&db, &product.id, "retry recovery");
+    let root = crate::test_support::create_test_chore(&db, &product.id, "retry recovery");
+    let task_id = insert_revision(&db, &product.id, &root.id);
+    let (crate::work::WorkItem::Task(before) | crate::work::WorkItem::Chore(before)) =
+        db.get_work_item(&task_id).unwrap()
+    else {
+        panic!("expected a task row")
+    };
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
-                .work_item_id(task.id.clone())
+                .work_item_id(task_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .build(),
         )
         .unwrap();
     assert!(!crate::execution_bookmark_recovery::block_unrecoverable(&db, &execution, &err).unwrap());
-    let crate::work::WorkItem::Chore(current) = db.get_work_item(&task.id).unwrap() else {
-        panic!("expected chore")
+    let (crate::work::WorkItem::Task(current) | crate::work::WorkItem::Chore(current)) =
+        db.get_work_item(&task_id).unwrap()
+    else {
+        panic!("expected a task row")
     };
-    assert_eq!(current.status, task.status);
-    assert_eq!(current.autostart, task.autostart);
+    assert_eq!(current.status, before.status);
+    assert_eq!(current.autostart, before.autostart);
     assert!(current.blocked_reason.is_none());
-    assert!(
-        db.list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(alerts(&db), 0);
+    // Positive control: the same revision fixture does raise the root-card
+    // alert for an authoritative failure, so the zero above is meaningful.
+    let integrity = execution_bookmark::pointer_integrity_error("GitHub head is gone");
+    assert!(crate::execution_bookmark_recovery::block_unrecoverable(&db, &execution, &integrity).unwrap());
+    assert_eq!(alerts(&db), 1);
     assert_eq!(one(&store.repo.repo, &record.head()), saved);
     store.fail_fetch = false;
     ensure_with_gh(&store, &record, 7, &lookup).await.unwrap();
@@ -335,4 +378,18 @@ async fn invalid_authoritative_sha_is_an_integrity_failure() {
     let err = ensure_with_gh(&store, &record, 7, &lookup).await.unwrap_err();
     assert!(execution_bookmark::is_pointer_integrity_error(&err));
     assert!(format!("{err:#}").contains("invalid or absent"));
+}
+
+/// A real revision row under `root_id`, so chain-root lookups resolve.
+fn insert_revision(db: &crate::work::WorkDb, product_id: &str, root_id: &str) -> String {
+    let conn = db.connect().unwrap();
+    let id = crate::work::next_id("task");
+    let now = crate::work::now_string();
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+             VALUES (?1, ?2, 'revision', 'Test revision', '', 'todo', ?3, ?3, ?4)",
+        rusqlite::params![id, product_id, now, root_id],
+    )
+    .unwrap();
+    id
 }

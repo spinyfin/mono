@@ -8,23 +8,48 @@ trait PrHeadLookup: Send + Sync {
     async fn fetch(&self, slug: &str, pr: u64) -> Result<(String, String)>;
 }
 
+/// A successful GitHub response that cannot supply a usable PR head.
+#[derive(Debug, thiserror::Error)]
+#[error("GitHub returned no usable PR head")]
+struct PrHeadUnavailable;
+
+/// Parse the `.head | .ref, .sha` jq output into branch and SHA.
+fn parse_pr_head(stdout: &str) -> Result<(String, String)> {
+    let mut lines = stdout.lines();
+    let head_ref = lines.next().unwrap_or_default().trim();
+    let sha = lines.next().unwrap_or_default().trim();
+    if head_ref.is_empty() || head_ref == "null" || sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(PrHeadUnavailable.into());
+    }
+    Ok((head_ref.to_owned(), sha.to_owned()))
+}
+
+/// Production lookup: an uncached REST read through the shared instrumented
+/// `gh` spawn, which records one telemetry sample from the real arguments.
+struct GhApiHead;
+
 #[async_trait]
-impl PrHeadLookup for PathBuf {
+impl PrHeadLookup for GhApiHead {
     async fn fetch(&self, slug: &str, pr: u64) -> Result<(String, String)> {
         boss_gh_telemetry::scope(boss_gh_telemetry::callers::WORKER_SPAWN, async {
-            // git_utils is shared with Cube and has no Boss telemetry;
-            // record this call at the engine boundary as well as scoping it.
-            use boss_gh_telemetry::{GhCallTimer, GhOutcome};
             let endpoint = format!("repos/{slug}/pulls/{pr}");
-            let timer = GhCallTimer::start_args(&["api", &endpoint]);
-            let result = git_utils::gh_cli::fetch_pr_head(self, slug, pr).await;
-            let outcome = match &result {
-                Ok(_) => GhOutcome::Ok,
-                Err(err) if boss_gh_telemetry::is_rate_limited(&format!("{err:#}")) => GhOutcome::RateLimited,
-                Err(_) => GhOutcome::Error,
-            };
-            timer.finish(outcome, None);
-            result
+            let output = boss_github::gh_runner::gh_output(&[
+                "api",
+                "-H",
+                "Cache-Control: no-cache",
+                &endpoint,
+                "--jq",
+                ".head | .ref, .sha",
+            ])
+            .await
+            .context("failed to spawn `gh api PR head`")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "`gh api {endpoint}` failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            parse_pr_head(&String::from_utf8_lossy(&output.stdout))
         })
         .await
     }
@@ -36,7 +61,7 @@ pub(super) async fn reconcile(
     pr_bookmark: Option<&str>,
     trunk: &str,
 ) -> Result<Option<execution_bookmark::Reconciliation>> {
-    reconcile_with_gh(jj, record, pr_bookmark, trunk, &PathBuf::from("gh")).await
+    reconcile_with_gh(jj, record, pr_bookmark, trunk, &GhApiHead).await
 }
 
 async fn reconcile_with_gh(
@@ -68,7 +93,7 @@ async fn reconcile_with_gh(
 }
 
 pub(super) async fn ensure(jj: &dyn Jj, record: &ExecutionBookmark, pr: u64) -> Result<()> {
-    ensure_with_gh(jj, record, pr, &PathBuf::from("gh")).await
+    ensure_with_gh(jj, record, pr, &GhApiHead).await
 }
 
 async fn ensure_with_gh(jj: &dyn Jj, record: &ExecutionBookmark, pr: u64, gh: &dyn PrHeadLookup) -> Result<()> {
@@ -90,16 +115,7 @@ pub(super) async fn restore_rebased(
     base_branch: &str,
     upstream: &str,
 ) -> Result<execution_bookmark::RestoreReport> {
-    restore_with_gh(
-        jj,
-        record,
-        workspace,
-        pr_bookmark,
-        base_branch,
-        upstream,
-        &PathBuf::from("gh"),
-    )
-    .await
+    restore_with_gh(jj, record, workspace, pr_bookmark, base_branch, upstream, &GhApiHead).await
 }
 
 async fn restore_with_gh(
@@ -154,7 +170,7 @@ async fn repair_with_gh(jj: &dyn Jj, record: &ExecutionBookmark, pr: u64, gh: &d
         let (remote, slug) = git_utils::repo_slug::parse_github_remote(&remotes)
             .ok_or_else(|| execution_bookmark::pointer_integrity_error("recovery store has no GitHub remote"))?;
         let (head_ref, head_sha) = gh.fetch(&slug, pr).await.map_err(|err| {
-            if err.is::<git_utils::gh_cli::PrHeadUnavailable>() {
+            if err.is::<PrHeadUnavailable>() {
                 execution_bookmark::pointer_integrity_error(format!("GitHub head for {bookmark} is unavailable"))
             } else {
                 err

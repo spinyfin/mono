@@ -50,7 +50,7 @@ pub(crate) fn report_chain_block(db: &WorkDb, execution: &WorkExecution, reason:
     let Some(root) = db.get_revision_chain_root_task_id(&execution.work_item_id) else {
         return Ok(());
     };
-    db.upsert_external_tracker_attention(
+    db.upsert_refreshing_work_item_attention(
         &root,
         CHAIN_BLOCKED,
         "PR revision chain blocked on recovery",

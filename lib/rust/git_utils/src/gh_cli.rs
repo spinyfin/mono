@@ -17,11 +17,7 @@ use tokio::process::Command;
 /// spawn-failure context and the non-zero-exit error message (which also
 /// carries the captured stderr).
 async fn run_gh(args: &[&str], display: &str) -> Result<String> {
-    run_gh_with_program(std::path::Path::new("gh"), args, display).await
-}
-
-async fn run_gh_with_program(program: &std::path::Path, args: &[&str], display: &str) -> Result<String> {
-    let output = Command::new(program)
+    let output = Command::new("gh")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -37,37 +33,6 @@ async fn run_gh_with_program(program: &std::path::Path, args: &[&str], display: 
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-/// A successful GitHub response that cannot supply a usable PR head.
-#[derive(Debug, thiserror::Error)]
-#[error("GitHub returned no usable PR head")]
-pub struct PrHeadUnavailable;
-
-/// Read branch and SHA together from an uncached REST response. The explicit
-/// executable permits isolated CLI fixtures without mutating process PATH.
-pub async fn fetch_pr_head(program: &std::path::Path, repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
-    let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
-    let output = run_gh_with_program(
-        program,
-        &[
-            "api",
-            "-H",
-            "Cache-Control: no-cache",
-            &endpoint,
-            "--jq",
-            ".head | .ref, .sha",
-        ],
-        "gh api PR head",
-    )
-    .await?;
-    let mut lines = output.lines();
-    let head_ref = lines.next().unwrap_or_default();
-    let sha = lines.next().unwrap_or_default();
-    if head_ref.is_empty() || head_ref == "null" || sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(PrHeadUnavailable.into());
-    }
-    Ok((head_ref.to_owned(), sha.to_owned()))
 }
 
 /// Fetch the head commit SHA (`headRefOid`) for a PR by shelling out to
