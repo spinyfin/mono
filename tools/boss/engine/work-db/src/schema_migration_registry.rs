@@ -14,6 +14,16 @@ pub(super) fn all() -> Vec<Migration> {
         .collect();
     migrations.extend([
         Migration {
+            id: "20261102_1200_execution_force_launched".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_executions", "force_launched")? {
+                    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN force_launched INTEGER NOT NULL DEFAULT 0")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261029_1430_critical_requests".into(),
             legacy_version: None,
             apply: critical_requests::migrate,
