@@ -434,7 +434,10 @@ fn repairing_a_conflicted_bookmark_clears_the_cached_conflict_of_sibling_workspa
         // store-wide conflict. The first becomes the repairable candidate.
         scan_status_command(ws1, &jj_status_conflicted("pr/3226")),
         scan_status_command(ws2, &jj_status_conflicted("pr/3226")),
-        ExpectedCommand::ok(ws1.clone(), "jj", &["bookmark", "forget", "pr/3226"], ""),
+        // A conflicted `pr/<n>` is deleted and the deletion exported — never
+        // forgotten, which would leave a stale git ref to resurrect it.
+        ExpectedCommand::ok(ws1.clone(), "jj", &["bookmark", "delete", "pr/3226"], ""),
+        ExpectedCommand::ok(ws1.clone(), "jj", &["git", "export"], ""),
     ];
     script.extend(claim_reset_commands_for(ws1, "def5678"));
     let runner = FakeRunner::new(script);

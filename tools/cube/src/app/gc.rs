@@ -19,6 +19,7 @@ use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{self, run_jj, run_jj_network, workspace_path_exists};
+use crate::app::pr_bookmarks;
 use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, trim_free_workspaces_to_mark};
 use crate::app::reconcile::reconcile_free_workspace_health;
 use crate::app::reset::reset_workspace_after_fetch_within;
@@ -140,27 +141,48 @@ pub(super) fn gc_workspace_bookmarks(
         ),
     )?;
 
-    let mut bookmarks: Vec<String> = dedup_bookmark_names(&output, |s| s.starts_with("boss/exec_"));
+    let exec_bookmarks: Vec<String> = dedup_bookmark_names(&output, |s| s.starts_with("boss/exec_"));
+
+    // A stale `refs/heads/pr/<n>` left in the colocated git repo by an older
+    // cube's `forget` only becomes visible to the sweep once imported; do that
+    // first so those leftovers are found and removed rather than lingering
+    // until some unrelated command at the colocated root happens to import
+    // them. A dry run must not write, so it sees only what jj already knows.
+    if !dry_run {
+        pr_bookmarks::import_git_refs(runner, database_path, workspace_path)?;
+    }
 
     // Also sweep pr/<n> bookmarks no workspace is positioned on any more.
-    bookmarks.extend(collect_unreferenced_pr_bookmarks(
-        runner,
-        database_path,
-        workspace_path,
-    )?);
+    let mut pr_candidates = collect_unreferenced_pr_bookmarks(runner, database_path, workspace_path)?;
 
+    let mut bookmarks = exec_bookmarks.clone();
+    bookmarks.extend(pr_candidates.iter().cloned());
     if bookmarks.is_empty() || dry_run {
         return Ok(bookmarks);
     }
 
-    let mut args: Vec<&str> = vec!["bookmark", "forget"];
-    let bookmark_refs: Vec<&str> = bookmarks.iter().map(String::as_str).collect();
-    args.extend_from_slice(&bookmark_refs);
-    run_jj(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(workspace_path, "jj", &args),
-    )?;
+    // The candidate set was decided a few jj calls ago; a concurrent `cube
+    // workspace goto --pr` in another workspace can have positioned on (and
+    // re-set) one of them since. Decide again immediately before acting and
+    // act only on bookmarks that are still unreferenced.
+    if !pr_candidates.is_empty() {
+        let still_unreferenced = collect_unreferenced_pr_bookmarks(runner, database_path, workspace_path)?;
+        pr_candidates.retain(|name| still_unreferenced.contains(name));
+        bookmarks = exec_bookmarks.clone();
+        bookmarks.extend(pr_candidates.iter().cloned());
+    }
+
+    if !exec_bookmarks.is_empty() {
+        let mut args: Vec<&str> = vec!["bookmark", "forget"];
+        args.extend(exec_bookmarks.iter().map(String::as_str));
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(workspace_path, "jj", &args),
+        )?;
+    }
+    // `delete`, not `forget`, and exported: see `crate::app::pr_bookmarks`.
+    pr_bookmarks::delete_pr_bookmarks(runner, database_path, workspace_path, &pr_candidates)?;
 
     Ok(bookmarks)
 }

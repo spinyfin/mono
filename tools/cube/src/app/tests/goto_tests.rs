@@ -47,15 +47,45 @@ fn goto_set_bookmark_cmd(branch: &str) -> ExpectedCommand {
     )
 }
 
-fn goto_set_pr_bookmark_cmd(pr: u64, branch: &str) -> ExpectedCommand {
+fn goto_jj(args: &[&str], out: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(goto_cwd(), "jj", args, out)
+}
+
+fn goto_pr_bookmark_commits_cmd(pr: u64, out: &str) -> ExpectedCommand {
+    let revset = format!("bookmarks(exact:\"pr/{pr}\")");
+    goto_jj(&["log", "--no-graph", "-r", &revset, "-T", r#"commit_id ++ "\n""#], out)
+}
+
+/// The commands `point_pr_bookmark` issues around the `pr/<n>` set, up to and
+/// including the set itself: import any stale git ref, resolve the head, read
+/// what `pr/<n>` currently resolves to (`before`).
+fn goto_pr_bookmark_prelude(pr: u64, branch: &str, head: &str, before: &str) -> Vec<ExpectedCommand> {
+    let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+    vec![
+        goto_jj(&["git", "import"], ""),
+        goto_jj(
+            &["log", "--no-graph", "-r", &remote_ref, "-T", r#"commit_id ++ "\n""#],
+            head,
+        ),
+        goto_pr_bookmark_commits_cmd(pr, before),
+    ]
+}
+
+fn goto_pr_bookmark_set_cmds(pr: u64, branch: &str, head: &str) -> Vec<ExpectedCommand> {
     let remote_ref = format!("{branch}@{GOTO_REMOTE}");
     let pr_bm = format!("pr/{pr}");
-    ExpectedCommand::ok(
-        goto_cwd(),
-        "jj",
-        &["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"],
-        "",
-    )
+    vec![
+        goto_jj(&["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"], ""),
+        goto_jj(&["git", "export"], ""),
+        goto_pr_bookmark_commits_cmd(pr, head),
+    ]
+}
+
+/// Whole healthy-`pr/<n>` sequence: nothing there before, exactly the head after.
+fn goto_set_pr_bookmark_cmds(pr: u64, branch: &str, head: &str) -> Vec<ExpectedCommand> {
+    let mut cmds = goto_pr_bookmark_prelude(pr, branch, head, "");
+    cmds.extend(goto_pr_bookmark_set_cmds(pr, branch, head));
+    cmds
 }
 
 fn goto_positioned_cmd(branch: &str, sha: &str) -> ExpectedCommand {
@@ -148,7 +178,7 @@ fn goto_bookmark_already_positioned_skips_jj_new() {
 #[test]
 fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
     let branch = "boss/exec_gotopr";
-    let cmds = vec![
+    let mut cmds = vec![
         goto_remote_list_cmd(),
         goto_fetch_cmd(),
         ExpectedCommand::ok(
@@ -159,10 +189,10 @@ fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
         ),
         goto_exists_cmd(branch, "e42"),
         goto_set_bookmark_cmd(branch),
-        goto_set_pr_bookmark_cmd(42, branch),
-        goto_positioned_cmd(branch, ""),
-        goto_new_cmd(branch),
     ];
+    cmds.extend(goto_set_pr_bookmark_cmds(42, branch, "e42"));
+    cmds.push(goto_positioned_cmd(branch, ""));
+    cmds.push(goto_new_cmd(branch));
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, None, Some(42)).expect("pr goto");
     runner.assert_exhausted();
@@ -240,4 +270,95 @@ fn goto_revision_already_positioned_skips_new() {
     let result = run_goto_revision(&runner, sha).expect("idempotent revision goto");
     runner.assert_exhausted();
     assert_eq!(result.payload["already_positioned"], true);
+}
+
+/// A conflicted `pr/<n>` whose other side is an ancestor of the head (nothing
+/// unique) is repaired to the head: no forget, no retry.
+#[test]
+fn goto_pr_repairs_conflicted_bookmark_when_other_side_is_an_ancestor() {
+    let branch = "boss/exec_gotopr";
+    let mut cmds = vec![
+        goto_remote_list_cmd(),
+        goto_fetch_cmd(),
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "gh",
+            &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
+            &format!(r#"{{"head":{{"ref":"{branch}"}},"state":"open","merged":false}}"#),
+        ),
+        goto_exists_cmd(branch, "e42"),
+        goto_set_bookmark_cmd(branch),
+    ];
+    cmds.extend(goto_pr_bookmark_prelude(42, branch, "e42", "e42\nold1\n"));
+    cmds.push(goto_jj(
+        &[
+            "log",
+            "--no-graph",
+            "-n",
+            "101",
+            "-r",
+            "(::old1) ~ (::e42)",
+            "-T",
+            r#"change_id ++ "\t" ++ commit_id ++ "\n""#,
+        ],
+        "",
+    ));
+    cmds.extend(goto_pr_bookmark_set_cmds(42, branch, "e42"));
+    cmds.push(goto_positioned_cmd(branch, "e42"));
+    let runner = FakeRunner::new(cmds);
+    run_goto(&runner, None, Some(42)).expect("conflicted pr bookmark repaired");
+    runner.assert_exhausted();
+}
+
+/// A conflicted `pr/<n>` whose other side carries a commit the head has no
+/// rewrite of fails loudly, naming both commits, and writes nothing.
+#[test]
+fn goto_pr_refuses_conflicted_bookmark_with_unique_content() {
+    let branch = "boss/exec_gotopr";
+    let mut cmds = vec![
+        goto_remote_list_cmd(),
+        goto_fetch_cmd(),
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "gh",
+            &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
+            &format!(r#"{{"head":{{"ref":"{branch}"}},"state":"open","merged":false}}"#),
+        ),
+        goto_exists_cmd(branch, "e42"),
+        goto_set_bookmark_cmd(branch),
+    ];
+    cmds.extend(goto_pr_bookmark_prelude(42, branch, "e42", "e42\nuniq9\n"));
+    cmds.push(goto_jj(
+        &[
+            "log",
+            "--no-graph",
+            "-n",
+            "101",
+            "-r",
+            "(::uniq9) ~ (::e42)",
+            "-T",
+            r#"change_id ++ "\t" ++ commit_id ++ "\n""#,
+        ],
+        "chg1\tuniq9\n",
+    ));
+    cmds.push(goto_jj(
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "(::e42) & (chg1)",
+            "-T",
+            r#"change_id ++ "\n""#,
+        ],
+        "",
+    ));
+    let runner = FakeRunner::new(cmds);
+    let err = run_goto(&runner, None, Some(42)).expect_err("unique content must not be discarded");
+    runner.assert_exhausted();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("e42") && msg.contains("uniq9"),
+        "names both commits: {msg}"
+    );
+    assert!(msg.contains("will not pick a side"), "{msg}");
 }

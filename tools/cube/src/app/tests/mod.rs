@@ -14,6 +14,7 @@ mod jj_tests;
 mod lease_reclaim_tests;
 mod lease_tests;
 mod list_status_tests;
+mod pr_bookmarks_tests;
 mod pr_push_tests;
 mod pr_tests;
 mod push_tests;
