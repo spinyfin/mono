@@ -44,7 +44,7 @@ enum BossOperatorQuestionCapture {
             VStack(alignment: .leading) {
                 CollapsibleWorkBoardSection(
                     sectionID: "doing-needs-attention", title: "Needs Attention",
-                    count: 2, defaultExpanded: true
+                    count: 2, defaultExpanded: true, countLabel: "2 decisions waiting"
                 ) {
                     WorkBoardCardOperatorQuestion(slice: .init(presentation: question))
                     WorkBoardCardOperatorQuestion(slice: .init(presentation: choiceQuestion))

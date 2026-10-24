@@ -75,4 +75,51 @@ final class DecisionNotificationTests: XCTestCase {
         XCTAssertEqual(DecisionReminderSchedule.interval(86400), 86400)
         XCTAssertEqual(DecisionReminderSchedule.interval(1), 1)
     }
+
+    func testFailedSubmissionRetriesWithoutConsumingReminderAndClosureCancelsRetry() async {
+        let notifier = ReviewNotificationCenter()
+        notifier.decisionSchedule = DecisionReminderSchedule()
+        notifier.decisionSchedule.reconcile([question()])
+        var attempts = 0
+        var persisted: [String: TimeInterval] = [:]
+        let send: () async throws -> Void = {
+            attempts += 1
+            if attempts == 1 { throw NSError(domain: "test", code: 1) }
+        }
+        await notifier.submitDecision(question(), send: send, remove: {}, now: { self.start },
+                                      persist: { persisted = $0 })
+        XCTAssertTrue(notifier.decisionSchedule.lastSent.isEmpty)
+        XCTAssertTrue(persisted.isEmpty)
+        XCTAssertTrue(notifier.decisionSchedule.due(at: start, interval: 3600).isEmpty)
+        let retry = start.addingTimeInterval(DecisionReminderSchedule.retryInterval)
+        XCTAssertEqual(notifier.decisionSchedule.nextDate(interval: 3600), retry)
+        XCTAssertEqual(notifier.decisionSchedule.due(at: retry, interval: 3600), [question()])
+        await notifier.submitDecision(question(), send: send, remove: {}, now: { retry },
+                                      persist: { persisted = $0 })
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(persisted["question"], retry.timeIntervalSince1970)
+        XCTAssertEqual(notifier.decisionSchedule.nextDate(interval: 3600), retry.addingTimeInterval(3600))
+        await notifier.submitDecision(question(), send: { throw NSError(domain: "test", code: 2) },
+                                      remove: {}, now: { retry }, persist: { persisted = $0 })
+        notifier.decisionSchedule.reconcile([])
+        XCTAssertTrue(notifier.decisionSchedule.retryAfter.isEmpty)
+        XCTAssertNil(notifier.decisionSchedule.nextDate(interval: 3600))
+    }
+
+    func testSuccessPersistsDuringDisconnectButClosureRemovesDelivery() async {
+        let notifier = ReviewNotificationCenter()
+        notifier.decisionSchedule = DecisionReminderSchedule()
+        notifier.decisionSchedule.reconcile([question()])
+        var persisted: [String: TimeInterval] = [:]
+        await notifier.submitDecision(question(), send: { notifier.suspendDecisionReminders() },
+                                      remove: { XCTFail("Still open") }, now: { self.start },
+                                      persist: { persisted = $0 })
+        XCTAssertEqual(persisted["question"], start.timeIntervalSince1970)
+        var removed = false
+        await notifier.submitDecision(question(), send: { notifier.decisionSchedule.reconcile([]) },
+                                      remove: { removed = true },
+                                      persist: { _ in XCTFail("Closed question must not be persisted") })
+        XCTAssertTrue(removed)
+        XCTAssertTrue(notifier.decisionSchedule.lastSent.isEmpty)
+    }
 }

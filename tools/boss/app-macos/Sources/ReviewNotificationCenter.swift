@@ -29,6 +29,7 @@ final class ReviewNotificationCenter: NSObject {
     var decisionTimer: Timer?
     var pendingDecisionIDs: Set<String> = []
     var decisionFeedAvailable = false
+    nonisolated static let reviewCategory = "Ready for Review"
     private var hasRequestedAuthorization = false
 
     /// `UNUserNotificationCenter.current()` throws
@@ -52,6 +53,10 @@ final class ReviewNotificationCenter: NSObject {
         guard isBundleContextSafe else { return }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
+        NSWorkspace.shared.notificationCenter.removeObserver(self, name: NSWorkspace.didWakeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(decisionSystemDidWake), name: NSWorkspace.didWakeNotification, object: nil
+        )
         center.setNotificationCategories([
             UNNotificationCategory(identifier: Self.decisionCategory, actions: [], intentIdentifiers: [])
         ])
@@ -71,8 +76,8 @@ final class ReviewNotificationCenter: NSObject {
         }
 
         let content = UNMutableNotificationContent()
-        content.title = "Ready for Review"
-        content.categoryIdentifier = "Ready for Review"
+        content.title = Self.reviewCategory
+        content.categoryIdentifier = Self.reviewCategory
         if let shortID = task.shortID {
             content.body = "#\(shortID): \(task.name)"
         } else {
@@ -89,7 +94,7 @@ final class ReviewNotificationCenter: NSObject {
 
 extension ReviewNotificationCenter: UNUserNotificationCenterDelegate {
     nonisolated static func presentationOptions(category: String) -> UNNotificationPresentationOptions {
-        category == "Decision needed" ? [.banner, .list, .sound] : []
+        category == decisionCategory ? [.banner, .list, .sound] : []
     }
 
     /// Only decisions interrupt while Boss is in the foreground.

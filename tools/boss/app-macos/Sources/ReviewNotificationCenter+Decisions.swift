@@ -2,7 +2,7 @@ import Foundation
 import UserNotifications
 
 extension ReviewNotificationCenter {
-    static let decisionCategory = "Decision needed"
+    nonisolated static let decisionCategory = "Decision needed"
     static let decisionHistoryKey = "boss.decisions.lastSent"
 
     static func decisionContent(_ question: DecisionNotification) -> UNMutableNotificationContent {
@@ -36,6 +36,38 @@ extension ReviewNotificationCenter {
         decisionTimer = nil
     }
 
+    @objc func decisionSystemDidWake() {
+        deliverDueDecisions()
+    }
+
+    /// Persist successful delivery even if the feed disconnects during submission.
+    func submitDecision(
+        _ question: DecisionNotification,
+        send: () async throws -> Void,
+        remove: () -> Void,
+        now: () -> Date = Date.init,
+        persist: ([String: TimeInterval]) -> Void = {
+            BossDefaults.store.set($0, forKey: ReviewNotificationCenter.decisionHistoryKey)
+        }
+    ) async {
+        do {
+            try await send()
+            guard decisionSchedule.questions[question.questionID] != nil else {
+                remove()
+                return
+            }
+            decisionSchedule.lastSent[question.questionID] = now().timeIntervalSince1970
+            decisionSchedule.retryAfter.removeValue(forKey: question.questionID)
+            persist(decisionSchedule.lastSent)
+        } catch {
+            if decisionSchedule.questions[question.questionID] != nil {
+                decisionSchedule.retryAfter[question.questionID] =
+                    now().timeIntervalSince1970 + DecisionReminderSchedule.retryInterval
+            }
+            NSLog("Decision notification failed: %@", error.localizedDescription)
+        }
+    }
+
     func deliverDueDecisions() {
         decisionTimer?.invalidate()
         decisionTimer = nil
@@ -57,24 +89,16 @@ extension ReviewNotificationCenter {
                 _ = try? await center.requestAuthorization(options: [.alert, .sound])
                 guard self.decisionFeedAvailable,
                       self.decisionSchedule.questions[question.questionID] != nil else { return }
-                // Record only after permission returns and the feed still
-                // confirms the question. Disconnect during the prompt must
-                // not suppress the creation alert for three days.
-                self.decisionSchedule.lastSent[question.questionID] = Date().timeIntervalSince1970
                 let request = UNNotificationRequest(
                     identifier: "boss.decision:\(question.questionID)",
                     content: Self.decisionContent(question), trigger: nil
                 )
-                do {
+                await self.submitDecision(question, send: {
                     try await center.add(request)
-                    // A close can arrive while add is suspended.
-                    if self.decisionSchedule.questions[question.questionID] == nil {
-                        center.removePendingNotificationRequests(withIdentifiers: [request.identifier])
-                        center.removeDeliveredNotifications(withIdentifiers: [request.identifier])
-                    }
-                } catch {
-                    NSLog("Decision notification failed: %@", error.localizedDescription)
-                }
+                }, remove: {
+                    center.removePendingNotificationRequests(withIdentifiers: [request.identifier])
+                    center.removeDeliveredNotifications(withIdentifiers: [request.identifier])
+                })
             }
         }
         BossDefaults.store.set(decisionSchedule.lastSent, forKey: Self.decisionHistoryKey)

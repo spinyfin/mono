@@ -37,6 +37,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
     let sectionID: String
     let title: String
     let count: Int
+    let countLabel: String?
     let defaultExpanded: Bool
     var shortIDLabel: String? = nil
     /// "Trunk queue paused/draining" (or similar) banner shown under the
@@ -56,6 +57,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
         title: String,
         count: Int,
         defaultExpanded: Bool,
+        countLabel: String? = nil,
         shortIDLabel: String? = nil,
         banner: String? = nil,
         revealGeneration: UUID? = nil,
@@ -66,6 +68,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
         self.sectionID = sectionID
         self.title = title
         self.count = count
+        self.countLabel = countLabel
         self.defaultExpanded = defaultExpanded
         self.shortIDLabel = shortIDLabel
         self.banner = banner
@@ -100,9 +103,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .frame(width: 10)
-                        Text(sectionID == "doing-needs-attention"
-                             ? "\(title) · \(count) \(count == 1 ? "decision" : "decisions") waiting"
-                             : "\(title) (\(count))")
+                        Text(countLabel.map { "\(title) · \($0)" } ?? "\(title) (\(count))")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                         if let label = shortIDLabel {
