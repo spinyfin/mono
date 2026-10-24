@@ -184,8 +184,8 @@ fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner, pr_descrip
 
 /// Return the URL of the single open PR for `ctx.branch`, or `None` when
 /// there is no open PR. Errors when more than one open PR matches.
-fn list_open_pr(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<Option<String>> {
-    let prs = gh_pr::list_open_prs_for_branch(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)
+fn list_open_pr(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, branch: &str) -> Result<Option<String>> {
+    let prs = gh_pr::list_open_prs_for_branch(runner, cwd, owner_repo, branch)
         .map_err(|e| CubeError::InvalidArgument(format!("failed to check for existing PR: {e}")))?;
 
     if prs.len() > 1 {
@@ -193,7 +193,7 @@ fn list_open_pr(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<Option<St
             "found {} open PRs for branch `{}` — expected at most 1. \
              Close duplicate PRs before retrying.",
             prs.len(),
-            ctx.branch
+            branch
         )));
     }
 
@@ -326,7 +326,7 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
     // success rather than a hard error so retries after a caller-side
     // timeout are safe. A caller with genuinely new commits to add should
     // use `cube pr update` instead; this path never pushes.
-    if let Some(url) = list_open_pr(&ctx, runner)? {
+    if let Some(url) = list_open_pr(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)? {
         eprintln!(
             "cube: an open PR already exists for branch `{branch}` — treating this `pr create` call \
              as already satisfied. If you have new commits to push, use \
@@ -335,7 +335,7 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
         );
         let number = pr_number_from_url(&url);
         let published = verify_push_reached_github(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)?;
-        let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, number, &published)?;
+        let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, &ctx.branch, number, &published)?;
         return RunResult::new(
             url.clone(),
             json!({"action": "already_exists", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -346,7 +346,7 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
     let published = push_branch_to_github(&ctx, runner, body.text.as_deref())?;
     let url = gh_create_pr(&args, &ctx, runner, &body)?;
     let number = pr_number_from_url(&url);
-    let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, number, &published)?;
+    let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, &ctx.branch, number, &published)?;
     RunResult::new(
         url.clone(),
         json!({"action": "created", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -371,7 +371,7 @@ pub(super) fn pr_update(args: PrUpdateArgs, runner: &dyn CommandRunner) -> Resul
         assert_working_copy_matches_branch(&ctx, runner)?;
     }
 
-    let Some(url) = list_open_pr(&ctx, runner)? else {
+    let Some(url) = list_open_pr(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)? else {
         return Err(CubeError::InvalidArgument(format!(
             "no open PR exists for branch `{branch}`. Open one with `cube pr create --branch {branch}` \
              — `cube pr update` only pushes commits to an existing PR and never creates one.",
@@ -381,7 +381,7 @@ pub(super) fn pr_update(args: PrUpdateArgs, runner: &dyn CommandRunner) -> Resul
 
     let published = push_branch_to_github(&ctx, runner, None)?;
     let number = pr_number_from_url(&url);
-    let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, number, &published)?;
+    let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, &ctx.branch, number, &published)?;
     RunResult::new(
         url.clone(),
         json!({"action": "updated", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -402,9 +402,9 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
     let body = resolve_pr_body(&args)?;
     let published = push_branch_to_github(&ctx, runner, body.text.as_deref())?;
 
-    if let Some(url) = list_open_pr(&ctx, runner)? {
+    if let Some(url) = list_open_pr(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)? {
         let number = pr_number_from_url(&url);
-        let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, number, &published)?;
+        let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, &ctx.branch, number, &published)?;
         return RunResult::new(
             url.clone(),
             json!({"action": "exists", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -413,7 +413,7 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
 
     let url = gh_create_pr(&args, &ctx, runner, &body)?;
     let number = pr_number_from_url(&url);
-    let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, number, &published)?;
+    let pr_bookmark_name = record_published_pr_head(runner, &ctx.cwd, &ctx.branch, number, &published)?;
     RunResult::new(
         url.clone(),
         json!({"action": "created", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
@@ -423,30 +423,40 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
 /// Record only a verified published SHA, never a branch that can move during
 /// publication. Rebased revisions can replace a conflicted sibling, so this
 /// bookkeeping update deliberately allows non-fast-forward movement.
+///
+/// `branch` is only used to render an accurate retry command in errors.
 pub(super) fn record_published_pr_head(
     runner: &dyn CommandRunner,
     cwd: &Path,
+    branch: &str,
     number: Option<u64>,
     published: &str,
 ) -> Result<Option<String>> {
+    let retry = format!("cube pr create --branch {branch}");
     let bookmark = write_pr_bookmark(runner, cwd, number, published).map_err(|e| {
+        let hint = if crate::app::pr_bookmarks::is_unsafe_repair(&e) {
+            format!(
+                "retrying `{retry}` will not help until the conflicted bookmark is resolved as described above; \
+                 then run it to repair bookkeeping without pushing"
+            )
+        } else {
+            format!("retry `{retry}` to repair bookkeeping without pushing")
+        };
         CubeError::InvalidArgument(format!(
-            "push succeeded at {published}, but PR bookmark bookkeeping failed: {e}; \
-             retry `cube pr create` for the published branch to repair bookkeeping without pushing"
+            "push succeeded at {published}, but PR bookmark bookkeeping failed: {e}; {hint}"
         ))
     })?;
     if let Some(name) = &bookmark {
         let revision = format!("bookmarks(exact:{})", serde_json::to_string(name).unwrap());
         let actual = jj_commit_id(runner, cwd, &revision).map_err(|e| {
             CubeError::InvalidArgument(format!(
-                "push succeeded at {published}, but bookmark readback failed: {e}; \
-                 retry `cube pr create` for the published branch"
+                "push succeeded at {published}, but bookmark readback failed: {e}; retry `{retry}`"
             ))
         })?;
         if actual != published {
             return Err(CubeError::InvalidArgument(format!(
                 "push succeeded at {published}, but local bookmark `{name}` resolves to `{actual}`; \
-                 publication bookkeeping failed; retry `cube pr create` for the published branch without re-pushing"
+                 publication bookkeeping failed; retry `{retry}` without re-pushing"
             )));
         }
         eprintln!("cube: published PR bookmark `{name}` verified at {published}");
@@ -461,19 +471,12 @@ pub(super) fn resolve_workspace_pr_number(
     branch: &str,
     number: Option<u64>,
 ) -> Result<Option<u64>> {
-    let number = match number {
-        Some(number) => Some(number),
-        None => {
-            let ctx = PrContext {
-                cwd: cwd.to_owned(),
-                github_remote: String::new(),
-                owner_repo: owner_repo.to_owned(),
-                branch: branch.to_owned(),
-            };
-            list_open_pr(&ctx, runner)?.as_deref().and_then(pr_number_from_url)
-        }
-    };
-    Ok(number)
+    match number {
+        Some(number) => Ok(Some(number)),
+        None => Ok(list_open_pr(runner, cwd, owner_repo, branch)?
+            .as_deref()
+            .and_then(pr_number_from_url)),
+    }
 }
 
 fn write_pr_bookmark(
@@ -732,7 +735,7 @@ pub(super) fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<Ru
 
     // Verify the push reached GitHub.
     let published = verify_push_reached_github(runner, &cwd, &owner_repo, &head_branch)?;
-    record_published_pr_head(runner, &cwd, Some(pr_number), &published)?;
+    record_published_pr_head(runner, &cwd, &head_branch, Some(pr_number), &published)?;
 
     let pr_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
     RunResult::new(

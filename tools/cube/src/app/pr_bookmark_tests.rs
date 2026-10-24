@@ -49,17 +49,42 @@ impl CommandRunner for PublishFixture<'_> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Scenario {
+    /// The rebase conflicts; the worker resolves it with a fresh duplicate.
+    Plain,
+    /// Concurrent operations left `pr/42` conflicted between two rewrites of
+    /// the published head.
+    AmbiguousRewrite,
+    /// `pr/42` is conflicted against a commit unrelated to anything published.
+    AmbiguousUnrelated,
+    /// The incident shape: the pre-rebase commit stays visible through another
+    /// bookmark, and the pushed resolution shares a change id with the
+    /// conflicted rebase result, evolved from the pre-rebase commit.
+    Divergent,
+}
+
 #[test]
 fn resolved_rebase_updates_shared_pr_bookmark_for_next_launch() {
-    exercise_publication(false);
+    exercise_publication(Scenario::Plain);
 }
 
 #[test]
 fn resolved_rebase_replaces_an_ambiguous_pr_bookmark_at_publication() {
-    exercise_publication(true);
+    exercise_publication(Scenario::AmbiguousRewrite);
 }
 
-fn exercise_publication(ambiguous: bool) {
+#[test]
+fn divergent_resolution_of_the_published_head_moves_the_pr_bookmark() {
+    exercise_publication(Scenario::Divergent);
+}
+
+#[test]
+fn unrelated_ambiguous_pr_bookmark_side_is_still_refused() {
+    exercise_publication(Scenario::AmbiguousUnrelated);
+}
+
+fn exercise_publication(scenario: Scenario) {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -81,6 +106,10 @@ fn exercise_publication(ambiguous: bool) {
     jj(&repo, &["git", "remote", "add", "origin", remote_git.to_str().unwrap()]);
     jj(&repo, &["git", "push", "-b", "feature", "--allow-new"]);
     let published_before = jj_commit_id(&runner, &repo, "feature").unwrap();
+    // Only a head that was genuinely published is on record, as a production
+    // publication of it would have left it. The conflicted rebase result below
+    // is never pushed and so is never recorded.
+    crate::app::pr_bookmarks::record_head(&repo, 42, &published_before).unwrap();
     jj(&repo, &["new", "base", "-m", "upstream"]);
     std::fs::write(repo.join("file"), "upstream\n").unwrap();
     jj(&repo, &["bookmark", "set", "main", "-r", "@"]);
@@ -89,31 +118,63 @@ fn exercise_publication(ambiguous: bool) {
         jj(&repo, &["log", "-r", "pr/42", "--no-graph", "-T", "conflict"]).trim(),
         "true"
     );
-    // Earlier cube publications record each head they publish; the raw pushes
-    // in this fixture stand in for them.
-    let mut earlier_heads = vec![published_before, jj_commit_id(&runner, &repo, "pr/42").unwrap()];
+    let conflicted = jj_commit_id(&runner, &repo, "pr/42").unwrap();
+    if scenario == Scenario::Divergent {
+        // Recovery bookmarks keep the pre-rebase commit addressable next to
+        // its conflicted rewrite.
+        jj(&repo, &["bookmark", "set", "boss-base/test", "-r", &published_before]);
+    }
 
     // A revision stages its own history, preserving the old conflicted head.
     let worker = temp.path().join("worker");
     jj(&repo, &["workspace", "add", worker.to_str().unwrap(), "-r", "main"]);
-    jj(&worker, &["duplicate", "feature", "--insert-before", "@"]);
-    jj(&worker, &["edit", "@-"]);
+    if scenario == Scenario::Divergent {
+        jj(&worker, &["edit", &published_before]);
+        jj(&worker, &["rebase", "-r", "@", "-d", "main"]);
+    } else {
+        jj(&worker, &["duplicate", "feature", "--insert-before", "@"]);
+        jj(&worker, &["edit", "@-"]);
+    }
     std::fs::write(worker.join("file"), "upstream and feature\n").unwrap();
     jj(&worker, &["bookmark", "set", "feature", "-r", "@", "--allow-backwards"]);
     let pushed = jj_commit_id(&runner, &worker, "feature").unwrap();
-    assert_eq!(jj_commit_id(&runner, &worker, "feature").unwrap(), pushed);
+    assert_ne!(pushed, conflicted);
+    if scenario == Scenario::Divergent {
+        let change = jj(&repo, &["log", "-r", &conflicted, "--no-graph", "-T", "change_id"]);
+        let same_change = jj(
+            &repo,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("present({})", change.trim()),
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+        );
+        let mut same_change: Vec<_> = same_change.lines().collect();
+        same_change.sort();
+        let mut expected = vec![conflicted.as_str(), pushed.as_str()];
+        expected.sort();
+        assert_eq!(same_change, expected, "expected the incident's divergent change");
+    }
     assert_eq!(
         jj(&worker, &["log", "-r", &pushed, "--no-graph", "-T", "conflict"]).trim(),
         "false"
     );
 
+    let ambiguous = matches!(scenario, Scenario::AmbiguousRewrite | Scenario::AmbiguousUnrelated);
     if ambiguous {
         // Concurrent bookmark operations can leave two added targets. Publish
         // must resolve that ambiguity explicitly; launch must never pick one.
         let operation = jj(&repo, &["op", "log", "--no-graph", "--limit", "1", "-T", "id"]);
-        jj(&repo, &["new", "base", "-m", "other history"]);
-        jj(&repo, &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"]);
-        earlier_heads.push(jj_commit_id(&runner, &repo, "@").unwrap());
+        if scenario == Scenario::AmbiguousRewrite {
+            // The other target is a rewrite of the conflicted rebase result.
+            jj(&repo, &["describe", "-r", &conflicted, "-m", "concurrent rewrite"]);
+        } else {
+            jj(&repo, &["new", "base", "-m", "other history"]);
+            jj(&repo, &["bookmark", "set", "pr/42", "-r", "@", "--allow-backwards"]);
+        }
         jj(
             &repo,
             &[
@@ -159,7 +220,7 @@ fn exercise_publication(ambiguous: bool) {
 
     // Exercise the command recommended by the conflict handoff, including
     // its real push, verification and shared-bookmark synchronization.
-    crate::app::tests::with_checkleft_fixture(|| {
+    let published = crate::app::tests::with_checkleft_fixture(|| {
         let publisher = PublishFixture {
             worker: &worker,
             remote: &remote,
@@ -169,11 +230,9 @@ fn exercise_publication(ambiguous: bool) {
         } else {
             (None, Some(42))
         };
-        for head in &earlier_heads {
-            crate::app::pr_bookmarks::record_head(&worker, 42, head).unwrap();
-        }
-        crate::app::workspace_ops::workspace_push_at(worker.clone(), None, &publisher, bookmark, pr).unwrap();
+        crate::app::workspace_ops::workspace_push_at(worker.clone(), None, &publisher, bookmark, pr)
     });
+    // The push itself lands either way; only the bookkeeping is in question.
     assert_eq!(jj_commit_id(&runner, &remote, "feature").unwrap(), pushed);
     let heads = jj(
         &repo,
@@ -186,6 +245,14 @@ fn exercise_publication(ambiguous: bool) {
             "commit_id ++ \"\\n\"",
         ],
     );
+    if scenario == Scenario::AmbiguousUnrelated {
+        let error = published.unwrap_err().to_string();
+        assert!(error.contains("will not pick a side"), "{error}");
+        assert!(error.contains("will not help"), "{error}");
+        assert_eq!(heads.lines().count(), 2, "an unrelated side must not be discarded");
+        return;
+    }
+    published.unwrap();
     assert_eq!(heads.lines().collect::<Vec<_>>(), vec![pushed.as_str()]);
     jj(&repo, &["git", "export"]);
     jj(&repo, &["git", "import"]);

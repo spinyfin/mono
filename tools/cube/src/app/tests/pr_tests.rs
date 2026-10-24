@@ -1905,10 +1905,10 @@ fn publication_fails_if_bookmark_verification_observes_multiple_heads() {
             "publishedother",
         ),
     ]);
-    let error = crate::app::pr::record_published_pr_head(&runner, &cwd, Some(42), "published").unwrap_err();
+    let error = crate::app::pr::record_published_pr_head(&runner, &cwd, "feature", Some(42), "published").unwrap_err();
     assert!(error.to_string().contains("publication bookkeeping failed"));
     assert!(error.to_string().contains("push succeeded"));
-    assert!(error.to_string().contains("cube pr create"));
+    assert!(error.to_string().contains("cube pr create --branch feature"));
     runner.assert_exhausted();
 }
 

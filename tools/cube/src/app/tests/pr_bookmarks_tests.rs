@@ -863,7 +863,7 @@ fn gc_retains_whole_conflict_when_one_side_is_in_use() {
 #[test]
 fn publication_writers_export_from_secondary_workspace() {
     let f = Fixture::new();
-    crate::app::pr::record_published_pr_head(&f.runner, &f.ws, Some(1), &f.commit("feat")).unwrap();
+    crate::app::pr::record_published_pr_head(&f.runner, &f.ws, "feat", Some(1), &f.commit("feat")).unwrap();
     assert_eq!(f.git_ref(1), Some(f.commit("feat")));
     f.jj(&f.ws, &["new", "feat", "-m", "next revision"]);
     std::fs::write(f.ws.join("next.txt"), "next\n").unwrap();

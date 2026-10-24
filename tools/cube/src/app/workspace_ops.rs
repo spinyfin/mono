@@ -1078,7 +1078,7 @@ pub(super) fn rebase_workspace_branch(
         )));
     }
     let published = verify_push_reached_github(runner, cwd, owner_repo, &boss_branch)?;
-    record_published_pr_head(runner, cwd, number, &published)?;
+    record_published_pr_head(runner, cwd, &boss_branch, number, &published)?;
 
     eprintln!("cube: workspace rebase: {boss_branch} rebased onto {main_branch} cleanly and pushed");
     RunResult::new(
@@ -1210,7 +1210,7 @@ pub(super) fn workspace_push_at(
         .map_err(|e| CubeError::InvalidArgument(format!("failed to push `{boss_branch}`: {e}")))?;
 
     let published = verify_push_reached_github(runner, &cwd, &owner_repo, &boss_branch)?;
-    record_published_pr_head(runner, &cwd, number, &published)?;
+    record_published_pr_head(runner, &cwd, &boss_branch, number, &published)?;
 
     RunResult::new(
         format!("PUSHED: branch `{boss_branch}` pushed to `{github_remote}`."),

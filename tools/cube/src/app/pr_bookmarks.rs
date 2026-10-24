@@ -233,9 +233,10 @@ fn distinct_lines(out: &str) -> Vec<String> {
 /// A side is safe when every commit unique to it is an ancestor of the head,
 /// an ancestor of a head cube previously recorded for *this PR* (so it was the
 /// PR's own published content, however long ago GitHub's head moved on and
-/// whatever became of any branch it was pushed to), or a recorded predecessor
-/// of a commit in the head's history. Matching change ids alone never
-/// establish provenance, and content that merely reached some other branch is
+/// whatever became of any branch it was pushed to), a recorded predecessor of a
+/// commit in the head's history, or a rewrite (per the evolution log) of a
+/// recorded head, such as the conflicted result of rebasing it. Matching change
+/// ids alone never establish provenance, and content that merely reached some other branch is
 /// not evidence of anything.
 fn ensure_sides_are_obsolete(
     runner: &dyn CommandRunner,
@@ -298,14 +299,27 @@ fn ensure_sides_are_obsolete(
             )
             .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?
             .is_some();
-            if !proven {
+            if proven {
+                continue;
+            }
+            // A rebase that conflicts leaves `pr/<n>` on a rewrite of the
+            // published head that was never itself pushed, so it can never be
+            // recorded. It is still the PR's own content when it evolved from
+            // a head recorded for this PR.
+            let rewrite = git_utils::jj_provenance::is_rewrite_of_any(
+                |args| run(runner, database_path, cwd, args),
+                commit,
+                recorded_heads,
+            )
+            .map_err(|error| unsafe_repair(name, head, side, &format!("evolution unavailable: {error}")))?;
+            if !rewrite {
                 return Err(unsafe_repair(
                     name,
                     head,
                     side,
                     &format!(
-                        "commit {commit} is neither an ancestor of a head recorded for this PR nor a recorded \
-                         predecessor of the head's history"
+                        "commit {commit} is neither an ancestor of a head recorded for this PR, a rewrite of one, \
+                         nor a recorded predecessor of the head's history"
                     ),
                 ));
             }
@@ -314,9 +328,18 @@ fn ensure_sides_are_obsolete(
     Ok(())
 }
 
+/// Wording shared by [`unsafe_repair`] and [`is_unsafe_repair`].
+const UNSAFE_REPAIR_PHRASE: &str = "cube will not pick a side";
+
+/// Whether `error` is the deterministic refusal to repair a conflicted
+/// bookmark, which no plain retry can get past.
+pub(super) fn is_unsafe_repair(error: &CubeError) -> bool {
+    error.to_string().contains(UNSAFE_REPAIR_PHRASE)
+}
+
 fn unsafe_repair(name: &str, head: &str, side: &str, why: &str) -> CubeError {
     CubeError::InvalidArgument(format!(
-        "`{name}` is conflicted and cube will not pick a side: the GitHub head is {head} but the other side \
+        "`{name}` is conflicted and {UNSAFE_REPAIR_PHRASE}: the GitHub head is {head} but the other side \
          {side} has unique content ({why}). Inspect with `jj log -r 'bookmarks(exact:\"{name}\")'`; if {side} \
          is really obsolete, resolve with `jj bookmark set {name} -r {head} --allow-backwards`."
     ))
