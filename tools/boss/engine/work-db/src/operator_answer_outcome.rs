@@ -27,6 +27,10 @@ pub struct OperatorAnswerOutcome {
     /// update path (it cascades to dependents and the project), so the caller
     /// runs it once the answer has committed.
     pub archive_work_item_id: Option<String>,
+    /// The minted resume execution, when the run that asked the question was
+    /// admitted by an operator force launch. The RPC layer re-admits it the
+    /// same way so it does not queue behind the dispatch pause.
+    pub force_resume_execution_id: Option<String>,
 }
 
 impl OperatorAnswerOutcome {

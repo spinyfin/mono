@@ -1038,6 +1038,15 @@ mod floor_tests {
                 Box::new(|c| pre_start_failure::migrate_dispatch_failure_history(c).unwrap()),
             ),
             (
+                "20261118_1200_execution_force_launched",
+                Box::new(|c| {
+                    c.execute_batch(
+                        "ALTER TABLE work_executions ADD COLUMN force_launched INTEGER NOT NULL DEFAULT 0",
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
                 "20261118_0258_execution_launch_failed",
                 Box::new(|c| {
                     c.execute_batch("ALTER TABLE work_executions ADD COLUMN launch_failed INTEGER NOT NULL DEFAULT 0")

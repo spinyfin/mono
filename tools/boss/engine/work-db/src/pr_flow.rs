@@ -2646,6 +2646,7 @@ impl WorkDb {
         let mut touched_work_item_ids = Vec::new();
         let mut dispatch_work_item_id = None;
         let mut archive_work_item_id = None;
+        let mut force_resume_execution_id = None;
         let ladder_question = crate::progression_ladder::is_ladder_question(&tx, &question.question.id)?;
         let mismatch_attempt = super::conflict_mismatch::attempt_for_question(&tx, &question.question.id)?;
         match (answer, &question.question.answer_type) {
@@ -2717,7 +2718,7 @@ impl WorkDb {
             (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::YesNo) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = authorization_block(&question.question, &timestamp);
-                minted_execution = restart_after_answer_from(
+                let restart = restart_after_answer_from(
                     &mut pending,
                     &tx,
                     &task,
@@ -2726,11 +2727,13 @@ impl WorkDb {
                     RestartOptions::new(&now, suppress_start),
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
+                minted_execution = restart.minted;
+                force_resume_execution_id = restart.force_resume_execution_id;
             }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. }) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = choice_block(&question.question, &value, &timestamp);
-                minted_execution = restart_after_answer_from(
+                let restart = restart_after_answer_from(
                     &mut pending,
                     &tx,
                     &task,
@@ -2739,6 +2742,8 @@ impl WorkDb {
                     RestartOptions::new(&now, suppress_start),
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
+                minted_execution = restart.minted;
+                force_resume_execution_id = restart.force_resume_execution_id;
             }
             (
                 OperatorAnswer::YesNo { value: false },
@@ -2757,7 +2762,8 @@ impl WorkDb {
                     &block,
                     RestartOptions::new(&now, suppress_start),
                     crate::task_status_audit::WriteAttribution { actor, provenance },
-                )?;
+                )?
+                .minted;
             }
             (OperatorAnswer::YesNo { value: false }, _) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
@@ -2770,7 +2776,8 @@ impl WorkDb {
                     &block,
                     RestartOptions::new(&now, suppress_start),
                     crate::task_status_audit::WriteAttribution { actor, provenance },
-                )?;
+                )?
+                .minted;
             }
             // `check_answer` above refuses every other pairing.
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
@@ -2786,6 +2793,7 @@ impl WorkDb {
             .touched_work_item_ids(touched_work_item_ids)
             .maybe_dispatch_work_item_id(dispatch_work_item_id)
             .maybe_archive_work_item_id(archive_work_item_id)
+            .maybe_force_resume_execution_id(force_resume_execution_id)
             .build())
     }
 }
@@ -2803,7 +2811,7 @@ pub(super) fn restart_after_answer(
     block: &str,
     now: &str,
 ) -> Result<bool> {
-    restart_after_answer_from(
+    Ok(restart_after_answer_from(
         pending,
         tx,
         task,
@@ -2814,12 +2822,33 @@ pub(super) fn restart_after_answer(
             actor: boss_protocol::LAST_STATUS_ACTOR_HUMAN,
             provenance: None,
         },
-    )
+    )?
+    .minted)
+}
+
+/// Result of [`restart_after_answer_from`]: whether a ready execution was
+/// minted, and the resume id when the asking run was force-launched.
+pub(super) struct RestartAfterAnswer {
+    pub minted: bool,
+    pub force_resume_execution_id: Option<String>,
+}
+
+impl RestartAfterAnswer {
+    pub(super) fn none() -> Self {
+        Self {
+            minted: false,
+            force_resume_execution_id: None,
+        }
+    }
 }
 
 /// Move the answered task back to Todo with `block` appended to its brief and
-/// carry the answer to the next worker. Returns `true` when a ready execution
-/// was minted for it to start now.
+/// carry the answer to the next worker. Returns whether a ready execution was
+/// minted for it to start now.
+///
+/// When the asking run was admitted by an operator force launch (see
+/// `work_executions.force_launched`), `force_resume_execution_id` is the
+/// minted resume so the caller can admit it the same way.
 ///
 /// A task still gated by prerequisites (a conflict revision queued behind
 /// another writer on the same PR is the common case) cannot be started
@@ -2838,7 +2867,7 @@ pub(super) fn restart_after_answer_from(
     block: &str,
     options: RestartOptions<'_>,
     attribution: crate::task_status_audit::WriteAttribution<'_>,
-) -> Result<bool> {
+) -> Result<RestartAfterAnswer> {
     let RestartOptions { now, suppress_start } = options;
     let description = format!("{}{block}", task.description);
     super::description_guard::validate_description_update(&task.description, &description, false)?;
@@ -2859,7 +2888,7 @@ pub(super) fn restart_after_answer_from(
              blocked_detail = NULL, autostart = 1, last_status_actor = ?4, updated_at = ?3 WHERE id = ?1",
             params![task.id, description, now, actor],
         )?;
-        return Ok(false);
+        return Ok(RestartAfterAnswer::none());
     }
     crate::task_status_audit::execute(
         tx,
@@ -2870,7 +2899,7 @@ pub(super) fn restart_after_answer_from(
         params![task.id, description, now, actor],
     )?;
     if !parking::upkeep_eligible(tx, &task.id)? {
-        return Ok(false);
+        return Ok(RestartAfterAnswer::none());
     }
     if !deps::gating_prereqs_for(tx, &task.id)?.is_empty() {
         maybe_engine_block_dependent(pending, tx, &task.id, now)?;
@@ -2881,7 +2910,7 @@ pub(super) fn restart_after_answer_from(
             super::prerequisite_question::queue_gated_execution(tx, &task, question)?;
         }
         super::prerequisite_question::stamp_answered_waiting(tx, &task.id)?;
-        return Ok(false);
+        return Ok(RestartAfterAnswer::none());
     }
     super::prerequisite_question::continue_after_answer(pending, tx, task, question, suppress_start, attribution)
 }

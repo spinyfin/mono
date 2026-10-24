@@ -413,7 +413,8 @@ pub(super) fn answer_in_tx(
         CONFLICT_MISMATCH_CHOICE_FORCE_MERGE => {
             let block = force_merge_block(question, &timestamp);
             let minted_execution =
-                super::pr_flow::restart_after_answer_from(pending, tx, asker, question, &block, restart, attribution)?;
+                super::pr_flow::restart_after_answer_from(pending, tx, asker, question, &block, restart, attribution)?
+                    .minted;
             if !suppress_start {
                 mark_operator_forced_admission_in_tx(tx, &asker.id)?;
             }

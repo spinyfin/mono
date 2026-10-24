@@ -18,6 +18,7 @@
 //! and the question stays open.
 
 use super::dispatch_admission::primary_pr_awaits_review;
+use super::pr_flow::RestartAfterAnswer;
 use super::*;
 use boss_protocol::{CREATED_VIA_ENGINE_AUTO, OperatorQuestionView, TaskStatus};
 use chrono::{DateTime, Utc};
@@ -424,7 +425,8 @@ pub(crate) fn stamp_answered_waiting(conn: &Connection, task_id: &str) -> Result
 
 /// After an answer on an ungated, eligible task: leave a schedulable
 /// continuation, then (unless `suppress_start`) try an explicit start.
-/// Returns whether an explicit start minted the execution.
+/// Reports whether an explicit start minted the execution and, when the asking
+/// run was force-launched, the resume to admit the same way.
 pub(super) fn continue_after_answer(
     pending: &mut PendingEvents,
     tx: &rusqlite::Transaction<'_>,
@@ -432,7 +434,7 @@ pub(super) fn continue_after_answer(
     question: &OperatorQuestionView,
     suppress_start: bool,
     attribution: crate::task_status_audit::WriteAttribution<'_>,
-) -> Result<bool> {
+) -> Result<RestartAfterAnswer> {
     let actor = attribution.actor;
     // Recording the answer must not depend on starting the task, so the
     // explicit start is a best-effort step under a savepoint: a refusal
@@ -443,6 +445,7 @@ pub(super) fn continue_after_answer(
     let task = query_task(tx, &task.id).require("task", &task.id)?;
     if !suppress_start {
         let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
+        let asked_under_force_launch = super::dispatch::execution_force_launched_in(tx, &asking.id)?;
         tx.execute_batch("SAVEPOINT answer_explicit_start")?;
         let started = request_execution_in_tx_with_live_check(
             pending,
@@ -460,9 +463,13 @@ pub(super) fn continue_after_answer(
             |_| true,
         );
         match started {
-            Ok(_) => {
+            Ok(resume) => {
                 tx.execute_batch("RELEASE answer_explicit_start")?;
-                return Ok(true);
+                return Ok(RestartAfterAnswer {
+                    minted: true,
+                    force_resume_execution_id: (asked_under_force_launch && resume.status == ExecutionStatus::Ready)
+                        .then_some(resume.id),
+                });
             }
             Err(error) => {
                 tx.execute_batch("ROLLBACK TO answer_explicit_start; RELEASE answer_explicit_start")?;
@@ -490,7 +497,7 @@ pub(super) fn continue_after_answer(
     } else {
         super::prerequisite_question::queue_ready_execution(tx, &task, question)?;
     }
-    Ok(false)
+    Ok(RestartAfterAnswer::none())
 }
 
 /// Drop the answered-waiting marker from `task_id`'s `blocked_detail`, leaving
